@@ -147,13 +147,34 @@ fn no_fused_support(_fused: &FusedOp) -> bool {
 /// trait answers. Each backend module defines the matrix once and its trait impl
 /// forwards to it, so the registry's answer and the trait's answer are the same
 /// code and cannot diverge.
+///
+/// **Honest scope ([#244]).** "The same code" is true of the module-level free
+/// functions these fields point at; it is not true that the *registry field* is
+/// the authority production reads. `supports_op` / `supports_fused` /
+/// `supports_attn_span` are written by every `entry()` and read only by
+/// `registry::tests` (which is why each carries a `not(test)` allowance);
+/// assignment reads the trait method (`graph::backend_takes` →
+/// `dyn Backend::supports_op`), and `reads_packed_kv` is the one field
+/// production reads (`registry::reads_packed_kv`). Whether to make the trait
+/// forward through the caps (one read) or drop the three fields is [#244]'s
+/// reported decision, not a dead-code cleanup.
+///
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Clone, Copy)]
 pub struct BackendCaps {
+    /// The op×dtype matrix, as the module-level free function. Read by
+    /// `registry::tests::{registry_caps_match_the_backend_trait,
+    /// names_resolve_and_unknown_names_are_refused}`; the trait method calls the
+    /// same function.
     #[cfg_attr(not(test), allow(dead_code))]
     pub supports_op: fn(&Op, DType) -> bool,
+    /// The fusion matrix; read by the same two tests, answered by the same
+    /// function the trait method calls.
     #[cfg_attr(not(test), allow(dead_code))]
     pub supports_fused: fn(&FusedOp) -> bool,
     /// Whether attention can be bounded from the explicit `attn_span` (E1).
+    /// Read by `registry_caps_match_the_backend_trait`; the trait method returns
+    /// the same module-level constant.
     #[cfg_attr(not(test), allow(dead_code))]
     pub supports_attn_span: bool,
     /// Whether the attention kernel reads a packed `q8_0` KV region (C4).
@@ -182,6 +203,14 @@ impl BackendCaps {
 pub struct BackendEntry {
     pub handle: Backend,
     /// The canonical name (`resolve_name` matches it).
+    ///
+    /// Read only by tests (`convert::tests`, `cuda::issue162_tests`,
+    /// `cuda::issue218_tests`): production spelling goes through
+    /// `Backend::name()`'s `NAMES` table and `resolve_name`, not this field. It
+    /// stays as the entry's own name — a diagnostic that iterates `entry`s would
+    /// read it — with the `not(test)` allowance ([#244]).
+    ///
+    /// [#244]: https://github.com/yusiwen/minfer/issues/244
     #[cfg_attr(not(test), allow(dead_code))]
     pub name: &'static str,
     /// Assignment priority, higher first (see the module docs).

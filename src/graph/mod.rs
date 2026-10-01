@@ -68,15 +68,31 @@ use ops::{NodeMeta, Op};
 pub type NodeId = usize;
 
 /// Activation dtype carried by node outputs (weight tensors keep their own
-/// `TensorType`; IR activations are F32 except where noted). F16 / Q8_0 are
-/// part of the full IR dtype vocabulary (ggml parity) but no supported op
-/// constructs them today.
-#[allow(dead_code)]
+/// `TensorType`; IR activations are F32 except where noted).
+///
+/// `F16`/`Q8_0` are part of the full IR dtype vocabulary (ggml parity): a
+/// backend's `supports_op(op, dtype)` answers `false` for them, which is how a
+/// future dtype-aware op expresses "not supported yet". No supported op
+/// constructs them, so each carries its own member-level allowance and names
+/// what would construct it — [#244] keeps them and reports the membership
+/// question (delete the variants vs keep the vocabulary) rather than deciding
+/// it here.
+///
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,
+    /// Deferred (ggml parity): a half-precision activation. The device kernels
+    /// read f32 activations today; a kernel that takes an f16 activation buffer
+    /// is what would construct a node with this dtype.
+    #[allow(dead_code)]
     F16,
     I32,
+    /// Deferred (ggml parity): an int8 activation buffer. The CPU quantizes
+    /// activations to Q8_0 *inside* the matmul kernels
+    /// (`dot_q*_q8_0`), never as a graph node output; the IR node that exposes
+    /// that quantized buffer is what would construct this.
+    #[allow(dead_code)]
     Q8_0,
 }
 

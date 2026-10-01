@@ -9,8 +9,14 @@ use crate::tensor::TensorType;
 use crate::vec_ops::RopeStyle;
 
 /// Attention mode.
-// Mha is part of the full attention-mode vocabulary (ggml parity); only Gqa /
-// Flash are constructed by the supported architectures today.
+///
+/// `Mha` is part of the full attention-mode vocabulary (ggml parity) so a
+/// backend can express "not supported"; only `Gqa`/`Flash` are constructed by
+/// the supported architectures. What would construct it: an architecture with
+/// `n_head_kv == n_head` that spelled its attention out instead of reusing the
+/// GQA kernel. [#244] keeps it and reports the membership question.
+///
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttnMode {
     #[allow(dead_code)]
@@ -43,15 +49,20 @@ pub enum Op {
     // ---- element-wise ----
     Add,
     Mul,
-    /// Part of the full op vocabulary (ggml parity); no supported architecture
-    /// emits a scale node yet.
+    /// Part of the full op vocabulary (ggml parity) so a backend can refuse it;
+    /// no supported architecture emits a scale node. What would construct it: a
+    /// builder that scales an activation in place instead of folding the scale
+    /// into the producing op (llama.cpp's `ggml_scale`), for a temperature/1.0
+    /// style rescaled graph.
     #[allow(dead_code)]
     Scale(f32),
     Silu,
 
     // ---- reduction ----
     /// Softmax is part of the op vocabulary; the attention kernels fuse the
-    /// softmax internally, so no standalone softmax node is emitted today.
+    /// softmax internally, so no standalone softmax node is emitted. What would
+    /// construct it: an attention or sampling graph that exposes the normalized
+    /// probabilities as a node output instead of fusing them into the kernel.
     #[allow(dead_code)]
     Softmax {
         dim: usize,
@@ -104,13 +115,20 @@ pub enum Op {
     },
 
     // ---- view / reshape ----
-    /// View / Reshape / Permute / BatchMatMul are part of the full ggml op
-    /// vocabulary; the Qwen2 graph builder doesn't emit them (yet).
-    #[allow(dead_code)]
+    /// A window into another node's buffer; D1's `GraphBuilder::split_parts`
+    /// constructs it, so it carries no allowance.
     View {
         offset: usize,
         shape: [usize; 4],
     },
+    /// Reshape/Permute/BatchMatMul are part of the full ggml op vocabulary; the
+    /// Qwen2 graph builder does not emit them. What would construct them: a
+    /// builder that needs a non-contiguous reinterpretation (`reshape`/
+    /// `permute`) or a batched matmul the single-output IR cannot express
+    /// (`batch_matmul`, deferred — see the `FusedOp::BatchMatMul` note). [#244]
+    /// keeps them and reports the membership question.
+    ///
+    /// [#244]: https://github.com/yusiwen/minfer/issues/244
     #[allow(dead_code)]
     Reshape {
         shape: [usize; 4],

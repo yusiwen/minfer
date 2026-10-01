@@ -41,15 +41,11 @@ impl OffloadPlan {
     /// A plan with every block on the device — the plan an unset request means when a
     /// device is available.
     ///
-    /// **(a) verdict, [#239](https://github.com/yusiwen/minfer/issues/239): reported, not moved.** The
-    /// doc used to read "what an unset request resolves to when a device is available", but the
-    /// resolution path never calls this constructor: `OffloadRequest::plan` (`offload.rs:187`) and
-    /// `resolve` (`offload.rs:232`) build `OffloadPlan { gpu_layers, n_layers }` inline (they must —
-    /// they clamp `gpu_layers` first). The only callers are `graph::offload::tests`. A
-    /// production-looking constructor whose documented caller does not exist is the #218 shape:
-    /// either the resolution path should call it, or the doc should say test-only. That is a
-    /// decision for [#244](https://github.com/yusiwen/minfer/issues/244), so the annotation stays.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// [#239](https://github.com/yusiwen/minfer/issues/239) reported the lost caller this
+    /// constructor had: the resolution path built the plan inline, so only the tests reached
+    /// it. [#244](https://github.com/yusiwen/minfer/issues/244) wired the caller instead of
+    /// deleting the constructor — `resolve`'s unset-request arm now returns this (or
+    /// [`Self::all_on_cpu`]) directly, which is the same `OffloadPlan` the inline form built.
     pub fn all_on_device(n_layers: usize) -> Self {
         Self {
             gpu_layers: n_layers,
@@ -143,6 +139,15 @@ pub enum OffloadRequest {
     /// read, and which its own second arm had to unset. The repo's convention is
     /// an explicit argument over a mutated environment — `load_model_configured`'s
     /// explicit cache type is the precedent (#99, #153).
+    ///
+    /// Retained with a `not(test)` allowance ([#244]): the loader reads it
+    /// (`budget_mib`/`source`) and the E5 gates construct it, but no production
+    /// spelling produces it — that is deliberate, because an environment variable
+    /// reaching it would be the process global this variant exists to avoid. A CLI
+    /// flag or a server field that carries the budget as an argument is what would
+    /// construct it.
+    ///
+    /// [#244]: https://github.com/yusiwen/minfer/issues/244
     #[cfg_attr(not(test), allow(dead_code))]
     AutoWithBudget(usize),
 }
@@ -228,11 +233,14 @@ pub fn resolve(
 ) -> Result<OffloadPlan, String> {
     let gpu_layers = match requested.map(str::trim) {
         None | Some("") => {
-            if device_available {
-                n_layers
+            // The unset request is exactly one of the two named plans. Expressed through
+            // the constructors, so the plan and its name cannot drift; this is the lost
+            // caller #239 reported for `all_on_device` (#244).
+            return Ok(if device_available {
+                OffloadPlan::all_on_device(n_layers)
             } else {
-                0
-            }
+                OffloadPlan::all_on_cpu(n_layers)
+            });
         }
         Some(v) if v.eq_ignore_ascii_case(AUTO) => {
             return Err(

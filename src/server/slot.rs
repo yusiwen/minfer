@@ -12,11 +12,12 @@ pub enum SlotState {
 
 /// One inference slot. Only ever touched by the serial worker thread, so no
 /// locking is needed; the queue provides concurrency between requests.
+// The `id: usize` field was deleted in [#244]: the worker addresses slots
+// positionally, no diagnostic ever printed it, and "future routing" is the
+// future-consumer justification the plan's A7 note rejects.
+//
+// [#244]: https://github.com/yusiwen/minfer/issues/244
 pub struct Slot {
-    /// Slot index (0-based). Carried for diagnostics / future routing; the
-    /// worker currently addresses slots positionally.
-    #[allow(dead_code)]
-    pub id: usize,
     pub state: SlotState,
     pub cache: GraphCache,
     /// B2: the token sequence the slot's KV rows currently hold — row `i` holds
@@ -34,8 +35,7 @@ pub struct Slot {
 pub fn new_slots(n_slots: usize, n_ctx_total: usize) -> Vec<Slot> {
     let per = n_ctx_total / n_slots.max(1);
     (0..n_slots)
-        .map(|id| Slot {
-            id,
+        .map(|_| Slot {
             state: SlotState::Idle,
             cache: GraphCache::new(),
             cached_tokens: Vec::new(),

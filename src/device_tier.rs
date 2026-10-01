@@ -19,12 +19,25 @@
 /// day one (llama.cpp offset scheme: AMD `0x1000000`, Moore Threads
 /// `0x0100000`) so foreign rows can be added without restructuring; only
 /// NVIDIA rows exist today.
-#[allow(dead_code)] // the namespace is the design; rows arrive per backend
+///
+/// Each never-constructed vendor names itself ([#244] — replacing the
+/// container-level allowance #243 could not tighten): the variants are the
+/// namespace the design reserves, and a non-NVIDIA row in [`TIERS`] is what
+/// would construct one. `Nvidia`/`Unknown` are constructed by the table and the
+/// selector, so the enum itself stays checked.
+///
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Vendor {
     Nvidia,
+    /// Reserved for an AMD row keyed by the `0x1000000` gfx offset.
+    #[allow(dead_code)]
     Amd,
+    /// Reserved for a Moore Threads row keyed by the `0x0100000` offset.
+    #[allow(dead_code)]
     Mthreads,
+    /// Reserved for an Apple-silicon row keyed by chip generation.
+    #[allow(dead_code)]
     Apple,
     Unknown,
 }
@@ -54,27 +67,46 @@ pub enum Provenance {
 /// Quant class for per-type batch overrides. Only the K-quant families carry
 /// overrides in llama.cpp's tables (their k-quant MMVQ dequant cost is per
 /// column, so MMQ wins sooner); every other supported type uses the default.
-#[allow(dead_code)] // Other is consumed by callers at cap-activation time
+///
+/// `Other` (the no-override class) is constructed only by
+/// `device_tier::tests` today, so it carries the `not(test)` allowance at the
+/// member ([#244]) instead of the enum-level blanket #243 could not tighten; a
+/// caller that classifies a non-K-quant weight type would construct it.
+///
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QClass {
     K4,
     K5,
     K6,
+    #[cfg_attr(not(test), allow(dead_code))]
     Other,
 }
 
 /// One device tier: the dispatch parameters a cc resolves to.
-#[allow(dead_code)] // `source` is provenance documentation + test-checked
+///
+/// The three fields production does not read carry member-level `not(test)`
+/// allowances ([#244], replacing the container blanket #243 could not tighten):
+/// they are read by `device_tier::tests` and are the provenance/calibration
+/// record every row cites. [`select`] reads `key`/`name`/`provenance`/
+/// `mmq_available`; `mmvq_batch_default`/`mmvq_batch_by_type` are what the
+/// batch-cap activation (plan §14 R8) would read.
+///
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 pub struct DeviceTier {
     pub key: DeviceKey,
     pub name: &'static str,
     /// Provenance: minfer doc or llama.cpp file:line — every row cites its
-    /// source so future syncs and promotions have an anchor.
+    /// source so future syncs and promotions have an anchor. Read by
+    /// `device_tier::tests` (a row with no source is a data bug).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub source: &'static str,
     pub provenance: Provenance,
     /// Batch limit for the quantized decode (MMVQ-family) kernels.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub mmvq_batch_default: i32,
     /// Per-quant-class overrides (sparse; K-quant only in the source data).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub mmvq_batch_by_type: &'static [(QClass, i32)],
     /// int8 BT (block-tile tensor-core) prefill availability. The GENERIC
     /// row encodes `false` here; [`select`] replaces it with `cc >= 800`
