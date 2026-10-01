@@ -443,7 +443,8 @@ Every execution, in order:
 The gated evidence for 2–3 is `copystats::CrossCopyStats` (per allocator:
 `copies`, `waits`, `blocking_host_copies`, `async_host_copies`, `event_syncs`,
 `stream_waits`), `CudaBackend::blocking_readback_count()` (a device-level count of
-blocking `cudaMemcpy` D2H calls) and `cuda::stream_sync_count()` (host stalls).
+blocking `cudaMemcpy` D2H calls) and `CudaBackend::stream_sync_count()` (host
+stalls; per backend since [#185], the process-wide counter deleted in [#242]).
 `MINFER_SYNC_COPIES=1` restores the pre-F5 synchronous path as the bitwise
 reference; `copystats::set_sync_for_test` is its programmatic form.
 
