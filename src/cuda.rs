@@ -1842,15 +1842,10 @@ pub struct CudaState {
     buf_q8_ba: StreamScratch,
     #[allow(dead_code)] // legacy surface (7e⑦)
     buf_positions: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_logits: StreamScratch,
     // Persistent per-layer GPU KV cache (k, v) and current size
     kv_k: Mutex<Vec<CudaPtr>>,
     kv_v: Mutex<Vec<CudaPtr>>,
     kv_size: Mutex<Vec<usize>>,
-    // CUDA Graph for decode step (capture once, replay for each token)
-    #[allow(dead_code)] // legacy single-slot capture flow (7e⑦)
-    decode_graph_exec: Mutex<CudaPtr>,
 }
 
 /// Quant block element count (ggml block_q): 256 for K-quants, 32 otherwise.
@@ -2333,11 +2328,9 @@ impl CudaState {
             buf_f16_x: StreamScratch::new(),
             buf_q8_ba: StreamScratch::new(),
             buf_positions: StreamScratch::new(),
-            buf_logits: StreamScratch::new(),
             kv_k: Mutex::new(Vec::new()),
             kv_v: Mutex::new(Vec::new()),
             kv_size: Mutex::new(Vec::new()),
-            decode_graph_exec: Mutex::new(CudaPtr(std::ptr::null_mut())),
         })
     }
 
@@ -3314,20 +3307,6 @@ impl CudaState {
         }
     }
 
-    /// Issue #188: **the process-wide stream lock is gone.** It existed because
-    /// every backend shared one stream, so an open capture window had to exclude
-    /// every other backend's enqueues. Each `CudaBackend` now owns a stream and a
-    /// capture window (`CudaBackend::capturing`), so there is nothing left to
-    /// serialize at the context level.
-    ///
-    /// This accessor is retained only as a compile-time pointer for the removal;
-    /// it is `#[allow(dead_code)]` and no caller remains.
-    #[allow(dead_code)]
-    pub fn stream_lock(&self) -> &Mutex<()> {
-        static RETIRED: Mutex<()> = Mutex::new(());
-        &RETIRED
-    }
-
     // ─── F5 (#58): events + asynchronous host transfers ────────
     //
     // The split boundary is the only place the engine moves a value between
@@ -3485,15 +3464,6 @@ impl CudaState {
         ))
     }
 
-    /// Drop a pending required-launch record without reporting it. Used by a
-    /// documented fallback path (`minfer_launch_ok_opt` never sets one, but an
-    /// earlier required site in the same call may have) and by the `Err` arm of
-    /// `execute_node`, whose own message is the real error.
-    #[allow(dead_code)]
-    pub fn clear_launch_failure(&self) {
-        unsafe { minfer_launch_fail_clear() };
-    }
-
     /// Debug sync: print label, then sync and report error.
     /// `il` = layer index, or negative for non-layer steps (e.g. output norm).
     /// Only active when MINFER_CUDA_DEBUG is set.
@@ -3530,72 +3500,11 @@ impl CudaState {
     // ─── Upload/download for forward pass ─────────────────────
 
     #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn upload_hidden(&self, hidden: &[f32]) {
-        let need = hidden.len() * 4;
-        let ptr = Self::get_or_grow(&self.buf_hidden, need);
-        self.copy_to_device(
-            unsafe { std::slice::from_raw_parts(hidden.as_ptr() as *const u8, need) },
-            ptr,
-        );
-    }
-
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn download_hidden(&self, hidden: &mut [f32]) {
-        let need = hidden.len() * 4;
-        let ptr = self.buf_hidden.slot().0 .0;
-        if ptr.is_null() {
-            return;
-        }
-        self.copy_from_device(ptr as *const std::ffi::c_void, unsafe {
-            std::slice::from_raw_parts_mut(hidden.as_mut_ptr() as *mut u8, need)
-        });
-    }
-
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn upload_positions(&self, positions: &[usize]) {
-        let ints: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
-        let need = ints.len() * 4;
-        let ptr = Self::get_or_grow(&self.buf_positions, need);
-        self.copy_to_device(
-            unsafe { std::slice::from_raw_parts(ints.as_ptr() as *const u8, need) },
-            ptr,
-        );
-    }
-
-    #[allow(dead_code)] // legacy surface (7e⑦)
     pub fn get_positions_buf(&self) -> *mut std::ffi::c_void {
         self.buf_positions.slot().0 .0
     }
 
     // ─── KV cache management ─────────────────────────────────
-
-    /// Pre-allocate GPU KV cache for all layers to n_ctx entries.
-    /// Must be called after model loading (when n_layer, n_ctx, nkt are known)
-    /// but before the first forward pass. Eliminates O(n²) incremental growth.
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn init_kv_cache(&self, n_layer: usize, n_ctx: usize, nkt: usize) {
-        let need = n_ctx * nkt * 4;
-        let mut kvec = self.kv_k.lock().unwrap();
-        let mut vvec = self.kv_v.lock().unwrap();
-        let mut szvec = self.kv_size.lock().unwrap();
-        for il in 0..n_layer {
-            let new_k = Self::cuda_malloc(need);
-            let new_v = Self::cuda_malloc(need);
-            if new_k.is_null() || new_v.is_null() {
-                eprintln!("CUDA: failed to pre-allocate KV cache for layer {}", il);
-                return;
-            }
-            kvec.push(CudaPtr(new_k));
-            vvec.push(CudaPtr(new_v));
-            szvec.push(n_ctx);
-        }
-        let total_kb = (n_layer * need * 2) / 1024;
-        eprintln!(
-            "CUDA: pre-allocated KV cache for {} layers ({:.1} MB)",
-            n_layer,
-            total_kb as f64 / 1024.0
-        );
-    }
 
     /// Verify KV cache has enough room for `max_nkv` entries at layer `il`.
     /// Returns false if capacity is exceeded (should never happen with pre-allocation).
@@ -3613,31 +3522,7 @@ impl CudaState {
         true
     }
 
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn get_kv_size(&self, il: usize) -> usize {
-        let szvec = self.kv_size.lock().unwrap();
-        szvec.get(il).copied().unwrap_or(0)
-    }
-
-    /// Download logits from GPU after layer loop.
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn download_logits(&self, logits: &mut [f32]) {
-        let need = logits.len() * 4;
-        let ptr = self.buf_logits.slot().0 .0;
-        if ptr.is_null() {
-            return;
-        }
-        self.copy_from_device(ptr as *const std::ffi::c_void, unsafe {
-            std::slice::from_raw_parts_mut(logits.as_mut_ptr() as *mut u8, need)
-        });
-    }
-
     // ─── CUDA Graph (decode step batch) ───────────────────────
-
-    #[allow(dead_code)] // legacy single-slot capture flow (7e⑦)
-    pub fn graph_available(&self) -> bool {
-        !self.decode_graph_exec.lock().unwrap().0.is_null()
-    }
 
     pub fn graph_begin_capture(&self) -> bool {
         let stream = self.stream();
@@ -3655,54 +3540,6 @@ impl CudaState {
         } else {
             true
         }
-    }
-
-    #[allow(dead_code)] // legacy single-slot capture flow (7e⑦)
-    pub fn graph_end_capture(&self) {
-        let stream = self.stream();
-
-        let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
-        let err = unsafe { cudaStreamEndCapture(stream, &mut graph) };
-        if err != 0 || graph.is_null() {
-            if err != 0 {
-                unsafe {
-                    cudaGetLastError();
-                }
-            }
-            return;
-        }
-
-        let mut exec: *mut std::ffi::c_void = std::ptr::null_mut();
-        let err = unsafe {
-            cudaGraphInstantiate(
-                &mut exec,
-                graph,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if err != 0 || exec.is_null() {
-            // #147: `cudaGraphDestroy` takes the `cudaGraph_t` from
-            // `cudaStreamEndCapture`; read its own return value here.
-            let derr = unsafe { cudaGraphDestroy(graph) };
-            if derr != 0 {
-                eprintln!("{}", graph_destroy_failure_message(derr));
-                unsafe {
-                    cudaGetLastError(); // this site owns the error
-                }
-            }
-            return;
-        }
-
-        let derr = unsafe { cudaGraphDestroy(graph) };
-        if derr != 0 {
-            eprintln!("{}", graph_destroy_failure_message(derr));
-            unsafe {
-                cudaGetLastError(); // this site owns the error
-            }
-        }
-        *self.decode_graph_exec.lock().unwrap() = CudaPtr(exec);
     }
 
     /// Close a capture window and return the instantiated exec handle (null
@@ -3809,20 +3646,6 @@ impl CudaState {
             unsafe {
                 cudaGetLastError();
             }
-            return false;
-        }
-        true
-    }
-
-    #[allow(dead_code)] // legacy single-slot capture flow (7e⑦)
-    pub fn graph_launch(&self) -> bool {
-        let exec = self.decode_graph_exec.lock().unwrap().0;
-        if exec.is_null() {
-            return false;
-        }
-        let stream = self.stream();
-        let err = unsafe { cudaGraphLaunch(exec, stream) };
-        if err != 0 {
             return false;
         }
         true
@@ -6891,95 +6714,6 @@ impl CudaState {
         }
     }
 
-    // ─── Batch quant_matmul (for Q/K/V projection) ────────────
-
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn quant_matmul_f32_batch(
-        &self,
-        mats: &mut [(
-            /*weight*/ &Tensor,
-            /*output*/ &mut [f32],
-            /*od*/ usize,
-        )],
-        x: &[f32],
-        id: usize,
-        nt: usize,
-    ) {
-        // For batch Q4_0 matmuls: quantize activations once, then launch each matmul
-        if mats.iter().any(|m| m.0.ttype != TensorType::Q4_0) {
-            // Fall back to CPU for non-Q4_0 types
-            for mat in mats.iter_mut() {
-                crate::kernel::cpu_quant_matmul_f32(mat.0, x, mat.1, mat.2, id, nt);
-            }
-            return;
-        }
-
-        let nb = id / 32;
-        let q8_len = nt * nb * Q8B;
-        let mut q8 = vec![0u8; q8_len];
-        crate::quants::quantize_row_q8_0_buf(x, nt, id, &mut q8);
-
-        let xbuf = Self::get_or_grow(&self.buf_hidden, q8_len);
-        self.copy_to_device(&q8, xbuf);
-
-        // Launch each matmul and read back results
-        for (_i, mat) in mats.iter_mut().enumerate() {
-            let out_len = nt * mat.2 * 4;
-            let obuf = Self::get_or_grow(&self.buf_bq, out_len);
-            self.quant_matmul_q8(mat.0, xbuf, obuf, mat.2, id, nt);
-            self.sync();
-            let out_bytes =
-                unsafe { std::slice::from_raw_parts_mut(mat.1.as_mut_ptr() as *mut u8, out_len) };
-            self.copy_from_device(obuf as *const std::ffi::c_void, out_bytes);
-        }
-    }
-
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn quant_matmul_f32(
-        &self,
-        w: &Tensor,
-        x: &[f32],
-        out: &mut [f32],
-        od: usize,
-        id: usize,
-        nt: usize,
-    ) {
-        if w.ttype == TensorType::Q4_0 {
-            let nb = id / 32;
-            let q8_len = nt * nb * Q8B;
-            let out_len = nt * od * 4;
-
-            let mut q8 = vec![0u8; q8_len];
-            crate::quants::quantize_row_q8_0_buf(x, nt, id, &mut q8);
-
-            let xbuf = Self::get_or_grow(&self.buf_hidden, q8_len);
-            let obuf = Self::get_or_grow(&self.buf_logits, out_len);
-
-            self.copy_to_device(&q8, xbuf);
-            self.quant_matmul_q8(w, xbuf, obuf, od, id, nt);
-            self.sync();
-            let out_bytes =
-                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_len) };
-            self.copy_from_device(obuf as *const std::ffi::c_void, out_bytes);
-        } else if w.ttype == TensorType::Q8_0 {
-            let out_len = nt * od * 4;
-            let x_len = nt * id * 4;
-            let xbuf = Self::get_or_grow(&self.buf_hidden, x_len);
-            let obuf = Self::get_or_grow(&self.buf_logits, out_len);
-            self.copy_to_device(
-                unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x_len) },
-                xbuf,
-            );
-            self.quant_matmul_f32_on_gpu(w, xbuf, obuf, od, id, nt);
-            self.sync();
-            let out_bytes =
-                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, out_len) };
-            self.copy_from_device(obuf as *const std::ffi::c_void, out_bytes);
-        } else {
-            crate::kernel::cpu_quant_matmul_f32(w, x, out, od, id, nt);
-        }
-    }
-
     // ─── Full-layer GPU pass ──────────────────────────────────
 
     /// Encode one transformer layer onto the CUDA stream.
@@ -7190,71 +6924,6 @@ impl CudaState {
         self.add_f32(hidden, bn, hidden, nt * ne);
         self.debug_sync(il as i32, "add(residual ffn)");
 
-        true
-    }
-
-    /// Final RMSNorm + output matmul on GPU.
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn output_norm_gpu(
-        &self,
-        output: &Tensor,
-        output_norm: Option<&Tensor>,
-        output_b: Option<&Tensor>,
-        ne: usize,
-        nv: usize,
-        nt: usize,
-        n_out: usize,
-        eps: f32,
-    ) -> bool {
-        let norm_w = match output_norm {
-            Some(t) => match self.get_weight_ptr(&t.name) {
-                Some(w) => w,
-                None => return false,
-            },
-            None => return false,
-        };
-        if !self.has_weight(&output.name) {
-            return false;
-        }
-        if output.ttype != TensorType::Q4_0
-            && output.ttype != TensorType::Q8_0
-            && output.ttype != TensorType::Q4_1
-            && output.ttype != TensorType::Q4_K
-            && output.ttype != TensorType::Q6_K
-        {
-            return false;
-        }
-        debug_assert!(n_out <= nt, "n_out={n_out} > nt={nt}");
-
-        // Output rows = last n_out tokens (single-sequence [nt][ne] row-major).
-        let hid_off = (nt - n_out) * ne * 4;
-
-        let hidden = Self::get_or_grow(&self.buf_hidden, nt * ne * 4);
-        let bn = Self::get_or_grow(&self.buf_bn, n_out * ne * 4);
-        let logits = Self::get_or_grow(&self.buf_logits, n_out * nv * 4);
-
-        let hidden_off = unsafe { (hidden as *mut u8).add(hid_off) } as *mut std::ffi::c_void;
-        self.rms_norm(hidden_off, Some(norm_w), bn, ne, n_out, eps);
-        self.debug_sync(-1, "output: rms_norm");
-
-        if output.ttype == TensorType::Q4_0 {
-            let q8_len = n_out * (ne / 32) * Q8B;
-            let q8_bn = Self::get_or_grow(&self.buf_q8_bn, q8_len);
-            self.quantize_q8_0(bn, q8_bn, ne, n_out);
-            self.debug_sync(-1, "output: quantize_q8_0");
-            self.quant_matmul_q8(output, q8_bn, logits, nv, ne, n_out);
-            self.debug_sync(-1, "output: q4_0 matmul");
-        } else {
-            self.quant_matmul_f32_on_gpu(output, bn, logits, nv, ne, n_out);
-            self.debug_sync(-1, "output: f32 matmul");
-        }
-
-        if let Some(ob) = output_b {
-            if let Some(bias_buf) = self.get_weight_ptr(&ob.name) {
-                self.add_bias_f32(logits, bias_buf, nv, n_out);
-                self.debug_sync(-1, "output: bias");
-            }
-        }
         true
     }
 }
