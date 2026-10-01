@@ -5852,6 +5852,173 @@ mutation of `new`'s body is observable through it, so the tensor group's mutatio
 `Tensor::from_data` (same `impl Tensor`, same file), and that is a real gap in the helper's coverage,
 recorded rather than papered over. (4) `--features debug_dump` was not built by the census or here.
 
+#### Test-infrastructure record (#239, 2026-10-01) — the same-module test-only items move into their module's `tests.rs`
+
+**The ticket.** [#239](https://github.com/yusiwen/minfer/issues/239) is T2 of the `allow(dead_code)` census. Its bucket **B** is
+"dead in the production `--features cuda` build, reached from test code, and **every** test caller
+sits inside the item's own module subtree". That is what makes the retirement a *move* rather than
+#238's in-place gate: an inherent method goes into a `#[cfg(test)] impl Type` block in that module's
+`tests.rs` (an inherent impl may live in a child module — the cuda build proves it), a free
+function/const/FFI declaration goes in as a `#[cfg(test)]` item there. After the move nothing in a
+non-test build knows the item exists, which is strictly stronger than `#[cfg(test)] pub(crate)`
+in place: there is no production-file line left for a later cleanup to orphan.
+
+**Reconciliation: the ticket's "26" is not a B unit.** Re-derived from the raw captures
+(`minfer-allow-census/cuda.jsonl`, `tests_cuda.jsonl`) with the same rule T1 used — **every** span of
+every `dead_code` diagnostic whose file starts with `src/`:
+
+| unit | count |
+|---|---|
+| distinct `(file, line)` dead sites, `cargo check --release --features cuda` | **314** (99 diagnostics) |
+| … still dead under `--tests --features cuda` → bucket **A** ([#242](https://github.com/yusiwen/minfer/issues/242)) | **142** |
+| … test-reachable (314 − 142) → **68** sites on B items + **71** on C items + **33** `impl`/`mod` header spans rustc reports without an item identity | **172** |
+
+At census **item** level (`census.json`, keyed by `(file, line, name)`) the cuda build has **260** dead
+items: A **121** (89 code / 32 shape), **B 68 (58 / 10)**, C **71** (56 / 15). The three numbers the
+tracker circulated are therefore:
+
+- **68** — the item-level bucket-B count (`cuda_B`), i.e. 58 code + 10 shape.
+- **58** — the **code**-only B set, which is T2's list. `tickets/T2.md` carries exactly 58 item
+  bullets (a naive `grep -c '^- \`'` reads 59 because one Method/Sentence line also matches);
+  `census.json` and the list agree name for name.
+- **26 — does not reproduce for B, and is not a third unit.** Re-deriving it the only way it can be
+  read (*how many of the 99 diagnostics have their **primary** span on a bucket-B item*) gives **45**
+  (42 code + 3 shape), not 26. **26** reproduces *exactly* as the number of diagnostics whose primary
+  span is a bucket-**C** item — which is T1's headline unit ([#238](https://github.com/yusiwen/minfer/issues/238)). The
+  ticket body's "26 (diagnostics whose primary span is a bucket item)" is a mis-attribution of T1's
+  number to T2, and its body is patched to say so. (For completeness, the README's *collapsed* B = 28
+  reproduces as **27** diagnostics whose every `src/` span is a B item; the one-diagnostic difference
+  is a diagnostic that also carries an `impl` header span.)
+
+**Per-item verification, and what a re-read changed.** Every item was read at its call site before it
+was touched. The census's collision overrides all held for these items (`snapshot`, `plan`,
+`cuda_backend::new`, `submit`, `sample` were checked again: the recorded cross-module matches really
+are other items — `TimingSink::snapshot`, `OffloadRequest::plan`, `Vec::new`, the Metal
+`CommandBuffer::submit`, `server::metrics`' own `sample`). Five items did **not** survive as a plain
+move:
+
+| item | verdict |
+|---|---|
+| `KvCache::set_owner` (`kvcache.rs:322`) | **(a) question**: its doc said "C1 uses it from `own_range`", but `own_range` (`kvcache.rs:517`) writes `l.owner[cell] = seq` inline and never calls it. A helper whose documented production caller does not exist is the #218 shape — *reported, not moved* (the annotation stays), for [#244](https://github.com/yusiwen/minfer/issues/244). |
+| `OffloadPlan::all_on_device` (`offload.rs:44`) | **(a) question**: its doc said it is "what an unset request resolves to when a device is available", but `OffloadRequest::plan` (`offload.rs:187`) and `resolve` (`offload.rs:232`) build `OffloadPlan { gpu_layers, n_layers }` inline (they must — they clamp first). Same class, same disposition. |
+| `StreamScratch::slot` (`cuda.rs:1300`) | **blocked**: bucket B by the census (its only *test* caller is `cuda::d35_probe_tests`), but the bucket-**A** legacy wrappers `upload_hidden` / `upload_positions` / `download_logits` / `get_positions_buf` still call it **and are still compiled**, so it cannot leave the production file. Deferred to [#240](https://github.com/yusiwen/minfer/issues/240) / [#242](https://github.com/yusiwen/minfer/issues/242), with the reason at the item. |
+| `device_entry.rs`'s 4 items (`DEVICE_ENTRY`, `DeviceHolder`, `DeviceEntry`, `enter`) | **blocked**: `enter` is still called by the bucket-**A** `CudaState::layer_gpu` (`cuda.rs:7051`), which is compiled in the cuda build. Deferred to [#241](https://github.com/yusiwen/minfer/issues/241), which deletes the guard. |
+| `CudaBackend::new` (`cuda_backend.rs:200`) | **reclassified B→C, and still moved**: the census calls it B because `is_test_path` only recognises `tests.rs` / `*_tests.rs`, but it also has a cross-module test caller, `graph::op_matrix` (a `#[cfg(test)] mod`). An inherent method's impl may live in a child module, so moving it into `cuda_backend/tests.rs` with `pub(crate)` keeps `op_matrix` compiling while production loses the constructor — verified by the `--features cuda` check and the device suite. |
+
+Three further stale doc claims were found on items that **were** moved (their own docs do not assert
+a current consumer, so they are not (a) items) and are recorded at the item and in the tracker:
+`GraphAllocator::set_memory_budget`'s "a future offload policy uses it" (the E5 S2 policy landed and
+resolves its budget through `MINFER_GPU_MEM` + `allocplan::weight_budget`), `KvCache::note_written`'s
+`// E2 surface` note (E2 records written extents through `own_positions` /
+`fill_batch_inputs`), and `allocplan.rs`'s module doc ("the plan is checked against a per-backend
+budget before that loop runs" — the gate is `alloc_in_pool`, not `AllocPlan::plan`). The module doc
+keeps its wording and gains an (a) note rather than being quietly rewritten.
+
+**The moves: 51 items, 18 module groups.** One item per line stayed free; the map is
+
+| module (`tests.rs`) | moved items | visibility |
+|---|---|---|
+| `conversation` | `Conversation::snapshot` | private |
+| `cuda` (**new `src/cuda/tests.rs`**) | 13 test-only FFI declarations (`cuda_test_latch_oversized_smem`, `minfer_site_fail_*` ×8, `minfer_site_hist_{len,site,name,msg}`), `latched_api_error_count`, `CudaState::take_last_error` | `pub(super)` — the callers are sibling `*_tests` modules under `cuda` |
+| `device_tier` | `IDENTITY_BATCH_BOUND`, `mmvq_batch_limit`, `mmvq_cap` | private (the const is a standalone item, not a field/variant, so it can move; `mmvq_cap` was its only production-side reader) |
+| `grammar` | `GrammarState::pending_bytes` | private |
+| `graph/alloc` | `set_memory_budget`, `n_cpu_buffers`, `n_mapped_buffers` | private |
+| `graph/allocplan` | `AllocPlan`, `plan`, `live_peak`, `DeviceMemory::free_bytes` | private |
+| `graph/cache` | `cached_graphs` | private |
+| `graph/cpu_backend` | `weight` | private |
+| `graph/cuda_backend` | `new`, `exec_ids` + `elems` (the `#[cfg(test)]` shim and its helper) | `pub(crate)` on `new` (the `op_matrix` caller), private otherwise |
+| `graph/kvcache` | `own_prefix`, `note_written`, `after_shift`, `seq_range`, `private_written` | private |
+| `graph/mod` | `DType::size` | private |
+| `graph/registry` | `names` | private |
+| `graph/scheduler` | `with_timing` | private |
+| `sampler` | `apply_repetition_penalty`, `sample_with_penalties`, `sample` | private (`sample_with_penalties` has no test caller of its own; it is reached only through `sample`, so it moved with it) |
+| `server/batch` | `idle_slots`, `submit`, `prefill_stats`, `prefill_fed`, `interleaved_ticks` | private |
+| `server/metrics` | `completion_tokens_per_second` | private |
+| `template` | `PyValue::to_json` | private |
+| `tokenizer` | `PreTokenizer::gguf_name`, `Tokenizer::decode` | private |
+
+The visibility rule: private when the only caller is that one `tests.rs`; `pub(super)` when the
+callers are several test files under the same module (`cuda`); `pub(crate)` when a `#[cfg(test)]`
+module elsewhere in the crate calls it (`CudaBackend::new` from `graph::op_matrix`). Each moved item
+carries a doc note naming the test that drives it (machine-checked against the named test's module
+and file) and the sentence "Test-only (#239)".
+
+**T1's `pool_len` deferral is closed.** With `GraphAllocator::n_cpu_buffers` now in
+`graph/alloc/tests.rs`, `CpuBackend::pool_len` has no production caller left, so it became
+`#[cfg(test)] pub(in crate::graph)` — the narrowest spelling that reaches `graph::alloc::tests`
+(`pub(crate)` would also work; the narrower one is preferred). [#238](https://github.com/yusiwen/minfer/issues/238) gets a comment saying so.
+T1's other deferral, `CudaState::matmul_f32_ptr`, stays with [#240](https://github.com/yusiwen/minfer/issues/240)/[#242](https://github.com/yusiwen/minfer/issues/242): its caller
+`quant_matmul_f32_on_gpu` is still compiled.
+
+**Bar named before measuring.** No `#[test]` is added or removed and no assertion changes — the moved
+items are byte-identical bodies, so the claim each test makes is unchanged by construction. The bar:
+the non-test build stays warning-free with and without `--features cuda` (the crate carries
+`#![cfg_attr(not(test), deny(warnings))]`), the recorded suite counts do not move, and one mutation
+per module group must be visible to the test that drives the moved item.
+
+**Mutation evidence (rule 3), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-01.** One representative
+item per module group that actually moved; each mutation applied, the named test run, then reverted
+and the file verified byte-identical. **All 18 went red**:
+
+| group (item) | mutation | test (all FAILED) | first failing line |
+|---|---|---|---|
+| conversation (`Conversation::snapshot`) | `messages: Vec::new()` | `conversation::tests::a_resumed_snapshot_prefills_nothing_and_continues_alike` | `tests.rs:301` |
+| cuda (`latched_api_error_count`) | return `0` (`MINFER_TEST_LATCH_ERROR=1`) | `cuda::issue145_tests::cuda_sync_surfaces_a_latched_error_as_latched` (**CUDA**) | `issue145_tests.rs:230` |
+| device_tier (`mmvq_cap`) | drop the `.min(IDENTITY_BATCH_BOUND)` | `device_tier::tests::caps_clamp_to_the_identity_bound` | `tests.rs:85` |
+| grammar (`pending_bytes`) | return `0` | `grammar::tests::token_advancement_handles_partial_utf8` | `tests.rs:514` |
+| graph/alloc (`pool_len`, through the moved `n_cpu_buffers`) | return `0` | `graph::alloc::tests::a_rebuild_remaps_instead_of_reallocating` | `tests.rs:1607` |
+| graph/allocplan (`free_bytes`) | `Some(*free + 1)` | `graph::allocplan::tests::a_reported_free_read_keeps_the_three_quarters_default` | `tests.rs:51` |
+| graph/cache (`cached_graphs`) | return `0` | `graph::cache::tests::switching_between_cached_graphs_re_maps_instead_of_rebuilding` | `tests.rs:97` |
+| graph/cpu_backend (`weight`) | return `None` | `graph::cpu_backend::tests::f32_matmul_nt2_token_major` | `tests.rs:249` |
+| graph/cuda_backend (`new`) | return `None` | `graph::cuda_backend::tests::cuda_pool_roundtrip` (**CUDA**) | `tests.rs:108` |
+| graph/kvcache (`seq_range`) | `Ok(None)` | `graph::kvcache::tests::two_sequences_resolve_to_disjoint_windows` | `tests.rs:151` |
+| graph/mod (`DType::size`) | `F32 => 8` | `graph::tests::dtype_size` | `tests.rs:101` |
+| graph/registry (`names`) | return `["metal", "cpu", "cuda"]` | `graph::registry::tests::names_resolve_and_unknown_names_are_refused` | `tests.rs:111` |
+| graph/scheduler (`with_timing`) | force `TimingMode::Global` | `graph::scheduler::tests::a_concurrent_graph_load_cannot_move_a_private_sink` | `tests.rs:230` |
+| sampler (`apply_repetition_penalty`) | no-op | `sampler::tests::test_repeat_penalty_reduces_repeated` | `tests.rs:18` |
+| server/batch (`idle_slots`) | return `0` | `server::batch::tests::a_failed_decode_forward_answers_a_single_run_and_releases_its_slot` | `tests.rs:1955` |
+| server/metrics (`completion_tokens_per_second`) | return `0.0` | `server::metrics::tests::token_counters_and_the_trailing_rate` | `tests.rs:277` |
+| template (`PyValue::to_json`) | encode an int as a string | `template::tests::python_str_methods_match_cpython` | `tests.rs:263` |
+| tokenizer (`Tokenizer::decode`) | return `String::new()` | `tokenizer::tests::decode_bytes_reverses_byte_encoding` | `tests.rs:65` |
+
+The `offload` group has no row: its only bucket-B item, `all_on_device`, is an (a) finding and was
+not moved.
+
+**Two coverage gaps, recorded rather than papered over.** (1) `allocplan::live_peak`'s result is not
+observable at all: `AllocPlan::plan` computes `peak` in its main loop (that loop never subtracts, so
+`peak == reserved_bytes` on exit) and then `peak.max(live_peak(…))` cannot exceed it — mutating
+`live += class_bytes(classes[i])` to `live += 0` left `the_live_peak_is_not_the_reserved_total`
+**green**. The group's mutation is therefore on a sibling in the same move, `DeviceMemory::free_bytes`.
+This is a real gap in `live_peak`'s coverage and also a hint that the function is dead arithmetic —
+for [#244](https://github.com/yusiwen/minfer/issues/244) to decide. (2) `pool_len`'s *value* is only ever compared with itself in
+`a_rebuild_remaps_instead_of_reallocating`, so a constant offset (`+1`) is invisible; the observable
+mutation is `0`, which fails that test's `buffers > 0` start assertion.
+
+**Counts (rule 5).** No `#[test]` was added or removed, so no row moves: `cargo test --release`, box
+`dgxspark (aarch64, GB10 sm_121)`, 2026-10-01 → **481 / 0 / 36** unit + **10 / 0 / 6** integration (the
+recorded CPU row); `bash scripts/cuda_test.sh`, same box, 2026-10-01 → **566 / 0 / 42** (the recorded
+CUDA row — run to confirm the device build still resolves the moved FFI declarations, the moved
+`CudaBackend::new` and the `#[cfg(test)] extern "C"` block the new `cuda/tests.rs` introduces).
+`cargo check --release` and `cargo check --release --features cuda` both exit 0 with no rustc
+diagnostic (the one CUDA `warning:` line is `build.rs`'s pre-existing `cargo:warning=` target list);
+`cargo fmt --all --check` clean; `check_status.py --check`, `check_docs_links.py` and
+`check_source_layout.py` all clean (the new `src/cuda/tests.rs` is named by its `#[cfg(test)] mod
+tests;`).
+
+**Docs.** [#239](https://github.com/yusiwen/minfer/issues/239) gets the reconciliation, the five non-moves and the mutation table as a comment and
+its body is patched (the 26 → 45/68/58 reconciliation); [#238](https://github.com/yusiwen/minfer/issues/238) gets the `pool_len` closure;
+[#240](https://github.com/yusiwen/minfer/issues/240)/[#241](https://github.com/yusiwen/minfer/issues/241)/[#242](https://github.com/yusiwen/minfer/issues/242) keep the two blocked groups; [#244](https://github.com/yusiwen/minfer/issues/244) gets the two (a)
+items and the three stale doc claims.
+
+**Limits.** (1) The macOS-only modules (`metal.rs`, the Metal half of `graph/metal_backend.rs`) are
+not compiled on Linux and were not touched — the macOS CI job is their only gate. (2) The item-level
+B/C classification rests on textual resolution of a caller's *module* (liveness is rustc's); the one
+residue found here (`CudaBackend::new`, called from the `#[cfg(test)] mod op_matrix`) is exactly the
+limit, and it was handled by moving with `pub(crate)`. (3) `--features debug_dump` was not built.
+(4) The two (a) verdicts are *questions*, not findings of fact about intent: in both cases the doc may
+simply be stale rather than a caller having been deleted, and either resolution (call it, or delete
+it, or say test-only) belongs to [#244](https://github.com/yusiwen/minfer/issues/244), not here.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
