@@ -137,6 +137,21 @@ and the `impl Backend for X` methods become one-line forwards to them, so the
 registry's answer and the trait's answer are **the same code** and cannot
 diverge.
 
+**Correction ([#244], 2026-10-01): "the same code" is true of the module-level
+functions, not of the fields.** The three capability *fields*
+(`BackendCaps::{supports_op, supports_fused, supports_attn_span}`) are written
+by every `entry()` and read only by `registry::tests` — assignment reads the
+trait method (`graph::backend_takes` → `dyn Backend::supports_op`), and
+`reads_packed_kv` is the one `BackendCaps` field production reads
+(`registry::reads_packed_kv`, §8). The earlier claim that "the trait forwards to
+the caps" is not what the code does: both the trait method and the caps field
+point at the same free function, but the registry field is not the read path.
+Whether to make the trait read the caps (one authority, one read) or to drop the
+three fields is [#244]'s reported decision, not a cleanup; the fields keep their
+`not(test)` allowances until then.
+
+[#244]: https://github.com/yusiwen/minfer/issues/244
+
 `pool` / `pool_mut` are why "sync" and "copy" are not a match any more: the
 allocator's dispatch helpers ask the entry for the pool and then call the
 `Backend` trait method (`synchronize`, `copy_cells`, `write_host`, …) on it.
@@ -335,8 +350,10 @@ adds their kernels). No other per-format query is added here.
      winning over the environment, both refusals).
   4. `registry::tests::the_packed_kv_capability_is_the_registrys_answer` and
      `registry::tests::registry_caps_match_the_backend_trait` — the #87 seam is
-     the field both C4 gates read, and the registry's capability matrix is the
-     trait's (they are one authority).
+     the field both C4 gates read, and the registry's capability matrix answers
+     exactly what the trait answers because both name the same module-level free
+     function (**the same code**, not the same read path — see the correction in
+     §3).
   5. `alloc::tests::a_fresh_allocator_inherits_the_runs_backend_filter` — the
      fence reaches the assignment pass through the same active filter.
   6. `tests/backend_registry_cli.rs` — the process level: an unknown name exits
