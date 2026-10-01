@@ -259,8 +259,9 @@ impl Drop for MetalBackend {
 
 /// F4: the Metal capability matrix, as a free function.
 ///
-/// The registry carries this as [`super::registry::BackendCaps::supports_op`],
-/// which cannot take a `&self`; the trait method below forwards to it.
+/// This is the **authority** for the answer: the `Backend` trait method below
+/// forwards to it (the function cannot take a `&self`), and assignment reads the
+/// trait method. The registry does not carry a copy.
 pub fn supports_op(op: &Op, dtype: DType) -> bool {
     match op {
         Op::Input => true,
@@ -361,9 +362,6 @@ pub fn entry() -> super::registry::BackendEntry {
         name: "metal",
         priority: PRIORITY_METAL,
         caps: BackendCaps {
-            supports_op,
-            supports_fused,
-            supports_attn_span: SUPPORTS_ATTN_SPAN,
             reads_packed_kv: READS_PACKED_KV,
         },
         pool: |a| a.metal().map(|m| m as &dyn Backend),

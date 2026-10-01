@@ -105,10 +105,7 @@ One `BackendEntry` per backend, built once at startup (`registry()`, a
 
 ```rust
 pub struct BackendCaps {
-    pub supports_op: fn(&Op, DType) -> bool,
-    pub supports_fused: fn(&FusedOp) -> bool,
-    pub supports_attn_span: bool,
-    pub reads_packed_kv: bool,          // the #87 seam, §8
+    pub reads_packed_kv: bool,          // the #87 seam, §8 — the only field
 }
 
 pub struct BackendEntry {
@@ -131,24 +128,30 @@ pub struct BackendEntry {
 Each backend module owns its entry and its hooks (`cpu_backend::entry()`,
 `metal_backend::entry()`, `cuda_backend::entry()`), and `Registry::build()`
 calls their `register()` — that call site is the *only* place a backend is
-introduced. The capability matrices (`supports_op`, `supports_fused`) and the
-`supports_attn_span` / `reads_packed_kv` constants move to module-level items,
-and the `impl Backend for X` methods become one-line forwards to them, so the
-registry's answer and the trait's answer are **the same code** and cannot
-diverge.
+introduced.
 
-**Correction ([#244], 2026-10-01): "the same code" is true of the module-level
-functions, not of the fields.** The three capability *fields*
-(`BackendCaps::{supports_op, supports_fused, supports_attn_span}`) are written
-by every `entry()` and read only by `registry::tests` — assignment reads the
-trait method (`graph::backend_takes` → `dyn Backend::supports_op`), and
-`reads_packed_kv` is the one `BackendCaps` field production reads
-(`registry::reads_packed_kv`, §8). The earlier claim that "the trait forwards to
-the caps" is not what the code does: both the trait method and the caps field
-point at the same free function, but the registry field is not the read path.
-Whether to make the trait read the caps (one authority, one read) or to drop the
-three fields is [#244]'s reported decision, not a cleanup; the fields keep their
-`not(test)` allowances until then.
+**The capability authority is the module-level item, stated once ([#244],
+2026-10-01).** Each backend defines its op×dtype matrix and its fusion matrix as
+module-level free functions (`cpu_backend::supports_op`, `cuda_backend::supports_fused`,
+…) and its `attn_span` answer as a module-level constant
+(`cpu_backend::SUPPORTS_ATTN_SPAN`, …). The `impl Backend for X` methods are
+one-line forwards to them, and the assignment pass reads the trait method
+(`graph::backend_takes` → `dyn Backend::supports_op`). **The registry carries no
+copy of those three answers.** The `supports_op` / `supports_fused` /
+`supports_attn_span` *fields* that used to sit here were written by every
+`entry()` and read only by `registry::tests` — a mirror with no production
+reader, which is why [#244] deleted them (option (b) of that ticket's
+escalation). The gate that used to compare the field against the trait now
+compares the module-level function against the trait
+(`registry::tests::registry_caps_match_the_backend_trait`), i.e. the authority
+the field merely mirrored; putting the two on one line is no longer possible
+even in principle.
+
+`BackendCaps` therefore carries exactly one field, `reads_packed_kv`, and that
+one **is** read in production because the question is asked about a *format*,
+not an engine: `GraphAllocator::ensure_kv`'s packed-region refusal and
+`KvFormat::supports` call `registry::reads_packed_kv(backend)`, where no `&self`
+is available (§8). It is the one capability the registry itself carries.
 
 [#244]: https://github.com/yusiwen/minfer/issues/244
 
@@ -350,10 +353,11 @@ adds their kernels). No other per-format query is added here.
      winning over the environment, both refusals).
   4. `registry::tests::the_packed_kv_capability_is_the_registrys_answer` and
      `registry::tests::registry_caps_match_the_backend_trait` — the #87 seam is
-     the field both C4 gates read, and the registry's capability matrix answers
-     exactly what the trait answers because both name the same module-level free
-     function (**the same code**, not the same read path — see the correction in
-     §3).
+     the field both C4 gates read; and the capability answer is **one authority**:
+     each `Backend` trait method forwards to its backend module's own free
+     function / constant, and the assignment pass reads the trait. [#244] deleted
+     the three mirrored `BackendCaps` fields, so the registry holds no second
+     copy to disagree with (§3).
   5. `alloc::tests::a_fresh_allocator_inherits_the_runs_backend_filter` — the
      fence reaches the assignment pass through the same active filter.
   6. `tests/backend_registry_cli.rs` — the process level: an unknown name exits

@@ -190,15 +190,13 @@ pub fn ffn_composition(requested: Option<&str>, device: Device) -> bool {
 /// worker thread owns the only inference path; `Arc<dyn ModelDef>` is used by
 /// the OpenAI-compatible server, OPENAI-CHAT-API-PLAN.md).
 ///
-/// Three members are dead in a non-test Linux build, and each names its own
+/// Two members are dead in a non-test Linux build, and each names its own
 /// configuration ([#244], replacing the trait-level blanket #243 left):
-/// `as_any`/`offload` are test-reached, `forward_graph`'s one caller sits in a
-/// `#[cfg(target_os = "macos")]` test block. Whether `as_any` (no `src/`
-/// downcast outside `#[cfg(test)]`) and `offload` (the builder reads the
-/// concrete `model.offload` field) should exist at all is [#244]'s reported
-/// decision, not a dead-code cleanup — so the annotations are precise but the
-/// members stay. `format_chat` had no caller in any build and was deleted in
-/// [#242]; template.rs is the chat-rendering path.
+/// `as_any` is test-reached, `forward_graph`'s one caller sits in a
+/// `#[cfg(target_os = "macos")]` test block. A third, `offload`, was deleted in
+/// [#244] — the graph builders read the concrete `model.offload.plan` field, so
+/// the method had no production reader. `format_chat` had no caller in any build
+/// and was deleted in [#242]; template.rs is the chat-rendering path.
 ///
 /// [#242]: https://github.com/yusiwen/minfer/issues/242
 /// [#244]: https://github.com/yusiwen/minfer/issues/244
@@ -215,13 +213,19 @@ pub trait ModelDef: Send + Sync {
         n_ctx: usize,
     ) -> Vec<f32>;
 
-    /// Downcast helper for the graph path's weight registration.
+    /// Downcast helper for **test** code, and nothing else.
     ///
-    /// Read only by tests (`models::qwen2::graph::tests`,
-    /// `graph::cuda_backend::tests`, `tooling::tests`, `metal::mmap_align_test`,
-    /// `cuda::issue218_tests`); no `src/` production path downcasts. The
-    /// `not(test)` allowance is [`#244`](https://github.com/yusiwen/minfer/issues/244)'s
-    /// explicit keep's; the membership question is reported there.
+    /// Its callers are `#[cfg(test)]` only (`tooling::tests`,
+    /// `graph::cuda_backend::tests`, `models::qwen2::graph::{tests,tail_tests}`,
+    /// `models::qwen3::graph::tests`, `metal::mmap_align_test`,
+    /// `cuda::issue218_tests`); **no `src/` production path downcasts**, and in
+    /// particular there is no weight-registration consumer — registration goes
+    /// through the name-keyed registry, not a concrete type. It is kept because
+    /// the test scaffolding deliberately holds `Arc<dyn ModelDef>` (the shape
+    /// production serves through), so a test that needs an architecture's
+    /// internals would otherwise have to abandon that shape ([#244]'s decision).
+    ///
+    /// [#244]: https://github.com/yusiwen/minfer/issues/244
     #[cfg_attr(not(test), allow(dead_code))]
     fn as_any(&self) -> &dyn std::any::Any;
 
@@ -306,24 +310,10 @@ pub trait ModelDef: Send + Sync {
     /// truth for any implementation that does not override it.
     ///
     /// E5: with a partial offload plan this is "the device participates" — the *per-block*
-    /// answer is `offload().on_device(block)`, and the graph's assignment pass reads that.
+    /// answer is the concrete `model.offload.plan` field's `on_device(block)`, and the graph's
+    /// assignment pass reads that.
     fn device(&self) -> Device {
         Device::Cpu
-    }
-
-    /// E5: the layer offload plan in force (the **effective** one: a request the device
-    /// could not honour has already been reduced to what it can). The default is "no block
-    /// on the device", which is the pre-E5 behaviour for an implementation that does not
-    /// override it.
-    ///
-    /// Read only by tests (`models::qwen2::graph::tests`); the graph builders read the
-    /// concrete `model.offload.plan` field directly, which is why the trait method carries
-    /// the `not(test)` allowance. Whether the builders should call *this* method, or the
-    /// trait method should be deleted and the field kept, is
-    /// [`#244`](https://github.com/yusiwen/minfer/issues/244)'s reported decision.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn offload(&self) -> crate::graph::offload::OffloadPlan {
-        crate::graph::offload::OffloadPlan::all_on_cpu(self.n_layer())
     }
 
     /// E5's startup report line ("which blocks landed where"), or `None` when there is

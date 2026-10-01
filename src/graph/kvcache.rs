@@ -315,34 +315,6 @@ impl KvCache {
         Ok(cells)
     }
 
-    /// Mark `cell` owned by `seq` in every layer (or release it with `FREE`).
-    ///
-    /// **(a) verdict, [#244](https://github.com/yusiwen/minfer/issues/244): kept, escalated — not wired.**
-    /// [#239](https://github.com/yusiwen/minfer/issues/239) reported that the doc named a production
-    /// caller that does not exist: `own_range` writes `l.owner[cell] = seq` inline, and the only
-    /// callers are `graph::kvcache::tests`. `[#244]` did **not** express `own_range` through this
-    /// method, because the wiring is not behaviour-preserving: `own_range` **clamps** `to` to the
-    /// arena (`to.min(l.owner.len())`) and is infallible, while `set_owner` **errors** on a cell at
-    /// or past the arena — so routing the production write through it would turn a silent clamp
-    /// into a load-time failure. The three options (wire it behind the clamp / delete it with its
-    /// test, losing the loud out-of-range check / keep it as the test-only C2 surface) are reported
-    /// on the ticket. The `not(test)` allowance names the one build where it is unused.
-    #[cfg_attr(not(test), allow(dead_code))] // C2 surface, test-reached
-    pub fn set_owner(&mut self, layer: usize, cell: usize, seq: SeqId) -> Result<(), String> {
-        let l = self
-            .layers
-            .get_mut(&layer)
-            .ok_or_else(|| format!("no KV arena for layer {layer}"))?;
-        if cell >= l.owner.len() {
-            return Err(format!(
-                "KV layer {layer}: cell {cell} out of range ({} cells)",
-                l.owner.len()
-            ));
-        }
-        l.owner[cell] = seq;
-        Ok(())
-    }
-
     /// Reserve a contiguous run of `cap` cells for `seq` (E2).
     ///
     /// First-fit over cells no live sequence covers, so several sequences share

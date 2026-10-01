@@ -1842,8 +1842,9 @@ impl CudaBackend {
 
 /// F4: the CUDA capability matrix, as a free function.
 ///
-/// The registry carries this as [`super::registry::BackendCaps::supports_op`],
-/// which cannot take a `&self`; the trait method below forwards to it.
+/// This is the **authority** for the answer: the `Backend` trait method below
+/// forwards to it (the function cannot take a `&self`), and assignment reads the
+/// trait method. The registry does not carry a copy.
 ///
 /// Capability matrix (docs/CUDA-BACKEND-DESIGN.md §4.3): the full per-layer
 /// chain runs on CUDA, including the embedding/tail gather (7e③) and the
@@ -2005,9 +2006,6 @@ pub fn entry() -> super::registry::BackendEntry {
         name: "cuda",
         priority: PRIORITY_CUDA,
         caps: BackendCaps {
-            supports_op,
-            supports_fused,
-            supports_attn_span: SUPPORTS_ATTN_SPAN,
             reads_packed_kv: READS_PACKED_KV,
         },
         pool: |a| a.cuda().map(|c| c as &dyn Backend),

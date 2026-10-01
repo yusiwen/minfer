@@ -30,8 +30,8 @@ pub struct Qwen2Model {
     pub ns: String,
     /// E5: the layer offload plan in force (the effective one) plus what the device
     /// registration measured. The graph builders and the assignment pass read this
-    /// **field** (`model.offload.plan`) directly; `ModelDef::offload()` is the trait
-    /// surface and is read only by tests ([#244]); `offload_report()` is the startup line.
+    /// **field** (`model.offload.plan`) directly — it is the one plan surface since
+    /// [#244] deleted the `ModelDef::offload()` method. `offload_report()` prints the line.
     ///
     /// [#244]: https://github.com/yusiwen/minfer/issues/244
     pub offload: crate::models::OffloadState,
@@ -79,11 +79,6 @@ impl ModelDef for Qwen2Model {
     /// authority, so the server's batching default and `CParams.gpu` agree.
     fn device(&self) -> crate::models::Device {
         graph::Qwen2Graph::device(self)
-    }
-
-    /// E5: the offload plan in force (which blocks run on the device).
-    fn offload(&self) -> crate::graph::offload::OffloadPlan {
-        self.offload.plan
     }
 
     /// E5: the startup line naming where each block landed, or `None` on the CPU-only path.

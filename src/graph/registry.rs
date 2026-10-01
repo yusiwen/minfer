@@ -48,8 +48,7 @@ use std::sync::OnceLock;
 use super::alloc::GraphAllocator;
 use super::backend::Backend as BackendTrait;
 use super::kvformat::KvFormat;
-use super::ops::{FusedOp, Op};
-use super::{DType, NodeId};
+use super::NodeId;
 
 /// How many backend ids exist. Fixed: the id is a file-format contract.
 pub const N_BACKENDS: usize = 3;
@@ -113,9 +112,9 @@ impl Backend {
         registry().get(self)
     }
 
-    /// This handle's capabilities. An unregistered backend supports nothing —
-    /// the safe answer, and the pre-F4 answer for the configurations where the
-    /// backend did not exist.
+    /// This handle's capability record. The one field is `reads_packed_kv`; an
+    /// unregistered backend reads nothing — the safe answer, and the pre-F4
+    /// answer for the configurations where the backend did not exist.
     pub fn caps(self) -> BackendCaps {
         self.entry().map_or(BackendCaps::NOTHING, |e| e.caps)
     }
@@ -135,48 +134,29 @@ impl fmt::Debug for Backend {
     }
 }
 
-fn no_op_support(_op: &Op, _dtype: DType) -> bool {
-    false
-}
-
-fn no_fused_support(_fused: &FusedOp) -> bool {
-    false
-}
-
-/// A backend's capability matrix — the registry's copy of what the `Backend`
-/// trait answers. Each backend module defines the matrix once and its trait impl
-/// forwards to it, so the registry's answer and the trait's answer are the same
-/// code and cannot diverge.
+/// The one capability the **registry itself** carries: whether this backend's
+/// attention kernel reads a packed `q8_0` KV region (C4).
 ///
-/// **Honest scope ([#244]).** "The same code" is true of the module-level free
-/// functions these fields point at; it is not true that the *registry field* is
-/// the authority production reads. `supports_op` / `supports_fused` /
-/// `supports_attn_span` are written by every `entry()` and read only by
-/// `registry::tests` (which is why each carries a `not(test)` allowance);
-/// assignment reads the trait method (`graph::backend_takes` →
-/// `dyn Backend::supports_op`), and `reads_packed_kv` is the one field
-/// production reads (`registry::reads_packed_kv`). Whether to make the trait
-/// forward through the caps (one read) or drop the three fields is [#244]'s
-/// reported decision, not a dead-code cleanup.
+/// Every other capability answer lives in the backend module's own free
+/// function or constant, which is the authority: the `Backend` trait method
+/// forwards to it (`cpu_backend::supports_op`, `cuda_backend::supports_op`,
+/// …), and the assignment pass reads the trait method
+/// (`graph::backend_takes` → `dyn Backend::supports_op`). There is no second
+/// copy here, so the registry's answer and the trait's answer cannot diverge.
 ///
+/// `reads_packed_kv` is the exception **because per-format consumers read the
+/// registry, not an engine**: `GraphAllocator::ensure_kv`'s packed-region
+/// refusal and `KvFormat::supports` ask `registry::reads_packed_kv(backend)`,
+/// a question about a *format* that must be answerable without a `&self`. It is
+/// the `#87` seam (see `docs/BACKEND-REGISTRY-DESIGN.md` §8); the three
+/// capability *fields* that used to sit beside it were write-only (`entry()`
+/// set them, only tests read them) and were deleted in [#244] — option (b) of
+/// that ticket's escalation.
+///
+/// [#87]: https://github.com/yusiwen/minfer/issues/87
 /// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Clone, Copy)]
 pub struct BackendCaps {
-    /// The op×dtype matrix, as the module-level free function. Read by
-    /// `registry::tests::{registry_caps_match_the_backend_trait,
-    /// names_resolve_and_unknown_names_are_refused}`; the trait method calls the
-    /// same function.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub supports_op: fn(&Op, DType) -> bool,
-    /// The fusion matrix; read by the same two tests, answered by the same
-    /// function the trait method calls.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub supports_fused: fn(&FusedOp) -> bool,
-    /// Whether attention can be bounded from the explicit `attn_span` (E1).
-    /// Read by `registry_caps_match_the_backend_trait`; the trait method returns
-    /// the same module-level constant.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub supports_attn_span: bool,
     /// Whether the attention kernel reads a packed `q8_0` KV region (C4).
     ///
     /// The single authority for that answer, read by
@@ -190,11 +170,9 @@ pub struct BackendCaps {
 }
 
 impl BackendCaps {
-    /// The capabilities of a backend that is not compiled in: it claims nothing.
+    /// The capability of a backend that is not compiled in: it reads no packed
+    /// KV region.
     pub const NOTHING: BackendCaps = BackendCaps {
-        supports_op: no_op_support,
-        supports_fused: no_fused_support,
-        supports_attn_span: false,
         reads_packed_kv: false,
     };
 }

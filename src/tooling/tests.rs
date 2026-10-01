@@ -557,8 +557,7 @@ fn f141_f16_weights_run_on_the_cuda_device() {
             "offload report does not put the blocks on the device: {report}"
         );
         assert_eq!(
-            crate::models::ModelDef::offload(q).gpu_layers,
-            crate::models::ModelDef::offload(q).n_layers,
+            q.offload.plan.gpu_layers, q.offload.plan.n_layers,
             "not every block is on the device: {report}"
         );
 
@@ -777,10 +776,9 @@ fn f167_f16_qwen3_weights_run_on_the_cuda_device() {
             report.contains("on cuda") && !report.contains("cpu only"),
             "offload report does not put the blocks on the device: {report}"
         );
-        let n_layers = crate::models::ModelDef::offload(q).n_layers;
+        let n_layers = q.offload.plan.n_layers;
         assert_eq!(
-            crate::models::ModelDef::offload(q).gpu_layers,
-            n_layers,
+            q.offload.plan.gpu_layers, n_layers,
             "not every block is on the device: {report}"
         );
 
