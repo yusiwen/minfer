@@ -63,14 +63,6 @@ impl BackendScheduler {
         }
     }
 
-    /// A scheduler that times wherever `mode` says. The #173 isolation seam: a
-    /// test hands in its own sink so its verdict reads only the rows its own
-    /// scheduler wrote, and a concurrent graph execution cannot move them.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn with_timing(mode: crate::optiming::TimingMode) -> Self {
-        Self { timing: mode }
-    }
-
     /// Assign every node to the best backend that supports it (capability
     /// driven via the allocator's backend registry).
     ///

@@ -103,3 +103,23 @@ fn dtype_size() {
     assert_eq!(DType::I32.size(), 4);
     assert_eq!(DType::Q8_0.size(), 1);
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `mod.rs` (bucket B of the dead-code census — the only
+// test caller, `graph::tests::dtype_size`, already lives in this subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl DType {
+    /// Bytes per element (Q8_0 = 1 byte per quantized element block member;
+    /// actual block layout is a backend concern).
+    ///
+    /// Test-only (#239): driven by `graph::tests::dtype_size`.
+    pub fn size(&self) -> usize {
+        match self {
+            DType::F32 => 4,
+            DType::F16 => 2,
+            DType::I32 => 4,
+            DType::Q8_0 => 1,
+        }
+    }
+}

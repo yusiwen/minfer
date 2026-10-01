@@ -327,3 +327,16 @@ fn registry_caps_match_the_backend_trait() {
         backend_takes(&cpu, &Op::Silu, DType::F32)
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `registry.rs` (bucket B of the dead-code census — the
+// only test caller lives in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Every accepted name, in id order.
+///
+/// Test-only (#239): driven by
+/// `graph::registry::tests::names_resolve_and_unknown_names_are_refused`.
+pub fn names() -> &'static [&'static str; N_BACKENDS] {
+    &NAMES
+}

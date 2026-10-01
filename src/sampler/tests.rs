@@ -1152,3 +1152,81 @@ fn sampled_tokens_are_always_allowed_by_the_json_grammar() {
         "the driven text is a complete instance"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `sampler.rs` (bucket B of the dead-code census —
+// every test caller already lives in this module's subtree). `sample_with_penalties`
+// has no test caller of its own; it is reached only through `sample`, so it moved
+// with it.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Repetition penalty: penalize tokens that already appeared in `prev_tokens`.
+/// `penalty == 1.0` disables. Positive logits are divided by the penalty
+/// (reduced), negative logits are multiplied (pushed further down). This is
+/// llama.cpp's `repeat_penalty` applied to the last `repeat_last_n` tokens.
+///
+/// Test-only (#239): driven by `sampler::tests::{test_repeat_penalty_reduces_repeated,
+/// test_repeat_penalty_disabled_at_1, test_penalties_identity_with_old_repeat_only}`.
+pub fn apply_repetition_penalty(logits: &mut [f32], prev_tokens: &[u32], penalty: f32) {
+    apply_penalties(logits, prev_tokens, penalty, 0.0, 0.0);
+}
+
+/// `temp < 1e-6` (greedy) skips the stochastic steps but still applies the
+/// penalties.
+///
+/// Pre-F3 signature, kept for the pre-[`SamplerConfig`] tests. It builds a config
+/// whose new knobs are all at their no-op defaults, so its output is bit-identical
+/// to the pre-F3 chain (the `default_config_is_bit_identical_to_the_old_path` gate
+/// pins this).
+///
+/// Test-only (#239): reached only through `sample` below.
+pub fn sample_with_penalties<R: Rng>(
+    logits: &mut [f32],
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+    repeat_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    prev_tokens: &[u32],
+    rng: &mut R,
+) -> SampledToken {
+    let cfg = SamplerConfig {
+        temp,
+        top_k,
+        top_p,
+        repeat_penalty,
+        frequency_penalty,
+        presence_penalty,
+        ..SamplerConfig::default()
+    };
+    let mut mirostat = MirostatState::new(cfg.mirostat_tau);
+    sample_with_config(logits, &cfg, prev_tokens, &mut mirostat, rng)
+}
+
+/// Complete sampling pipeline with only the repeat penalty (frequency and
+/// presence disabled) — the pre-F3 entry point.
+///
+/// Test-only (#239): driven by `sampler::tests::test_sample_pipeline_greedy_applies_penalty`
+/// and the `f3_sequence` helper of the pinned-pipeline gates.
+pub fn sample<R: Rng>(
+    logits: &mut [f32],
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+    repeat_penalty: f32,
+    prev_tokens: &[u32],
+    rng: &mut R,
+) -> SampledToken {
+    sample_with_penalties(
+        logits,
+        temp,
+        top_k,
+        top_p,
+        repeat_penalty,
+        0.0,
+        0.0,
+        prev_tokens,
+        rng,
+    )
+}

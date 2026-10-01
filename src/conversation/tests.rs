@@ -1125,3 +1125,32 @@ fn context_shift_real_model_measurement() {
     assert!(shifted > 0, "no turn overflowed n_ctx = {n_ctx}");
     eprintln!("[c2] context shift fired on {shifted} overflow(s); no full re-render was needed");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `conversation.rs` (bucket B of the dead-code census —
+// the only test caller lives in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl Conversation {
+    /// The host state a KV session belongs to (C5 S2).
+    ///
+    /// The container carries the KV *rows*; this is everything the host needs to continue
+    /// the conversation those rows were written for — which is what lets a resume prefill
+    /// **nothing**. The message list is part of it (not just the token bookkeeping), so a
+    /// resumed session can render its next turn's delta from the same history the KV was
+    /// built from.
+    ///
+    /// Test-only (#239): driven by
+    /// `conversation::tests::a_resumed_snapshot_prefills_nothing_and_continues_alike`
+    /// (the `snap` the JSON round-trip and `restore_snapshot` compare against).
+    pub fn snapshot(&self) -> ConversationSnapshot {
+        ConversationSnapshot {
+            messages: self.messages.clone(),
+            stream_tokens: self.stream_tokens.clone(),
+            current_pos: self.current_pos,
+            turn_pos: self.turn_pos,
+            prev_tokens: self.prev_tokens.clone(),
+            need_insert_eot: self.need_insert_eot,
+        }
+    }
+}

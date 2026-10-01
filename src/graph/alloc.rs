@@ -904,20 +904,6 @@ impl GraphAllocator {
         decision.budget
     }
 
-    /// Set (or clear, with `None`) a backend's memory budget. Tests and a future
-    /// offload policy use it; `None` restores the default.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn set_memory_budget(&mut self, backend: Backend, budget: Option<usize>) {
-        match budget {
-            Some(b) => {
-                self.budget.insert(backend, b);
-            }
-            None => {
-                self.budget.remove(&backend);
-            }
-        }
-    }
-
     /// E4's accounting for one backend: what is resident, what is live, the peak, and the
     /// budget the allocator checks against.
     pub fn memory_report(&self, backend: Backend) -> MemoryReport {
@@ -2363,28 +2349,12 @@ impl GraphAllocator {
             .and_then(|p| self.cpu.read_host(p.id))
     }
 
-    /// Number of distinct buffers currently allocated (for tests).
-    #[allow(dead_code)]
-    pub fn n_cpu_buffers(&self) -> usize {
-        self.cpu.pool_len()
-    }
-
     /// E4 S3: how many pool buffers the CPU backend has created (a re-map creates none).
     /// (Test helper.)
     /// Test-only (#238): driven by `graph::alloc::tests::slots`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
     pub(crate) fn n_cpu_allocs(&self) -> usize {
         self.cpu.alloc_count()
-    }
-
-    /// Number of distinct buffers actually mapped to nodes (for tests).
-    #[allow(dead_code)]
-    pub fn n_mapped_buffers(&self) -> usize {
-        let mut s: std::collections::BTreeSet<(Backend, usize)> = std::collections::BTreeSet::new();
-        for br in self.node_to_buf.values() {
-            s.insert((br.backend, br.id));
-        }
-        s.len()
     }
 
     /// Flush a backend's pending async work (split boundary / end).

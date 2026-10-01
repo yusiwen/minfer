@@ -1139,25 +1139,6 @@ impl Conversation {
             .collect()
     }
 
-    /// The host state a KV session belongs to (C5 S2).
-    ///
-    /// The container carries the KV *rows*; this is everything the host needs to continue
-    /// the conversation those rows were written for — which is what lets a resume prefill
-    /// **nothing**. The message list is part of it (not just the token bookkeeping), so a
-    /// resumed session can render its next turn's delta from the same history the KV was
-    /// built from.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn snapshot(&self) -> ConversationSnapshot {
-        ConversationSnapshot {
-            messages: self.messages.clone(),
-            stream_tokens: self.stream_tokens.clone(),
-            current_pos: self.current_pos,
-            turn_pos: self.turn_pos,
-            prev_tokens: self.prev_tokens.clone(),
-            need_insert_eot: self.need_insert_eot,
-        }
-    }
-
     /// Serialize [`Self::snapshot`] for the container's opaque host section. JSON for
     /// the same reason the history is: it is the host's own bookkeeping, it is small, and
     /// a human inspecting a session file can read it. The `version` field is the

@@ -1,6 +1,11 @@
 //! `#[cfg(test)] mod issue162_tests` for `src/cuda.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
+// #239: declared in `cuda::tests` now (test-only FFI / accessors).
+use super::tests::{
+    minfer_site_fail_code, minfer_site_fail_count, minfer_site_fail_kind, minfer_site_fail_reset,
+    minfer_site_hist_len, minfer_site_hist_msg, minfer_site_hist_name, minfer_site_hist_site,
+};
 use std::collections::{BTreeSet, HashMap};
 
 /// `minfer_site_fail_kind` for a kernel launch (`cuda_kernels.cu`).

@@ -108,17 +108,6 @@ pub fn apply_penalties(
     }
 }
 
-/// Repetition penalty: penalize tokens that already appeared in `prev_tokens`.
-/// `penalty == 1.0` disables. Positive logits are divided by the penalty
-/// (reduced), negative logits are multiplied (pushed further down). This is
-/// llama.cpp's `repeat_penalty` applied to the last `repeat_last_n` tokens.
-/// (Kept as the standalone penalty API — the CLI path uses
-/// `sample_with_penalties` directly; tests exercise this wrapper.)
-#[allow(dead_code)]
-pub fn apply_repetition_penalty(logits: &mut [f32], prev_tokens: &[u32], penalty: f32) {
-    apply_penalties(logits, prev_tokens, penalty, 0.0, 0.0);
-}
-
 /// Last `last_n` tokens of `tokens` — the recent-token window for the penalty
 /// pass (llama.cpp `repeat_last_n` default = 64). Returns the whole slice when
 /// shorter; empty when `tokens` is empty.
@@ -315,62 +304,6 @@ pub fn sample_temperature<R: Rng>(logits: &mut [f32], temp: f32, rng: &mut R) ->
 /// the whole generation and its greedy picks diverge from sequential decode
 /// past the first >64-distant repeat.
 pub const REPEAT_LAST_N: usize = 64;
-
-/// `temp < 1e-6` (greedy) skips the stochastic steps but still applies the
-/// penalties.
-///
-/// Pre-F3 signature, kept for callers that predate [`SamplerConfig`]. It builds
-/// a config whose new knobs are all at their no-op defaults, so its output is
-/// bit-identical to the pre-F3 chain (the
-/// `default_config_is_bit_identical_to_the_old_path` gate pins this).
-pub fn sample_with_penalties<R: Rng>(
-    logits: &mut [f32],
-    temp: f32,
-    top_k: usize,
-    top_p: f32,
-    repeat_penalty: f32,
-    frequency_penalty: f32,
-    presence_penalty: f32,
-    prev_tokens: &[u32],
-    rng: &mut R,
-) -> SampledToken {
-    let cfg = SamplerConfig {
-        temp,
-        top_k,
-        top_p,
-        repeat_penalty,
-        frequency_penalty,
-        presence_penalty,
-        ..SamplerConfig::default()
-    };
-    let mut mirostat = MirostatState::new(cfg.mirostat_tau);
-    sample_with_config(logits, &cfg, prev_tokens, &mut mirostat, rng)
-}
-
-/// Complete sampling pipeline with only the repeat penalty (frequency and
-/// presence disabled) — kept for callers that don't use the OAI penalties.
-#[allow(dead_code)]
-pub fn sample<R: Rng>(
-    logits: &mut [f32],
-    temp: f32,
-    top_k: usize,
-    top_p: f32,
-    repeat_penalty: f32,
-    prev_tokens: &[u32],
-    rng: &mut R,
-) -> SampledToken {
-    sample_with_penalties(
-        logits,
-        temp,
-        top_k,
-        top_p,
-        repeat_penalty,
-        0.0,
-        0.0,
-        prev_tokens,
-        rng,
-    )
-}
 
 // ============================================================================
 // F3 sampler set: min-p, typical, XTC, DRY, mirostat, logit bias (#48)

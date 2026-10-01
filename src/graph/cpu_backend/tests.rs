@@ -997,3 +997,18 @@ fn cpu_generic_get_rows() {
     let got = alloc.get_buffer(&g, r).unwrap();
     assert_eq!(got, &[1.0, 2.0, 3.0, 4.0], "get_rows should select row 0");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `cpu_backend.rs` (bucket B of the dead-code census —
+// every test caller already lives in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl CpuBackend {
+    /// Look up a registered weight tensor (test / debug helper).
+    ///
+    /// Test-only (#239): driven by `graph::cpu_backend::tests::{f32_matmul_nt2_token_major,
+    /// rms_norm_matches_reference, embedding_and_rope}`.
+    pub fn weight(&self, name: &str) -> Option<&Tensor> {
+        self.weights.get(name)
+    }
+}

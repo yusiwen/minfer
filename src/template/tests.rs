@@ -503,3 +503,25 @@ fn expand_home(path: &str) -> Option<std::path::PathBuf> {
         None => Some(std::path::PathBuf::from(path)),
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `template.rs` (bucket B of the dead-code census —
+// every test caller already lives in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl PyValue {
+    /// Fixture comparison form (the JSON encoding of the CPython result).
+    ///
+    /// Test-only (#239): driven by
+    /// `template::tests::{python_str_methods_match_cpython, python_split_edge_cases}`.
+    fn to_json(self) -> serde_json::Value {
+        match self {
+            PyValue::Str(s) => serde_json::Value::String(s),
+            PyValue::Int(i) => serde_json::Value::from(i),
+            PyValue::Bool(b) => serde_json::Value::from(b),
+            PyValue::List(v) => {
+                serde_json::Value::Array(v.into_iter().map(serde_json::Value::String).collect())
+            }
+        }
+    }
+}

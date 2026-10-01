@@ -82,11 +82,6 @@ pub struct DeviceTier {
     pub mmq_available: bool,
 }
 
-/// doc-95 bitwise bound for the speculative verify path. The batch limit fed
-/// to any dispatch arm must never exceed this — the greedy identity chain
-/// (multi-MMVQ bitwise vs nt=1 decode) is proven only up to 8.
-pub const IDENTITY_BATCH_BOUND: i32 = 8;
-
 /// The tier table. Row order: exact matches are found by key scan, so order
 /// is free; the GENERIC row must be last (selected as the fallback tail).
 pub const TIERS: &[DeviceTier] = &[
@@ -255,31 +250,6 @@ fn select_by_key(key: i32, minfer_cc: i32) -> Selected {
         tier,
         mmq_available: minfer_cc >= 800,
     }
-}
-
-/// Batch limit for a quant class on a tier (default or per-type override).
-pub fn mmvq_batch_limit(tier: &DeviceTier, class: QClass) -> i32 {
-    tier.mmvq_batch_by_type
-        .iter()
-        .find(|(c, _)| *c == class)
-        .map(|(_, v)| *v)
-        .unwrap_or(tier.mmvq_batch_default)
-}
-
-/// Dispatch cap for a quant class: the tier batch limit clamped by the
-/// doc-95 identity bound. The bound always wins — no tier data may strip the
-/// multi-MMVQ family above its own limit (the speculative verify path and
-/// the identity battery depend on it, plan §5.4/R3).
-///
-/// Activation note (plan §14 R8): the dispatch arms do not consume this cap
-/// yet — with the current dispatch structure a limit < 8 has no destination
-/// for the vacated nt range (it would fall to the f32 fallbacks, a likely
-/// pessimization) and would strip the spec identity family (R3). The cap
-/// activates together with a small-nt BT destination (T2 tile candidates) or
-/// field evidence; the table data and this function are ready and tested.
-#[allow(dead_code)] // activated with the R8 destination decision (plan §14)
-pub fn mmvq_cap(tier: &DeviceTier, class: QClass) -> i32 {
-    mmvq_batch_limit(tier, class).min(IDENTITY_BATCH_BOUND)
 }
 
 #[cfg(test)]

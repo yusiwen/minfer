@@ -647,12 +647,6 @@ impl BatchEngine {
         self.slots.len()
     }
 
-    /// Slots without a request (their reservation and KV stay).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn idle_slots(&self) -> usize {
-        self.slots.iter().filter(|s| s.run.is_none()).count()
-    }
-
     pub fn busy(&self) -> bool {
         self.slots.iter().any(|s| s.run.is_some())
     }
@@ -740,20 +734,6 @@ impl BatchEngine {
             .into_iter()
             .map(|a| a.expect("every job has an answer"))
             .collect()
-    }
-
-    /// Admit a single request: [`BatchEngine::admit`] with one job.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn submit(
-        &mut self,
-        model: &dyn ModelDef,
-        tokenizer: &Tokenizer,
-        job: Job,
-    ) -> Result<usize, ApiError> {
-        self.admit(model, tokenizer, vec![job])
-            .into_iter()
-            .next()
-            .expect("one job in, one answer out")
     }
 
     /// Tokens this slot would have to feed for `input_ids` (reuse-aware): the
@@ -962,26 +942,6 @@ impl BatchEngine {
     /// forward per prefill, the pre-E3 behaviour).
     pub fn set_prefill_chunk(&mut self, n_batch: usize) {
         self.n_batch = n_batch;
-    }
-
-    /// E3: `(largest nt any prefill forward carried, prefill forwards run)`. The
-    /// activation-memory bound is `max_nt`, so the gate asserts on this rather than
-    /// on a claim about buffers.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn prefill_stats(&self) -> (usize, usize) {
-        (self.prefill_max_nt, self.prefill_forwards)
-    }
-
-    /// B2/C5 S2: prompt tokens this engine has fed to prefills (see `prefill_fed`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn prefill_fed(&self) -> usize {
-        self.prefill_fed
-    }
-
-    /// E3: decode steps run between the chunks of a prefill (0 with chunking off).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn interleaved_ticks(&self) -> u64 {
-        self.interleaved_ticks
     }
 
     /// #158: the engine's monotone work counter (see the field). A gate drives the

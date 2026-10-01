@@ -350,3 +350,18 @@ fn both_threads_write_into_one_registry() {
     assert!(text.contains("minfer_kv_rows 512\n"));
     assert!(text.contains("minfer_kv_packed 1\n"));
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `metrics.rs` (bucket B of the dead-code census — the
+// only test caller lives in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl ServerMetrics {
+    /// The current trailing-window rate, without building a whole snapshot.
+    ///
+    /// Test-only (#239): driven by
+    /// `server::metrics::tests::token_counters_and_the_trailing_rate`.
+    pub fn completion_tokens_per_second(&self) -> f64 {
+        self.token_window.rate(now_secs())
+    }
+}

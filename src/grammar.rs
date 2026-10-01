@@ -108,12 +108,6 @@ impl GrammarState {
         self.accepting
     }
 
-    /// Bytes of an incomplete UTF-8 character carried across the last token.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn pending_bytes(&self) -> usize {
-        self.inner.partial.len()
-    }
-
     /// Number of states whose mask is cached (bounded by `MAX_MASK_CACHE`).
     /// Test-only (#238): driven by `grammar::tests::mask_is_cached_per_state and server::chat::tests::real_model_json_schema_generation_parses`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]

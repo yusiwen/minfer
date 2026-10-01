@@ -92,12 +92,6 @@ impl GraphCache {
         (self.builds, self.reuses)
     }
 
-    /// How many graphs are cached right now.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn cached_graphs(&self) -> usize {
-        self.graphs.len()
-    }
-
     fn params_match(a: &GraphParams, b: &GraphParams) -> bool {
         a.n_tokens == b.n_tokens
             && a.n_out == b.n_out

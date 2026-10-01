@@ -1,6 +1,8 @@
 //! `#[cfg(test)] mod issue145_tests` for `src/cuda.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
+// #239: declared in `cuda::tests` now (test-only FFI / accessors).
+use super::tests::{cuda_test_latch_oversized_smem, latched_api_error_count};
 
 fn device() -> Option<&'static CudaState> {
     CudaState::init();
