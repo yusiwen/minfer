@@ -110,9 +110,13 @@ extern "C" {
     fn cudaStreamCreateWithFlags(stream: *mut *mut std::ffi::c_void, flags: u32) -> i32;
     fn cudaStreamDestroy(stream: *mut std::ffi::c_void) -> i32;
     fn cudaStreamSynchronize(stream: *mut std::ffi::c_void) -> i32;
-    // Issue #188: is `stream` currently inside a capture window? Used by the
-    // probe and by the registration path's refusal (no host-synchronous work
-    // may land on a stream another thread is capturing).
+    // Issue #188: is `stream` currently inside a capture window? The only reader is
+    // `CudaState::stream_is_capturing` below, whose only caller is the #188 probe in
+    // `graph/cuda_backend/tests.rs`; the production capture bookkeeping is the
+    // per-instance `CudaBackend::capturing` field. (The older note here claimed a
+    // registration-path refusal that no longer exists — corrected by #238.)
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::cuda_capture_abort_on_error`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
     fn cudaStreamIsCapturing(stream: *mut std::ffi::c_void, status: *mut i32) -> i32;
     // F5 (#58): events, the synchronization primitive the split boundary's async
     // staging copies need. `cudaEventRecord` marks a point on the stream;
@@ -1358,8 +1362,9 @@ static STREAM_SYNCS: AtomicU64 = AtomicU64::new(0);
 static LAST_CAPTURE_END_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Issue #188: see [`LAST_CAPTURE_END_CODE`].
-#[allow(dead_code)] // read by the #188 acceptance probe
-pub fn last_capture_end_code() -> i32 {
+/// Test-only (#238): driven by `graph::cuda_backend::tests::capture_window_on_one_thread_survives_a_weight_registration_on_another`; `#[cfg(test)]` keeps it out of production builds.
+#[cfg(test)]
+pub(crate) fn last_capture_end_code() -> i32 {
     LAST_CAPTURE_END_CODE.load(Ordering::Relaxed)
 }
 
@@ -2039,8 +2044,9 @@ pub fn layout_of(format: crate::graph::kvformat::KvFormat) -> i32 {
 /// The `KvFormat` a `KV_LAYOUT_*` tag names. The inverse of [`layout_of`]; an
 /// unknown tag is F32, the pre-C4 reading, and is only reachable from an internal
 /// bug (the tag is never parsed from a file or the environment).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn format_of(layout: i32) -> crate::graph::kvformat::KvFormat {
+/// Test-only (#238): driven by `cuda::kv_dtype_tests::the_layout_tag_is_the_format_discriminant`; `#[cfg(test)]` keeps it out of production builds.
+#[cfg(test)]
+pub(crate) fn format_of(layout: i32) -> crate::graph::kvformat::KvFormat {
     use crate::graph::kvformat::KvFormat;
     match layout {
         KV_LAYOUT_F16 => KvFormat::F16,
@@ -2962,8 +2968,9 @@ impl CudaState {
     /// `(name, bytes)`. The plane's only consumer is the NB-BT q4_K kernel, so this is
     /// the exact set of device buffers a load that is *not* q4_K must leave empty — the
     /// registry query the #165 gate and its before/after accounting read by name.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn q4dsc_planes(&self) -> Vec<(String, usize)> {
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::cuda_q4dsc_plane_is_q4k_only and tooling::tests::f167_qwen3_q4k_registers_the_dsc_plane_exactly`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn q4dsc_planes(&self) -> Vec<(String, usize)> {
         self.weights
             .lock()
             .unwrap()
@@ -3001,8 +3008,9 @@ impl CudaState {
     /// decode), so this performs exactly that lookup rather than looking the sibling name
     /// up in the registry — which is the part a name-only assertion cannot see. `None`
     /// when the weight is not registered at all.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn q4dsc_plane_for(&self, name: &str) -> Option<*mut std::ffi::c_void> {
+    /// Test-only (#238): driven by `tooling::tests::f167_qwen3_q4k_registers_the_dsc_plane_exactly`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn q4dsc_plane_for(&self, name: &str) -> Option<*mut std::ffi::c_void> {
         let wp = self.get_weight_ptr(name)?;
         if wp.is_null() {
             return None;
@@ -3094,11 +3102,14 @@ impl CudaState {
         }
     }
 
-    /// Issue #188: is `stream` inside a capture window right now? Used by the
-    /// probe and by the registration path's inventory; a failed query reads as
-    /// "not capturing" (the caller's own capture bookkeeping is authoritative).
-    #[allow(dead_code)] // probe + record surface
-    pub fn stream_is_capturing(stream: *mut std::ffi::c_void) -> bool {
+    /// Issue #188: is `stream` inside a capture window right now? Read only by the
+    /// #188 probe; a failed query reads as "not capturing" (the caller's own
+    /// per-instance capture bookkeeping is authoritative). The note here used to
+    /// claim a registration-path inventory that does not call it — corrected by
+    /// #238.
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::cuda_capture_abort_on_error`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn stream_is_capturing(stream: *mut std::ffi::c_void) -> bool {
         let mut status: i32 = 0; // cudaStreamCaptureStatusNone == 0
         let err = unsafe { cudaStreamIsCapturing(stream, &mut status) };
         err == 0 && status != 0

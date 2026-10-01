@@ -359,8 +359,9 @@ impl GraphAllocator {
     ///
     /// E5: `supports_for` with `layer = None` (no offload policy) — kept for callers that
     /// only ask "does any backend have this op", like the op matrix.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn supports(&self, op: &Op, dtype: crate::graph::DType) -> Option<Backend> {
+    /// Test-only (#238): driven by `graph::registry::tests::the_registered_set_and_priority_order_are_pinned`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn supports(&self, op: &Op, dtype: crate::graph::DType) -> Option<Backend> {
         self.supports_for(op, dtype, None)
     }
 
@@ -1103,8 +1104,9 @@ impl GraphAllocator {
     /// Drop the identity fast path (Phase C / C2). After this the scheduler
     /// refuses to execute until the backends consume the resolved cell array,
     /// so a half-ported C2 fails loudly instead of writing the wrong row.
-    #[allow(dead_code)] // C2 calls it
-    pub fn kv_clear_identity(&mut self) {
+    /// Test-only (#238): driven by `graph::scheduler::tests::a_non_identity_kv_mapping_is_refused`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn kv_clear_identity(&mut self) {
         self.kv.clear_identity();
     }
 
@@ -1218,8 +1220,9 @@ impl GraphAllocator {
     /// rows of every layer's KV arena and re-rope the survivors by `-drop`, so
     /// the same tokens become addressable at `pos - drop`. Returns the new
     /// written-row count.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_shift(
+    /// Test-only (#238): driven by `models::qwen2::graph::tests::kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn kv_shift(
         &mut self,
         drop: usize,
         rope: &super::kvcache::KvRope,
@@ -1228,8 +1231,9 @@ impl GraphAllocator {
     }
 
     /// Written rows in a layer's arena (`n_used`), or `None` before allocation.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_n_used(&self, layer: usize) -> Option<usize> {
+    /// Test-only (#238): driven by `graph::alloc::tests::kv_session_round_trips_the_rows_and_the_run_table`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn kv_n_used(&self, layer: usize) -> Option<usize> {
         self.kv.get(layer).map(|l| l.n_used)
     }
 
@@ -1249,8 +1253,9 @@ impl GraphAllocator {
 
     /// Fill an input node's buffer from host data (routes to the node's pool).
     /// (Test / debug helper — the generation loop fills I32 inputs.)
-    #[allow(dead_code)]
-    pub fn fill_input(
+    /// Test-only (#238): driven by `graph::alloc::tests::fill_and_read_input`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn fill_input(
         &mut self,
         graph: &ComputeGraph,
         name: &str,
@@ -1262,8 +1267,9 @@ impl GraphAllocator {
     /// Reserve a contiguous cell run for `seq` (Phase E / E2). Several
     /// sequences share one arena this way; `Err` when no run fits — see
     /// [`Self::kv_reserve_seq_with_defrag`] for the C3 retry.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_reserve_seq(
+    /// Test-only (#238): driven by `graph::alloc::tests::copying_a_prefix_refuses_what_it_cannot_copy`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn kv_reserve_seq(
         &mut self,
         seq: super::kvcache::SeqId,
         cap: usize,
@@ -2098,8 +2104,9 @@ impl GraphAllocator {
     /// rounded up to its size class, so the physical slice is longer than the
     /// node and handing it back whole would leak another allocation's padding
     /// into every comparison.
-    #[allow(dead_code)]
-    pub fn get_buffer(&self, _graph: &ComputeGraph, id: NodeId) -> Option<&[f32]> {
+    /// Test-only (#238): driven by `graph::alloc::tests::fill_and_read_input`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn get_buffer(&self, _graph: &ComputeGraph, id: NodeId) -> Option<&[f32]> {
         let br = self.node_buffer(id)?;
         // Only the CPU pool lends a host slice: a device pool's read is a copy
         // (`copy_to_cpu`), which cannot be returned by reference.
@@ -2160,8 +2167,9 @@ impl GraphAllocator {
     /// The header records the shape, the KV element type and the backend, so a
     /// load can refuse a file that does not describe *this* arena instead of
     /// applying it. All layers must agree on the shape: a session is one arena.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_save(&mut self, path: &Path) -> Result<KvSessionReport, String> {
+    /// Test-only (#238): driven by `graph::alloc::tests::kv_session_round_trips_the_rows_and_the_run_table`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn kv_save(&mut self, path: &Path) -> Result<KvSessionReport, String> {
         self.kv_save_with_host(path, &[])
     }
 
@@ -2226,8 +2234,9 @@ impl GraphAllocator {
     /// checksum, end-of-file) **before** a single byte is written into a pool, so
     /// a truncated, corrupted or foreign file leaves the allocator untouched. The
     /// header must match what the caller knows from the model (`expect`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_load(
+    /// Test-only (#238): driven by `graph::alloc::tests::kv_session_round_trips_the_rows_and_the_run_table`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn kv_load(
         &mut self,
         path: &Path,
         expect: &KvSessionExpect,
@@ -2345,8 +2354,9 @@ impl GraphAllocator {
 
     /// Host view of a persistent region by name (CPU pool).
     /// (Test helper.)
-    #[allow(dead_code)]
-    pub fn get_persistent(&self, name: &str) -> Option<&[f32]> {
+    /// Test-only (#238): driven by `graph::cache::tests::allocator_survives_rebuild`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn get_persistent(&self, name: &str) -> Option<&[f32]> {
         self.persistent
             .iter()
             .find(|p| p.name == name && p.backend == Backend::CPU)
@@ -2361,8 +2371,9 @@ impl GraphAllocator {
 
     /// E4 S3: how many pool buffers the CPU backend has created (a re-map creates none).
     /// (Test helper.)
-    #[allow(dead_code)]
-    pub fn n_cpu_allocs(&self) -> usize {
+    /// Test-only (#238): driven by `graph::alloc::tests::slots`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn n_cpu_allocs(&self) -> usize {
         self.cpu.alloc_count()
     }
 
@@ -2576,8 +2587,9 @@ impl GraphAllocator {
     /// around one workload ([`CrossCopyStats::delta`]), because the counters are
     /// cumulative for the allocator's life. (The F5 gates are tests, so the
     /// production build has no caller.)
-    #[allow(dead_code)]
-    pub fn cross_stats(&self) -> CrossCopyStats {
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise` and `graph::alloc::tests::a_pending_staged_copy_is_refused_until_its_wait_is_issued`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn cross_stats(&self) -> CrossCopyStats {
         self.cross_stats
     }
 

@@ -102,8 +102,9 @@ pub struct GrammarState {
 
 impl GrammarState {
     /// The state is a complete, acceptable string (end-of-generation is legal).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn is_accepting(&self) -> bool {
+    /// Test-only (#238): driven by `grammar::tests::eog_is_allowed_only_at_an_accepting_state and sampler::tests::grammar_mask_decides_the_greedy_choice_and_advances`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn is_accepting(&self) -> bool {
         self.accepting
     }
 
@@ -114,8 +115,9 @@ impl GrammarState {
     }
 
     /// Number of states whose mask is cached (bounded by `MAX_MASK_CACHE`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn cached_states(&self) -> usize {
+    /// Test-only (#238): driven by `grammar::tests::mask_is_cached_per_state and server::chat::tests::real_model_json_schema_generation_parses`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn cached_states(&self) -> usize {
         self.cache.len()
     }
 }
@@ -291,21 +293,24 @@ impl Grammar {
     /// the automaton never entered a dead state on it. This is the honest
     /// assertion for a generation truncated by the length limit: the whole text
     /// need not be a complete instance, but every byte emitted was legal.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn accepts_prefix(&self, bytes: &[u8]) -> bool {
+    /// Test-only (#238): driven by `grammar::tests::accept_reports_the_longest_accepted_prefix and server::chat::tests::real_model_max_length_output_is_a_valid_prefix`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn accepts_prefix(&self, bytes: &[u8]) -> bool {
         self.consume(&self.initial_key(), bytes).is_ok()
     }
 
     /// True when the byte string is a complete sentence of the grammar.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn accepts(&self, bytes: &[u8]) -> bool {
+    /// Test-only (#238): driven by `grammar::tests::gbnf_literals_classes_and_dot`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn accepts(&self, bytes: &[u8]) -> bool {
         match self.consume(&self.initial_key(), bytes) {
             Ok(next) => self.state_key_accepting(&next),
             Err(_) => false,
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only (#238): driven by `grammar::tests::gbnf_literals_classes_and_dot (through accepts/accepts_prefix)`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
     fn initial_key(&self) -> StateKey {
         StateKey {
             stacks: self

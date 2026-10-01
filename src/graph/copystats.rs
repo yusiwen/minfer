@@ -64,7 +64,9 @@ pub struct CrossCopyStats {
 impl CrossCopyStats {
     /// The change from `before` to `self` — what a gate asserts on, so an
     /// unrelated earlier execution cannot shift the numbers.
-    pub fn delta(self, before: CrossCopyStats) -> CrossCopyStats {
+    /// Test-only (#238): driven by `graph::copystats::tests::the_two_phases_are_counted_separately_and_the_delta_is_exact`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn delta(self, before: CrossCopyStats) -> CrossCopyStats {
         CrossCopyStats {
             copies: self.copies.saturating_sub(before.copies),
             waits: self.waits.saturating_sub(before.waits),
@@ -81,7 +83,9 @@ impl CrossCopyStats {
 
     /// Whether phase B was issued for every phase-A copy. The missing-wait gate
     /// reads this: a boundary that drops its wait leaves `waits < copies`.
-    pub fn all_copies_awaited(self) -> bool {
+    /// Test-only (#238): driven by `graph::copystats::tests::the_two_phases_are_counted_separately_and_the_delta_is_exact` and `graph::cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn all_copies_awaited(self) -> bool {
         self.waits == self.copies
     }
 }

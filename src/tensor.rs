@@ -135,7 +135,9 @@ pub struct Tensor {
 impl Tensor {
     /// Create a new tensor with given type and shape.
     /// Allocates data buffer with proper alignment.
-    pub fn new(ttype: TensorType, shape: &[i64; 4]) -> Self {
+    /// Test-only (#238): driven by `graph::builder::tests::builder_creates_topo_sorted_graph` (its `f32_tensor` helper); `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn new(ttype: TensorType, shape: &[i64; 4]) -> Self {
         let mut tensor = Tensor {
             ttype,
             shape: *shape,
@@ -161,7 +163,9 @@ impl Tensor {
     }
 
     /// Create a tensor from an existing data buffer (takes ownership)
-    pub fn from_data(ttype: TensorType, shape: &[i64; 4], data: Vec<u8>) -> Self {
+    /// Test-only (#238): driven by `graph::op_matrix::matrix_cases_match_their_reference` (test-only module) and `graph::alloc::tests::a_rebuild_does_not_touch_the_device_pool`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn from_data(ttype: TensorType, shape: &[i64; 4], data: Vec<u8>) -> Self {
         let mut tensor = Tensor {
             ttype,
             shape: *shape,

@@ -264,14 +264,16 @@ impl CudaBackend {
 
     /// The stream this backend issues its device work on (test introspection +
     /// the #188 concurrency gate's "two engines really do hold two streams" arm).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::cuda_capture_abort_on_error`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
     pub(crate) fn device_stream(&self) -> *mut std::ffi::c_void {
         self.stream
     }
 
     /// Pool generation counter (CUDA Graph replay invalidation, Phase 7d).
-    #[allow(dead_code)]
-    pub fn pool_gen(&self) -> u64 {
+    /// Test-only (#238): driven by `graph::alloc::tests::a_rebuild_does_not_touch_the_device_pool`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn pool_gen(&self) -> u64 {
         self.pool_gen
     }
 
@@ -310,8 +312,9 @@ impl CudaBackend {
     /// The `KvFormat` this backend's regions store (the registry's `kv_format`
     /// hook, C5's session header). The tag is set from the engine's resolved format,
     /// so this is the engine's answer, not a process-wide one.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kv_format(&self) -> super::kvformat::KvFormat {
+    /// Test-only (#238): driven by `graph::alloc::tests::set_kv_format_stamps_the_cuda_layout_per_engine`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn kv_format(&self) -> super::kvformat::KvFormat {
         crate::cuda::format_of(self.kv_layout)
     }
 
@@ -649,8 +652,9 @@ impl CudaBackend {
     /// enumerated host-visible ones (logits, KV session save, debug dumps,
     /// capture fallbacks) — see `docs/BACKEND-REGISTRY-DESIGN.md` §11.
     /// (The F5 gates are tests, so the production build has no caller.)
-    #[allow(dead_code)]
-    pub fn blocking_readback_count(&self) -> u64 {
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise` and `models::qwen2::graph::tests::async_cross_copies_never_block_and_stay_bitwise_identical`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn blocking_readback_count(&self) -> u64 {
         self.blocking_readbacks
             .load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -663,8 +667,9 @@ impl CudaBackend {
     /// around one workload is then attributable to that workload, whereas the
     /// process-wide total moves whenever *any* other thread syncs (the parallel
     /// harness ran the F5 gate beside ~27 other device tests).
-    #[allow(dead_code)] // read by the F5 device gates
-    pub fn stream_sync_count(&self) -> u64 {
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::stream_sync_counts_are_per_backend_not_process_wide`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn stream_sync_count(&self) -> u64 {
         self.stream_syncs.load(std::sync::atomic::Ordering::Relaxed)
     }
 

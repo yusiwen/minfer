@@ -475,8 +475,9 @@ impl BackendFilter {
     }
 
     /// Whether this is "no fence" (every backend allowed).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn is_unfiltered(&self) -> bool {
+    /// Test-only (#238): driven by `graph::registry::tests::the_name_surface_fences_devices_and_keeps_cpu`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn is_unfiltered(&self) -> bool {
         self.allowed.iter().all(|a| *a)
     }
 }

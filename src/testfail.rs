@@ -133,8 +133,9 @@ pub fn note_checked(site: &'static str) {
 ///
 /// Gate-facing API: read by `#[cfg(test)]` gates and by the `#[ignore]`d
 /// real-model set, so a non-test build sees it unused.
-#[allow(dead_code)]
-pub fn checked(site: &str) -> u64 {
+/// Test-only (#238): driven by `graph::scheduler::tests::the_execute_chokepoint_is_observable`; `#[cfg(test)]` keeps it out of production builds.
+#[cfg(test)]
+pub(crate) fn checked(site: &str) -> u64 {
     CHECKED.with(|c| {
         c.borrow()
             .iter()
@@ -145,8 +146,9 @@ pub fn checked(site: &str) -> u64 {
 
 /// Clear every counter on this thread (a gate calls this before the run it
 /// wants to observe, so a previous test on the same thread cannot fake it).
-#[allow(dead_code)]
-pub fn reset_checked() {
+/// Test-only (#238): driven by `graph::scheduler::tests::the_execute_chokepoint_is_observable`; `#[cfg(test)]` keeps it out of production builds.
+#[cfg(test)]
+pub(crate) fn reset_checked() {
     CHECKED.with(|c| c.borrow_mut().clear());
 }
 

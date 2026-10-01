@@ -181,8 +181,9 @@ impl GraphBuilder {
     /// The composition is proven in production by D2: `fused_ffn_composition` is
     /// a concat matmul whose gate/up halves are consumed through two such
     /// windows.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn split_parts(&mut self, owner: NodeId, sizes: &[usize]) -> Vec<NodeId> {
+    /// Test-only (#238): driven by `graph::alloc::tests::split_parts_maps_every_part_onto_the_owners_buffer`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn split_parts(&mut self, owner: NodeId, sizes: &[usize]) -> Vec<NodeId> {
         let out_shape = self.graph.nodes[owner].out_shape;
         let total: usize = sizes.iter().sum();
         assert_eq!(
@@ -572,8 +573,9 @@ impl GraphBuilder {
 
     /// Softmax builder (op vocabulary; the fused attention kernels softmax
     /// internally, so no live graph emits a standalone softmax node today).
-    #[allow(dead_code)]
-    pub fn softmax(&mut self, x: NodeId, dim: usize) -> NodeId {
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::cuda_multisplit_capture_bit_parity`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn softmax(&mut self, x: NodeId, dim: usize) -> NodeId {
         let shape = self.graph.nodes[x].out_shape;
         self.node(
             "softmax",
@@ -630,8 +632,9 @@ impl GraphBuilder {
     /// Fused SwiGLU (fusion-pass target; backends without a fused kernel
     /// decompose to silu+mul at execution). Used by tests; the Qwen2 graph
     /// builder emits gate/up separately and lets the fusion pass combine them.
-    #[allow(dead_code)]
-    pub fn swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
+    /// Test-only (#238): driven by `graph::builder::tests::swiglu_builder_and_meta`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn swiglu(&mut self, gate: NodeId, up: NodeId) -> NodeId {
         let shape = self.graph.nodes[gate].out_shape;
         self.node(
             "swiglu",
