@@ -260,8 +260,9 @@ fn bytes_to_words(src: &[u8], out: &mut [f32]) {
 }
 
 /// Quantize one f32 cell row (`src.len() == nkt`) into `dst`, one packed cell.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn pack_q8_0_cell(dst: &mut [f32], nkt: usize, src: &[f32]) {
+/// Test-only (#238): driven by `graph::kvformat::tests::a_packed_cell_round_trips_within_the_q8_0_block_error` and `graph::cpu_backend::tests::the_fused_q8_read_matches_the_dequantizing_reference`; `#[cfg(test)]` keeps it out of production builds.
+#[cfg(test)]
+pub(crate) fn pack_q8_0_cell(dst: &mut [f32], nkt: usize, src: &[f32]) {
     let mut raw = vec![0u8; KvFormat::Q8_0.payload_bytes(nkt)];
     pack_q8_0_cell_into(dst, nkt, src, &mut raw);
 }

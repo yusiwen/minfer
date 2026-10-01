@@ -624,8 +624,9 @@ impl KvCache {
     /// Drop the identity fast path. C2 calls this when it introduces a hole or
     /// a window; after that, backends that only understand raw positions must
     /// refuse the node (standing rule 2) instead of indexing the wrong row.
-    #[allow(dead_code)] // C2 surface
-    pub fn clear_identity(&mut self) {
+    /// Test-only (#238): driven by `graph::kvcache::tests::clearing_identity_is_the_backend_gate`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn clear_identity(&mut self) {
         self.identity = false;
     }
 

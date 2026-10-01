@@ -519,8 +519,9 @@ impl Conversation {
 
     /// Starts the session: `Some(first input)` → full render + prefill + generate; None → wait for input.
     /// (Entry kept as the full API; the CLI goes through the unified `user_turn` path, `start` is covered by tests.)
-    #[allow(dead_code)]
-    pub fn start(
+    /// Test-only (#238): driven by `conversation::tests::first_turn_full_render_and_eog` and the `#[ignore]`d `models::qwen2::graph::tail_tests::cuda_conversation_multiturn_reuse`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn start(
         &mut self,
         first_input: Option<&str>,
         decoder: &dyn TokenCodec,

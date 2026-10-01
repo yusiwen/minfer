@@ -301,8 +301,9 @@ fn nanos_of(elapsed: Duration) -> u64 {
 /// scheduler goes through a resolved [`TimingSink`] so a private sink is
 /// possible; this free function is the module's unchanged entry point for
 /// anything that just wants the shared table.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn record(index: usize, elapsed: Duration) {
+/// Test-only (#238): driven by `graph::scheduler::tests::a_concurrent_graph_load_cannot_move_a_private_sink`; `#[cfg(test)]` keeps it out of production builds.
+#[cfg(test)]
+pub(crate) fn record(index: usize, elapsed: Duration) {
     global().record(index, elapsed);
 }
 

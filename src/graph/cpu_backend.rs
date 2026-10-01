@@ -96,8 +96,9 @@ impl CpuBackend {
 
     /// E4 S3: buffers this pool has created (never reused from the slot table).
     /// (Test / accounting helper.)
-    #[allow(dead_code)]
-    pub fn alloc_count(&self) -> usize {
+    /// Test-only (#238): driven by `graph::alloc::tests::slots`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn alloc_count(&self) -> usize {
         self.allocs
     }
 
@@ -898,8 +899,9 @@ pub(crate) fn cpu_rope(
 /// The causal span for a single sequence, in the `attn_span` layout E1 defines:
 /// token `t` may see the cells `[0, pos[t] + 1)`. Test/reference helper — the
 /// model path resolves the span from the KV store's ownership instead.
-#[allow(dead_code)]
-pub fn causal_span(pos: &[usize]) -> Vec<(usize, usize)> {
+/// Test-only (#238): driven by `graph::cuda_backend::tests::cuda_rope_kv_attn_roundtrip`; `#[cfg(test)]` keeps it out of production builds.
+#[cfg(test)]
+pub(crate) fn causal_span(pos: &[usize]) -> Vec<(usize, usize)> {
     pos.iter().map(|&p| (0, p + 1)).collect()
 }
 
@@ -981,7 +983,8 @@ fn decode_window(
 /// (tests and the causal fixture): `span[t] = (lo, hi)` is one run of `hi - lo`
 /// cells. The Op::Attn path decodes the window input itself, so it can carry a
 /// list of runs (C8b S2) and not only a contiguous range.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Test-only (#238): driven by `graph::cpu_backend::tests::a_window_split_into_runs_gathers_like_one_range`; `#[cfg(test)]` keeps it out of production builds.
+#[cfg(test)]
 pub(crate) fn cpu_gqa_attn(
     q: &[f32],
     ka: &[f32],

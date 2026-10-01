@@ -647,7 +647,9 @@ impl GgufContext {
         self.alignment
     }
 
-    pub fn get_data_offset(&self) -> usize {
+    /// Test-only (#238): driven by `gguf_write::tests::every_metadata_type_round_trips_through_the_parser`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn get_data_offset(&self) -> usize {
         self.offset
     }
 
@@ -681,25 +683,33 @@ impl GgufContext {
         }
     }
 
-    pub fn get_arr_type(&self, key_id: i64) -> GgufType {
+    /// Test-only (#238): driven by `gguf_write::tests::every_metadata_type_round_trips_through_the_parser`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn get_arr_type(&self, key_id: i64) -> GgufType {
         assert!(key_id >= 0 && key_id < self.get_n_kv());
         assert!(self.kv[key_id as usize].is_array);
         self.kv[key_id as usize].get_type()
     }
 
-    pub fn get_arr_data(&self, key_id: i64) -> &[u8] {
+    /// Test-only (#238): driven by `gguf_write::tests::every_metadata_type_round_trips_through_the_parser`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn get_arr_data(&self, key_id: i64) -> &[u8] {
         assert!(key_id >= 0 && key_id < self.get_n_kv());
         assert!(self.kv[key_id as usize].get_type() != GgufType::String);
         &self.kv[key_id as usize].data
     }
 
-    pub fn get_arr_str(&self, key_id: i64, i: usize) -> &str {
+    /// Test-only (#238): driven by `gguf_write::tests::every_metadata_type_round_trips_through_the_parser`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn get_arr_str(&self, key_id: i64, i: usize) -> &str {
         assert!(key_id >= 0 && key_id < self.get_n_kv());
         assert!(self.kv[key_id as usize].get_type() == GgufType::String);
         &self.kv[key_id as usize].data_string[i]
     }
 
-    pub fn get_arr_n(&self, key_id: i64) -> usize {
+    /// Test-only (#238): driven by `gguf_write::tests::every_metadata_type_round_trips_through_the_parser`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn get_arr_n(&self, key_id: i64) -> usize {
         assert!(key_id >= 0 && key_id < self.get_n_kv());
         self.kv[key_id as usize].get_ne()
     }
@@ -764,7 +774,9 @@ impl GgufContext {
         self.kv[key_id as usize].get_val_f64(0)
     }
 
-    pub fn get_val_bool(&self, key_id: i64) -> bool {
+    /// Test-only (#238): driven by `gguf_write::tests::every_metadata_type_round_trips_through_the_parser`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn get_val_bool(&self, key_id: i64) -> bool {
         assert!(key_id >= 0 && key_id < self.get_n_kv());
         assert!(self.kv[key_id as usize].get_ne() == 1);
         self.kv[key_id as usize].get_val_bool(0)

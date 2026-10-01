@@ -86,8 +86,9 @@ impl GraphCache {
 
     /// (builds, reuses) since the cache was created — the observable behind "a switch stopped
     /// rebuilding" (E4 S3's acceptance).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn stats(&self) -> (usize, usize) {
+    /// Test-only (#238): driven by `graph::cache::tests::switching_between_cached_graphs_re_maps_instead_of_rebuilding`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> (usize, usize) {
         (self.builds, self.reuses)
     }
 
