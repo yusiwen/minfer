@@ -33,8 +33,11 @@ pub struct Qwen3Model {
     /// name-keyed registrations cannot collide with the first one's.
     pub ns: String,
     /// E5: the layer offload plan in force (the effective one) plus what the device
-    /// registration measured. `ModelDef::offload()` hands the plan to the graph builder and
-    /// the assignment pass; `offload_report()` is the startup line.
+    /// registration measured. The graph builders and the assignment pass read this
+    /// **field** (`model.offload.plan`) directly; `ModelDef::offload()` is the trait
+    /// surface and is read only by tests ([#244]); `offload_report()` is the startup line.
+    ///
+    /// [#244]: https://github.com/yusiwen/minfer/issues/244
     pub offload: crate::models::OffloadState,
     /// C4 per-engine (issue #99): the KV storage format this engine resolved from
     /// `MINFER_CACHE_TYPE` at load (`F32` until `ModelDef::set_kv_format` stamps it).

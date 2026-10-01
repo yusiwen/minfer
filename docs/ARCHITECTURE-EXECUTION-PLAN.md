@@ -6367,6 +6367,165 @@ with cuda rests on `cuda_backend::entry`'s `kv_format` hook being compiled in th
 `--tests --features cuda`, not the macOS test build; the `#[cfg(test)]` accessor is
 platform-independent.
 
+#### Test-infrastructure record (#244, 2026-10-01) — the dead-code decisions get a verdict, and the unambiguous subset lands
+
+**The ticket.** [#244] is T5, the last ticket of the `allow(dead_code)` census: the items rustc
+still reports on the stripped oracle after T1–T4, which need a decision rather than a deletion.
+It is also the ticket the earlier records handed their findings to — [#239]'s two lost callers
+(`KvCache::set_owner`, `OffloadPlan::all_on_device`), its vacuous `live_peak` gate and its
+`Tensor::new` coverage gap; [#240]/[#241]'s stale-doc items; [#242]'s ~12 stale-doc notes; and
+[#243]'s three `src/device_tier.rs` container blankets.
+
+**Reconciled lineage — the oracle re-run on `0a81d47`.** Method identical on both sides: `strip.py`
+in a scratch worktree (every `allow(dead_code)` replaced by a `//STRIPPED` comment, line numbers
+preserved), then `cargo check --release`, `cargo check --release --features cuda` and
+`cargo check --release --tests --features cuda`, each with `--message-format=json`, taking **every**
+`src/` span of every `dead_code` diagnostic (a primary-span-only read undercounts ~2.6× because
+rustc groups a dead `impl` into one diagnostic). The scratch worktree was pinned to the repo's
+`1.97.1` toolchain (`RUSTUP_TOOLCHAIN` is set to `stable` in this shell; the census unsets it).
+
+| tree | cuda dead sites | cuda dead items | CPU sites/items | tests-cuda sites/items |
+|---|---|---|---|---|
+| `e9bf4c5` — the durable census' baseline | 314 | 261 | — | — |
+| `79c9837` — after [#238]/[#239] | 191 | 157 | — | — |
+| `5147d2c` — after [#240]/[#241] | 143 | 110 | — | — |
+| `212e748` — after [#242] | 71 | 48 | — | — |
+| `0a81d47` — this branch's parent (after [#243]; re-run here) | **71** | **48** | 80 / 60 | 34 / 23 |
+| this branch's final tree | **57** | **39** | 67 / 51 | 22 / 15 |
+
+**A one-item parser bug the re-run exposed, fixed in the durable `census.py`.** `RopeStyle::Interleaved
+= 1` carries an explicit discriminant, and the item-name regex (`VARIANT_RE`) accepted only
+`(`/`{`/`,`/end after the identifier — so the variant's own row was dropped while its *span* still
+counted. The durable captures were re-parsed after the fix: `e9bf4c5` is **261** cuda / **198** CPU
+items, not 260 / 197 — exactly one more in each non-test capture. The sites columns are span-based
+and unchanged, and the historical rows above are the recorded ones **plus that one** (the fix is
+deterministic and the variant is present in every tree). The cuda set is therefore **41 shape + 7
+code** items, not the 40 + 7 [#242] reconciled, and the item this recovery adds —
+`RopeStyle::Interleaved` — is one of [#244]'s own (its bare `#[allow(dead_code)]` is now
+`#[cfg_attr(not(test), allow(dead_code))]`, the test that constructs it being `graph::op_matrix`).
+
+The 7 code items are `cudaStreamWaitEvent` + `CudaState::stream_wait_event` (pending [#138]),
+`KvCache::set_owner`, `OffloadPlan::all_on_device`, `ModelDef::{as_any, forward_graph, offload}`.
+
+**Verdict table (all 48).**
+
+| verdict | items | landed? |
+|---|---|---|
+| **delete** (internal, never read in any build, no API contract) | `SampledToken::logit`; `Slot::id`; `KVCacheLayer::{k,v,size,max_size,dim}` + `KVCache::layers` | **yes** |
+| **wire the lost caller** (small, behaviour-preserving) | `OffloadPlan::all_on_device` (called by `resolve`'s unset-request arm) | **yes** |
+| **keep + honest note, precise annotation** | `DType::{F16,Q8_0}`; `Op::{Scale,Softmax,Reshape,Permute,BatchMatMul}`; `AttnMode::Mha`; `RopeStyle::Interleaved`; `TimingMode::{Off,Private}`; `OffloadRequest::AutoWithBudget`; `HfCheckpoint::order` (deferred to [#209]); `Tokenizer::{id_to_score,id_to_type}`; `Vendor::{Amd,Mthreads,Apple}`; `QClass::Other`; `DeviceTier::{source,mmvq_batch_default,mmvq_batch_by_type}`; `TurnOutcome::{text,stopped_by_eog,stopped_by_string}`; `Tokenizer::{special_tokens,im_start,im_end}`; `BackendCaps::{supports_op,supports_fused,supports_attn_span}`; `BackendEntry::name`; `ModelDef::{as_any,forward_graph,offload}` | **yes** (annotation + note; the membership questions are escalated) |
+| **keep, nothing to change** | `CudaState::cc` (already `not(test)` from [#243]); `cudaStreamWaitEvent` + `stream_wait_event` (bare, dead in every build, pending [#138]) | n/a |
+| **escalate, do not land** | `BackendCaps` **authority**; `ModelDef::as_any`; `ModelDef::offload`; `KvCache::set_owner`; the deferred `DType`/`Op`/`RopeStyle` variant **membership**; removing `ModelDef::forward`'s `&mut KVCache` | **no** |
+
+Two annotation-shape corrections ride along: `Op::View`'s `#[allow(dead_code)]` was **unnecessary**
+(D1's `GraphBuilder::split_parts` constructs it, and the stripped oracle does not report it), so it
+was dropped; and the `ModelDef` trait-level blanket became four member-level annotations
+(`not(test)` for `as_any`/`offload`, `any(not(test), not(target_os = "macos"))` for `forward_graph`)
+so `forward`/`kv_format`/… stay checked.
+
+**The three `device_tier.rs` container blankets (#243's acceptance item).** `Vendor`, `QClass` and
+`DeviceTier` lost their item-level `#[allow(dead_code)]`; each member rustc named in the cuda build
+now carries its own: `Vendor::{Amd,Mthreads,Apple}` bare (never constructed in **either**
+configuration — the CPU build reports the enclosing enum and never descends), `QClass::Other` and
+`DeviceTier::{source,mmvq_batch_default,mmvq_batch_by_type}` `not(test)` (constructed/read by
+`device_tier::tests`). The non-test cuda build stays warning-free, which is what #243 could not
+achieve without deciding these members first.
+
+**The vacuous gate (#239's finding), fixed rather than removed.** `AllocPlan::plan`'s in-loop `live`
+never decreased, so `peak` always equalled `reserved_bytes` and `peak.max(live_peak(..))` could
+never observe `live_peak`; `the_live_peak_is_not_the_reserved_total` stayed green under a mutation
+of `live_peak`'s arithmetic. The dead in-loop accumulation is **gone**; `live_peak` now takes its
+peak between the add and the remove pass (an interval whose `first == last` counts for its one
+step), and the test adds the shape where the two numbers genuinely differ — two **different** classes
+whose lifetimes never overlap (both reserved, one live at a time) — on top of the existing
+same-class-singletons and two-classes-overlapping cases. No assertion was removed or weakened; two
+were added to an existing test, so no count row moves. **Mutation:** `live += class_bytes(classes[i])`
+→ `live += 0` fails `the_live_peak_is_not_the_reserved_total` at `allocplan/tests.rs:171` (before
+this ticket the same mutation left it green). The `[#244]` module doc also replaces the stale
+sentence that claimed the plan is the feasibility gate: the gate is `GraphAllocator::alloc_in_pool`.
+
+**The `Tensor::new` coverage gap (#239's finding), closed.** Its only consumer, `f32_tensor` in
+`graph/builder/tests.rs`, asserted neither the strides nor the allocation, so the body was
+unobserved. The helper now asserts `strides[0..4]`, `nbytes()` and `data.len() == nbytes()` for the
+f32 shapes it is called with. **Mutation:** `tensor.strides[1] = 0` fails
+`builder_creates_topo_sorted_graph` at the new assertion.
+
+**Census before/after (the evidence form for annotation-only work).**
+
+| capture | before (items / sites) | after (items / sites) | newly dead |
+|---|---|---|---|
+| `cargo check --release` (CPU) | 60 / 80 | 51 / 67 | **0** |
+| `cargo check --release --features cuda` | **48 / 71** | **39 / 57** | **0** |
+| `cargo check --release --tests --features cuda` | 23 / 34 | 15 / 22 | **0** |
+
+The cuda-set difference is **exactly** the nine items the ticket deleted or wired — the six
+`KVCache` fields, `SampledToken::logit`, `Slot::id` and `OffloadPlan::all_on_device` — and every
+other item is the same item at a different line. No item was newly exposed (a deletion can unmask a
+transitive callee, so this is checked, not assumed) and none was hidden. Item identity is
+`(file, name, kind)` (with the parser fix above); the line-keyed diff is misleading because the
+doc/annotation edits move lines.
+
+**Counts (rule 5), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-01.**
+`cargo test --release` → **480 / 0 / 36** unit + **10 / 0 / 6** integration.
+`bash scripts/cuda_test.sh` → **565 / 0 / 42**.
+`cargo check --release` and `cargo check --release --features cuda` exit 0 with **0 diagnostics**.
+The test build (which does not carry `deny(warnings)`) has an **unchanged warning multiset**:
+79 diagnostics before and after, with no new, removed or re-counted message; the only difference is
+the source line of one pre-existing `unused variable: pos` in `graph/builder/tests.rs`, shifted by
+the assertions this ticket added above it. No count row moves: no `#[test]` was added, removed or
+weakened, so `docs/status.toml` and the `AGENTS.md` rows are unchanged. `cargo fmt --all --check`,
+`check_status.py --check`, `check_docs_links.py` and `check_source_layout.py` are clean.
+
+**Bar named before measuring.** No item is load-bearing (the landed code changes are deletions and
+one constructor call whose result is identical), so the bar is the census identity plus the two test
+mutations: "the after-set is the before-set minus exactly the deleted/wired items", "the
+`live_peak` mutation is red", "the `Tensor::new` mutation is red" — stated before the after-capture
+and the two mutation runs, and measured by the tables above.
+
+**Escalated — reported on [#244], not landed.** (1) `BackendCaps` authority: the three
+`supports_*` fields are written by every `entry()` but read only by tests; the trait methods call the
+same module-level functions, so the answers cannot diverge, but the registry field is not the
+production read path. Options: make the trait/assignment read the caps (the design's intent, a real
+refactor), drop the three fields (small, removes the mirror), or keep them as the test-asserted
+mirror (what the code does). (2) `ModelDef::as_any` — no `src/` downcast outside `#[cfg(test)]`;
+keep as the test harness' handle or delete it and restructure that harness. (3) `ModelDef::offload`
+— the builders read `model.offload.plan` directly; wire them through the trait method or delete it.
+(4) `KvCache::set_owner` — `own_range` clamps where `set_owner` errors, so wiring is not
+behaviour-preserving; wire behind the clamp, delete it with its loud check, or keep it test-only.
+(5) The deferred `DType`/`Op`/`RopeStyle` variant membership (keep the vocabulary or delete the
+variants). (6) Removing `ModelDef::forward`'s legacy `&mut KVCache` parameter (the type is now an
+empty marker kept so the signature does not move). Each has a recommendation on the ticket; none
+changes behaviour, so none belongs in a dead-code cleanup silently.
+
+**Doc corrections landed.** `docs/BACKEND-REGISTRY-DESIGN.md` §3 + §10 carry the `BackendCaps`
+correction above; `src/models/{qwen2,qwen3}/mod.rs` no longer claim `ModelDef::offload()` hands the
+plan to the builders (they read the field); `src/graph/allocplan.rs`'s module doc no longer claims
+the plan is the feasibility gate. `clear_launch_failure`/`init_kv_cache` and the [#242] stale-doc
+items were already corrected or deleted by [#240]/[#242], and were re-checked here: no live doc
+still names them as callers. AGENTS.md Core Convention 5 gains one sentence: a deliberately retained
+**deferred** item says what would construct or read it.
+
+**Limits.** (1) The macOS-only modules (`metal.rs`, the Metal half of `graph/metal_backend.rs`) are
+not compiled on Linux, so their annotations are outside this census — the macOS CI job is the only
+gate, and the `ModelDef::forward_graph` cfg is written to be true on the macOS test build, where its
+one caller lives. (2) `--features debug_dump` was not built; no #244 item appears in `src/dump.rs`.
+(3) The census is a `cargo check`: a "caller" is a compile-time reference, so `all_on_device`'s new
+liveness rests on `resolve` being compiled in every build (the offload unit tests are the
+independent runtime check). (4) The `device_tier.rs` member annotations are asserted warning-free in
+the two non-test builds and the cuda test build, not on a macOS host (the module is CUDA-only).
+(5) The one-item parser fix above is applied to the durable `census.py` but is **not** in the repo:
+it does not change any site count, and it corrects item counts only.
+
+[#138]: https://github.com/yusiwen/minfer/issues/138
+[#209]: https://github.com/yusiwen/minfer/issues/209
+[#238]: https://github.com/yusiwen/minfer/issues/238
+[#239]: https://github.com/yusiwen/minfer/issues/239
+[#240]: https://github.com/yusiwen/minfer/issues/240
+[#241]: https://github.com/yusiwen/minfer/issues/241
+[#242]: https://github.com/yusiwen/minfer/issues/242
+[#243]: https://github.com/yusiwen/minfer/issues/243
+[#244]: https://github.com/yusiwen/minfer/issues/244
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
