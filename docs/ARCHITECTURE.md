@@ -383,7 +383,7 @@ type remains only as CLI plumbing.
    ComputeGraph` **deterministically in params** (the reuse invariant), using
    `GraphBuilder` — mirror llama.cpp's `llm_graph_context` builder methods.
 5. In `mod.rs`: implement `ModelDef` (`forward`, `build_graph`,
-   `forward_graph`, `forward_graph_cached`, `as_any`, `format_chat`,
+   `forward_graph`, `forward_graph_cached`, `as_any`,
    `special_tokens`, `n_layer`/`n_head_kv`/`n_embd_head`/`n_kv_embd`/`n_vocab`,
    `rope_style`). `models/qwen3/` is the worked example of a second
    architecture (decoupled head dim + per-head Q/K norm).

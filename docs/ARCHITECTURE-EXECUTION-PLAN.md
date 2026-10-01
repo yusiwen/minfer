@@ -6143,6 +6143,121 @@ the cached models and were unaffected — no test in that set was touched); thei
 still dated 2026-09-27. (5) `cc`'s tightening and the residual dead items are named above and left to
 [#242](https://github.com/yusiwen/minfer/issues/242)/[#243](https://github.com/yusiwen/minfer/issues/243)/[#244](https://github.com/yusiwen/minfer/issues/244).
 
+#### Test-infrastructure record (#242, 2026-10-01) — the remaining no-caller items are deleted
+
+**The ticket.** [#242](https://github.com/yusiwen/minfer/issues/242) is T3c of the `allow(dead_code)` census: bucket **A** — an item
+rustc reports dead in the maximal build (`--release --features cuda`) that is **still** dead with
+`--tests --features cuda`, i.e. nothing reaches it at all. It is the last of the census' *code* items
+after [#238](https://github.com/yusiwen/minfer/issues/238)/[#239](https://github.com/yusiwen/minfer/issues/239) (buckets B/C, test-only) and
+[#240](https://github.com/yusiwen/minfer/issues/240)/[#241](https://github.com/yusiwen/minfer/issues/241) (the legacy CUDA wrapper layer and the `device_entry` guard), and
+it closes [#235](https://github.com/yusiwen/minfer/issues/235)'s last row (`kv_cells_for`).
+
+**Reconciled numbers — the tracker was patched to this run.** The ticket body carried the `e9bf4c5`
+item list, so it was re-derived and the body rewritten:
+
+| tree | dead `src/` sites | dead items | bucket A code | bucket A shape |
+|---|---|---|---|---|
+| `e9bf4c5` — the durable census' recorded baseline | 314 | 260 | 89 | 32 |
+| `79c9837` — after [#238](https://github.com/yusiwen/minfer/issues/238)/[#239](https://github.com/yusiwen/minfer/issues/239) | 191 | 156 | — | — |
+| `5147d2c` — this branch's parent (after [#240](https://github.com/yusiwen/minfer/issues/240)/[#241](https://github.com/yusiwen/minfer/issues/241)) | **143** | **109** | **65** | 15 |
+| `8d3f54a` — this branch's final tree | **71** | **47** | **3** | 15 |
+
+Method, identical on both sides: `strip.py` in a scratch worktree (every `allow(dead_code)` replaced
+by a `//STRIPPED` comment, line numbers preserved), then `cargo check --release --features cuda
+--message-format=json`, counting **every** `src/` span of every `dead_code` diagnostic — rustc groups
+a dead `impl` into one diagnostic, so a primary-span-only read undercounts ~2.6×. The
+`--tests --features cuda` capture is the A-vs-B/C discriminator, and the `--cap-lints=warn` twins
+prove the `deny(warnings)` capture was not truncated (symmetric difference **0** on both cpu and
+cuda). The branch deletes **62 code items**; the counted drop is **72 sites / 62 items**, exactly the
+number deleted.
+
+**Per-file disposition (62 census items; every item read at its definition, its cross-module name
+matches read rather than name-matched, and `git log -S` read where its doc claimed a caller).**
+
+| file | items | what was deleted and why it was safely dead |
+|---|---|---|
+| `src/cache.rs` | 6 | `KVCacheLayer::{store, get_k, get_v, clear, store_multi}` and `KVCache::clear` — the graph path owns KV in the allocator; the type survives only as `forward`'s vestigial `&mut KVCache` argument (its fields are the shape items below) |
+| `src/cuda.rs` | 4 | the `cudaGetErrorString` FFI declaration + `cuda_error_string` (production names errors through `cuda_error_name`), the dead `minfer_site_hist_reset` FFI declaration (the `.cu` defines and calls its own), and the process-wide `stream_sync_count` with its `STREAM_SYNCS` static and the increment in `CudaState::sync` ([#185](https://github.com/yusiwen/minfer/issues/185) moved every gate to the backend's own counter) |
+| `src/gguf.rs` | 22 | `GgufType::type_name`; `GgufContext::{get_version, get_alignment, get_kv_type, get_val_u8…get_val_f64, get_val_str, get_val_data, get_n_tensors, find_tensor, get_tensor_offset, get_tensor_name, get_tensor_type, get_tensor_size, dump_metadata}` (main.rs has its own dumper). The surviving accessors are production- or test-reached, so the `impl GgufContext` `#[allow(dead_code)]` went with them |
+| `src/graph/mod.rs` | 2 | `ComputeGraph::{node_mut, n_elements}` |
+| `src/graph/alloc.rs` | 2 | `GraphAllocator::{kv_cells_for, reset_cross_stats}` |
+| `src/graph/backend.rs` | 1 (+3 impls) | the `Backend::name` trait method and its cpu/cuda/metal impls — the live name surface is `registry::Backend::name(self)`, the handle's own method |
+| `src/graph/params.rs` | 1 | `next_weights_version` (the `GraphParams::weights_version` field stays in the reuse identity) |
+| `src/models/mod.rs` | 1 | `ModelDef::format_chat` |
+| `src/models/qwen2/mod.rs` | 1 (+1 impl) | `format_chatml` and its `format_chat` impl |
+| `src/models/qwen3/mod.rs` | 2 (+1 impl) | `format_chatml`, the inherent `Qwen3Model::n_layer`, and the `format_chat` impl |
+| `src/tensor.rs` | 20 | `from_data_with_strides`, `nelements`, `nrows`, `ncols`, `data_mut`, `data_f32_mut`, the eight `data_q*`/`data_q*_mut` byte accessors, `get_f32`, `set_f32`, `copy_from`, `reshape`; with them the `impl Tensor` allow went |
+| `src/server/batch/tests.rs` | — | the test mock's `format_chat` (forced by the trait change; it was an `unreachable!()`, so no assertion changes) |
+
+**Named keeps, not silent leftovers.** `cudaStreamWaitEvent` + `CudaState::stream_wait_event` stay
+pending [#138](https://github.com/yusiwen/minfer/issues/138) (open — the F5 device→device staging copy). `ModelDef::forward_graph` stays because its
+only caller is `models::qwen2::graph::tests`'s `#[cfg(target_os = "macos")]` block
+(`tests.rs:3021`): the Linux census cannot compile it, `cargo test` on a Mac would not compile if the
+method were deleted, and CI's macOS job (`cargo build --release`) would not catch the break. That is
+this ticket's **one platform-cfg blind spot** in bucket A, found by reading the call site rather than
+by the oracle. The 15 bucket-A **shape** items (`KVCacheLayer`'s fields, `Vendor::{Amd,Mthreads,
+Apple}`, `AttnMode::Mha`, `SampledToken::logit`, `Slot::id`, `Tokenizer::{id_to_score,id_to_type}`,
+`HfCheckpoint::order`) are [#244](https://github.com/yusiwen/minfer/issues/244)'s decisions; `cc`'s
+annotation (2 of the 5 residual `src/cuda.rs` sites) is [#243](https://github.com/yusiwen/minfer/issues/243)'s.
+
+**No newly-dead items.** The before/after diff keyed on `(name, kind, container)` has an **empty
+"new" side**: 0 newly-dead. The after-set is a strict subset of the before-set, so deletion unmasked
+no transitive dead code — the `impl GgufContext` and `impl Tensor` allow-removals were the two places
+that could have exposed some, and neither did.
+
+**Findings — every doc that named a caller was stale; no lost caller.** `GgufType::type_name` ("only
+exercised by tests/debug tooling today") had no test caller, only the dead `dump_metadata`;
+`ComputeGraph::node_mut` ("fusion pass / debug tooling") is never called by the fusion pass;
+`ComputeGraph::n_elements` ("assertion / debug helper") by no assertion; `kv_cells_for` ("the
+resolver's C2 consumers are the backends") names a wrapper C2 never used — the backends read the
+resolved `cells` input through `kv_cells_for_seq` ([#235](https://github.com/yusiwen/minfer/issues/235)); `reset_cross_stats` ("a gate that wants
+an absolute number") by no gate — every F5 gate reads `cross_stats().delta(before)`;
+`next_weights_version` ("Phase 6 wires the model to bump it") was introduced by the Phase-4 commit
+and never gained a caller (`git log -S`), i.e. the A7 "a future feature will need it" pattern;
+`cuda_error_string` ("for diagnostics that want the prose form") by no diagnostic after
+[#122](https://github.com/yusiwen/minfer/issues/122); `Backend::name` ("part of the Backend API surface") by nothing — all `.name()`
+calls are on the registry handle; `ModelDef::format_chat`/`format_chatml` ("kept as the fallback
+implementation") by nothing — `template.rs` is the path; `Qwen3Model::n_layer` ("stays as a
+concrete-type helper") by no concrete-type caller; the `impl Tensor` "complete ggml_tensor interface
+(used by tests / debug tooling)" note and the `impl GgufContext` "public raw API surface (tests /
+debug tooling)" note likewise. None is the [#218](https://github.com/yusiwen/minfer/issues/218) *lost-caller* shape — no earlier cleanup
+removed a caller that this ticket then deleted — so nothing here is referred to
+[#244](https://github.com/yusiwen/minfer/issues/244) as a decision; the two bucket-**B** doc-vs-caller items [#239](https://github.com/yusiwen/minfer/issues/239) reported there
+(`KvCache::set_owner`, `OffloadPlan::all_on_device`) are outside this ticket's bucket and untouched.
+
+**Evidence form: the census re-run (this ticket's version of mutation evidence, as in #240).** There
+is no gate to mutate — the deleted code has no caller, so no test observes it. The observable claim
+is instead "the dead set shrank by exactly what was removed and nothing else became dead", and that
+is *measured* on both sides (table above): sites 143 → 71, items 109 → 47, the item drop equal to the
+62 deleted, and a before/after item diff whose "new" side is empty. The one test-adjacent edit is
+`stream_sync_counts_are_per_backend_not_process_wide`'s mutation note, which named the deleted
+process-wide counter as its mutation; it now names the still-available mutation (bump a process-wide
+static in `state_sync` and read it) and the test's two assertions are unchanged.
+
+**Counts (rule 5), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-01.**
+`cargo test --release` → **480 / 0 / 36** unit + **10 / 0 / 6** integration.
+`bash scripts/cuda_test.sh` → **565 / 0 / 42**.
+`compute-sanitizer --tool memcheck --target-processes all <test binary> --test-threads=1` →
+**0 API errors** over 565 / 0 / 42. No count row moves: no `#[test]` was added or removed, and every
+count above is the same number the #240/#241 record left. `cargo check --release`,
+`cargo check --release --features cuda` and `cargo check --release --tests --features cuda` all exit
+0; the non-test builds are warning-free and the only `warning:` line is `build.rs`'s pre-existing
+`cargo:warning=` target list. `cargo fmt --all --check` clean; `check_status.py --check`,
+`check_docs_links.py` and `check_source_layout.py` clean.
+
+**Bar named before measuring.** No `#[test]` is added, removed or weakened: the bar is "no test loses
+an assertion; every deletion is a no-caller item", and the evidence form is the census before/after
+(the deleted code has no gate to mutate, so a mutation-checked gate would be a claim about nothing).
+
+**Limits.** (1) The macOS-only modules and tests are not compiled here; `ModelDef::forward_graph` is
+the one bucket-A item that lives only behind `target_os = "macos"`, and it was kept for that reason —
+`build-macos` compiles the library, not the macOS-gated tests, so nothing in CI would have caught a
+deletion of it. (2) `--features debug_dump` was not built; every bucket-A name was grepped against
+its gated code (`src/dump.rs`, `src/quants.rs`, `src/main.rs`) and none appears there. (3) The
+counted census is a `cargo check`: a "caller" is a compile-time reference, not a verified runtime
+exercise; the suites above are the independent runtime check. (4) The real-model gate sets were not
+re-run (no test in that set was touched); their rows remain dated 2026-09-27.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define

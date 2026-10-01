@@ -138,7 +138,7 @@ run-able.
 1. `src/models/qwen3/mod.rs`
    - `Qwen3Model { hparams, tok_embd, output_norm, output, output_b, layers }`
      and `impl ModelDef` — copy `qwen2/mod.rs` (forward routes through the
-     graph; `format_chat` ChatML fallback; `special_tokens` from hparams;
+     graph; `special_tokens` from hparams;
      accessors use explicit `n_embd_head`).
    - `tensor_names`: copy + add
      `attn_q_norm(i) = "blk.{i}.attn_q_norm.weight"`,

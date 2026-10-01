@@ -395,7 +395,6 @@ pub trait ModelDef: Send + Sync {
     fn forward_graph_cached(&self, tokens: &[u32], positions: &[usize],
                             n_out: usize, n_ctx: usize, cache: &mut GraphCache)
                             -> Vec<f32> { ... }
-    fn format_chat(&self, messages: &[(String, String)]) -> String;
     fn special_tokens(&self) -> SpecialTokens;
     fn n_layer(&self) -> usize;
     fn n_head_kv(&self) -> usize;
@@ -418,7 +417,6 @@ not know which architecture it is talking to.
 | `n_head_kv`, `n_embd_head`, `n_kv_embd` | GQA (grouped-query attention: fewer K/V heads than query heads) head mapping and strides (doc 11), and the KV region width `n_kv_embd × n_ctx` (doc 07) |
 | `n_vocab` | logits width — the sampler's input size (doc 12) |
 | `special_tokens` | the sampler's stop condition: `main.rs` fetches `eos`/`im_end` ids once and checks every sampled token against them (`main.rs:839,900,1020`) |
-| `format_chat` | doc 04's ChatML fallback when the GGUF has no renderable template |
 | `rope_style` | doc 11: RoPE (rotary positional encoding) has two layout styles — Qwen's non-interleaved vs Llama's interleaved — and the vec-op must be told which |
 | `as_any` | lets graph code downcast to the concrete model when it needs specifics |
 | `Send + Sync` | the HTTP server shares the model across threads (`Arc<dyn ModelDef>`) |

@@ -1176,7 +1176,6 @@ pub trait ModelDef: Send + Sync {
     fn forward_graph_cached(&self, tokens, positions, n_out, n_ctx,
                             cache: &mut GraphCache) -> Vec<f32>;            // default: unimplemented!
 
-    fn format_chat(&self, messages: &[(String, String)]) -> String;
     fn special_tokens(&self) -> SpecialTokens;
     fn n_layer(&self) -> usize;
     fn n_head_kv(&self) -> usize;
