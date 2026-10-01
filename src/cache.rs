@@ -26,41 +26,6 @@ impl KVCacheLayer {
             dim,
         }
     }
-
-    pub fn store(&mut self, pos: usize, k: &[f32], v: &[f32]) {
-        let dim = self.dim;
-        let offset = pos * dim;
-        self.k[offset..offset + dim].copy_from_slice(k);
-        self.v[offset..offset + dim].copy_from_slice(v);
-        if pos + 1 > self.size {
-            self.size = pos + 1;
-        }
-    }
-
-    pub fn get_k(&self) -> &[f32] {
-        &self.k[..self.size * self.dim]
-    }
-
-    pub fn get_v(&self) -> &[f32] {
-        &self.v[..self.size * self.dim]
-    }
-
-    pub fn clear(&mut self) {
-        self.size = 0;
-    }
-
-    /// Store K/V for multiple positions at once.
-    pub fn store_multi(&mut self, positions: &[usize], k_rope: &[f32], v: &[f32]) {
-        let dim = self.dim;
-        for (i, &pos) in positions.iter().enumerate() {
-            let offset = pos * dim;
-            self.k[offset..offset + dim].copy_from_slice(&k_rope[i * dim..(i + 1) * dim]);
-            self.v[offset..offset + dim].copy_from_slice(&v[i * dim..(i + 1) * dim]);
-            if pos + 1 > self.size {
-                self.size = pos + 1;
-            }
-        }
-    }
 }
 
 /// KV cache for all layers.
@@ -75,11 +40,5 @@ impl KVCache {
             .map(|_| KVCacheLayer::new(max_seq_len, dim))
             .collect();
         Self { layers }
-    }
-
-    pub fn clear(&mut self) {
-        for l in &mut self.layers {
-            l.clear();
-        }
     }
 }

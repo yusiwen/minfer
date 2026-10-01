@@ -1080,13 +1080,6 @@ impl GraphAllocator {
         self.kv.is_identity()
     }
 
-    /// Host-side `position -> cell` resolution for a layer (Phase C / C1).
-    /// Today the identity; C2 is the only thing that changes its behaviour.
-    #[allow(dead_code)] // the resolver's C2 consumers are the backends
-    pub fn kv_cells_for(&self, layer: usize, positions: &[usize]) -> Result<Vec<u32>, String> {
-        self.kv.cells_for(layer, positions)
-    }
-
     /// Drop the identity fast path (Phase C / C2). After this the scheduler
     /// refuses to execute until the backends consume the resolved cell array,
     /// so a half-ported C2 fails loudly instead of writing the wrong row.
@@ -2570,13 +2563,6 @@ impl GraphAllocator {
     #[cfg(feature = "cuda")]
     pub fn cross_stats_mut(&mut self) -> &mut CrossCopyStats {
         &mut self.cross_stats
-    }
-
-    /// F5: forget what the boundaries did so far (a gate that wants an absolute
-    /// number rather than a delta).
-    #[allow(dead_code)]
-    pub fn reset_cross_stats(&mut self) {
-        self.cross_stats = CrossCopyStats::default();
     }
 
     /// F5: the staged buffer a consumer on `backend` must read for `node_id`.

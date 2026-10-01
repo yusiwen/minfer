@@ -128,13 +128,12 @@ pub struct CudaBackend {
     /// read path takes `&self` (the trait's `read_host` shape).
     blocking_readbacks: std::sync::atomic::AtomicU64,
     /// Issue #185: how many times **this backend** blocked the host on a whole
-    /// stream (`CudaState::sync`). Per instance, never the process-wide
-    /// `cuda::stream_sync_count()`: the F5 gates compare the async arm's stalls
-    /// against the synchronous arm's, and under a parallel harness a *foreign*
-    /// test's syncs landed between the two snapshots (run A: the async arm read
-    /// 4160 stalls against the synchronous arm's 728 — the harness's own load,
-    /// not the async path). Same hazard and same fix as `blocking_readbacks`,
-    /// which was per-instance from the start.
+    /// stream (`CudaState::sync`). Per instance, never process-wide: the F5
+    /// gates compare the async arm's stalls against the synchronous arm's, and
+    /// under a parallel harness a *foreign* test's syncs landed between the two
+    /// snapshots (run A: the async arm read 4160 stalls against the synchronous
+    /// arm's 728 — the harness's own load, not the async path). Same hazard and
+    /// same fix as `blocking_readbacks`, which was per-instance from the start.
     stream_syncs: std::sync::atomic::AtomicU64,
 }
 
@@ -650,12 +649,14 @@ impl CudaBackend {
     /// Issue #185: this backend's own count of full-stream host stalls
     /// (`CudaState::sync`, the only `cudaStreamSynchronize` in the device layer).
     ///
-    /// It is the per-instance twin of the process-wide
-    /// [`crate::cuda::stream_sync_count`], and the F5 gates read it: a delta
-    /// around one workload is then attributable to that workload, whereas the
-    /// process-wide total moves whenever *any* other thread syncs (the parallel
-    /// harness ran the F5 gate beside ~27 other device tests).
+    /// The F5 gates read this held per instance: a delta around one workload is
+    /// then attributable to that workload, whereas a process-wide total would
+    /// move whenever *any* other thread syncs (the parallel harness ran the F5
+    /// gate beside ~27 other device tests). The process-wide counter this
+    /// replaced was deleted in [#242].
     /// Test-only (#238): driven by `graph::cuda_backend::tests::stream_sync_counts_are_per_backend_not_process_wide`; `#[cfg(test)]` keeps it out of production builds.
+    ///
+    /// [#242]: https://github.com/yusiwen/minfer/issues/242
     #[cfg(test)]
     pub(crate) fn stream_sync_count(&self) -> u64 {
         self.stream_syncs.load(std::sync::atomic::Ordering::Relaxed)
@@ -2049,10 +2050,6 @@ pub fn register(registry: &mut super::registry::Registry) {
 }
 
 impl Backend for CudaBackend {
-    fn name(&self) -> &str {
-        "cuda"
-    }
-
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         supports_op(op, dtype)
     }

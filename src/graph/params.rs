@@ -12,8 +12,6 @@
 //! with the topology unchanged (see the `sequence_count_is_data_not_topology`
 //! test in `models/qwen2/graph.rs`).
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use super::kvformat::KvFormat;
 
 /// Decode (n_tokens=1, incremental) vs prefill (n_tokens>1) graph type.
@@ -97,12 +95,4 @@ pub struct GraphParams {
     pub cparams: CParams,
     /// Bumped by the model whenever weights change (LoRA switch, reload).
     pub weights_version: u64,
-}
-
-/// Global weight-version counter (Phase 6 wires the model to bump it; the
-/// counter exists so a future LoRA/reload path can break graph reuse).
-#[allow(dead_code)]
-pub fn next_weights_version() -> u64 {
-    static V: AtomicU64 = AtomicU64::new(1);
-    V.fetch_add(1, Ordering::Relaxed)
 }

@@ -1124,12 +1124,13 @@ fn a_partial_offload_runs_the_rest_on_the_cpu() {
 ///   run. The pre-F5 path synced the whole stream once *per staged input
 ///   inside* `copy_to_host`; the async path issues none of those. This is the
 ///   latency-shaped evidence, and it is a hard count, not a timing. It is read
-///   **through the backend** ([#185]): the process-wide
-///   `cuda::stream_sync_count()` let a concurrent device test's stalls land
-///   between the two snapshots (run A read 4160 async vs 728 sync — the
-///   harness's own load, not the async path).
+///   **through the backend** ([#185]): a process-wide counter let a concurrent
+///   device test's stalls land between the two snapshots (run A read 4160 async
+///   vs 728 sync — the harness's own load, not the async path). That
+///   process-wide counter was deleted in [#242].
 ///
 /// [#185]: https://github.com/yusiwen/minfer/issues/185
+/// [#242]: https://github.com/yusiwen/minfer/issues/242
 ///
 /// Ignored because it needs the cached 0.5B and a CUDA device. Run alone:
 ///
@@ -1195,10 +1196,10 @@ fn async_cross_copies_never_block_and_stay_bitwise_identical() {
             .cuda()
             .expect("the CUDA pool is enabled")
             .blocking_readback_count();
-        // #185: read the stall count through **this** backend, not the
-        // process-wide `cuda::stream_sync_count()`: a concurrent device test's
-        // syncs landed inside this delta and made the async arm look worse than
-        // the synchronous one (4160 vs 728 in the ticket's run A).
+        // #185: read the stall count through **this** backend, not a
+        // process-wide total: a concurrent device test's syncs landed inside
+        // this delta and made the async arm look worse than the synchronous one
+        // (4160 vs 728 in the ticket's run A).
         let syncs_before = cache
             .alloc()
             .cuda()
