@@ -309,9 +309,12 @@ so results are trustworthy and (b) transfers any *execution* error into the
 return value, checked and printed. Note what it does **not** do: no panic, no
 abort, no `Result`. `CudaState::sync` is a *drain point*; the safety contract
 lives one level up, in the backend, where invariant violations become `Err`.
-There is also a per-node debug variant, `debug_sync(il, label)`
-(`cuda.rs:2407`, gated behind `MINFER_CUDA_DEBUG=1`), printing the layer
-index and label with any launch or sync error — the bisection tool.
+There also used to be a per-node debug variant, `debug_sync(il, label)`
+(gated behind `MINFER_CUDA_DEBUG=1`), printing the layer index and label with
+any launch or sync error — the bisection tool. It belonged to the legacy
+`layer_gpu` surface and was deleted with it in [#240](https://github.com/yusiwen/minfer/issues/240)/[#241](https://github.com/yusiwen/minfer/issues/241);
+the graph path's `CudaState::sync()` is the drain point, and `MINFER_OP_TIMING=1`
+the per-op timing tool.
 
 Why "at sync points, not per launch"? The graph path launches ~100+ kernels
 per decode step; a `cudaGetLastError()` after each is cheap, but a *sync*
@@ -914,9 +917,6 @@ GB10 / CUDA 13.0 machine). Two experiments beyond the pasted runs:
 
 ```console
 $ cargo build --release --features cuda
-$ MINFER_CUDA_DEBUG=1 ./target/release/minfer <model.gguf> "hello"
-#   per-node lines from debug_sync (cuda.rs:2407): "l{il}: {label} OK",
-#   or the launch/sync error with the node's layer + label when something breaks
 $ MINFER_NO_CUDA_GRAPH=1 ./target/release/minfer <model.gguf> "hello"
 #   decode without graph replay — every kernel is a separate launch; compare
 #   tokens/s against the default (replay) run to feel §4's launch tax
