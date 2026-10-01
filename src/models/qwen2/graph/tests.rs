@@ -927,7 +927,7 @@ fn a_partial_offload_runs_the_rest_on_the_cpu() {
     let reference = crate::models::qwen2::loader::load(&gguf, "cpuref.", OffloadRequest::Layers(0))
         .expect("load the CPU reference");
     assert_eq!(reference.device(), Device::Cpu);
-    assert_eq!(reference.offload().gpu_layers, 0);
+    assert_eq!(reference.offload.plan.gpu_layers, 0);
 
     // The mixed model: `k` blocks on the device, the rest on the CPU.
     let mixed = crate::models::qwen2::loader::load(&gguf, "", OffloadRequest::Layers(k))
@@ -939,7 +939,7 @@ fn a_partial_offload_runs_the_rest_on_the_cpu() {
         );
         return;
     }
-    let plan = mixed.offload();
+    let plan = mixed.offload.plan;
     assert_eq!((plan.gpu_layers, plan.cpu_layers()), (k, n_layers - k));
     let report = mixed
         .offload_report()
@@ -1002,8 +1002,10 @@ fn a_partial_offload_runs_the_rest_on_the_cpu() {
     let n_ctx = 256;
     let steps = 4;
 
-    // Run both, greedily, and compare the token sequences.
-    let run = |model: &dyn ModelDef| -> Vec<u32> {
+    // Run both, greedily, and compare the token sequences. The plan is passed in
+    // because the closure takes `&dyn ModelDef` and since #244 the plan surface is
+    // the concrete `model.offload.plan` field, not a trait method.
+    let run = |model: &dyn ModelDef, plan: crate::graph::offload::OffloadPlan| -> Vec<u32> {
         let mut cache = GraphCache::new();
         cache.alloc().kv_set_capacity(n_ctx);
         let mut l =
@@ -1043,7 +1045,7 @@ fn a_partial_offload_runs_the_rest_on_the_cpu() {
             cuda_splits.len(),
             cpu_splits.len()
         );
-        if model.offload().is_mixed() {
+        if plan.is_mixed() {
             assert!(
                 n_cuda > 0 && n_cpu > 0,
                 "a mixed plan must place nodes on both"
@@ -1086,8 +1088,8 @@ fn a_partial_offload_runs_the_rest_on_the_cpu() {
         toks
     };
 
-    let want = run(&reference);
-    let got = run(&mixed);
+    let want = run(&reference, reference.offload.plan);
+    let got = run(&mixed, mixed.offload.plan);
     assert_eq!(
         got, want,
         "a partial offload must produce the same greedy tokens as the all-CPU run"
@@ -1394,7 +1396,7 @@ fn an_auto_offload_plan_fits_the_budget() {
         );
         return;
     }
-    let plan = mixed.offload();
+    let plan = mixed.offload.plan;
     assert!(
         plan.gpu_layers > 0 && plan.gpu_layers < n_layers,
         "a 64 MiB budget must be a strict prefix, got {plan:?}"
@@ -1449,7 +1451,7 @@ fn an_auto_offload_plan_fits_the_budget() {
     )
     .expect("load the auto (whole-device-budget) model");
     assert_eq!(
-        full.offload().gpu_layers,
+        full.offload.plan.gpu_layers,
         n_layers,
         "a budget covering the device's free bytes must offload every block: {}",
         full.offload_report().unwrap_or_default()

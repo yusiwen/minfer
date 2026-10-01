@@ -123,9 +123,9 @@ impl Default for CpuBackend {
 
 /// F4: the CPU capability matrix, as a free function.
 ///
-/// The registry carries this as [`super::registry::BackendCaps::supports_op`],
-/// which cannot take a `&self`; the trait method below forwards to it, so the
-/// registry's answer and the trait's answer are the same code.
+/// This is the **authority** for the answer: the `Backend` trait method below
+/// forwards to it (the function cannot take a `&self`), and assignment reads the
+/// trait method (`graph::backend_takes`). The registry does not carry a copy.
 pub fn supports_op(op: &Op, dtype: DType) -> bool {
     if dtype != DType::F32 {
         return false;
@@ -230,9 +230,6 @@ pub fn entry() -> super::registry::BackendEntry {
         name: "cpu",
         priority: PRIORITY_CPU,
         caps: BackendCaps {
-            supports_op,
-            supports_fused,
-            supports_attn_span: SUPPORTS_ATTN_SPAN,
             reads_packed_kv: READS_PACKED_KV,
         },
         pool: |a| Some(a.cpu()),

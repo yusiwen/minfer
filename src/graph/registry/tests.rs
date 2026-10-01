@@ -1,6 +1,11 @@
 //! `#[cfg(test)] mod tests` for `src/graph/registry.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
+// The capability free functions the trait forwards to — imported here because
+// the parent module no longer imports them (only tests name the op/dtype types
+// now that `BackendCaps` carries just `reads_packed_kv`, [#244]).
+use crate::graph::ops::{FusedOp, Op};
+use crate::graph::DType;
 
 /// The registered set, per configuration. Pinned so a backend that stops
 /// registering (or gains an entry it should not have) fails here.
@@ -156,11 +161,10 @@ fn names_resolve_and_unknown_names_are_refused() {
     #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
     {
         assert!(!Backend::METAL.is_registered());
-        assert!(!(Backend::METAL.caps().supports_op)(&Op::Input, DType::F32));
-        assert!(!(Backend::CUDA.caps().supports_fused)(&FusedOp::SwiGLU));
-        assert!(!Backend::CUDA.caps().supports_attn_span);
+        assert!(!Backend::METAL.caps().reads_packed_kv);
+        assert!(!Backend::CUDA.caps().reads_packed_kv);
         assert!(Backend::CPU.is_registered());
-        assert!((Backend::CPU.caps().supports_op)(&Op::Input, DType::F32));
+        assert!(Backend::CPU.caps().reads_packed_kv);
         // "not compiled in" is not "available": the reason is still named.
         assert!(unavailable_reason(Backend::METAL).is_some());
         // …and a name that exists but is not in this binary is *not* the
@@ -287,16 +291,23 @@ fn the_packed_kv_capability_is_the_registrys_answer() {
     }
 }
 
-/// The capability matrix the registry advertises is the matrix the trait
-/// answers — the two are one authority, so a graph can never be assigned to
-/// a backend whose trait would refuse the op.
+/// The capability answer is **one authority**: each `Backend` trait method
+/// forwards to its backend module's own free function or constant, and the
+/// assignment pass reads the trait method. Nothing keeps a second copy, so a
+/// graph can never be assigned to a backend whose trait would refuse the op.
+///
+/// Repointed in [#244]: the test used to compare `Backend::CPU.caps()` (a
+/// registry field) against the trait. The registry no longer carries the three
+/// `supports_*` fields, so the comparison is now module function vs. trait —
+/// which is the authority the field merely mirrored.
+///
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[test]
 fn registry_caps_match_the_backend_trait() {
     use super::super::backend_takes;
-    use super::super::cpu_backend::CpuBackend;
+    use super::super::cpu_backend::{self, CpuBackend};
     use crate::graph::backend::Backend as BackendTrait;
     let cpu = CpuBackend::new();
-    let caps = Backend::CPU.caps();
     for op in [
         Op::Input,
         Op::Add,
@@ -306,21 +317,21 @@ fn registry_caps_match_the_backend_trait() {
     ] {
         for dtype in [DType::F32, DType::F16] {
             assert_eq!(
-                (caps.supports_op)(&op, dtype),
+                cpu_backend::supports_op(&op, dtype),
                 BackendTrait::supports_op(&cpu, &op, dtype),
                 "{op:?} {dtype:?}"
             );
         }
     }
     assert_eq!(
-        caps.supports_attn_span,
+        cpu_backend::SUPPORTS_ATTN_SPAN,
         BackendTrait::supports_attn_span(&cpu)
     );
     assert_eq!(
-        (caps.supports_fused)(&FusedOp::SwiGLU),
+        cpu_backend::supports_fused(&FusedOp::SwiGLU),
         BackendTrait::supports_fused(&cpu, &FusedOp::SwiGLU)
     );
-    // …and the assignment answers what the caps say.
+    // …and the assignment answers what the trait says.
     let alloc = GraphAllocator::new();
     assert_eq!(
         alloc.supports(&Op::Silu, DType::F32).is_some(),

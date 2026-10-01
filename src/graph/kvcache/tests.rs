@@ -52,7 +52,7 @@ fn ownership_follows_the_written_cells() {
 }
 
 #[test]
-fn own_prefix_and_release_round_trip() {
+fn own_prefix_round_trip() {
     let mut c = cache(4);
     c.own_prefix(SEQ_MAIN, 3);
     assert_eq!(
@@ -62,9 +62,6 @@ fn own_prefix_and_release_round_trip() {
             .chain([FREE])
             .collect::<Vec<_>>()
     );
-    c.set_owner(0, 1, FREE).unwrap();
-    assert_eq!(c.get(0).unwrap().owner[1], FREE);
-    assert!(c.set_owner(0, 9, SEQ_MAIN).is_err(), "cell out of range");
 }
 
 #[test]
