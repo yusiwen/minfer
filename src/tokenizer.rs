@@ -258,10 +258,25 @@ fn byte_encode(text: &str, byte_to_unicode: &HashMap<u8, char>) -> String {
 #[derive(Clone)]
 pub struct Tokenizer {
     pub id_to_token: Vec<String>,
-    /// Score / type / special-token maps are loaded from GGUF metadata for
-    /// llama.cpp parity; the engine reads `id_to_token` + `vocab` + `merges`.
+    /// The GGUF `tokenizer.ggml.scores` array, parsed for llama.cpp parity.
+    ///
+    /// Retained with an allowance ([#244]'s verdict: keep, deferred): the engine
+    /// reads `id_to_token` + `vocab` + `merges`, and nothing reads the scores —
+    /// the field is dead in every build. What would read it: a sampler or
+    /// diagnostic that weights candidates by the vocabulary's declared score
+    /// (llama.cpp's `llama_token_data` carries it).
+    ///
+    /// [#244]: https://github.com/yusiwen/minfer/issues/244
     #[allow(dead_code)]
     pub id_to_score: Vec<f32>,
+    /// The GGUF `tokenizer.ggml.token_type` array.
+    ///
+    /// Retained with an allowance ([#244]'s verdict: keep, deferred): the *field*
+    /// is dead in every build, but the loader's local copy of the same array is
+    /// what derives the special-token table (`special_tokens` /
+    /// `special_by_first`, types 3/4), so the parse is not dead — only this copy
+    /// of it. What would read the field: a diagnostic or writer that re-emits the
+    /// metadata, or a tokenizer test that inspects the loaded types.
     #[allow(dead_code)]
     pub id_to_type: Vec<i32>,
     pub vocab: HashMap<String, u32>,
@@ -269,7 +284,12 @@ pub struct Tokenizer {
     byte_to_unicode: HashMap<u8, char>,
     /// Reverse mapping for decode
     unicode_to_byte: HashMap<char, u8>,
-    #[allow(dead_code)]
+    /// Special-token map parsed from GGUF types 3/4.
+    ///
+    /// Read only by `tokenizer::tests` (`rebuild_special_index`) and
+    /// `conversation::tests`; production matches through `special_by_first`,
+    /// which the loader builds from this map.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub special_tokens: HashMap<String, u32>,
     /// The pre-tokenization rule selected from `tokenizer.ggml.pre` (F7).
     pub pre: PreTokenizer,
@@ -279,13 +299,16 @@ pub struct Tokenizer {
     /// converters mark special tokens as type 1 still match.
     special_by_first: HashMap<char, Vec<(String, u32)>>,
     pub bos_token: u32,
-    // Reserved special-token ids (special-token handling flows through
-    // `special_tokens()` / SpecialTokens; these are kept for API completeness).
-    #[allow(dead_code)]
+    /// The EOS id; production reads it (`spec::SpecEngine` and the special-token
+    /// table).
     pub eos_token: u32,
-    #[allow(dead_code)]
+    /// Reserved `<|im_start|>` id. Read only by `tokenizer::tests`; production
+    /// reaches the token through the merged special-token index.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub im_start: u32,
-    #[allow(dead_code)]
+    /// Reserved `<|im_end|>` id. Read only by `conversation::tests` /
+    /// `grammar::tests`; production reaches it through `SpecialTokens`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub im_end: u32,
 }
 

@@ -163,7 +163,9 @@ fn an_empty_plan_is_free() {
 #[test]
 fn the_live_peak_is_not_the_reserved_total() {
     // Three intervals of the same class, one at a time: the pool holds one buffer,
-    // and the live peak is that one buffer too.
+    // and the live peak is that one buffer too. Each interval's `first == last`, so
+    // this case also pins `live_peak`'s two-pass order: a single pass would add and
+    // remove the interval inside its step and report 0.
     let plan = AllocPlan::plan(&[(4096, 0, 0), (4096, 1, 1), (4096, 2, 2)]);
     assert_eq!(plan.buffers, 1);
     assert_eq!(plan.live_peak_bytes, class_bytes(4096));
@@ -173,6 +175,18 @@ fn the_live_peak_is_not_the_reserved_total() {
     // as the reserved total (nothing to recycle yet).
     let plan = AllocPlan::plan(&[(4096, 0, 1), (8192, 0, 1)]);
     assert_eq!(plan.live_peak_bytes, plan.reserved_bytes);
+    // Two different classes whose lifetimes never overlap: both buffers are reserved
+    // for the whole run, but only one is live at a time. This is the shape the two
+    // numbers differ on — the assertion `plan` needs to make so that `live_peak`'s
+    // arithmetic is observable at all ([#244]: before the fix the in-loop
+    // `peak.max(live)` masked it and mutating `live += class_bytes(..)` to `+= 0`
+    // left this test green).
+    //
+    // [#244]: https://github.com/yusiwen/minfer/issues/244
+    let plan = AllocPlan::plan(&[(4096, 0, 1), (8192, 2, 3)]);
+    assert_eq!(plan.buffers, 2);
+    assert_eq!(plan.reserved_bytes, class_bytes(4096) + class_bytes(8192));
+    assert_eq!(plan.live_peak_bytes, class_bytes(8192));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -235,8 +249,6 @@ impl AllocPlan {
             std::collections::BTreeMap::new();
         let mut classes = vec![0usize; intervals.len()];
         let mut reserved = 0usize;
-        let mut live = 0usize;
-        let mut peak = 0usize;
         let mut buffers = 0usize;
         let mut reused = 0usize;
         for i in order {
@@ -255,16 +267,17 @@ impl AllocPlan {
                 None => {
                     buffers += 1;
                     reserved += class_bytes(class);
-                    live += class_bytes(class);
-                    peak = peak.max(live);
                 }
             }
             free.entry(class).or_default().push(last);
             classes[i] = class;
         }
-        // The transient peak needs the free-at steps, not just the count: recompute over
-        // the same placement in step order.
-        peak = peak.max(live_peak(intervals, &classes));
+        // The live peak needs the free-at steps, not just the buffer count, so it is
+        // recomputed over the same placement in step order. [#244]: this is the *only*
+        // source of `live_peak_bytes`; the old in-loop `peak` tracked a `live` that never
+        // decreased, so `peak == reserved_bytes` and `peak.max(live_peak(..))` could never
+        // observe `live_peak` — the arithmetic and the assertion were both vacuous.
+        let peak = live_peak(intervals, &classes);
         AllocPlan {
             classes,
             reserved_bytes: reserved,
@@ -276,7 +289,9 @@ impl AllocPlan {
 }
 
 /// The live-bytes peak of a placement: walk the steps, adding each interval's class when
-/// its lifetime starts and removing it when it ends.
+/// its lifetime starts and removing it when it ends — in two passes, so an interval whose
+/// `first == last` is counted for its one step (a single pass adds and removes it within
+/// the step and reports 0).
 ///
 /// Test-only (#239): reached only through `AllocPlan::plan`.
 fn live_peak(intervals: &[(usize, usize, usize)], classes: &[usize]) -> usize {
@@ -287,15 +302,17 @@ fn live_peak(intervals: &[(usize, usize, usize)], classes: &[usize]) -> usize {
     let mut live = 0usize;
     let mut peak = 0usize;
     for step in 0..=last_step {
-        for (i, &(_, first, last)) in intervals.iter().enumerate() {
+        for (i, &(_, first, _)) in intervals.iter().enumerate() {
             if first == step {
                 live += class_bytes(classes[i]);
             }
+        }
+        peak = peak.max(live);
+        for (i, &(_, _, last)) in intervals.iter().enumerate() {
             if last == step {
                 live = live.saturating_sub(class_bytes(classes[i]));
             }
         }
-        peak = peak.max(live);
     }
     peak
 }

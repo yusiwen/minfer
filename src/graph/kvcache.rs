@@ -317,14 +317,17 @@ impl KvCache {
 
     /// Mark `cell` owned by `seq` in every layer (or release it with `FREE`).
     ///
-    /// **(a) verdict, [#239](https://github.com/yusiwen/minfer/issues/239): reported, not moved.** The
-    /// doc used to read "C1 uses it from `own_range`", but `own_range` (`kvcache.rs:517`) writes
-    /// `l.owner[cell] = seq` inline and never calls this. The only callers are
-    /// `graph::kvcache::tests`. A helper whose documented production caller does not exist is the
-    /// #218 shape — either `own_range`/`note_written` should be expressed through it, or it should be
-    /// deleted. A decision for [#244](https://github.com/yusiwen/minfer/issues/244), so the
-    /// annotation stays.
-    #[allow(dead_code)] // C2 surface
+    /// **(a) verdict, [#244](https://github.com/yusiwen/minfer/issues/244): kept, escalated — not wired.**
+    /// [#239](https://github.com/yusiwen/minfer/issues/239) reported that the doc named a production
+    /// caller that does not exist: `own_range` writes `l.owner[cell] = seq` inline, and the only
+    /// callers are `graph::kvcache::tests`. `[#244]` did **not** express `own_range` through this
+    /// method, because the wiring is not behaviour-preserving: `own_range` **clamps** `to` to the
+    /// arena (`to.min(l.owner.len())`) and is infallible, while `set_owner` **errors** on a cell at
+    /// or past the arena — so routing the production write through it would turn a silent clamp
+    /// into a load-time failure. The three options (wire it behind the clamp / delete it with its
+    /// test, losing the loud out-of-range check / keep it as the test-only C2 surface) are reported
+    /// on the ticket. The `not(test)` allowance names the one build where it is unused.
+    #[cfg_attr(not(test), allow(dead_code))] // C2 surface, test-reached
     pub fn set_owner(&mut self, layer: usize, cell: usize, seq: SeqId) -> Result<(), String> {
         let l = self
             .layers

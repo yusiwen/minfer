@@ -218,13 +218,17 @@ pub struct HfCheckpoint {
     pub tensors: Vec<HfTensor>,
     /// Tensor order as it will be written (canonical, not header order).
     ///
-    /// Kept, with an allowance rather than deleted: `canonical_order` computes the
-    /// permutation but nothing applies it — the writer emits `specs` in the
-    /// name-sorted order `HfCheckpoint::open` produced, so the field records an
-    /// intent that was never wired. Whether to apply it (which changes the output
-    /// file's tensor order, and therefore what #209's `convert_hf_to_gguf.py`
-    /// comparison sees) or to drop it is a decision for that ticket, not for a
-    /// dead-code cleanup.
+    /// Retained with an allowance rather than deleted ([#244]'s verdict: keep,
+    /// deferred): `canonical_order` computes the permutation but nothing applies
+    /// it — the writer emits `specs` in the name-sorted order
+    /// `HfCheckpoint::open` produced, so the field records an intent that was
+    /// never wired. Whether to apply it (which changes the output file's tensor
+    /// order, and therefore what [#209]'s `convert_hf_to_gguf.py` comparison sees)
+    /// or to drop it is [#209]'s decision, not a dead-code cleanup's; the reader
+    /// that would apply it is that ticket's writer change.
+    ///
+    /// [#209]: https://github.com/yusiwen/minfer/issues/209
+    /// [#244]: https://github.com/yusiwen/minfer/issues/244
     #[allow(dead_code)]
     pub order: Vec<usize>,
 }

@@ -189,14 +189,19 @@ pub fn ffn_composition(requested: Option<&str>, device: Device) -> bool {
 /// `Send + Sync` so a model can be shared across threads (the HTTP server's
 /// worker thread owns the only inference path; `Arc<dyn ModelDef>` is used by
 /// the OpenAI-compatible server, OPENAI-CHAT-API-PLAN.md).
-// NOTE: rustc's dead-code lint flags this trait's `as_any` and `offload` in a
-// non-test build (their callers are test code) and `forward_graph` on a Linux
-// host (its one caller sits in a `#[cfg(target_os = "macos")]` test block), so
-// the trait is allow'd as the model API surface. `format_chat` had no caller in
-// any build and was deleted in [#242]; template.rs is the chat-rendering path.
-//
-// [#242]: https://github.com/yusiwen/minfer/issues/242
-#[allow(dead_code)]
+///
+/// Three members are dead in a non-test Linux build, and each names its own
+/// configuration ([#244], replacing the trait-level blanket #243 left):
+/// `as_any`/`offload` are test-reached, `forward_graph`'s one caller sits in a
+/// `#[cfg(target_os = "macos")]` test block. Whether `as_any` (no `src/`
+/// downcast outside `#[cfg(test)]`) and `offload` (the builder reads the
+/// concrete `model.offload` field) should exist at all is [#244]'s reported
+/// decision, not a dead-code cleanup — so the annotations are precise but the
+/// members stay. `format_chat` had no caller in any build and was deleted in
+/// [#242]; template.rs is the chat-rendering path.
+///
+/// [#242]: https://github.com/yusiwen/minfer/issues/242
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 pub trait ModelDef: Send + Sync {
     /// Single-shot forward. `n_ctx` sizes the graph's persistent KV regions
     /// (the graph path; the legacy `kv` arg is ignored there). Callers must
@@ -211,6 +216,13 @@ pub trait ModelDef: Send + Sync {
     ) -> Vec<f32>;
 
     /// Downcast helper for the graph path's weight registration.
+    ///
+    /// Read only by tests (`models::qwen2::graph::tests`,
+    /// `graph::cuda_backend::tests`, `tooling::tests`, `metal::mmap_align_test`,
+    /// `cuda::issue218_tests`); no `src/` production path downcasts. The
+    /// `not(test)` allowance is [`#244`](https://github.com/yusiwen/minfer/issues/244)'s
+    /// explicit keep's; the membership question is reported there.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// C4 per-engine (issue #99): the KV storage format this engine resolved from
@@ -236,6 +248,15 @@ pub trait ModelDef: Send + Sync {
     }
 
     /// Graph-based forward (Phase 6); defaults to the imperative path.
+    ///
+    /// Reachable from a `#[cfg(target_os = "macos")]` **test** block only
+    /// (`models::qwen2::graph::tests::graph_metal_matches_cpu_logits`), so the
+    /// allowance names both halves of the configuration in which it is unused —
+    /// a non-test build or a non-macOS host ([#244]; [#243]'s rule).
+    ///
+    /// [#243]: https://github.com/yusiwen/minfer/issues/243
+    /// [#244]: https://github.com/yusiwen/minfer/issues/244
+    #[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]
     fn forward_graph(
         &self,
         tokens: &[u32],
@@ -294,6 +315,13 @@ pub trait ModelDef: Send + Sync {
     /// could not honour has already been reduced to what it can). The default is "no block
     /// on the device", which is the pre-E5 behaviour for an implementation that does not
     /// override it.
+    ///
+    /// Read only by tests (`models::qwen2::graph::tests`); the graph builders read the
+    /// concrete `model.offload.plan` field directly, which is why the trait method carries
+    /// the `not(test)` allowance. Whether the builders should call *this* method, or the
+    /// trait method should be deleted and the field kept, is
+    /// [`#244`](https://github.com/yusiwen/minfer/issues/244)'s reported decision.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn offload(&self) -> crate::graph::offload::OffloadPlan {
         crate::graph::offload::OffloadPlan::all_on_cpu(self.n_layer())
     }

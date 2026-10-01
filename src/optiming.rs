@@ -245,20 +245,31 @@ pub fn flag_from_env(value: Option<&std::ffi::OsString>) -> bool {
 /// Chosen when the scheduler is constructed, so the decision is a value its
 /// owner holds rather than a process-wide flag another thread can flip under it.
 /// The default is [`TimingMode::Global`], the pre-#173 production behaviour.
-/// `Off`/`Private` are constructed by tests and by a caller that wants its own
-/// destination, so a non-test build sees only `Global`.
+/// `Off`/`Private` are constructed only by tests today, so each carries its own
+/// `not(test)` allowance and names the caller that would construct it — a
+/// separate member-level annotation rather than a blanket on the enum, so
+/// `Global` stays checked ([#243]'s rule, applied in [#244]).
+///
+/// [#243]: https://github.com/yusiwen/minfer/issues/243
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Clone, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum TimingMode {
     /// Production: follow `MINFER_OP_TIMING` (once per `execute`) and record
     /// into the process-global sink when it is on.
     #[default]
     Global,
-    /// Never read the clock and never record.
+    /// Never read the clock and never record. Constructed by
+    /// `optiming::tests`; a production caller that wants timing off without
+    /// touching the environment would construct it.
+    #[cfg_attr(not(test), allow(dead_code))]
     Off,
     /// Record into a caller-owned sink, gated by a caller-owned flag. This is
     /// the isolation seam: a test owns both the destination and the on/off
     /// decision, so its assertions read only the rows its own scheduler wrote.
+    /// Constructed by `optiming::tests` and `graph::scheduler::tests`; a caller
+    /// that wants per-instance timing (rather than the process-global sink)
+    /// would construct it.
+    #[cfg_attr(not(test), allow(dead_code))]
     Private {
         sink: Arc<TimingSink>,
         enabled: bool,

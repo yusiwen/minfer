@@ -10,22 +10,21 @@
 //! This module is the **reserve** half — a *pure* plan over `(size, first use, last use)`
 //! intervals that assigns each activation a size class, recycles a class buffer once its
 //! interval ends, and reports what the pool will have to hold. The **assign** half is the
-//! allocator's pool loop, which now asks for the class size; the plan is checked against a
-//! per-backend budget *before* that loop runs, so an over-budget graph is refused with its
-//! numbers instead of failing later.
-//!
-//! **(a) note, [#239](https://github.com/yusiwen/minfer/issues/239):** the sentence above describes a
-//! production consumer of the *pure plan* that does not exist — `AllocPlan::plan` has no caller
-//! outside `graph::allocplan::tests`, and the gate the sentence means is `GraphAllocator::alloc_in_pool`
-//! (per-allocation `weights + pooled + this`, via `allocplan::budget_decision`), not the plan. The plan
-//! itself is the test oracle for the pool loop, so #239 moves it (with `live_peak`) into this module's
-//! `tests.rs`; whether the feasibility gate *should* run the plan is [#244](https://github.com/yusiwen/minfer/issues/244)'s question.
-//! The wording above is deliberately left in place rather than quietly rewritten.
+//! allocator's pool loop, which asks for the class size; **the feasibility gate is
+//! `GraphAllocator::alloc_in_pool`, per allocation** (`weights + pooled + this allocation
+//! at its size class`, resolved through [`budget_decision`]) — *not* the pure plan.
+//! `AllocPlan::plan` has no production caller: [#239] moved it (with `live_peak`) into
+//! `graph/allocplan/tests.rs`, where it is the oracle the pool loop's numbers are checked
+//! against. Whether the feasibility gate *should* run the plan is [#244]'s reported
+//! question; the earlier wording claimed that gate for the plan, and [#244] corrected it.
 //!
 //! The class is a pure function of the size ([`class_size`]), which is what lets the plan
 //! and the pool agree without a lookup table between them: the plan's aggregate numbers
-//! (reserved bytes, live peak, how many buffers get recycled) are simulated here, and the
-//! pool simply rounds every request the same way.
+//! (reserved bytes, live peak, how many buffers get recycled) are simulated in the test
+//! oracle, and the pool rounds every request the same way.
+//!
+//! [#239]: https://github.com/yusiwen/minfer/issues/239
+//! [#244]: https://github.com/yusiwen/minfer/issues/244
 
 /// Smallest class, in f32 elements (1 KiB).
 pub const CLASS_MIN: usize = 256;

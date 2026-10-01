@@ -4,6 +4,24 @@ use super::*;
 
 fn f32_tensor(name: &str, shape: [i64; 4]) -> Tensor {
     let mut t = Tensor::new(crate::tensor::TensorType::F32, &shape);
+    // [#244]: this helper is `Tensor::new`'s only consumer, and every assertion in
+    // the tests below reads `name` or a graph shape — never the strides or the
+    // allocation `Tensor::new` computes. Without these the body could be wrong
+    // (a zeroed stride, a mis-sized buffer) with every gate still green; #239
+    // recorded the gap, this closes it. `nbytes()` is derived from the strides,
+    // so the two assertions together observe both halves of the body.
+    //
+    // [#244]: https://github.com/yusiwen/minfer/issues/244
+    assert_eq!(t.strides[0], 4, "f32 element stride");
+    assert_eq!(t.strides[1], 4 * shape[0] as usize);
+    assert_eq!(t.strides[2], t.strides[1] * shape[1] as usize);
+    assert_eq!(t.strides[3], t.strides[2] * shape[2] as usize);
+    assert_eq!(
+        t.nbytes(),
+        4 * shape.iter().map(|&d| d as usize).product::<usize>(),
+        "a dense f32 tensor of {shape:?}"
+    );
+    assert_eq!(t.data.len(), t.nbytes(), "the buffer is allocated");
     t.name = name.to_string();
     t
 }

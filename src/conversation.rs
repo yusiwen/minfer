@@ -313,15 +313,26 @@ enum BreakKind {
 }
 
 /// The result of one generation turn.
-// text / stopped_by_* are emitted by the streaming emit path; the fields are kept as structured results (for tests).
+///
+/// `text` / `stopped_by_eog` / `stopped_by_string` are emitted by the streaming
+/// emit path as locals; the *fields* are read only by tests
+/// (`conversation::tests`, `grammar::tests`, `server::batch::tests`), so each
+/// carries the `not(test)` allowance rather than a bare one (`[#243]`'s rule,
+/// applied in `[#244]`). A caller that wants the structured result instead of the
+/// streamed deltas would read them in production.
+///
+/// [#243]: https://github.com/yusiwen/minfer/issues/243
+/// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Debug)]
 pub struct TurnOutcome {
     /// The assistant-generated text (after stop-string truncation; without the EOG).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub text: String,
-    #[allow(dead_code)]
+    /// Read by `conversation::tests`; the streaming path uses the local.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub stopped_by_eog: bool,
-    #[allow(dead_code)]
+    /// Read by `conversation::tests`; the streaming path uses the local.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub stopped_by_string: bool,
     /// n_predict exhausted or the context is full.
     pub hit_n_predict: bool,

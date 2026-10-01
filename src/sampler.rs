@@ -10,9 +10,6 @@ use crate::grammar::{Grammar, GrammarState};
 #[derive(Debug)]
 pub struct SampledToken {
     pub token_id: u32,
-    /// Logit of the sampled token (result metadata; callers read `token_id`).
-    #[allow(dead_code)]
-    pub logit: f32,
 }
 
 /// A failure of the one pipeline (F2, #47). Both variants are loud stops: a
@@ -52,10 +49,7 @@ pub fn sample_greedy(logits: &[f32]) -> SampledToken {
             best_id = i as u32;
         }
     }
-    SampledToken {
-        token_id: best_id,
-        logit: best_val,
-    }
+    SampledToken { token_id: best_id }
 }
 
 /// Combined penalty pass over the tokens in `prev_tokens` (the caller keeps the
@@ -284,15 +278,11 @@ pub fn sample_temperature<R: Rng>(logits: &mut [f32], temp: f32, rng: &mut R) ->
         }
         cumulative += v;
         if r <= cumulative {
-            return SampledToken {
-                token_id: i as u32,
-                logit: v,
-            };
+            return SampledToken { token_id: i as u32 };
         }
     }
     SampledToken {
         token_id: (logits.len() - 1) as u32,
-        logit: logits[logits.len() - 1],
     }
 }
 
@@ -952,10 +942,7 @@ pub fn sample_mirostat_v2<R: Rng>(
 ) -> SampledToken {
     let cand = softmax_desc(logits);
     if cand.is_empty() {
-        return SampledToken {
-            token_id: 0,
-            logit: f32::NEG_INFINITY,
-        };
+        return SampledToken { token_id: 0 };
     }
     let mut keep = cand.len();
     for (i, &(_, p)) in cand.iter().enumerate() {
@@ -976,7 +963,6 @@ pub fn sample_mirostat_v2<R: Rng>(
     *mu = (*mu as f64 - eta as f64 * (observed - tau as f64)) as f32;
     SampledToken {
         token_id: token_id as u32,
-        logit: p,
     }
 }
 
@@ -1000,10 +986,7 @@ pub fn sample_mirostat_v1<R: Rng>(
 ) -> SampledToken {
     let cand = softmax_desc(logits);
     if cand.is_empty() {
-        return SampledToken {
-            token_id: 0,
-            logit: f32::NEG_INFINITY,
-        };
+        return SampledToken { token_id: 0 };
     }
     let n_vocab = logits.len() as f64;
     let mut sum_ti_bi = 0.0f64;
@@ -1046,7 +1029,6 @@ pub fn sample_mirostat_v1<R: Rng>(
     *mu = (*mu as f64 - eta as f64 * (observed - tau as f64)) as f32;
     SampledToken {
         token_id: token_id as u32,
-        logit: p,
     }
 }
 
