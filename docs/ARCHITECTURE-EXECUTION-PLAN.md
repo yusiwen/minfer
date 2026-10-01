@@ -6526,6 +6526,107 @@ it does not change any site count, and it corrects item counts only.
 [#243]: https://github.com/yusiwen/minfer/issues/243
 [#244]: https://github.com/yusiwen/minfer/issues/244
 
+#### Test-infrastructure record (#244 escalations, 2026-10-01) — the five decided verdicts land, and decision 6 becomes [#252]
+
+**The ticket.** [#244]'s six escalations each needed a decision rather than a dead-code deletion.
+Decision 5 (keep the deferred `DType`/`Op`/`RopeStyle` vocabulary, each member naming what would
+construct it) had already landed in [#251]; this branch lands 1–4 and 2, and decision 6 — retiring
+the legacy `KVCache` and `ModelDef::forward`'s `&mut KVCache` parameter — is a **trait-signature
+refactor, not dead-code cleanup**, so it was filed separately as [#252] with the verified inventory
+rather than smuggled into this ticket.
+
+**Verdict table.**
+
+| # | item | verdict | why |
+|---|---|---|---|
+| 1 | `BackendCaps::{supports_op, supports_fused, supports_attn_span}` | **delete the three fields** | every `entry()` wrote them and production read none: the trait methods forward to the backend module's free function / constant, and assignment reads the trait. The registry keeps `reads_packed_kv`, the one field production reads (a *format* question answered without a `&self`, §8 of the registry design) |
+| 2 | `ModelDef::as_any` | **keep, doc fixed** | its callers are `#[cfg(test)]` only (the harness deliberately holds `Arc<dyn ModelDef>`); no `src/` production path downcasts, and there is no weight-registration consumer — the doc no longer claims one |
+| 3 | `ModelDef::offload` | **delete the trait method + both impls** | the graph builders and the assignment pass read the concrete `model.offload.plan` field; the method's only readers were tests |
+| 4 | `KvCache::set_owner` | **delete it and its two test assertions** | no production consumer, and it was **not** behaviour-equivalent to `own_range` (which truncates out-of-range silently where `set_owner` returned `Err`), so wiring it in would have changed behaviour — option (a) was rejected on that ground |
+| 5 | deferred `DType`/`Op`/`AttnMode`/`RopeStyle` vocabulary | already landed in [#251] | verified only: every kept member names what would construct it |
+| 6 | `ModelDef::forward`'s legacy `&mut KVCache` | **escalated as [#252]** | a trait-signature refactor with its own acceptance criteria; the parameter is provably unread |
+
+**The caps≡trait gate was repointed, not deleted.** `registry_caps_match_the_backend_trait` used to
+compare `Backend::CPU.caps().supports_op` (a registry field) against the trait method. With the
+fields gone, the same test now compares **`cpu_backend::supports_op` / `supports_fused` /
+`SUPPORTS_ATTN_SPAN` against the trait method** — i.e. the authority the field merely mirrored, so
+the property the gate was written for (the registry's answer and the trait's answer cannot disagree)
+is still asserted, and the two sides are now the forwarding pair rather than a field and the code it
+pointed at. `names_resolve_and_unknown_names_are_refused` had three `caps().supports_*` assertions in
+its "an unregistered handle claims nothing" block; they were repointed to the remaining field
+(`reads_packed_kv`), which is the only capability an unregistered handle can now be asked about.
+**Mutation:** making `CpuBackend::supports_op` diverge from `cpu_backend::supports_op` (return `true`
+unconditionally) fails the test — `panicked at src/graph/registry/tests.rs:319: assertion left ==
+right failed: Input F16, left: false, right: true`; reverted.
+
+**The removed-assertion note (decision 4).** `Cache::set_owner`'s only callers were the two
+assertions in `graph::kvcache::tests::own_prefix_and_release_round_trip`:
+`c.set_owner(0, 1, FREE).unwrap()` + the `owner[1] == FREE` check (the release half) and
+`assert!(c.set_owner(0, 9, SEQ_MAIN).is_err())` (the loud out-of-range check). **Two assertions are
+removed with the method**, which is the same discipline [#240]/[#241] used for the `device_entry`
+guard's test: the deleted method's check has no production consumer, and the deliberate production
+contract is `own_range`'s silent clamp, so keeping a test that pins the opposite (erroring) contract
+would pin behaviour the engine does not promise. No `#[test]` was added or removed; the test is
+renamed `own_prefix_round_trip` so its name does not overclaim, and it still covers `own_prefix`'s
+owner table + `n_used`. The two `ModelDef::offload` deletions removed no assertion — the five test
+call sites (`qwen2::graph::tests` ×3, `tooling::tests` ×4 uses) now read `model.offload.plan`, and
+the one call inside a `&dyn ModelDef` closure takes the plan as an explicit argument because the plan
+surface is the concrete field.
+
+**Census before/after (same method as [#244]: `strip.py` in a scratch worktree at the pinned
+`1.97.1`, three `--message-format=json` captures, every `src/` span of every `dead_code`
+diagnostic).** "sites" is the number of such spans; "items" the deduplicated `(file, name, kind)`
+set, the same two columns the previous records use.
+
+| capture | before (items / sites) | after (items / sites) | newly dead |
+|---|---|---|---|
+| `cargo check --release` (CPU) | 51 / 67 | **46 / 60** | **0** |
+| `cargo check --release --features cuda` | **39 / 57** | **34 / 50** | **0** |
+| `cargo check --release --tests --features cuda` | 15 / 22 | 15 / 22 | **0** |
+| `cargo check --release --tests` (CPU) | 7 / 9 | 7 / 9 | **0** |
+
+The cuda set is **33 shape + 6 code → 30 shape + 4 code**, and the difference is exactly the five
+deleted items: the three `BackendCaps` **shape** fields (`supports_op`, `supports_fused`,
+`supports_attn_span`) and the two **code** items (`KvCache::set_owner`, `ModelDef::offload`). The
+site column drops by 7 rather than 5 because two of the removed spans are container spans rustc had
+grouped into the now-gone diagnostics (`pub struct BackendCaps {` and `impl KvCache {`), which move
+or vanish with the grouping, not with an item. **No item was newly dead** (checked, not assumed: a
+deletion can unmask a transitive callee), and the cuda/CPU `--cap-lints=warn` captures have
+symmetric difference 0 in both the before and the after run, so neither required capture is a
+truncated lint pass.
+
+**Counts (rule 5), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-01.**
+`cargo test --release` → **480 / 0 / 36** unit + **10 / 0 / 6** integration;
+`bash scripts/cuda_test.sh` → **565 / 0 / 42** — all three numbers unchanged, because no `#[test]`
+was added or removed (the cap test was repointed, the two `set_owner` assertions were dropped from an
+existing test). `cargo check --release` and `cargo check --release --features cuda` exit 0 with **0
+diagnostics** (the non-test build's `deny(warnings)` gate). The test build's warning multiset is
+**unchanged**: `cargo check --release --tests` 68 warning diagnostics / 35 distinct messages before
+and after, `cargo check --release --tests --features cuda` 79 / 38 before and after, with no new,
+removed or re-counted message. No count row in `docs/status.toml` or `AGENTS.md` moves, so none was
+edited.
+
+**Bar named before measuring.** The removed items are not load-bearing (three write-only fields and
+two methods with test-only callers; the landed code changes are deletions plus test reads of the
+same concrete field), so the bar is the census identity plus the one forwarding mutation: "the
+after-set is the before-set minus exactly the five deleted items, with zero newly dead", "the
+`caps`-divergence mutation is red", and "the suite counts are unchanged" — stated before the
+after-capture and the mutation run, and measured by the tables above. The mutation rule is applied
+where it bites (the repointed gate); for the pure deletions there is nothing to mutate, and what was
+verified instead is the census identity and the green suites.
+
+**Limits.** (1) Metal is not compiled on Linux, so the `metal_backend::entry()` edit and the
+`ModelDef::as_any`/`forward_graph` annotations are asserted by the macOS CI job, not here. (2) The
+census is a `cargo check`: a "caller" is a compile-time reference, so the claim that the three
+deleted fields had no production reader rests on rustc plus the `git grep` of `.caps()` (the only
+remaining reads are `reads_packed_kv`). (3) `--features debug_dump` was not built; no #244 item
+appears in `src/dump.rs`. (4) The `--tests --features cuda` row is the maximal test build; the CPU
+`--tests` row is reported alongside it for completeness.
+
+[#244]: https://github.com/yusiwen/minfer/issues/244
+[#251]: https://github.com/yusiwen/minfer/pull/251
+[#252]: https://github.com/yusiwen/minfer/issues/252
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
