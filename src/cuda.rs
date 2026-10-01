@@ -1694,13 +1694,6 @@ pub struct CudaState {
     /// consumes the value at init before the field is stored.
     #[allow(dead_code)]
     cc: std::sync::atomic::AtomicI32,
-    /// T1: resolved device tier (plan §5) — exact key match → family
-    /// inheritance → GENERIC. Resolved once at init (also honors the
-    /// MINFER_DEVICE_TIER override); dispatch reads plain fields, never
-    /// re-scans the table. Direct consumers arrive with the batch-cap
-    /// activation (plan §14 R8); the effective gate travels via `tier_mmq`.
-    #[allow(dead_code)]
-    tier: &'static device_tier::DeviceTier,
     /// T1: effective MMQ gate — the tier's own flag, or `cc >= 800` for the
     /// GENERIC row (unknown architectures keep the conservative gate).
     tier_mmq: bool,
@@ -2113,7 +2106,7 @@ impl CudaState {
         // the forced-tier soak runs the whole suite under a foreign tier to
         // prove gates only ever choose among correct kernels.
         let cc_val = major * 100 + minor;
-        let (tier, tier_mmq) = match std::env::var("MINFER_DEVICE_TIER")
+        let tier_mmq = match std::env::var("MINFER_DEVICE_TIER")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
         {
@@ -2123,7 +2116,7 @@ impl CudaState {
                     "CUDA: device tier FORCED {} ({:?}, mmq {}) — key {}",
                     s.tier.name, s.tier.provenance, s.mmq_available, key
                 );
-                (s.tier, s.mmq_available)
+                s.mmq_available
             }
             None => {
                 let s = device_tier::select(cc_val);
@@ -2131,7 +2124,7 @@ impl CudaState {
                     "CUDA: device tier {} ({:?}, mmq {})",
                     s.tier.name, s.tier.provenance, s.mmq_available
                 );
-                (s.tier, s.mmq_available)
+                s.mmq_available
             }
         };
         // T2 (plan §6.2): BT dynamic-smem feasibility — the tile config's
@@ -2237,7 +2230,6 @@ impl CudaState {
             w16_cache: Mutex::new(HashMap::new()),
             w16_enabled: std::sync::atomic::AtomicBool::new(false),
             cc: std::sync::atomic::AtomicI32::new(major * 100 + minor),
-            tier,
             tier_mmq,
             sm_count,
             nb_bt_only: std::sync::atomic::AtomicBool::new(true),
