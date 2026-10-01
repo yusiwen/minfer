@@ -38,8 +38,17 @@ pub struct OffloadPlan {
 }
 
 impl OffloadPlan {
-    /// A plan with every block on the device (what an unset request resolves to when a
-    /// device is available).
+    /// A plan with every block on the device — the plan an unset request means when a
+    /// device is available.
+    ///
+    /// **(a) verdict, [#239](https://github.com/yusiwen/minfer/issues/239): reported, not moved.** The
+    /// doc used to read "what an unset request resolves to when a device is available", but the
+    /// resolution path never calls this constructor: `OffloadRequest::plan` (`offload.rs:187`) and
+    /// `resolve` (`offload.rs:232`) build `OffloadPlan { gpu_layers, n_layers }` inline (they must —
+    /// they clamp `gpu_layers` first). The only callers are `graph::offload::tests`. A
+    /// production-looking constructor whose documented caller does not exist is the #218 shape:
+    /// either the resolution path should call it, or the doc should say test-only. That is a
+    /// decision for [#244](https://github.com/yusiwen/minfer/issues/244), so the annotation stays.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn all_on_device(n_layers: usize) -> Self {
         Self {

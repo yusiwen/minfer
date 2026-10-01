@@ -99,3 +99,47 @@ fn every_row_cites_a_source() {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `device_tier.rs` (bucket B of the dead-code census —
+// the only test callers live in this module's subtree; `mmvq_batch_limit`'s only
+// other reader was `mmvq_cap`, which moved with it).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// doc-95 bitwise bound for the speculative verify path. The batch limit fed
+/// to any dispatch arm must never exceed this — the greedy identity chain
+/// (multi-MMVQ bitwise vs nt=1 decode) is proven only up to 8.
+///
+/// Test-only (#239): driven by `device_tier::tests::caps_clamp_to_the_identity_bound`
+/// (and asserted literally at 8).
+pub const IDENTITY_BATCH_BOUND: i32 = 8;
+
+/// Batch limit for a quant class on a tier (default or per-type override).
+///
+/// Test-only (#239): driven by
+/// `device_tier::tests::per_type_batch_overrides_match_source_tables`.
+pub fn mmvq_batch_limit(tier: &DeviceTier, class: QClass) -> i32 {
+    tier.mmvq_batch_by_type
+        .iter()
+        .find(|(c, _)| *c == class)
+        .map(|(_, v)| *v)
+        .unwrap_or(tier.mmvq_batch_default)
+}
+
+/// Dispatch cap for a quant class: the tier batch limit clamped by the
+/// doc-95 identity bound. The bound always wins — no tier data may strip the
+/// multi-MMVQ family above its own limit (the speculative verify path and
+/// the identity battery depend on it, plan §5.4/R3).
+///
+/// Activation note (plan §14 R8): the dispatch arms do not consume this cap
+/// yet — with the current dispatch structure a limit < 8 has no destination
+/// for the vacated nt range (it would fall to the f32 fallbacks, a likely
+/// pessimization) and would strip the spec identity family (R3). The cap
+/// activates together with a small-nt BT destination (T2 tile candidates) or
+/// field evidence; the table data and this function are ready and tested.
+///
+/// Test-only (#239): driven by
+/// `device_tier::tests::caps_clamp_to_the_identity_bound`.
+pub fn mmvq_cap(tier: &DeviceTier, class: QClass) -> i32 {
+    mmvq_batch_limit(tier, class).min(IDENTITY_BATCH_BOUND)
+}

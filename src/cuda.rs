@@ -548,11 +548,9 @@ extern "C" {
     // declaration is carried by a non-test build. The `checked`/`skipped`
     // counters did not come back with #223's pre-warm.
     //
-    // #145 test injection: latch a real `cudaErrorInvalidValue` on purpose
-    // (request the device limit + 4096 B) without clearing it. Only the gate
-    // calls this.
-    #[allow(dead_code)]
-    fn cuda_test_latch_oversized_smem() -> i32;
+    // #145/#147/#162 test introspection (`cuda_test_latch_oversized_smem`,
+    // `minfer_site_fail_*`, `minfer_site_hist_{len,site,name,msg}`) moved to
+    // `cuda::tests` by #239: their only callers are the `cuda::*_tests` modules.
     // P6: A arrives as f32 activations; the GEMM converts on stage — the
     // separate convert_f32_f16 pass disappears for every prefill matmul.
     // #147: the same shape for the af32 path — 1 = launched and accepted; 0 =
@@ -567,27 +565,6 @@ extern "C" {
         id: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
-    // #147 site-failure introspection: the last dynamic-smem / launch failure a
-    // hardened C++ site named, so the `issue147_tests` device gates can assert
-    // the site, the requested value and `cudaGetErrorName` without parsing
-    // stderr. `kind`: 1 = attribute, 2 = launch, 3 = a latched error found
-    // before a launch.
-    #[allow(dead_code)] // read by the #147 device gates
-    fn minfer_site_fail_count() -> i32;
-    #[allow(dead_code)]
-    fn minfer_site_fail_kind() -> i32;
-    #[allow(dead_code)]
-    fn minfer_site_fail_code() -> i32;
-    #[allow(dead_code)]
-    fn minfer_site_fail_bytes() -> i32;
-    #[allow(dead_code)]
-    fn minfer_site_fail_limit() -> i32;
-    #[allow(dead_code)]
-    fn minfer_site_fail_site() -> *const std::os::raw::c_char;
-    #[allow(dead_code)]
-    fn minfer_site_fail_message() -> *const std::os::raw::c_char;
-    #[allow(dead_code)]
-    fn minfer_site_fail_reset();
     // #162: the sticky required-launch failure and the ordered launch-site
     // history. `minfer_launch_ok` sets the sticky for a REQUIRED site;
     // `CudaBackend::execute_node` drains it and returns an `Err` naming the site,
@@ -604,14 +581,6 @@ extern "C" {
     fn minfer_launch_fail_code() -> i32;
     #[allow(dead_code)]
     fn minfer_launch_fail_clear();
-    #[allow(dead_code)]
-    fn minfer_site_hist_len() -> i32;
-    #[allow(dead_code)]
-    fn minfer_site_hist_site(i: i32) -> *const std::os::raw::c_char;
-    #[allow(dead_code)]
-    fn minfer_site_hist_name(i: i32) -> *const std::os::raw::c_char;
-    #[allow(dead_code)]
-    fn minfer_site_hist_msg(i: i32) -> *const std::os::raw::c_char;
     #[allow(dead_code)]
     fn minfer_site_hist_reset();
     // 8p: fused dequant-in-GEMM — B tiles dequantize raw quantized bytes
@@ -1300,6 +1269,15 @@ impl StreamScratch {
 
     /// The current stream's `(ptr, size)`, or `(null, 0)` when this stream has
     /// never grown the slot. Test/introspection surface.
+    ///
+    /// **Not movable (#239):** the census puts it in bucket B (its only *test*
+    /// caller is `cuda::d35_probe_tests`), but the bucket-A legacy wrappers
+    /// `upload_hidden` / `upload_positions` / `download_logits` /
+    /// `get_positions_buf` still call it and are still compiled, so it must stay
+    /// until [#240]/[#242] delete them. The annotation stays for the same reason.
+    ///
+    /// [#240]: https://github.com/yusiwen/minfer/issues/240
+    /// [#242]: https://github.com/yusiwen/minfer/issues/242
     #[allow(dead_code)]
     fn slot(&self) -> (CudaPtr, usize) {
         let key = current_stream_key();
@@ -1386,12 +1364,6 @@ pub fn stream_sync_count() -> u64 {
 /// message names the observer, never a launch; this counter is how the gate
 /// proves the error was surfaced rather than dropped.
 static LATCHED_API_ERRORS: AtomicU64 = AtomicU64::new(0);
-
-/// Issue #145: the process-wide count of latched API errors `sync` has reported.
-#[allow(dead_code)] // read by the #145 device gate
-pub fn latched_api_error_count() -> u64 {
-    LATCHED_API_ERRORS.load(Ordering::Relaxed)
-}
 
 /// The honest label for an error that `cudaGetLastError` found **already
 /// latched** at a sync point.
@@ -3485,15 +3457,6 @@ impl CudaState {
         if err != 0 {
             eprintln!("CUDA stream sync error: {} ({err})", cuda_error_name(err));
         }
-    }
-
-    /// Clear and return the CUDA per-thread "last error" latch (`cudaGetLastError`).
-    ///
-    /// Used by the device gates that must assert a call left **no** error
-    /// behind (e.g. `cuda_graph_destroy_*`, issue #145), and by diagnostics.
-    #[allow(dead_code)] // read by the #145 device gates
-    pub fn take_last_error(&self) -> i32 {
-        unsafe { cudaGetLastError() }
     }
 
     /// #162: the sticky "a REQUIRED kernel launch failed" record, drained.
@@ -7390,3 +7353,7 @@ pub(crate) mod issue218_tests;
 pub(crate) mod issue223_tests;
 #[cfg(test)]
 pub(crate) mod test_child;
+
+// #239: the moved bucket-B helpers and test-only FFI declarations.
+#[cfg(test)]
+mod tests;

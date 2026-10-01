@@ -88,12 +88,6 @@ impl CpuBackend {
         self.weights.insert(name.to_string(), t);
     }
 
-    /// Look up a registered weight tensor (test / debug helper).
-    #[allow(dead_code)]
-    pub fn weight(&self, name: &str) -> Option<&Tensor> {
-        self.weights.get(name)
-    }
-
     /// E4 S3: buffers this pool has created (never reused from the slot table).
     /// (Test / accounting helper.)
     /// Test-only (#238): driven by `graph::alloc::tests::slots`; `#[cfg(test)]` keeps it out of production builds.
@@ -102,8 +96,6 @@ impl CpuBackend {
         self.allocs
     }
 
-    /// Pool size (for tests).
-    #[allow(dead_code)]
     /// D1: the `f32` window a [`BufRef`] names — the whole buffer for an owning
     /// node (offset 0, len = its element count), the parent's bytes at the
     /// window for a view.
@@ -111,7 +103,14 @@ impl CpuBackend {
         &self.buffers[r.id][r.offset..r.offset + r.len]
     }
 
-    pub fn pool_len(&self) -> usize {
+    /// Pool size (for tests).
+    ///
+    /// Test-only (#239): the only caller is the test helper
+    /// `GraphAllocator::n_cpu_buffers`, itself moved into `graph::alloc::tests` by
+    /// #239. `pub(in crate::graph)` is the narrowest spelling that reaches it — this
+    /// item is what closed [#238]'s `pool_len` deferral.
+    #[cfg(test)]
+    pub(in crate::graph) fn pool_len(&self) -> usize {
         self.buffers.len()
     }
 }

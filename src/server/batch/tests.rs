@@ -2571,3 +2571,63 @@ fn published_metrics_move_as_requests_are_served() {
         g2.kv.owned_cells
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `batch.rs` (bucket B of the dead-code census — every
+// test caller already lives in this module's subtree). The `cb.submit()` matches
+// in `metal/tests.rs` are the Metal `CommandBuffer`, a different item.
+// ────────────────────────────────────────────────────────────────────────────
+
+impl BatchEngine {
+    /// Slots without a request (their reservation and KV stay).
+    ///
+    /// Test-only (#239): driven by the `run_batched` helper and by
+    /// `server::batch::tests::{a_failed_decode_forward_answers_a_single_run_and_releases_its_slot,
+    /// the_stall_answers_every_live_run_exactly_once}`.
+    pub fn idle_slots(&self) -> usize {
+        self.slots.iter().filter(|s| s.run.is_none()).count()
+    }
+
+    /// Admit a single request: [`BatchEngine::admit`] with one job.
+    ///
+    /// Test-only (#239): driven by `server::batch::tests::a_slot_snapshot_resumes_the_context_without_re_prefilling`
+    /// and the chunked-prefill gates.
+    pub fn submit(
+        &mut self,
+        model: &dyn ModelDef,
+        tokenizer: &Tokenizer,
+        job: Job,
+    ) -> Result<usize, ApiError> {
+        self.admit(model, tokenizer, vec![job])
+            .into_iter()
+            .next()
+            .expect("one job in, one answer out")
+    }
+
+    /// E3: `(largest nt any prefill forward carried, prefill forwards run)`. The
+    /// activation-memory bound is `max_nt`, so the gate asserts on this rather than
+    /// on a claim about buffers.
+    ///
+    /// Test-only (#239): driven by
+    /// `server::batch::tests::{a_chunked_prefill_answers_like_an_unchunked_one,
+    /// a_long_prefill_keeps_another_slot_decoding}`.
+    pub fn prefill_stats(&self) -> (usize, usize) {
+        (self.prefill_max_nt, self.prefill_forwards)
+    }
+
+    /// B2/C5 S2: prompt tokens this engine has fed to prefills (see `prefill_fed`).
+    ///
+    /// Test-only (#239): driven by
+    /// `server::batch::tests::a_slot_snapshot_resumes_the_context_without_re_prefilling`.
+    pub fn prefill_fed(&self) -> usize {
+        self.prefill_fed
+    }
+
+    /// E3: decode steps run between the chunks of a prefill (0 with chunking off).
+    ///
+    /// Test-only (#239): driven by
+    /// `server::batch::tests::a_long_prefill_keeps_another_slot_decoding`.
+    pub fn interleaved_ticks(&self) -> u64 {
+        self.interleaved_ticks
+    }
+}

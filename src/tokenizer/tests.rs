@@ -415,3 +415,35 @@ fn token_ids_match_the_reference() {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `tokenizer.rs` (bucket B of the dead-code census —
+// every test caller already lives in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl PreTokenizer {
+    /// The `tokenizer.ggml.pre` spelling this rule was selected from.
+    ///
+    /// Test-only (#239): driven by
+    /// `tokenizer::tests::token_ids_match_the_reference`.
+    pub fn gguf_name(self) -> &'static str {
+        match self {
+            Self::Qwen2 => "qwen2",
+            Self::Qwen35 => "qwen35",
+        }
+    }
+}
+
+impl Tokenizer {
+    /// Decode token IDs to text.
+    ///
+    /// Lossy: an incomplete multi-byte sequence at the end becomes U+FFFD.
+    /// Streaming paths use [`Tokenizer::decode_bytes`] plus
+    /// [`complete_utf8_prefix_len`] holdback instead.
+    ///
+    /// Test-only (#239): driven by `tokenizer::tests::{decode_bytes_reverses_byte_encoding,
+    /// decode_bytes_keeps_multibyte_bytes, decode_out_of_range_id_is_skipped}`.
+    pub fn decode(&self, ids: &[u32]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
+    }
+}

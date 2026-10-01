@@ -783,3 +783,19 @@ fn generated_schema_grammar_is_reparseable() {
         assert!(!again.accepts(text));
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `grammar.rs` (bucket B of the dead-code census — the
+// only test callers live in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl GrammarState {
+    /// Bytes of an incomplete UTF-8 character carried across the last token.
+    ///
+    /// Test-only (#239): driven by
+    /// `grammar::tests::{token_advancement_handles_partial_utf8,
+    /// token_advancement_rejects_invalid_utf8}`.
+    pub fn pending_bytes(&self) -> usize {
+        self.inner.partial.len()
+    }
+}

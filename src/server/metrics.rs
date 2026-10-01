@@ -394,12 +394,6 @@ impl ServerMetrics {
         }
     }
 
-    /// The current trailing-window rate, without building a whole snapshot.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn completion_tokens_per_second(&self) -> f64 {
-        self.token_window.rate(now_secs())
-    }
-
     /// Read every atomic into one snapshot (relaxed; see the module docs).
     pub fn snapshot(&self) -> MetricsSnapshot {
         let r = Ordering::Relaxed;

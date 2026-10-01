@@ -8325,3 +8325,56 @@ fn stream_sync_counts_are_per_backend_not_process_wide() {
         "a sync on one backend must not move another backend's counter"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `cuda_backend.rs` (bucket B of the dead-code census —
+// every test caller already lives in this module's subtree, including the
+// `#[cfg(test)]` shim through which `elems` was reached).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl CudaBackend {
+    /// `None` when CUDA is unavailable (no device, or disabled via
+    /// `MINFER_DISABLE_CUDA` — both handled by `CudaState::try_new`).
+    ///
+    /// The layout defaults to **F32**; a real engine's backend is built by
+    /// `GraphAllocator::enable_cuda`, which passes the allocator's stamped format
+    /// (see [`Self::with_layout`]).
+    ///
+    /// Test-only (#239): driven by `cuda_backend::tests::cuda_pool_roundtrip` and
+    /// 35 further device gates in this file. `pub(crate)` because `graph::op_matrix`
+    /// (a `#[cfg(test)] mod`) builds an f32-layout backend through it — an inherent
+    /// impl may live in a child module, so the cross-module caller keeps compiling
+    /// while production loses the constructor entirely.
+    pub(crate) fn new() -> Option<Self> {
+        Self::with_layout(crate::cuda::KV_LAYOUT_F32)
+    }
+
+    /// Device tests address pool buffers by id (they always did), so convert to
+    /// owning `BufRef`s here — `elems(id)` gives the real length, which the D1
+    /// window arithmetic relies on. Views are exercised through the op matrix
+    /// (which goes through the allocator), not here.
+    ///
+    /// Test-only (#239): driven by the device parity gates in this file
+    /// (`cuda_elementwise_parity`, `cuda_norm_parity`, `cuda_matmul_parity`, …).
+    pub fn exec_ids(
+        &mut self,
+        node: &CNode,
+        in_ids: &[usize],
+        out_id: usize,
+        kv_pair: Option<(usize, usize)>,
+    ) -> Result<(), String> {
+        let ins: Vec<BufRef> = in_ids
+            .iter()
+            .map(|&id| BufRef::own(crate::graph::Backend::CUDA, id, self.elems(id)))
+            .collect();
+        let out = BufRef::own(crate::graph::Backend::CUDA, out_id, self.elems(out_id));
+        self.execute_node(node, &ins, out, kv_pair)
+    }
+
+    /// Bytes of one pool buffer, as f32 elements.
+    ///
+    /// Test-only (#239): reached only through `exec_ids` above.
+    fn elems(&self, id: usize) -> usize {
+        self.pool[id].bytes / 4
+    }
+}

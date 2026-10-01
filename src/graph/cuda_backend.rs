@@ -189,18 +189,6 @@ unsafe impl Send for CudaBackend {}
 unsafe impl Sync for CudaBackend {}
 
 impl CudaBackend {
-    /// `None` when CUDA is unavailable (no device, or disabled via
-    /// `MINFER_DISABLE_CUDA` — both handled by `CudaState::try_new`).
-    ///
-    /// The layout defaults to **F32**; a real engine's backend is built by
-    /// `GraphAllocator::enable_cuda`, which passes the allocator's stamped format
-    /// (see [`Self::with_layout`]). This constructor is for the tests and probes
-    /// that address an f32 region or stamp a layout afterwards.
-    #[allow(dead_code)]
-    pub fn new() -> Option<Self> {
-        Self::with_layout(crate::cuda::KV_LAYOUT_F32)
-    }
-
     /// #153: build a backend whose kernels address the KV regions in `layout`
     /// (`crate::cuda::KV_LAYOUT_*`). `GraphAllocator::enable_cuda` derives it from
     /// the engine's resolved `KvFormat` (`cuda::layout_of`), so the tag is per
@@ -852,26 +840,6 @@ impl Drop for CudaBackend {
 }
 
 impl CudaBackend {
-    /// Test-only shim: the device tests address pool buffers by id (they always
-    /// did), so convert to owning `BufRef`s here — `elems(id)` gives the real
-    /// length, which the D1 window arithmetic relies on. Views are exercised
-    /// through the op matrix (which goes through the allocator), not here.
-    #[cfg(test)]
-    fn exec_ids(
-        &mut self,
-        node: &CNode,
-        in_ids: &[usize],
-        out_id: usize,
-        kv_pair: Option<(usize, usize)>,
-    ) -> Result<(), String> {
-        let ins: Vec<BufRef> = in_ids
-            .iter()
-            .map(|&id| BufRef::own(crate::graph::Backend::CUDA, id, self.elems(id)))
-            .collect();
-        let out = BufRef::own(crate::graph::Backend::CUDA, out_id, self.elems(out_id));
-        self.execute_node(node, &ins, out, kv_pair)
-    }
-
     /// End an open capture window WITHOUT launching it (error path, Phase 8
     /// review): the recorded launches never executed, so the split's outputs
     /// are invalid. Disables graph capture for the session.
@@ -1768,11 +1736,6 @@ impl CudaBackend {
 
     fn state_free(ptr: *mut std::ffi::c_void) {
         <crate::cuda::CudaState>::cuda_free(ptr);
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn elems(&self, id: usize) -> usize {
-        self.pool[id].bytes / 4
     }
 
     fn copy_d2d(&self, src: BufRef, dst: BufRef) -> Result<(), String> {

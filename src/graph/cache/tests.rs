@@ -188,3 +188,18 @@ fn structural_check_detects_different_graph() {
         assert!(!cache.verify_structural(&g2));
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `cache.rs` (bucket B of the dead-code census — the
+// only test caller lives in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl GraphCache {
+    /// How many graphs are cached right now.
+    ///
+    /// Test-only (#239): driven by
+    /// `graph::cache::tests::switching_between_cached_graphs_re_maps_instead_of_rebuilding`.
+    pub fn cached_graphs(&self) -> usize {
+        self.graphs.len()
+    }
+}

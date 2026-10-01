@@ -343,12 +343,6 @@ pub fn init() {
     let _ = registry();
 }
 
-/// Every accepted name, in id order.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn names() -> &'static [&'static str; N_BACKENDS] {
-    &NAMES
-}
-
 fn not_compiled_why(backend: Backend) -> &'static str {
     match backend {
         Backend::METAL => "the Metal backend is compiled only on macOS (target_os = \"macos\")",

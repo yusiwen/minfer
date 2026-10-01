@@ -1,6 +1,12 @@
 //! `#[cfg(test)] mod issue147_tests` for `src/cuda.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
+// #239: declared in `cuda::tests` now (test-only FFI / accessors).
+use super::tests::{
+    minfer_site_fail_bytes, minfer_site_fail_code, minfer_site_fail_count, minfer_site_fail_kind,
+    minfer_site_fail_limit, minfer_site_fail_message, minfer_site_fail_reset,
+    minfer_site_fail_site,
+};
 
 /// `minfer_site_fail_kind` values (cuda_kernels.cu).
 const SITE_ATTR: i32 = 1;

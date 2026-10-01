@@ -73,15 +73,6 @@ impl PreTokenizer {
         }
     }
 
-    /// The `tokenizer.ggml.pre` spelling this rule was selected from.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn gguf_name(self) -> &'static str {
-        match self {
-            Self::Qwen2 => "qwen2",
-            Self::Qwen35 => "qwen35",
-        }
-    }
-
     fn include_marks(self) -> bool {
         matches!(self, Self::Qwen35)
     }
@@ -667,17 +658,6 @@ impl Tokenizer {
         }
 
         result
-    }
-
-    /// Decode token IDs to text.
-    ///
-    /// Lossy: an incomplete multi-byte sequence at the end becomes U+FFFD.
-    /// Streaming paths should use [`Tokenizer::decode_bytes`] plus
-    /// [`complete_utf8_prefix_len`] holdback instead. (Tests use this wrapper;
-    /// the CLI streams via `decode_bytes`.)
-    #[allow(dead_code)]
-    pub fn decode(&self, ids: &[u32]) -> String {
-        String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }
 
     pub fn vocab_size(&self) -> usize {

@@ -353,3 +353,22 @@ fn the_cpu_path_never_enters_the_cross_copy_machinery() {
         "the contract is trivially satisfied when nothing crossed"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `scheduler.rs` (bucket B of the dead-code census —
+// the only test caller lives in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl BackendScheduler {
+    /// A scheduler that times wherever `mode` says. The #173 isolation seam: a
+    /// test hands in its own sink so its verdict reads only the rows its own
+    /// scheduler wrote, and a concurrent graph execution cannot move them.
+    ///
+    /// Test-only (#239): driven by the `run_small_graph` helper of
+    /// `graph::scheduler::tests` (called by
+    /// `op_timing_does_not_change_the_result_but_does_accumulate` and
+    /// `a_concurrent_graph_load_cannot_move_a_private_sink`).
+    pub fn with_timing(mode: crate::optiming::TimingMode) -> Self {
+        Self { timing: mode }
+    }
+}

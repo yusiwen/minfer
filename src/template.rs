@@ -161,19 +161,6 @@ impl PyValue {
             PyValue::List(v) => Value::from(v),
         }
     }
-
-    /// Fixture comparison form (the JSON encoding of the CPython result).
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn to_json(self) -> serde_json::Value {
-        match self {
-            PyValue::Str(s) => serde_json::Value::String(s),
-            PyValue::Int(i) => serde_json::Value::from(i),
-            PyValue::Bool(b) => serde_json::Value::from(b),
-            PyValue::List(v) => {
-                serde_json::Value::Array(v.into_iter().map(serde_json::Value::String).collect())
-            }
-        }
-    }
 }
 
 /// The character set argument of `strip`/`lstrip`/`rstrip`, or `None` for

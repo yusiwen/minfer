@@ -174,3 +174,128 @@ fn the_live_peak_is_not_the_reserved_total() {
     let plan = AllocPlan::plan(&[(4096, 0, 1), (8192, 0, 1)]);
     assert_eq!(plan.live_peak_bytes, plan.reserved_bytes);
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #239: items moved out of `allocplan.rs` (bucket B of the dead-code census —
+// every test caller already lives in this module's subtree).
+// ────────────────────────────────────────────────────────────────────────────
+
+impl DeviceMemory {
+    /// The reported free bytes, or `None` when no measurement exists.
+    ///
+    /// Test-only (#239): driven by `allocplan::tests::a_reported_free_read_keeps_the_three_quarters_default`
+    /// and `allocplan::tests::a_failed_device_query_is_not_a_zero_budget`.
+    fn free_bytes(&self) -> Option<usize> {
+        match self {
+            DeviceMemory::Reported { free, .. } => Some(*free),
+            DeviceMemory::QueryFailed { .. } | DeviceMemory::NoDevice => None,
+        }
+    }
+}
+
+/// The plan for one backend's activations.
+///
+/// Test-only (#239): the pure model the allocator's pool loop is checked against,
+/// driven by `allocplan::tests::{two_shapes_in_one_class_share_a_buffer,
+/// the_plan_is_deterministic_and_order_independent, an_empty_plan_is_free,
+/// the_live_peak_is_not_the_reserved_total}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AllocPlan {
+    /// Per interval, in the order given: the class it will be handed (elements).
+    classes: Vec<usize>,
+    /// Bytes the pool must be able to hold once every interval has been placed — the
+    /// number the feasibility gate compares against the budget.
+    reserved_bytes: usize,
+    /// Peak bytes *live at one step* (what a shrinkable allocator would need).
+    live_peak_bytes: usize,
+    /// Distinct buffers the plan placed.
+    buffers: usize,
+    /// Intervals that reused a recycled buffer instead of a new one.
+    reused: usize,
+}
+
+impl AllocPlan {
+    /// Plan `intervals`, each `(size_elems, first_use, last_use)` with `first <= last`.
+    ///
+    /// Intervals are consumed in order of `first_use` (ties keep the input order, so the
+    /// plan is deterministic); a buffer of class `c` freed at step `f` may be handed to
+    /// the next interval of that class whose `first_use > f`. That is exactly the rule
+    /// the pool's free list implements, which is why the plan's numbers are the pool's.
+    ///
+    /// Test-only (#239): driven by
+    /// `graph::allocplan::tests::{two_shapes_in_one_class_share_a_buffer,
+    /// the_plan_is_deterministic_and_order_independent, an_empty_plan_is_free,
+    /// the_live_peak_is_not_the_reserved_total}`.
+    fn plan(intervals: &[(usize, usize, usize)]) -> AllocPlan {
+        let mut order: Vec<usize> = (0..intervals.len()).collect();
+        order.sort_by_key(|&i| (intervals[i].1, i));
+        // class -> the steps at which its placed buffers become free (unsorted; the sets
+        // are tiny compared with the graph).
+        let mut free: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        let mut classes = vec![0usize; intervals.len()];
+        let mut reserved = 0usize;
+        let mut live = 0usize;
+        let mut peak = 0usize;
+        let mut buffers = 0usize;
+        let mut reused = 0usize;
+        for i in order {
+            let (size, first, last) = intervals[i];
+            let class = class_size(size);
+            let slot = free.get_mut(&class).and_then(|f| {
+                f.iter()
+                    .position(|&free_at| free_at < first)
+                    .map(|pos| f.swap_remove(pos))
+            });
+            match slot {
+                Some(free_at) => {
+                    reused += 1;
+                    let _ = free_at;
+                }
+                None => {
+                    buffers += 1;
+                    reserved += class_bytes(class);
+                    live += class_bytes(class);
+                    peak = peak.max(live);
+                }
+            }
+            free.entry(class).or_default().push(last);
+            classes[i] = class;
+        }
+        // The transient peak needs the free-at steps, not just the count: recompute over
+        // the same placement in step order.
+        peak = peak.max(live_peak(intervals, &classes));
+        AllocPlan {
+            classes,
+            reserved_bytes: reserved,
+            live_peak_bytes: peak,
+            buffers,
+            reused,
+        }
+    }
+}
+
+/// The live-bytes peak of a placement: walk the steps, adding each interval's class when
+/// its lifetime starts and removing it when it ends.
+///
+/// Test-only (#239): reached only through `AllocPlan::plan`.
+fn live_peak(intervals: &[(usize, usize, usize)], classes: &[usize]) -> usize {
+    if intervals.is_empty() {
+        return 0;
+    }
+    let last_step = intervals.iter().map(|i| i.2).max().unwrap_or(0);
+    let mut live = 0usize;
+    let mut peak = 0usize;
+    for step in 0..=last_step {
+        for (i, &(_, first, last)) in intervals.iter().enumerate() {
+            if first == step {
+                live += class_bytes(classes[i]);
+            }
+            if last == step {
+                live = live.saturating_sub(class_bytes(classes[i]));
+            }
+        }
+        peak = peak.max(live);
+    }
+    peak
+}

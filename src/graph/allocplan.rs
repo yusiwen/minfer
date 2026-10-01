@@ -14,6 +14,14 @@
 //! per-backend budget *before* that loop runs, so an over-budget graph is refused with its
 //! numbers instead of failing later.
 //!
+//! **(a) note, [#239](https://github.com/yusiwen/minfer/issues/239):** the sentence above describes a
+//! production consumer of the *pure plan* that does not exist — `AllocPlan::plan` has no caller
+//! outside `graph::allocplan::tests`, and the gate the sentence means is `GraphAllocator::alloc_in_pool`
+//! (per-allocation `weights + pooled + this`, via `allocplan::budget_decision`), not the plan. The plan
+//! itself is the test oracle for the pool loop, so #239 moves it (with `live_peak`) into this module's
+//! `tests.rs`; whether the feasibility gate *should* run the plan is [#244](https://github.com/yusiwen/minfer/issues/244)'s question.
+//! The wording above is deliberately left in place rather than quietly rewritten.
+//!
 //! The class is a pure function of the size ([`class_size`]), which is what lets the plan
 //! and the pool agree without a lookup table between them: the plan's aggregate numbers
 //! (reserved bytes, live peak, how many buffers get recycled) are simulated here, and the
@@ -76,15 +84,6 @@ pub enum DeviceMemory {
 }
 
 impl DeviceMemory {
-    /// The reported free bytes, or `None` when no measurement exists.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn free_bytes(&self) -> Option<usize> {
-        match self {
-            DeviceMemory::Reported { free, .. } => Some(*free),
-            DeviceMemory::QueryFailed { .. } | DeviceMemory::NoDevice => None,
-        }
-    }
-
     /// A one-line reason for a failed query, for a diagnostic that must name the real
     /// cause. `None` when the query succeeded or there was no device to query.
     pub fn failure_note(&self, what: &str) -> Option<String> {
@@ -149,107 +148,6 @@ pub fn budget_decision(explicit: Option<usize>, mem: &DeviceMemory) -> BudgetDec
             note: None,
         },
     }
-}
-
-/// The plan for one backend's activations.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub struct AllocPlan {
-    /// Per interval, in the order given: the class it will be handed (elements).
-    pub classes: Vec<usize>,
-    /// Bytes the pool must be able to hold once every interval has been placed — the
-    /// number the feasibility gate compares against the budget. The pool is a high-water
-    /// mark (it never returns memory), so this is the sum of every distinct slot, not the
-    /// transient peak.
-    pub reserved_bytes: usize,
-    /// Peak bytes *live at one step* (what a shrinkable allocator would need).
-    pub live_peak_bytes: usize,
-    /// Distinct buffers the plan placed.
-    pub buffers: usize,
-    /// Intervals that reused a recycled buffer instead of a new one — the observable
-    /// that size classes are actually sharing.
-    pub reused: usize,
-}
-
-impl AllocPlan {
-    /// Plan `intervals`, each `(size_elems, first_use, last_use)` with `first <= last`.
-    ///
-    /// Intervals are consumed in order of `first_use` (ties keep the input order, so the
-    /// plan is deterministic); a buffer of class `c` freed at step `f` may be handed to
-    /// the next interval of that class whose `first_use > f`. That is exactly the rule
-    /// the pool's free list implements, which is why the plan's numbers are the pool's.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn plan(intervals: &[(usize, usize, usize)]) -> AllocPlan {
-        let mut order: Vec<usize> = (0..intervals.len()).collect();
-        order.sort_by_key(|&i| (intervals[i].1, i));
-        // class -> the steps at which its placed buffers become free (unsorted; the sets
-        // are tiny compared with the graph).
-        let mut free: std::collections::BTreeMap<usize, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        let mut classes = vec![0usize; intervals.len()];
-        let mut reserved = 0usize;
-        let mut live = 0usize;
-        let mut peak = 0usize;
-        let mut buffers = 0usize;
-        let mut reused = 0usize;
-        for i in order {
-            let (size, first, last) = intervals[i];
-            let class = class_size(size);
-            let slot = free.get_mut(&class).and_then(|f| {
-                f.iter()
-                    .position(|&free_at| free_at < first)
-                    .map(|pos| f.swap_remove(pos))
-            });
-            match slot {
-                Some(free_at) => {
-                    reused += 1;
-                    let _ = free_at;
-                }
-                None => {
-                    buffers += 1;
-                    reserved += class_bytes(class);
-                    live += class_bytes(class);
-                    peak = peak.max(live);
-                }
-            }
-            free.entry(class).or_default().push(last);
-            classes[i] = class;
-        }
-        // The transient peak needs the free-at steps, not just the count: recompute over
-        // the same placement in step order.
-        peak = peak.max(live_peak(intervals, &classes));
-        AllocPlan {
-            classes,
-            reserved_bytes: reserved,
-            live_peak_bytes: peak,
-            buffers,
-            reused,
-        }
-    }
-}
-
-/// The live-bytes peak of a placement: walk the steps, adding each interval's class when
-/// its lifetime starts and removing it when it ends.
-#[cfg_attr(not(test), allow(dead_code))]
-fn live_peak(intervals: &[(usize, usize, usize)], classes: &[usize]) -> usize {
-    if intervals.is_empty() {
-        return 0;
-    }
-    let last_step = intervals.iter().map(|i| i.2).max().unwrap_or(0);
-    let mut live = 0usize;
-    let mut peak = 0usize;
-    for step in 0..=last_step {
-        for (i, &(_, first, last)) in intervals.iter().enumerate() {
-            if first == step {
-                live += class_bytes(classes[i]);
-            }
-            if last == step {
-                live = live.saturating_sub(class_bytes(classes[i]));
-            }
-        }
-        peak = peak.max(live);
-    }
-    peak
 }
 
 #[cfg(test)]

@@ -316,8 +316,14 @@ impl KvCache {
     }
 
     /// Mark `cell` owned by `seq` in every layer (or release it with `FREE`).
-    /// C1 uses it from `own_range`; C2's removal/reuse is where it earns its
-    /// keep.
+    ///
+    /// **(a) verdict, [#239](https://github.com/yusiwen/minfer/issues/239): reported, not moved.** The
+    /// doc used to read "C1 uses it from `own_range`", but `own_range` (`kvcache.rs:517`) writes
+    /// `l.owner[cell] = seq` inline and never calls this. The only callers are
+    /// `graph::kvcache::tests`. A helper whose documented production caller does not exist is the
+    /// #218 shape — either `own_range`/`note_written` should be expressed through it, or it should be
+    /// deleted. A decision for [#244](https://github.com/yusiwen/minfer/issues/244), so the
+    /// annotation stays.
     #[allow(dead_code)] // C2 surface
     pub fn set_owner(&mut self, layer: usize, cell: usize, seq: SeqId) -> Result<(), String> {
         let l = self
@@ -576,51 +582,6 @@ impl KvCache {
         Ok(())
     }
 
-    /// The single-sequence case: reserve the whole arena for `seq` if it has no
-    /// reservation yet, then take ownership of `0..n_used`.
-    ///
-    /// **Test-only.** Its last production-looking caller, `GraphAllocator::kv_note_used`,
-    /// was E1's C1 remnant and was deleted with E1 (#228): production now records the
-    /// written extent per position through [`Self::own_positions`], which is
-    /// reservation-aware. The remaining callers are this module's own tests —
-    /// `kvcache::tests::own_prefix_and_release_round_trip` and its three siblings — which
-    /// use it to set up a written prefix directly.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn own_prefix(&mut self, seq: SeqId, n_used: usize) {
-        if !self.seqs.contains_key(&seq) {
-            let cap = self.n_ctx;
-            if let Err(e) = self.reserve_seq(seq, cap) {
-                debug_assert!(false, "own_prefix: {e}");
-                return;
-            }
-        }
-        self.own_range(seq, 0, n_used);
-    }
-
-    /// Record that `rows` were written at the given resolved cells by `seq`.
-    #[allow(dead_code)] // E2 surface (per-token writes)
-    pub fn note_written(&mut self, seq: SeqId, layer: usize, cells: &[u32]) {
-        if let Some(l) = self.layers.get_mut(&layer) {
-            for &c in cells {
-                let c = c as usize;
-                if c < l.owner.len() {
-                    l.owner[c] = seq;
-                    l.n_used = l.n_used.max(c + 1);
-                }
-            }
-        }
-        // C8b S2: a recorded row is a written position, whatever the cell holds.
-        let mut written = self.seqs.get(&seq).map_or(0, |s| s.written);
-        for &c in cells {
-            if let Some(pos) = self.pos_of_cell(seq, c as usize) {
-                written = written.max(pos + 1);
-            }
-        }
-        if let Some(slot) = self.seqs.get_mut(&seq) {
-            slot.written = written;
-        }
-    }
-
     /// Drop the identity fast path. C2 calls this when it introduces a hole or
     /// a window; after that, backends that only understand raw positions must
     /// refuse the node (standing rule 2) instead of indexing the wrong row.
@@ -683,30 +644,6 @@ impl KvCache {
             new_used = l.n_used;
         }
         Ok(new_used)
-    }
-
-    /// Sliding-window special case of [`KvCache::after_rm`]: drop the oldest
-    /// `drop` rows, so every survivor's position decreases by `drop`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn after_shift(&mut self, drop: usize) -> Result<usize, String> {
-        self.after_rm(0, drop)
-    }
-
-    /// The cell range a sequence owns in `layer`, as `(start, len)`; `None` when
-    /// it owns nothing.
-    ///
-    /// Ownership is contiguous by construction — a sequence's cells are written
-    /// in position order and a removal slides the survivors down (C2) — so one
-    /// range describes it completely. A gap is a bug rather than a supported
-    /// layout, and this returns `Err` instead of letting attention bound itself
-    /// to the wrong window; a per-cell mask is what a hole-creating layout would
-    /// need (C3/D1).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn seq_range(&self, layer: usize, seq: SeqId) -> Result<Option<(usize, usize)>, String> {
-        if !self.layers.contains_key(&layer) {
-            return Err(format!("no KV arena for layer {layer}"));
-        }
-        Ok(self.seqs.get(&seq).map(|s| (s.start, s.cap)))
     }
 
     /// Resolve each query token's allowed cell range into the `attn_span` input
@@ -890,13 +827,6 @@ impl KvCache {
     /// This is the number of rows a reader may see and the bound `attn_span` uses.
     pub fn written_rows(&self, seq: SeqId) -> usize {
         self.seqs.get(&seq).map_or(0, |s| s.written)
-    }
-
-    /// Rows `seq` wrote into its **own** run — the rows a relocation copies, since
-    /// the shared prefix is another sequence's memory (C8b S2).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn private_written(&self, seq: SeqId) -> usize {
-        self.seqs.get(&seq).map_or(0, |s| s.private_written())
     }
 
     /// C8b S2: let `dst` read the first `rows` positions of `src` **in place**.

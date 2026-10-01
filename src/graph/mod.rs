@@ -80,20 +80,6 @@ pub enum DType {
     Q8_0,
 }
 
-#[allow(dead_code)]
-impl DType {
-    /// Bytes per element (Q8_0 = 1 byte per quantized element block member;
-    /// actual block layout is a backend concern).
-    pub fn size(&self) -> usize {
-        match self {
-            DType::F32 => 4,
-            DType::F16 => 2,
-            DType::I32 => 4,
-            DType::Q8_0 => 1,
-        }
-    }
-}
-
 /// The backend handle (F4): an opaque id into the [`registry`], not an enum.
 ///
 /// Re-exported here because the IR has always called it `Backend`; the handle
