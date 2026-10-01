@@ -1238,10 +1238,12 @@ story of §3.2.1.
   (per-node host readbacks are illegal in a capture window) — and mode-2
   fused producers degrade to mode 1 when any dump/trace reader is on, so
   instrumented runs are not perf runs.
-- **Device-side debugging** — `MINFER_CUDA_DEBUG` turns on per-node labeled
-  syncs (`debug_sync`) that report launch/sync errors with a layer tag;
-  each sync costs a full stream flush, so it is a debugging tool, not a
-  profiling one.
+- **Device-side debugging** — `MINFER_CUDA_DEBUG` used to turn on per-node
+  labeled syncs (`debug_sync`) that reported launch/sync errors with a layer
+  tag. That knob lived on the legacy `layer_gpu` surface and was deleted with
+  it ([#240](https://github.com/yusiwen/minfer/issues/240)/[#241](https://github.com/yusiwen/minfer/issues/241)); the
+  corresponding graph-path tool today is `MINFER_OP_TIMING=1` with
+  `CudaState::sync()` as the drain point.
 - **Kernel selection in one command** — `MINFER_NO_CUDA_GRAPH=1
   MINFER_TIMING=1 ./target/release/minfer <model> "hi"` gives clean
   per-forward timing (doc 09's caliber), and `bench [-p N] [-n N]` measures

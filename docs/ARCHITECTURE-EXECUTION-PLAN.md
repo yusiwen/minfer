@@ -6019,6 +6019,130 @@ limit, and it was handled by moving with `pub(crate)`. (3) `--features debug_dum
 simply be stale rather than a caller having been deleted, and either resolution (call it, or delete
 it, or say test-only) belongs to [#244](https://github.com/yusiwen/minfer/issues/244), not here.
 
+#### Test-infrastructure record (#240/#241, 2026-10-01) — the dead legacy `CudaState` wrapper layer and the `device_entry` guard are deleted
+
+**The tickets.** [#240](https://github.com/yusiwen/minfer/issues/240) is T3a of the `allow(dead_code)` census: delete the
+legacy `CudaState` wrapper layer — 23 methods and 18 backing fields that no build configuration calls.
+[#241](https://github.com/yusiwen/minfer/issues/241) is T3b: the legacy `device_entry` guard is unreachable and #185's
+remaining token should be retired. They landed as **one PR** because they are compile-coupled, not
+because they were convenient to batch.
+
+**Why one PR: the coupling is a compile error, not a preference.** `CudaState::layer_gpu` is the
+**only** caller of `has_weight`, `debug_sync`, `kv_ensure_layer`, `get_positions_buf`, `matmul_on_gpu`,
+`quant_matmul_q8` and `quant_matmul_f32_on_gpu`, and the only reader of fifteen `buf_*`/`kv_*` fields.
+Deleting them while `layer_gpu` stays is `E0599`. The reverse is also true: `src/device_entry.rs` opened
+with `#![cfg_attr(not(feature = "cuda"), allow(dead_code))]`, so in the cuda build there is no allow —
+with `layer_gpu` gone, `enter`/`DeviceEntry`/`DEVICE_ENTRY` have no caller and `deny(warnings)` fails the
+build. A partial #240 that "skips `layer_gpu`" can therefore only delete the sixteen uncoupled leaf
+items and cannot close either of the deferrals T1/T2 left here; that split was rejected after the
+coupling was traced, and the user approved deleting the guard, whose only caller is itself dead.
+
+**Per-item disposition.** Every item was read at its definition, its cross-module matches checked, and
+its history read (`git log -S`) before it was touched.
+
+| item | disposition |
+|---|---|
+| `stream_lock`, `clear_launch_failure`, `upload_hidden`, `download_hidden`, `upload_positions`, `init_kv_cache`, `get_kv_size`, `download_logits`, `graph_available`, `graph_end_capture`, `graph_launch`, `quant_matmul_f32_batch`, `quant_matmul_f32`, `output_norm_gpu` | **deleted** (uncoupled leaf; no caller in any build) |
+| `buf_logits` (readers: `download_logits`/`quant_matmul_f32`/`output_norm_gpu`), `decode_graph_exec` (`graph_available`/`graph_end_capture`/`graph_launch`) | **deleted** with their initializers |
+| `layer_gpu` (bucket A; dead in every build) | **deleted** ([#241](https://github.com/yusiwen/minfer/issues/241)'s item, absorbed by the coupling above) |
+| `has_weight`, `debug_sync`, `kv_ensure_layer`, `get_positions_buf`, `matmul_on_gpu`, `quant_matmul_q8`, `quant_matmul_f32_on_gpu` | **deleted** once `layer_gpu` went (it was their only caller) |
+| `buf_hidden`, `buf_bn`, `buf_bq`, `buf_bk`, `buf_bv`, `buf_ba`, `buf_bf`, `buf_bg`, `buf_q8_bn`, `buf_q8_ba`, `buf_positions`, `kv_k`, `kv_v`, `kv_size` | **deleted** with their initializers (only `layer_gpu` read them) |
+| `tier` | **deleted**: never read from `self`; the name-level matches are `device_tier::Selection`'s own `tier` in the two select arms (the collision the census note flags). Its doc said "Direct consumers arrive with the batch-cap activation (plan §14 R8)", which is the pattern the plan's own A7 note rejects — "a future feature will need it" is not enough. The effective gate production reads is `tier_mmq`; the R8 work re-adds the field from the selection it already computes. |
+| `cc` | **kept, reported**: read by `#[cfg(test)] CudaState::cc()` (driven from `graph/cuda_backend/tests.rs`), so it is test-reachable and not a deletion. Its non-test-dead annotation is [#243](https://github.com/yusiwen/minfer/issues/243)'s tightening, the same shape T1/T2 handled for their items. |
+| `stream_wait_event` / the FFI declaration `cudaStreamWaitEvent` | **kept, pending [#138](https://github.com/yusiwen/minfer/issues/138)**: the device→device staging copy it is the mechanism for. The census brief requires this. |
+| `src/device_entry.rs` (`DEVICE_ENTRY`, `DeviceHolder`, `DeviceEntry`, `enter`) + its `mod` declaration and its test file | **deleted**: the guard exists for a caller that does not exist (#188 had already narrowed it to `layer_gpu`). |
+| `cuda_debug_enabled` + the `CUDA_DEBUG` `OnceLock` | **newly dead**, identified here and deleted in the same commit: `debug_sync` was its only reader. |
+
+Two doc claims were read because a doc that names a production caller is the #218 *lost-caller* shape:
+`clear_launch_failure`'s `Err`-arm claim (`graph/cuda_backend.rs::execute_node` drains
+`take_launch_failure()` on both arms instead — the doc was stale) and `init_kv_cache`'s "must be called
+before the first forward pass" (superseded by the graph path, which owns KV through
+`GraphAllocator::kv_pair`). Both items are deleted; no lost caller was found, so nothing is reported as
+(a) for these two. No `extern "C"`/`#[no_mangle]` item is in the set and none of the names is a symbol
+in `src/cuda_kernels.cu` or `build.rs`; nothing `memcpy`s a `CudaState`.
+
+**The two deferrals this closes.** `StreamScratch::slot` ([#239](https://github.com/yusiwen/minfer/issues/239)'s deferral, pinned by the
+four bucket-A wrappers `upload_hidden`/`upload_positions`/`download_logits`/`get_positions_buf`) now
+lives in `src/cuda/tests.rs` as `pub(super)`, the visibility the rest of that file uses for the sibling
+`cuda::*_tests` modules. `CudaState::matmul_f32_ptr` ([#238](https://github.com/yusiwen/minfer/issues/238)'s deferral, pinned by `quant_matmul_f32_on_gpu`)
+is now `#[cfg(test)] pub(crate)` — its callers are the device gates in `graph::cuda_backend::tests`, a
+`#[cfg(test)]` module in another file, so T1's in-place form (not T2's move) is the correct one.
+
+**The one intentional coverage decrease.** `src/device_entry/tests.rs` held a single test,
+`device_entry::tests::the_legacy_unbound_path_is_exclusive_across_threads_and_re_entrant_on_one`, which
+asserted the guard's cross-thread exclusion and per-thread re-entrancy with mutation evidence. It is
+deleted with the guard, **by decision** (recorded on [#241](https://github.com/yusiwen/minfer/issues/241)): the guard's only caller is
+dead, so there is no engine property left for the assertions to be about. This is the only place a test
+is removed in this ticket, and no other test loses an assertion. It is why the CPU rows move 481 → 480
+(aarch64) and 479 → 478 (CI), and the CUDA rows 566 → 565.
+
+**Evidence form: the census re-run (this ticket's version of mutation evidence).** There is no gate to
+mutate — the deleted code has no caller, so no test observes it, and "break the implementation and watch
+a gate go red" has nothing to break. For a deletion ticket the observable claim is instead "the dead set
+shrank by exactly what was removed, and nothing else became dead", and that is *measured*. Method,
+identical on both sides: `strip.py` in a scratch worktree (every `allow(dead_code)` replaced by a
+`//STRIPPED` comment, line numbers preserved), then
+`cargo check --release --features cuda --message-format=json` (the maximal configuration on Linux,
+because `src/cuda.rs` is `#[cfg(feature = "cuda")] mod`), counting **every** `src/` span of every
+`dead_code` diagnostic. Liveness is rustc's, never a name grep.
+
+| tree | dead `src/` sites | dead items | `src/cuda.rs` sites |
+|---|---|---|---|
+| `e9bf4c5` — the durable census' recorded baseline (reproduced here from `minfer-allow-census/cuda.jsonl`) | **314** | 260 | 53 |
+| `79c9837` — this branch's parent | **191** | **156** | 53 |
+| `dc550a9` — after the uncoupled deletions | **175** | **140** | 37 |
+| `2fbaf00` — the final tree | **143** | **109** | 7 |
+
+The drop from the parent is **48 sites / 47 items**, and the before/after item-name diff has an **empty
+"new" side**: zero newly-dead items. The 314 → 191 drop between the recorded baseline and this branch's
+parent is **not** this ticket: [#238](https://github.com/yusiwen/minfer/issues/238)/[#239](https://github.com/yusiwen/minfer/issues/239) turned bucket-C items into `#[cfg(test)]` and moved bucket-B items
+into `tests.rs`, and an item that is not compiled into a non-test build leaves the dead set entirely.
+Truncation check: both captures re-run under `RUSTFLAGS=--cap-lints=warn` differ from the
+`deny(warnings)` captures by **symmetric difference 0** (cpu and cuda), so `deny(warnings)` did not
+truncate the count.
+
+The seven `src/cuda.rs` sites left are outside this ticket's list and are **named, not silently left**:
+`stream_wait_event` + its FFI declaration `cudaStreamWaitEvent` ([#138](https://github.com/yusiwen/minfer/issues/138)), `cc`
+([#243](https://github.com/yusiwen/minfer/issues/243)), and `cudaGetErrorString`/`cuda_error_string`, `minfer_site_hist_reset`,
+`stream_sync_count` — dead before this ticket too (they are in the baseline set, not the diff), so they
+belong to [#242](https://github.com/yusiwen/minfer/issues/242)/[#243](https://github.com/yusiwen/minfer/issues/243)/[#244](https://github.com/yusiwen/minfer/issues/244)'s sweep, not to #240.
+
+**Bar named before measuring.** No `#[test]` is added or removed **except** the guard's own, removed by
+decision (above), so no assertion outside it changes. The bar: the non-test build stays warning-free
+with and without `--features cuda` and without adding a single `allow(dead_code)`; the suite rows move
+by exactly the one removed test (480/0/36 + 10/0/6 CPU, 565/0/42 CUDA); and the census dead-site count
+drops by at least the number of items deleted, with zero newly-dead sites.
+
+**Counts (rule 5), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-01.**
+`cargo test --release` → **480 / 0 / 36** unit + **10 / 0 / 6** integration.
+`bash scripts/cuda_test.sh` → **565 / 0 / 42**.
+`compute-sanitizer --tool memcheck --target-processes all <test binary> --test-threads=1` →
+**0 API errors** over 565 / 0 / 42.
+`cargo check --release`, `cargo check --release --features cuda` and
+`cargo check --release --tests --features cuda` all exit 0; the only `warning:` line is `build.rs`'s
+pre-existing `cargo:warning=` target list. `cargo fmt --all --check` clean; `check_status.py --check`,
+`check_docs_links.py` and `check_source_layout.py` clean (the deleted `src/device_entry/tests.rs` and
+the `mod device_entry;` line go together, so no `.rs` is left undeclared). The four rows that share the
+removed test are updated together: `docs/status.toml`'s CPU rows (481 → 480, 479 → 478), the CUDA unit
+row (566 → 565) and the sanitizer row (566 → 565), each with its `projection_base_passed`; `AGENTS.md`
+carries the same numbers and the changelog sentence.
+
+**Docs.** [#240](https://github.com/yusiwen/minfer/issues/240) is closed with the evidence comment; [#241](https://github.com/yusiwen/minfer/issues/241) carries the absorption and the deletion
+(not silent); [#239](https://github.com/yusiwen/minfer/issues/239) gets the `slot` closure, [#238](https://github.com/yusiwen/minfer/issues/238) the `matmul_f32_ptr` closure; [#244](https://github.com/yusiwen/minfer/issues/244) gets
+`cc`'s annotation and the two stale-doc findings as decisions; [#243](https://github.com/yusiwen/minfer/issues/243) gets `cc`; [#185](https://github.com/yusiwen/minfer/issues/185) is closed with
+the guard's removal and what remains of its question. The live doc claims that named the removed knob
+(`MINFER_CUDA_DEBUG` in `docs/CUDA-BACKEND-DESIGN.md`, the walkthrough and the tutorial) and the
+`#189` record's sentence about the guard covering `layer_gpu` are updated in place; the historical
+`#185`/`#188` records keep their wording.
+
+**Limits.** (1) The macOS-only modules were not touched — the `build-macos` CI job is their only gate.
+(2) The counted census is a `cargo check`: a "caller" is a compile-time reference, not a verified
+runtime exercise; the suites above are the independent runtime check. (3) `--features debug_dump` was
+not built, as in the census itself. (4) The real-model gate sets were **not** re-run here (they need
+the cached models and were unaffected — no test in that set was touched); their rows are unchanged and
+still dated 2026-09-27. (5) `cc`'s tightening and the residual dead items are named above and left to
+[#242](https://github.com/yusiwen/minfer/issues/242)/[#243](https://github.com/yusiwen/minfer/issues/243)/[#244](https://github.com/yusiwen/minfer/issues/244).
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define

@@ -619,8 +619,9 @@ CParams.gpu = metal_on || cuda_on
   `Backend::Cuda` to the position found by name, so the SwiGLU rewrite is gated by CUDA's own
   `supports_fused`.
 - The dump/debug tags in `forward_cached` are backend-agnostic (`MINFER_GRAPH_DUMP`;
-  `MINFER_REBUILD_TRACE=1`, Qwen2 only). `MINFER_CUDA_DEBUG` is a device-layer trace for the legacy
-  surface.
+  `MINFER_REBUILD_TRACE=1`, Qwen2 only). `MINFER_CUDA_DEBUG` was a device-layer trace on the legacy
+  `layer_gpu` surface; [#240](https://github.com/yusiwen/minfer/issues/240)/[#241](https://github.com/yusiwen/minfer/issues/241) deleted that surface, so the knob and its per-node syncs
+  (`debug_sync`) are gone — the graph path's `CudaState::sync()` is the remaining drain point.
 
 ### 4.7 Memory, residency and staging
 
@@ -1284,7 +1285,7 @@ A median of 9 flips once 5 pairs are disturbed, and that run had exactly 5 above
 
 The co-tenant moved up to 3 of 9 pairs above the bar (the recorded failure's 5 is inside the tolerance); a single disturbed pair reached **5.09x** in run 4 and the sign test still returned green. The whole set was **6 / 6 green**, including the `#154` batching gate that had also failed once in this configuration. Honest reading: in these six runs the co-tenant was lighter than in the recorded one — no run's *median* exceeded 1.25x — so they show the gate is not decided by the co-tenant, not that the new statistic rescued a median-red run. That case is the recorded distribution itself, replayed by the pure test `graph::cuda_backend::tests::the_s4_ab_statistic_absorbs_a_loaded_run_and_still_refuses_a_real_regression` (5 of 9 refusals pass at 7; the old median of the same ratios is 1.398x and red).
 
-The parallel configuration is reachable without removing anything: after #188 the `src/device_entry.rs` guard covers only `CudaState::layer_gpu` (`src/cuda.rs` ~line 6900, `#[allow(dead_code)]` legacy surface), and `BackendScheduler::execute` and `register_cuda_weight` no longer take it. No guard change is part of this ticket.
+The parallel configuration is reachable without removing anything: after #188 the `src/device_entry.rs` guard covers only `CudaState::layer_gpu` (`src/cuda.rs` ~line 6900, `#[allow(dead_code)]` legacy surface), and `BackendScheduler::execute` and `register_cuda_weight` no longer take it. No guard change is part of this ticket. *(Superseded 2026-10-01: [#241](https://github.com/yusiwen/minfer/issues/241) deleted `layer_gpu`, and the guard module with it, once the census showed `layer_gpu` had no caller at all — see the #240 record in the plan.)*
 
 **Mutation evidence (rule 3).** `MINFER_S4_AB_MAP_REPS=2` (`src/cuda.rs::s4_ab_map_reps`) issues every **map-mode** attention launch twice, so the gate's timed map arm pays twice the work — the reproducible form of #123's map-work doubling, and an implementation mutation rather than a test edit. With it armed, the same command on the same binary fails in the decode phase:
 
