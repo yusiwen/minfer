@@ -5713,6 +5713,145 @@ from `-- --ignored`, not from the default `cargo test --release` run. (4) The mu
 the instrument is the span-**cover** one, not the span-**offset** one the ticket names; which arm
 each kills is stated above, and neither is presented as the other.
 
+
+#### Test-infrastructure record (#238, 2026-10-01) — the bucket-C test-only wrappers become `#[cfg(test)]`, in place
+
+**The ticket.** [#238](https://github.com/yusiwen/minfer/issues/238) is T1 of the `allow(dead_code)` census. Its bucket **C** is "dead in the
+production `--features cuda` build, reached from test code, with at least one test caller **outside**
+the item's own module subtree". Those items cannot move into their module's `tests.rs` — that is
+bucket **B** / T2 ([#239](https://github.com/yusiwen/minfer/issues/239)) — so the retirement is an explicit test-only scope at the item:
+
+```diff
+-    #[cfg_attr(not(test), allow(dead_code))]
+-    pub fn foo(…)
++    /// Test-only (#238): driven by `…::tests::…`; `#[cfg(test)]` keeps it out of production builds.
++    #[cfg(test)]
++    pub(crate) fn foo(…)
+```
+
+`#[cfg(test)]` is strictly stronger than `allow(dead_code)`: the item **does not exist** in a
+non-test build, so a later cleanup cannot leave a production-looking orphan behind (the #218 shape
+[GATE-CONTRACT.md](./GATE-CONTRACT.md) §1 asks about). The item stays where it is because its callers are in other
+modules: moving the surface into a different module's test file would relocate the boundary without
+relocating the caller — the same reasoning [#236](https://github.com/yusiwen/minfer/issues/236)'s record gives for `kv_cell_of`.
+
+**Reconciliation: the three tallies were 26, 71 and 56.** Re-derived from the raw captures
+(`minfer-allow-census/cuda.jsonl`, `tests_cuda.jsonl`), taking **every** span of every `dead_code`
+diagnostic whose file starts with `src/`:
+
+| unit | count |
+|---|---|
+| distinct `(file, line)` dead sites, `cargo check --release --features cuda` | **314** (99 diagnostics) |
+| … still dead under `--tests --features cuda` → bucket **A** ([#242](https://github.com/yusiwen/minfer/issues/242)) | **142** |
+| … test-reachable (314 − 142) → 68 sites on B items + 71 on C items + 33 `impl`/`mod` header spans that rustc reports without an item identity | **172** |
+
+At census **item** level (`census.json`, keyed by `(file, line, name)`) the cuda build has **260**
+dead items: A **121** (89 code / 32 shape), B **68** (58 / 10), C **71** (56 code / 15 shape). The
+three numbers the tracker carried are three different units, not three measurements:
+
+- **26** — the number of `dead_code` *diagnostics* whose **primary** span is a bucket-C item. The
+  earlier analysis took each diagnostic's primary span only, so a grouped diagnostic collapsed a
+  whole dead `impl` into one row. This record reproduces 26 exactly with that rule.
+- **71** — the item-level bucket-C count (`cuda_C` in `census.json`), i.e. 56 code + 15 shape.
+- **56** — the **code**-only C set, which is what T1 lists. `tickets/T1.md` carries exactly 56 item
+  bullets (a naive `grep -c '^- \`` reads 57: one Acceptance bullet also starts with a backtick).
+
+**Per-item verification, and what a re-read changed.** Every item was read at its call site before
+it was touched; a name match is not a call site. The census's six recorded collision overrides
+(`snapshot`, `plan`, `cuda_backend::new`, `submit`, `sample`, `source`) all held. Six more were found
+here, and one of them changed a recorded call list without changing a bucket:
+
+- `CudaBackend::kv_format` vs `GraphAllocator::kv_format` / `ModelDef::kv_format`: the census's three
+  recorded test callers for `graph/cuda_backend.rs:314` are the other two (the registry hook is
+  `fn(&GraphAllocator)`, `registry.rs:241`). The real caller is `graph/alloc/tests.rs:1526`
+  (`alloc.cuda().unwrap().kv_format()`), so the item stays C.
+- `optiming::record` vs `TimingSink::record`: the census's `optiming/tests.rs:142` caller is the
+  sink's method; the free function's one caller is `graph/scheduler/tests.rs:208`.
+- `GgufContext::get_val_bool` vs `GgufKv::get_val_bool`: the four non-test matches (`gguf.rs:770`,
+  `:1752`, `:1849`, `main.rs:2398`) are the inner type's method; the context's is test-only.
+- `CpuBackend::pool_len` vs `BackendTrait::pool_len`: `GraphAllocator::pool_len_of` calls the trait
+  method; the inherent method's only caller is `n_cpu_buffers`.
+- `Tensor::new` vs `Vec::new()` / `String::new()` / `OnceLock::new()`: the census's ~200 "other
+  callers" are all other types; the one real caller is `graph/builder/tests.rs:6`.
+- `GraphAllocator::supports` vs `KvFormat::supports`: `kvformat::resolve` calls the format's.
+
+**No item moved from C to A or C to B**, but four of the 56 are not gated here, each with its reason
+written at the item (or, for the two (a) verdicts, in the tracker):
+
+| item | verdict |
+|---|---|
+| `CudaState::matmul_f32_ptr` (`cuda.rs:3888`) | **blocked**: its caller `CudaState::quant_matmul_f32_on_gpu` (`cuda.rs:5325`) is bucket **A** and still compiled into production (part of [#240](https://github.com/yusiwen/minfer/issues/240)'s legacy wrapper layer). Gating the callee would leave the production CUDA build naming a function that does not exist. Deferred to [#240](https://github.com/yusiwen/minfer/issues/240)/[#242](https://github.com/yusiwen/minfer/issues/242). |
+| `CpuBackend::pool_len` (`cpu_backend.rs:113`) | **blocked**: its only caller `GraphAllocator::n_cpu_buffers` (`alloc.rs:2358`) is bucket **B** ([#239](https://github.com/yusiwen/minfer/issues/239)) and stays compiled, with its own `allow`, until T2 moves it. Deferred to [#239](https://github.com/yusiwen/minfer/issues/239). |
+| `ModelDef::as_any` (`models/mod.rs:211`) | **(a) question**: the doc says "downcast helper for the graph path's weight registration"; `models::weight_reg` never downcasts (its decision is a pure `(ttype, geometry)` predicate) and every `as_any()` call site under `src/` is in a `#[cfg(test)]` module. A production-looking trait method whose documented caller does not exist — reported, not silenced. |
+| `ModelDef::offload` (`models/mod.rs:294`) | **(a) question**: the doc (and the qwen2/qwen3 module docs) says it "hands the plan to the graph builder", but the builder reads `model.offload.plan` (`models/qwen2/graph.rs:556`) and nothing outside tests calls the accessor. Same class, same disposition. |
+
+Both (a) items are defaulted/required **trait** methods, so `#[cfg(test)]` would also change the
+trait's public surface and (for `as_any`) both impls — a decision for [#244](https://github.com/yusiwen/minfer/issues/244)'s shape/API class
+rather than a mechanical retirement.
+
+**Stale docs corrected at the item.** `CudaState::stream_is_capturing` and its FFI declaration
+`cudaStreamIsCapturing` both claimed a "registration path's refusal / inventory" consumer. No such
+caller exists: the production capture bookkeeping is the per-instance `CudaBackend::capturing` field,
+and the pair's only caller is the #188 probe in `graph/cuda_backend/tests.rs`. Their docs now say so.
+
+**Bar named before measuring.** No `#[test]` is added or removed, and no assertion moves — the tests
+keep their own assertions and only the resolution of the item changes. The bar: the non-test build
+stays warning-free with and without `--features cuda` (the crate carries
+`#![cfg_attr(not(test), deny(warnings))]`, so an exposed callee or a broken call site is a hard
+failure), the suite counts stay where the recorded rows put them, and one mutation per module group
+must be visible to the test that drives the scoped item.
+
+**Mutation evidence (rule 3), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-01.** One representative
+item per module group; each mutation applied, the named test run with `--exact`, then reverted and
+`git status --porcelain <file>` empty. All 16 went red:
+
+| group (item) | mutation | test (all FAILED) | first failing line |
+|---|---|---|---|
+| conversation (`Conversation::start`) | `prefill_tokens = toks.len() + 1` | `conversation::tests::first_turn_full_render_and_eog` | `tests.rs:209`: left 22 / right 21 |
+| cuda (`format_of`) | `KV_LAYOUT_F16 => F32` | `cuda::kv_dtype_tests::the_layout_tag_is_the_format_discriminant` | `kv_dtype_tests.rs:14`: left F32 / right F16 |
+| gguf (`get_arr_n`) | `get_ne() + 1` | `gguf_write::tests::every_metadata_type_round_trips_through_the_parser` | `tests.rs:58`: left 3 / right 2 |
+| grammar (`accepts`) | `Err(_) => true` | `grammar::tests::gbnf_literals_classes_and_dot` | `tests.rs:83` |
+| graph/alloc (`get_buffer`) | `if true { return None }` | `graph::alloc::tests::fill_and_read_input` | `tests.rs:356` |
+| graph/builder (`swiglu`) | inputs `&[up, gate]` | `graph::builder::tests::swiglu_builder_and_meta` | `tests.rs:91`: left `[1, 0]` / right `[0, 1]` |
+| graph/cache (`stats`) | `builds + 1` | `graph::cache::tests::switching_between_cached_graphs_re_maps_instead_of_rebuilding` | `tests.rs:96`: left (3, 0) / right (2, 0) |
+| graph/copystats (`delta`) | `copies: self.copies` | `graph::copystats::tests::the_two_phases_are_counted_separately_and_the_delta_is_exact` | `tests.rs:28`: left copies 5 / right 2 |
+| graph/cpu_backend (`causal_span`) | `(0, p)` instead of `(0, p + 1)` | `graph::cuda_backend::tests::cuda_rope_kv_attn_roundtrip` (**CUDA**) | `graph/cuda_backend/tests.rs:689` |
+| graph/cuda_backend (`stream_sync_count`) | return `0` | `graph::cuda_backend::tests::stream_sync_counts_are_per_backend_not_process_wide` (**CUDA**) | `tests.rs:8317`: left 0 / right 1 |
+| graph/kvcache (`GraphAllocator::kv_clear_identity`) | no-op | `graph::scheduler::tests::a_non_identity_kv_mapping_is_refused` | `tests.rs:85` |
+| graph/kvformat (`pack_q8_0_cell`) | `dst *= 2.0` after packing | `graph::kvformat::tests::a_packed_cell_round_trips_within_the_q8_0_block_error` | `tests.rs:172` |
+| graph/registry (`is_unfiltered`) | `all` → `any` | `graph::registry::tests::the_name_surface_fences_devices_and_keeps_cpu` | `tests.rs:186` |
+| optiming (`record`) | drop the record | `graph::scheduler::tests::a_concurrent_graph_load_cannot_move_a_private_sink` | `tests.rs:242`: left 256 / right 257 |
+| tensor (`Tensor::from_data`) | zero the payload | `graph::op_matrix::matrix_cases_match_their_reference` | `op_matrix.rs:800` |
+| testfail (`checked`) | `map_or(0, |_| 1)` | `graph::scheduler::tests::the_execute_chokepoint_is_observable` | `tests.rs:131`: left 1 / right 2 |
+
+The full suite run is the baseline these deltas are read against (below). The CUDA rows ran through
+the device build; the rest are CPU rows.
+
+**Counts (rule 5).** No `#[test]` was added or removed, so no row moves and **no CUDA row is
+re-measured**: `cargo test --release`, box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-01 → **481 / 0 /
+36** unit + **10 / 0 / 6** integration (the recorded CPU row, unchanged);
+`bash scripts/cuda_test.sh`, same box, 2026-10-01 → **566 / 0 / 42** (the recorded CUDA row,
+unchanged; the suite was run to confirm the device build still links the `#[cfg(test)]` items it now
+gates). `cargo check --release` and `cargo check --release --features cuda` both exit 0 with no rustc
+diagnostic (the one CUDA `warning:` line is `build.rs`'s pre-existing `cargo:warning=` target list);
+`cargo fmt --all --check` clean; `python3 scripts/check_status.py --check` exits 0.
+
+**Docs.** The [#235](https://github.com/yusiwen/minfer/issues/235) family issue gets a comment recording which of its four wrappers this ticket
+closed (`kv_clear_identity`, `kv_shift`, `kv_n_used` — `kv_cells_for` is bucket A and stays with
+[#242](https://github.com/yusiwen/minfer/issues/242)); [#238](https://github.com/yusiwen/minfer/issues/238) gets the reconciliation, the four deferrals and the patch that brings its body in
+line; [#239](https://github.com/yusiwen/minfer/issues/239)/[#240](https://github.com/yusiwen/minfer/issues/240)/[#242](https://github.com/yusiwen/minfer/issues/242) keep their rows.
+
+**Limits.** (1) The macOS-only modules (`metal.rs`, the Metal half of `graph/metal_backend.rs`) are
+not compiled on Linux, so their annotations are unchanged and unjudged — the macOS CI job is the only
+gate (`src/models/mod.rs`'s `as_any` is reached from `metal/mmap_align_test.rs`, which is why it
+appears in this bucket at all). (2) The item-level classification still rests on textual test-caller
+resolution for the *module* of a caller (liveness is rustc's); the six new collisions above are the
+residue, each now verified by reading. (3) `Tensor::new`'s only consumer is the `f32_tensor` helper
+in `graph/builder/tests.rs`, whose assertions read fields the helper sets itself (name, shape) — no
+mutation of `new`'s body is observable through it, so the tensor group's mutation is on
+`Tensor::from_data` (same `impl Tensor`, same file), and that is a real gap in the helper's coverage,
+recorded rather than papered over. (4) `--features debug_dump` was not built by the census or here.
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
