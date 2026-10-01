@@ -586,9 +586,13 @@ fn two_cuda_engines_with_different_kv_layouts_run_interleaved() {
 /// two OS threads at the same time, each bitwise equal to its own serial
 /// reference.
 ///
-/// This is the configuration [#185] refuses today (`device_entry::enter`) and
-/// the one the pre-#188 `CudaState` singleton cannot express: one stream means
-/// a stream's work is serial, and two capture windows cannot be open on it.
+/// This is the configuration [#185](https://github.com/yusiwen/minfer/issues/185)
+/// used to refuse (`device_entry::enter`, until
+/// [#240](https://github.com/yusiwen/minfer/issues/240)/[#241](https://github.com/yusiwen/minfer/issues/241)
+/// deleted that guard together with the dead legacy `CudaState::layer_gpu` path it
+/// protected) and the one the pre-#188 `CudaState` singleton cannot express: one
+/// stream means a stream's work is serial, and two capture windows cannot be open
+/// on it.
 /// The fix gives every `CudaBackend` its own non-blocking stream and a
 /// thread-local capture mode, so the two engines really do overlap — the
 /// `streams` arm asserts the two live backends hold **different** device
