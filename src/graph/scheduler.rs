@@ -155,9 +155,10 @@ impl BackendScheduler {
         // Issue #188: a CUDA split no longer takes the #185 device-entry guard.
         // Each `CudaBackend` owns a non-blocking stream and a capture window on
         // that stream, and the capture mode is thread-local, so two device graph
-        // executions no longer share — or invalidate — each other's capture. The
-        // guard is narrowed to the unbound legacy `layer_gpu` path; see
-        // `src/device_entry.rs`.
+        // executions no longer share — or invalidate — each other's capture.
+        // #188 narrowed the guard to the unbound legacy `layer_gpu` path; #241
+        // then deleted that path, and the guard module with it, so there is no
+        // device-entry exclusion left anywhere in the engine.
         if std::env::var("MINFER_GRAPH_TRACE").is_ok() {
             for (si, s) in splits.iter().enumerate() {
                 eprintln!(

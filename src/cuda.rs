@@ -226,14 +226,6 @@ fn cuda_error_string(code: i32) -> &'static str {
     }
 }
 
-// Legacy layer_gpu debug tracing (7e⑦): the graph path syncs via
-// `CudaState::sync()`; MINFER_CUDA_DEBUG tracing stays for the legacy
-// surface only (debug_sync in the impl below).
-static CUDA_DEBUG: OnceLock<bool> = OnceLock::new();
-fn cuda_debug_enabled() -> bool {
-    *CUDA_DEBUG.get_or_init(|| std::env::var("MINFER_CUDA_DEBUG").is_ok())
-}
-
 // ─── FFI declarations for kernel launch wrappers ───────────
 
 extern "C" {
@@ -1266,28 +1258,6 @@ impl StreamScratch {
             map: Mutex::new(HashMap::new()),
         }
     }
-
-    /// The current stream's `(ptr, size)`, or `(null, 0)` when this stream has
-    /// never grown the slot. Test/introspection surface.
-    ///
-    /// **Not movable (#239):** the census puts it in bucket B (its only *test*
-    /// caller is `cuda::d35_probe_tests`), but the bucket-A legacy wrappers
-    /// `upload_hidden` / `upload_positions` / `download_logits` /
-    /// `get_positions_buf` still call it and are still compiled, so it must stay
-    /// until [#240]/[#242] delete them. The annotation stays for the same reason.
-    ///
-    /// [#240]: https://github.com/yusiwen/minfer/issues/240
-    /// [#242]: https://github.com/yusiwen/minfer/issues/242
-    #[allow(dead_code)]
-    fn slot(&self) -> (CudaPtr, usize) {
-        let key = current_stream_key();
-        self.map
-            .lock()
-            .unwrap()
-            .get(&key)
-            .copied()
-            .unwrap_or((CudaPtr(std::ptr::null_mut()), 0))
-    }
 }
 
 /// Issue #188: the CUDA stream capture mode the device layer opens windows
@@ -1787,25 +1757,6 @@ pub struct CudaState {
     /// r59 rider: max id/32 seen at K-quant registration — the pre-warm
     /// MmqCache scratch sizing hint (0 until a K-quant weight registers).
     max_nchunk: std::sync::atomic::AtomicUsize,
-    // Persistent activation buffers (grown on demand) with size tracking
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_hidden: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bn: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bq: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bk: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bv: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_ba: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bf: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_bg: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_q8_bn: StreamScratch,
     /// 8c: prefill Q8_0-activation scratch (quantized activations for the
     /// Q4_0×Q8_0 GEMM, nt > 1). Grown on demand like the layer-path buffers.
     buf_q8_prefill: StreamScratch,
@@ -1838,14 +1789,6 @@ pub struct CudaState {
     /// (same assumption as the 8c buf_q8_prefill).
     buf_f16_w: StreamScratch,
     buf_f16_x: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_q8_ba: StreamScratch,
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    buf_positions: StreamScratch,
-    // Persistent per-layer GPU KV cache (k, v) and current size
-    kv_k: Mutex<Vec<CudaPtr>>,
-    kv_v: Mutex<Vec<CudaPtr>>,
-    kv_size: Mutex<Vec<usize>>,
 }
 
 /// Quant block element count (ggml block_q): 256 for K-quants, 32 otherwise.
@@ -2308,15 +2251,6 @@ impl CudaState {
             q4k_dsc: Mutex::new(HashMap::new()),
             q4k_dsc_warned: std::sync::atomic::AtomicBool::new(false),
             max_nchunk: std::sync::atomic::AtomicUsize::new(0),
-            buf_hidden: StreamScratch::new(),
-            buf_bn: StreamScratch::new(),
-            buf_bq: StreamScratch::new(),
-            buf_bk: StreamScratch::new(),
-            buf_bv: StreamScratch::new(),
-            buf_ba: StreamScratch::new(),
-            buf_bf: StreamScratch::new(),
-            buf_bg: StreamScratch::new(),
-            buf_q8_bn: StreamScratch::new(),
             buf_q8_prefill: StreamScratch::new(),
             buf_qa8_t: StreamScratch::new(),
             buf_sda_t: StreamScratch::new(),
@@ -2326,11 +2260,6 @@ impl CudaState {
             buf_q8_decode: StreamScratch::new(),
             buf_f16_w: StreamScratch::new(),
             buf_f16_x: StreamScratch::new(),
-            buf_q8_ba: StreamScratch::new(),
-            buf_positions: StreamScratch::new(),
-            kv_k: Mutex::new(Vec::new()),
-            kv_v: Mutex::new(Vec::new()),
-            kv_size: Mutex::new(Vec::new()),
         })
     }
 
@@ -2357,11 +2286,6 @@ impl CudaState {
             }
             s
         });
-    }
-
-    #[allow(dead_code)] // legacy surface (7e⑦): used by layer_gpu
-    pub fn has_weight(&self, name: &str) -> bool {
-        self.weights.lock().unwrap().contains_key(name)
     }
 
     /// Bytes of device-resident weights this state holds (E4: the feasibility gate
@@ -3464,64 +3388,6 @@ impl CudaState {
         ))
     }
 
-    /// Debug sync: print label, then sync and report error.
-    /// `il` = layer index, or negative for non-layer steps (e.g. output norm).
-    /// Only active when MINFER_CUDA_DEBUG is set.
-    #[allow(dead_code)]
-    pub fn debug_sync(&self, il: i32, label: &str) {
-        if !cuda_debug_enabled() {
-            return;
-        }
-        let err = unsafe { cudaGetLastError() };
-        if il >= 0 {
-            let tag = format!("l{il}: ");
-            if err != 0 {
-                eprintln!("CUDA DEBUG: {tag}{label} -- latched API error: {err}");
-            }
-            let err = unsafe { cudaStreamSynchronize(self.stream()) };
-            if err != 0 {
-                eprintln!("CUDA DEBUG: {tag}{label} -- sync error: {err}");
-            } else {
-                eprintln!("CUDA DEBUG: {tag}{label} OK");
-            }
-        } else {
-            if err != 0 {
-                eprintln!("CUDA DEBUG: {label} -- latched API error: {err}");
-            }
-            let err = unsafe { cudaStreamSynchronize(self.stream()) };
-            if err != 0 {
-                eprintln!("CUDA DEBUG: {label} -- sync error: {err}");
-            } else {
-                eprintln!("CUDA DEBUG: {label} OK");
-            }
-        }
-    }
-
-    // ─── Upload/download for forward pass ─────────────────────
-
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn get_positions_buf(&self) -> *mut std::ffi::c_void {
-        self.buf_positions.slot().0 .0
-    }
-
-    // ─── KV cache management ─────────────────────────────────
-
-    /// Verify KV cache has enough room for `max_nkv` entries at layer `il`.
-    /// Returns false if capacity is exceeded (should never happen with pre-allocation).
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    fn kv_ensure_layer(&self, il: usize, max_nkv: usize) -> bool {
-        let szvec = self.kv_size.lock().unwrap();
-        let size = szvec.get(il).copied().unwrap_or(0);
-        if max_nkv > size {
-            eprintln!(
-                "CUDA: KV cache overflow at layer {}: need {} but allocated {}",
-                il, max_nkv, size
-            );
-            return false;
-        }
-        true
-    }
-
     // ─── CUDA Graph (decode step batch) ───────────────────────
 
     pub fn graph_begin_capture(&self) -> bool {
@@ -3653,36 +3519,17 @@ impl CudaState {
 
     // ─── Kernel launch operations (called from CudaCommandBuffer) ──
 
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn quant_matmul_q8(
-        &self,
-        w: &Tensor,
-        x: *mut std::ffi::c_void,
-        out: *mut std::ffi::c_void,
-        od: usize,
-        id: usize,
-        nt: usize,
-    ) {
-        let wptr = self.get_weight_ptr(&w.name).expect("weight not on GPU");
-        let stream = self.stream();
-        unsafe {
-            launch_q4_0_q8_0_matmul(
-                wptr as *const u8,
-                x as *const u8,
-                out as *mut f32,
-                od as i32,
-                id as i32,
-                nt as i32,
-                stream,
-            );
-        }
-    }
-
     /// f32-activation matmul dispatch by raw weight pointer + tensor type.
     /// The graph backend (graph/cuda_backend.rs) resolves weights by name and
-    /// holds no Tensor, so dispatch takes (ptr, ttype) directly; the legacy
-    /// Tensor-taking entry point below delegates here.
-    pub fn matmul_f32_ptr(
+    /// holds no Tensor, so dispatch takes (ptr, ttype) directly.
+    ///
+    /// Test-only (#240): production goes through `matmul_f32_ptr_layout`
+    /// directly; the only callers of this `padded_q6k: false` shorthand are the
+    /// device gates in `graph::cuda_backend::tests`, so `#[cfg(test)] pub(crate)`
+    /// is the T1 (#238) form — a `#[cfg(test)]` module in another file is the
+    /// caller, so it cannot move into `cuda/tests.rs`.
+    #[cfg(test)]
+    pub(crate) fn matmul_f32_ptr(
         &self,
         wptr: *mut std::ffi::c_void,
         ttype: TensorType,
@@ -5117,41 +4964,6 @@ impl CudaState {
             );
         }
         Ok(())
-    }
-
-    pub fn quant_matmul_f32_on_gpu(
-        &self,
-        w: &Tensor,
-        x: *mut std::ffi::c_void,
-        out: *mut std::ffi::c_void,
-        od: usize,
-        id: usize,
-        nt: usize,
-    ) {
-        let wptr = self.get_weight_ptr(&w.name).expect("weight not on GPU");
-        self.matmul_f32_ptr(wptr, w.ttype, x, out, od, id, nt)
-            .unwrap_or_else(|e| panic!("CUDA: {e}"));
-    }
-
-    pub fn matmul_on_gpu(
-        &self,
-        w: &Tensor,
-        q8_x: *mut std::ffi::c_void,
-        f32_x: *mut std::ffi::c_void,
-        out: *mut std::ffi::c_void,
-        od: usize,
-        id: usize,
-        nt: usize,
-    ) {
-        if w.ttype == TensorType::Q4_0 {
-            self.quant_matmul_q8(w, q8_x, out, od, id, nt);
-        } else if w.ttype == TensorType::Q8_0 {
-            self.quant_matmul_f32_on_gpu(w, f32_x, out, od, id, nt);
-        } else if w.ttype == TensorType::Q4_1 {
-            self.quant_matmul_f32_on_gpu(w, f32_x, out, od, id, nt);
-        } else {
-            self.quant_matmul_f32_on_gpu(w, f32_x, out, od, id, nt);
-        }
     }
 
     pub fn quantize_q8_0(
@@ -6712,219 +6524,6 @@ impl CudaState {
                 stream,
             );
         }
-    }
-
-    // ─── Full-layer GPU pass ──────────────────────────────────
-
-    /// Encode one transformer layer onto the CUDA stream.
-    /// Returns false if any weight is missing from GPU.
-    ///
-    /// Issue #188: this is the **last unbound device entry point** — it drives
-    /// `buf_hidden`/`buf_bn`/… directly, with no `CudaBackend` instance to bind a
-    /// stream, so it shares the context stream and its (context-keyed) scratch set
-    /// with any other unbound caller. `crate::device_entry::enter` keeps that path
-    /// to one thread at a time. The graph path (`BackendScheduler::execute` →
-    /// `CudaBackend`, which binds its own stream) and weight registration
-    /// (stream-ordered on the context stream) no longer take the guard — see
-    /// `src/device_entry.rs` for the narrowed scope and why.
-    #[allow(dead_code)] // legacy surface (7e⑦)
-    pub fn layer_gpu(
-        &self,
-        il: usize,
-        l: &crate::models::qwen2::loader::LayerWeights,
-        positions: &[usize],
-        ne: usize,
-        nqt: usize,
-        nkt: usize,
-        nf: usize,
-        nt: usize,
-        nh: usize,
-        nk: usize,
-        hd: usize,
-        eps: f32,
-        freq_base: f32,
-        freq_scale: f32,
-    ) -> bool {
-        let _entry = match crate::device_entry::enter(
-            "the legacy `layer_gpu` path (unbound context stream)",
-        ) {
-            Ok(e) => e,
-            Err(reason) => {
-                eprintln!("{reason}");
-                return false;
-            }
-        };
-        let attn_norm = match &l.attn_norm {
-            Some(t) => t,
-            None => return false,
-        };
-        let ffn_norm = match &l.ffn_norm {
-            Some(t) => t,
-            None => return false,
-        };
-        let wq = l.wq.as_ref().unwrap();
-        let wk = l.wk.as_ref().unwrap();
-        let wv = l.wv.as_ref().unwrap();
-        let wo = l.wo.as_ref().unwrap();
-        let ffn_gate = l.ffn_gate.as_ref().unwrap();
-        let ffn_up = l.ffn_up.as_ref().unwrap();
-        let ffn_down = l.ffn_down.as_ref().unwrap();
-
-        // Accept Q4_0/Q4_1 group or Q4_K/Q6_K group (no mixing between groups)
-        fn is_q4(t: TensorType) -> bool {
-            t == TensorType::Q4_0 || t == TensorType::Q4_1
-        }
-        fn is_qk(t: TensorType) -> bool {
-            t == TensorType::Q4_K || t == TensorType::Q6_K
-        }
-        let all_q4 = is_q4(wq.ttype)
-            && is_q4(wk.ttype)
-            && is_q4(wv.ttype)
-            && is_q4(wo.ttype)
-            && is_q4(ffn_gate.ttype)
-            && is_q4(ffn_up.ttype)
-            && is_q4(ffn_down.ttype);
-        let all_qk = is_qk(wq.ttype)
-            && is_qk(wk.ttype)
-            && is_qk(wv.ttype)
-            && is_qk(wo.ttype)
-            && is_qk(ffn_gate.ttype)
-            && is_qk(ffn_up.ttype)
-            && is_qk(ffn_down.ttype);
-        if !all_q4 && !all_qk {
-            return false;
-        }
-
-        if !self.has_weight(&wq.name)
-            || !self.has_weight(&wk.name)
-            || !self.has_weight(&wv.name)
-            || !self.has_weight(&wo.name)
-            || !self.has_weight(&ffn_gate.name)
-            || !self.has_weight(&ffn_up.name)
-            || !self.has_weight(&ffn_down.name)
-        {
-            return false;
-        }
-        let norm_attn_w = match self.get_weight_ptr(&attn_norm.name) {
-            Some(p) => p,
-            None => return false,
-        };
-        let norm_ffn_w = match self.get_weight_ptr(&ffn_norm.name) {
-            Some(p) => p,
-            None => return false,
-        };
-        let bq_bias = l.bq.as_ref().and_then(|b| self.get_weight_ptr(&b.name));
-        let bk_bias = l.bk.as_ref().and_then(|b| self.get_weight_ptr(&b.name));
-        let bv_bias = l.bv.as_ref().and_then(|b| self.get_weight_ptr(&b.name));
-
-        let max_pos = positions.iter().copied().max().unwrap_or(0);
-        if !self.kv_ensure_layer(il, max_pos + 1) {}
-
-        let hidden_len = nt * ne * 4;
-        let bn_len = hidden_len;
-        let bq_len = nt * nqt * 4;
-        let bk_len = nt * nkt * 4;
-        let bv_len = bk_len;
-        let ba_len = nt * ne * 4;
-        let bf_len = nt * nf.max(ne) * 4;
-        let bg_len = nt * nf * 4;
-        let q8_bn_len = nt * (ne / 32) * Q8B;
-        let q8_ba_len = nt * (nf.max(ne) / 32) * Q8B;
-
-        let hidden = Self::get_or_grow(&self.buf_hidden, hidden_len);
-        let bn = Self::get_or_grow(&self.buf_bn, bn_len);
-        let bq_buf = Self::get_or_grow(&self.buf_bq, bq_len);
-        let bk_buf = Self::get_or_grow(&self.buf_bk, bk_len);
-        let bv_buf = Self::get_or_grow(&self.buf_bv, bv_len);
-        let ba_buf = Self::get_or_grow(&self.buf_ba, ba_len);
-        let bf_buf = Self::get_or_grow(&self.buf_bf, bf_len);
-        let bg_buf = Self::get_or_grow(&self.buf_bg, bg_len);
-        let q8_bn = Self::get_or_grow(&self.buf_q8_bn, q8_bn_len);
-        let q8_ba = Self::get_or_grow(&self.buf_q8_ba, q8_ba_len);
-        let pos_buf = self.get_positions_buf();
-        let kv_k = self.kv_k.lock().unwrap()[il].0;
-        let kv_v = self.kv_v.lock().unwrap()[il].0;
-
-        // Attention branch
-        self.rms_norm(hidden, Some(norm_attn_w), bn, ne, nt, eps);
-        self.debug_sync(il as i32, "rms_norm(attn)");
-
-        self.quantize_q8_0(bn, q8_bn, ne, nt);
-        self.debug_sync(il as i32, "quantize_q8_0(attn)");
-        self.matmul_on_gpu(wq, q8_bn, bn, bq_buf, nqt, ne, nt);
-        self.debug_sync(il as i32, "wq matmul");
-        if let Some(bb) = bq_bias {
-            self.add_bias_f32(bq_buf, bb, nqt, nt);
-            self.debug_sync(il as i32, "bq bias");
-        }
-        self.matmul_on_gpu(wk, q8_bn, bn, bk_buf, nkt, ne, nt);
-        self.debug_sync(il as i32, "wk matmul");
-        if let Some(bb) = bk_bias {
-            self.add_bias_f32(bk_buf, bb, nkt, nt);
-            self.debug_sync(il as i32, "bk bias");
-        }
-        self.matmul_on_gpu(wv, q8_bn, bn, bv_buf, nkt, ne, nt);
-        self.debug_sync(il as i32, "wv matmul");
-        if let Some(bb) = bv_bias {
-            self.add_bias_f32(bv_buf, bb, nkt, nt);
-            self.debug_sync(il as i32, "bv bias");
-        }
-        self.rope_f32(bq_buf, nh, hd, nt, freq_base, freq_scale, pos_buf);
-        self.debug_sync(il as i32, "rope q");
-        self.rope_f32(bk_buf, nk, hd, nt, freq_base, freq_scale, pos_buf);
-        self.debug_sync(il as i32, "rope k");
-        self.store_kv_f32(bk_buf, kv_k as *mut std::ffi::c_void, nkt, nt, pos_buf);
-        self.debug_sync(il as i32, "store_kv k");
-        self.store_kv_f32(bv_buf, kv_v as *mut std::ffi::c_void, nkt, nt, pos_buf);
-        self.debug_sync(il as i32, "store_kv v");
-        let scale = 1.0 / (hd as f32).sqrt();
-        // The layer-level fused path is single-sequence (its caller is the
-        // graph's FusedQKV/QkvBiasRopeStore layer, which has no span input), so
-        // it always takes the causal instantiation.
-        self.gqa_attn_f32(
-            bq_buf,
-            kv_k as *mut std::ffi::c_void,
-            kv_v as *mut std::ffi::c_void,
-            ba_buf,
-            pos_buf,
-            AttnWindow::Causal.code(),
-            KV_LAYOUT_F32,
-            nh,
-            nk,
-            hd,
-            scale,
-            (nk * hd * 4) as usize,
-            nt,
-        );
-        self.debug_sync(il as i32, "gqa_attn");
-
-        // wo projection
-        self.quantize_q8_0(ba_buf, q8_ba, ne, nt);
-        self.debug_sync(il as i32, "quantize_q8_0(wo)");
-        self.matmul_on_gpu(wo, q8_ba, ba_buf, bn, ne, ne, nt);
-        self.debug_sync(il as i32, "wo matmul");
-        self.add_f32(hidden, bn, hidden, nt * ne);
-        self.debug_sync(il as i32, "add(residual attn)");
-
-        // FFN branch
-        self.rms_norm(hidden, Some(norm_ffn_w), ba_buf, ne, nt, eps);
-        self.debug_sync(il as i32, "rms_norm(ffn)");
-        self.quantize_q8_0(ba_buf, q8_ba, ne, nt);
-        self.debug_sync(il as i32, "quantize_q8_0(ffn)");
-        self.matmul_on_gpu(ffn_gate, q8_ba, ba_buf, bg_buf, nf, ne, nt);
-        self.debug_sync(il as i32, "ffn_gate matmul");
-        self.matmul_on_gpu(ffn_up, q8_ba, ba_buf, bf_buf, nf, ne, nt);
-        self.debug_sync(il as i32, "ffn_up matmul");
-        self.swiglu_f32(bg_buf, bf_buf, bg_buf, nt * nf);
-        self.debug_sync(il as i32, "swiglu");
-        self.quantize_q8_0(bg_buf, q8_ba, nf, nt);
-        self.debug_sync(il as i32, "quantize_q8_0(ffn_down)");
-        self.matmul_on_gpu(ffn_down, q8_ba, bg_buf, bn, ne, nf, nt);
-        self.debug_sync(il as i32, "ffn_down matmul");
-        self.add_f32(hidden, bn, hidden, nt * ne);
-        self.debug_sync(il as i32, "add(residual ffn)");
-
-        true
     }
 }
 

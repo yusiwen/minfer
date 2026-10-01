@@ -91,3 +91,27 @@ impl CudaState {
         unsafe { cudaGetLastError() }
     }
 }
+
+impl StreamScratch {
+    /// The current stream's `(ptr, size)`, or `(null, 0)` when this stream has
+    /// never grown the slot.
+    ///
+    /// Test-only (#240): [#239] deferred this move because the bucket-A legacy
+    /// wrappers `upload_hidden` / `upload_positions` / `download_logits` /
+    /// `get_positions_buf` still called it and were still compiled; [#240]
+    /// deleted them, so the only remaining caller is `cuda::d35_probe_tests`
+    /// (`st.buf_q8_decode.slot()`). `pub(super)` is the visibility the rest of
+    /// this file uses for the sibling `cuda::*_tests` modules.
+    ///
+    /// [#239]: https://github.com/yusiwen/minfer/issues/239
+    /// [#240]: https://github.com/yusiwen/minfer/issues/240
+    pub(super) fn slot(&self) -> (CudaPtr, usize) {
+        let key = current_stream_key();
+        self.map
+            .lock()
+            .unwrap()
+            .get(&key)
+            .copied()
+            .unwrap_or((CudaPtr(std::ptr::null_mut()), 0))
+    }
+}
