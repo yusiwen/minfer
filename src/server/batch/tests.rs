@@ -668,9 +668,10 @@ fn server_batch_matches_serial_and_is_faster() {
             if templated {
                 // Exactly what the server does (`server::mod`): the GGUF's
                 // chat template, rendered with a generation prompt, then
-                // tokenized. `model.format_chat` is a *different* path and
-                // produced a 13-token prompt where the server's is 34 — which
-                // is why the first bisect compared unequal inputs.
+                // tokenized. The legacy trait `format_chat` fallback (deleted
+                // in #242) was a *different* path and produced a 13-token
+                // prompt where the server's is 34 — which is why the first
+                // bisect compared unequal inputs.
                 let tpl = super::super::chat_template_from_gguf(&gguf.parts[0].data);
                 let msgs = vec![("user".to_string(), Some(p.to_string()))];
                 tok.encode(
@@ -1818,10 +1819,6 @@ impl ModelDef for FailingForward {
     }
 
     fn set_kv_format(&mut self, _format: crate::graph::kvformat::KvFormat) {}
-
-    fn format_chat(&self, _messages: &[(String, String)]) -> String {
-        unreachable!("the gate never renders a chat template")
-    }
 
     fn special_tokens(&self) -> SpecialTokens {
         SpecialTokens {

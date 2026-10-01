@@ -399,10 +399,6 @@ pub fn register(registry: &mut super::registry::Registry) {
 }
 
 impl Backend for MetalBackend {
-    fn name(&self) -> &str {
-        "metal"
-    }
-
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         supports_op(op, dtype)
     }

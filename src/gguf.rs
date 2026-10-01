@@ -75,27 +75,6 @@ impl GgufType {
             GgufType::Float64 => 8,
         }
     }
-
-    /// Human-readable name for a GgufType. Part of the raw KV accessor API
-    /// (only exercised by tests/debug tooling today).
-    #[allow(dead_code)]
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            GgufType::Uint8 => "u8",
-            GgufType::Int8 => "i8",
-            GgufType::Uint16 => "u16",
-            GgufType::Int16 => "i16",
-            GgufType::Uint32 => "u32",
-            GgufType::Int32 => "i32",
-            GgufType::Float32 => "f32",
-            GgufType::Bool => "bool",
-            GgufType::String => "str",
-            GgufType::Array => "arr",
-            GgufType::Uint64 => "u64",
-            GgufType::Int64 => "i64",
-            GgufType::Float64 => "f64",
-        }
-    }
 }
 
 // === GGML types (subset needed for GGUF — from ggml.h lines 389-433) ===
@@ -632,20 +611,14 @@ pub struct GgufContext {
                        // This is handled by the caller (loader.rs), not stored here
 }
 
-// Raw key/value + tensor accessors (from gguf.cpp lines 1004-1193); the loader
-// reads through its own typed helpers (get_key_val_*), so this impl stays as
-// the public raw API surface (tests / debug tooling).
-#[allow(dead_code)]
+// Raw key/value accessors (from gguf.cpp lines 1004-1193) still reached from
+// production (`find_key`/`get_key`/`get_n_kv`/`get_val_u32`) or by the
+// `gguf_write` round-trip tests (`#[cfg(test)]`). The rest of the cpp accessor
+// surface had no caller in any build and was deleted in [#242].
+//
+// [#242]: https://github.com/yusiwen/minfer/issues/242
 impl GgufContext {
     // === Accessor functions (from gguf.cpp lines 1004-1193) ===
-
-    pub fn get_version(&self) -> u32 {
-        self.version
-    }
-
-    pub fn get_alignment(&self) -> usize {
-        self.alignment
-    }
 
     /// Test-only (#238): driven by `gguf_write::tests::every_metadata_type_round_trips_through_the_parser`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
@@ -672,15 +645,6 @@ impl GgufContext {
     pub fn get_key(&self, key_id: i64) -> &str {
         assert!(key_id >= 0 && key_id < self.get_n_kv());
         self.kv[key_id as usize].get_key()
-    }
-
-    pub fn get_kv_type(&self, key_id: i64) -> GgufType {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        if self.kv[key_id as usize].is_array {
-            GgufType::Array
-        } else {
-            self.kv[key_id as usize].get_type()
-        }
     }
 
     /// Test-only (#238): driven by `gguf_write::tests::every_metadata_type_round_trips_through_the_parser`; `#[cfg(test)]` keeps it out of production builds.
@@ -714,64 +678,10 @@ impl GgufContext {
         self.kv[key_id as usize].get_ne()
     }
 
-    pub fn get_val_u8(&self, key_id: i64) -> u8 {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_u8(0)
-    }
-
-    pub fn get_val_i8(&self, key_id: i64) -> i8 {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_i8(0)
-    }
-
-    pub fn get_val_u16(&self, key_id: i64) -> u16 {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_u16(0)
-    }
-
-    pub fn get_val_i16(&self, key_id: i64) -> i16 {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_i16(0)
-    }
-
     pub fn get_val_u32(&self, key_id: i64) -> u32 {
         assert!(key_id >= 0 && key_id < self.get_n_kv());
         assert!(self.kv[key_id as usize].get_ne() == 1);
         self.kv[key_id as usize].get_val_u32(0)
-    }
-
-    pub fn get_val_i32(&self, key_id: i64) -> i32 {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_i32(0)
-    }
-
-    pub fn get_val_f32(&self, key_id: i64) -> f32 {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_f32(0)
-    }
-
-    pub fn get_val_u64(&self, key_id: i64) -> u64 {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_u64(0)
-    }
-
-    pub fn get_val_i64(&self, key_id: i64) -> i64 {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_i64(0)
-    }
-
-    pub fn get_val_f64(&self, key_id: i64) -> f64 {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_f64(0)
     }
 
     /// Test-only (#238): driven by `gguf_write::tests::every_metadata_type_round_trips_through_the_parser`; `#[cfg(test)]` keeps it out of production builds.
@@ -780,55 +690,6 @@ impl GgufContext {
         assert!(key_id >= 0 && key_id < self.get_n_kv());
         assert!(self.kv[key_id as usize].get_ne() == 1);
         self.kv[key_id as usize].get_val_bool(0)
-    }
-
-    pub fn get_val_str(&self, key_id: i64) -> &str {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        self.kv[key_id as usize].get_val_str(0)
-    }
-
-    pub fn get_val_data(&self, key_id: i64) -> &[u8] {
-        assert!(key_id >= 0 && key_id < self.get_n_kv());
-        assert!(self.kv[key_id as usize].get_ne() == 1);
-        assert!(self.kv[key_id as usize].get_type() != GgufType::String);
-        &self.kv[key_id as usize].data
-    }
-
-    pub fn get_n_tensors(&self) -> i64 {
-        self.info.len() as i64
-    }
-
-    pub fn find_tensor(&self, name: &str) -> i64 {
-        // return -1 if tensor not found
-        // gguf.cpp lines 1159-1173
-        let n_tensors = self.get_n_tensors();
-        for i in 0..n_tensors {
-            if name == self.get_tensor_name(i) {
-                return i;
-            }
-        }
-        -1
-    }
-
-    pub fn get_tensor_offset(&self, tensor_id: i64) -> usize {
-        assert!(tensor_id >= 0 && tensor_id < self.get_n_tensors());
-        self.info[tensor_id as usize].offset as usize
-    }
-
-    pub fn get_tensor_name(&self, tensor_id: i64) -> &str {
-        assert!(tensor_id >= 0 && tensor_id < self.get_n_tensors());
-        &self.info[tensor_id as usize].name
-    }
-
-    pub fn get_tensor_type(&self, tensor_id: i64) -> GgmlType {
-        assert!(tensor_id >= 0 && tensor_id < self.get_n_tensors());
-        self.info[tensor_id as usize].type_
-    }
-
-    pub fn get_tensor_size(&self, tensor_id: i64) -> usize {
-        assert!(tensor_id >= 0 && tensor_id < self.get_n_tensors());
-        ggml_nbytes(&self.info[tensor_id as usize])
     }
 }
 
@@ -1736,77 +1597,6 @@ impl GgufContext {
         }
 
         Some(ctx)
-    }
-
-    /// Debug dump of all KV metadata
-    #[allow(dead_code)]
-    pub fn dump_metadata(&self) {
-        println!("GGUF Context:");
-        println!("  version: {}", self.version);
-        println!("  alignment: {}", self.alignment);
-        println!("  data_offset: {}", self.offset);
-        println!("  data_size: {}", self.size);
-        println!("  KV pairs ({}):", self.kv.len());
-        for (i, kv) in self.kv.iter().enumerate() {
-            let type_str = if kv.is_array {
-                format!("array[{}] of {}", kv.get_ne(), kv.type_.type_name())
-            } else {
-                kv.type_.type_name().to_string()
-            };
-            let val_str = match kv.type_ {
-                GgufType::Uint8 => format!("{}", kv.get_val_u8(0)),
-                GgufType::Int8 => format!("{}", kv.get_val_i8(0)),
-                GgufType::Uint16 => format!("{}", kv.get_val_u16(0)),
-                GgufType::Int16 => format!("{}", kv.get_val_i16(0)),
-                GgufType::Uint32 => format!("{}", kv.get_val_u32(0)),
-                GgufType::Int32 => format!("{}", kv.get_val_i32(0)),
-                GgufType::Float32 => format!("{}", kv.get_val_f32(0)),
-                GgufType::Bool => format!("{}", kv.get_val_bool(0)),
-                GgufType::String => format!("\"{}\"", kv.get_val_str(0)),
-                GgufType::Uint64 => format!("{}", kv.get_val_u64(0)),
-                GgufType::Int64 => format!("{}", kv.get_val_i64(0)),
-                GgufType::Float64 => format!("{}", kv.get_val_f64(0)),
-                GgufType::Array => {
-                    if kv.get_type() == GgufType::String {
-                        let strs: Vec<&str> = (0..kv.get_ne()).map(|j| kv.get_val_str(j)).collect();
-                        format!("{:?}", strs)
-                    } else {
-                        format!("[{} elements]", kv.get_ne())
-                    }
-                }
-            };
-            if kv.is_array && kv.get_type() != GgufType::String {
-                println!(
-                    "  [{:4}] {}: {} ({} elements)",
-                    i,
-                    kv.key,
-                    type_str,
-                    kv.get_ne()
-                );
-            } else {
-                println!("  [{:4}] {}: {} = {}", i, kv.key, type_str, val_str);
-            }
-        }
-        println!("  Tensors ({}):", self.info.len());
-        for (i, ti) in self.info.iter().enumerate() {
-            print!(
-                "  [{:4}] {}: type={} shape=(",
-                i,
-                ti.name,
-                ti.type_.type_name()
-            );
-            let mut first = true;
-            for j in 0..GGML_MAX_DIMS {
-                if ti.ne[j] != 1 || j == 0 {
-                    if !first {
-                        print!(",");
-                    }
-                    print!("{}", ti.ne[j]);
-                    first = false;
-                }
-            }
-            println!(") offset={} size={}", ti.offset, ggml_nbytes(ti));
-        }
     }
 }
 

@@ -128,10 +128,11 @@ pub struct Tensor {
     pub name: String,
 }
 
-// ggml-parity Tensor API: the graph path exercises a subset of these helpers
-// (borrowed weights, nbytes, data, …); the rest are kept as the complete
-// ggml_tensor interface (used by tests / debug tooling).
-#[allow(dead_code)]
+// ggml-parity Tensor API: the graph path exercises this subset (borrowed
+// weights, nbytes, data, …). The rest of the ggml_tensor interface had no
+// caller in any build and was deleted in [#242].
+//
+// [#242]: https://github.com/yusiwen/minfer/issues/242
 impl Tensor {
     /// Create a new tensor with given type and shape.
     /// Allocates data buffer with proper alignment.
@@ -186,23 +187,6 @@ impl Tensor {
         tensor
     }
 
-    /// Create a tensor using the strides computed by the GGUF parser
-    /// (when loading from a GGUF file, the strides are already computed)
-    pub fn from_data_with_strides(
-        ttype: TensorType,
-        shape: &[i64; 4],
-        strides: &[usize; 4],
-        data: Vec<u8>,
-    ) -> Self {
-        Tensor {
-            ttype,
-            shape: *shape,
-            strides: *strides,
-            data: std::borrow::Cow::Owned(data),
-            name: String::new(),
-        }
-    }
-
     /// Create a weight tensor as a Borrowed slice of the mmap'd GGUF file
     /// (zero-copy load — the file pages are shared with the CPU/GPU instead of
     /// being copied per tensor). The slice must be 'static: the gguf loader
@@ -228,23 +212,6 @@ impl Tensor {
     }
 
     // === Shape queries (ggml.c lines 1259-1269) ===
-
-    /// Total number of elements (ggml.c line 1259-1263)
-    pub fn nelements(&self) -> i64 {
-        // ggml_nelements: ne[0]*ne[1]*ne[2]*ne[3]
-        self.shape[0] * self.shape[1] * self.shape[2] * self.shape[3]
-    }
-
-    /// Number of rows (ggml.c lines 1265-1269)
-    pub fn nrows(&self) -> i64 {
-        // ggml_nrows: ne[1]*ne[2]*ne[3]
-        self.shape[1] * self.shape[2] * self.shape[3]
-    }
-
-    /// Number of elements in the first dimension (columns per row)
-    pub fn ncols(&self) -> i64 {
-        self.shape[0]
-    }
 
     /// Total size in bytes (ggml.c lines 1271-1294)
     pub fn nbytes(&self) -> usize {
@@ -277,10 +244,6 @@ impl Tensor {
         self.data.as_ref()
     }
 
-    pub fn data_mut(&mut self) -> &mut [u8] {
-        self.data.to_mut()
-    }
-
     /// Get the data as f32 slice (panics if type is not F32)
     pub fn data_f32(&self) -> &[f32] {
         assert!(
@@ -291,108 +254,6 @@ impl Tensor {
         );
         let n = self.data.len() / 4;
         unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const f32, n) }
-    }
-
-    pub fn data_f32_mut(&mut self) -> &mut [f32] {
-        assert!(self.ttype == TensorType::F32);
-        let n = self.data.len() / 4;
-        unsafe { std::slice::from_raw_parts_mut(self.data.to_mut().as_mut_ptr() as *mut f32, n) }
-    }
-
-    /// Get the quantized data as raw bytes (Q4_0)
-    pub fn data_q4_0(&self) -> &[u8] {
-        assert!(self.ttype == TensorType::Q4_0, "expected Q4_0 tensor");
-        self.data.as_ref()
-    }
-
-    pub fn data_q4_0_mut(&mut self) -> &mut [u8] {
-        assert!(self.ttype == TensorType::Q4_0, "expected Q4_0 tensor");
-        self.data.to_mut()
-    }
-
-    /// Get the quantized data as raw bytes (Q4_1)
-    pub fn data_q4_1(&self) -> &[u8] {
-        assert!(self.ttype == TensorType::Q4_1, "expected Q4_1 tensor");
-        self.data.as_ref()
-    }
-
-    pub fn data_q4_1_mut(&mut self) -> &mut [u8] {
-        assert!(self.ttype == TensorType::Q4_1, "expected Q4_1 tensor");
-        self.data.to_mut()
-    }
-
-    /// Get the quantized data as raw bytes (Q8_0)
-    pub fn data_q8_0(&self) -> &[u8] {
-        assert!(self.ttype == TensorType::Q8_0, "expected Q8_0 tensor");
-        self.data.as_ref()
-    }
-
-    pub fn data_q8_0_mut(&mut self) -> &mut [u8] {
-        assert!(self.ttype == TensorType::Q8_0, "expected Q8_0 tensor");
-        self.data.to_mut()
-    }
-
-    /// Get the quantized data as raw bytes (Q4_K)
-    pub fn data_q4_k(&self) -> &[u8] {
-        assert!(self.ttype == TensorType::Q4_K, "expected Q4_K tensor");
-        self.data.as_ref()
-    }
-
-    pub fn data_q4_k_mut(&mut self) -> &mut [u8] {
-        assert!(self.ttype == TensorType::Q4_K, "expected Q4_K tensor");
-        self.data.to_mut()
-    }
-
-    /// Get the quantized data as raw bytes (Q6_K)
-    pub fn data_q6_k(&self) -> &[u8] {
-        assert!(self.ttype == TensorType::Q6_K, "expected Q6_K tensor");
-        self.data.as_ref()
-    }
-
-    pub fn data_q6_k_mut(&mut self) -> &mut [u8] {
-        assert!(self.ttype == TensorType::Q6_K, "expected Q6_K tensor");
-        self.data.to_mut()
-    }
-
-    /// Access a single f32 value at linear index (F32 only)
-    pub fn get_f32(&self, i: usize) -> f32 {
-        self.data_f32()[i]
-    }
-
-    pub fn set_f32(&mut self, i: usize, val: f32) {
-        self.data_f32_mut()[i] = val;
-    }
-
-    /// Copy data from another tensor (for views/slices)
-    pub fn copy_from(&mut self, src: &Tensor) {
-        assert!(self.nbytes() == src.nbytes());
-        self.data.to_mut().copy_from_slice(src.data.as_ref());
-    }
-
-    // === Reshape ===
-
-    /// Change shape without changing data layout (ne[0]*ne[1]*ne[2]*ne[3] must match)
-    /// Corresponds to ggml_reshape in spirit — just changes ne, recalculates nb
-    pub fn reshape(&mut self, new_shape: &[i64; 4]) {
-        let old_ne = self.nelements();
-        let new_ne = new_shape[0] * new_shape[1] * new_shape[2] * new_shape[3];
-        assert!(
-            old_ne == new_ne,
-            "reshape: element count mismatch ({} vs {})",
-            old_ne,
-            new_ne
-        );
-
-        self.shape = *new_shape;
-
-        // Recalculate strides
-        let type_size = self.ttype.type_size();
-        let blck_size = self.ttype.blck_size();
-        self.strides[0] = type_size;
-        self.strides[1] = self.strides[0] * (self.shape[0] / blck_size) as usize;
-        for j in 2..4 {
-            self.strides[j] = self.strides[j - 1] * self.shape[j - 1] as usize;
-        }
     }
 
     /// Display

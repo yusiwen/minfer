@@ -144,7 +144,6 @@ extern "C" {
     // Issue #122: the *name* of a CUDA error code, so a failed memory query can say
     // `cudaErrorIllegalAddress (700)` instead of a bare number (or nothing at all).
     fn cudaGetErrorName(error: i32) -> *const std::os::raw::c_char;
-    fn cudaGetErrorString(error: i32) -> *const std::os::raw::c_char;
     fn cudaGetDeviceProperties(prop: *mut CudaDevicePropBuf, device: i32) -> i32;
     // T2 device-adaptation queries (plan §6): smem feasibility for the BT
     // tile config. The externs query the CURRENT device (R2 fix).
@@ -210,20 +209,6 @@ fn cstr_owned(p: *const std::os::raw::c_char) -> String {
     unsafe { std::ffi::CStr::from_ptr(p) }
         .to_string_lossy()
         .into_owned()
-}
-
-/// The human-readable description of a CUDA error code (`cudaGetErrorString`).
-#[allow(dead_code)] // for diagnostics that want the prose form
-fn cuda_error_string(code: i32) -> &'static str {
-    let p = unsafe { cudaGetErrorString(code) };
-    if p.is_null() {
-        return "";
-    }
-    let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
-    match s {
-        std::borrow::Cow::Borrowed(b) => b,
-        std::borrow::Cow::Owned(o) => Box::leak(o.into_boxed_str()),
-    }
 }
 
 // ─── FFI declarations for kernel launch wrappers ───────────
@@ -573,8 +558,6 @@ extern "C" {
     fn minfer_launch_fail_code() -> i32;
     #[allow(dead_code)]
     fn minfer_launch_fail_clear();
-    #[allow(dead_code)]
-    fn minfer_site_hist_reset();
     // 8p: fused dequant-in-GEMM — B tiles dequantize raw quantized bytes
     // in-register (no f16 weight scratch round trip). type_id mapping as in
     // launch_dequant_f16; q6_stride = 210 raw / 224 padded (only Q6_K reads
@@ -1294,14 +1277,6 @@ fn capture_mode() -> i32 {
     })
 }
 
-/// F5 (#58): how many times this process has **blocked the host** on the stream
-/// (`CudaState::sync` — the only full `cudaStreamSynchronize` in the device
-/// layer). Process-wide and monotonic on purpose: it is the "host stalls"
-/// measurement the ticket's before/after is stated in, and a reader compares a
-/// delta around one workload rather than an absolute count. A relaxed atomic
-/// increment is the whole cost on the hot path.
-static STREAM_SYNCS: AtomicU64 = AtomicU64::new(0);
-
 /// Issue #188: the raw return code of the last `cudaStreamEndCapture` the graph
 /// backend performed. `0` = the window closed cleanly; `901`
 /// (`cudaErrorStreamCaptureInvalidated`) = another thread's driver call was not
@@ -1314,19 +1289,6 @@ static LAST_CAPTURE_END_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::
 #[cfg(test)]
 pub(crate) fn last_capture_end_code() -> i32 {
     LAST_CAPTURE_END_CODE.load(Ordering::Relaxed)
-}
-
-/// F5 (#58): the process-wide stream-synchronization count (see [`STREAM_SYNCS`]).
-///
-/// **A gate must not read this** (issue #185). It is a lifetime total across every
-/// thread, so a delta around one workload also contains whatever any concurrent
-/// device test synced — the F5 gate's async arm read 4160 stalls against the
-/// synchronous arm's 728 under the parallel harness. Read the backend's own
-/// `CudaBackend::stream_sync_count()` instead; the counter lives per instance,
-/// like `blocking_readbacks` and like `copystats`' accumulators.
-#[allow(dead_code)] // kept as the process-wide total; the F5 gates read the backend's own (#185)
-pub fn stream_sync_count() -> u64 {
-    STREAM_SYNCS.load(Ordering::Relaxed)
 }
 
 /// Issue #145: how many times `CudaState::sync` found an error **already latched**
@@ -3336,9 +3298,6 @@ impl CudaState {
     }
 
     pub fn sync(&self) {
-        // F5: a full stream sync is a host stall — count it. It is the number the
-        // split-boundary before/after is stated in (`stream_sync_count`).
-        STREAM_SYNCS.fetch_add(1, Ordering::Relaxed);
         // #145: `cudaGetLastError` reports whatever an earlier call latched —
         // it is NOT evidence about the kernel that just ran. Name the observer
         // and the real API error; the counting keeps the error visible instead

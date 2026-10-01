@@ -427,9 +427,9 @@ fn a_split_graph_waits_once_per_staged_copy_and_stays_bitwise() {
         alloc.fill_input(&g, "x", &data).unwrap();
         let before = alloc.cross_stats();
         let readbacks_before = alloc.cuda().unwrap().blocking_readback_count();
-        // #185: read the count through the backend, never the process-wide
-        // `cuda::stream_sync_count()` — a concurrent device test's syncs would
-        // otherwise land inside this delta (the failure the ticket records).
+        // #185: read the count through **this** backend, never a process-wide
+        // total — a concurrent device test's syncs would otherwise land inside
+        // this delta (the failure the ticket records).
         let syncs_before = alloc.cuda().unwrap().stream_sync_count();
 
         BackendScheduler::new().execute(&g, &mut alloc).unwrap();
@@ -8290,15 +8290,19 @@ fn cuda_graph_generation_replay_parity_real_model() {
     );
 }
 
-/// Issue #185: the F5 host-stall counter is **per backend**, not the
-/// process-wide `cuda::stream_sync_count()`. Two backends in one process each
-/// count only their own `CudaState::sync` calls, so a gate can read a delta
-/// attributable to its own workload even when other tests are syncing on the
-/// shared singleton.
+/// Issue #185: the F5 host-stall counter is **per backend**, not process-wide.
+/// Two backends in one process each count only their own `CudaState::sync`
+/// calls, so a gate can read a delta attributable to its own workload even when
+/// other tests are syncing on the shared singleton. The process-wide counter
+/// this test was written against was deleted in [#242]; the per-instance
+/// property it pins is the surviving one.
 ///
-/// Mutation evidence (rule 3): make `CudaBackend::stream_sync_count` return
-/// `crate::cuda::stream_sync_count()` instead of `self.stream_syncs`, and the
-/// second assertion goes red — the process-wide total moves for both.
+/// Mutation evidence (rule 3): make `CudaBackend::state_sync` bump a
+/// process-wide `static` and `stream_sync_count()` read that static instead of
+/// `self.stream_syncs` — the pre-[#185] shape — and the second assertion goes
+/// red, because `a`'s sync then moves `b`'s count too.
+///
+/// [#242]: https://github.com/yusiwen/minfer/issues/242
 #[test]
 fn stream_sync_counts_are_per_backend_not_process_wide() {
     if device().is_none() {

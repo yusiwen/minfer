@@ -189,10 +189,13 @@ pub fn ffn_composition(requested: Option<&str>, device: Device) -> bool {
 /// `Send + Sync` so a model can be shared across threads (the HTTP server's
 /// worker thread owns the only inference path; `Arc<dyn ModelDef>` is used by
 /// the OpenAI-compatible server, OPENAI-CHAT-API-PLAN.md).
-// NOTE: several required methods (as_any, forward_graph, format_chat,
-// n_head_kv, n_embd_head, n_kv_embd, n_vocab, rope_style) are only reached
-// through `Box<dyn ModelDef>` calls or planned paths; rustc's dead-code lint
-// flags them anyway, so the trait is allow'd as the model API surface.
+// NOTE: rustc's dead-code lint flags this trait's `as_any` and `offload` in a
+// non-test build (their callers are test code) and `forward_graph` on a Linux
+// host (its one caller sits in a `#[cfg(target_os = "macos")]` test block), so
+// the trait is allow'd as the model API surface. `format_chat` had no caller in
+// any build and was deleted in [#242]; template.rs is the chat-rendering path.
+//
+// [#242]: https://github.com/yusiwen/minfer/issues/242
 #[allow(dead_code)]
 pub trait ModelDef: Send + Sync {
     /// Single-shot forward. `n_ctx` sizes the graph's persistent KV regions
@@ -302,7 +305,6 @@ pub trait ModelDef: Send + Sync {
         None
     }
 
-    fn format_chat(&self, messages: &[(String, String)]) -> String;
     fn special_tokens(&self) -> SpecialTokens;
     fn n_layer(&self) -> usize;
     fn n_head_kv(&self) -> usize;

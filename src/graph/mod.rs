@@ -212,18 +212,8 @@ impl ComputeGraph {
     pub fn node(&self, id: NodeId) -> &CNode {
         &self.nodes[id]
     }
-    /// Mutable node access (fusion pass / debug tooling).
-    #[allow(dead_code)]
-    pub fn node_mut(&mut self, id: NodeId) -> &mut CNode {
-        &mut self.nodes[id]
-    }
     pub fn n_nodes(&self) -> usize {
         self.nodes.len()
-    }
-    /// Element count of a node output (assertion / debug helper).
-    #[allow(dead_code)]
-    pub fn n_elements(&self, id: NodeId) -> usize {
-        self.nodes[id].n_elements()
     }
 
     /// Kahn topological sort. The builder appends sources before consumers, so

@@ -127,10 +127,6 @@ impl ModelDef for Qwen2Model {
         graph::Qwen2Graph::forward_batch(self, batch, n_out, n_ctx, cache)
     }
 
-    fn format_chat(&self, messages: &[(String, String)]) -> String {
-        format_chatml(messages)
-    }
-
     fn special_tokens(&self) -> SpecialTokens {
         let eos = self.hparams.eos_token_id;
         let im_end = self.hparams.im_end_token_id;
@@ -158,19 +154,6 @@ impl ModelDef for Qwen2Model {
     fn rope_params(&self) -> (f32, f32) {
         (self.hparams.rope_freq_base, self.hparams.rope_freq_scale)
     }
-}
-
-/// Simple ChatML formatting.
-// Only reached through the trait's format_chat (which no live caller uses —
-// template.rs renders chat templates); kept as the fallback implementation.
-#[allow(dead_code)]
-fn format_chatml(messages: &[(String, String)]) -> String {
-    let mut prompt = String::new();
-    for (role, content) in messages {
-        prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content));
-    }
-    prompt.push_str("<|im_start|>assistant\n");
-    prompt
 }
 
 // ============================================================

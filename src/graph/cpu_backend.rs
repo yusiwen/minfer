@@ -258,10 +258,6 @@ pub fn register(registry: &mut super::registry::Registry) {
 }
 
 impl Backend for CpuBackend {
-    fn name(&self) -> &str {
-        "cpu"
-    }
-
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         supports_op(op, dtype)
     }
