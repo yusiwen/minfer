@@ -3,7 +3,6 @@
 pub mod graph;
 pub mod loader;
 
-use crate::cache::KVCache;
 use crate::models::{ModelDef, SpecialTokens};
 use crate::tensor::Tensor;
 
@@ -53,15 +52,8 @@ impl Qwen2Model {
 }
 
 impl ModelDef for Qwen2Model {
-    fn forward(
-        &self,
-        tokens: &[u32],
-        positions: &[usize],
-        kv: &mut KVCache,
-        n_out: usize,
-        n_ctx: usize,
-    ) -> Vec<f32> {
-        graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out, n_ctx)
+    fn forward(&self, tokens: &[u32], positions: &[usize], n_out: usize, n_ctx: usize) -> Vec<f32> {
+        graph::Qwen2Graph::forward(self, tokens, positions, n_out, n_ctx)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -98,11 +90,10 @@ impl ModelDef for Qwen2Model {
         &self,
         tokens: &[u32],
         positions: &[usize],
-        kv: &mut KVCache,
         n_out: usize,
         n_ctx: usize,
     ) -> Vec<f32> {
-        graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out, n_ctx)
+        graph::Qwen2Graph::forward(self, tokens, positions, n_out, n_ctx)
     }
 
     fn forward_graph_cached(

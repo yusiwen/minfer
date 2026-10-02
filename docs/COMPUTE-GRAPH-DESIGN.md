@@ -1167,12 +1167,12 @@ drain them with a single sync at the split boundary.
 
 ```rust
 pub trait ModelDef: Send + Sync {
-    fn forward(&self, tokens: &[u32], positions: &[usize], kv: &mut KVCache,
+    fn forward(&self, tokens: &[u32], positions: &[usize],
                n_out: usize, n_ctx: usize) -> Vec<f32>;
     fn as_any(&self) -> &dyn std::any::Any;
 
     fn build_graph(&self, params: &GraphParams) -> ComputeGraph;            // default: unimplemented!
-    fn forward_graph(&self, tokens, positions, kv, n_out, n_ctx) -> Vec<f32>; // default: forward()
+    fn forward_graph(&self, tokens, positions, n_out, n_ctx) -> Vec<f32>;   // default: forward()
     fn forward_graph_cached(&self, tokens, positions, n_out, n_ctx,
                             cache: &mut GraphCache) -> Vec<f32>;            // default: unimplemented!
 
@@ -1188,8 +1188,9 @@ pub trait ModelDef: Send + Sync {
 
 - `forward` is retained as the single-shot convenience entry and both models route it to the graph
   path: `QwenXGraph::forward` clamps `n_ctx` to `max_seq_len`, locks the process-global
-  `graph_cache()`, and calls `forward_cached`. The `kv: &mut KVCache` argument is legacy and ignored —
-  the KV lives in the graph allocator.
+  `graph_cache()`, and calls `forward_cached`. Its pre-[#252](https://github.com/yusiwen/minfer/issues/252)
+  legacy `kv: &mut KVCache` argument was ignored (the KV lives in the graph allocator) and was
+  deleted with the type.
 - `build_graph` is the immutable-topology constructor; each architecture implements it in
   `models/<arch>/graph.rs`.
 - `forward_graph_cached` is the real primitive used by the CLI, the server, the conversation engine
@@ -1327,8 +1328,8 @@ The plan's file-change manifest, replaced by the landed inventory.
 
 `src/models/qwen2/forward.rs` was **deleted** in Phase 6; the imperative path no longer exists.
 `src/metal.rs` and `src/cuda.rs` remain the per-op kernel/device layers that the graph backends wrap;
-`src/cuda_kernels.cu` holds the CUDA kernels. `src/cache.rs` keeps the legacy `KVCache` type, which the
-graph path ignores (the allocator owns KV).
+`src/cuda_kernels.cu` holds the CUDA kernels. `src/cache.rs` (the legacy `KVCache` the graph path
+ignored) was deleted in [#252](https://github.com/yusiwen/minfer/issues/252) — the allocator owns KV.
 
 ---
 

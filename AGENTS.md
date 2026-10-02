@@ -30,7 +30,6 @@ src/
 ├── kernel.rs        # quantized matmul dispatch + scalar fallbacks; shared worker pool
 ├── vec_ops.rs       # RMSNorm, RoPE, Softmax, SiLU; vectorized f16 weight dot
 ├── tensor.rs        # 4D Tensor (shape/strides/data)
-├── cache.rs         # legacy KV cache type (graph path owns KV in the allocator)
 ├── dump.rs          # debug dump module (--features debug_dump)
 ├── tokenizer.rs     # byte-level BPE from GGUF metadata; `tokenizer.ggml.pre` splitter
 ├── sampler.rs       # SamplerConfig pipeline: penalties → DRY → grammar → top-k/typical/top-p/min-p/XTC → temp | mirostat

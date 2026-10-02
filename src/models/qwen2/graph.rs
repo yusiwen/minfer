@@ -9,13 +9,14 @@
 //! - Full-nt computation (the n_out tail-row `GetRows` optimization is
 //!   deferred; tail-row extraction happens on the logits only, which is
 //!   numerically identical for the sampled rows).
-//! - KV cache lives in the graph allocator's persistent regions (the caller's
-//!   `KVCache` is ignored by the graph path).
+//! - KV cache lives in the graph allocator's persistent regions (the allocator
+//!   owns it; the pre-[#252] legacy `KVCache` argument is gone).
 //! - `weights_version` is static (1) until LoRA support lands.
+//!
+//! [#252]: https://github.com/yusiwen/minfer/issues/252
 
 use std::sync::{Mutex, OnceLock};
 
-use crate::cache::KVCache;
 use crate::graph::alloc::GraphAllocator;
 use crate::graph::backend::Backend;
 use crate::graph::cache::GraphCache;
@@ -419,7 +420,7 @@ impl Qwen2Graph {
     }
 
     /// Graph-based forward: build/assign/fuse/alloc/execute with reuse.
-    /// `kv` is ignored (the graph owns its KV in persistent regions).
+    /// KV is owned by the graph (persistent regions), not by the caller.
     ///
     /// CLI convenience wrapper: uses the process-global `graph_cache()`. The
     /// KV regions are sized by `n_ctx`, clamped to the model's `max_seq_len`
@@ -432,7 +433,6 @@ impl Qwen2Graph {
         model: &Qwen2Model,
         tokens: &[u32],
         positions: &[usize],
-        _kv: &mut KVCache,
         n_out: usize,
         n_ctx: usize,
     ) -> Vec<f32> {

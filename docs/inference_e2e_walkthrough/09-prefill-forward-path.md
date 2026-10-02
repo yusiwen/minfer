@@ -354,11 +354,10 @@ from the decode side.
 - `n_out = 1` — the tail-row count (§2.4).
 - `ctx = max(params.n_ctx, nt)` — the KV region width for the whole run
   (§2.5); `params.n_ctx` defaults to 4096 (`main.rs:74`).
-- `kv_cache` — a legacy `KVCache` object created at `main.rs:657` and passed
-  as `&mut kv_cache`. On the graph path it is **ignored** (the parameter is
-  named `_kv` at `graph.rs:388`); the graph owns KV in its persistent
-  regions (doc 03 covers why the object still exists — the type predates the
-  graph refactor and remains the pre-graph API shape).
+- `kv_cache` — **gone (#252)**. Until [#252] the call passed a legacy
+  `KVCache` created in `main.rs`; the graph path always **ignored** it (the
+  callee bound it as `_kv`) and the graph owns KV in its persistent regions.
+  [#252] deleted the argument, the type and that construction (doc 03).
 - The model itself: hparams and weight tensors, registered by name in the
   allocator's registries (doc 03).
 
@@ -708,11 +707,14 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   on first use) or loudly (the preflight assert). This is why the comment
   says "computed ONCE" — and why `main.rs:932` passes the *same* `ctx`
   binding, not a recomputation.
-- **The legacy `kv_cache` argument is dead on this path.** Passing `&mut
-  KVCache` keeps the pre-graph API shape alive (doc 03); nothing reads it in
-  `forward_cached`. Do not "optimize" it away without a breaking API change —
-  the trait signature is the compat surface for the server's gradual
-  migration (`models/mod.rs:23-25` documents the contract).
+- **The legacy `kv_cache` argument is gone (#252).** It was dead on this path
+  from the start — nothing read it in `forward_cached` — and [#252] deleted it
+  (with the `KVCache` type and the `main.rs` construction) once the storage
+  had already gone in [#244]. `forward_cached`'s signature never took it; the
+  server's `GraphCache`/`forward_batch` surface is unchanged.
+
+[#244]: https://github.com/yusiwen/minfer/issues/244
+[#252]: https://github.com/yusiwen/minfer/issues/252
 - **The prefill timer includes one-time setup.** Comparing `Prefill:` lines
   across runs of different prompt lengths (or across builds with different
   fusion env toggles) mixes steady-state prefill cost with build/first-submit

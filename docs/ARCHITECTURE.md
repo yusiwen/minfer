@@ -47,7 +47,6 @@
 | `kernel.rs` | Quantized matmul dispatch (Q4_0/Q4_1/Q5_0/Q5_1/Q4_K/Q5_K/Q6_K/Q8_0) over activations, CPU scalar fallback, shared `embed_tokens` row getter |
 | `vec_ops.rs` | SIMD vector ops: RMSNorm, RoPE (Qwen2/Llama styles), softmax, SiLU, add/scale/mul |
 | `tensor.rs` | 4D `Tensor` (type/shape/strides/`Vec<u8>` data), ggml-compatible strides & byte sizing |
-| `cache.rs` | **Legacy** per-layer KV cache type (the graph path owns KV in the allocator; kept for the CLI's `KVCache` plumbing) |
 | `sampler.rs` | Repeat/frequency/presence penalties → top-k → top-p → temperature, seeded `StdRng` |
 | `tokenizer.rs` | Self-contained BPE tokenizer, loaded from GGUF metadata (no tiktoken) |
 | `template.rs` | GGUF `chat_template` rendering via minijinja + a Python-`str`-method hook (F7/#50), so Qwen3's think-block template renders; a template that cannot be rendered is a **loud refusal**, never a silent ChatML fallback (`docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`) |
@@ -366,8 +365,10 @@ on. `kv_pair(layer)` resolves them; the KV store node writes K/V at the
 positions carried by the `positions` input; attention reads the written prefix.
 The regions live inside the `GraphCache`'s allocator and **survive graph
 rebuilds** (the prefill→decode transition). `MINFER_CACHE_TYPE=f16` selects an
-f16 GPU cache where the kernels support it. The legacy `cache.rs` `KVCache`
-type remains only as CLI plumbing.
+f16 GPU cache where the kernels support it. The pre-graph `cache.rs` `KVCache`
+type — and the vestigial `&mut KVCache` argument of `ModelDef::forward` — was
+deleted in [#252](https://github.com/yusiwen/minfer/issues/252); these regions
+are the only KV store.
 
 ---
 

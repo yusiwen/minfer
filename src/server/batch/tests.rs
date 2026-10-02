@@ -1791,7 +1791,6 @@ impl ModelDef for FailingForward {
         &self,
         _tokens: &[u32],
         _positions: &[usize],
-        _kv: &mut crate::cache::KVCache,
         _n_out: usize,
         _n_ctx: usize,
     ) -> Vec<f32> {

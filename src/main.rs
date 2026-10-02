@@ -10,7 +10,6 @@
 
 mod bench;
 mod block;
-mod cache;
 mod conversation;
 mod convert;
 #[cfg(feature = "cuda")]
@@ -1221,11 +1220,6 @@ fn main() {
         println!("Model loaded.");
     }
 
-    // === KV Cache ===
-    let n_kv_embd = model.n_kv_embd();
-    let n_layer = model.n_layer();
-    let mut kv_cache = cache::KVCache::new(n_layer, n_kv_embd, params.n_ctx);
-
     // === Tokenizer ===
     // F7 (#50): an unsupported or incomplete tokenizer is a refused load, never
     // a wrong split. The reason names the metadata value.
@@ -1475,7 +1469,7 @@ fn main() {
             .prefill(&input_ids, ctx);
         l
     } else {
-        model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx)
+        model.forward(&input_ids, &positions, 1, ctx)
     };
     let last_logits: Vec<f32> = logits;
     if trace_on {
@@ -1785,7 +1779,7 @@ fn main() {
                 crate::trace::set_token(sampled.token_id, &text);
             }
             t1 = std::time::Instant::now();
-            logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1, ctx);
+            logits = model.forward(&[sampled.token_id], &[current_pos], 1, ctx);
             if trace_on {
                 crate::trace::attach_step(&logits);
             }

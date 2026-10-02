@@ -8,11 +8,13 @@
 > against minfer's current graph architecture and expands the MVP sampling scope:
 >
 > - **KV cache lives in the graph allocator, not `src/cache.rs`.** The graph path (`Qwen2Graph::forward`)
->   ignores the legacy `KVCache` argument entirely — KV is a pair of persistent f32 regions per layer inside
+>   ignores the legacy `KVCache` argument entirely — KV is a pair of persistent regions per layer inside
 >   a **process-global `Mutex<GraphCache>`** (`src/models/qwen2/graph.rs`, `graph_cache()`). Multi-slot
 >   therefore requires refactoring `forward()` to take a **slot-scoped `&mut GraphCache`** plus an explicit
 >   `n_ctx` (currently hardcoded to `hparams.max_seq_len`). "Each slot owns an independent `KVCache`" is
->   wrong as written.
+>   wrong as written. (The ignored argument and the `src/cache.rs` type were deleted in
+>   [#252](https://github.com/yusiwen/minfer/issues/252); the slot-scoped `GraphCache` is what the
+>   server uses.)
 > - **Sampling is expanded to full MVP parity with llama.cpp**: `frequency_penalty` / `presence_penalty`
 >   (per-vocab penalty pass, shared with the existing repeat penalty), `stop` strings (text-level matching
 >   with UTF-8-safe incremental decoding), and `top_k` / `repeat_penalty` passthrough. These were listed as
@@ -788,7 +790,8 @@ Each slot contains (see the `Slot` struct in [Data Structures](#data-structures)
 - id: unique slot identifier
 - state: Idle or Processing
 - cache: a **`GraphCache`** (graph + allocator + persistent KV regions) — *not* the legacy `KVCache`
-  from `src/cache.rs`, which the graph path ignores
+  from `src/cache.rs`, which the graph path ignored (and which was deleted in
+  [#252](https://github.com/yusiwen/minfer/issues/252))
 - n_ctx_slot: per-slot context budget
 - current_pos: current generation position (number of tokens stored in KV since the last reset)
 - generated_tokens: list of generated token IDs
