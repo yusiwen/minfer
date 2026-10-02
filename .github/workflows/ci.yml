@@ -13,9 +13,18 @@
 #                       suite: the toolchain step installs the `rustfmt` component
 #                       *for 1.97.1*, so the formatter is the one the pinned
 #                       toolchain names, never `stable`'s.
+#                       Its last step is the CPU half of the dead-code oracle
+#                       (#254): a scratch copy with every `allow(dead_code)`
+#                       stripped, so a newly hidden item fails the job. Last on
+#                       purpose — the copy shares this job's warm `target/`, and
+#                       nothing after it reads the stripped tree.
 # 2. build-linux-cuda : compile check for the CUDA backend in NVIDIA's own devel
 #                       image. GitHub runners have no GPU, so this cannot run
 #                       anything — it catches nvcc/kernel-compile breakage only.
+#                       Its last step is the CUDA half of the dead-code oracle
+#                       (#254) — the maximal configuration, since `src/cuda.rs`
+#                       and `src/graph/cuda_backend.rs` exist only under the
+#                       feature — which is why the image installs `python3`.
 # 3. build-macos      : unchanged macOS/Metal compile check (Apple Silicon).
 # 4. check-docs       : the documentation gate (#63, #94). `mdbook build` proves the
 #                       book renders (a chapter missing from SUMMARY.md is a hard
@@ -31,6 +40,12 @@
 #                       It also runs the source-level CUDA launch-return audit (#162):
 #                       every `<<<>>>` in src/cuda_kernels.cu must read its own error
 #                       and carry an injection lever, which needs no GPU.
+#                       It also runs Layer 1 of the dead-code ratchet (#254): a
+#                       shape audit of every `allow(dead_code)` (a bare form is
+#                       rejected, a `cfg_attr` must name a cfg, every annotation
+#                       carries a reason) plus that checker's own cases. A source
+#                       audit needs no build; the liveness half is the oracle that
+#                       the two build/test jobs run last.
 # 5. check-viz        : the shape-flow gate. `scripts/check_viz_e2e.mjs` replays the
 #                       stage template against every exported sample and requires the
 #                       computed shapes to equal the ones the engine actually
@@ -114,6 +129,11 @@ jobs:
           cargo test --release 2>&1 | tee /tmp/cargo-test.log
       - name: The x86_64 suite counts must match this run
         run: python3 scripts/check_status.py --check-live /tmp/cargo-test.log --box 'x86_64 (CI runner)'
+      # #254 Layer 2, the default configuration. Deliberately the last step: the
+      # scratch copy shares this job's warm target/, so only the crate is
+      # rechecked, and nothing below would want the stripped tree.
+      - name: Newly dead code must fail the dead-code oracle (CPU)
+        run: python3 scripts/check_dead_code_oracle.py --config cpu
 
   # The container tag carries both the CUDA toolkit and the base image, and the
   # base is the compile-time glibc/gcc floor. Keep the toolkit at a version
@@ -144,7 +164,7 @@ jobs:
       - name: Install build prerequisites
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends curl ca-certificates build-essential
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential python3
       - uses: dtolnay/rust-toolchain@1.97.1
       # This job does not share a cache with the release x64 job: rust-cache's key
       # includes the job id (`build-linux-cuda` ≠ `linux-x64-cuda`), which is the
@@ -156,6 +176,11 @@ jobs:
         run: cargo build --release --features cuda
       - name: Compile the test harness (no device on a hosted runner)
         run: cargo test --release --features cuda --no-run
+      # #254 Layer 2, the maximal configuration. Deliberately the last step: the
+      # scratch copy shares this job's warm target/, so only the crate is
+      # rechecked, and nothing below would want the stripped tree.
+      - name: Newly dead code must fail the dead-code oracle (cuda)
+        run: python3 scripts/check_dead_code_oracle.py --config cuda
 
   build-macos:
     if: github.event_name != 'pull_request' || github.event.action != 'edited'
@@ -211,6 +236,20 @@ jobs:
         run: python3 scripts/check_source_layout.py
       - name: The source-layout checker's own pass/fail cases
         run: python3 scripts/check_source_layout.py --selftest
+      # #254 Layer 1: the shape of every `allow(dead_code)` — a bare annotation
+      # is rejected (the 11 sites that predate the ratchet are grandfathered in
+      # the script), a `cfg_attr` must name a cfg, and each annotation carries a
+      # reason. It is a *shape* audit: liveness is the oracle the two build/test
+      # jobs run last. This job has python3 and needs no toolchain for it.
+      - name: Every dead-code annotation must carry an allowed shape and a reason
+        run: python3 scripts/check_dead_code_annotations.py
+      - name: The annotation-shape checker's own pass/fail cases
+        run: python3 scripts/check_dead_code_annotations.py --selftest
+      # The oracle's parser/strip cases, without cargo: the real check runs in the
+      # build/test jobs, but a broken strip or item derivation must not wait for
+      # those to be noticed.
+      - name: The dead-code oracle's own pass/fail cases
+        run: python3 scripts/check_dead_code_oracle.py --selftest
       # Same toolchain as Docs (`.github/workflows/docs.yml`), so the gate builds the
       # book the site actually ships: mdBook 0.4.37 because 0.5 changed the
       # preprocessor protocol, and mdbook-mermaid 0.13.0 because it only understands
