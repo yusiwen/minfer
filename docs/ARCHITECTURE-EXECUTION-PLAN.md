@@ -6951,6 +6951,136 @@ is caught the next time the oracle runs, not by Layer 1; that division of labour
 [#227]: https://github.com/yusiwen/minfer/issues/227
 [PR #258]: https://github.com/yusiwen/minfer/pull/258
 
+#### Test-infrastructure record (#252, 2026-10-02) — the legacy `KVCache` and `ModelDef::forward`'s `&mut KVCache` parameter are deleted
+
+**The ticket.** [#252] is [#244]'s decision 6, spun out because it is a **trait-signature refactor**
+rather than a dead-code cleanup: a dead-code ticket may delete an item, but it may not move a public
+trait's signature. [#244] had already deleted `KVCache`'s storage, leaving `src/cache.rs` a 31-line
+storage-free marker whose only job was to keep `ModelDef::forward`'s `kv: &mut KVCache` argument
+spelled the same. The argument was **provably unread**: the graph path owns KV in the allocator's
+persistent regions, both graph entry points already bound the parameter as `_kv`
+(`models/qwen2/graph.rs:435`, `models/qwen3/graph.rs:380`), and every implementation only threaded it
+through. [#252] lands as [PR #259].
+
+**What was deleted, and the proof the parameter was dead.** The inventory was re-grepped on the
+branch point (`bef4bd9`), not trusted from the ticket: `git grep -n 'KVCache' src/` plus
+`git grep -n '\.forward(' src/` names exactly the sites below, and nothing else.
+
+| what | site before | change |
+|---|---|---|
+| the marker type | `src/cache.rs` (31 lines: `pub struct KVCache;`, `KVCache::new`) | **file deleted** |
+| its declaration | `src/main.rs:13` `mod cache;` | deleted (with the file, so `check_source_layout.py` stays consistent) |
+| the trait declaration | `src/models/mod.rs:207` (`kv` at `:211`) | `kv: &mut KVCache` removed; doc comment updated |
+| the default `forward_graph` | `src/models/mod.rs:264` (`kv` at `:268`) | `kv` removed from the signature and the delegation |
+| Qwen2 impls | `src/models/qwen2/mod.rs:56`/`:97` (`kv` at `:60`/`:101`) | both removed; `use crate::cache::KVCache;` gone |
+| Qwen3 impls | `src/models/qwen3/mod.rs:48`/`:89` (`kv` at `:52`/`:93`) | both removed; `use crate::cache::KVCache;` gone |
+| graph entry points | `src/models/qwen2/graph.rs:435`, `src/models/qwen3/graph.rs:380` | `_kv: &mut KVCache` removed from `forward`; imports gone |
+| CLI construction | `src/main.rs:1227` (`KVCache::new`) | deleted, with the then-unused `n_kv_embd`/`n_layer` locals |
+| CLI forwards | `src/main.rs:1478`, `:1788` | argument dropped |
+| test construction | `src/models/qwen2/graph/tests.rs:2978/3019/3023` | `KVCache::new` calls and arguments dropped |
+| test mock | `src/server/batch/tests.rs:1794` (`FailingForward::forward`) | `_kv` parameter dropped |
+
+`src/conversation.rs` was verified rather than assumed: `GraphEngine::forward`
+(`src/conversation.rs:43`) is its **own** 3-argument method and the model calls go through
+`forward_graph_cached` (`:237`), neither of which ever took a `KVCache` — its diff is empty.
+`src/graph/cache.rs` (`pub mod cache;` at `src/graph/mod.rs:29`, the `GraphCache`) is untouched; only
+the **other**, legacy `cache` module went. `Cargo.toml`, `src/graph/mod.rs` and every `GraphCache`
+call site are unchanged.
+
+**Zero behaviour change — stated before the suites ran.** No implementation read the argument (both
+graph entry points bound it `_kv`), `KVCache` had no fields since [#244], and nothing else names the
+type. The edit is therefore signature-only: the graph every caller builds, the KV the allocator owns,
+the token stream and the logits are bit-identical. The suite counts are the check — no `#[test]` was
+added, removed or weakened, so the rows below are unchanged rather than re-baselined.
+
+**Warning table — four configurations, before and after.** Same method as [#256]: four
+`cargo check --release --message-format=json` captures on the pinned `1.97.1` toolchain with
+`RUSTFLAGS=--cap-lints=warn` (the crate's `cfg_attr(not(test), deny(warnings))` must not truncate the
+pass), counting rustc `compiler-message` diagnostics (a build script's `cargo:warning=` is not mixed
+in) and comparing the **whole `(level, code, message)` multiset** by sha256, not only counts:
+
+| command | before `bef4bd9` | after (this PR) | multiset |
+|---|---|---|---|
+| `cargo check --release` | 0 (0 `dead_code` / 0 other) | **0 (0 / 0)** | equal (empty) — sha `e3b0c442…` both |
+| `cargo check --release --features cuda` | 0 (0 / 0) | **0 (0 / 0)** | equal (empty) — sha `e3b0c442…` both |
+| `cargo check --release --tests` | 68 (7 / 61) | **68 (7 / 61)** | equal — sha `cc1f8468…` both |
+| `cargo check --release --tests --features cuda` | 79 (5 / 74) | **79 (5 / 74)** | equal — sha `6b87d17c…` both |
+
+Both non-test configurations are warning-free in the strict sense (the plain `cargo build --release`
+and `cargo build --release --features cuda`, without `--cap-lints`, both exit 0 under
+`deny(warnings)`; the cuda run's one `warning:` line is `build.rs`'s pre-existing `cargo:warning=`
+target list). The two `--tests` configurations carry #256's recorded 68/79 pre-existing test-code
+warnings, which Core Convention 5 explicitly scopes out. The honest claim is therefore **"no new
+warning in any of the four configurations"**, and the sha equality is stronger than the count
+equality: not one message was added, removed or moved.
+
+**The ratchet's first real exercise — it said PASS, 0 additions, 0 removals.** [#254]'s stripped
+oracle (`scripts/check_dead_code_oracle.py`) ran in both configurations against
+`docs/dead-code-baseline.toml`:
+
+```
+[cpu]  stripped 43 annotation(s); dead_code diagnostics: 32  src/ spans (sites): 60  items: 46
+       baseline [cpu]: 46 entry/entries — 0 addition(s), 0 removal(s); PASS
+[cuda] stripped 43 annotation(s); dead_code diagnostics: 17  src/ spans (sites): 50  items: 34
+       baseline [cuda]: 34 entry/entries — 0 addition(s), 0 removal(s); PASS
+```
+
+Those are **exactly** the recorded cpu 60/46 and cuda 50/34 that [#254]/[#256] measured, and the
+manifest needed no edit — no entry added, none removed, no `arch` field. That the ratchet is silent
+here is itself the finding, and it is the expected one: the oracle strips `allow(dead_code)`
+annotations and compiles, and `KVCache` carried **no annotation** — it was *live by reference*, kept
+alive by the very signature this PR moves. The ratchet's subject is newly **hidden** code; this PR
+deletes a live-by-reference item, so its item set is unchanged. The manifest never listed `KVCache`
+(`grep -n KVCache docs/dead-code-baseline.toml` is empty), which is why there is no removal to
+report. The two runs also confirm the oracle survives a file deletion and a `mod` removal without an
+infrastructure error (the "every `.rs` is declared" half of `check_source_layout.py` is what would
+have caught a half-done deletion).
+
+**Counts (rule 5), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-02.**
+`cargo test --release` → **480 / 0 / 36** unit + **10 / 0 / 6** integration;
+`bash scripts/cuda_test.sh` → **565 / 0 / 42** unit + **7 + 3 passed / 0 failed / 6 ignored**
+integration; `PARALLEL=0 scripts/real_model_gates.sh` (CPU) → **36 / 0**.
+No `#[test]` was added, removed or weakened, so no count row moves and `docs/status.toml`, the
+`AGENTS.md` rows and `projection_base_passed` are untouched. `cargo fmt --all --check`,
+`check_status.py --check`, `check_docs_links.py`, `check_source_layout.py` and
+`check_dead_code_annotations.py` are clean.
+
+**Docs.** `AGENTS.md`'s layout block loses its `cache.rs` line; `docs/ARCHITECTURE.md` loses the
+module-table row and its "remains only as CLI plumbing" sentence; `docs/COMPUTE-GRAPH-DESIGN.md` §10's
+trait sketch loses `kv` and the other two `src/cache.rs` mentions are corrected;
+`docs/METAL-BACKEND-DESIGN.md`'s legacy-surface paragraph is past-tensed;
+`docs/CPU_OPTIMIZATIONS.md`'s P2/P4 "current state" lines stop citing the deleted file/parameter;
+`docs/OPENAI-CHAT-API-PLAN.md`'s revision note and slot structure say the ignored argument was
+deleted; the walkthrough docs 01/03/09/13 carry dated forward notes (history is not rewritten); and
+the move of this record closes the two `#252` forward notes in the [#244] and #244-escalations
+records above.
+
+**Bar named before measuring.** No `#[test]` is added, removed or weakened and the parameter was
+never read, so the bar is: *the four warning multisets are unchanged, the stripped-oracle
+`(site, item)` set is unchanged in both configurations, and the three suite counts are unchanged* —
+stated before the after-captures, the oracle runs and the suites, and measured by the tables above.
+
+**Mutation evidence takes the warning-multiset form here.** A signature refactor has no runtime
+behaviour to mutate and no new gate to break — the falsifiable claim is "the edit is inert", and the
+sharpest inertness test available is that the compiler sees **exactly** the same message multiset in
+all four configurations, which cannot hold if the deletion moved a live path (it would surface as a
+new `dead_code`/`unused` diagnostic) or left a dangling reference (it would surface as a resolved
+error). The oracle's *stripped* captures are the second arm: if `KVCache` had been merely hidden
+rather than removed, or if the deleted parameter had a reader left behind, the `(site, item)` set
+would have moved; it did not, in either configuration. A behavioural mutation is not available
+because there is no behaviour in the diff, and inventing one would be the "passed for the wrong
+reason" failure `docs/GATE-CONTRACT.md` warns about.
+
+**Limits.** (1) macOS is not compiled here: `graph_metal_matches_cpu_logits` is the one test that
+called `forward_graph`, and its call site is inside a `#[cfg(target_os = "macos")]` **test** block,
+so this box proves the edit compiles on Linux and CI's `build-macos` job (a type-check, not a test
+run) must prove the macOS half compiles. (2) The oracle is a `cargo check`: "live" is a compile-time
+reference, as [#254] states. (3) `--features debug_dump` and `cuda_static` were not built; neither
+names the removed type. (4) The `--tests` warnings are the two configurations' pre-existing sets
+(68/79), not a claim that master's test build is warning-free.
+
+[PR #259]: https://github.com/yusiwen/minfer/pull/259
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
