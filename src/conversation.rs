@@ -326,6 +326,8 @@ enum BreakKind {
 #[derive(Debug)]
 pub struct TurnOutcome {
     /// The assistant-generated text (after stop-string truncation; without the EOG).
+    /// Read only by `conversation::tests`: the streaming path hands each delta to the
+    /// caller as it is produced, so nothing in production reads the assembled field.
     #[cfg_attr(not(test), allow(dead_code))]
     pub text: String,
     /// Read by `conversation::tests`; the streaming path uses the local.

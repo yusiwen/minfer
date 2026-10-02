@@ -19,6 +19,9 @@ use crate::vec_ops::RopeStyle;
 /// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttnMode {
+    /// Part of the attention-mode vocabulary (llama.cpp parity); see the enum note
+    /// above — only `Gqa`/`Flash` are constructed, and an architecture with
+    /// `n_head_kv == n_head` that spelled its attention out would construct this.
     #[allow(dead_code)]
     Mha,
     Gqa,
@@ -133,6 +136,10 @@ pub enum Op {
     Reshape {
         shape: [usize; 4],
     },
+    /// Same deferred vocabulary as `Reshape` above: a permute needs a
+    /// non-contiguous reinterpretation no builder asks for. What would construct it:
+    /// a builder that wants a transposed view rather than a copied or reshaped
+    /// buffer.
     #[cfg_attr(not(test), allow(dead_code))]
     Permute {
         dims: [usize; 4],
@@ -140,6 +147,9 @@ pub enum Op {
 
     // ---- fused ops (fusion pass output, gated by backend supports_fused) ----
     SwiGLU,
+    /// Deferred with its `FusedOp::BatchMatMul` tag (see the `FusedOp` note above):
+    /// the single-output IR cannot express a batched matmul, and no builder emits
+    /// one. What would construct it: that IR extension.
     #[cfg_attr(not(test), allow(dead_code))]
     BatchMatMul,
     /// decode (nt==1) fused QKV: one concat matmul (wq/wk/wv) + bias+rope+store

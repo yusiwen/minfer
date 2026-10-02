@@ -79,6 +79,8 @@ pub enum QClass {
     K4,
     K5,
     K6,
+    /// See the enum note: constructed only by `device_tier::tests` today; a caller
+    /// that classifies a non-K-quant weight type would construct it.
     #[cfg_attr(not(test), allow(dead_code))]
     Other,
 }
@@ -102,10 +104,14 @@ pub struct DeviceTier {
     #[cfg_attr(not(test), allow(dead_code))]
     pub source: &'static str,
     pub provenance: Provenance,
-    /// Batch limit for the quantized decode (MMVQ-family) kernels.
+    /// Batch limit for the quantized decode (MMVQ-family) kernels. Read by
+    /// `device_tier::tests`; the batch-cap activation (plan §14 R8) is what would
+    /// read it in production ([#244]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub mmvq_batch_default: i32,
-    /// Per-quant-class overrides (sparse; K-quant only in the source data).
+    /// Per-quant-class overrides (sparse; K-quant only in the source data). Read by
+    /// `device_tier::tests`; the batch-cap activation (plan §14 R8) is what would read
+    /// the per-class override in production ([#244]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub mmvq_batch_by_type: &'static [(QClass, i32)],
     /// int8 BT (block-tile tensor-core) prefill availability. The GENERIC
