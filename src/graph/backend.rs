@@ -136,7 +136,6 @@ pub trait Backend: Send + Sync {
     /// A backend that captured a CUDA Graph window for the current split must
     /// close it here (instantiate + launch the captured work once), because
     /// capture records launches without executing them.
-    #[allow(dead_code)]
     fn synchronize(&mut self);
 
     /// Try to replay a previously captured graph for `(uid, range)` on this

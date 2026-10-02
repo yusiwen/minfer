@@ -318,7 +318,6 @@ impl GraphAllocator {
     ///
     /// #153: the backend is built with this allocator's stamped KV format, so its
     /// kernels address the regions in the layout the loaded engine resolved.
-    #[allow(dead_code)]
     #[cfg(feature = "cuda")]
     pub fn enable_cuda(&mut self) -> bool {
         if self.cuda.is_none() {
@@ -348,7 +347,6 @@ impl GraphAllocator {
     }
 
     /// Immutable CUDA backend. (Phase 7c: used by the model-side gate.)
-    #[allow(dead_code)]
     #[cfg(feature = "cuda")]
     pub fn cuda(&self) -> Option<&super::cuda_backend::CudaBackend> {
         self.cuda.as_ref()

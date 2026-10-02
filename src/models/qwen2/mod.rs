@@ -43,9 +43,10 @@ pub struct Qwen2Model {
 }
 
 impl Qwen2Model {
-    /// Inherent accessor — callers use the trait's `n_layer()` (the graph tests
-    /// go through `Box<dyn ModelDef>`), so this stays as a concrete-type helper.
-    #[allow(dead_code)]
+    /// Inherent accessor. Most callers use the trait's `n_layer()` (the graph
+    /// tests go through `Box<dyn ModelDef>`), but a concrete `&Qwen2Model`
+    /// caller exists — `forward_batch`'s `MINFER_GRAPH_DUMP` branch in
+    /// `models/qwen2/graph.rs` — so this is live, not a dead helper.
     pub fn n_layer(&self) -> usize {
         self.layers.len()
     }

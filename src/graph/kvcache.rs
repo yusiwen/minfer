@@ -58,12 +58,12 @@ pub struct KvLayer {
     /// host-side paths that read rows as f32 (the C2 shift's re-rope) refuse a packed
     /// region instead of reinterpreting its bytes.
     pub packed: bool,
-    /// `owner[cell]` — one entry per cell, `FREE` when unowned.
-    #[allow(dead_code)] // read by C2's resolver and the tests; C1 only writes it
+    /// `owner[cell]` — one entry per cell, `FREE` when unowned. Read by C2's
+    /// resolver and the tests, and by C1's own `release_seq` (which finds the
+    /// donor's cells) — so "C1 only writes it" is not the whole story.
     pub owner: Vec<SeqId>,
     /// Highest written row + 1 (the "used" prefix). Positions at or beyond it
     /// have never been written; attention above it would read zeroes.
-    #[allow(dead_code)] // C2's eviction policy reads it
     pub n_used: usize,
 }
 
@@ -278,7 +278,6 @@ impl KvCache {
     }
 
     /// Layers in layer order (diagnostics / tests).
-    #[allow(dead_code)] // C2 surface
     pub fn iter(&self) -> impl Iterator<Item = (usize, &KvLayer)> {
         self.layers.iter().map(|(&l, r)| (l, r))
     }

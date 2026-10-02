@@ -60,7 +60,6 @@ pub struct CrossCopyStats {
 
 // Read by the F5 gates (tests) and by a caller that wants a delta rather than a
 // lifetime total; production code only bumps the counters.
-#[allow(dead_code)]
 impl CrossCopyStats {
     /// The change from `before` to `self` — what a gate asserts on, so an
     /// unrelated earlier execution cannot shift the numbers.
