@@ -314,8 +314,6 @@ def toml_entry(config: str, name: str, kind: str, file: str, reason: str) -> str
     )
 
 
-
-
 def check(
     tree: Path,
     config: str,

@@ -6790,6 +6790,155 @@ references it, which is the right rule for a warning-free build and not a statem
 [PR #257]: https://github.com/yusiwen/minfer/pull/257
 
 
+#### Test-infrastructure record (#254, 2026-10-02) — the dead-code ratchet: an annotation-shape guard in `check-docs`, and a stripped oracle in the two building jobs
+
+**The ticket.** The #218 → [#227] → #228/#236/#238–#244 series established that an
+`#[allow(dead_code)]` is not a lint silence but a **liveness root**: rustc hides the annotated
+item *and its whole call chain*, so one stray annotation can hide a large dead subgraph while
+`deny(warnings)` stays quiet (the minimal case the census was built on: without the allow rustc
+reports both `struct NeverBuilt is never constructed` and `fn annotated_root is never used`; with
+it, neither). The series measured the real dead set by stripping every annotation and reading
+rustc's own `dead_code` diagnostics, but that census lived in a scratch script outside the
+repository. [#254] productises it as two mechanical layers; it lands as [PR #258]. The workflow
+keeps its **seven-job shape**: Layer 1 rides in `check-docs` (no build), Layer 2 is the **last**
+step of `test-linux-cpu` (`--config cpu`) and `build-linux-cuda` (`--config cuda`) — the two jobs
+that already pay for their compile, so the strip pass is one more `cargo check` over a warm
+`target/`.
+
+**Layer 1 — the shape guard (`scripts/check_dead_code_annotations.py`).** It enforces the
+annotation *shape*, not liveness, and its docstring says so — that is what keeps it honest. `R1`
+a bare `#[allow(dead_code)]` is rejected unless it is one of the 11 sites that predate the ratchet
+(`GRANDFATHERED_BARE`, keyed `path:item`; **a stale entry is a failure**, so fixing a site forces
+its entry out — the two `src/metal.rs` entries must go when [#255] resolves them). `R2` a
+`cfg_attr` must name a cfg predicate: `#[cfg_attr(dead_code, allow(dead_code))]` names the lint,
+not a configuration. `R3` the annotated item needs a *reason marker* in its own comment block — a
+ticket reference (`#254`), a named consumer/configuration (`tokenizer::tests`,
+`not(feature = "cuda")`), or one of the deferred-use phrases [#244] established. `R4` the
+rejection text points a test-only item at `#[cfg(test)]` / `tests.rs`, which needs no annotation.
+`R3` is a *presence* test: the checker can see that a reason was written, never that it is true.
+`--selftest` pins 14 cases (13 shapes plus the stale-entry rule) and runs in `check-docs`.
+
+**Seven annotations had no reason under `R3`.** Each gets a one-line doc-comment reason — no
+code and no attribute change — and all seven are reported here because the ticket asks for them:
+
+| site | item | the reason added |
+|---|---|---|
+| `src/conversation.rs:329` | `TurnOutcome::text` | read only by `conversation::tests`; the streaming path hands each delta to the caller as it is produced |
+| `src/device_tier.rs:82` | `QClass::Other` | points at the enum note above: `device_tier::tests` constructs it; a caller classifying a non-K-quant weight type would in production |
+| `src/device_tier.rs:106` | `DeviceTier::mmvq_batch_default` | read by `device_tier::tests`; the batch-cap activation (plan §14 R8) would read it |
+| `src/device_tier.rs:109` | `DeviceTier::mmvq_batch_by_type` | read by `device_tier::tests`; the batch-cap activation would read the per-class override |
+| `src/graph/ops.rs:22` | `AttnMode::Mha` | what would construct it: a multi-head-attention builder (`n_head_kv == n_head`) |
+| `src/graph/ops.rs:136` | `Op::Permute` | the deferred note: a builder that wants a transposed view rather than a copied/reshaped buffer |
+| `src/graph/ops.rs:143` | `Op::BatchMatMul` | the `FusedOp::BatchMatMul` note: the single-output IR cannot express a batched matmul |
+
+(`mmvq_batch_default`'s doc already mentioned “kernels”, which the marker test happens to accept;
+its reason was added anyway so the two fields of the pair read the same.)
+
+**Layer 2 — the oracle ratchet (`scripts/check_dead_code_oracle.py` +
+`docs/dead-code-baseline.toml`).** It copies the tree to a scratch directory (the checked-out
+tree is never modified), replaces **every** `allow(dead_code)` — bare, `cfg_attr`, a combined list
+(dropping only `dead_code`) and the inner `#![...]` form — with a line-preserving marker, then
+runs `cargo check --release [--features cuda] --message-format=json` with
+`RUSTFLAGS=--cap-lints=warn` (never `deny(warnings)`, which turns the lint into an error and can
+truncate the pass). It takes **every `src/` span** of every `dead_code` diagnostic — the primary
+span alone undercounts ~2.6×, the first census's error — and every `(name, kind)` the diagnostic's
+message names (`fields `a`, `b` …` is two `field` items, `variants `X`, `Y` …` two `variant`
+items), and compares that set with the manifest. An **addition fails**, printed with `file:line`,
+the diagnostic and a paste-ready entry; a **removal** is informational; a file move is a note.
+The strip cannot pass silently: an unrecognised spelling (a multi-line attribute, a
+`clippy::dead_code` path), a surviving `dead_code` in a code line, a zero-annotation strip, or a
+capture with no `dead_code` diagnostic at all is an exit-2 infrastructure error.
+
+The scratch copy shares the calling tree's `target/` by default, and that is the point: on a warm
+tree the cpu configuration costs **1.5 s** (only the crate is rechecked) while the cuda one — whose
+non-test artifacts the job has not built — costs about two minutes over the job's already-warm
+dependency cache. Four CI steps, seconds-to-minutes inside jobs that compile the tree anyway.
+
+**Counts, both architectures.** `sites` is every `src/` span of every `dead_code` diagnostic;
+`items` is every `(name, kind)`:
+
+| configuration | `dgxspark (aarch64, GB10 sm_121)` | `--target x86_64-unknown-linux-gnu` |
+|---|---|---|
+| `cargo check --release` (cpu) | **32 diagnostics / 60 sites / 46 items** | 32 / 60 / 46 |
+| `cargo check --release --features cuda` | **17 / 50 / 34** | 17 / 50 / 34 |
+
+Both columns reproduce the [#256] record's recorded cpu **60 / 46** and cuda **50 / 34** exactly,
+and the two architectures are **identical at the `(name, kind)` level**. The x86_64 column is a
+local cross-check the box can make because `cargo check` needs no x86 linker — the rustc invocation
+carries `--target x86_64-unknown-linux-gnu` and `target_arch="x86_64"` — but it is not a run on
+the runner. Since the sets agree, the manifest is the union of one set and carries **no `arch`
+field**; the authoritative architecture validation is the PR's own CI run, which passes no
+`--target` (the first run's oracle output is the confirmation this record's table is checked
+against).
+
+**Confirmed on the runner.** The PR's first CI run is green 7/7 with zero code annotations (the
+single `build-macos` annotation is GitHub's platform `notice` about macOS runner capacity). On the
+**x86_64** runner `test-linux-cpu` printed `stripped 43 annotation(s) … dead_code diagnostics: 32
+src/ spans (sites): 60 items: 46 … baseline [cpu]: 46 entry/entries — 0 addition(s), 0 removal(s);
+PASS` in 17 s, and `build-linux-cuda` printed `stripped 43 … 17 … 50 … 34 … 34 entry/entries —
+0 addition(s), 0 removal(s); PASS` in 2 m 47 s over its warm dependency cache. Those are the same
+sets as the aarch64 column, so no `arch` field was needed and the manifest needed no second seed;
+`check-docs` printed `annotation shapes clean (11 grandfathered bare site(s))`, the Layer-1
+selftest's `14 cases pass` and the oracle's `strip, item and capture cases pass`.
+
+**The manifest (`docs/dead-code-baseline.toml`).** 46 `[[cpu]]` + 34 `[[cuda]]` entries, each
+`name` / `kind` / `file` / `reason`, plus a top-level `macos = "unjudged"`. The update rule is
+written into the file: an addition is a decision — make the item live, delete it, or add the entry
+**in the same PR** with a one-line reason — and the checker prints the entry to paste; a removal
+is informational. `--print-toml` regenerates the block (reusing the existing reasons), and
+`--selftest` pins the strip, the item derivation and the capture parser in `check-docs`, so
+regression in the strip is caught without cargo.
+
+**The blind spots, written into the manifest rather than discovered later.** (1) macOS is not
+compiled on Linux: a macOS-only module is invisible, and a cross-platform item whose only caller
+sits in a `#[cfg(target_os = "macos")]` **test** block *looks* dead here while it is live there —
+`ModelDef::forward_graph` is exactly that case, and its reason names the test
+(`models::qwen2::graph::tests::graph_metal_matches_cpu_logits`). `build-macos` only type-checks,
+so `macos = "unjudged"` records the gap and the two `src/metal.rs` sites stay with [#255]. (2) The
+oracle is a `cargo check`: “live” is a compile-time reference, not runtime reachability. (3)
+`--features debug_dump` and `cuda_static` are not covered.
+
+**Fixture evidence — both layers can fail.** Layer 1: appending a bare
+`#[allow(dead_code)] fn layer1_bare_allow_probe() {}` to a scratch copy makes
+`check_dead_code_annotations.py` exit 1 with two problems (the bare form; no reason); swapping it
+for a reason-less `#[cfg_attr(not(test), allow(dead_code))]` exits 1 with the “no reason” problem
+alone; removing the probe restores the clean run. Layer 2: a synthetic `oracle_mutation_probe`
+function added to a scratch copy makes the oracle exit 1 in **both** configurations, naming
+`oracle_mutation_probe (fn) at src/vec_ops.rs:1349` and printing the manifest entry; pasting that
+entry into the scratch manifest's `[[cpu]]` array makes the same command pass
+(`47 items, 47 entries — 0 addition(s), 0 removal(s)`), which is the update path in one diff.
+Neither fixture is committed.
+
+**Bar named before measuring.** Layer 1: *the shape audit passes on the tree as it stands, and
+each fixture mutation exits non-zero*. Layer 2: *the stripped oracle reproduces the recorded cpu
+60 / 46 and cuda 50 / 34 and the manifest compares equal (0 additions, 0 removals) in both
+configurations on both architectures*. Both were stated before the after-runs and are met by the
+tables above.
+
+**Mutation evidence takes the fixture form here.** There is no behavioural gate to break: an
+attribute-only diff plus two new checkers have no runtime effect, so the falsifiable claims are
+that Layer 1 rejects the two shapes it forbids and that Layer 2 fails on a newly hidden item. Both
+are the transcripts above, and the oracle's own strip is mutation-checked by construction — the
+`oracle_mutation_probe` run strips **44** annotations (43 + the probe) and the item set moves 46 →
+47 exactly.
+
+**Counts (rule 5), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-02.** `cargo test --release` →
+**480 / 0 / 36** unit + **10 / 0 / 6** integration; `bash scripts/cuda_test.sh` → **565 / 0 / 42**
+(unit), integration **7 + 3 passed / 0 failed / 6 ignored**. No `#[test]` was added, removed or
+weakened — the diff is two scripts, a TOML manifest, CI steps and seven doc comments — so no count
+row moves and `docs/status.toml` / the `AGENTS.md` rows are untouched. `cargo fmt --all --check`,
+`check_status.py --check`, `check_docs_links.py` and `check_source_layout.py` are clean.
+
+**Limits.** (1) The x86_64 column is a cross-compile, not a run on the runner; the CI job is the
+confirmation. (2) The one-line `reason` strings are as good as the annotation notes they reuse:
+the oracle proves an item is *dead*, never that the reason for keeping it is still true. (3) A
+`dead_code` diagnostic whose only span is outside `src/` is ignored by construction — this
+configuration compiles the crate, not `tests/`. (4) A *new* annotation that hides a large subgraph
+is caught the next time the oracle runs, not by Layer 1; that division of labour is the design.
+
+[#227]: https://github.com/yusiwen/minfer/issues/227
+[PR #258]: https://github.com/yusiwen/minfer/pull/258
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
