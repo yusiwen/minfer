@@ -284,7 +284,7 @@ shape, and `offset` — offset from the start of the part's data section), and
 `ctx.offset + ti.offset`, where `ctx.offset` is where the data section starts
 in the file (`gguf.rs:603-619`).
 
-**Out:** four things.
+**Out:** three things.
 
 1. `Box<dyn ModelDef>` — the polymorphic model object (`Qwen2Model` /
    `Qwen3Model`): `HParams` + `tok_embd` + `output_norm` + `output` +
@@ -293,8 +293,6 @@ in the file (`gguf.rs:603-619`).
    entries when MPS initialized; CUDA's device copies when a device exists.
 3. The KV element-type decision (f16 vs f32), set once from the model's
    dimensions before any forward runs.
-4. The legacy `KVCache` in `main.rs` — allocated, then ignored by the graph
-   path (§3.2, excerpt 1).
 
 **Shapes to internalize now** (they recur in every later doc): a GGUF weight
 matrix is stored with shape metadata `[in, out]` (ne[0] = input dim,
@@ -313,7 +311,8 @@ fewer bits, grouped into blocks that share a scale factor.
 ### 3.2 Key code
 
 Excerpt 1 — the startup order in `main.rs`: GPU init, dispatch, legacy KV
-cache. (`src/main.rs:637-657`)
+cache. (`src/main.rs:637-657`; the KV block below is **historical** — see the
+forward note under the annotations)
 
 ```rust
     // === GPU backends ===
@@ -334,19 +333,25 @@ cache. (`src/main.rs:637-657`)
     let mut kv_cache = cache::KVCache::new(n_layer, n_kv_embd, params.n_ctx);
 ```
 
+> **Forward note (#252, 2026-10-02):** the `// === KV Cache ===` block above is gone. [#244] had
+> already deleted the `KVCacheLayer` storage; [#252] then deleted the empty marker `src/cache.rs`,
+> its `mod cache;` declaration and the vestigial `&mut KVCache` parameter of `ModelDef::forward` and
+> `forward_graph`, so `main.rs` loads the model and the tokenizer and nothing else. There is no
+> per-load KV allocation to narrate at all — the graph allocator's persistent regions are the only
+> KV store ([#244], [#252]).
+
 Annotations: `MpsState::init()` is a `OnceLock` singleton init — inside, it
 honors `MINFER_DISABLE_MPS` by returning `None`, so "disabled" and "no
 device" are the same state downstream (`metal.rs:2031-2035`). CUDA likewise
 honors `MINFER_DISABLE_CUDA` and takes the `--gpu N` index here. The
 `load_model` call is where this entire doc's work happens — note `.expect`:
-an unsupported architecture is fatal, by design (§2.2). And the final three
-lines allocate the legacy KV cache *before* the tokenizer is even loaded —
-its only remaining job is to satisfy the `ModelDef::forward` signature's
-`&mut KVCache` parameter, which the graph path ignores. Nothing reads it; it
-is kept until that trait signature is refactored away (`cache.rs:1-7`). It
-is not free, though: at 4096 context, 128-wide KV and 24 layers it is
-2 × 24 × 4096 × 128 × 4 B ≈ 100 MB of zeroed memory — a good illustration of
-why vestigial plumbing should eventually die.
+an unsupported architecture is fatal, by design (§2.2). The final three lines
+in the excerpt allocated the legacy KV cache, whose only remaining job (after
+[#244] deleted its storage) was to satisfy the `ModelDef::forward` signature's
+`&mut KVCache` parameter — a parameter no path read, and the claim that it cost
+≈ 100 MB of zeroed memory stopped being true with [#244]. [#252] deleted the
+argument and the type rather than keep a dead allocation alive for the API
+shape.
 
 Excerpt 2 — the dispatch itself. (`src/models/mod.rs:95-112`)
 
@@ -384,7 +389,7 @@ Excerpt 3 — the interface everything downstream codes against.
 ```rust
 pub trait ModelDef: Send + Sync {
     fn forward(&self, tokens: &[u32], positions: &[usize],
-               kv: &mut KVCache, n_out: usize, n_ctx: usize) -> Vec<f32>;
+               n_out: usize, n_ctx: usize) -> Vec<f32>;
     /// Downcast helper for the graph path's weight registration.
     fn as_any(&self) -> &dyn std::any::Any;
     /// Build the declarative compute graph for one forward step (Phase 5).
@@ -836,13 +841,16 @@ The alternative (per-layer fallback) is the old engine's design, and its
 cost — 144 DMA operations per decode step in the worst case — is on record
 in `docs/CUDA_OPTIMIZATION.md`.
 
-**The legacy `KVCache` lives on, ignored.** Deleting it means changing the
-`ModelDef::forward` signature and every test that constructs a `KVCache`;
-the graph path's real KV lives in the allocator's persistent per-layer
-regions (docs 07–08). Keeping a vestigial 100 MB allocation is the cheaper
-mess until that signature refactor happens — and it is annotated as such at
-both ends (`cache.rs:1-7`, `qwen2/graph.rs:388` where `_kv` is underscored
-and ignored).
+**The legacy `KVCache` is gone (#252).** [#244] deleted the type's storage (it was never read), and
+[#252] then deleted the empty marker `src/cache.rs`, its `mod cache;` declaration, the
+`ModelDef::forward`/`forward_graph` `&mut KVCache` parameter, the `KVCache::new` call in `main.rs` and
+the tests that constructed one only to satisfy the signature. The graph path's real KV lives in the
+allocator's persistent per-layer regions (docs 07–08) and always did; the "vestigial 100 MB
+allocation" this paragraph used to call the cheaper mess stopped existing with [#244]'s storage
+deletion, so keeping the parameter bought nothing.
+
+[#244]: https://github.com/yusiwen/minfer/issues/244
+[#252]: https://github.com/yusiwen/minfer/issues/252
 
 ### 3.4 Pitfalls & invariants
 

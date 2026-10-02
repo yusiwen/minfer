@@ -227,7 +227,7 @@ frame):
 | mode flags | `conv_mode`, `server_mode`, `viz_mode`, `meta_flag`, … | parse loop + subcommand match |
 | `model_path` | `String` — a path that exists on disk | `download::resolve` |
 | `prompt` | `String` | positional join, or one stdin line |
-| KV sizing | `n_kv_embd`, `n_layer`, `params.n_ctx` | loaded model + params (handed to `KVCache` and later the graph) |
+| KV sizing | `params.n_ctx` (and the model's `n_kv_embd`) | loaded model + params (the graph's persistent KV regions; the `KVCache` this row used to name was deleted in [#252](https://github.com/yusiwen/minfer/issues/252)) |
 
 The stage boundary is `gguf::load_gguf_model` — the first call doc 02
 covers. Everything above it in `main()` is this stage.

@@ -380,7 +380,10 @@ approach. This is the highest-impact optimization for Q4_K models.
 **Impact:** 2× memory bandwidth reduction during attention.
 **Difficulty:** Medium.
 
-**Current state:** `src/cache.rs:6-7` uses `Vec<f32>` for K/V cache.
+**Current state:** the KV store is the graph allocator's persistent regions, whose width is the
+per-engine `KvFormat` (`graph/kvformat.rs`; f16/q8_0 supported on CPU + CUDA, f32 default —
+`MINFER_CACHE_TYPE`). The pre-graph `src/cache.rs` `Vec<f32>` this line used to name was deleted in
+[#252](https://github.com/yusiwen/minfer/issues/252).
 
 **llama.cpp approach:** Default is `GGML_TYPE_F16`, reducing memory by half.
 
@@ -406,9 +409,11 @@ for typical use cases.
 **Impact:** Linear speedup with core count (expected +50-70% on 8-core CPUs).
 **Difficulty:** Medium.
 
-**Current state:** Single-threaded inference. No parallel libraries (rayon,
-crossbeam) in Cargo.toml. The `forward` function uses `&mut KVCache` which
-prevents top-level parallelization.
+**Current state:** no parallel libraries (rayon, crossbeam) in Cargo.toml, so a forward is one
+thread. The `&mut KVCache` this line used to blame was a dead parameter, not a constraint: it was
+never read and was deleted in [#252](https://github.com/yusiwen/minfer/issues/252), and the KV store
+the graph really uses lives inside the allocator (so top-level parallelization is bounded by the
+allocator's ownership, not by a caller-held cache handle).
 
 **llama.cpp approach:** OpenMP parallelism across layers and attention heads.
 

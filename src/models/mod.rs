@@ -6,7 +6,6 @@ pub mod qwen3;
 /// #167: the one CUDA per-tensor weight-registration rule both loaders share.
 pub mod weight_reg;
 
-use crate::cache::KVCache;
 use crate::gguf::GgufModel;
 use crate::graph::cache::GraphCache;
 use crate::graph::offload::OffloadPlan;
@@ -202,16 +201,9 @@ pub fn ffn_composition(requested: Option<&str>, device: Device) -> bool {
 /// [#244]: https://github.com/yusiwen/minfer/issues/244
 pub trait ModelDef: Send + Sync {
     /// Single-shot forward. `n_ctx` sizes the graph's persistent KV regions
-    /// (the graph path; the legacy `kv` arg is ignored there). Callers must
-    /// guarantee `positions[i] < n_ctx` for every position.
-    fn forward(
-        &self,
-        tokens: &[u32],
-        positions: &[usize],
-        kv: &mut KVCache,
-        n_out: usize,
-        n_ctx: usize,
-    ) -> Vec<f32>;
+    /// (which the graph allocator owns). Callers must guarantee
+    /// `positions[i] < n_ctx` for every position.
+    fn forward(&self, tokens: &[u32], positions: &[usize], n_out: usize, n_ctx: usize) -> Vec<f32>;
 
     /// Downcast helper for **test** code, and nothing else.
     ///
@@ -265,11 +257,10 @@ pub trait ModelDef: Send + Sync {
         &self,
         tokens: &[u32],
         positions: &[usize],
-        kv: &mut KVCache,
         n_out: usize,
         n_ctx: usize,
     ) -> Vec<f32> {
-        self.forward(tokens, positions, kv, n_out, n_ctx)
+        self.forward(tokens, positions, n_out, n_ctx)
     }
 
     /// Graph-based forward with a caller-provided cache and explicit context

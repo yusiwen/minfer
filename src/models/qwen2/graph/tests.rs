@@ -2975,10 +2975,9 @@ fn graph_logits_match_forward_real_model() {
     // NOTE: both runs share one GraphAllocator so the KV persists across
     // the prefill -> decode transition (like the real loop).
     let n_ctx = q2.hparams.max_seq_len as usize;
-    let mut kv_f = KVCache::new(model.n_layer(), model.n_kv_embd(), n_ctx);
-    let lf = model.forward(&ids, &positions, &mut kv_f, 1, n_ctx);
+    let lf = model.forward(&ids, &positions, 1, n_ctx);
     let next = argmax(&lf);
-    let lf2 = model.forward(&[next], &[ids.len()], &mut kv_f, 1, n_ctx);
+    let lf2 = model.forward(&[next], &[ids.len()], 1, n_ctx);
     let (lg, lg2) = run_prefill_decode(q2, &ids, next, n_ctx);
     compare("prefill", &lf, &lg);
     compare("decode", &lf2, &lg2);
@@ -3016,12 +3015,10 @@ fn graph_metal_matches_cpu_logits() {
         let positions: Vec<usize> = (0..ids.len()).collect();
 
         // CPU reference (forward, not forward_graph — separate KV state)
-        let mut kv = KVCache::new(model.n_layer(), model.n_kv_embd(), 4096);
-        let ref_l = model.forward(&ids, &positions, &mut kv, 1, 4096);
+        let ref_l = model.forward(&ids, &positions, 1, 4096);
 
         // GPU graph (forward_graph picks Metal when MPS + weights on GPU)
-        let mut kv2 = KVCache::new(model.n_layer(), model.n_kv_embd(), 4096);
-        let gpu_l = model.forward_graph(&ids, &positions, &mut kv2, 1, 4096);
+        let gpu_l = model.forward_graph(&ids, &positions, 1, 4096);
 
         let mut maxd = 0.0f32;
         for i in 0..ref_l.len() {

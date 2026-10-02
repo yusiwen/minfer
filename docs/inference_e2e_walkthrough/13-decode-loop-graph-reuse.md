@@ -447,13 +447,15 @@ rebuild step the same call additionally runs build → register → assign →
 fuse → alloc. The loop code has no idea any of that exists — which is the
 point of the `ModelDef::forward` facade (`models/mod.rs:26-33`).
 
-One name in the call needs a sentence for honesty: `forward`'s signature
-takes a `&mut KVCache` (`main.rs:932` passes `kv_cache`, created at
-`main.rs:657`). On the graph path this legacy type is *ignored* — the doc
-comment says so (`models/mod.rs:23-25`) and `forward_cached` names the
-parameter `_kv` (`graph.rs:388`). The real KV lives in the allocator's
-persistent regions (doc 07). The parameter survives from the pre-graph
-architecture; the graph path routes around it.
+One name in the call needs a sentence for honesty: `forward`'s signature *used*
+to take a `&mut KVCache` (`main.rs` passed a `kv_cache` created at load). On the
+graph path that legacy type was always *ignored* — the callee bound it as `_kv`
+and `forward_cached` never took it — so [#252] deleted the parameter, the
+`KVCache` type and the construction rather than keep a dead API shape. The real
+KV lives in the allocator's persistent regions (doc 07), and the call now reads
+`forward(tokens, positions, n_out, n_ctx)`.
+
+[#252]: https://github.com/yusiwen/minfer/issues/252
 
 ### 3.2 Key code
 

@@ -147,8 +147,9 @@ no `layer_gpu` function in `metal.rs` (the name survives only in the legacy CUDA
 `src/graph/metal_backend.rs` is the only live consumer of the device layer. What remains is a
 `#[allow(dead_code)]` block in `metal.rs` holding the old-forward scaffolding and a few methods kept
 for tests (e.g. `matmul_on_gpu_buf`); the loaders, the graph backend and the kernel tests are the
-live callers. (The legacy `KVCache` type in `src/cache.rs` is likewise unused by the graph path; KV
-lives in the allocator's persistent regions.)
+live callers. (The legacy `KVCache` type in `src/cache.rs` was likewise unused by the graph path; KV
+lives in the allocator's persistent regions, and the type — with the `ModelDef::forward` argument
+that kept it alive — was deleted in [#252](https://github.com/yusiwen/minfer/issues/252).)
 
 ---
 

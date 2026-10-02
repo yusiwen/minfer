@@ -6497,6 +6497,12 @@ variants). (6) Removing `ModelDef::forward`'s legacy `&mut KVCache` parameter (t
 empty marker kept so the signature does not move). Each has a recommendation on the ticket; none
 changes behaviour, so none belongs in a dead-code cleanup silently.
 
+> **#252 forward note (2026-10-02):** escalation (6) landed. `src/cache.rs`, its `mod cache;`
+> declaration, the `&mut KVCache` argument of `ModelDef::{forward,forward_graph}`, the `KVCache::new`
+> call in `main.rs` and the tests that constructed one only for the signature are all gone; the
+> parameter was never read by any path (the graph allocator owns KV). See the [#252] record in
+> §test-infrastructure.
+
 **Doc corrections landed.** `docs/BACKEND-REGISTRY-DESIGN.md` §3 + §10 carry the `BackendCaps`
 correction above; `src/models/{qwen2,qwen3}/mod.rs` no longer claim `ModelDef::offload()` hands the
 plan to the builders (they read the field); `src/graph/allocplan.rs`'s module doc no longer claims
@@ -6545,6 +6551,12 @@ rather than smuggled into this ticket.
 | 4 | `KvCache::set_owner` | **delete it and its two test assertions** | no production consumer, and it was **not** behaviour-equivalent to `own_range` (which truncates out-of-range silently where `set_owner` returned `Err`), so wiring it in would have changed behaviour — option (a) was rejected on that ground |
 | 5 | deferred `DType`/`Op`/`AttnMode`/`RopeStyle` vocabulary | already landed in [#251] | verified only: every kept member names what would construct it |
 | 6 | `ModelDef::forward`'s legacy `&mut KVCache` | **escalated as [#252]** | a trait-signature refactor with its own acceptance criteria; the parameter is provably unread |
+
+> **#252 forward note (2026-10-02):** the escalation landed as its own PR — decision 6 is no longer
+> pending. The `KVCache` type, the `mod cache;` declaration and the `&mut KVCache` parameter are
+> deleted, with **zero behaviour change** (every implementation ignored the argument, and both graph
+> entry points already bound it as `_kv`). The [#252] record in §test-infrastructure carries the
+> evidence.
 
 **The caps≡trait gate was repointed, not deleted.** `registry_caps_match_the_backend_trait` used to
 compare `Backend::CPU.caps().supports_op` (a registry field) against the trait method. With the

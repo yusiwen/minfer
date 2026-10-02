@@ -15,7 +15,6 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use crate::cache::KVCache;
 use crate::graph::alloc::GraphAllocator;
 use crate::graph::backend::Backend;
 use crate::graph::cache::GraphCache;
@@ -364,7 +363,7 @@ impl Qwen3Graph {
     }
 
     /// Graph-based forward: build/assign/fuse/alloc/execute with reuse.
-    /// `kv` is ignored (the graph owns its KV in persistent regions).
+    /// KV is owned by the graph (persistent regions), not by the caller.
     ///
     /// CLI convenience wrapper: uses the process-global `graph_cache()`. The
     /// KV regions are sized by `n_ctx`, clamped to the model's `max_seq_len`
@@ -377,7 +376,6 @@ impl Qwen3Graph {
         model: &Qwen3Model,
         tokens: &[u32],
         positions: &[usize],
-        _kv: &mut KVCache,
         n_out: usize,
         n_ctx: usize,
     ) -> Vec<f32> {
