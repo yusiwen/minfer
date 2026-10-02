@@ -6627,6 +6627,169 @@ appears in `src/dump.rs`. (4) The `--tests --features cuda` row is the maximal t
 [#251]: https://github.com/yusiwen/minfer/pull/251
 [#252]: https://github.com/yusiwen/minfer/issues/252
 
+#### Test-infrastructure record (#256, 2026-10-02) — the 25 bare `allow(dead_code)` verdicts land, and the stripped oracle does not move
+
+**The ticket.** [#256] is the last Linux-side work on the `allow(dead_code)` population: the 18
+sites whose bare `allow` is redundant because the item is **live** (delete the annotation), the 7
+that are dead only outside `cfg(test)` (tighten to `#[cfg_attr(not(test), allow(dead_code))]`), and
+the 4 stale comments the deletions exposed. It lands as [PR #257]. It is the Layer-1 prerequisite
+[#254] names for its shape ratchet ("resolve the 40 bare/other `allow(dead_code)` sites … so Layer
+1's rule starts from a clean baseline"). The two macOS-only sites (`src/metal.rs:971`, `:2029`) stay
+with [#255], which needs a Mac; the 9 bare-**correct** deferred sites (`HfCheckpoint::order` —
+[#209] owns apply-or-drop — the two [#138]-pending `cuda.rs` items,
+`Vendor::{Amd,Mthreads,Apple}`, `tokenizer.rs::{id_to_score,id_to_type}`, `AttnMode::Mha`) stay bare,
+because bare is the precise spelling for an item dead in *every* compilable configuration.
+
+**Method, identical on both sides.** `strip_dead_code.py` in a scratch worktree
+(`.worktrees/256-oracle`): every `allow(dead_code)` — bare, `cfg_attr` and inner `#![…]` — replaced
+by a line-preserving `//STRIPPED` comment. Then four `cargo check --release --message-format=json`
+captures with `RUSTFLAGS=--cap-lints=warn` on the pinned `1.97.1` toolchain (`RUSTUP_TOOLCHAIN` is
+`stable` in this shell, so it is unset for every run): `cpu`, `cuda` (`--features cuda`),
+`tests_cpu` (`--tests`) and `tests_cuda` (`--tests --features cuda`). **Sites** are every `src/` span
+of every `dead_code` diagnostic (a primary-span-only read undercounts ~2.6×); **items** are every
+member named in a diagnostic's message, keyed `(file, name, kind)` — "variants `Scale`, `Softmax`, …
+are never constructed" contributes five items, and a line move does not read as a change.
+
+**The baseline is the recorded one, byte-for-byte.** The four `f47e4c3` captures are *diff-identical*
+to the captures the 36-site table was built from (`/home/yusiwen/minfer-36/captures/*.dead.json` on
+the maintainer's box), so the before column is that measurement rather than a restatement of it.
+
+| capture | before sites/items | after sites/items | item Δ | per-file site-count Δ |
+|---|---|---|---|---|
+| `cargo check --release` (CPU) | 60 / 46 | 60 / 46 | **0** | none |
+| `cargo check --release --features cuda` | **50 / 34** | **50 / 34** | **0** | none |
+| `cargo check --release --tests` | 22 / 15 | 22 / 15 | **0** | none |
+| `cargo check --release --tests --features cuda` | 22 / 15 | 22 / 15 | **0** | none |
+
+**Every diagnostic is unchanged, not only every `dead_code` one.** The complete JSON diagnostic
+multiset (level, code, message) is *equal* before and after in all four configurations: 32 `cpu` (all
+`dead_code`), 17 `cuda`, 73 `tests_cpu` (61 warnings + 12 `dead_code`) and 86 `tests_cuda` (74 + 12).
+The stripped-annotation population falls **61 → 43** (36 bare + 25 `cfg_attr` → 11 bare + 32
+`cfg_attr`).
+
+**A — the 18 deletions.** Each `allow` was redundant: the item is live in every configuration that
+compiles it.
+
+| site on `f47e4c3` | item | the live reader |
+|---|---|---|
+| `src/cuda.rs:551,553,555,557,559` | `minfer_launch_fail_{pending,site,name,code,clear}` | via `CudaState::take_launch_failure` → `graph/cuda_backend.rs:2137` `execute_node` (production, cuda) |
+| `src/cuda.rs:3329` | `CudaState::take_launch_failure` | the same `execute_node` read; the #162 gates (`src/cuda/issue162_tests.rs:954…`) are the other callers |
+| `src/cuda.rs:1346` | `test_call_failure_requested` | production `graph_end_capture_to_exec` (`src/cuda.rs:3403`, the `destroy:graph_destroy` injection) |
+| `src/cuda.rs:2965` | `CudaState::get_or_grow` | ~24 non-test `impl CudaState` call sites (MMQ / attention / f16 scratch), e.g. `matmul_f32_ptr_layout` ← `cuda_backend.rs:1205/1346/1440` |
+| `src/graph/alloc.rs:321` | `GraphAllocator::enable_cuda` | `graph/json.rs:94`, `models/qwen2/graph.rs:614`, `models/qwen3/graph.rs:534`, and the `cuda_backend::entry` `enable` hook (`:2034`) |
+| `src/graph/alloc.rs:351` | `GraphAllocator::cuda` | the registry hooks `pool`/`host_read` (`cuda_backend.rs:2011/2017`) |
+| `src/graph/backend.rs:139` | `Backend::synchronize` | `GraphAllocator::sync_backend` (`alloc.rs:2356`) ← `scheduler.rs:221/417` |
+| `src/graph/copystats.rs:63` | the `impl CrossCopyStats` blanket | the `impl` is **empty** in every non-test build (`delta` has carried `#[cfg(test)]` since [#238]) |
+| `src/graph/kvcache.rs:62` | `KvLayer::owner` | C2's resolver, and C1's own `release_seq` (`kvcache.rs:363`) ← `alloc.rs:1623` |
+| `src/graph/kvcache.rs:66` | `KvLayer::n_used` | C2's `after_rm` / `kv_rm` (`kv_rm` ← `conversation.rs:189/258`) |
+| `src/graph/kvcache.rs:281` | `KvCache::iter` | `alloc.rs`'s `kv_rm` (`:1121`) and `kv_save_with_host` |
+| `src/gguf.rs:1681` | `MmapFile::_file` | **attribute line only** — the field stays; rustc ignores `_`-prefixed fields, so the `allow` silenced nothing |
+| `src/models/qwen2/mod.rs:48` | `Qwen2Model::n_layer` | the concrete `&Qwen2Model` caller at `models/qwen2/graph.rs:714` |
+| `src/download/mod.rs:295` | `HfSibling::size` | `download/mod.rs:274` `.and_then(\|s\| s.size)` (the `l.size` at `:365` is `OllamaLayer::size` — a name collision, not this field) |
+
+Eight of the 18 are live **only under `--features cuda`** (`enable_cuda`, `cuda`, the five launch-fail
+FFI decls and `take_launch_failure`), which is why the CUDA capture and the CUDA warning-free build
+are load-bearing here: deleting them without the CUDA check would leave the CPU CI green while the
+CUDA `deny(warnings)` build broke — the trap this series exists to close.
+
+**B — the 7 tightenings, with the split that justifies the cfg.** All seven items behave identically:
+dead in both non-test configurations, alive in both test configurations, so `not(test)` is exact and
+any other cfg (`not(feature = "cuda")`) or a bare `allow` would be wrong.
+
+| item | cpu (non-test) | cuda (non-test) | tests-cpu | tests-cuda | constructed in test code by |
+|---|---|---|---|---|---|
+| `DType::F16` (`graph/mod.rs`) | dead | dead | alive | alive | `graph/tests.rs` (`:102`, `:120`) |
+| `DType::Q8_0` (`graph/mod.rs`) | dead | dead | alive | alive | `graph/tests.rs` (`:104`, `:122`) |
+| `Op::Scale` (`graph/ops.rs`) | dead | dead | alive | alive | `op_matrix.rs` (`:262`, `:555`, `:677`), `optiming/tests.rs` |
+| `Op::Softmax` (`graph/ops.rs`) | dead | dead | alive | alive | `op_matrix.rs` (`:573`, `:679`), `builder.rs`'s `#[cfg(test)] fn softmax` |
+| `Op::Reshape` (`graph/ops.rs`) | dead | dead | alive | alive | `op_matrix.rs` (`:416`, `:625`, `:701`, `:886`) |
+| `Op::Permute` (`graph/ops.rs`) | dead | dead | alive | alive | `op_matrix.rs` (`:432`, `:633`, `:704`, `:895`) |
+| `Op::BatchMatMul` (`graph/ops.rs`) | dead | dead | alive | alive | `op_matrix.rs` (`:706`, `:937`) |
+
+Each keeps the note naming what would construct it in production (a kernel taking an f16 activation,
+an IR node exposing the quantized buffer, a builder scaling in place, …); the `not(test)` cfg is the
+part that says *when* it is unused. The mutation direction that matters was checked: a wrong cfg is
+exactly what this split would expose, and the stripped after-captures keep all seven out of both test
+builds and in both non-test ones.
+
+**The `copystats` coupling, stated because the deletion is only conditionally safe.** The blanket was
+on `impl CrossCopyStats`, whose one member (`delta`) already carries `#[cfg(test)]` ([#238]), so the
+`impl` is empty in the shippable build and an empty inherent impl draws no diagnostic. Deleting the
+blanket is therefore safe *only while `delta` keeps its `#[cfg(test)]`*: if someone un-gates `delta`,
+the non-test build must fail — which is the correct outcome, and the reason the blanket is deleted
+rather than narrowed (the member-level gate is already the precise spelling).
+
+**The `gguf` attribute-only note.** `src/gguf.rs` `MmapFile::_file` is the one site where "delete the
+annotation" means the **attribute line only**: `_file` is the RAII handle that keeps the fd alive for
+the mapping's lifetime and must stay. rustc ignores `_`-prefixed fields for `dead_code`, so the
+attribute silenced nothing — the stripped capture reports no `gguf.rs` diagnostic at all, which is
+the baseline's confirmation rather than a reasoning claim.
+
+**Warning table — the un-stripped twin.** The same four commands on both trees, each analysed from
+its own `--message-format=json` capture, with `RUSTFLAGS=--cap-lints=warn` so the crate's
+`cfg_attr(not(test), deny(warnings))` cannot truncate the pass. Counting rustc `compiler-message`
+diagnostics (so a build script's `cargo:warning=` is not mixed in with them):
+
+| command | `f47e4c3` diagnostics (`dead_code` / other) | `8c3f74b` | multiset |
+|---|---|---|---|
+| `cargo check --release` | 0 (0 / 0) | **0 (0 / 0)** | equal (empty) |
+| `cargo check --release --features cuda` | 0 (0 / 0) | **0 (0 / 0)** | equal (empty); the run's one `warning:` line is `build.rs`'s pre-existing `cargo:warning=` target list, the same line [#243] recorded |
+| `cargo check --release --tests` | 68 (7 / 61) | **68 (7 / 61)** | equal |
+| `cargo check --release --tests --features cuda` | 79 (5 / 74) | **79 (5 / 74)** | equal |
+
+Both production configurations are warning-free — no rustc diagnostic of any kind. The two `--tests`
+configurations are **not** warning-free on `f47e4c3` either: 61/74 of their diagnostics are the
+test-code `unused import` / `unused variable` set and 7/5 more are `dead_code` on test helpers, the
+"separate, tracked cleanup" Core Convention 5 explicitly scopes out of the non-test gate. These
+counts differ from the stripped capture's 73/86 above only because stripping the annotations exposes
+5/7 more dead items; the shared 61/74 non-`dead_code` warnings are the same set in both. (An
+un-stripped `--tests --features cuda` cargo run therefore prints 81 `warning:` lines: 79 diagnostics
+plus cargo's `generated 79 warnings` summary; `--tests` prints 69 = 68 + 1.) The acceptance property
+this ticket can honestly claim is therefore **"no new warning and no new `dead_code` in any of the
+four configurations"**, which the multiset equality above proves directly; "the test build is
+warning-free" is not a property master has, and this record does not claim it.
+
+**Counts (rule 5), box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-02.**
+`cargo test --release` → **480 / 0 / 36** unit + **10 / 0 / 6** integration.
+`bash scripts/cuda_test.sh` → **565 / 0 / 42**. No `#[test]` was added, removed or weakened, so no
+count row moves and `docs/status.toml` / the `AGENTS.md` rows — including
+`projection_base_passed` — are untouched. `cargo fmt --all --check` clean; `check_status.py
+--check`, `check_docs_links.py` and `check_source_layout.py` clean.
+
+**Bar named before measuring.** No `#[test]` is added, removed or weakened and the diff is 25
+attribute lines plus 4 comments, so the bar is: *the stripped-oracle `(file, name, kind)` item set
+and the per-file site-count histogram are unchanged in all four configurations, and the un-stripped
+warning multiset is unchanged in all four* — stated before the after-captures and the twin builds
+were run, and measured by the two tables above.
+
+**Mutation evidence takes the annotation-shape form here.** There is no behavioural gate to mutate:
+an attribute-only diff has no observable effect, and the falsifiable claims are (a) deleting a
+redundant `allow` changes no diagnostic once *all* annotations are stripped, and (b) tightening keeps
+the item dead in exactly the configuration the `cfg_attr` names. Claim (a) is measured by the
+before/after oracle identity (0 item Δ, 0 per-file site Δ, equal diagnostic multisets); claim (b) is
+mutation-checkable in the direction that matters and was checked — the after-captures' per-item split
+is dead/dead/alive/alive for all 7, which a wrong cfg (e.g. `not(feature = "cuda")`, or a bare
+`allow`) would have broken.
+
+**Limits.** (1) macOS is not compiled here: `src/metal.rs`'s two sites are [#255]'s, the macOS half of
+`graph/metal_backend.rs` and the macOS branches of the loaders are invisible to all four captures,
+and this ticket touches none of them. (2) `--features debug_dump` was not built; no #256 site lives
+in `src/dump.rs`. (3) The oracle is a `cargo check`: "live" is a compile-time reference, not runtime
+reachability — `Qwen2Model::n_layer` is live precisely because a `MINFER_GRAPH_DUMP` branch
+references it, which is the right rule for a warning-free build and not a statement about hot paths.
+(4) `cuda_static` was not built (it changes linking only). (5) The cross-platform gate is CI's
+`build-macos` plus the three build jobs; the local aarch64 runs above are this box's.
+
+[#138]: https://github.com/yusiwen/minfer/issues/138
+[#209]: https://github.com/yusiwen/minfer/issues/209
+[#238]: https://github.com/yusiwen/minfer/issues/238
+[#243]: https://github.com/yusiwen/minfer/issues/243
+[#254]: https://github.com/yusiwen/minfer/issues/254
+[#255]: https://github.com/yusiwen/minfer/issues/255
+[#256]: https://github.com/yusiwen/minfer/issues/256
+[PR #257]: https://github.com/yusiwen/minfer/pull/257
+
+
 ## 8. Note — the dead identity fields (A7 rationale)
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
