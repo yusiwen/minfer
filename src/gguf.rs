@@ -1678,7 +1678,6 @@ impl GgufContext {
 pub struct MmapFile {
     ptr: *mut u8,
     len: usize,
-    #[allow(dead_code)]
     _file: std::fs::File, // keeps the fd alive for the mapping's lifetime
 }
 

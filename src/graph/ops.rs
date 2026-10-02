@@ -54,7 +54,7 @@ pub enum Op {
     /// builder that scales an activation in place instead of folding the scale
     /// into the producing op (llama.cpp's `ggml_scale`), for a temperature/1.0
     /// style rescaled graph.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     Scale(f32),
     Silu,
 
@@ -63,7 +63,7 @@ pub enum Op {
     /// softmax internally, so no standalone softmax node is emitted. What would
     /// construct it: an attention or sampling graph that exposes the normalized
     /// probabilities as a node output instead of fusing them into the kernel.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     Softmax {
         dim: usize,
     },
@@ -129,18 +129,18 @@ pub enum Op {
     /// keeps them and reports the membership question.
     ///
     /// [#244]: https://github.com/yusiwen/minfer/issues/244
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     Reshape {
         shape: [usize; 4],
     },
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     Permute {
         dims: [usize; 4],
     },
 
     // ---- fused ops (fusion pass output, gated by backend supports_fused) ----
     SwiGLU,
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     BatchMatMul,
     /// decode (nt==1) fused QKV: one concat matmul (wq/wk/wv) + bias+rope+store
     /// in one kernel pass (llama `attn_bias_rope_store`). Carries the layer so

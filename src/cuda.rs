@@ -548,15 +548,10 @@ extern "C" {
     // so one Rust-side check covers every launcher. `minfer_launch_ok_opt` (a
     // documented fallback) never sets it. The history records every named launch
     // failure so the #162 gate can see more than one site per call.
-    #[allow(dead_code)]
     fn minfer_launch_fail_pending() -> i32;
-    #[allow(dead_code)]
     fn minfer_launch_fail_site() -> *const std::os::raw::c_char;
-    #[allow(dead_code)]
     fn minfer_launch_fail_name() -> *const std::os::raw::c_char;
-    #[allow(dead_code)]
     fn minfer_launch_fail_code() -> i32;
-    #[allow(dead_code)]
     fn minfer_launch_fail_clear();
     // 8p: fused dequant-in-GEMM — B tiles dequantize raw quantized bytes
     // in-register (no f16 weight scratch round trip). type_id mapping as in
@@ -1341,9 +1336,10 @@ pub fn graph_destroy_failure_message(err: i32) -> String {
 ///
 /// #171 absorbed the matcher into `crate::testfail::injection_names_site` — one
 /// matcher for the Rust chokepoints and the device-side `launch:*`/`attr:*`
-/// sites, with its exact-token tests in `src/testfail.rs` — so this is now a
-/// thin alias that keeps the #147 device gates' call site unchanged.
-#[allow(dead_code)] // read by the #147 device gates
+/// sites, with its exact-token tests in `src/testfail.rs` — so this is a thin
+/// alias. Its direct reader is production `graph_end_capture_to_exec` (the
+/// `destroy:graph_destroy` injection); the #147 device gates are other call
+/// sites, not the only ones.
 fn test_call_failure_requested(site: &str) -> bool {
     crate::testfail::requested(site)
 }
@@ -2962,7 +2958,10 @@ impl CudaState {
 
     // ─── Persistent buffer management ─────────────────────────
 
-    #[allow(dead_code)] // legacy surface (7e⑦)
+    /// The live persistent-scratch allocator: every `buf_*`/staging slot the
+    /// MMQ, attention and f16 paths use is grown here, per stream (#188), so no
+    /// `cudaMalloc` lands mid-capture. (This replaces a stale "legacy surface
+    /// (7e⑦)" note.)
     fn get_or_grow(slot: &StreamScratch, need: usize) -> *mut std::ffi::c_void {
         // Issue #188: the slot is private to the **current stream**, so two
         // engines' concurrent launches never read each other's staging.
@@ -3326,7 +3325,6 @@ impl CudaState {
     ///
     /// Draining (rather than peeking) is what keeps a stale record from poisoning
     /// the *next* node: `execute_node` drains it on both the `Ok` and `Err` arms.
-    #[allow(dead_code)] // read by the backend's execute_node and the #162 gates
     pub fn take_launch_failure(&self) -> Option<String> {
         if unsafe { minfer_launch_fail_pending() } == 0 {
             return None;

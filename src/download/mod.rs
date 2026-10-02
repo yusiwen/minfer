@@ -292,7 +292,6 @@ fn download_hf(repo: &str, cache_dir: &Path) -> Result<PathBuf, String> {
 #[derive(serde::Deserialize)]
 struct HfSibling {
     rfilename: String,
-    #[allow(dead_code)]
     size: Option<u64>,
 }
 
