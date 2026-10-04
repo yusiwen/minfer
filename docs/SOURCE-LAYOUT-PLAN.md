@@ -17,8 +17,8 @@
 
 | step | ticket | state |
 |---|---|---|
-| −1 #138 + #225 | #138, #225 | **in flight** (2026-10-04): #225's PR #268 at 6/7 green (`build-linux-cuda` running); #138's worktree `feat/138-defer-cross-wait` created |
-| 0 plan document + conventions | this file | **prepared**: 14 edit blocks in a guarded apply script (every anchor present exactly once), pre-flight `check_docs_links` 989/189 green, mutation evidence captured; lands after #225 merges |
+| −1 #138 + #225 | #138, #225 | **#225 landed** `5386a1c` (PR #268, 7/7 green; the cold first-run row is in §2.4); **#138 in flight** on `feat/138-defer-cross-wait` |
+| 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
 | 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | blocked on Step −1; blueprint ready (all 126 `impl CudaState` fns mapped to their target file) |
 | 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | not started |
 | 3 CPU files | #264 | not started |
@@ -129,7 +129,8 @@ Two honest wrinkles:
   [#219](https://github.com/yusiwen/minfer/issues/219) (it already owns two of them):
   `AGENTS.md:3` `~4400 LOC` (production code is 55,529 lines),
   `inference_e2e_walkthrough/15-cuda-backend.md:4/29/36` line counts,
-  `CUDA-BACKEND-DESIGN.md:1175/1184/1218` `120 sites / 120 / 120` (today 130),
+  `CUDA-BACKEND-DESIGN.md` §"the gates" — `120 sites / 120 / 120` (the count at that revision;
+  130 on `6b6d94f`),
   `cuda.rs:3471`'s banner naming the deleted `CudaCommandBuffer`. If #219 is not widened, they become
   ticket 7 in §7.4.
 - Add the interface-eligibility rule (§1.3) and the layer definition (§2) to `docs/ARCHITECTURE.md`.
@@ -152,7 +153,9 @@ Two honest wrinkles:
 - `src/cuda/policy.rs` — `mmq_gate_on`, `mmq_enabled`, `mmq_active`, `mmq_a_fuse_mode`, the `no_*`
   knobs, `fused_b_on`, `no_w16cache`, `no_prefill_gemm`, `no_fa_prefill`, `plane_budget_ok`,
   `gemm_prewarm_disabled` as pure predicates with unit tests (no device).
-- Acceptance: CUDA unit **565 / 0 / 42**; CPU **480 / 0 / 36** + integration **10 / 0 / 6**;
+- Acceptance: CUDA unit **567 / 0 / 42**; CPU **481 / 0 / 36** on `dgxspark (aarch64, GB10 sm_121)`
+  (**479** on the CI runner) + integration **10 / 0 / 6** — the rows [#138](https://github.com/yusiwen/minfer/issues/138)
+  moved when it landed (565 → 567, 480 → 481 / 478 → 479);
   `cargo fmt --all --check`; `check_source_layout.py`; `check_dead_code_annotations.py` (its two
   `src/cuda.rs:` keys still valid **because the file keeps its name**); `check_dead_code_oracle.py
   --config {cpu,cuda}` unchanged; real-model gates `FEATURES=cuda scripts/real_model_gates.sh` **42 / 0 ×2**.
@@ -316,7 +319,7 @@ route (a) and is also llama.cpp's CUDA shape. The evidence base for the split's 
 - **the CUDA build is not bit-reproducible today** (two identical serial runs differ by 16 bytes in
   the `.text` of two cubins) — so the split's evidence is runtime gates, not binary identity;
 - the recorded per-module fatbin load is **~2.2 ms, set-size independent**
-  (`docs/CUDA-BACKEND-DESIGN.md:362-365`), so ten modules are extrapolated at ~13–22 ms one-time —
+  (`docs/CUDA-BACKEND-DESIGN.md` §2.4's cost table), so ten modules are extrapolated at ~13–22 ms one-time —
   **unverified**, and to be measured in Step 2's first increment.
 
 ## 6. Documentation plan
@@ -325,8 +328,8 @@ route (a) and is also llama.cpp's CUDA shape. The evidence base for the split's 
 
 | measure | count |
 |---|---|
-| documents that mention one of the four paths (`src/cuda.rs`, `src/cuda_kernels.cu`, `src/metal.rs`, `src/metal.metal`) | **126** (869 mentions) |
-| documents carrying a line anchor **into** one of them (`…:NNN`) | **35** (401 anchors: cuda side 269, metal side 132) |
+| documents that mention one of the four paths (`src/cuda.rs`, `src/cuda_kernels.cu`, `src/metal.rs`, `src/metal.metal`), measured on `6b6d94f` — the campaign's own documents (this plan, `AGENTS.md`, `ARCHITECTURE.md`, `BACKENDS.md`) have since added mentions | **126** (869 mentions) |
+| documents carrying a line anchor **into** one of them (`…:NNN`), measured on `6b6d94f` | **35** (401 anchors: cuda side 269, metal side 132) |
 | the anchor hot spots | `docs/cuda_tutorial/*` 180 (6 files), `docs/LLAMA_METAL_E2E.md` 50, `docs/inference_e2e_walkthrough/14-metal-backend.md` 35, `docs/LLAMA-CPP-MMQ-ANALYSIS.md` 18, `docs/METAL-OBJC2-MIGRATION-PLAN.md` 15, `docs/inference_e2e_walkthrough/15-cuda-backend.md` 10, `docs/metal-inference-analysis.md` 10, `docs/ARCHITECTURE-EXECUTION-PLAN.md` 11 |
 | documents that describe the **layout** and need rewriting, not sweeping | 18 (listed in §6.3) |
 | machine-checked today | `check_docs_links.py` (relative link targets only — it **cannot** see `path:NNN`), `check_status.py --check` (AGENTS.md prose ↔ `docs/status.toml`), `build_book.sh` (mdBook chapters from `docs/SUMMARY.md`) |
@@ -574,6 +577,12 @@ plus the **new-file guard** that a file in `kernels/` cannot silently be absent 
 | 5 close | #225's table re-measured; #53's `DeviceMemory` for Metal | one interface, two implementations |
 | 6 tests | the step-appropriate suite (CUDA 565/0/42 for the executor tests, CPU 480/0/36 + 10/0/6) + `check_source_layout.py` | counts **identical**; every new test file named by a `mod` |
 | all | `scripts/check_docs_links.py`, `scripts/check_status.py --check`, `scripts/build_book.sh`, `scripts/check_doc_line_anchors.py` (once ticket 6 lands) | green; no stale anchor |
+
+**Suite counts are read, not remembered.** The numbers in the table above are the pre-#138 rows; the
+current rows are `docs/status.toml` (after #138: CUDA **567 / 0 / 42**, CPU **481 / 0 / 36** on
+`dgxspark (aarch64, GB10 sm_121)` and **479** on the CI runner, integration **10 / 0 / 6**). Every step
+must read the rows from that file rather than quote this document, and a step that moves a row updates
+`AGENTS.md` and `docs/status.toml` in its own PR.
 
 Standing rule for every step: a layout PR moves code and nothing else; anything else it notices is
 filed, not fixed inside it.
