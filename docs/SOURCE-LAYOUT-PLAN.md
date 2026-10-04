@@ -24,7 +24,7 @@
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
-| 6 long test files | #267 | **file 1 landed** (PR #275): `src/graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests, identical counts); 8 files left |
+| 6 long test files | #267 | **files 1–2 landed** (PRs #275, #277): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21 tests); 7 files left |
 
 Each step appends its dated record here when it lands (gates run, counts, box label).
 

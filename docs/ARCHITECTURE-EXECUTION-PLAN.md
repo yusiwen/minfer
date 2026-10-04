@@ -9506,3 +9506,46 @@ tests, 2 ignored — are unchanged, and `docs/status.toml` is not edited: the su
 `src/graph/alloc/tests.rs` (1,833), `src/tooling/tests.rs` (1,669), `src/sampler/tests.rs` (1,232),
 `src/conversation/tests.rs` (1,156), `src/graph/kvcache/tests.rs` (1,134), and
 `src/cuda/issue162_tests.rs` (1,186) last, after #263 changes its launch-fixture column assertion.
+
+#### Test-infrastructure record (#267 step 6, file 2, 2026-10-04) — `models/qwen2/graph/tests.rs` becomes a parent plus five topic files
+
+**What landed.** `src/models/qwen2/graph/tests.rs` (3,399 lines, **21 `#[test]` — 7 of them
+`#[ignore]`d** device/real-model gates — plus 6 top-level helpers) is split by topic into
+`src/models/qwen2/graph/tests/{cuda_kv,offload_copy,kv_reuse,batching,real_model}.rs`, each named by a
+`mod` declaration in the now-111-line parent (PR
+[#277](https://github.com/yusiwen/minfer/pull/277), part of [#267](https://github.com/yusiwen/minfer/issues/267)).
+A pure move: every top-level `fn`/`const` item is byte-identical apart from rustfmt and the 21 test names
+are the same set. The topics are `cuda_kv` (4: the packed cache, two engines with different KV layouts,
+the concurrent bitwise gate, a session resumed from disk), `offload_copy` (3: E5 partial/auto offload and
+the F5 async cross copies), `kv_reuse` (4: cache/prefix reuse, compaction, physical `kv_rm`/`kv_shift`),
+`batching` (6: batch composition, offset sensitivity, sequence-count independence) and `real_model` (4:
+logits parity + the Metal gates). The 6 shared fixtures (`cached_model_path`, `max_delta`,
+`cross_shape_tolerance`, `assert_across_shapes`, `argmax`, `compare`) stay in the parent.
+`src/models/qwen2/graph.rs` keeps its `#[cfg(test)] mod tests;` untouched.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the worktree:
+
+| Command | Result |
+|---|---|
+| `scripts/cuda_test.sh` | **567 / 0 / 42** |
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration |
+| `python3 scripts/check_source_layout.py` | `src obeys the layout rules`, exit 0 |
+| `python3 scripts/check_doc_line_anchors.py` | exit 0 (the walkthrough anchor was `OUT-OF-RANGE` before the re-point) |
+| `cargo fmt --all --check` | clean |
+| CI on PR [#277](https://github.com/yusiwen/minfer/pull/277) | **7 / 7 green** |
+
+**Mutation evidence (rule 3).** `mod batching;` → `// mod batching;`: the layout checker exits **1** with
+`src/models/qwen2/graph/tests/batching.rs: not reachable from src/main.rs …`, and the CPU unit row drops
+**481 → 475** (the six `batching` tests), 36 ignored unchanged. Reverted.
+
+**Docs swept.** The live `models::qwen2::graph::tests::<leaf>` prose gains its topic segment in
+`AGENTS.md`, `docs/CUDA-BACKEND-DESIGN.md`, and the `#238`/`#244` annotations in
+`src/graph/cuda_backend.rs`, `src/graph/alloc.rs` and `src/models/mod.rs`; the walkthrough anchor in
+`docs/inference_e2e_walkthrough/13-decode-loop-graph-reuse.md` now names
+`forward_cached_isolates_kv_between_caches` at `models/qwen2/graph/tests/batching.rs:742`. The
+`ARCHITECTURE-EXECUTION-PLAN.md` records themselves are frozen and keep their pre-split anchors.
+
+**Deliberately out of scope.** The remaining six files of #267: `src/server/batch/tests.rs` (2,629),
+`src/graph/alloc/tests.rs` (1,833), `src/tooling/tests.rs` (1,669), `src/sampler/tests.rs` (1,232),
+`src/conversation/tests.rs` (1,156), `src/graph/kvcache/tests.rs` (1,134), and
+`src/cuda/issue162_tests.rs` (1,186) last, after #263.
