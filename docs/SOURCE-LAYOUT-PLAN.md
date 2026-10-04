@@ -20,7 +20,7 @@
 | −1 #138 + #225 | #138, #225 | **#225 landed** `5386a1c` (PR #268, 7/7 green; the cold first-run row is in §2.4); **#138 in flight** on `feat/138-defer-cross-wait` |
 | 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
 | 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 594 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
-| 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5, G6): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` + 18 TUs; audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2 |
+| 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5, G6): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` (1 header) + 17 TUs; audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2 |
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
@@ -181,7 +181,7 @@ Two honest wrinkles:
   `/home/yusiwen/minfer-split/step1/line-map.tsv`, and the anchors whose old line was only a locator
   were re-anchored to the symbol).
 
-### Step 2 — `src/cuda_kernels.cu` → `src/cuda/kernels/` (landed: 1 header + 18 TUs)
+### Step 2 — `src/cuda_kernels.cu` → `src/cuda/kernels/` (landed: 1 header + 17 TUs)
 
 Route (a): launchers move with the kernels they launch (llama.cpp's CUDA shape). **Two of the 77
 launchers are the exception** (blueprint: `/home/yusiwen/minfer-split/step2/README.md` §2) — they
@@ -298,10 +298,25 @@ Three measured corrections to the tables above, applied as the stages land:
 
 ### Step 3 — CPU files
 
-In-place split along the ISA axis that is already there (`src/quants.rs:479 mod neon_kernels`,
-`:966 mod neon_q8k`, `src/vec_ops.rs:923 mod neon_f16`, `:1169 mod neon_vec`, plus the inline
-`#[cfg(target_arch = "x86_64")] *_avx2` bodies). No path changes. Acceptance: CPU **480 / 0 / 36** +
-**10 / 0 / 6**, and the dead-code `(name, kind)` set identical on `aarch64` and `x86_64`.
+In-place split along the ISA axis that is already there (`src/quants.rs` `mod neon_kernels` /
+`mod neon_q8k`, `src/vec_ops.rs` `mod neon_f16` / `mod neon_vec`, plus the inline
+`#[cfg(target_arch = "x86_64")] *_avx2` bodies). No path changes: the three file names stay the module
+deciders. Three stages, one PR each, `quants` → `vec_ops` → `kernel`:
+
+- **3A `src/quants.rs`** — `dot_q4_0` / `dot_q4_1` / `dot_q5` / `dot_q8_0` / `kquant` /
+  `quantize_q8_0` / `quantize_q8_k` / `avx2` / `neon` (the two inline NEON modules, flattened into the
+  one file), and the inline `#[cfg(all(test, target_arch = "aarch64"))] mod neon_correctness` promoted
+  to `src/quants/neon_correctness.rs` — which is also the extraction that lets
+  `scripts/check_source_layout.py`'s first rule be widened to read the cfg *predicate* instead of the
+  literal `#[cfg(test)]` ([#274](https://github.com/yusiwen/minfer/issues/274)).
+- **3B `src/vec_ops.rs`** — `vec` / `rms_norm` / `rope` / `softmax` / `silu` / `f16` (with the inline
+  `mod neon_f16`) / `bf16` / `neon` (the promoted `mod neon_vec`).
+- **3C `src/kernel.rs`** — `dispatch` / `pool` / `embed`.
+
+Acceptance for each stage: CPU **481 / 0 / 36** + **10 / 0 / 6** (read from `docs/status.toml`; the
+plan's older text said 480, which predates [#138](https://github.com/yusiwen/minfer/issues/138)'s two
+tests), the dead-code `(name, kind)` set identical on `aarch64` and `x86_64`, and
+`check_source_layout.py` / `check_dead_code_annotations.py` / `cargo fmt --all --check` green.
 
 ### Step 4 — Metal (Mac round, after [#255](https://github.com/yusiwen/minfer/issues/255))
 
@@ -605,11 +620,12 @@ src/
 │   └── tests.rs                            (exists)
 ├── quants.rs                        [S3]  module quants: `pub use`
 ├── quants/
-│   ├── dot_q4_0.rs · dot_q4_1.rs · dot_q5.rs · dot_q8_0.rs    [S3]
-│   ├── kquant.rs                    [S3]  Q4_K/Q5_K/Q6_K dots + Q8_K activation quantization
-│   ├── quantize_q8_0.rs · quantize_q8_k.rs                    [S3]
-│   ├── neon.rs                      [S3]  was `mod neon_kernels` / `mod neon_q8k`
-│   ├── avx2.rs                      [S3]  was the inline `*_avx2` bodies
+│   ├── dot_q4_0.rs · dot_q4_1.rs · dot_q5.rs · dot_q8_0.rs    [S3A]
+│   ├── kquant.rs                    [S3]  Q4_K/Q5_K/Q6_K dots
+│   ├── quantize_q8_0.rs · quantize_q8_k.rs                    [S3A]
+│   ├── neon.rs                      [S3A] was `mod neon_kernels` / `mod neon_q8k`, flattened
+│   ├── avx2.rs                      [S3A] was the inline `*_avx2` bodies
+│   ├── neon_correctness.rs          [S3A] was the inline `#[cfg(all(test, aarch64))] mod
 │   └── tests.rs                            (exists)
 ├── vec_ops.rs                       [S3]  module vec_ops: `pub use`
 ├── vec_ops/
@@ -654,7 +670,7 @@ columns**),
 | 0 docs | `scripts/check_docs_links.py`, `scripts/check_status.py --check`, `scripts/build_book.sh` | green |
 | 1 `cuda.rs` | `cargo build --release --features cuda`, `scripts/cuda_test.sh`, `cargo test --release`, `cargo fmt --all --check`, `check_source_layout.py`, `check_dead_code_{annotations,oracle}.py`, `FEATURES=cuda scripts/real_model_gates.sh` ×2 | 565/0/42; 480/0/36 + 10/0/6; 42/0 ×2; all checkers green |
 | 2 `.cu` | Step 1's list plus `check_cuda_launch_returns.py` (+`--selftest`, `--check-fixture`), `MINFER_TEST_ISSUE162=1` device gate, `MINFER_OP_TIMING=1` cold-start record | 130 sites; 42/0 ×2 bitwise; module-load cost recorded |
-| 3 CPU | CPU suites + the two-arch dead-code set comparison | 480/0/36, 10/0/6, sets identical |
+| 3 CPU | CPU suites (`cargo test --release`, plus `MINFER_NO_NEON=1`) + the two-arch dead-code set comparison | 481/0/36, 10/0/6, sets identical |
 | 4 Metal | on a Mac: `cargo build --release` (non-empty metallib), real-model gates, #255's two judgments | recorded on the Mac box |
 | 5 close | #225's table re-measured; #53's `DeviceMemory` for Metal | one interface, two implementations |
 | 6 tests | the step-appropriate suite (CUDA 565/0/42 for the executor tests, CPU 480/0/36 + 10/0/6) + `check_source_layout.py` | counts **identical**; every new test file named by a `mod` |

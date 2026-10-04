@@ -43,9 +43,9 @@
 | `graph/` | **Compute graph core** — IR, builder, scheduler, backends, reuse cache (see §4 table) |
 | `gguf.rs` | GGUF v3 parser (metadata KV + tensor table + data blob), multi-part (split) support, `ggml_pad` alignment |
 | `block.rs` | 20+ quantized block types as `repr(C)` structs + fp16 conversions, matching `ggml-common.h` |
-| `quants.rs` | AVX2+FMA dot-product kernels (Q4_0×Q8_0, Q8_0×Q8_0) + f32→Q8_0 quantization, scalar fallback |
-| `kernel.rs` | Quantized matmul dispatch (Q4_0/Q4_1/Q5_0/Q5_1/Q4_K/Q5_K/Q6_K/Q8_0) over activations, CPU scalar fallback, shared `embed_tokens` row getter |
-| `vec_ops.rs` | SIMD vector ops: RMSNorm, RoPE (Qwen2/Llama styles), softmax, SiLU, add/scale/mul |
+| `quants.rs` + `src/quants/*.rs` | AVX2+FMA / NEON+SDOT dot-product kernels (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/K-quants × Q8_0/Q8_K) + f32→Q8_0/Q8_K quantization, scalar fallback. The module file is the decider; the parts are `src/quants/{dot_q4_0,dot_q4_1,dot_q5,dot_q8_0,kquant,quantize_q8_0,quantize_q8_k,avx2,neon}.rs` ([#264](https://github.com/yusiwen/minfer/issues/264), [the source layout plan](./SOURCE-LAYOUT-PLAN.md)) |
+| `kernel.rs` + `src/kernel/*.rs` | Quantized matmul dispatch (Q4_0/Q4_1/Q5_0/Q5_1/Q4_K/Q5_K/Q6_K/Q8_0) over activations, CPU scalar fallback, the shared worker pool, and the shared `embed_tokens` row getter |
+| `vec_ops.rs` + `src/vec_ops/*.rs` | SIMD vector ops: RMSNorm, RoPE (Qwen2/Llama styles), softmax, SiLU, add/scale/mul, plus the f16/bf16 weight-row dots |
 | `tensor.rs` | 4D `Tensor` (type/shape/strides/`Vec<u8>` data), ggml-compatible strides & byte sizing |
 | `sampler.rs` | Repeat/frequency/presence penalties → top-k → top-p → temperature, seeded `StdRng` |
 | `tokenizer.rs` | Self-contained BPE tokenizer, loaded from GGUF metadata (no tiktoken) |
