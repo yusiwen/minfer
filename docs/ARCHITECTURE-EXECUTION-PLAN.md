@@ -9285,3 +9285,38 @@ thread '…cuda_map_window_costs_no_more_than_the_span_it_replaces' panicked: th
 The mutation is an env switch, so the unmutated run is the same binary with the variable unset — there is no source mutation to revert, and `git diff` on the tree carries only the #189 change.
 
 **Docs.** `docs/CUDA-BACKEND-DESIGN.md` gains §7.10 (the statistic, the bar, the value arm, the dated device tables); `AGENTS.md`'s CUDA counts bullet and `docs/status.toml` move 545 / 39 → 546 / 39 for the pure statistic test; the gate's doc comment (which claimed "It no longer needs an otherwise quiet box" — the claim #189 refutes) now states the sign test and the value arm.
+
+#### Test-infrastructure record (#261 step 0, 2026-10-04) — the source-layout plan and the four-layer convention
+
+**What landed.** A docs-only PR (`9174644`, [#269](https://github.com/yusiwen/minfer/pull/269)) that fixes
+the *shape* of the campaign splitting `src/cuda.rs`, `src/cuda_kernels.cu`, `src/metal.rs` and
+`src/metal.metal`: `docs/SOURCE-LAYOUT-PLAN.md` (new — the decision, the target tree, the per-backend file
+tables, the tooling changes, the documentation-anchor plan and the interaction table for the 18 affected
+open issues), its mdBook chapter, the four-layer convention in `AGENTS.md` (L1 runtime / L2 launch /
+L3 `<backend>/kernels/` / L4 executors; device-first, one polymorphic seam), the backend-layer section in
+`docs/ARCHITECTURE.md` — including the rule that a shared `common` needs two real implementations, of
+which `allocplan::DeviceMemory` is the only candidate today (second implementation: [#53](https://github.com/yusiwen/minfer/issues/53)) —
+and a `docs/BACKENDS.md` footnote. Four of the six stale claims folded into
+[#219](https://github.com/yusiwen/minfer/issues/219) are fixed here; `register_weight`'s prose and the
+`src/cuda.rs:3471` banner naming the deleted `CudaCommandBuffer` ride with step 1
+([#262](https://github.com/yusiwen/minfer/issues/262)), which is the step that moves that code.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the step's worktree:
+
+| Command | Result |
+|---|---|
+| `python3 scripts/check_docs_links.py .` | **989 relative links resolve in 189 markdown files**, exit 0 (base `5386a1c`: 985 / 188) |
+| `python3 scripts/check_status.py --check` | prose agrees with `docs/status.toml` (7 phases, 7 count rows: 1 live-checkable, 6 recorded measurements); exit 0 |
+| CI run 37197027339 | **7 / 7 green** (`check-docs`, `test-linux-cpu`, `build-linux-cuda`, `build-macos`, `check-viz`, `check-pr-body`, `lint-workflows`), zero code annotations — the single `build-macos` annotation is GitHub's runner-capacity notice |
+
+**Mutation evidence (rule 3).** Two mutations in the worktree, each reverted: a broken relative link at
+`docs/BACKENDS.md:18` (`./SOURCE-LAYOUT-PLAN-NOPE.md`) → `check_docs_links` prints
+`BROKEN LINK  docs/BACKENDS.md:18: ./SOURCE-LAYOUT-PLAN-NOPE.md` and
+`1 of 989 relative links do not resolve (in 189 markdown files)`, exit 1; a perturbed copy of the manifest
+(`passed = 478` → `479`, prose untouched) → `check_status` prints
+`AGENTS.md:92: cpu-unit (x86_64 (CI runner)) passed: prose says '478', docs/status.toml says '479'`, exit 1.
+
+**Deliberately out of scope.** No `src/` file changed. The plan document's pre-split line ranges are
+rewritten by the step that moves the code; its two `docs/CUDA-BACKEND-DESIGN.md` line citations were
+replaced by section references in the follow-up that carries this record, because step 0 itself shifted
+them — the same class of rot this campaign exists to remove.
