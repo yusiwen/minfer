@@ -7,6 +7,7 @@ fn the_two_phases_are_counted_separately_and_the_delta_is_exact() {
     let a = CrossCopyStats {
         copies: 3,
         waits: 3,
+        deferred_waits: 3,
         blocking_host_copies: 0,
         async_host_copies: 2,
         event_syncs: 2,
@@ -20,6 +21,7 @@ fn the_two_phases_are_counted_separately_and_the_delta_is_exact() {
     let b = CrossCopyStats {
         copies: 5,
         waits: 5,
+        deferred_waits: 4,
         blocking_host_copies: 1,
         async_host_copies: 4,
         event_syncs: 4,
@@ -30,6 +32,7 @@ fn the_two_phases_are_counted_separately_and_the_delta_is_exact() {
         CrossCopyStats {
             copies: 2,
             waits: 2,
+            deferred_waits: 1,
             blocking_host_copies: 1,
             async_host_copies: 2,
             event_syncs: 2,
