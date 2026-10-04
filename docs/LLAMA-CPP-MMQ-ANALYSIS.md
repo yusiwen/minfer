@@ -393,9 +393,9 @@ schedule requires a **separate fixup pass** (+34 μs) to reorder fp partial sums
 
 ## 9. Contrast with minfer's MMQ
 
-The campaign's kernel is `mmq_raw_wide_nt_kernel<KDR>` (cuda_kernels.cu:4451-4770):
+The campaign's kernel is `mmq_raw_wide_nt_kernel<KDR>` (mmq_raw.cu:222):
 block 128 od × 128 tokens, warp = 16 od-rows × full 128-token tile, 8 A-frags + 2 B-frags = 16
-chains, `sum[64]`. Its staging layout (cuda_kernels.cu:4459-4482):
+chains, `sum[64]`. Its staging layout (mmq_raw.cu:222):
 
 | operand | minfer wide (r22/r25 HEAD) | llama MMQ |
 |---|---|---|
@@ -551,19 +551,19 @@ better than the added instructions hurt. Per §10 this is the one untried lever 
 
 **The one hard constraint.** 2 blocks/SM on GB10 (48 SMs; shared/SM ≈ 99 KB usable, opt-in per-block
 ≈ 99 KB, §2) requires **per-block dynamic smem ≤ ~49.5 KB**. The current wide kernel at KD=8 is
-**98,304 B** (cuda_kernels.cu:4793) → hard-pinned 1 block/SM (2.00 warps/sched, r20). The B weight
+**98,304 B** (mmq_raw.cu:222) → hard-pinned 1 block/SM (2.00 warps/sched, r20). The B weight
 tile is the dominant term and the only one that shrinks by switching representation.
 
 ### 11.1 Tile geometry
 
 Block = **256 threads (8 warps)**, one block per (token-tile × od-tile). Smem byte formulas (KDR =
-chunks/super-block = 256/32 = 8 at KD=8; region map cuda_kernels.cu:4459-4482):
+chunks/super-block = 256/32 = 8 at KD=8; region map mmq_raw.cu:222):
 
 | region | per block | element | notes |
 |---|---|---|---|
 | QA8 (activation) | `KDR·T·32` | chunk q8 planes | r22 XOR swizzle, r20 split-phase staging |
 | SDA (act d/ssum) | `KDR·T·8` | uint2 (d f16 \| ssum i16) | token pair (t,t+8) per LDS.64 |
-| QB EXP (weight) | `8·O·48` | 1 byte/nibble, 48B slot | expanded-qb8 (current, cuda_kernels.cu:4573) |
+| QB EXP (weight) | `8·O·48` | 1 byte/nibble, 48B slot | expanded-qb8 (current, mmq_raw.cu:222) |
 | QB RAW (weight) | `O·128` qs plane (or `O·144` full super-block) | 2 nibbles/byte | raw-packed GGUF qs |
 | SDS (weight scale) | `KDR·O·8` | float2 (d·sc, −dmin·m) | r15 rank-1 rescale |
 
@@ -597,8 +597,8 @@ so the dominant A-re-read stream is untouched.
 ### 11.2 Warp shape & register budget
 
 Keep the per-warp structure (each warp owns a private 16-od-row slice and reads the full T-token
-tile, cuda_kernels.cu:4484-4490) now over T=64: 8 warps × 16 od-rows = 128 od. mma.m16n8k32 maps
-**m = token, n = od** (epilogue `C[i·od + j]`, cuda_kernels.cu:4764-4767). Using the audit C-lane map
+tile, mmq_raw.cu:222) now over T=64: 8 warps × 16 od-rows = 128 od. mma.m16n8k32 maps
+**m = token, n = od** (epilogue `C[i·od + j]`, mmq_raw.cu:222). Using the audit C-lane map
 `get_i(l) = (l/2)*8 + tid/4`, `get_j(l) = (tid%4)*2 + (l%2)` (mma.cuh:245,262) and
 `tile<16,8,int>::ne = I·J/32 = 4` (mma.cuh:226-227):
 
@@ -624,7 +624,7 @@ The single unmeasured decision in Direction A is how the B weight enters smem:
 
 **(Option 1) expanded-qb8 + ldmatrix (current).** Stage the raw weight, nibble-isolate at staging
 (`0x0F0F0F0F`, 1 byte/nibble), 48B slot-major, load B-frags with ONE `ldmatrix.x4`
-(cuda_kernels.cu:4569-4608, 4685-4698). **B smem = 8·O·48 = 49,152 B @ O=128 ⇒ 64×128 totals
+(mmq_raw.cu:222, 4685-4698). **B smem = 8·O·48 = 49,152 B @ O=128 ⇒ 64×128 totals
 77,824 B ⇒ 1 block/SM.** It does not reach 2 blocks at any geometry keeping O=128. **Rejected.**
 
 **(Option 2) raw-nibbles + in-loop expansion (chosen).** Stage the **raw GGUF qs plane, 2 nibbles/byte**
@@ -662,13 +662,13 @@ Raw-nibble semantics are **exactly** the r13-era two-term rescale (the parity-sa
 - The mma consumes the **unsigned 0..15 nibble** as the int8 B operand (upper nibble zero ⇒ positive
   int8), so the int accumulator holds `C_int = Σ_k nib(k)·act(k)`, nib ∈ **[0,15]**.
 - At accumulate (per chunk, fp32): `sum += da·dsv·C_int + dma·dmv` with `da = act d`,
-  `dsv = d·sc`, `dma = da·ssum`, `dmv = −dmin·m` (cuda_kernels.cu:4742-4752). This is the exact
+  `dsv = d·sc`, `dma = da·ssum`, `dmv = −dmin·m` (mmq_raw.cu:222). This is the exact
   `d·s·nib − dmin·m` dequant form. **There is no `(nib − m)` centering anywhere** — that fold is
   proven wrong for q4_K because the dmin offset is per-sub-block-scaled (`−dmin·m`, not a fixed
-  subtraction), which is the "82.896 diff mode" lesson. mma is `.s32.s8.s8.s32` (cuda_kernels.cu:4061);
+  subtraction), which is the "82.896 diff mode" lesson. mma is `.s32.s8.s8.s32` (mmq_raw.cu:222);
   the f32-accumulate spelling does not exist (r15).
 - **fp32 write-back epilogue** (adopt llama's): `sum[]` is already fp32 at the rescale, so the
-  epilogue is a plain per-value `C[i·od + j] = sum[...]` global store (cuda_kernels.cu:4758-4768) — no
+  epilogue is a plain per-value `C[i·od + j] = sum[...]` global store (mmq_raw.cu:222) — no
   fp16 anywhere in the mma→store path (llama's Q4_K `write_back` is likewise a plain fp32 store,
   mmq.cuh:519).
 
@@ -678,7 +678,7 @@ Raw-nibble semantics are **exactly** the r13-era two-term rescale (the parity-sa
 |---|---|---|---|
 | 1 | **Nibble-layout mistake** at in-loop unpack (wrong nibble=k, sign-extend the high 4 bits, double dmin) | the r13-era **82.896 max-diff** parity mode | `cuda_prefill_mmq` parity arm (§11.6) must run BEFORE the first perf run; a garbage-magnitude diff (like r14's uint4-tiling corrupting qb8) = layout bug; ~1e-6 diff = legit fp rounding. |
 | 2 | **Token identity** — any fp add reordering | greedy token identity diverges | the design does NOT reorder (same per-chunk mma + same two-term fp fold order); still gate on greedy-32 (r24 rung-3 convention). |
-| 3 | **Smem-cap overrun** (the r7-era silent-attr-failure regression, phantom 2124) | launcher quietly fallback/corrupts | launcher re-derives smem and **return 0** (→ narrow fallback, src/cuda/methods/init.rs:140-152) if over cap; `cudaFuncSetAttribute` result checked (cuda_kernels.cu:4787-4790, 4795-4798). KD=8 @ 45,056 B safe; KD=16 or O=256 would not be. |
+| 3 | **Smem-cap overrun** (the r7-era silent-attr-failure regression, phantom 2124) | launcher quietly fallback/corrupts | launcher re-derives smem and **return 0** (→ narrow fallback, src/cuda/methods/init.rs:140-152) if over cap; `cudaFuncSetAttribute` result checked (mmq_raw.cu:222, 4795-4798). KD=8 @ 45,056 B safe; KD=16 or O=256 would not be. |
 | 4 | **Register spill at KD=8** (in-loop B-expand temps + sum[32]) | ptxas → 255 regs + local spill (the r22 Lever-2 failure) | `-Xptxas -v` gate: expect ~110–130 regs, 0 spill; `REG > 160` → risk. |
 | 5 | **Occupancy gained but wall flat** (ncu ~4 warps/sched, duration unchanged) | falsifies the occupancy hypothesis | this is the designed kill criterion (§11.8), not a bug — it closes the line. |
 | 6 | **A-side re-staging for the smaller T** | more A per od-tile | A re-reads unchanged (od/O held at 128); only B re-reads grow (the designed sacrifice). |
@@ -805,7 +805,7 @@ Design invariant: **M never appears in the launch grid as a dimension that
 multiplies weight traffic** — it is either a register loop (MMVQ, ≤8) or a
 tiled dimension with partial-tile masking (MMQ, ≥9). minfer's legacy
 kernel violates it — `launch_q4_k_f32_matmul`
-(src/cuda_kernels.cu:3515–3522): `dim3 grid((od + NR0*NSG - 1)/(NR0*NSG),
+(src/cuda/kernels/matmul_f32act.cu:672): `dim3 grid((od + NR0*NSG - 1)/(NR0*NSG),
 nt, 1)`, grid.y = nt, one full weight pass per token, on a 64-thread
 f32-dequantizing kernel at ~125 GB/s (vs the MMVQ path's ~238 GB/s). That
 is the measured 34.9 ms/token linear regime of doc 81 §4 (4.36 GiB /

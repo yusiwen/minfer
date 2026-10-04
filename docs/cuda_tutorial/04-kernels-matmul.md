@@ -231,7 +231,7 @@ Line by line:
   baseline the rest of the ladder exists to beat. The store address *is*
   `idx`: `od` outputs per token are contiguous, so flat index = address.
 
-The launcher (`src/cuda_kernels.cu:3676`) is where the ladder's first fork
+The launcher (`src/cuda_kernels.cu:293`) is where the ladder's first fork
 lives — `id % 8 == 0` (the vector kernel's float4 alignment requirement)
 routes to `f32_f32_matmul_vec` with `grid = ceil(od/8)`, 64-thread blocks;
 otherwise the scalar kernel launches with the familiar
@@ -436,12 +436,12 @@ The one-line answer to "which kernel does decode's Matmul dispatch to?":
 - **decode (`nt == 1`)**: `Op::MatMul` (`cuda_backend.rs:931`) →
   `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:151`) → per-type MMVQ — for Q4_0 with
   `id ≥ 2048`: `q4_0_decode_mmvq` (`src/cuda/methods/mmvq.rs:224`) → `launch_q4_0_q8_mmvq`
-  (`cuda_kernels.cu:5435`) → **`q4_0_q8_mmvq`** (`cuda_kernels.cu:5278`),
+  (`mmvq_multi.cu:605`) → **`q4_0_q8_mmvq`** (`mmvq_multi.cu:605`),
   after `decode_quantize_native` (`src/cuda/methods.rs:180`) has produced (or memoized,
   the MmqCache) the pad40 q8 activation plane via `quantize_q8_0_pad40`.
 - **prefill (`nt ≥ 9`)**: the same arm → `mmq_active()` → `prefill_mmq`
   (`src/cuda/methods.rs:301`) → for Q4_K: transposed-A prepass
-  `quantize_q8_0_pad40_t` (`cuda_kernels.cu:794`) then
+  `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`) then
   `launch_mmq_raw_nb_bt_nt` (`mmq_nb.cu:601`) →
   **`mmq_raw_nb_bt_kernel`** (`mmq_nb.cu:289`); Q6_K has its own BT
   kernel (:6976); older/fallback shapes land on `mmq_nt_kernel` (:5663).
@@ -484,7 +484,7 @@ documents the layout; the sum feeds the *MMQ* min-term correction and is
 one thread per block, tree-reduced amax — chapter 03's quantize family,
 already read.
 
-**The kernel** — `src/cuda_kernels.cu:5278`:
+**The kernel** — `src/cuda/kernels/mmvq_aquant.cu:27`:
 
 ```c
 __global__ void __launch_bounds__(256) q4_0_q8_mmvq(
@@ -528,7 +528,7 @@ __global__ void __launch_bounds__(256) q4_0_q8_mmvq(
 ```
 
 **What one thread processes: a slice of one weight row — 32-element blocks,
-round-robin.** The launcher (`cuda_kernels.cu:5435`) is `grid(od, nt)` × 256
+round-robin.** The launcher (`mmvq_multi.cu:605`) is `grid(od, nt)` × 256
 threads, so block `row` owns output element `out[t][row]` and its 256
 threads split the row's `nb = id/32` quant blocks (`u = threadIdx.x; u +=
 256`). For `ffn_down` 0.5B: `nb = 152`, so each thread handles exactly one
@@ -557,7 +557,7 @@ per-row on purpose. Line by line:
 - **`acc += d8 * d4 * (dot - 8*sx)`** — both scales fold once per block, in
   f32. The integer accumulation is *exact*; the only rounding in the row is
   the two quantizations, which already happened.
-- **`mmvq_block_reduce`** (`cuda_kernels.cu:1310`) — the two-stage reduction
+- **`mmvq_block_reduce`** (`mmvq_multi.cu:484`) — the two-stage reduction
   of §2.2's second mapping: 5 warp shuffles, `warp_sums[8]` in shared memory,
   `__syncthreads()`, thread 0 adds and stores `output[t*od + row]`.
 
@@ -603,10 +603,10 @@ but it is the right one to read first — smaller, and every idea transfers.
 per-weight f16 cache — `w16_get`, `src/cuda/methods/prefill_f16.rs:119`, dequantized once by
 chapter 03's `dequant_q*_f16` — or by dequantizing into scratch on this
 call), converts the f32 activations once (`launch_convert_f16`), and
-launches the GEMM (`launch_gemm_f16`, `cuda_kernels.cu:5075`).
+launches the GEMM (`launch_gemm_f16`, `cuda_kernels.cu:2351`).
 
 **The contract.** `C[nt, od] = A[nt, id] · B[od, id]ᵀ`. The header comment
-is the design in six lines (`cuda_kernels.cu:4780-4785`):
+is the design in six lines (`cuda_kernels.cu:2351`):
 
 ```c
 // C[nt, od] = A[nt, id] · B[od, id]^T. 64 x TM output tiles (TM = 64
@@ -618,7 +618,7 @@ is the design in six lines (`cuda_kernels.cu:4780-4785`):
 ```
 
 **Layer 1 — block tiles.** The grid is
-`dim3 grid((nt + 63) / 64, (od + TM_ - 1) / TM_)` (`cuda_kernels.cu:5098`,
+`dim3 grid((nt + 63) / 64, (od + TM_ - 1) / TM_)` (`cuda_kernels.cu:1885`,
 `TM_ = 128` default per the `MINFER_GEMM_TM` selection at :5079-5086). Block
 `(bx, by)` owns output rows `n0 = bx·64` (tokens) × `m0 = by·TM` (outputs).
 The comment at :4809-4811 records why the *token* axis is `grid.x`:
@@ -627,9 +627,9 @@ the weight stream across blocks — the weight matrix streams from DRAM ~once
 per forward instead of once per token-tile.
 
 **Layer 2 — shared-memory staging, double-buffered.** The setup
-(`cuda_kernels.cu:4796-4802`) carves one dynamic shared-memory allocation
+(`cuda_kernels.cu:1885`) carves one dynamic shared-memory allocation
 into `As` (2 × 64×KS f16 — two buffers), `Bs` (2 × TM×KS f16), and `Cs` (a
-per-warp staging area for the store). The k-loop (`cuda_kernels.cu:4877`):
+per-warp staging area for the store). The k-loop (`cuda_kernels.cu:1885`):
 
 ```c
     for (int k = 0; k < id; k += KS, buf ^= 1) {
@@ -658,7 +658,7 @@ double-buffered staging of §2.4, verbatim.
 
 **Layer 3 — register tiles as wmma fragments.** Each warp owns a 32-token ×
 TM-output rectangle (warp `w`: `wm = w >> 1` picks the od chunk, `wn = w & 1`
-the 32-row token half, :4805-4808). The compute step (`cuda_kernels.cu:4954`):
+the 32-row token half, :4805-4808). The compute step (`cuda_kernels.cu:1885`):
 
 ```c
 #pragma unroll
@@ -688,7 +688,7 @@ both k-halves must accumulate; fragment indexing bugs do not crash, they
 silently halve your dot products (the parity gates catch them, chapter 06).
 
 **The store.** After the k-loop, each warp spills its fragments through
-`Cs` (shared) and writes out with bounds masks (`cuda_kernels.cu:4973-4986`):
+`Cs` (shared) and writes out with bounds masks (`cuda_kernels.cu:1885`):
 `store_matrix_sync` lands the 16×16 fragment in shared memory, then lanes
 copy the 256 values to global `C[n * od + m]` for in-range `(n, m)` — how
 the kernel handles the ragged tail of a 30-token prompt without a second
@@ -706,7 +706,7 @@ trigger is a shared row stride that is an exact multiple of the bank count
 (32 floats = 128 bytes): every row's column 0 lands in bank 0, so a
 column-wise read across rows collapses to one bank. The standard fix is
 padding the stride by one bank's width — exactly what chapter 05's attention
-kernel does with `sstr = hd + 8` (`cuda_kernels.cu:4168-4171`, its comment
+kernel does with `sstr = hd + 8` (`attention_prefill.cu:117`, its comment
 is a worked example worth rereading now that you know the term). This GEMM
 sidesteps the issue differently: its hot shared reads are `wmma::
 load_matrix_sync` calls, and the fragment-load hardware handles the layout.
@@ -728,7 +728,7 @@ measuring **1.080× vs llama.cpp on 7B Q4_K_M** (`src/cuda/methods/buffers.rs:12
 the tutorial's policy is to link, not re-explain — but you should recognize
 its pieces in a profile:
 
-- **Activation prepass**: `quantize_q8_0_pad40_t` (`cuda_kernels.cu:794`)
+- **Activation prepass**: `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`)
   quantizes f32 activations to int8 *and writes them pre-transposed and
   swizzled* into the exact layout the GEMM stages (`src/cuda/methods/dispatch.rs:193`;
   llama.cpp's `quantize_mmq_q8_1` design — "byte-identical … only
@@ -832,7 +832,7 @@ at `nt ≥ 9` you buy MACs.**
   (`src/cuda/methods/weights.rs:575`, `2820-2824`, `2855`).
 - **Prefill GEMM, mis-tiled.** A tile that underfills the machine (TM=64 at
   huge `od`, the `MINFER_GEMM_TM` A/B) or a k-step whose shared appetite
-  halves occupancy (KS=64's −38%, `cuda_kernels.cu:5087-5094`) trades the
+  halves occupancy (KS=64's −38%, `cuda_kernels.cu:2103`) trades the
   §2.3 reuse away.
 - **Anywhere: the silent 15/16.** Force the tensor-core GEMM onto `nt == 1`
   and 15 of every 16 mma rows are padding (walkthrough 15 §2.3) — no

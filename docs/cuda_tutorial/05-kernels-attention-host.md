@@ -145,12 +145,12 @@ Two details that matter when you read the real kernel:
 
 - The **first chunk is special**: `m` starts at `−∞` and `α` would be
   `exp(−∞ − m_new) = 0`, so the code simply skips the rescale on the first tile
-  (see the `fresh0`/`fresh1` flags at `cuda_kernels.cu:4280-4285`).
+  (see the `fresh0`/`fresh1` flags at `attention_prefill.cu:117`).
 - **Masked keys must contribute exactly nothing**: causality forbids attending
   to future positions, so a masked score is forced to `0.0` *after* the max
   reduction, not merely given a tiny weight — otherwise `l` would be polluted and
   the normalization would be subtly wrong (this is the `(gcol[q] <= qpos0)`
-  guard at `cuda_kernels.cu:4290-4293`).
+  guard at `attention_prefill.cu:117`).
 
 ### 2.4 RoPE in two sentences, and why the tail is fused
 
@@ -179,13 +179,13 @@ SM — Streaming Multiprocessor — and can share an on-chip scratchpad called
 streams the whole key/value history for that head through a 32-key tile:
 `grid.x = ceil(nt / 64)` query token tiles, `grid.y = nh` heads,
 128 threads = 4 warps (a warp is 32 threads that execute in lockstep)
-(`cuda_kernels.cu:4416`, the launcher). K/V come from the persistent cache as
+(`attention_prefill.cu:394`, the launcher). K/V come from the persistent cache as
 `__half` (16-bit float — the f16 KV cache from chapter 04's bandwidth story);
 q and the output `o` are f32. The kernel is gated to `hd == 128` models — see
 the dispatch note at the end of this section.
 
 **Why this shape at all.** The header comment above the kernel
-(`cuda_kernels.cu:4096-4102`) is the honest cost accounting of the kernel it
+(`attention_decode.cu:18`) is the honest cost accounting of the kernel it
 replaced:
 
 ```c
@@ -202,7 +202,7 @@ One block per (token, head) re-reads every K row once *per query token*; tiling
 64 queries together amortizes each K row across 64 consumers — chapter 03's GEMM
 tiling reasoning, applied to attention.
 
-**The tile constants and shared layout** (`cuda_kernels.cu:4112-4113` and
+**The tile constants and shared layout** (`attention_prefill.cu:117` and
 `4167-4174`): `FA_TQ = 64` query rows, `FA_TKV = 32` key columns per iteration;
 shared memory holds the q tile, the K tile, and the V tile, all as `__half` with
 a padded row stride:
@@ -228,7 +228,7 @@ address formula.
 API for tensor-core matmul) multiplies 16×16×16 matrix fragments; a *fragment*
 is the per-lane register layout of a piece of a matrix. The Q·Kᵀ product of a
 16-query-row block against the 32-column K tile is accumulated in fragment
-registers (`cuda_kernels.cu:4233-4246`):
+registers (`attention_decode.cu:160`):
 
 ```c
 wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[FA_TKV / 16];
@@ -250,14 +250,14 @@ elements at a time (the K dimension of this GEMM), loading an A-fragment
 (16 query rows × 16 dims, row-major) and two B-fragments (16 dims × 16 key
 columns, col-major — `Kᵀ`'s layout falls out of storing `K` row-major) per
 step. The `scale` factor was already folded into q at load
-(`cuda_kernels.cu:4188`), so the scores need no second pass.
+(`attention_decode.cu:160`), so the scores need no second pass.
 
 **The online softmax, fragment-resident.** Now the section-2 machinery, but the
 "row" lives in tensor-core accumulator registers. For an m16n16 f32 accumulator
 each lane holds 8 elements — two fragment rows (`r0`, `r0+8`) × four column
 groups — and four lanes (`l = 0..3`) share one row, so a row max is a local
 loop plus a 2-step butterfly shuffle (`__shfl_xor_sync` exchanges a register
-between lanes) (`cuda_kernels.cu:4265-4279`):
+between lanes) (`attention_decode.cu:160`):
 
 ```c
 float mnew0 = -INFINITY, mnew1 = -INFINITY;
@@ -277,11 +277,11 @@ for (int off = 1; off <= 2; off <<= 1) {
 
 Note the two validity conditions on every element: **causal masking**
 (`gcol[q] <= qpos0` — positions are read from device memory at
-`cuda_kernels.cu:4213-4214`) and **tile-range masking** (`gcol[q] < kv_end` —
+`attention_prefill.cu:117`) and **tile-range masking** (`gcol[q] < kv_end` —
 the last KV tile is zero-filled beyond the history end, and zeros must not
 enter the max). Then the classic triple — fresh flags for the first tile,
 exponentiate against the new max, running sums —
-(`cuda_kernels.cu:4280-4303`):
+(`attention_prefill.cu:287`):
 
 ```c
 const int fresh0 = (m0 == -INFINITY);
@@ -301,7 +301,7 @@ l0 = l0 * a0 + sum0;                               // l ← l·α + new sum
 **The O rescale in code.** The output accumulator is 8 fragments (the
 64-dim-per-16-row-block V product, `hd/16 = 8` blocks). Each fragment's 8
 elements interleave the two fragment rows, so the per-row α is applied by
-multiplying the right lanes of every fragment (`cuda_kernels.cu:4307-4315`):
+multiplying the right lanes of every fragment (`attention_prefill.cu:117`):
 
 ```c
 // rescale O fragments by the per-row alpha (x[0,1,4,5] -> row r0,
@@ -316,20 +316,20 @@ for (int ob = 0; ob < 8; ob++) {
 
 This is §2.2's `o ← o·α`, 64 rows at a time, entirely in registers. Then P (the
 probabilities — the scaled scores) is packed into an f16 A-fragment *in place*
-(`cuda_kernels.cu:4317-4333`, exploiting that the m16n16 f32 accumulator and the
+(`attention_decode.cu:160`, exploiting that the m16n16 f32 accumulator and the
 m16k16 f16 row-major A-fragment use the same element-per-lane layout), and the
-P·V product is accumulated (`cuda_kernels.cu:4334-4343`). The comment at
+P·V product is accumulated (`attention_decode.cu:160`). The comment at
 `4317-4320` records the layout facts that make the round trip free — the kind of
 thing you verify once with a standalone fragment-layout test, then trust.
 
 **Write-out and K/V staging.** After the KV loop, one final normalize `acc / l`
 and the fragments go to global memory; the last, partially-filled query tile
 stages through shared memory so out-of-range rows can be skipped
-(`cuda_kernels.cu:4347-4385`); rows whose `l` is 0 (fully masked) stay 0. The
-K/V tiles themselves arrive via `fa_stage_kv_async` (`cuda_kernels.cu:4119-4155`):
+(`attention_prefill.cu:43`); rows whose `l` is 0 (fully masked) stay 0. The
+K/V tiles themselves arrive via `fa_stage_kv_async` (`attention_prefill.cu:43`):
 16-byte `cp.async` transfers — an asynchronous copy that lands in shared memory
 without passing through registers — which zero-fill rows beyond `kv_end` by
-capping the copy size (`sz = full ? 16 : 0`, `cuda_kernels.cu:4131`); the
+capping the copy size (`sz = full ? 16 : 0`, `attention_decode.cu:160`); the
 pre-sm80 fallback does plain synchronous vector loads. Zero-filling lets the
 softmax treat out-of-range keys uniformly and exclude them with the one
 `gcol < kv_end` test instead of a second control path.
@@ -350,7 +350,7 @@ if nt >= 2 && hd == 128 && !Self::no_fa_prefill() {
 the positions array, so verify-shaped short batches are safe); `hd == 128`
 (FA_HQ is hard-wired to `hd/4 = 32`); and `MINFER_NO_FA_PREFILL=1`
 (`src/cuda/methods/prefill_f16.rs:256-257`) as the A/B escape hatch. If the shared-memory opt-in
-fails at launch (`cuda_kernels.cu:4398-4413`) the launcher returns `−1`, prints
+fails at launch (`attention_prefill.cu:394`) the launcher returns `−1`, prints
 one loud warning, and the wrapper falls back to the legacy per-token kernel —
 the one visible fallback in the attention path, and it is *announced*, not
 silent. Note for Qwen2.5-0.5B specifically: its head dim is 64
@@ -370,7 +370,7 @@ header comment, `cuda_kernels.cu:2571-2574`; TECH-PRIMER §6.4 prices the whole
 campaign at "−310 launches/step"). This kernel is one launch that does all of
 it, ending with K/V in exactly the layout the next kernel reads.
 
-**Thread mapping.** The launcher (`cuda_kernels.cu:3997-4014`) is a flat 1-D
+**Thread mapping.** The launcher (`cuda_kernels.cu:1479`) is a flat 1-D
 grid of 256-thread blocks over `total = nqt/2 + nkt/2 + nkt` — one thread per
 *RoPE pair* for q (`nqt/2`), one per RoPE pair for k (`nkt/2`), one per element
 for v (`nkt`); `nqt = nh·hd` and `nkt = nk·hd` are the q and k section widths
@@ -547,7 +547,7 @@ AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:78`): the
 graph topology is identical at position 0 and position 2000, and the kernels
 discover the valid range by reading `positions[t] + 1`
 (`cuda_backend.rs:1100-1102` has the comment; `fa_prefill_f16kv` computes
-`kv_end = positions[last_t] + 1` at `cuda_kernels.cu:4193-4194`). Two payoffs
+`kv_end = positions[last_t] + 1` at `attention_prefill.cu:117`). Two payoffs
 we have already met: the decode graph can be allocated once and replayed
 (§3.5), and attention never needs a host round trip to learn where the history
 ends.
@@ -887,7 +887,7 @@ launch overhead" at a 14B decode (`cuda_backend.rs:37-43`) — about 1.2 µs per
 launch, right in TECH-PRIMER's band. §3.2's fusion is the same arithmetic at
 graph level — the 7-launch QKV tail becomes 1 ("−310 launches/step" across a
 whole model, `docs/CUDA-TECH-PRIMER.md:294-298`) — and the dispatch notes
-price even one wasted launch at "~1-2 us/layer" (`cuda_kernels.cu:4044-4045`).
+price even one wasted launch at "~1-2 us/layer" (`attention_prefill.cu:394`).
 
 **f16 KV bytes per token per layer.** With `nkt = n_head_kv · hd`, each region
 stores `nkt` elements per position. Qwen2.5-0.5B: `nkt = 2·64 = 128` elements
@@ -910,17 +910,17 @@ head) kernel re-read the K history once per query token per head: at 7B @2K
 that was ~132 GB of K traffic *per layer*, 176 ms, 76% of the whole 2K
 prefill. `fa_prefill_f16kv` amortizes each K row across a 64-query tile and
 stages K/V once per 32-key chunk: **~0.8 GB per layer** — about 165× less
-traffic (`cuda_kernels.cu:4096-4102`). The grid at those shapes is small and
+traffic (`attention_prefill.cu:394`). The grid at those shapes is small and
 regular: `ceil(2048/64) = 32` query tiles × 28 heads = 896 blocks of 128
 threads, each asking for `((64 + 2·32) · 136 · 2) = 34,816 B ≈ 34.8 KB` of
-dynamic shared memory (`cuda_kernels.cu:4395`), raised via
-`cudaFuncSetAttribute` (`cuda_kernels.cu:4398-4414`). What makes it *slow*, by
+dynamic shared memory (`attention_prefill.cu:394`), raised via
+`cudaFuncSetAttribute` (`attention_prefill.cu:394`). What makes it *slow*, by
 construction: an `hd ≠ 128` model silently takes the legacy path (0.5B does
 exactly this, §3.1); a device that refuses the shared-memory opt-in falls back
 with one printed warning and a "~50× slower" attention
-(`cuda_kernels.cu:4402-4412`); and an unpadded shared-memory stride would
+(`attention_prefill.cu:394`); and an unpadded shared-memory stride would
 re-introduce the 8-way bank conflicts the `sstr = hd + 8` line exists to
-prevent (`cuda_kernels.cu:4168-4171`).
+prevent (`attention_prefill.cu:117`).
 
 ## 5. Try it / Observe
 

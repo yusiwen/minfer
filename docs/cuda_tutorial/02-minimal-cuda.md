@@ -203,7 +203,7 @@ the same memory, which would forbid reordering loads and stores). The bias
 vector itself is 896 × 4 B = 3.5 KB, re-read by every token's block — small
 enough to stay hot in L2 cache across blocks.
 
-The launcher builds that 2-D grid (`src/cuda_kernels.cu:3872-3878`): 64
+The launcher builds that 2-D grid (`src/cuda/kernels/matmul_f32act.cu:624`): 64
 threads in x per block, `dim3 grid(n, (d + 63) / 64, 1)` — the same ceil-div
 over the column axis, 896 columns → 14 blocks in y. For one decode token
 (`n = 1`) the grid is 1 × 14 blocks of 64 threads — 896 threads for 896
@@ -247,7 +247,7 @@ a node may alias its input only when it is the sole consumer and runs on the
 same backend — §3 shows the D2D (device-to-device) copy the backend stages
 when the allocator did *not* alias it). Both launch through their launchers'
 ceil-div grid of 256-thread blocks (`launch_add_f32`
-`src/cuda_kernels.cu:3880-3887`, `launch_silu_f32` `:3898-3903`), and every
+`src/cuda_kernels.cu:1369`, `launch_silu_f32` `:3898-3903`), and every
 launcher in the file ends with `, stream)`: the entry-point family is uniform
 so the Rust side can target any stream uniformly. Why that matters is §2.4.
 
@@ -744,7 +744,7 @@ CUDA node takes; the layered picture first (the one diagram of this chapter):
      ▼
  src/cuda/methods/dispatch.rs:33               extern "C" launch_silu_f32 (FFI declaration)
      ▼
- cuda_kernels.cu:3898-3903 launch_silu_f32            (grid = ceil-div, <<<>>>)
+ cuda_kernels.cu:1391 launch_silu_f32            (grid = ceil-div, <<<>>>)
      ▼
  cuda_kernels.cu:2429-2434 __global__ silu_f32         (index → guard → math)
      ▼
