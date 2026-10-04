@@ -241,11 +241,13 @@ above; that is why `matmul_f32act` and `attention_*` look slightly over their se
   - `check_cuda_launch_returns.py` discovers `src/cuda/kernels/*.cu` as a list and audits one file per
     `audit()` call (`_RESOLVE_LINES` is a module global); it must also **assert that no `<<<>>>` lives
     in a `.cuh`** (the invariant that keeps the audit complete).
-  - `tests/fixtures/cuda_launch_sites.tsv` is regenerated with a **5th `file` column appended**, so the
-    existing column indices stay valid; `--check-fixture`'s
-    `[w[1:4] for w in want if len(w) == 4]` becomes a `>= 4` filter whose key includes the file; and
-    `src/cuda/issue162_tests.rs:55`'s `assert_eq!(f.len(), 4)` becomes 5 (its only structural use of
-    the fixture — lines 228 and 911 read fields 2 and 3 only).
+  - `tests/fixtures/cuda_launch_sites.tsv` **keeps its four columns** and is regenerated in the build
+    list's order. The identity key is the ordered `(owner, site, kernel-fragment)` list, and only 2 of
+    the 130 triples repeat, so four columns still identify every site; the `--fixture` writer emits no
+    file column and `src/cuda/issue162_tests.rs`'s `assert_eq!(f.len(), 4)` stays as it is. The one
+    tooling change is `--check-fixture`'s filter, `len(w) == 4` → `len(w) >= 4`, so a future column
+    cannot silently empty the fixture (a 5-column fixture under the old filter audited 0 of 130
+    sites — the pre-verified mutation in the blueprint's §5).
   - `build.rs` compiles the list, emits one `.o` per file, keeps `libcuda_kernels.a`, and adds one
     `rerun-if-changed` **per `.cu` and per `.cuh`** (a header edit that does not trigger a rebuild is
     the silent-stale hazard of this step). It also gains a **new-file guard**: every `.cu`/`.cuh` found
@@ -586,7 +588,8 @@ Non-`src/` changes that ride along: `build.rs` (CUDA/Metal file lists + one `rer
 `.cu`/`.cuh`/.metal/.h + one `.o` per `.cu`, still one `libcuda_kernels.a`; Metal parts → one metallib;
 plus the **new-file guard** that a file in `kernels/` cannot silently be absent from the list),
 `scripts/check_cuda_launch_returns.py` (directory discovery + the "no `<<<>>>` in a `.cuh`" assertion) +
-`tests/fixtures/cuda_launch_sites.tsv` (regenerated, still 130 rows, **5th column `file`**),
+`tests/fixtures/cuda_launch_sites.tsv` (regenerated in build-list order, still 130 rows, still **four
+columns**),
 `scripts/check_doc_line_anchors.py` (new, ticket 6),
 `docs/SOURCE-LAYOUT-PLAN.md` (this file) + `AGENTS.md` Layout block + `docs/ARCHITECTURE.md`
 (layer definition + interface-eligibility rule) + the path/anchor sweeps in `docs/BACKENDS.md`,

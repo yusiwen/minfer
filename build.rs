@@ -1,6 +1,73 @@
 use std::path::Path;
 use std::process::Command;
 
+// ─── The CUDA kernel translation units (issue #263) ──────────────────────────
+//
+// `src/cuda_kernels.cu` was one 10 215-line translation unit; it is split into
+// `src/cuda/kernels/`. This explicit list is the compile order, the launch
+// audit's `--source` order and the launch-site fixture's row order — one list,
+// so a file added to one consumer but not another is the drift the new-file
+// guard below exists to catch. `KERNEL_HEADERS` is watched for rebuilds but not
+// compiled: a header holds no `<<<>>>` (the audit asserts it).
+//
+// The order is the directory's sorted order; `check_kernel_file_list()`
+// verifies the set equality AND the order, so the fixture stays stable.
+const KERNEL_SOURCES: &[&str] = &["src/cuda/kernels/guard.cu"];
+const KERNEL_HEADERS: &[&str] = &["src/cuda/kernels/common.cuh"];
+// The shrinking remainder: every line not yet moved into `kernels/`. Deleted
+// by stage 6 of #263, after which this constant's file simply does not exist.
+const LEGACY_SOURCE: &str = "src/cuda_kernels.cu";
+const KERNELS_DIR: &str = "src/cuda/kernels";
+
+/// Every `.cu`/`.cuh` in `KERNELS_DIR` must be listed, every listed file must
+/// exist, and the `.cu` order must be the directory's sorted order.
+fn check_kernel_file_list() {
+    let dir = Path::new(KERNELS_DIR);
+    if !dir.exists() {
+        return;
+    }
+    let mut found_cu: Vec<String> = Vec::new();
+    let mut found_cuh: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read src/cuda/kernels/") {
+        let path = entry.expect("read src/cuda/kernels/ entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("cu") => found_cu.push(format!("{KERNELS_DIR}/{name}")),
+            Some("cuh") => found_cuh.push(format!("{KERNELS_DIR}/{name}")),
+            _ => {}
+        }
+    }
+    found_cu.sort();
+    found_cuh.sort();
+    let listed_cu: Vec<String> = KERNEL_SOURCES.iter().map(|s| s.to_string()).collect();
+    let listed_cuh: Vec<String> = KERNEL_HEADERS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        listed_cu, found_cu,
+        "build.rs KERNEL_SOURCES must list every .cu in {KERNELS_DIR}, in sorted \
+         order (an unlisted kernel file is never compiled)"
+    );
+    assert_eq!(
+        listed_cuh, found_cuh,
+        "build.rs KERNEL_HEADERS must list every .cuh in {KERNELS_DIR}, in sorted \
+         order (an unlisted header never triggers a rebuild)"
+    );
+    for f in listed_cu.iter().chain(listed_cuh.iter()) {
+        assert!(
+            Path::new(f).exists(),
+            "build.rs lists {f}, which does not exist"
+        );
+    }
+}
+
+/// The translation units to compile, in the one shared order.
+fn kernel_translation_units() -> Vec<String> {
+    let mut v: Vec<String> = KERNEL_SOURCES.iter().map(|s| s.to_string()).collect();
+    if Path::new(LEGACY_SOURCE).exists() {
+        v.push(LEGACY_SOURCE.to_string());
+    }
+    v
+}
+
 fn main() {
     // ─── Build version (minfer --version) ─────────────────────────────
     // The release workflow passes MINFER_VERSION as "vX.Y.Z(shortsha)",
@@ -173,7 +240,19 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=MINFER_CUDA_CCBIN");
-    println!("cargo:rerun-if-changed=src/cuda_kernels.cu");
+    // One `rerun-if-changed` per translation unit AND per header: a header edit
+    // that does not trigger a rebuild is the silent-stale hazard of the #263
+    // split, because cargo does not compile these files itself.
+    for f in KERNEL_SOURCES.iter().chain(KERNEL_HEADERS) {
+        println!("cargo:rerun-if-changed={f}");
+    }
+    if Path::new(LEGACY_SOURCE).exists() {
+        println!("cargo:rerun-if-changed={LEGACY_SOURCE}");
+    }
+    // The new-file guard runs on EVERY build (not just a CUDA one): a kernel
+    // source present in `src/cuda/kernels/` but absent from the list below is
+    // never compiled, and its tests would silently not run.
+    check_kernel_file_list();
     if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
     }
@@ -188,7 +267,6 @@ fn main() {
 
     let cuda_home = find_cuda_home(&nvcc);
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let cu_file = "src/cuda_kernels.cu";
     let include_flag = format!("-I{cuda_home}/include");
 
     // nvcc inherits the first cc/g++ on PATH as its host compiler and
@@ -239,55 +317,71 @@ fn main() {
             .join(",")
     );
 
-    let obj_file = format!("{out_dir}/cuda_kernels.o");
-    let mut args: Vec<String> = vec![
-        "-o".into(),
-        obj_file.clone(),
-        "-c".into(),
-        cu_file.into(),
-        include_flag,
-        "-O3".into(),
-        "--compiler-options".into(),
-        "-fPIC".into(),
-        "-Xcompiler".into(),
-        "-Wno-unused-function".into(),
-    ];
-    if let Some(c) = &ccbin {
-        args.push("-ccbin".into());
-        args.push(c.clone());
-    }
-    for arch in &archs {
-        args.push("-gencode".into());
-        args.push(format!("arch=compute_{arch},code=sm_{arch}"));
-    }
-    // Backward-JIT PTX. The auto-detected list has no exact sm_70/sm_72 SASS
-    // on toolkits that dropped Volta, and the trailing forward-only PTX for the
-    // *highest* compute can only JIT *up* — it cannot reach an older GPU (e.g.
-    // a V100/sm_70). Embedding a compute_70/72 PTX (only when nvcc accepts the
-    // arch, i.e. CUDA 12.x) lets those cards load by JIT; a compute_70 PTX also
-    // forward-JITs to any GPU >= sm_70. compute_72 is slightly redundant but
-    // kept so sm_72 has its own best-match image.
-    for pa in ["70", "72"] {
-        if archs.iter().any(|a| a.as_str() == pa) {
-            args.push("-gencode".into());
-            args.push(format!("arch=compute_{pa},code=compute_{pa}"));
+    // One `.o` per translation unit, each compiled exactly as the single TU
+    // used to be, then all of them into the one `libcuda_kernels.a` rustc
+    // links. `-Wno-unused-function` matters more after #263: the shared header
+    // gives every TU a copy of every helper.
+    let cu_files = kernel_translation_units();
+    let mut obj_files: Vec<String> = Vec::new();
+    for cu_file in &cu_files {
+        let stem = Path::new(cu_file)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let obj_file = format!("{out_dir}/{stem}.o");
+        let mut args: Vec<String> = vec![
+            "-o".into(),
+            obj_file.clone(),
+            "-c".into(),
+            cu_file.clone(),
+            include_flag.clone(),
+            "-O3".into(),
+            "--compiler-options".into(),
+            "-fPIC".into(),
+            "-Xcompiler".into(),
+            "-Wno-unused-function".into(),
+        ];
+        if let Some(c) = &ccbin {
+            args.push("-ccbin".into());
+            args.push(c.clone());
         }
-    }
-    // Forward-compat PTX for GPUs newer than the newest SASS.
-    args.push("-gencode".into());
-    args.push(format!("arch=compute_{highest},code=compute_{highest}"));
+        for arch in &archs {
+            args.push("-gencode".into());
+            args.push(format!("arch=compute_{arch},code=sm_{arch}"));
+        }
+        // Backward-JIT PTX. The auto-detected list has no exact sm_70/sm_72 SASS
+        // on toolkits that dropped Volta, and the trailing forward-only PTX for the
+        // *highest* compute can only JIT *up* — it cannot reach an older GPU (e.g.
+        // a V100/sm_70). Embedding a compute_70/72 PTX (only when nvcc accepts the
+        // arch, i.e. CUDA 12.x) lets those cards load by JIT; a compute_70 PTX also
+        // forward-JITs to any GPU >= sm_70. compute_72 is slightly redundant but
+        // kept so sm_72 has its own best-match image.
+        for pa in ["70", "72"] {
+            if archs.iter().any(|a| a.as_str() == pa) {
+                args.push("-gencode".into());
+                args.push(format!("arch=compute_{pa},code=compute_{pa}"));
+            }
+        }
+        // Forward-compat PTX for GPUs newer than the newest SASS.
+        args.push("-gencode".into());
+        args.push(format!("arch=compute_{highest},code=compute_{highest}"));
 
-    let status = Command::new(&nvcc)
-        .args(&args)
-        .status()
-        .unwrap_or_else(|e| panic!("CUDA: failed to spawn {nvcc}: {e}"));
-    if !status.success() {
-        panic!("CUDA kernel compilation failed — see the nvcc errors above");
+        let status = Command::new(&nvcc)
+            .args(&args)
+            .status()
+            .unwrap_or_else(|e| panic!("CUDA: failed to spawn {nvcc}: {e}"));
+        if !status.success() {
+            panic!("CUDA kernel compilation failed for {cu_file} — see the nvcc errors above");
+        }
+        obj_files.push(obj_file);
     }
 
     let lib_file = format!("{out_dir}/libcuda_kernels.a");
+    let mut ar_args: Vec<String> = vec!["rcs".into(), lib_file.clone()];
+    ar_args.extend(obj_files.iter().cloned());
     let ar_status = Command::new("ar")
-        .args(["rcs", &lib_file, &obj_file])
+        .args(&ar_args)
         .status()
         .unwrap_or_else(|e| panic!("CUDA: failed to spawn ar: {e}"));
     if !ar_status.success() {
