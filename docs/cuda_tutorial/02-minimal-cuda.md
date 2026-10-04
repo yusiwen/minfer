@@ -796,9 +796,9 @@ microseconds while the kernel may not even have started. Finally the CPU
 counterpart — this tutorial's pattern is kernel → CPU → why the GPU version
 looks the way it does (chapter 03 does this line by line for the whole
 elementwise family). The same op on CPU is `vec_silu_f32`
-(`src/vec_ops.rs:155-173`): signature
+(`src/vec_ops/silu.rs:8-23`): signature
 `pub fn vec_silu_f32(n: usize, y: &mut [f32], x: &[f32])`, an x86_64
-AVX2+FMA arm detected at run time (`src/vec_ops.rs:161-167`, 8 lanes per
+AVX2+FMA arm detected at run time (`src/vec_ops/silu.rs:27-53`, 8 lanes per
 step), and the scalar fallback `y[i] = x[i] / (1.0 + (-x[i]).exp())` — the
 same formula as the kernel, one explicit loop index instead of 4,864
 materialized threads.

@@ -29,7 +29,8 @@ src/
 ├── quants.rs        # AVX2 / NEON+SDOT dot kernels + Q8_0/Q8_K quantization — module decider
 ├── quants/          # dot_q4_0 · dot_q4_1 · dot_q5 · dot_q8_0 · kquant · quantize_q8_0 · quantize_q8_k · avx2 · neon (split by #264)
 ├── kernel.rs        # quantized matmul dispatch + scalar fallbacks; shared worker pool
-├── vec_ops.rs       # RMSNorm, RoPE, Softmax, SiLU; vectorized f16 weight dot
+├── vec_ops.rs       # RMSNorm, RoPE, Softmax, SiLU; vectorized f16 weight dot — module decider
+├── vec_ops/         # vec · rms_norm · rope · softmax · silu · f16 · bf16 · neon (split by #264)
 ├── tensor.rs        # 4D Tensor (shape/strides/data)
 ├── dump.rs          # debug dump module (--features debug_dump)
 ├── tokenizer.rs     # byte-level BPE from GGUF metadata; `tokenizer.ggml.pre` splitter
