@@ -16,6 +16,10 @@ const KERNEL_SOURCES: &[&str] = &[
     "src/cuda/kernels/attention_decode.cu",
     "src/cuda/kernels/attention_prefill.cu",
     "src/cuda/kernels/guard.cu",
+    "src/cuda/kernels/mmq_bt_q6k.cu",
+    "src/cuda/kernels/mmq_int8.cu",
+    "src/cuda/kernels/mmq_nb.cu",
+    "src/cuda/kernels/mmq_raw.cu",
 ];
 const KERNEL_HEADERS: &[&str] = &["src/cuda/kernels/common.cuh"];
 // The shrinking remainder: every line not yet moved into `kernels/`. Deleted
