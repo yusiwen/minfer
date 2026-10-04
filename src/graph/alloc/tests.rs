@@ -1015,7 +1015,7 @@ fn staging_is_keyed_by_destination_backend() {
 /// (`copy_across`) and phase B (`await_cross`), and `cross_input` — the only
 /// accessor the scheduler's consumer path uses — refuses it by name. The
 /// graph-level version (the same refusal through the real `execute`) is
-/// `scheduler::tests::a_staged_boundary_input_cannot_be_consumed_before_its_wait`.
+/// `scheduler::tests::a_staged_boundary_input_is_waited_on_at_its_first_use`.
 #[test]
 fn a_pending_staged_copy_is_refused_until_its_wait_is_issued() {
     let g = {
@@ -1065,6 +1065,66 @@ fn a_pending_staged_copy_is_refused_until_its_wait_is_issued() {
         },
         "the wait is counted; no copy was issued here (the test injected the state)"
     );
+}
+
+/// #138 gate: **the end-of-execution drain issues the wait for a staged entry
+/// nothing read**, so `copies == waits` cannot depend on what the consumer did
+/// with its inputs.
+///
+/// A deferred wait is issued at the consumer's first read, and the scheduler
+/// skips node loops (a replayed CUDA split) and dead nodes, so an entry can go
+/// unread. Without the drain it would stay pending forever — a pinned slab and an
+/// event held past the execution, and the missing-wait gate reading
+/// `copies > waits`. The drain is deliberately *not* counted as a deferred wait:
+/// it is not issued at a use.
+#[test]
+fn the_drain_waits_on_a_staged_entry_nothing_read() {
+    let g = {
+        use crate::graph::builder::GraphBuilder;
+        let mut b = GraphBuilder::new();
+        let x = b.input("x", [8, 1, 1, 1], super::super::DType::F32);
+        let s = b.silu(x);
+        b.output(s);
+        b.build()
+    };
+    let mut alloc = GraphAllocator::new();
+    alloc.alloc_graph(&g).unwrap();
+    // Two staged entries for a notional device consumer; `await_cross`
+    // dispatches to the CPU entry's registered no-op (the CPU has no device
+    // transfer to wait on), so the test stays device-free.
+    alloc.stage_cross_for_test(g.uid, 1, Backend::CUDA, 4, 8);
+    alloc.mark_cross_pending_for_test(g.uid, 1, Backend::CUDA);
+    alloc.stage_cross_for_test(g.uid, 0, Backend::CUDA, 5, 8);
+    alloc.mark_cross_pending_for_test(g.uid, 0, Backend::CUDA);
+
+    // The consumer reads one of them through the deferred path.
+    assert!(alloc
+        .cross_input_ready(g.uid, 1, Backend::CUDA)
+        .unwrap()
+        .is_some());
+    // The other is still pending — and still unreadable.
+    assert!(alloc.cross_input(g.uid, 0, Backend::CUDA).is_err());
+
+    alloc.drain_cross_pending().unwrap();
+    assert!(
+        alloc
+            .cross_input(g.uid, 0, Backend::CUDA)
+            .unwrap()
+            .is_some(),
+        "the drain published the entry nothing read"
+    );
+    assert_eq!(
+        alloc.cross_stats(),
+        CrossCopyStats {
+            copies: 0, // injected state: no phase A ran
+            waits: 2,
+            deferred_waits: 1, // only the read one was deferred
+            ..CrossCopyStats::default()
+        }
+    );
+    // Draining again is a no-op (nothing pending).
+    alloc.drain_cross_pending().unwrap();
+    assert_eq!(alloc.cross_stats().waits, 2);
 }
 
 /// F5: `await_cross` is idempotent and self-cleaning — including when the pair

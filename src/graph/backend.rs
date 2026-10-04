@@ -130,13 +130,33 @@ pub trait Backend: Send + Sync {
     fn write_host_window(&mut self, id: usize, offset: usize, data: &[f32]) -> Result<(), String>;
 
     /// Wait for async work to complete (CPU: no-op; Metal: submit the pending
-    /// command buffer). Called between splits and after the last split; only the
-    /// Metal path invokes it today, so a CPU-only build never calls it.
+    /// command buffer). Called after the last split and by
+    /// [`Self::retire`]'s default body; only the Metal path and CUDA's drain
+    /// invoke it today, so a CPU-only build never calls it.
     ///
     /// A backend that captured a CUDA Graph window for the current split must
     /// close it here (instantiate + launch the captured work once), because
     /// capture records launches without executing them.
     fn synchronize(&mut self);
+
+    /// Retire this backend's split at a **cross-backend boundary** (#138),
+    /// ordering the split's work before the staging copies that follow it.
+    ///
+    /// The default is the full [`Self::synchronize`]: a backend whose boundary
+    /// work *is* a submission (Metal submits its pending command buffer) has
+    /// nothing cheaper to give, and blocking there is not a defect — the host has
+    /// to hand the batch over before the next split can start.
+    ///
+    /// CUDA overrides it, because its boundary close is already stream-ordered
+    /// with the copies that follow (both run on the backend's own stream): the
+    /// close must still happen — an open capture window must be instantiated and
+    /// launched, and the MMQ memoization is bounded to one execution — but the
+    /// host block that [`Self::synchronize`] adds orders nothing new. Deferring
+    /// that block to the consumer's first read is the point of #138, and it is
+    /// what lets the boundary's copies stay in flight while the consumer works.
+    fn retire(&mut self) {
+        self.synchronize();
+    }
 
     /// Try to replay a previously captured graph for `(uid, range)` on this
     /// backend (Phase 7d, CUDA only). Returns `true` when the replay replaced

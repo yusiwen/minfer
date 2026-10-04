@@ -135,6 +135,15 @@ pub struct CudaBackend {
     /// arm's 728 — the harness's own load, not the async path). Same hazard and
     /// same fix as `blocking_readbacks`, which was per-instance from the start.
     stream_syncs: std::sync::atomic::AtomicU64,
+    /// #138: the high-water mark of [`Self::cross_slabs`] entries in use at once
+    /// — i.e. how many cross-backend copies were **enqueued but not yet waited
+    /// on** simultaneously. This is the device-side measurement of the ticket's
+    /// overlap claim: a boundary that waits per input (F5) cannot exceed 1,
+    /// because the wait releases the slab before the next copy takes one, while
+    /// the deferred boundary reaches the number of staged inputs. Read only by
+    /// the multi-input gate, so it is `#[cfg(test)]`-accessed like the other
+    /// device counters.
+    cross_inflight_peak: usize,
 }
 
 /// F5: one pinned host slab of the async D2H staging pool (see
@@ -236,6 +245,7 @@ impl CudaBackend {
             cross_pending: Vec::new(),
             blocking_readbacks: std::sync::atomic::AtomicU64::new(0),
             stream_syncs: std::sync::atomic::AtomicU64::new(0),
+            cross_inflight_peak: 0,
         })
     }
 
@@ -548,9 +558,19 @@ impl CudaBackend {
     }
 
     /// Close an open capture window (instantiate + launch once + cache), or
-    /// fall back to a plain synchronize. Called at split boundaries and after
-    /// the last split — never inside a capture window.
-    fn close_capture_or_sync(&mut self) {
+    /// fall back to a plain synchronize. Called at split boundaries (`block =
+    /// false` since #138 — see the trait's `retire`) and after the last split
+    /// (`block = true`) — never inside a capture window.
+    ///
+    /// `block` is the only difference between the boundary close and the drain:
+    /// the capture must be *ended and launched* either way (capture records
+    /// launches without executing them, and the copies that follow it on the same
+    /// stream are ordered behind the launch), while the `cudaStreamSynchronize`
+    /// that makes the host wait for it is exactly what #138 defers to the
+    /// consumer's first read. The failure arm keeps its sync in both modes: the
+    /// step's outputs are undefined there, and a caller that has just lost a graph
+    /// should see the error before it reads them.
+    fn close_capture_or_sync(&mut self, block: bool) {
         if let Some(key) = self.capturing.take() {
             let _bound = self.bind();
             let exec = self.state.graph_end_capture_to_exec();
@@ -563,7 +583,9 @@ impl CudaBackend {
                     pool_gen: self.pool_gen,
                     kv_layout: self.kv_layout,
                 });
-                self.state_sync();
+                if block {
+                    self.state_sync();
+                }
             } else {
                 self.state.graph_destroy(exec);
                 // The recorded launches never executed — this step's
@@ -586,7 +608,9 @@ impl CudaBackend {
             }
             return;
         }
-        self.state_sync();
+        if block {
+            self.state_sync();
+        }
     }
 
     /// D1: a reference's device pointer with its window applied. D1 views are
@@ -644,6 +668,25 @@ impl CudaBackend {
     pub(crate) fn blocking_readback_count(&self) -> u64 {
         self.blocking_readbacks
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #138: the high-water mark of cross-backend copies enqueued but not yet
+    /// waited on (see [`Self::cross_inflight_peak`]). Test-only (#138): driven by
+    /// `graph::cuda_backend::tests::a_boundary_with_several_staged_inputs_defers_its_waits`;
+    /// `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn cross_inflight_peak(&self) -> usize {
+        self.cross_inflight_peak
+    }
+
+    /// #138: restart the in-flight high-water mark from the number of slabs
+    /// currently in use, so one backend can measure two copy disciplines in a row
+    /// (the gate drives the F5 enqueue-then-wait order by hand after the
+    /// scheduler's deferred run). Test-only (#138), same gate as
+    /// [`Self::cross_inflight_peak`].
+    #[cfg(test)]
+    pub(crate) fn reset_cross_inflight_peak(&mut self) {
+        self.cross_inflight_peak = self.cross_slabs.iter().filter(|s| s.in_use).count();
     }
 
     /// Issue #185: this backend's own count of full-stream host stalls
@@ -761,6 +804,7 @@ impl CudaBackend {
         }
         if let Some(i) = best {
             self.cross_slabs[i].in_use = true;
+            self.note_cross_inflight();
             return Ok(i);
         }
         // 64 KiB floor: a decode-step boundary copies KB-scale activations, and
@@ -774,7 +818,16 @@ impl CudaBackend {
             bytes: need,
             in_use: true,
         });
+        self.note_cross_inflight();
         Ok(self.cross_slabs.len() - 1)
+    }
+
+    /// #138: record how many cross slabs are in use right now (see
+    /// [`Self::cross_inflight_peak`]). Called on every slab acquisition, which is
+    /// the only point the count can rise.
+    fn note_cross_inflight(&mut self) {
+        let n = self.cross_slabs.iter().filter(|s| s.in_use).count();
+        self.cross_inflight_peak = self.cross_inflight_peak.max(n);
     }
 
     /// Viz/trace capture: queue an async D2H of pool buffer `id` into the
@@ -2263,7 +2316,29 @@ impl Backend for CudaBackend {
         // No i32-memo reset is needed any more: `positions_i32` re-converts on
         // every request into a stable per-input buffer, so a stale value cannot
         // survive a boundary (the buffers themselves are reused).
-        self.close_capture_or_sync();
+        self.close_capture_or_sync(true);
+    }
+
+    /// #138 ([#138]): the boundary close **without the host block**.
+    ///
+    /// Everything `synchronize` does that orders the following staging copies is
+    /// still done — an open capture window is instantiated and launched (its
+    /// launches are stream-ordered before the copies, which run on this same
+    /// backend stream), and the MMQ memoization is dropped at the boundary exactly
+    /// as before. What is *not* done is the `cudaStreamSynchronize`: the copies
+    /// are already ordered behind this split's work by stream order, so blocking
+    /// the host there buys nothing, and the one wait that is required (the
+    /// device→host event) is deferred to the consumer's first read. Measured on
+    /// the 0.5B mixed-offload gate: one full stream sync per boundary removed.
+    ///
+    /// [#138]: https://github.com/yusiwen/minfer/issues/138
+    fn retire(&mut self) {
+        let _bound = self.bind();
+        if self.capturing.is_none() {
+            let _sg = self.stream_guard();
+        }
+        self.state.clear_mmq_cache();
+        self.close_capture_or_sync(false);
     }
 
     fn graph_replay(&mut self, uid: u64, range: (usize, usize), nt_hint: Option<usize>) -> bool {

@@ -433,23 +433,28 @@ impl BackendScheduler {
 - **`split_graph`** scans nodes in order and cuts whenever the assigned backend changes, then derives
   cross-split edges: a `src` living in another split becomes an `input` of this split and an `output`
   of the producer's split. The result is a contiguous partition — there is no split-merging pass.
-- **`execute`** flushes the previous backend, copies the new split's inputs across, then runs its
+- **`execute`** retires the previous backend, copies the new split's inputs across, then runs its
   nodes. Cross-backend inputs are resolved through `cross_buffer(src)` filtered to the executing
   backend, falling back to the canonical `node_buffer(src)`; this filtering matters when one value
   feeds two backends and only one staging copy exists.
-- **The boundary is two phases (F5, [#58](https://github.com/yusiwen/minfer/issues/58)).** At a
-  backend change, `execute` first **enqueues** one staging copy per entry of `Split::inputs`
-  (`GraphAllocator::copy_across`) and then **waits** on each of them
-  (`GraphAllocator::await_cross`), before any node of the consuming split runs. The transfer itself
-  is the source backend's registered hook (`BackendEntry::copy_cross`), so a device source can make
-  it an `cudaMemcpyAsync` plus a recorded event instead of the pre-F5 blocking stream-sync +
-  `cudaMemcpy` host round trip. The wait is the backend's `await_cross`: `cudaEventSynchronize` for a
-  device→host copy (host memory is about to be read — the invariant that makes it necessary), a
-  no-op for a CPU source (there is no device transfer to wait for), and `cudaStreamWaitEvent` for a
-  device consumer. One wait per copy is the contract; the consumer's read goes through
-  `GraphAllocator::cross_input`, which **refuses** a staged entry whose wait has not been issued
-  rather than consuming a transfer that may still be in flight. Counters, the not-hot-site list and
-  the per-backend table are in `BACKEND-REGISTRY-DESIGN.md` §11.
+- **The boundary is two phases (F5, [#58](https://github.com/yusiwen/minfer/issues/58); the wait is
+  deferred since [#138](https://github.com/yusiwen/minfer/issues/138)).** At a backend change,
+  `execute` first **enqueues** one staging copy per entry of `Split::inputs`
+  (`GraphAllocator::copy_across` — a no-op if that entry is already in flight, because it is the same
+  transfer into the same staging buffer), then runs the consuming split. Each staged entry's single
+  **wait** (`GraphAllocator::await_cross`) is issued at the consumer's first read of that buffer
+  (`GraphAllocator::cross_input_ready`); whatever nothing downstream reads is drained once after the
+  last split. The transfer itself is the source backend's registered hook (`BackendEntry::copy_cross`),
+  so a device source can make it an `cudaMemcpyAsync` plus a recorded event instead of the pre-F5
+  blocking stream-sync + `cudaMemcpy` host round trip. The wait is the backend's `await_cross`:
+  `cudaEventSynchronize` for a device→host copy (host memory is about to be read — the invariant that
+  makes it necessary), a no-op for a CPU source (there is no device transfer to wait for), and
+  `cudaStreamWaitEvent` for a device consumer. One wait per copy is the contract; the checked
+  `GraphAllocator::cross_input` **refuses** a staged entry whose wait has not been issued rather than
+  consuming a transfer that may still be in flight. The boundary's own `sync_backend` is gone for a
+  backend that can order its close on its own stream (`Backend::retire`), since the copies are
+  stream-ordered behind it. Counters, the not-hot-site list and the per-backend table are in
+  `BACKEND-REGISTRY-DESIGN.md` §11.
 - **KV resolution** happens before the backend borrow: `KvcacheStore`, `FusedQKV`,
   `QkvBiasRopeStore`, `FusedQkvNorm` and `Attn` (via `AttnMeta.layer`) all call `alloc.kv_pair(layer)`
   and pass it to `execute_node`.

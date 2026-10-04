@@ -9,8 +9,13 @@
 //!   an event; a backend without device memory performs the synchronous host
 //!   round trip it always did.
 //! - **phase B** (`GraphAllocator::await_cross`) *waits* on that event, exactly
-//!   once per staged input, at the documented synchronization point (before the
-//!   consuming split executes).
+//!   once per staged input. Since #138 the wait is **deferred to the consumer's
+//!   first use** of that staging buffer (`GraphAllocator::cross_input_ready`)
+//!   rather than issued for every input at the split entry, so the copies of one
+//!   boundary stay in flight while the consumer works on the ones it has already
+//!   resolved; a staged entry nothing downstream reads has its wait drained at the
+//!   end of the execution, which is what keeps the one-wait-per-copy contract
+//!   unconditional.
 //!
 //! This module owns the counters those two phases bump, so "no host-side
 //! blocking copy on the hot path" is a number a gate can read instead of a
@@ -36,11 +41,20 @@ use std::sync::OnceLock;
 /// half — the one the ticket is about.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CrossCopyStats {
-    /// Phase A: staging copies issued at a split boundary.
+    /// Phase A: staging copies issued at a split boundary. A second request for
+    /// the same `(graph, node, destination)` while the first is still in flight is
+    /// the same transfer and is **not** counted again (#138) — see
+    /// `GraphAllocator::copy_across`.
     pub copies: u64,
-    /// Phase B: waits issued at a split boundary. One per staged input, so it
-    /// equals `copies` on every path that honours the contract.
+    /// Phase B: waits issued for a staged input. One per staged input, so it
+    /// equals `copies` on every path that honours the contract — whether the wait
+    /// happened at the boundary or (since #138) at the consumer's first read.
     pub waits: u64,
+    /// The subset of `waits` issued **at the consumer's first use** of the staging
+    /// buffer instead of at the split entry (#138). On the deferred path this
+    /// equals `copies`; `waits - deferred_waits` is what the end-of-execution
+    /// drain had to pick up (staged entries nothing downstream read).
+    pub deferred_waits: u64,
     /// Phase A copies that blocked the host on a device→host read: the pre-F5
     /// path (a stream sync plus a blocking `cudaMemcpy`) and the fallback for a
     /// direction no backend has made asynchronous yet. **This is the counter the
@@ -69,6 +83,7 @@ impl CrossCopyStats {
         CrossCopyStats {
             copies: self.copies.saturating_sub(before.copies),
             waits: self.waits.saturating_sub(before.waits),
+            deferred_waits: self.deferred_waits.saturating_sub(before.deferred_waits),
             blocking_host_copies: self
                 .blocking_host_copies
                 .saturating_sub(before.blocking_host_copies),

@@ -6058,7 +6058,7 @@ its history read (`git log -S`) before it was touched.
 | `buf_hidden`, `buf_bn`, `buf_bq`, `buf_bk`, `buf_bv`, `buf_ba`, `buf_bf`, `buf_bg`, `buf_q8_bn`, `buf_q8_ba`, `buf_positions`, `kv_k`, `kv_v`, `kv_size` | **deleted** with their initializers (only `layer_gpu` read them) |
 | `tier` | **deleted**: never read from `self`; the name-level matches are `device_tier::Selection`'s own `tier` in the two select arms (the collision the census note flags). Its doc said "Direct consumers arrive with the batch-cap activation (plan §14 R8)", which is the pattern the plan's own A7 note rejects — "a future feature will need it" is not enough. The effective gate production reads is `tier_mmq`; the R8 work re-adds the field from the selection it already computes. |
 | `cc` | **kept, reported**: read by `#[cfg(test)] CudaState::cc()` (driven from `graph/cuda_backend/tests.rs`), so it is test-reachable and not a deletion. Its non-test-dead annotation is [#243](https://github.com/yusiwen/minfer/issues/243)'s tightening, the same shape T1/T2 handled for their items. |
-| `stream_wait_event` / the FFI declaration `cudaStreamWaitEvent` | **kept, pending [#138](https://github.com/yusiwen/minfer/issues/138)**: the device→device staging copy it is the mechanism for. The census brief requires this. |
+| `stream_wait_event` / the FFI declaration `cudaStreamWaitEvent` | **kept**: the device→device staging copy it is the mechanism for. [#138](https://github.com/yusiwen/minfer/issues/138) landed 2026-10-04 (the F5 S2 record) **without creating a reachable caller**: the only pair that could express a device destination needs two device backends, `copy_across` early-returns on a same-backend pair, and Metal declines phase A. So the item is still dead in every compilable configuration and the census brief requires it be named. |
 | `src/device_entry.rs` (`DEVICE_ENTRY`, `DeviceHolder`, `DeviceEntry`, `enter`) + its `mod` declaration and its test file | **deleted**: the guard exists for a caller that does not exist (#188 had already narrowed it to `layer_gpu`). |
 | `cuda_debug_enabled` + the `CUDA_DEBUG` `OnceLock` | **newly dead**, identified here and deleted in the same commit: `debug_sync` was its only reader. |
 
@@ -6199,7 +6199,7 @@ matches read rather than name-matched, and `git log -S` read where its doc claim
 | `src/server/batch/tests.rs` | — | the test mock's `format_chat` (forced by the trait change; it was an `unreachable!()`, so no assertion changes) |
 
 **Named keeps, not silent leftovers.** `cudaStreamWaitEvent` + `CudaState::stream_wait_event` stay
-pending [#138](https://github.com/yusiwen/minfer/issues/138) (open — the F5 device→device staging copy). `ModelDef::forward_graph` stays because its
+reserved for the F5 device→device staging copy, which [#138](https://github.com/yusiwen/minfer/issues/138) (landed 2026-10-04) found unreachable — see the F5 S2 record. `ModelDef::forward_graph` stays because its
 only caller is `models::qwen2::graph::tests`'s `#[cfg(target_os = "macos")]` block
 (`tests.rs:3021`): the Linux census cannot compile it, `cargo test` on a Mac would not compile if the
 method were deleted, and CI's macOS job (`cargo build --release`) would not catch the break. That is
@@ -6413,7 +6413,7 @@ code** items, not the 40 + 7 [#242] reconciled, and the item this recovery adds 
 `RopeStyle::Interleaved` — is one of [#244]'s own (its bare `#[allow(dead_code)]` is now
 `#[cfg_attr(not(test), allow(dead_code))]`, the test that constructs it being `graph::op_matrix`).
 
-The 7 code items are `cudaStreamWaitEvent` + `CudaState::stream_wait_event` (pending [#138]),
+The 7 code items are `cudaStreamWaitEvent` + `CudaState::stream_wait_event` (reserved for the F5 device→device staging copy — still unreachable after [#138](https://github.com/yusiwen/minfer/issues/138)),
 `KvCache::set_owner`, `OffloadPlan::all_on_device`, `ModelDef::{as_any, forward_graph, offload}`.
 
 **Verdict table (all 48).**
@@ -6423,7 +6423,7 @@ The 7 code items are `cudaStreamWaitEvent` + `CudaState::stream_wait_event` (pen
 | **delete** (internal, never read in any build, no API contract) | `SampledToken::logit`; `Slot::id`; `KVCacheLayer::{k,v,size,max_size,dim}` + `KVCache::layers` | **yes** |
 | **wire the lost caller** (small, behaviour-preserving) | `OffloadPlan::all_on_device` (called by `resolve`'s unset-request arm) | **yes** |
 | **keep + honest note, precise annotation** | `DType::{F16,Q8_0}`; `Op::{Scale,Softmax,Reshape,Permute,BatchMatMul}`; `AttnMode::Mha`; `RopeStyle::Interleaved`; `TimingMode::{Off,Private}`; `OffloadRequest::AutoWithBudget`; `HfCheckpoint::order` (deferred to [#209]); `Tokenizer::{id_to_score,id_to_type}`; `Vendor::{Amd,Mthreads,Apple}`; `QClass::Other`; `DeviceTier::{source,mmvq_batch_default,mmvq_batch_by_type}`; `TurnOutcome::{text,stopped_by_eog,stopped_by_string}`; `Tokenizer::{special_tokens,im_start,im_end}`; `BackendCaps::{supports_op,supports_fused,supports_attn_span}`; `BackendEntry::name`; `ModelDef::{as_any,forward_graph,offload}` | **yes** (annotation + note; the membership questions are escalated) |
-| **keep, nothing to change** | `CudaState::cc` (already `not(test)` from [#243]); `cudaStreamWaitEvent` + `stream_wait_event` (bare, dead in every build, pending [#138]) | n/a |
+| **keep, nothing to change** | `CudaState::cc` (already `not(test)` from [#243]); `cudaStreamWaitEvent` + `stream_wait_event` (bare, dead in every build — [#138](https://github.com/yusiwen/minfer/issues/138) landed 2026-10-04 and did not create a reachable caller) | n/a |
 | **escalate, do not land** | `BackendCaps` **authority**; `ModelDef::as_any`; `ModelDef::offload`; `KvCache::set_owner`; the deferred `DType`/`Op`/`RopeStyle` variant **membership**; removing `ModelDef::forward`'s `&mut KVCache` | **no** |
 
 Two annotation-shape corrections ride along: `Op::View`'s `#[allow(dead_code)]` was **unnecessary**
@@ -6657,7 +6657,7 @@ the 4 stale comments the deletions exposed. It lands as [PR #257]. It is the Lay
 [#254] names for its shape ratchet ("resolve the 40 bare/other `allow(dead_code)` sites … so Layer
 1's rule starts from a clean baseline"). The two macOS-only sites (`src/metal.rs:971`, `:2029`) stay
 with [#255], which needs a Mac; the 9 bare-**correct** deferred sites (`HfCheckpoint::order` —
-[#209] owns apply-or-drop — the two [#138]-pending `cuda.rs` items,
+[#209] owns apply-or-drop — the two `cuda.rs` items [#138](https://github.com/yusiwen/minfer/issues/138) reserved and left dead,
 `Vendor::{Amd,Mthreads,Apple}`, `tokenizer.rs::{id_to_score,id_to_type}`, `AttnMode::Mha`) stay bare,
 because bare is the precise spelling for an item dead in *every* compilable configuration.
 
@@ -7151,7 +7151,7 @@ Can run in parallel with A–E by a different workstream.
 | F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost) | M | dgxspark |
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | dgxspark |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
-| F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (true overlap) | M | dgxspark (CUDA) |
+| F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
 | F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC + the remaining pre-tokenizer rules) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
@@ -8042,7 +8042,8 @@ wait), so there is no independent work for a copy to overlap with, and a
 host-side consumer must wait by definition. What the substrate buys today is that
 the transfers are enqueued back to back and the redundant per-copy stream syncs
 disappear — the 34 → 27 measurement above. Deferring a wait to the consumer's
-first use is [#138](https://github.com/yusiwen/minfer/issues/138). (c) **Only
+first use landed as [#138](https://github.com/yusiwen/minfer/issues/138)
+(2026-10-04; the F5 S2 record is below). (c) **Only
 CUDA has an async device path**, and only the CUDA→host direction (a device→device
 staging copy is unreachable — `copy_across` early-returns when source and
 destination backends match; CUDA→Metal on a macOS+CUDA build declines and stays
@@ -8061,6 +8062,126 @@ allocator-level missing-wait invariant plus the graph-level refusal through
 (`scheduler::tests::a_staged_boundary_input_cannot_be_consumed_before_its_wait`),
 and the CPU no-op/bitwise gate. The mutation's CUDA failure output above is the
 record of the part CI cannot reach.
+
+### F5 S2 — the cross-backend wait is deferred to the consumer (#138) — **DONE 2026-10-04**
+
+**The ticket.** [#138](https://github.com/yusiwen/minfer/issues/138) is F5's overlap follow-up: F5
+enqueued one staging copy per `Split::inputs` entry and then waited on **every** one of them at the
+split entry, so no copy could overlap anything, and the boundary also paid a full
+`cudaStreamSynchronize` to retire a producer whose work the copies were already stream-ordered
+behind.
+
+**What landed.**
+
+- `src/graph/scheduler.rs` — the boundary calls `GraphAllocator::retire_backend(previous)` instead of
+  `sync_backend(previous)`, its phase-B loop is gone, the node loop resolves each source through
+  `GraphAllocator::cross_input_ready`, and `drain_cross_pending()` runs after the last split.
+- `src/graph/backend.rs` — a new `Backend::retire`, whose default body is `synchronize` (Metal's
+  boundary *is* a submission, so it still blocks there) with the reason the CUDA override is safe.
+- `src/graph/cuda_backend.rs` — `CudaBackend::retire` closes the capture window and drops the MMQ
+  memoization **without** the `cudaStreamSynchronize`; `close_capture_or_sync(block)` is that one
+  difference; `CudaBackend::cross_inflight_peak()` is the device-side overlap metric.
+- `src/graph/alloc.rs` — `cross_input_ready` (the deferred wait), `drain_cross_pending`,
+  `retire_backend`, and a `copy_across` that is idempotent while an entry is in flight.
+- `src/graph/copystats.rs` — `CrossCopyStats::deferred_waits`.
+
+**The reading of the ambiguous acceptance line, recorded here and in the issue comment.** "A boundary
+with several staged inputs waits **once**, at the first actual use, not once per input at the split
+entry" is read as *each staged entry's single wait is issued at its first use*, not as *one wait per
+boundary*: F5's documented contract is one phase-B call per phase-A copy
+(`BACKEND-REGISTRY-DESIGN.md` §11.2), and the ticket's fourth acceptance line keeps
+`GraphAllocator::cross_input`'s refusal of a pending entry, which a per-boundary collapse of the wait
+count would have to weaken. The counters show the deferral: `deferred_waits == copies` on the
+deferred path.
+
+**The finding the deferral exposed (fixed in the same commit).** With the wait deferred, the same
+`(graph, node, destination)` can be staged by **two** boundaries of one execution while the first
+copy is still in flight — a state unreachable under F5, which always awaited before re-enqueuing.
+Re-issuing it duplicated the transfer *and* pushed a second `CrossPending` record into `CudaBackend`
+that the allocator's single pending key would never wait on: a leaked pinned slab and event. Measured
+on the 0.5B gate before the fix: **56 copies / 47 waits**, 18 in-flight re-requests and 6 drains of 4.
+`copy_across` now returns early while its entry is pending (same staging buffer, one unchanged source
+node), so the contract holds again and `copies` means *unique transfers per execution*.
+
+**Measured acceptance (box `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04).** The bar was named from
+the F5 record (34 → 27 stream syncs, 7 → 0 blocking D2H). On this box the *pre-change* tree at
+`6b6d94f` measures **21** stream syncs for the same gate and mode (the ticket's 27 is the
+2026-09-24/27 measurement), so the same gate's printed output is the before/after:
+
+| | F5 (measured at `6b6d94f`) | #138 |
+|---|---|---|
+| staging copies (`copies`) | 56 | 47 (9 in-flight re-requests deduped) |
+| waits (`waits`) | 56 | 47 |
+| of which deferred to a consumer read | 0 | 35 |
+| blocking device→host copies | 0 | 0 |
+| device-level blocking readbacks | 0 | 0 |
+| **full stream syncs** | **21** | **0** |
+| max \|Δlogit\| vs `MINFER_SYNC_COPIES=1` | 0 | **0** |
+
+The cheap device gate (`cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise`,
+3 nodes CPU → CUDA → CPU) reads: async `copies=2 waits=2 deferred=2 blocking=0 async_host=1
+event_syncs=1 readbacks=0 syncs=0` against the F5 reading `syncs=1`; sync mode `copies=2 waits=2
+blocking=1 readbacks=1 syncs=1` (F5: 2).
+
+The new overlap gate
+(`cuda_backend::tests::a_boundary_with_several_staged_inputs_defers_its_waits`) makes the device split
+produce **two** values the CPU split consumes, with an independent CPU node between the boundary and
+the first staged read. Two deterministic device-side metrics:
+
+- **in-flight copies** — the pinned-slab high-water mark is **2** for the deferred boundary, while the
+  F5 enqueue-then-wait discipline, driven by hand on the same buffers in the same test, cannot exceed
+  **1** (the wait releases the slab before the next copy takes one). This is the "enqueuing copy N+1
+  while copy N is in flight" measurement.
+- **host stalls** — `stream_syncs` is **0** for the deferred boundary and **2** for the synchronous
+  reference over the same two device→host copies; `copies == waits == 3` and
+  `deferred_waits == 3`, bitwise against the reference.
+
+The gate also asserts the dedup directly: two `copy_across` calls for one pending entry count as
+**one** copy and owe **one** wait.
+
+**Mutation evidence (reverted; the tree was restored byte-identical).** The node loop's resolver was
+replaced with a bare `cross_input` — i.e. the deferral removed, the F5 read path restored:
+
+```text
+graph::cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise
+  panicked: "staged cross-backend input 0 for Cuda was read before its boundary wait: every
+  copy_across owes one await_cross (F5, #58)"
+graph::cuda_backend::tests::a_boundary_with_several_staged_inputs_defers_its_waits
+  panicked: "staged cross-backend input 0 for Cuda was read before its boundary wait: …"
+graph::scheduler::tests::a_staged_boundary_input_is_waited_on_at_its_first_use
+  panicked: "staged cross-backend input 1 for CPU was read before its boundary wait: …"
+models::qwen2::graph::tests::async_cross_copies_never_block_and_stay_bitwise_identical
+  panicked: "staged cross-backend input 3 for Cuda was read before its boundary wait: …"
+```
+
+**Suite counts.** `cargo test --release` **481 / 0 / 36** unit + **10 / 0 / 6** integration (baseline
+480 / 0 / 36; `graph::alloc::tests::the_drain_waits_on_a_staged_entry_nothing_read` is the new
+feature-independent gate). `scripts/cuda_test.sh` **567 / 0 / 42** (baseline 565 / 0 / 42; the same
+alloc gate plus `cuda_backend::tests::a_boundary_with_several_staged_inputs_defers_its_waits`; no
+`#[ignore]`d test moved). `FEATURES=cuda scripts/real_model_gates.sh` **42 / 0** on the cached 0.5B
+and **42 / 0** with `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf`. `cargo build --release
+--features cuda` and `cargo test --release --features cuda --no-run` are clean, and
+`cargo fmt --all --check` is clean on the pinned 1.97.1 toolchain.
+
+**Honest scope.** (a) **Metal is still unported** ([#137](https://github.com/yusiwen/minfer/issues/137)):
+its `copy_cross` declines, `Backend::retire`'s default keeps its boundary blocking, and its copies
+still count as blocking — no half-written blit/event code. (b) **The `cudaStreamWaitEvent`
+device-consumer arm is not reached**: the ticket's first bullet asks for it, but the only pair that
+could express a device destination would need two device backends, `copy_across` early-returns on a
+same-backend pair, and CUDA→Metal (macOS + CUDA) declines phase A — so a call site would be
+unreachable code, exactly what Core Convention 5 asks about rather than silences. The *observable*
+requirement of that bullet — "a device consumer does not block the host" — is met by the CPU→device
+direction, whose fill is already stream-ordered on the destination pool's own stream (§11.3). The two
+grandfathered bare sites therefore **stay dead in every configuration**, and this PR leaves
+`GRANDFATHERED_BARE` and `docs/dead-code-baseline.toml` unchanged; the stripped oracle confirms it
+below. (c) **True cross-split overlap is still not claimed** — the split loop remains sequential;
+what the deferral buys is that the wait happens where the data is read, not where it was produced.
+
+**The dead-code ratchet, measured.** `python3 scripts/check_dead_code_annotations.py` reports the
+same **11** grandfathered bare sites (this PR adds no annotation and tightens none), and the stripped
+oracle run with `RUSTFLAGS=--cap-lints=warn` and `RUSTUP_TOOLCHAIN` unset reports **0 additions** in
+both configurations — the `(name, kind)` set difference against
+`docs/dead-code-baseline.toml` is empty, so neither site became live and neither entry went stale.
 
 ### F6 — Quantizer tooling: convert, quantize, split (#49) — **DONE 2026-09-24**
 

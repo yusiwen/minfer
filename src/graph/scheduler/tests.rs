@@ -247,27 +247,30 @@ fn a_concurrent_graph_load_cannot_move_a_private_sink() {
     crate::optiming::reset(); // leave the shared sink as we found it
 }
 
-/// F5 ([#58]) gate: **a staged cross-backend input cannot be consumed before
-/// its boundary wait**.
+/// F5 ([#58]) + #138 gate: **a staged cross-backend input is waited on at its
+/// first use, and the checked accessor still refuses a pending read.**
 ///
-/// This is the ticket's second acceptance line made deterministic on a
-/// CPU-only build. The test puts the allocator in exactly the state between
-/// phase A and phase B (a staged entry that has not been waited on), runs the
-/// **real** `execute` — whose node loop resolves every input through
-/// `cross_input` — and asserts it fails **loudly**, naming the missing wait,
-/// instead of consuming the staging buffer. Issuing the wait publishes the
-/// entry and the same graph then executes to completion.
+/// Two halves, both deterministic on a CPU-only build:
+///
+/// * `cross_input` — the accessor F5 built — still turns a still-pending entry
+///   into a loud `Err` naming the missing wait. The #138 deferral does **not**
+///   weaken that: it adds a resolver in front of the read, it does not remove the
+///   refusal.
+/// * the **real** `execute` resolves the entry at the moment its first consumer
+///   runs and counts that as a *deferred* wait. Removing the resolver from the
+///   node loop (going back to a bare `cross_input`) makes this half fail with the
+///   same message as the first — which is the mutation this gate catches.
 ///
 /// Why the state is injected with a test hook rather than produced by a real
 /// boundary: a boundary needs two usable backends, and the only backend a
 /// CPU-only CI can enable is the CPU (a cross-backend split on this build
 /// would have to be a device). The CUDA
-/// `async_cross_copies_never_block_and_stay_bitwise_identical` gate produces
+/// `a_boundary_with_several_staged_inputs_defers_its_waits` gate produces
 /// the state end-to-end on a device; together they cover the invariant from
-/// both ends. The mutation evidence (dropping the boundary's `await_cross`
-/// loop) is recorded in `docs/ARCHITECTURE-EXECUTION-PLAN.md`.
+/// both ends. The mutation evidence is recorded in
+/// `docs/ARCHITECTURE-EXECUTION-PLAN.md`.
 #[test]
-fn a_staged_boundary_input_cannot_be_consumed_before_its_wait() {
+fn a_staged_boundary_input_is_waited_on_at_its_first_use() {
     let g = small_graph();
     let sched = BackendScheduler::new();
     let mut alloc = GraphAllocator::new();
@@ -280,19 +283,27 @@ fn a_staged_boundary_input_cannot_be_consumed_before_its_wait() {
     alloc.stage_cross_for_test(g.uid, 1, BackendTag::CPU, br.id, br.len);
     alloc.mark_cross_pending_for_test(g.uid, 1, BackendTag::CPU);
 
-    let err = sched
-        .execute(&g, &mut alloc)
-        .expect_err("a pending staged input must not be consumed");
+    // F5's invariant, unchanged by the deferral: the checked accessor refuses to
+    // publish a pending entry.
+    let err = alloc
+        .cross_input(g.uid, 1, BackendTag::CPU)
+        .expect_err("a pending staged input must not be published");
     assert!(
         err.contains("was read before its boundary wait"),
         "the refusal must name the missing wait, got: {err}"
     );
     assert!(err.contains("#58"), "{err}");
 
-    // Phase B publishes it; the graph then runs. (The staged reference is the
-    // canonical buffer, so the values are unchanged.)
-    alloc.await_cross(g.uid, 1, BackendTag::CPU).unwrap();
+    // `execute` issues that wait at node 2's first use. (The staged reference is
+    // the canonical buffer, so the values are unchanged.)
+    let before = alloc.cross_stats();
     sched.execute(&g, &mut alloc).unwrap();
+    let stats = alloc.cross_stats().delta(before);
+    assert_eq!(
+        stats.deferred_waits, 1,
+        "the pending entry's wait was issued at the consumer's first use: {stats:?}"
+    );
+    assert!(stats.all_copies_awaited(), "{stats:?}");
     let silu = |v: f32| v / (1.0 + (-v).exp());
     let got = alloc.get_buffer(&g, 2).unwrap();
     for i in 0..4 {

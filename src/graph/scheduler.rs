@@ -4,10 +4,12 @@
 //! - `assign_backends`: per-op capability-driven assignment
 //! - `split_graph`: partition into contiguous same-backend splits, deriving
 //!   cross-split inputs/outputs
-//! - `execute`: per split — sync the previous backend, copy split inputs
-//!   across backends, run the nodes (each backend batches its ops into one
-//!   command buffer, flushed at the boundary via `synchronize`), then a final
-//!   sync.
+//! - `execute`: per split — retire the previous backend (`retire`, which since
+//!   #138 does not block the host when the backend can order its close on its own
+//!   stream), copy split inputs across backends, run the nodes (each backend
+//!   batches its ops into one command buffer, flushed at the boundary via
+//!   `synchronize`), then a final sync. Each staged input's wait is **deferred to
+//!   its first use**, and whatever is left over is drained at the end.
 //!
 //! Nodes execute in **build order** (the builder appends sources before
 //! consumers, so this is a valid topological order — matching ggml, which
@@ -217,29 +219,37 @@ impl BackendScheduler {
         for split in &splits {
             if let Some(pb) = prev_backend {
                 if pb != split.backend {
-                    // 1. flush the previous backend's async work
-                    alloc.sync_backend(pb);
+                    // 1. #138 ([#138]): retire the previous backend's async work
+                    //    **without blocking the host** where the backend can order
+                    //    it on its own stream. The close itself is not skipped — a
+                    //    CUDA capture window is instantiated and launched, and the
+                    //    MMQ memoization is dropped, exactly as `synchronize` did —
+                    //    but the `cudaStreamSynchronize` is gone: the copies
+                    //    enqueued in step 2 run on that same stream and are
+                    //    therefore already ordered behind this split's work, so a
+                    //    host block here buys no ordering. A backend whose boundary
+                    //    work *is* a submission (Metal) still blocks here, which is
+                    //    what `Backend::retire`'s default body expresses.
+                    alloc.retire_backend(pb);
                     // 1b. staged Metal/CUDA captures are valid now — read back
                     flush_metal_captures(graph, alloc, &mut staged, trace_on, live_on);
                     flush_cuda_captures(graph, alloc, &mut cuda_caps, trace_on, live_on);
                     // 2. F5 phase A — enqueue this split's cross-backend staging
                     //    copies. A device source's transfer is an async
                     //    `cudaMemcpyAsync` plus a recorded event; nothing here
-                    //    blocks the host on a copy.
+                    //    blocks the host on a copy, and the boundary enqueues every
+                    //    input before any of them is waited on, so the copies overlap
+                    //    each other and the consumer's independent work.
                     for &inp in &split.inputs {
                         alloc.copy_across(graph.uid, inp, split.backend)?;
                     }
-                    // 3. F5 phase B — the split boundary's **synchronization
-                    //    points**: one wait per staged input, in the same order,
-                    //    before any consumer can read the staging buffer. This is
-                    //    the wait the missing-wait gate is about: dropping it
-                    //    leaves the staging entry pending, and the consumer's read
-                    //    below (`cross_input`) fails loudly instead of reading a
-                    //    transfer that may still be in flight. See
-                    //    `docs/BACKEND-REGISTRY-DESIGN.md` §11.
-                    for &inp in &split.inputs {
-                        alloc.await_cross(graph.uid, inp, split.backend)?;
-                    }
+                    // 3. #138 phase B is **deferred**: the boundary no longer waits
+                    //    per input here. Each staged entry's single wait is issued at
+                    //    the consumer's first read (`cross_input_ready` in the node
+                    //    loop below), and anything nothing reads is drained after the
+                    //    last split. The missing-wait gate is unchanged: a consumer
+                    //    that reaches `cross_input` with the entry still pending is a
+                    //    loud `Err`. See `docs/BACKEND-REGISTRY-DESIGN.md` §11.
                 }
             }
             // CUDA Graph replay (Phase 7d): a captured split replays its whole
@@ -301,11 +311,15 @@ impl BackendScheduler {
                     // the node's canonical buffer (already on this split's
                     // backend when no copy was needed).
                     //
-                    // F5: `cross_input` (not the raw `cross_buffer`) so a staged
-                    // entry whose boundary wait was skipped is a loud error, never
-                    // a read of an in-flight transfer.
+                    // F5/#138: `cross_input_ready` (not the raw `cross_buffer`) —
+                    // it issues a still-pending entry's phase-B wait *here*, at
+                    // this consumer's first use, and then hands the buffer over
+                    // through the checked `cross_input`, whose refusal of a
+                    // pending entry is the missing-wait gate. Deferring the wait
+                    // to this point is what lets the boundary's other copies stay
+                    // in flight while this node runs.
                     let sbr = alloc
-                        .cross_input(graph.uid, s, split.backend)?
+                        .cross_input_ready(graph.uid, s, split.backend)?
                         .or_else(|| alloc.node_buffer(s))
                         .ok_or_else(|| format!("node {s} has no allocated buffer"))?;
                     in_bufs.push(sbr);
@@ -413,6 +427,12 @@ impl BackendScheduler {
             }
             prev_backend = Some(split.backend);
         }
+        // #138: every staged entry owes exactly one wait. The consumer path
+        // issued the ones it read; this drains the rest (a split the replay path
+        // skipped, a node without a buffer), so `copies == waits` holds no matter
+        // what the consumer did with its inputs — and so a pinned slab and its
+        // event cannot outlive the execution that opened them.
+        alloc.drain_cross_pending()?;
         if let Some(pb) = prev_backend {
             alloc.sync_backend(pb);
             flush_metal_captures(graph, alloc, &mut staged, trace_on, live_on);

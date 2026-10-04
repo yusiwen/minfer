@@ -129,6 +129,11 @@ pub struct GraphAllocator {
     /// loudly, so a boundary that drops its wait is a named error instead of a
     /// read of in-flight device data.
     ///
+    /// Since #138 the boundary does not clear them itself: the consumer's first
+    /// read does (`cross_input_ready`), and whatever is left at the end of the
+    /// execution is drained there — see [`Self::drain_cross_pending`]. The set is
+    /// therefore the list of copies still in flight, not of copies issued.
+    ///
     /// Cleared at every `alloc_graph` (a rebuild starts a fresh execution, and no
     /// copy can be in flight across it — the boundary either completed or failed).
     cross_pending: HashSet<(u64, NodeId, Backend)>,
@@ -2352,12 +2357,30 @@ impl GraphAllocator {
         self.cpu.alloc_count()
     }
 
-    /// Flush a backend's pending async work (split boundary / end).
+    /// Flush a backend's pending async work **and block the host** (end of an
+    /// execution, or a session/diagnostic read).
     pub fn sync_backend(&mut self, backend: Backend) {
         // The CPU's `synchronize` is a no-op, and a pool that is not enabled has
         // no pending work — so one path serves every backend.
         if let Some(pool) = self.pool_mut(backend) {
             pool.synchronize();
+        }
+    }
+
+    /// #138 ([#138]): retire a producer split at a cross-backend boundary.
+    ///
+    /// Identical to [`Self::sync_backend`] except that the pool is asked for
+    /// [`Backend::retire`] rather than [`Backend::synchronize`]: a backend that
+    /// can order its boundary work on its own stream (CUDA) closes the split
+    /// without blocking the host, because the staging copies that follow are
+    /// stream-ordered behind it and their one required wait is deferred to the
+    /// consumer. A backend whose boundary work is a submission (Metal) blocks
+    /// here, exactly as it did before — that block *is* the ordering.
+    ///
+    /// [#138]: https://github.com/yusiwen/minfer/issues/138
+    pub fn retire_backend(&mut self, backend: Backend) {
+        if let Some(pool) = self.pool_mut(backend) {
+            pool.retire();
         }
     }
 
@@ -2381,8 +2404,10 @@ impl GraphAllocator {
     /// `cross_pending` **before** the hook runs, so the contract "every staged
     /// input owes exactly one wait" holds even when the hook fails.
     ///
-    /// Phase B is [`Self::await_cross`]; the consumer's read is
-    /// [`Self::cross_input`], which refuses to hand out a still-pending entry.
+    /// Phase B is [`Self::await_cross`]; the consumer reads through
+    /// [`Self::cross_input_ready`], which issues a still-pending entry's wait at
+    /// that first use (#138) and then hands the buffer over, refusing to publish
+    /// one that is somehow still pending.
     pub fn copy_across(
         &mut self,
         uid: u64,
@@ -2393,6 +2418,19 @@ impl GraphAllocator {
             .node_buffer(node_id)
             .ok_or_else(|| format!("node {node_id} has no buffer"))?;
         if br.backend == dst_backend {
+            return Ok(());
+        }
+        // #138: a second request for the same `(graph, node, destination)` while
+        // the first transfer is still in flight is the **same** transfer — the
+        // staging buffer is keyed on exactly that triple, and the node's buffer
+        // cannot change under one execution. Re-issuing it would duplicate the
+        // copy and leave the first record's slab and event behind (the allocator
+        // clears one pending key per entry, so the second record would never be
+        // waited on). Under the F5 boundary this state was unreachable, because
+        // the first copy was always awaited before the second was enqueued; a
+        // deferring scheduler is what makes it reachable, so the copy becomes
+        // idempotent while it is in flight.
+        if self.cross_pending.contains(&(uid, node_id, dst_backend)) {
             return Ok(());
         }
         let dst = self.cross_staging(uid, node_id, dst_backend)?;
@@ -2495,7 +2533,13 @@ impl GraphAllocator {
     }
 
     /// F5 **phase B**: wait on the event [`Self::copy_across`]'s hook recorded,
-    /// exactly once per staged input, before the consuming split executes.
+    /// exactly once per staged input.
+    ///
+    /// Since #138 the caller is the consumer's first read
+    /// ([`Self::cross_input_ready`]) rather than the split-boundary loop, and the
+    /// end-of-execution drain ([`Self::drain_cross_pending`]) picks up whatever
+    /// nothing downstream read. The count is the same either way — one call per
+    /// phase-A copy is the contract.
     ///
     /// The wait itself is the source backend's registered `await_cross` hook: a
     /// device source waits on its recorded event (a host block for a device→host
@@ -2571,9 +2615,10 @@ impl GraphAllocator {
     ///
     /// Unlike [`Self::cross_buffer`], this **refuses** an entry whose phase-B wait
     /// has not been issued: reading it would read a transfer that may still be in
-    /// flight. The scheduler uses this (never the raw accessor) precisely so that
-    /// dropping the boundary's wait is a loud, named failure — "no host-side
-    /// blocking copy" must never be bought with a missing synchronization.
+    /// flight. [`Self::cross_input_ready`] (the consumer path) resolves a pending
+    /// entry first and then calls this; a reader that skips the resolver is still a
+    /// loud, named failure — "no host-side blocking copy" must never be bought
+    /// with a missing synchronization.
     pub fn cross_input(
         &self,
         uid: u64,
@@ -2591,6 +2636,59 @@ impl GraphAllocator {
             ));
         }
         Ok(Some(staged))
+    }
+
+    /// #138 ([#138]): the consumer's **first actual use** of a staged input — the
+    /// deferred phase B.
+    ///
+    /// The split boundary no longer waits for every entry of `Split::inputs` up
+    /// front; it only enqueues them (phase A). This is the accessor the consumer
+    /// path uses instead of [`Self::cross_input`]: a still-pending entry has its
+    /// wait issued *here*, at the moment this consumer is about to read it, so the
+    /// boundary's other copies stay in flight while the consumer works. The wait
+    /// itself is unchanged — the source backend's registered `await_cross` hook,
+    /// once per copy, with the counters of [`super::copystats::CrossCopyStats`]
+    /// recording it.
+    ///
+    /// The missing-wait invariant is **not** weakened: [`Self::cross_input`] still
+    /// refuses a pending entry, and this accessor is the only production caller
+    /// that clears the flag on the read path. A consumer that reaches the raw
+    /// accessor without resolving first is still the loud `Err` F5 built.
+    ///
+    /// [#138]: https://github.com/yusiwen/minfer/issues/138
+    pub fn cross_input_ready(
+        &mut self,
+        uid: u64,
+        node_id: NodeId,
+        backend: Backend,
+    ) -> Result<Option<BufRef>, String> {
+        if self.cross_pending.contains(&(uid, node_id, backend)) {
+            self.await_cross(uid, node_id, backend)?;
+            self.cross_stats.deferred_waits += 1;
+        }
+        self.cross_input(uid, node_id, backend)
+    }
+
+    /// #138: drain every staged entry whose wait was never issued, so the
+    /// one-wait-per-copy contract holds unconditionally.
+    ///
+    /// A deferred wait is issued at the consumer's first read, and a boundary may
+    /// stage an input that no consumer node reads in this execution — a split the
+    /// scheduler skips because it replayed a captured graph, or a node the
+    /// allocation pass left without a buffer. Those entries would otherwise keep
+    /// `copies > waits` forever (the missing-wait gate) and, worse, hold a pinned
+    /// slab and an event. The scheduler calls this once, after the last split; the
+    /// waits it issues are not counted as deferred, because they are not issued at
+    /// a use.
+    ///
+    /// [#138]: https://github.com/yusiwen/minfer/issues/138
+    pub fn drain_cross_pending(&mut self) -> Result<(), String> {
+        // Snapshot: `await_cross` mutates `cross_pending`.
+        let pending: Vec<(u64, NodeId, Backend)> = self.cross_pending.iter().copied().collect();
+        for (uid, node_id, backend) in pending {
+            self.await_cross(uid, node_id, backend)?;
+        }
+        Ok(())
     }
 
     /// The staging buffer a consumer on `backend` must read for `node_id`, if a

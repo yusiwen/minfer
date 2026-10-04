@@ -1097,10 +1097,11 @@ fn a_partial_offload_runs_the_rest_on_the_cpu() {
     eprintln!("[e5] {k}/{n_layers} blocks on cuda, {steps} greedy steps match the CPU run");
 }
 
-/// F5 ([#58]) acceptance on the real model: a split graph's cross-backend
-/// staging copies are **asynchronous**, the boundary still issues exactly one
-/// event wait per staged input, and the results are **bitwise identical** to
-/// the pre-F5 synchronous reference.
+/// F5 ([#58]) + #138 ([#138]) acceptance on the real model: a split graph's
+/// cross-backend staging copies are **asynchronous**, every staged input owes
+/// exactly one event wait — issued since #138 at the consumer's first use rather
+/// than at the split boundary — the boundary close no longer blocks the host, and
+/// the results are **bitwise identical** to the pre-F5 synchronous reference.
 ///
 /// The test runs the *same* mixed model (the E5 offload plan, so the graph
 /// really does alternate CPU and CUDA splits) twice — once with the async
@@ -1113,10 +1114,15 @@ fn a_partial_offload_runs_the_rest_on_the_cpu() {
 /// What it asserts, and why each half matters:
 ///
 /// - **the missing-wait gate** — `copies == waits` (one phase-B wait per
-///   phase-A copy) and `waits > 0`. The counts are deterministic; dropping the
-///   boundary's `await_cross` loop makes them unequal *and* leaves the staging
-///   entry pending, which `GraphAllocator::cross_input` turns into a loud
-///   error the moment the consumer reads it. The mutation was recorded.
+///   phase-A copy) and `waits > 0`. The counts are deterministic; removing the
+///   consumer path's resolver (a bare `cross_input` in the node loop) makes them
+///   unequal *and* leaves the staging entry pending, which
+///   `GraphAllocator::cross_input` turns into a loud error the moment the
+///   consumer reads it. The mutation was recorded.
+/// - **the deferral (#138)** — `deferred_waits >= async_host_copies`: every
+///   device→host copy is read by the host consumer, so its wait is issued at that
+///   read (the boundary issues none). The entries nothing read are drained at the
+///   end of the execution and show up as the `waits - deferred_waits` difference.
 /// - **the no-blocking-copy gate** — `blocking_host_copies == 0` in async mode
 ///   and `== copies` in sync mode, plus the device-level
 ///   `CudaBackend::blocking_readback_count()` (which counts actual blocking
@@ -1124,13 +1130,16 @@ fn a_partial_offload_runs_the_rest_on_the_cpu() {
 ///   measured before/after numbers.
 /// - **the host stalls** — the backend's own `stream_sync_count()` around the
 ///   run. The pre-F5 path synced the whole stream once *per staged input
-///   inside* `copy_to_host`; the async path issues none of those. This is the
-///   latency-shaped evidence, and it is a hard count, not a timing. It is read
-///   **through the backend** ([#185]): a process-wide counter let a concurrent
-///   device test's stalls land between the two snapshots (run A read 4160 async
-///   vs 728 sync — the harness's own load, not the async path). That
-///   process-wide counter was deleted in [#242].
+///   inside* `copy_to_host`; the async path issues none of those, and since #138
+///   the boundary close issues none either (the copies are stream-ordered behind
+///   the producer, so that sync was redundant). This is the latency-shaped
+///   evidence, and it is a hard count, not a timing. It is read **through the
+///   backend** ([#185]): a process-wide counter let a concurrent device test's
+///   stalls land between the two snapshots (run A read 4160 async vs 728 sync —
+///   the harness's own load, not the async path). That process-wide counter was
+///   deleted in [#242].
 ///
+/// [#138]: https://github.com/yusiwen/minfer/issues/138
 /// [#185]: https://github.com/yusiwen/minfer/issues/185
 /// [#242]: https://github.com/yusiwen/minfer/issues/242
 ///
@@ -1239,10 +1248,11 @@ fn async_cross_copies_never_block_and_stay_bitwise_identical() {
     drop(gate);
 
     eprintln!(
-        "[f5] async: copies={} waits={} blocking_host_copies={} async_host_copies={} \
-         event_syncs={} stream_waits={} blocking_readbacks={} stream_syncs={}",
+        "[f5] async: copies={} waits={} deferred_waits={} blocking_host_copies={} \
+         async_host_copies={} event_syncs={} stream_waits={} blocking_readbacks={} stream_syncs={}",
         a.copies,
         a.waits,
+        a.deferred_waits,
         a.blocking_host_copies,
         a.async_host_copies,
         a.event_syncs,
@@ -1274,6 +1284,19 @@ fn async_cross_copies_never_block_and_stay_bitwise_identical() {
     assert_eq!(
         s.copies, s.waits,
         "the synchronous reference issues the same one-wait-per-copy contract"
+    );
+    // ── the deferred-wait half (#138) ────────────────────────────────────
+    // Every device→host copy is read by the host consumer, so its wait is
+    // issued at that read. The CPU→device entries are a mixed bag: the device
+    // split's node loop resolves them while it runs, and a split that replayed a
+    // captured graph has none — those are drained at the end of the execution and
+    // are the reason `deferred_waits` is a floor here, not an equality.
+    assert!(
+        a.deferred_waits >= a.async_host_copies,
+        "the host consumer's reads must be what issues the device→host waits: \
+         {} deferred vs {} async device→host copies",
+        a.deferred_waits,
+        a.async_host_copies
     );
 
     // ── the no-blocking-copy-on-the-hot-path gate ────────────────────────
@@ -1313,15 +1336,17 @@ fn async_cross_copies_never_block_and_stay_bitwise_identical() {
 
     // ── host stalls removed ──────────────────────────────────────────────
     // The pre-F5 path synced the whole stream once per staged input inside
-    // `copy_to_host`; the async path syncs only at the split boundary itself.
+    // `copy_to_host`; F5 removed those, and #138 removed the boundary's own sync
+    // too (the copies are stream-ordered behind the producer). What is left is
+    // what a backend's own submission needs.
     assert!(
         a_syncs < s_syncs,
         "the async path must issue strictly fewer full stream syncs ({a_syncs} vs {s_syncs})"
     );
     assert!(
-        s_syncs >= s.blocking_host_copies + 1,
-        "the synchronous reference must pay its per-copy stream syncs plus the boundary's \
-         own: {s_syncs} syncs for {} blocking copies",
+        s_syncs >= s.blocking_host_copies,
+        "the synchronous reference pays one stream sync per blocking copy: {s_syncs} syncs \
+         for {} blocking copies",
         s.blocking_host_copies
     );
     // ── bitwise equality ─────────────────────────────────────────────────
