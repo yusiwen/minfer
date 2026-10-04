@@ -255,7 +255,7 @@ Two readings: the **mode** is what makes the historical shared-stream setup safe
 capturing thread's own mistakes fatal, so it is the one adopted), and the
 **structural** change makes the mode irrelevant by removing the sharing. The
 concurrent device gate
-(`models::qwen2::graph::tests::two_cuda_engines_forward_concurrently_and_stay_bitwise_identical`)
+(`models::qwen2::graph::tests::cuda_kv::two_cuda_engines_forward_concurrently_and_stay_bitwise_identical`)
 is the positive half: two engines on two threads, two distinct streams, bitwise equal
 to their serial references.
 
