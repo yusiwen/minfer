@@ -118,7 +118,7 @@ input buffer. Contrast a **parallel** shape — `a2 = add(silu(a0), a0)` and
 `b2 = add(silu(b0), b0)` computed independently — where both branches are live
 simultaneously and *must* get separate buffers. minfer's unit tests assert
 exactly these two behaviors: `liveness_reuses_buffers_along_chain` (fewer
-buffers than nodes) and `parallel_chains_do_not_share` (`alloc.rs:668-709`).
+buffers than nodes) and `parallel_chains_do_not_share` (`alloc/tests.rs:319`).
 
 Two bookkeeping rules extend the basic window, and both exist because of
 execution-order realities rather than graph theory:
@@ -437,7 +437,7 @@ builds a new graph and `replace_graph` swaps it in — **keeping the allocator**
 That is the entire reason the KV regions survive: the regions live inside the
 allocator, the allocator lives inside the cache, and rebuilds replace only the
 graph. The unit test `allocator_survives_rebuild` pins this contract with a
-planted persistent region (`cache.rs:203-217`).
+planted persistent region (`cache/tests.rs:159`).
 
 ## 3. Implementation
 
@@ -946,7 +946,7 @@ longer matters.
   assert the two liveness behaviors of §2.2; `kv_regions_two_per_layer`
   asserts store and load share the K region, V is a sibling, and exactly two
   persistent regions exist for one layer; `cycle_graph_allocation_fails`
-  proves the acyclicity check is live. `src/graph/cache.rs:203-217` pins
+  proves the acyclicity check is live. `src/graph/cache/tests.rs:159` pins
   "persistent regions survive rebuilds". Filter with
   `cargo test liveness` / `cargo test kv_regions`.
 - **`MINFER_TRACE=/tmp/t.json ./target/release/minfer model.gguf "Hello"`** —

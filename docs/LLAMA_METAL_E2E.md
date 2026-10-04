@@ -48,7 +48,7 @@
 | P0 | Backend & scheduler init | Create Metal backend, MTLCommandQueue, kernel library, scheduler; pre-reserve compute buffers | `ggml-metal.cpp:689` `ggml-metal-context.m:84` `llama-context.cpp:581` `ggml-backend.cpp:1792` | `src/metal.rs:1090` (MpsState::try_new) |
 | P1 | Model loading / weight registration | Allocate Metal buffers per tensor and upload quantized weights | `llama-model.cpp:1401` `llama-model-loader.cpp:1426` `ggml-metal-device.m:1631` | `src/models/qwen2/loader.rs` + `src/metal.rs:1302` (register_weight) |
 | P2 | Batch preparation & microbatching | Split the API batch into micro-batches, reserve host output buffers | `llama-context.cpp:1635` `llama-batch.cpp:25` | `src/main.rs` (single batch, no split) "N/A" |
-| P3 | Compute graph build (Qwen2) | Build the ggml compute graph (DFS topological order) | `src/models/qwen2.cpp:53` `llama-graph.cpp` `ggml.c:7188` | `src/models/qwen2/forward.rs:6` (imperative encode, not a graph) |
+| P3 | Compute graph build (Qwen2) | Build the ggml compute graph (DFS topological order) | `src/models/qwen2.cpp:53` `llama-graph.cpp` `ggml.c:7188` | `src/models/qwen2/graph.rs:432` (declarative graph build) |
 | P4 | Scheduler split & allocation | Assign nodes to backends, split into runs, gallocr allocation | `ggml-backend.cpp:1936`→`:1055` | "N/A" (single MPS backend, static buffers) |
 | P5 | Scheduler compute | Per-split: copy inputs, call backend graph_compute | `ggml-backend.cpp:1594` `ggml-metal.cpp:535` | `forward.rs:88-134` (single CB, all layers) |
 | P6 | Metal graph compute | Multi-command-buffer encode (main thread + n_cb workers) | `ggml-metal-context.m:438` `:663` | `src/metal.rs:1032` (submit, single CB) |
@@ -95,7 +95,7 @@
 
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
-| 3.1 | Entry | `llama_model::build_graph` → `build_arch_graph` | `llama-model.cpp:2457` | `src/models/qwen2/forward.rs:6` (forward) |
+| 3.1 | Entry | `llama_model::build_graph` → `build_arch_graph` | `llama-model.cpp:2457` | `src/models/qwen2/graph.rs:432` (forward) |
 | 3.2 | Input embd | `build_inp_embd`: token ids + `ggml_get_rows(tok_embd, inp_tokens)` | `llama-graph.cpp:2284` | `src/metal.rs` (embed_tokens_gpu, get_rows — **2026-08-21: all minfer quants on GPU + dispatched into the MAIN command buffer, llama-graph-style single submit, #38/#39**) |
 | 3.3 | Position input | `build_inp_pos` | `llama-graph.cpp:2373` | `src/metal.rs:1565` (upload_positions) |
 | 3.4 | KV graph inputs | `build_attn_inp_kv` (k_idxs/v_idxs, mask, rotation tensors) | `llama-graph.cpp:2729` | `src/metal.rs` (store_kv uses pos_buf) |
@@ -164,29 +164,29 @@
 |---|---|---|---|---|
 | `MUL_MAT` | `ggml_metal_op_mul_mat` (3-way selection, §3.2) | `kernel_mul_mm_*` / `kernel_mul_mv_ext_*` / `kernel_mul_mv_*` | `ops.cpp:2299-2541` | `src/metal.rs:392` (quant_matmul_f32_on_gpu_buf) + `:352` (gemm_dispatch) |
 | `FLASH_ATTN_EXT` | `ggml_metal_op_flash_attn_ext` | `_kv_f16` / `_pad` / `_blk` / main kernel / `_vec` / `_vec_reduce` | `ops.cpp:2990-3492` | `src/metal.rs:949` (attn_flash_prefill) |
-| `RMS_NORM` | `ggml_metal_op_norm` (fuses Mul+Add) | `kernel_rms_norm_fuse_impl` | `ops.cpp:3887-4006` `metal.metal:3181` | `src/metal.rs:614` (rms_norm) + separate `:648` (add) |
-| `ROPE` | `ggml_metal_op_rope` | `kernel_rope_norm/neox/multi/vision` | `ops.cpp:4025-4126` `metal.metal:4664-4868` | `src/metal.rs:719` (rope_f32) |
+| `RMS_NORM` | `ggml_metal_op_norm` (fuses Mul+Add) | `kernel_rms_norm_fuse_impl` | `ops.cpp:3887-4006` `ggml-metal.metal:3181` | `src/metal.rs:614` (rms_norm) + separate `:648` (add) |
+| `ROPE` | `ggml_metal_op_rope` | `kernel_rope_norm/neox/multi/vision` | `ops.cpp:4025-4126` `ggml-metal.metal:4664-4868` | `src/metal.rs:719` (rope_f32) |
 | `ADD/SUB/MUL/DIV` | `ggml_metal_op_bin` (ADD fusion ×8) | `kernel_add` / `kernel_mul` (n_fuse specialization) | `ops.cpp:3578` | `src/metal.rs:648` (add_f32 single op) |
-| `GET_ROWS` | `ggml_metal_op_get_rows` | `kernel_get_rows_q/_f` | `ops.cpp:1165` `metal.metal:10061` | `src/metal.rs:599` (embed_tokens_gpu → **2026-08-21: all minfer-supported quants — Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 (32-elem) + Q4_K/Q6_K/Q5_K (256-elem)**, matching llama's template coverage) |
-| `SET_ROWS` | `ggml_metal_op_set_rows` | `kernel_set_rows_*` | `ops.cpp:1210` `metal.metal:10156` | `src/metal.rs:866` (store_kv dedicated kernel) |
-| `CPY/DUP/CONT` | `ggml_metal_op_cpy` | `kernel_cpy_t_t/_f32_q/_q_f32` | `ops.cpp:2078` `metal.metal:8023-8122` | "N/A" (f16 KV converted directly by store_kv) |
+| `GET_ROWS` | `ggml_metal_op_get_rows` | `kernel_get_rows_q/_f` | `ops.cpp:1165` `ggml-metal.metal:10061` | `src/metal.rs:599` (embed_tokens_gpu → **2026-08-21: all minfer-supported quants — Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 (32-elem) + Q4_K/Q6_K/Q5_K (256-elem)**, matching llama's template coverage) |
+| `SET_ROWS` | `ggml_metal_op_set_rows` | `kernel_set_rows_*` | `ops.cpp:1210` `ggml-metal.metal:10156` | `src/metal.rs:866` (store_kv dedicated kernel) |
+| `CPY/DUP/CONT` | `ggml_metal_op_cpy` | `kernel_cpy_t_t/_f32_q/_q_f32` | `ops.cpp:2078` `ggml-metal.metal:8023-8122` | "N/A" (f16 KV converted directly by store_kv) |
 
 ### P9 GPU kernel execution (key kernels)
 
 | kernel | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|
-| `kernel_mul_mm<...>` | simdgroup/tensor matmul (64×32 tile, §3.2 variants) | `metal.metal:10658-11040` (template + instantiations) | `src/metal.metal:758` (kernel_q4_0_mm_f32) and 7 more mm kernels |
-| `kernel_mul_mv_*` | mat-vec (decode, per quant type) | `metal.metal:3847` (q4_0), `:8498` (q4_K), etc. | `src/metal.metal` `*_f32_matmul` kernels |
-| `kernel_mul_mv_ext_*` | small-batch (ne11∈[2,8]) mat-mv | `metal.metal:4196` | "N/A" |
-| `kernel_flash_attn_ext_kv_f16` | **quantized KV → f16 dequant pre-pass** (Q4_0/1, Q5_0/1, Q8_0) | `metal.metal:6328-6366` | "N/A" (minfer KV stores f32/f16 raw, `MINFER_CACHE_TYPE=f16`) |
-| `kernel_flash_attn_ext_pad` | pad pre-pass for partial KV blocks | `metal.metal:6373` | `src/metal.metal: kernel_kv_tail_pad` (equivalent) |
-| `kernel_flash_attn_ext_blk` | mask pre-pass (nqptg/ncpsg blocks) | `metal.metal:6445` | inline causal mask (`kernel_flash_attn_blk_f32`) |
-| `kernel_flash_attn_ext` / `_impl` | flash attention main kernel (half8x8) | `metal.metal:6546,7184` | `src/metal.metal: kernel_flash_attn_blk_f32` |
-| `kernel_flash_attn_ext_vec` / `_vec_reduce` | decode small-batch flash (half4x4, ne01<20) | `metal.metal:7411,7980` | `src/metal.metal: kernel_flash_attn_ext_f32` |
-| `kernel_rms_norm_fuse_impl` | RMSNorm + Mul + Add fusion | `metal.metal:3181` | `rms_norm_256` + separate add |
-| `kernel_soft_max*` | non-flash path softmax | `metal.metal:2011,2117` | "N/A" (inlined in flash; or a dedicated `softmax` kernel) |
-| `kernel_rope_*` | RoPE | `metal.metal:4664-4868` | `src/metal.metal: kernel_rope_f32` |
-| `kernel_get_rows_*` | embedding lookup | `metal.metal:10061,10092` | `src/metal.metal: kernel_get_rows_q4_0/q4_1/q5_0/q5_1/q8_0/q4_k/q6_k/q5_k` (templates `kernel_get_rows_q32`/`_q256`) |
+| `kernel_mul_mm<...>` | simdgroup/tensor matmul (64×32 tile, §3.2 variants) | `ggml-metal.metal:10658-11040` (template + instantiations) | `src/metal.metal:758` (kernel_q4_0_mm_f32) and 7 more mm kernels |
+| `kernel_mul_mv_*` | mat-vec (decode, per quant type) | `ggml-metal.metal:3847` (q4_0), `:8498` (q4_K), etc. | `src/metal.metal` `*_f32_matmul` kernels |
+| `kernel_mul_mv_ext_*` | small-batch (ne11∈[2,8]) mat-mv | `ggml-metal.metal:4196` | "N/A" |
+| `kernel_flash_attn_ext_kv_f16` | **quantized KV → f16 dequant pre-pass** (Q4_0/1, Q5_0/1, Q8_0) | `ggml-metal.metal:6328-6366` | "N/A" (minfer KV stores f32/f16 raw, `MINFER_CACHE_TYPE=f16`) |
+| `kernel_flash_attn_ext_pad` | pad pre-pass for partial KV blocks | `ggml-metal.metal:6373` | `src/metal.metal: kernel_kv_tail_pad` (equivalent) |
+| `kernel_flash_attn_ext_blk` | mask pre-pass (nqptg/ncpsg blocks) | `ggml-metal.metal:6445` | inline causal mask (`kernel_flash_attn_blk_f32`) |
+| `kernel_flash_attn_ext` / `_impl` | flash attention main kernel (half8x8) | `ggml-metal.metal:6546,7184` | `src/metal.metal: kernel_flash_attn_blk_f32` |
+| `kernel_flash_attn_ext_vec` / `_vec_reduce` | decode small-batch flash (half4x4, ne01<20) | `ggml-metal.metal:7411,7980` | `src/metal.metal: kernel_flash_attn_ext_f32` |
+| `kernel_rms_norm_fuse_impl` | RMSNorm + Mul + Add fusion | `ggml-metal.metal:3181` | `rms_norm_256` + separate add |
+| `kernel_soft_max*` | non-flash path softmax | `ggml-metal.metal:2011,2117` | "N/A" (inlined in flash; or a dedicated `softmax` kernel) |
+| `kernel_rope_*` | RoPE | `ggml-metal.metal:4664-4868` | `src/metal.metal: kernel_rope_f32` |
+| `kernel_get_rows_*` | embedding lookup | `ggml-metal.metal:10061,10092` | `src/metal.metal: kernel_get_rows_q4_0/q4_1/q5_0/q5_1/q8_0/q4_k/q6_k/q5_k` (templates `kernel_get_rows_q32`/`_q256`) |
 
 ### P10 KV cache
 

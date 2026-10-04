@@ -148,7 +148,7 @@ is a *view*, not a copy. The `Tensor` type stores its payload as
 `std::borrow::Cow<'static, [u8]>` — a Rust "clone-on-write" enum that here is
 always the `Borrowed` variant, i.e. a plain `(pointer, length)` slice pointing
 into the mmap'd GGUF file. The `'static` lifetime works because doc 02's
-loader `Box::leak`s each mmap for the process lifetime (`gguf.rs:1996-2000`).
+loader `Box::leak`s each mmap for the process lifetime (`gguf.rs:1804-1810`).
 
 Three consequences follow, and each one answers a "why not the obvious
 alternative":

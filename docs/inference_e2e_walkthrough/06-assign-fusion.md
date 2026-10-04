@@ -705,7 +705,7 @@ fn params_match(a: &GraphParams, b: &GraphParams) -> bool {
 `a.cparams == b.cparams` is derived `PartialEq` over *all six fields* — `gpu`, `fuse_qkv`,
 `fuse_ffn` included. That one derived impl is why every toggle in this doc is a rebuild instead
 of a silent stale-graph reuse. The dedicated test
-`fuse_flags_are_part_of_the_reuse_identity` (cache.rs:141-170) flips each flag and asserts
+`fuse_flags_are_part_of_the_reuse_identity` (cache/tests.rs:36) flips each flag and asserts
 non-reuse.
 
 **Where fusion orphans die** — `src/graph/scheduler.rs:225-233` (doc 08's executor, forward
@@ -878,7 +878,7 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
   `cache.rs::fuse_flags_are_part_of_the_reuse_identity` (flag flip ⇒ no reuse);
   `qwen2/graph.rs::fused_qkv_matches_unfused_decode` (fused nodes present iff gated on, logits
   **bit-identical**, plus per-layer output comparison); the tail-reduction test asserts the
-  SwiGLU node exists and consumes the gate/up matmuls (qwen2/graph.rs:1497-1502) — the pass is
+  SwiGLU node exists and consumes the gate/up matmuls (qwen2/graph/tail_tests.rs:111-146) — the pass is
   exercised on every graph-level test run, not just the fusion unit tests.
 
 ## 5. Cross-references
