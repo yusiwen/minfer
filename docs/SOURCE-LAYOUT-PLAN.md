@@ -21,7 +21,7 @@
 | 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
 | 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 594 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
 | 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5, G6): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` (1 header) + 17 TUs; audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2 |
-| 3 CPU files | #264 | **in progress**: stage A `quants` landed (PR [#290](https://github.com/yusiwen/minfer/pull/290)) — `src/quants.rs` 1,340 → 61 lines + 9 part files + `src/quants/neon_correctness.rs`; `scripts/check_source_layout.py` rule 1 widened ([#274](https://github.com/yusiwen/minfer/issues/274)); counts unchanged (481/0/36 + 10/0/6). Stages B `vec_ops` and C `kernel` to follow |
+| 3 CPU files | #264 | **in progress**: stage A `quants` landed (PR [#290](https://github.com/yusiwen/minfer/pull/290)) — `src/quants.rs` 1,340 → 61 lines + 9 part files + `src/quants/neon_correctness.rs`; `scripts/check_source_layout.py` rule 1 widened ([#274](https://github.com/yusiwen/minfer/issues/274)); stage B `vec_ops` landed (PR [#291](https://github.com/yusiwen/minfer/pull/291)) — `src/vec_ops.rs` 1,344 → 52 lines + 8 part files; counts unchanged (481/0/36 + 10/0/6). Stage C `kernel` to follow |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
 | 6 long test files | #267 | **files 1–9 landed** (PRs #275, #277, #278, #279, #280, #281, #283): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` 1,186 → a 209-line parent + 4 `tests/<topic>.rs` (5 tests) |
@@ -328,6 +328,16 @@ name collides), their cross-references lose the `super::neon_kernels::` prefix. 
 old file had 48 `fn` definitions and the new files have the same 48 (excluding the pre-existing
 `tests.rs`); all 29 `cpu-map.tsv` items resolve in their mapped targets.
 
+**Stage B landed** (PR [#291](https://github.com/yusiwen/minfer/pull/291)): `src/vec_ops.rs` 1,344 → 52
+lines + `vec` 394 · `rms_norm` 154 · `rope` 17 · `softmax` 91 · `silu` 102 · `f16` 318 (the inline
+`mod neon_f16` stays nested, its `super::F16_SIMD_PATH_CALLS` unchanged) · `bf16` 95 · `neon` 165 (the
+promoted `mod neon_vec` — its items keep `pub(super)`, the same `pub(in vec_ops)` reach they had as a
+nested module). 47 `fn` definitions on each side of the move. Three f16 re-exports (`dot_f16_f32`,
+`dot_f16_f32_scalar`, `f16_dot_path`, `F16DotPath`) are `#[cfg(test)]`: their only consumer is
+`vec_ops::tests`, and a non-test `pub use` of an unused name is an `unused_imports` error under
+`#![deny(warnings)]`. `RopeStyle::Interleaved`'s `docs/dead-code-baseline.toml` `file =` field moves to
+`src/vec_ops/rope.rs` in the same PR.
+
 ### Step 4 — Metal (Mac round, after [#255](https://github.com/yusiwen/minfer/issues/255))
 
 `src/metal.rs` and `src/metal.metal` are **not compiled on Linux** (`src/main.rs:31-32` gates the
@@ -486,7 +496,15 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/quants.rs` 674–780 | `src/quants/quantize_q8_k.rs` |
 | `src/quants.rs` 782–962 | `src/quants/kquant.rs` |
 | `src/quants.rs` 1200–1340 | `src/quants/neon_correctness.rs` |
-| `src/vec_ops.rs` / `src/kernel.rs` | the §4 Step 3 tables (stages B, C) |
+| `src/vec_ops.rs` 6–20 | `src/vec_ops/rope.rs` |
+| `src/vec_ops.rs` 22–159, 349–569, 725–752 | `src/vec_ops/vec.rs` |
+| `src/vec_ops.rs` 161–258 | `src/vec_ops/silu.rs` |
+| `src/vec_ops.rs` 260–347 | `src/vec_ops/softmax.rs` |
+| `src/vec_ops.rs` 571–721 | `src/vec_ops/rms_norm.rs` |
+| `src/vec_ops.rs` 754–1069 | `src/vec_ops/f16.rs` |
+| `src/vec_ops.rs` 1071–1163 | `src/vec_ops/bf16.rs` |
+| `src/vec_ops.rs` 1165–1332 | `src/vec_ops/neon.rs` |
+| `src/kernel.rs` | the §4 Step 3 table (stage C) |
 
 ### 6.5 The macOS hand-off (decided 2026-10-04: Step 4 is Mac-local)
 
@@ -650,9 +668,10 @@ src/
 │   └── tests.rs                            (exists)
 ├── vec_ops.rs                       [S3]  module vec_ops: `pub use`
 ├── vec_ops/
-│   ├── vec.rs · rms_norm.rs · rope.rs · softmax.rs · silu.rs   [S3]
-│   ├── f16.rs · bf16.rs             [S3]
-│   ├── neon.rs                      [S3]  was `mod neon_f16` / `mod neon_vec`
+│   ├── vec.rs · rms_norm.rs · rope.rs · softmax.rs · silu.rs   [S3B]
+│   ├── f16.rs                       [S3B] the f16 dot/matmul + the nested `mod neon_f16`
+│   ├── bf16.rs                      [S3B] bf16 row decode + matmul
+│   ├── neon.rs                      [S3B] was `mod neon_vec`
 │   └── tests.rs                            (exists)
 ├── graph/                                   (unchanged: `backend.rs` + `registry.rs` stay the one
 │                                             device seam; `*_backend.rs` stay the executors)

@@ -9851,6 +9851,7 @@ are reported, `not(test)` is not (that module is the non-test build). Five selft
 | `python3 scripts/check_dead_code_annotations.py` | exit 0 (11 grandfathered bare sites) |
 | `python3 scripts/check_dead_code_oracle.py --config cpu` | 46 baseline entries, **0 additions, 0 removals** (no `file =` field moved: the baseline names items only) |
 | `python3 scripts/check_doc_line_anchors.py` | **17 out-of-range → 0**; the 19 `quants.rs:NNN` anchors in live docs → 0 |
+| CI run [37214801844](https://github.com/yusiwen/minfer/actions/runs/37214801844) | **7 / 7 green**, zero code annotations |
 
 **Mutation evidence (rule 3).** Renaming `src/quants/kquant.rs` to a name no `mod` declares →
 `check_source_layout` exits 1 with
@@ -9868,3 +9869,54 @@ Step 3 paragraph and its §10 row carried the same stale 480 and were corrected 
 visibility prefixes, `use`/`mod` preambles, the flattened-module renames and the doc sweep. Stages B
 (`src/vec_ops.rs`) and C (`src/kernel.rs`) follow, one PR each; `docs/CPU_OPTIMIZATIONS.md` is frozen
 and keeps its `quants.rs:NNN` numbers.
+
+#### Test-infrastructure record (#264 stage B, 2026-10-04) — `src/vec_ops.rs` becomes `src/vec_ops/*.rs`
+
+**What landed.** Stage B of the CPU split ([#264](https://github.com/yusiwen/minfer/issues/264),
+PR [#291](https://github.com/yusiwen/minfer/pull/291)): `src/vec_ops.rs` 1,344 → **52** lines (the module
+decider) and eight part files — `vec.rs` 394 · `rms_norm.rs` 154 · `rope.rs` 17 · `softmax.rs` 91 ·
+`silu.rs` 102 · `f16.rs` 318 · `bf16.rs` 95 · `neon.rs` 165. The old file had 47 `fn` definitions and
+the new files have the same 47 (excluding the pre-existing `tests.rs`).
+
+**The layout invariant.** `mod neon_vec` is promoted to the file `neon.rs`: its items keep `pub(super)`,
+which is `pub(in vec_ops)` on both sides of the move, and `vec_soft_max_inplace_f32`'s call becomes
+`super::neon::vec_soft_max_f32_inplace`. `mod neon_f16` stays nested inside `f16.rs` because its
+`super::F16_SIMD_PATH_CALLS` is one module up either way. `vec_exp_f32_avx2` and
+`decode_{f16,bf16}_row` widen to `pub(super)` (a sibling or the parent's wiring reaches them); the
+parent's `pub use` list keeps every `crate::vec_ops::…` path resolving, which is what
+`graph/cpu_backend.rs` (13 calls), `models/*/loader.rs` and `graph/cuda_backend.rs`'s `RopeStyle`
+import compile against.
+
+**One deliberate API narrowing.** `dot_f16_f32`, `dot_f16_f32_scalar`, `f16_dot_path` and `F16DotPath`
+have exactly one consumer, `vec_ops::tests`; a non-test `pub use` of an unused name is an
+`unused_imports` error under `#![deny(warnings)]`, so their re-export is `#[cfg(test)]`. The items
+themselves stay `pub` in `f16.rs`. `silu.rs` imports `vec_exp_f32_avx2` under
+`#[cfg(target_arch = "x86_64")]` for the same reason.
+
+**The baseline moved with the code.** `RopeStyle::Interleaved` is the one `docs/dead-code-baseline.toml`
+entry naming this file; its two `file =` fields (the `cpu` and `cuda` arms) now read
+`src/vec_ops/rope.rs`. The oracle still reports 0 additions and 0 removals on the cpu arm.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the step's worktree:
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration — identical to `docs/status.toml` |
+| `MINFER_NO_NEON=1 cargo test --release` | **481 / 0 / 36** + **10 / 0 / 6** — the scalar arm, identical |
+| `cargo check --release --target x86_64-unknown-linux-gnu` | exit 0 (the AVX2/`f16c` bodies and `F16DotPath::Avx2`) |
+| `cargo fmt --all --check` | exit 0 |
+| `python3 scripts/check_source_layout.py` (`--selftest`) | exit 0; 12 cases pass |
+| `python3 scripts/check_dead_code_annotations.py` | exit 0 (11 grandfathered bare sites) |
+| `python3 scripts/check_dead_code_oracle.py --config cpu` | 46 baseline entries, **0 additions, 0 removals** |
+| `python3 scripts/check_doc_line_anchors.py` | the 10 live `vec_ops.rs:NNN` anchors re-pointed, 0 out-of-range |
+
+**Mutation evidence (rule 3).** Renaming `src/vec_ops/rms_norm.rs` to a name no `mod` declares →
+`check_source_layout` exits 1 with
+`not reachable from src/main.rs — no `mod` declaration names it, so it is never compiled (tests in it would silently not run)`.
+Deleting `pub use rms_norm::{rms_norm_f32, rms_norm_fused_f32};` → `cargo check --release` exits 101 with
+`error[E0425]: cannot find function `rms_norm_fused_f32` in module `crate::vec_ops`` at
+`src/graph/cpu_backend.rs:445:45` and the note that the function exists but is inaccessible. Both
+reverted, exit 0.
+
+**Deliberately out of scope.** No value, order or algorithm changed. Stage C (`src/kernel.rs`) follows.
+`docs/CPU_OPTIMIZATIONS.md` is frozen and keeps its `vec_ops.rs:NNN` numbers.
