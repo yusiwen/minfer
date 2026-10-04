@@ -9813,3 +9813,58 @@ declarations move verbatim, and the only textual edits are the visibility prefix
 declarations, the generated `use`/`mod` preambles and the `CudaCommandBuffer` banner (rewritten to name
 `graph/cuda_backend.rs`, the deferred #219 item this step owned). The `.cu` file is untouched
 (Step 2, [#263](https://github.com/yusiwen/minfer/issues/263)).
+
+#### Test-infrastructure record (#264 stage A, 2026-10-04) — `src/quants.rs` becomes `src/quants/*.rs`
+
+**What landed.** Stage A of the CPU split ([#264](https://github.com/yusiwen/minfer/issues/264),
+PR [#290](https://github.com/yusiwen/minfer/pull/290)): `src/quants.rs` 1,340 → **61** lines (the module
+decider: `mod` declarations + the `pub use` list + the cross-module wiring) and nine part files —
+`dot_q4_0.rs` 71 · `dot_q4_1.rs` 44 · `dot_q5.rs` 94 · `dot_q8_0.rs` 64 · `kquant.rs` 185 ·
+`quantize_q8_0.rs` 125 · `quantize_q8_k.rs` 111 · `avx2.rs` 81 · `neon.rs` 414 — plus the extracted
+`src/quants/neon_correctness.rs` 138.
+
+**The layout invariant.** `neon_kernels` and `neon_q8k` are **flattened** into the one `neon.rs`: their
+item names do not collide (`enabled`/`fp16`/`dot16`/`sdot_vec` + the five `dot_*` kernels vs the three
+K-quant dots), and `neon_q8k`'s `super::neon_kernels::` prefixes become the same module's items. The
+move is otherwise verbatim: an item a sibling or the parent reaches becomes `pub(super)` — the same
+reachable set it had as a private item of `quants`, since every part file is exactly one level below —
+and the parent's `pub use` list keeps `crate::quants::…` resolving, which is what
+`graph/kvformat.rs` (two calls) and `kernel.rs` (the dot dispatch) compile against.
+
+**The rule widening ([#274](https://github.com/yusiwen/minfer/issues/274)).** Extracting the inline
+`#[cfg(all(test, target_arch = "aarch64"))] mod neon_correctness` removes the tree's only compound-cfg
+inline test module, and the same PR widens `scripts/check_source_layout.py` rule 1 from the literal
+`#[cfg(test)]` to the cfg *predicate*: `all(test, …)`/`any(test, …)` with or without further attributes
+are reported, `not(test)` is not (that module is the non-test build). Five selftest cases were added
+(12 total). Measured: the baseline tree's compound-cfg module exits **0** under master's checker and
+**1** under the widened one; after the extraction the widened checker exits 0 on the tree.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the step's worktree:
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration — identical to `docs/status.toml` |
+| `MINFER_NO_NEON=1 cargo test --release` | **481 / 0 / 36** + **10 / 0 / 6** — the scalar arm, identical |
+| `cargo check --release --target x86_64-unknown-linux-gnu` | exit 0 (the AVX2/`f16c` bodies this aarch64 box never parses) |
+| `cargo fmt --all --check` | exit 0 |
+| `python3 scripts/check_source_layout.py` (`--selftest`) | *"src obeys the layout rules"*, exit 0; 12 cases pass |
+| `python3 scripts/check_dead_code_annotations.py` | exit 0 (11 grandfathered bare sites) |
+| `python3 scripts/check_dead_code_oracle.py --config cpu` | 46 baseline entries, **0 additions, 0 removals** (no `file =` field moved: the baseline names items only) |
+| `python3 scripts/check_doc_line_anchors.py` | **17 out-of-range → 0**; the 19 `quants.rs:NNN` anchors in live docs → 0 |
+
+**Mutation evidence (rule 3).** Renaming `src/quants/kquant.rs` to a name no `mod` declares →
+`check_source_layout` exits 1 with
+`not reachable from src/main.rs — no \`mod\` declaration names it, so it is never compiled (tests in it would silently not run)`.
+Deleting `pub use dot_q4_0::dot_q4_0_q8_0;` → `cargo check --release` exits 101 with
+`error[E0425]: cannot find function \`dot_q4_0_q8_0\` in module \`crate::quants\`` at
+`src/kernel.rs:148:63` (the re-export, not just the move, is load-bearing). Both reverted, exit 0.
+
+**What the brief had wrong (the tree wins).** #264's body states the acceptance as CPU **480 / 0 / 36**;
+`docs/status.toml` carries **481** (the two tests [#138](https://github.com/yusiwen/minfer/issues/138)
+added after that body was written) and the tree's rows are the ones this record uses. The plan's §4
+Step 3 paragraph and its §10 row carried the same stale 480 and were corrected here.
+
+**Deliberately out of scope.** No value, order or algorithm changed; the only textual edits are
+visibility prefixes, `use`/`mod` preambles, the flattened-module renames and the doc sweep. Stages B
+(`src/vec_ops.rs`) and C (`src/kernel.rs`) follow, one PR each; `docs/CPU_OPTIMIZATIONS.md` is frozen
+and keeps its `quants.rs:NNN` numbers.
