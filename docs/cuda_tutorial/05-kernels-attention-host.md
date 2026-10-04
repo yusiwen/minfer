@@ -366,17 +366,17 @@ projection matmuls, three small jobs remain before attention can run: add the
 attention biases (if the model has them), rotate q and k by RoPE, and write k/v
 into the persistent KV cache. The unfused graph spent **seven launches** on
 these (`add_bias` ×3, `rope` ×2, `store_kv` ×2 — the count in the kernel's
-header comment, `cuda_kernels.cu:2571-2574`; TECH-PRIMER §6.4 prices the whole
+header comment, `kv_store.cu:118`; TECH-PRIMER §6.4 prices the whole
 campaign at "−310 launches/step"). This kernel is one launch that does all of
 it, ending with K/V in exactly the layout the next kernel reads.
 
-**Thread mapping.** The launcher (`cuda_kernels.cu:1479`) is a flat 1-D
+**Thread mapping.** The launcher (`kv_store.cu:338`) is a flat 1-D
 grid of 256-thread blocks over `total = nqt/2 + nkt/2 + nkt` — one thread per
 *RoPE pair* for q (`nqt/2`), one per RoPE pair for k (`nkt/2`), one per element
 for v (`nkt`); `nqt = nh·hd` and `nkt = nk·hd` are the q and k section widths
 of the (single) token's QKV output. Each thread branches on which section its
 linear id `u` falls in — three sections, one kernel
-(`cuda_kernels.cu:2590-2610`):
+(`kv_store.cu:118`):
 
 ```c
 __global__ void attn_bias_rope_store_f32(
@@ -402,7 +402,7 @@ out: "no host scalar crosses the launch — CUDA Graph capture/replay safe". A
 captured graph freezes its kernel arguments; a host-side `n_past` integer would
 be baked in and wrong on every replay. Device-side data is re-read every replay.
 
-**Section 1 — q: bias + RoPE in place** (`cuda_kernels.cu:2612-2625`):
+**Section 1 — q: bias + RoPE in place** (`kv_store.cu:118`):
 
 ```c
 if (u < qpairs) {
@@ -422,16 +422,16 @@ if (u < qpairs) {
 }
 ```
 
-This is verbatim `rope_f32` (`cuda_kernels.cu:2503-2526`) with the bias add
+This is verbatim `rope_f32` (`ops_elementwise.cu:263`) with the bias add
 folded into the loads — same NEOX pairing `(j, j + hd/2)`, same frequency
 expression, same `cosf/sinf`. "Verbatim" is a hard requirement: the fused
 kernel had to be *bit-identical* to the seven-kernel chain it replaced (the
-header comment, `cuda_kernels.cu:2580-2585`, lists each correspondence) —
+header comment, `ops_elementwise.cu:263`, lists each correspondence) —
 fusion is only free when the answer does not change. The A/B proof lives in
 the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1011`
 exercises the f16 round trip end to end).
 
-**Section 2 — k: bias + RoPE + store into the cache** (`cuda_kernels.cu:2626-2649`).
+**Section 2 — k: bias + RoPE + store into the cache** (`kv_store.cu:118`).
 The first twelve lines are the q-section math with `bias_k`/`k` swapped — same
 pairing, same frequency, same rotation. The new part is what happens after the
 rotation: the rotated values are written *both* back to the k buffer *and* into
@@ -456,11 +456,11 @@ The store lines are the whole KV-cache story in miniature:
 `kv_k[(size_t)pos * nkt + j]` — the cache is a flat `[position][nkt]` array,
 and the thread computes the scatter address itself from the device-side
 `positions[0]`. The same line exists in the standalone `store_kv_f32`
-(`cuda_kernels.cu:2539`); the f16 branch converts on store with `__float2half`
+(`kv_store.cu:11`); the f16 branch converts on store with `__float2half`
 (round-to-nearest), the identical conversion the unfused `store_kv_f16` path
 uses — again for bit-identity.
 
-**Section 3 — v: bias + store** (`cuda_kernels.cu:2650-2660`): v gets no RoPE
+**Section 3 — v: bias + store** (`kv_store.cu:31`): v gets no RoPE
 (only q and k are rotated), so its threads add the bias and store one element
 each, same `pos * nkt + j` addressing into the V region.
 
@@ -489,7 +489,7 @@ launches it.
 
 **Two ways to call the same kernel.** The `q/k/v` parameters are *pointer-form
 section bases*, which lets one kernel serve both decode layer classes
-(`cuda_kernels.cu:2574-2578`): the **concat class** points all three into one
+(`kv_store.cu:118`): the **concat class** points all three into one
 concatenated matmul output (`q = base`, `k = base + nqt`, `v = base + 2·nkt`;
 the Rust arm does this pointer arithmetic at `cuda_backend.rs:902-911`), and
 the **mixed-quant class** (e.g. a model where `attn_v` is Q6_K and cannot join
@@ -539,7 +539,7 @@ region capacity : [n_ctx][nkt]          (nkt = n_head_kv * hd)
 element (p, j)  : region[p * nkt + j]   p = absolute position, j = kv dim
 ```
 
-The store address `dst[positions[t] * nkt + j]` (`cuda_kernels.cu:2539`,
+The store address `dst[positions[t] * nkt + j]` (`kv_store.cu:11`,
 `2644`) indexes by the **absolute position** of the token. `n_past` never
 appears in the layout — it is only ever *how many leading rows are valid*, and
 that count lives in the `positions` array on the device. That is precisely
@@ -573,7 +573,7 @@ policy (`kv_cache_is_f16`, `src/metal.rs:141`, set by the loader at
 `src/models/qwen2/loader.rs:347`). When it is on, every store converts to
 `__half` and every attention read converts back; §3.2's kernel shows both
 sides of that. The `store_kv_f16` header comment states the trade
-(`cuda_kernels.cu:2542-2549`): "halves attention read bandwidth", and
+(`kv_store.cu:31`): "halves attention read bandwidth", and
 `src/cuda/methods/attention.rs:154-156` adds the fine print — *the region stays f32-sized; the
 f16 view uses the first half of the bytes*: allocation does not shrink, the
 bytes written per store and read per attention call do (§4 does the

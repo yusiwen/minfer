@@ -173,10 +173,10 @@ copy back, reference loop and checks dwarf it.
 **The 2-D formula — minfer's real `add_bias_f32`.** A bias add works on
 token-major activations `[rows][d]`: row `t` is a token, column `i` a
 hidden-dimension index, and every row adds the *same* `b[i]`. minfer's kernel
-(`src/cuda_kernels.cu:2391-2399`) maps the 2-D shape directly onto the grid:
+(`src/cuda/kernels/ops_elementwise.cu:151`) maps the 2-D shape directly onto the grid:
 
 ```cuda
-// src/cuda_kernels.cu:2391-2399
+// src/cuda/kernels/ops_elementwise.cu:151
 __global__ void add_bias_f32(
     float* __restrict__ y,
     const float* __restrict__ b,
@@ -236,10 +236,10 @@ elementwise ones are the plainest and are all structured like your toy
 | `add_bias_f32` | 2391-2399 | `y[t*d+i] += b[i]`, 2-D | attention/FFN output bias |
 | `f32_bits_to_i32` | 2489-2497 | bit-reinterpret f32 → int32 | graph I32-input convention |
 
-`add_f32` (`src/cuda_kernels.cu:2403-2412`) is your toy's skeleton exactly —
+`add_f32` (`src/cuda/kernels/ops_elementwise.cu:201`) is your toy's skeleton exactly —
 index formula, guard, `z[tid] = x[tid] + y[tid]` — with two idiom changes:
 the parameter is named `tid` (thread id) and every pointer is
-`const ... __restrict__`. `silu_f32` (`src/cuda_kernels.cu:2429-2434`) is the
+`const ... __restrict__`. `silu_f32` (`src/cuda/kernels/ops_elementwise.cu:163`) is the
 toy's kernel verbatim except it is *in-place* — one buffer, read and written
 through the same pointer — legal because each element is touched by exactly
 one thread. In-place-ness is a graph-level decision in minfer (the alias rule:
@@ -247,7 +247,7 @@ a node may alias its input only when it is the sole consumer and runs on the
 same backend — §3 shows the D2D (device-to-device) copy the backend stages
 when the allocator did *not* alias it). Both launch through their launchers'
 ceil-div grid of 256-thread blocks (`launch_add_f32`
-`src/cuda_kernels.cu:1369`, `launch_silu_f32` `:3898-3903`), and every
+`src/cuda/kernels/ops_elementwise.cu:363`, `launch_silu_f32` `:3898-3903`), and every
 launcher in the file ends with `, stream)`: the entry-point family is uniform
 so the Rust side can target any stream uniformly. Why that matters is §2.4.
 
@@ -744,9 +744,9 @@ CUDA node takes; the layered picture first (the one diagram of this chapter):
      ▼
  src/cuda/methods/dispatch.rs:33               extern "C" launch_silu_f32 (FFI declaration)
      ▼
- cuda_kernels.cu:1391 launch_silu_f32            (grid = ceil-div, <<<>>>)
+ ops_elementwise.cu:385 launch_silu_f32            (grid = ceil-div, <<<>>>)
      ▼
- cuda_kernels.cu:2429-2434 __global__ silu_f32         (index → guard → math)
+ ops_elementwise.cu:385 __global__ silu_f32         (index → guard → math)
      ▼
  [ GPU: 19 blocks × 256 threads, enqueued on the stream, drains async ]
      …
@@ -839,10 +839,10 @@ are noise in the byte budget. Their cost is therefore not bandwidth but
 **latency**: launch overhead (microseconds per launch, host-side) plus the
 kernel's start-to-finish time. This is why the elementwise family is where
 fusion lives: decode never launches `silu_f32` standalone if it can help it —
-the fused-FFN path runs `swiglu_f32_off` (`src/cuda_kernels.cu:2441-2446`,
+the fused-FFN path runs `swiglu_f32_off` (`src/cuda/kernels/ops_elementwise.cu:189`,
 silu+mul in one pass over the concatenated gate|up buffer) and the prefill
 path fuses the q8 quantization epilogue into the same kernel
-(`swiglu_quant_pad40`, `src/cuda_kernels.cu:2455-2469` — its comment block is
+(`swiglu_quant_pad40`, `src/cuda/kernels/ops_elementwise.cu:189` — its comment block is
 worth reading for the "no early return — every thread reaches the barrier"
 discipline).
 
