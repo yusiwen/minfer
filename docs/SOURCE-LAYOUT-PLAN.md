@@ -57,7 +57,9 @@ Each step appends its dated record here when it lands (gates run, counts, box la
    by relocating the decision point. The predicates become pure functions with unit tests that need
    no device.
 7. **`src/cuda.rs` keeps its name and its type; the family `impl` blocks become descendants of one
-   intermediate parent** (`src/cuda/impl.rs`), so privacy does the work: private fields of
+   intermediate parent** (`src/cuda/methods.rs` — **not** `impl.rs`: `impl` is a Rust keyword, so
+   `mod impl;` is a syntax error — `expected identifier, found keyword 'impl'`, verified with a
+   two-file `rustc` probe on 2026-10-04), so privacy does the work: private fields of
    `CudaState` (defined in `cuda`) and private helper methods (defined in `cuda::impl`) are visible in
    every family file. **The split is therefore a pure move — 0 field-visibility edits, 0
    `pub(super)`** — with exactly one mechanical edit: the 86 `extern "C"` launch declarations get
@@ -88,7 +90,7 @@ would be a type refactor, not a file move — that is why the layer axis stays *
 
 | Backend | Second axis | Target shape |
 |---|---|---|
-| CUDA | kernel family | `src/cuda/{ffi_runtime,policy}.rs` + `src/cuda/impl.rs` + `src/cuda/impl/<family>.rs` (L2, Rust); **`src/cuda/kernels/*.cu` + `*.cuh`** (L3 + the C++ half of L2) |
+| CUDA | kernel family | `src/cuda/{ffi_runtime,policy}.rs` + `src/cuda/methods.rs` + `src/cuda/methods/<family>.rs` (L2, Rust); **`src/cuda/kernels/*.cu` + `*.cuh`** (L3 + the C++ half of L2) |
 | Metal (Mac round) | layer | `src/metal/{runtime,encode,ops,policy}.rs` (L1/L2) + **`src/metal/kernels/*.metal` + `*.h`** (L3) |
 | CPU | ISA | `src/quants/*.rs`, `src/vec_ops/*.rs`, `src/kernel/*.rs` |
 
@@ -101,7 +103,7 @@ Two honest wrinkles:
 
 - A CUDA `.cu` holds the kernels **and their host-side launchers** (the C++ half of L2), because a
   launcher must live in the TU that instantiates its kernel (§5). `src/cuda/kernels/` therefore means
-  "the CUDA translation units", not "device code only"; the Rust half of L2 is `src/cuda/impl/`.
+  "the CUDA translation units", not "device code only"; the Rust half of L2 is `src/cuda/methods/`.
 - **CPU is the exception**: `quants.rs` and `vec_ops.rs` are not device-private layers — they are the
   crate's numeric kernel library (`graph/kvformat.rs` uses
   `quants::quantize_row_q8_0_into`, `graph/cuda_backend.rs` uses `vec_ops::RopeStyle`), so they
@@ -143,10 +145,10 @@ Two honest wrinkles:
   stay private**), the free items (`cuda_error_name`, `cstr_owned`, `layout_of`/`format_of`,
   `concat_rows`, `bind_stream`, the KV-layout constants, …), the ten `#[cfg(test)] mod` declarations,
   and `pub(crate) use` lines.
-- `src/cuda/impl.rs` — the 16 methods called across families (`get_or_grow` is called by seven) plus
+- `src/cuda/methods.rs` — the 16 methods called across families (`get_or_grow` is called by seven) plus
   the `mod` declarations for the family files. Private here means visible in every family file, so
   **no `pub(super)` is needed anywhere**.
-- 18 family files under `src/cuda/impl/`: each holds its `impl CudaState` block **and its own
+- 18 family files under `src/cuda/methods/`: each holds its `impl CudaState` block **and its own
   `pub(crate)` `extern "C"` launch declarations** (the 86 declarations move with their family; no
   symbol is used by two families).
 - `src/cuda/ffi_runtime.rs` — the cudart/driver FFI block and the test-only extern block.
@@ -372,7 +374,7 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/cuda_kernels.cu` 20–50, 2655–2793, 5521–5922 | `src/cuda/kernels/{common.cuh, guard.cu}` |
 | `src/cuda_kernels.cu` 4050–5135 | distributed: each launcher to its kernel's file |
 | `src/cuda_kernels.cu` *other ranges* | the §4 Step 2 table (one row per new file) |
-| `src/cuda.rs` 1147–1930, 1934–6479 | `src/cuda/{ffi_runtime,policy}.rs` + `src/cuda/impl/*.rs` (the §4 Step 1 family table) |
+| `src/cuda.rs` 1147–1930, 1934–6479 | `src/cuda/{ffi_runtime,policy}.rs` + `src/cuda/methods/*.rs` (the §4 Step 1 family table) |
 | `src/metal.rs`, `src/metal.metal` | the §4 Step 4 table |
 
 ### 6.5 The macOS hand-off (decided 2026-10-04: Step 4 is Mac-local)
