@@ -428,8 +428,8 @@ expression, same `cosf/sinf`. "Verbatim" is a hard requirement: the fused
 kernel had to be *bit-identical* to the seven-kernel chain it replaced (the
 header comment, `cuda_kernels.cu:2580-2585`, lists each correspondence) —
 fusion is only free when the answer does not change. The A/B proof lives in
-the parity tests (`cuda_backend/tests.rs:5090` exercises the f16 round trip end to
-end).
+the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1011`
+exercises the f16 round trip end to end).
 
 **Section 2 — k: bias + RoPE + store into the cache** (`cuda_kernels.cu:2626-2649`).
 The first twelve lines are the q-section math with `bias_k`/`k` swapped — same
@@ -578,7 +578,7 @@ sides of that. The `store_kv_f16` header comment states the trade
 f16 view uses the first half of the bytes*: allocation does not shrink, the
 bytes written per store and read per attention call do (§4 does the
 arithmetic). The correctness story for the f16 round trip is test
-`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests.rs:5090`).
+`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1011`).
 
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
 copy — its output buffer *is* the K region (`alloc.rs:226-230` maps the node to
@@ -903,7 +903,7 @@ per position *touched*, though the regions stay f32-sized in allocation
 (§3.3). The flip side is precision: K/V are rounded to f16 on store and every
 downstream kernel reads the rounded values — which is why the parity tests
 compare against the *f16-rounded* reference, not f32
-(`cuda_backend/tests.rs:5090`).
+(`cuda_kv_f16_roundtrip_attn`, `cuda_backend/tests/kv.rs:1011`).
 
 **Prefill attention: the tiling win in one number.** The legacy per-(token,
 head) kernel re-read the K history once per query token per head: at 7B @2K
@@ -942,7 +942,7 @@ MINFER_NO_FUSE_QKV=1  ./target/release/minfer bench -p 128 -n 64 -r 3 <model.ggu
 
 Expect the replayed runs to win on decode tok/s (the launch tax of §4); expect
 **identical greedy output** — replay is bit-parity-gated
-(`cuda_graph_replay_bit_parity`, `cuda_backend/tests.rs:7645`).
+(`cuda_graph_replay_bit_parity`, `cuda_backend/tests/capture.rs:274`).
 
 **Per-node timing and values:** `MINFER_TRACE` records every node's real
 output stats (decode steps included; KV nodes skipped) for the viz page — see

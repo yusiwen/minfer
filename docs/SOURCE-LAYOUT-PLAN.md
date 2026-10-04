@@ -24,7 +24,7 @@
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
-| 6 long test files | #267 | not started |
+| 6 long test files | #267 | **file 1 landed** (PR #275): `src/graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests, identical counts); 8 files left |
 
 Each step appends its dated record here when it lands (gates run, counts, box label).
 
@@ -376,6 +376,7 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/cuda_kernels.cu` *other ranges* | the §4 Step 2 table (one row per new file) |
 | `src/cuda.rs` 1147–1930, 1934–6479 | `src/cuda/{ffi_runtime,policy}.rs` + `src/cuda/methods/*.rs` (the §4 Step 1 family table) |
 | `src/metal.rs`, `src/metal.metal` | the §4 Step 4 table |
+| `src/graph/cuda_backend/tests.rs` | `src/graph/cuda_backend/tests/{staging,pool,elementwise,matmul,mmvq,prefill,weights,kv,attention,attn_window,capture}.rs` |
 
 ### 6.5 The macOS hand-off (decided 2026-10-04: Step 4 is Mac-local)
 
