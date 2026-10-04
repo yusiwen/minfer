@@ -21,7 +21,7 @@
 | 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
 | 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 594 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
 | 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5, G6): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` (1 header) + 17 TUs; audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2 |
-| 3 CPU files | #264 | **in progress**: stage A `quants` landed (PR [#290](https://github.com/yusiwen/minfer/pull/290)) — `src/quants.rs` 1,340 → 61 lines + 9 part files + `src/quants/neon_correctness.rs`; `scripts/check_source_layout.py` rule 1 widened ([#274](https://github.com/yusiwen/minfer/issues/274)); stage B `vec_ops` landed (PR [#291](https://github.com/yusiwen/minfer/pull/291)) — `src/vec_ops.rs` 1,344 → 52 lines + 8 part files; counts unchanged (481/0/36 + 10/0/6). Stage C `kernel` to follow |
+| 3 CPU files | #264 | **done**: stage A `quants` landed (PR [#290](https://github.com/yusiwen/minfer/pull/290)) — `src/quants.rs` 1,340 → 61 lines + 9 part files + `src/quants/neon_correctness.rs`; `scripts/check_source_layout.py` rule 1 widened ([#274](https://github.com/yusiwen/minfer/issues/274)); stage B `vec_ops` landed (PR [#291](https://github.com/yusiwen/minfer/pull/291)) — `src/vec_ops.rs` 1,344 → 52 lines + 8 part files; stage C `kernel` landed (PR [#VERIFY]()) — `src/kernel.rs` 667 → 22 lines + 3 part files; counts unchanged (481/0/36 + 10/0/6) |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
 | 6 long test files | #267 | **files 1–9 landed** (PRs #275, #277, #278, #279, #280, #281, #283): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` 1,186 → a 209-line parent + 4 `tests/<topic>.rs` (5 tests) |
@@ -338,6 +338,15 @@ nested module). 47 `fn` definitions on each side of the move. Three f16 re-expor
 `#![deny(warnings)]`. `RopeStyle::Interleaved`'s `docs/dead-code-baseline.toml` `file =` field moves to
 `src/vec_ops/rope.rs` in the same PR.
 
+**Stage C landed** (PR [#VERIFY]()): `src/kernel.rs` 667 → 22 lines + `dispatch` 72 ·
+`pool` 313 · `embed` 278. 10 `fn` definitions on each side of the move. `Pool`'s fields and the
+`MmJob`/`PoolJob`/`ParForJob` types become `pub(super)` because `dispatch.rs` submits through them
+(the same `pub(in kernel)` reach they had as private items of `kernel`), and `Pool`'s `gate` field
+carries its hazard comment into `pool.rs`. One re-export is deliberately not carried: `cpu_quant_matmul`
+keeps its `pub` in `dispatch.rs` but is not re-exported at the `kernel` root, because its only caller is
+`cpu_quant_matmul_f32` in the same file and `#![deny(warnings)]` rejects a `pub use` of an unused name;
+no `crate::kernel::cpu_quant_matmul` path exists anywhere in the tree.
+
 ### Step 4 — Metal (Mac round, after [#255](https://github.com/yusiwen/minfer/issues/255))
 
 `src/metal.rs` and `src/metal.metal` are **not compiled on Linux** (`src/main.rs:31-32` gates the
@@ -504,7 +513,9 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/vec_ops.rs` 754–1069 | `src/vec_ops/f16.rs` |
 | `src/vec_ops.rs` 1071–1163 | `src/vec_ops/bf16.rs` |
 | `src/vec_ops.rs` 1165–1332 | `src/vec_ops/neon.rs` |
-| `src/kernel.rs` | the §4 Step 3 table (stage C) |
+| `src/kernel.rs` 8–34, 319–358 | `src/kernel/dispatch.rs` |
+| `src/kernel.rs` 36–317, 360–387 | `src/kernel/pool.rs` |
+| `src/kernel.rs` 389–664 | `src/kernel/embed.rs` |
 
 ### 6.5 The macOS hand-off (decided 2026-10-04: Step 4 is Mac-local)
 
@@ -653,9 +664,9 @@ src/
 │                                            (runtime fallback joins them with `concat!`)
 ├── kernel.rs                        [S3]  module kernel: `mod` + `pub use`
 ├── kernel/
-│   ├── dispatch.rs                  [S3]  cpu_quant_matmul* (12–44, 322–390)
-│   ├── pool.rs                      [S3]  Pool / par_for / set_cpu_threads (45–321)
-│   ├── embed.rs                     [S3]  embed_tokens (391–)
+│   ├── dispatch.rs                  [S3C] cpu_quant_matmul / cpu_quant_matmul_f32 (12–44, 322–390)
+│   ├── pool.rs                      [S3C] Pool / par_for / set_cpu_threads (45–321, 364–390)
+│   ├── embed.rs                     [S3C] embed_tokens (391–)
 │   └── tests.rs                            (exists)
 ├── quants.rs                        [S3]  module quants: `pub use`
 ├── quants/

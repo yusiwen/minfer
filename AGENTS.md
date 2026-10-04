@@ -28,7 +28,8 @@ src/
 ├── block.rs         # quantized block types (repr(C), ggml-common.h layout)
 ├── quants.rs        # AVX2 / NEON+SDOT dot kernels + Q8_0/Q8_K quantization — module decider
 ├── quants/          # dot_q4_0 · dot_q4_1 · dot_q5 · dot_q8_0 · kquant · quantize_q8_0 · quantize_q8_k · avx2 · neon (split by #264)
-├── kernel.rs        # quantized matmul dispatch + scalar fallbacks; shared worker pool
+├── kernel.rs        # quantized matmul dispatch + scalar fallbacks; shared worker pool — module decider
+├── kernel/          # dispatch · pool · embed (split by #264)
 ├── vec_ops.rs       # RMSNorm, RoPE, Softmax, SiLU; vectorized f16 weight dot — module decider
 ├── vec_ops/         # vec · rms_norm · rope · softmax · silu · f16 · bf16 · neon (split by #264)
 ├── tensor.rs        # 4D Tensor (shape/strides/data)

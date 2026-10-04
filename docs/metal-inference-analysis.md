@@ -83,7 +83,7 @@ Every weight tensor is copied into a new `MTLBuffer` via `copy_nonoverlapping`, 
 
 ### HIGH #6 — CPU-Side Quantization Blocking
 
-**Files**: `metal.rs:598`, `kernel.rs:81`
+**Files**: `metal.rs:598`, `src/kernel/dispatch.rs:9`
 
 Before each GPU matmul dispatch, `quantize_row_q8_0_buf` runs on the CPU to quantize activations to Q8_0, then uploads to GPU. This is a synchronous bottleneck in the GPU pipeline.
 
