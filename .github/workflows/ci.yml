@@ -46,6 +46,16 @@
 #                       carries a reason) plus that checker's own cases. A source
 #                       audit needs no build; the liveness half is the oracle that
 #                       the two build/test jobs run last.
+#                       It also runs `scripts/check_doc_line_anchors.py` (#266):
+#                       `check_docs_links.py` sees link *targets*, not the
+#                       `path:NNN` line anchors the docs cite code by, so a moved
+#                       line rots silently — and the source-layout campaign moves
+#                       400 of them. The anchors are resolved against the tree,
+#                       range-checked, and (heuristically) symbol-checked; the
+#                       historical records that cite a pre-split revision are
+#                       frozen in the script with a reason apiece, and an
+#                       exemption that no longer covers a failure is itself a
+#                       failure (the dead-code ratchet's shape).
 # 5. check-viz        : the shape-flow gate. `scripts/check_viz_e2e.mjs` replays the
 #                       stage template against every exported sample and requires the
 #                       computed shapes to equal the ones the engine actually
@@ -250,6 +260,16 @@ jobs:
       # those to be noticed.
       - name: The dead-code oracle's own pass/fail cases
         run: python3 scripts/check_dead_code_oracle.py --selftest
+      # #266: a `path:NNN` anchor must name a file of this tree *and* a real line of
+      # it, and — when the anchor names a symbol — that symbol must be in the file
+      # the anchor points at. The historical records whose anchors cite a pre-split
+      # revision are frozen inside the script, each with a reason; an exemption that
+      # no longer covers anything fails, so the frozen set only shrinks. A docs+
+      # source audit needs no toolchain and no GPU.
+      - name: Every `path:NNN` anchor must resolve to a real line
+        run: python3 scripts/check_doc_line_anchors.py
+      - name: The doc-line-anchor checker's own pass/fail cases
+        run: python3 scripts/check_doc_line_anchors.py --selftest
       # Same toolchain as Docs (`.github/workflows/docs.yml`), so the gate builds the
       # book the site actually ships: mdBook 0.4.37 because 0.5 changed the
       # preprocessor protocol, and mdbook-mermaid 0.13.0 because it only understands
