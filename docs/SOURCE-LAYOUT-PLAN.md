@@ -21,7 +21,7 @@
 | 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
 | 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 594 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
 | 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5, G6): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` (1 header) + 17 TUs; audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2 |
-| 3 CPU files | #264 | not started |
+| 3 CPU files | #264 | **in progress**: stage A `quants` landed (PR [#290](https://github.com/yusiwen/minfer/pull/290)) — `src/quants.rs` 1,340 → 61 lines + 9 part files + `src/quants/neon_correctness.rs`; `scripts/check_source_layout.py` rule 1 widened ([#274](https://github.com/yusiwen/minfer/issues/274)); counts unchanged (481/0/36 + 10/0/6). Stages B `vec_ops` and C `kernel` to follow |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
 | 6 long test files | #267 | **files 1–9 landed** (PRs #275, #277, #278, #279, #280, #281, #283): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` 1,186 → a 209-line parent + 4 `tests/<topic>.rs` (5 tests) |
@@ -318,6 +318,16 @@ plan's older text said 480, which predates [#138](https://github.com/yusiwen/min
 tests), the dead-code `(name, kind)` set identical on `aarch64` and `x86_64`, and
 `check_source_layout.py` / `check_dead_code_annotations.py` / `cargo fmt --all --check` green.
 
+**Stage A landed** (PR [#290](https://github.com/yusiwen/minfer/pull/290)): `src/quants.rs` 1,340 → 61
+lines + `dot_q4_0` 71 · `dot_q4_1` 44 · `dot_q5` 94 · `dot_q8_0` 64 · `kquant` 185 ·
+`quantize_q8_0` 125 · `quantize_q8_k` 111 · `avx2` 81 · `neon` 414, plus the extracted
+`neon_correctness.rs` 138. `neon_kernels` and `neon_q8k` are flattened into the one `neon.rs` (no item
+name collides), their cross-references lose the `super::neon_kernels::` prefix. `pub(super)` replaces
+"private to `quants`" on the items a sibling reaches, so the reachable set is unchanged; the parent's
+`pub use` list is what keeps `crate::quants::…` (and `graph/kvformat.rs`'s two calls) resolving. The
+old file had 48 `fn` definitions and the new files have the same 48 (excluding the pre-existing
+`tests.rs`); all 29 `cpu-map.tsv` items resolve in their mapped targets.
+
 ### Step 4 — Metal (Mac round, after [#255](https://github.com/yusiwen/minfer/issues/255))
 
 `src/metal.rs` and `src/metal.metal` are **not compiled on Linux** (`src/main.rs:31-32` gates the
@@ -437,7 +447,7 @@ route (a) and is also llama.cpp's CUDA shape. The evidence base for the split's 
 | 0 | `docs/SOURCE-LAYOUT-PLAN.md` (new) + `docs/SUMMARY.md` (chapter entry) + `AGENTS.md` (Layout block, docs index, the CUDA/Metal bullets, the `~4400 LOC` figure) + `docs/ARCHITECTURE.md` (module map + the layer/interface-eligibility convention) + `docs/BACKENDS.md` (the device-layer rows) + the stale-number list folded into [#219](https://github.com/yusiwen/minfer/issues/219) | none yet (no file has moved) |
 | 1 `cuda.rs` | `docs/inference_e2e_walkthrough/15-cuda-backend.md`, `docs/cuda_tutorial/{02,04,05}.md` (the Rust-side excerpts), `docs/CUDA-BACKEND-DESIGN.md` (§device layer), `docs/DEVICE-ADAPTATION-PLAN.md`, `docs/COMPUTE-GRAPH-DESIGN.md` | the **269-anchor cuda-Rust half** and the 269 mentions of `cuda.rs` across the live set |
 | 2 `.cu` | `docs/CUDA-BACKEND-DESIGN.md` (§kernels), `docs/cuda_tutorial/{03,04,05,06}.md`, `docs/LLAMA-CPP-MMQ-ANALYSIS.md`, `docs/CUDA-TECH-PRIMER.md`, `docs/CUDA_OPTIMIZATION.md`, `docs/GPU_SAFETY.md` (the `<<<>>>`/opt-in rules), `docs/BUILD.md` (the nvcc file list) | `cuda_kernels.cu` 342 mentions + its anchors, via the mapping table |
-| 3 CPU | `docs/ARCHITECTURE.md`, `docs/inference_e2e_walkthrough/{10,11}.md`, `docs/CPU_OPTIMIZATIONS.md` | `quants.rs`/`vec_ops.rs`/`kernel.rs` mentions (few, all live) |
+| 3 CPU | `docs/ARCHITECTURE.md`, `docs/inference_e2e_walkthrough/{10,11}.md`, `AGENTS.md` (Layout) — `docs/CPU_OPTIMIZATIONS.md` is **frozen** (§6.2) and keeps its `quants.rs`/`vec_ops.rs` line numbers | `quants.rs`/`vec_ops.rs`/`kernel.rs` mentions (19 `quants.rs:NNN` anchors in live docs, re-pointed in stage A; the frozen records resolve through §6.4) |
 | 4 Metal | `docs/METAL-BACKEND-DESIGN.md`, `docs/METAL_OPTIMIZATIONS.md`, `docs/inference_e2e_walkthrough/14-metal-backend.md`, `docs/LLAMA_METAL_E2E.md`, `docs/METAL_OBJC2-MIGRATION-PLAN.md`, `docs/metal-inference-analysis.md`, `docs/multi-token-kernel-analysis.md` | the 132 metal anchors + 250 `metal.rs`/`metal.metal` mentions |
 | 6 tests | `AGENTS.md` (the test-module convention paragraph), `docs/GATE-CONTRACT.md` if a gate's location is named | test-file paths named in docs |
 | every step | a dated entry in `docs/ARCHITECTURE-EXECUTION-PLAN.md` §test-infrastructure (the repo's per-ticket record) + the `Status` table of this document | — |
@@ -466,6 +476,17 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/conversation/tests.rs` | `src/conversation/tests/{turns,regen,spec,snapshot,overflow,real_model}.rs` |
 | `src/graph/kvcache/tests.rs` | `src/graph/kvcache/tests/{cells,spans,sharing,resize,defrag}.rs` |
 | `src/cuda/issue162_tests.rs` | `src/cuda/issue162_tests/{sites,severity,control,node}.rs` |
+| `src/quants.rs` 10–31, 292–355, 426–457 | `src/quants/quantize_q8_0.rs` |
+| `src/quants.rs` 33–53, 96–140 | `src/quants/dot_q4_0.rs` |
+| `src/quants.rs` 55–94 | `src/quants/dot_q4_1.rs` |
+| `src/quants.rs` 142–202 | `src/quants/dot_q8_0.rs` |
+| `src/quants.rs` 204–290 | `src/quants/dot_q5.rs` |
+| `src/quants.rs` 357–424, 459–466 | `src/quants/avx2.rs` |
+| `src/quants.rs` 471–663, 964–1198 | `src/quants/neon.rs` (the two flat NEON modules) |
+| `src/quants.rs` 674–780 | `src/quants/quantize_q8_k.rs` |
+| `src/quants.rs` 782–962 | `src/quants/kquant.rs` |
+| `src/quants.rs` 1200–1340 | `src/quants/neon_correctness.rs` |
+| `src/vec_ops.rs` / `src/kernel.rs` | the §4 Step 3 tables (stages B, C) |
 
 ### 6.5 The macOS hand-off (decided 2026-10-04: Step 4 is Mac-local)
 
