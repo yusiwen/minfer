@@ -1334,9 +1334,9 @@ the evidence is on stderr of any plain run.
   model side, `forward_cached_isolates_kv_between_caches`
   `src/models/qwen2/graph/tests/batching.rs:742`) proves two caches don't share KV. The
   conversation state machine is tested without a model via a mock engine:
-  `second_turn_appends_only_delta` (`conversation/tests.rs:223`) asserts the
+  `second_turn_appends_only_delta` (`conversation/tests/turns.rs:48`) asserts the
   delta prefill is smaller than the first turn's, and
-  `context_fill_during_decode_stops_cleanly` (`conversation/tests.rs:575`)
+  `context_fill_during_decode_stops_cleanly` (`conversation/tests/overflow.rs:22`)
   pins the cursor-vs-`n_ctx` guard.
 - **`bench -n N <model>`.** Runs decode for a fixed `N` and reports the
   pure-decode rate in md/csv/json — the reproducible version of the
