@@ -821,7 +821,7 @@ dispatch rejects `hd > 128` or `hd % 4 != 0` before launch). The core loop
 is the online softmax of §2.4:
 
 ```rust
-// src/cuda_kernels.cu:2878-2920 (attn_split_1w_body core loop)
+// src/cuda/kernels/attention_decode.cu:185 (attn_split_1w_body core loop)
 for (int base = lo; base < hi; base += 4) {
     int nr = min(4, hi - base); // warp-uniform
     // D2: stage BOTH K and V for the whole 4-row window before the first
@@ -879,7 +879,7 @@ weights to zero.
 The combine kernel is 20 lines and re-derives the whole answer:
 
 ```rust
-// src/cuda_kernels.cu:2959-2978
+// src/cuda/kernels/attention_decode.cu:360
 __global__ void gqa_attn_split_combine(
     const float* __restrict__ partial,
     float* __restrict__ o,

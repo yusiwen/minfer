@@ -104,7 +104,7 @@ chapter: the bare command printed `ERR_NVGPUCTRPERM`; the sudo form worked.
 `TMPDIR=/tmp/yourtmp` or fix the directory ownership.)
 
 The kernel lines of the observed output (Qwen3-0.6B Q8_0, 9-token prompt,
-decode `q8_0_p32_q8_mmvq` — the kernel at `src/cuda_kernels.cu:5487`):
+decode `q8_0_p32_q8_mmvq` — the kernel at `src/cuda/kernels/mmvq_multi.cu:657`):
 
 ```text
   q8_0_p32_q8_mmvq(...) (1024, 1, 1)x(256, 1, 1), Context 1, Stream 13, Device 0, CC 12.1
@@ -256,7 +256,7 @@ re-read from DRAM/L2 but eat shared memory, and shared memory per block
 `gemm_f16_nt_kernel_t` line by line; the design arithmetic is in step doc 02.
 
 - **Where minfer uses it**: `gemm_f16_nt_kernel_t`
-  (`src/cuda_kernels.cu:4787`) — TN=64 × TM tile, KS=32 k-step, dynamic smem
+  (`src/cuda_kernels.cu:1885`) — TN=64 × TM tile, KS=32 k-step, dynamic smem
   (`extern __shared__` at :4796); the MMQ GEMM family tiles the same way with
   raw quantized bytes (`mmq_raw_nb_kernel`, `src/cuda/kernels/mmq_nb.cu:9`; its BT
   successor `mmq_raw_nb_bt_kernel` :6656; q6_K variant :6976).
@@ -284,7 +284,7 @@ alignment).
 - **Where minfer uses it**: `store_kv_f16` (`float4` load + two `__half2`
   stores, `src/cuda_kernels.cu:2561`); the q6_K B-expand reads packed data as
   `uint4` groups; the q8_0 p32 decode planes are *designed around* the
-  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda_kernels.cu:5487`, row
+  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda/kernels/mmvq_multi.cu:657`, row
   pointer :8302, the `__ldg` group loads :8308).
 - **Step records**: [11-p5-gemm-tiles-fa-rewrite.md](../cuda_optimization_steps/11-p5-gemm-tiles-fa-rewrite.md)
   (P5·1, +4%); [44-r41-q6k-bexpand-uint4.md](../cuda_optimization_steps/44-r41-q6k-bexpand-uint4.md)
@@ -510,7 +510,7 @@ from llama.cpp (the MMQ analysis doc), then re-derived kernel by kernel over
 ~30 rounds.
 
 - **Where minfer uses it**: the A-plane prepass
-  (`quantize_q8_0_pad40_t`, `src/cuda_kernels.cu:794` — the pre-transposed,
+  (`quantize_q8_0_pad40_t`, `src/cuda/kernels/mmvq_aquant.cu:85` — the pre-transposed,
   64-token-blocked layout), the raw-byte NB/BT GEMM family
   (`mmq_raw_nb_bt_kernel` :6656, q6_K variant :6976), dispatched for
   `nt ≥ 16` under the `MINFER_MMQ` gate read through `CudaState::mmq_gate_on`
@@ -715,7 +715,7 @@ record of this exact effect is
 
 ### Exercise (b) — change dequant thread granularity in a *copy* *(medium)*
 
-**Task.** Copy `dequant_q4_0_f16` (`src/cuda_kernels.cu:4449`) into
+**Task.** Copy `dequant_q4_0_f16` (`src/cuda_kernels.cu:1556`) into
 `/tmp/dq_gran.cu` with a synthetic weight buffer — **do not modify the repo**.
 The incumbent maps one thread to one 32-element block (`g = blockIdx.x *
 blockDim.x + threadIdx.x` indexes `od*nb` blocks; each thread writes 32
@@ -752,7 +752,7 @@ separation. For doc 43 the modern equivalent knob is the q6_K kernel's
 `__launch_bounds__` line itself (do not modify the repo — build a scratch
 worktree copy in `/tmp` if you want to flip it); for P5·2 note the era
 shift first: `MINFER_GEMM_TM` (64/128/256, read at
-`src/cuda_kernels.cu:5079–5086`) retiles the *f16 wmma GEMM*, which is only
+`src/cuda_kernels.cu:1885`) retiles the *f16 wmma GEMM*, which is only
 on the hot path when you run the escape side `MINFER_MMQ=0` — exactly the A/B
 frame P5·2 was measured in. Then compare your numbers with the doc's recorded
 ones.

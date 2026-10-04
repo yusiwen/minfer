@@ -171,7 +171,7 @@ Line by line:
   `__restrict__` qualifiers promise the compiler the three buffers do not
   alias, which lets nvcc keep the loads before the store.
 
-The launcher — `src/cuda_kernels.cu:3880`:
+The launcher — `src/cuda_kernels.cu:1369`:
 
 ```c
 void launch_add_f32(
@@ -241,7 +241,7 @@ __global__ void add_bias_f32(
   exceed one block's width (a 0.5B layer has `d = 896`; a 7B one has 3,584 or
   18,944), so the launcher folds the remainder into `grid.y`:
   `grid(n, (d + 63) / 64)` with 64 threads per block
-  (`launch_add_bias_f32`, `cuda_kernels.cu:3872`). For 896: `grid.y = 14`,
+  (`launch_add_bias_f32`, `cuda_kernels.cu:1359`). For 896: `grid.y = 14`,
   so a 30-token prefill launches 30 × 14 = 420 blocks of 64.
 - **`y[t * d + i] += b[i];`** — in-place accumulate. The bias vector `b[i]`
   is read by every row, so it stays hot in L2 across the grid.
@@ -316,7 +316,7 @@ them:
 
 #### The kernel
 
-`src/cuda_kernels.cu:4449` (family header + type-id table at `:4421`):
+`src/cuda_kernels.cu:1556` (family header + type-id table at `:4421`):
 
 ```c
 __global__ void dequant_q4_0_f16(
@@ -369,7 +369,7 @@ grid has `od * nb` threads. Reading it line by line:
   start in the dense `[od][id]` f16 matrix, plus 32 elements per block. The
   writes of one thread are fully contiguous.
 
-The launcher — `src/cuda_kernels.cu:5043`:
+The launcher — `src/cuda_kernels.cu:2295`:
 
 ```c
 void launch_dequant_f16(
@@ -527,7 +527,7 @@ embedding *and* the tail-row selects before `lm_head` (doc 09 §2.4). The
 Rust wrapper (`src/cuda/methods/mmq_quant.rs:214`) maps `TensorType` to `(type_id,
 block_stride)` — `Q4_0 => (1, 18)` at `:4124` — and `F32` embeddings skip the
 quant kernels entirely by calling the f32 gather (`:4133`). The C launcher
-(`launch_embed_rows`, `cuda_kernels.cu:3643`) computes the grid per type
+(`launch_embed_rows`, `cuda_kernels.cu:1184`) computes the grid per type
 (eight `embed_rows_*` kernels behind one `switch`) with the same
 one-thread-per-32-block geometry.
 
@@ -552,7 +552,7 @@ that carries the idea.
 
 | Kernel (file:line) | Purpose | The one interesting line |
 |---|---|---|
-| `convert_f32_f16_kernel` (`cuda_kernels.cu:4614`) | f32 activations → f16, feeding the wmma prefill GEMM | `:4619` — `base = (…blockIdx.x * blockDim.x + threadIdx.x) * 8`: the thread index is **multiplied by 8**; each thread `float4`-loads 8 f32 and stores 4 `__half2` (`:4624`), 8× fewer transactions for the same traffic (the P1 comment at `:4617`). Launcher `launch_convert_f16` `:5067` sizes the grid over `n/8`. |
+| `convert_f32_f16_kernel` (`cuda_kernels.cu:1721`) | f32 activations → f16, feeding the wmma prefill GEMM | `:4619` — `base = (…blockIdx.x * blockDim.x + threadIdx.x) * 8`: the thread index is **multiplied by 8**; each thread `float4`-loads 8 f32 and stores 4 `__half2` (`:4624`), 8× fewer transactions for the same traffic (the P1 comment at `:4617`). Launcher `launch_convert_f16` `:5067` sizes the grid over `n/8`. |
 | `f32_bits_to_i32` (`cuda_kernels.cu:2489`) | positions/token ids arrive as I32-as-f32 bit patterns; rope/store/attention kernels want raw `int*` | `:2496` — `dst[tid] = __float_as_int(src[tid]);` the whole kernel *is* that line: one device-side bit reinterpretation pass, so the per-layer path never syncs with the host (comment `:2483`). Rust entry `bits_to_i32` `src/cuda/methods/kvstore.rs:146`, called from `positions_i32` (`cuda_backend.rs:1210`, launch `:1238`). |
 | `gather_rows_f32` (`cuda_kernels.cu:2046`) | the quant-free `GetRows`: `out[t*n+i] = x[ids[t]*n+i]` | `:2058` — `out[idx] = src[(long long)id * n + i];` the classic gather: one flat index decoded into `(t, i)`, the id looked up per thread. Same `(1, 18)`-style dispatch you saw in §3.3 is what routes F32 embeddings and the tail-row selects here. |
 
