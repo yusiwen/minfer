@@ -146,8 +146,8 @@ REASON_MARKERS = (
 #: [#255]'s, and the reason on the item names the test that consumes it.
 GRANDFATHERED_BARE = {
     "src/convert.rs:order",
-    "src/cuda.rs:cudaStreamWaitEvent",
-    "src/cuda.rs:stream_wait_event",
+    "src/cuda/ffi_runtime.rs:cudaStreamWaitEvent",
+    "src/cuda/methods/events.rs:stream_wait_event",
     "src/device_tier.rs:Amd",
     "src/device_tier.rs:Mthreads",
     "src/device_tier.rs:Apple",

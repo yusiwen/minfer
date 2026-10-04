@@ -431,7 +431,7 @@ reason = "Read only by the `#[cfg(test)]` accessor `Self::cc` (`cuda_backend/tes
 [[cuda]]
 name = "cudaStreamWaitEvent"
 kind = "fn"
-file = "src/cuda.rs"
+file = "src/cuda/ffi_runtime.rs"
 reason = "Held pending #138: the F5 device→device staging copy is what would call it; `docs/BACKEND-REGISTRY-DESIGN.md` §11 documents it as that path's mechanism."
 
 [[cuda]]
@@ -515,7 +515,7 @@ reason = "Read by `conversation::tests`; the streaming path uses the local copy.
 [[cuda]]
 name = "stream_wait_event"
 kind = "fn"
-file = "src/cuda.rs"
+file = "src/cuda/methods/events.rs"
 reason = "Held pending #138: the F5 device→device staging copy is what would call it — no caller yet by construction."
 
 [[cuda]]

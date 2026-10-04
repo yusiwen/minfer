@@ -268,9 +268,9 @@ scan a free list for an exact byte-length match and otherwise allocate fresh.
    generation — stops moving) and gave `GraphCache` one graph per `GraphParams`,
    so a switch is a re-map, not a build (§14 row 3, closed by E4 S3).
 3. **No VRAM budget or feasibility check.** `cudaMemGetInfo` is queried once at
-   init and only printed (`cuda.rs:1525-1546`); the sole consumer of free-memory
+   init and only printed (`src/cuda.rs:500-521`); the sole consumer of free-memory
    information today is a valve guarding the optional f16 weight cache
-   (`cuda.rs:3931-3936`) — the activation/KV allocator has no accounting at all.
+   (`src/cuda/methods.rs:57-62`) — the activation/KV allocator has no accounting at all.
    Out-of-memory surfaces as a null pointer that fails at execute time
    (`cuda_backend.rs:1345-1348`). There is no "this graph will not fit, offload
    the last *n* layers" fallback because there is no layer-offload concept at
@@ -451,7 +451,7 @@ sites, each of which had to be taught about a new backend.
 GPU participation is decided by an all-or-nothing model-level gate: every weight
 must be registered on the GPU or the model runs on CPU (`ARCHITECTURE.md §5.2`;
 `CUDA-BACKEND-DESIGN.md:251-255`). The engine enumerates devices and honours
-`--gpu N` but uses exactly one (`cuda.rs:1465-1501`); there is no
+`--gpu N` but uses exactly one (`src/cuda.rs:440-476`); there is no
 `tensor_split`, no peer copies, and no remote-device backend.
 
 **Gap.** 🟠 Two axes.

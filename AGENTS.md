@@ -39,7 +39,8 @@ src/
 ├── server/          # OpenAI-compatible axum server; batch.rs = continuous batching, metrics.rs = /metrics
 ├── download/mod.rs  # HuggingFace + Ollama auto-download
 ├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
-├── cuda.rs          # CUDA device layer, feature-gated (graph backend: graph/cuda_backend.rs); device_memory() → allocplan::DeviceMemory
+├── cuda.rs          # CUDA device layer (L1), feature-gated (graph backend: graph/cuda_backend.rs); device_memory() → allocplan::DeviceMemory
+├── cuda/            # L2 launch/dispatch: ffi_runtime.rs + methods.rs + methods/<family>.rs (split by #262)
 ├── device_tier.rs   # cc-keyed CUDA device-tier table + selector
 └── models/          # ModelDef trait + per-arch mod/graph/loader (qwen2/, qwen3/)
 ```

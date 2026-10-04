@@ -9717,3 +9717,51 @@ the CPU row drops: `mod dry;` in `sampler/tests.rs` → `src/sampler/tests/dry.r
 **What is left.** `src/cuda/issue162_tests.rs` (1,186 lines) is the last file of #267 and is deliberately
 not split here: it carries the launch-fixture column assertion (`assert_eq!(f.len(), 4)`) that Step 2
 (#263) changes, so it moves after #263 merges.
+
+#### Test-infrastructure record (#261 step 1, 2026-10-04) — `src/cuda.rs` becomes `src/cuda/{ffi_runtime,methods}.rs` + 18 family files
+
+**What landed.** The first code move of the source-layout campaign ([#262](https://github.com/yusiwen/minfer/issues/262),
+PR #PRNUM): `src/cuda.rs` loses its 4,546-line `impl CudaState` and its two `extern "C"` blocks and keeps
+the module doc, `AttnWindow`, `pub struct CudaState` (all 29 fields still private), the free items, the
+ten `#[cfg(test)] mod` declarations and the re-export lines — 6,578 → **1,014** lines. New:
+`src/cuda/ffi_runtime.rs` (the cudart/driver declarations, now `pub(super)`, plus the test-only extern
+block), `src/cuda/methods.rs` (the 15 non-`pub` helpers whose callers land in a second family file, the
+18 `mod` declarations and the two-level `#[cfg(test)] pub(crate) use` chain the launch tests resolve
+through `use super::*`), and the 18 `src/cuda/methods/<family>.rs` files (28–728 lines) holding the
+`impl CudaState` blocks and the 86 launch declarations (now `pub(crate)`), each with the family that
+uses it — no symbol has two consumer families.
+
+**The layout invariant.** `methods/<family>.rs` are descendants of `methods.rs`, itself a child of
+`cuda.rs`, so a private field of `CudaState` and a private method in `methods.rs` are visible in every
+family file: **0 field-visibility edits and 0 `pub(super)`**. The 15 helpers that must live in the
+shared parent are the transitive closure of the cross-file call graph, not the family table's first
+guess: `plane_budget_ok` stays in `methods/weights.rs` (all four callers are there), while the eight
+`no_*`/`fused_b_on` predicates are cross-family and cannot sit in a sibling `policy.rs` without
+`pub(super)` — that is the one place the executed shape differs from the plan's §4 Step 1 bullet.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the step's worktree:
+
+| Command | Result |
+|---|---|
+| `cargo build --release --features cuda` | exit 0 |
+| `scripts/cuda_test.sh` | **567 passed / 0 failed / 42 ignored** — unchanged from `2f70fc6` |
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration — unchanged |
+| `cargo fmt --all --check` | exit 0 |
+| `python3 scripts/check_source_layout.py` | *"src obeys the layout rules"*, exit 0 |
+| `python3 scripts/check_dead_code_annotations.py` | exit 0 (11 grandfathered bare sites) |
+| `python3 scripts/check_dead_code_oracle.py --config {cpu,cuda}` | 0 additions, 0 removals; only the two moved `file =` lines in `docs/dead-code-baseline.toml` |
+| `python3 scripts/check_doc_line_anchors.py` | **81 out-of-range → 0** (99 anchors re-pointed by the split's line map, 28 re-anchored to the symbol, 5 rebuilt by hand) |
+| `FEATURES=cuda scripts/real_model_gates.sh` ×2 | **42 / 0 ×2**, greedy output bitwise identical |
+| CI run RUNID | **7 / 7 green**, zero code annotations |
+
+**Mutation evidence (rule 3).** Two mutations in the worktree, each reverted:
+`src/cuda/methods/orphan.rs` → `check_source_layout` prints
+`not reachable from src/main.rs — no `mod` declaration names it, so it is never compiled (tests in it
+would silently not run)`, exit 1; deleting `mod buffers;` from `methods.rs` → the same message for
+`src/cuda/methods/buffers.rs`, exit 1 (restored, exit 0).
+
+**Deliberately out of scope.** No line of CUDA behaviour changed: the `impl` bodies, free items and
+declarations move verbatim, and the only textual edits are the visibility prefixes on the moved
+declarations, the generated `use`/`mod` preambles and the `CudaCommandBuffer` banner (rewritten to name
+`graph/cuda_backend.rs`, the deferred #219 item this step owned). The `.cu` file is untouched
+(Step 2, [#263](https://github.com/yusiwen/minfer/issues/263)).
