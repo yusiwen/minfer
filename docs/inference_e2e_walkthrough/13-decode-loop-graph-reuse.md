@@ -1332,7 +1332,7 @@ the evidence is on stderr of any plain run.
   `fuse_flags_are_part_of_the_reuse_identity` (`cache/tests.rs:36`), and
   `structural_check_detects_different_graph` (`cache/tests.rs:176`). On the
   model side, `forward_cached_isolates_kv_between_caches`
-  (`src/models/qwen2/graph/tests.rs:3306`) proves two caches don't share KV. The
+  `src/models/qwen2/graph/tests/batching.rs:742`) proves two caches don't share KV. The
   conversation state machine is tested without a model via a mock engine:
   `second_turn_appends_only_delta` (`conversation/tests.rs:223`) asserts the
   delta prefill is smaller than the first turn's, and
