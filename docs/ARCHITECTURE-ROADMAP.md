@@ -533,8 +533,8 @@ bf16 output is refused ([#142](https://github.com/yusiwen/minfer/issues/142)).
 🟢 for conversion/quantization of the supported set.
 
 **CPU SIMD.** Only `Q4_0` and `Q8_0` have AVX2 (Advanced Vector Extensions 2)
-dot kernels (`quants.rs:42`, `:151`); `Q4_1`/`Q5_0`/`Q5_1`/`Q4_K`/`Q5_K`/`Q6_K`
-are scalar on x86 and NEON-only on aarch64 (`quants.rs:891-1020` — the K-quant
+dot kernels (`src/quants/dot_q4_0.rs:29`, `src/quants/dot_q8_0.rs:28`); `Q4_1`/`Q5_0`/`Q5_1`/`Q4_K`/`Q5_K`/`Q6_K`
+are scalar on x86 and NEON-only on aarch64 (`src/quants/kquant.rs` — the K-quant
 dispatch has no `is_x86_feature_detected` branch at all). Since K-quants are the
 most common GGUF format in circulation, x86 CPU inference is far below what the
 hardware can deliver; the support matrix documents this (`SUPPORT-MATRIX.md`,

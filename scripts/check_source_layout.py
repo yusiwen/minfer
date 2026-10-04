@@ -7,6 +7,10 @@ Two rules, both cheap to check and both easy to break silently:
    plus `<module>/tests.rs`. An inline `#[cfg(test)] mod tests { … }` in a
    production file is what the PR that introduced this checker moved out, one
    module at a time; nothing in rustc objects to it coming back, so this does.
+   The gate is read from the cfg *predicate*, not from one spelling, so the
+   compound forms (`#[cfg(all(test, target_arch = "aarch64"))]`, `any(test, …)`)
+   are caught too; `#[cfg(not(test))]` is not a test gate and is left alone
+   ([#274](https://github.com/yusiwen/minfer/issues/274)).
 
 2. **Every `.rs` under `src/` is declared.** A file that no `mod` declaration
    names is never compiled — and when that file holds tests, they silently do
@@ -44,13 +48,22 @@ CRATE_ROOT = "main.rs"
 #: declare it", not "does it compile in this configuration".
 MOD_DECL = re.compile(r"^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?mod[ \t]+(\w+)[ \t]*;", re.M)
 
-#: An inline test module — the shape rule 1 forbids. The wanted shape ends in a
-#: semicolon, so the `{` is what makes this a violation. Whitespace (including a
-#: newline) may separate the attribute from `mod`: both
-#: `#[cfg(test)] mod tests {` and the two-line form are the same shape.
-INLINE_TEST_MOD = re.compile(
-    r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*mod[ \t]+(\w+)[ \t]*\{"
-)
+#: An inline module behind at least one attribute — the shape rule 1 inspects.
+#: The wanted shape ends in a semicolon, so the `{` is what makes this a
+#: candidate. Whitespace (including a newline) may separate an attribute from
+#: `mod`: both `#[cfg(test)] mod tests {` and the two-line form are one shape.
+#: Whether the module is a *test* module is decided by `test_gate` below, on the
+#: attribute text `(1)`.
+INLINE_MOD = re.compile(r"((?:#\[[^\]]*\]\s*)*)mod[ \t]+(\w+)[ \t]*\{")
+
+#: A `#[cfg(...)]` attribute; group `(1)` is the predicate text.
+CFG_ATTR = re.compile(r"#\[cfg\(([^\]]*)\)\]")
+
+#: `test` as its own identifier — `test_utils` is a different feature.
+TEST_TOKEN = re.compile(r"\btest\b")
+
+#: One `not(...)` group, innermost-first; repeated application removes nesting.
+NOT_GROUP = re.compile(r"\bnot\s*\([^()]*\)")
 
 #: `#[path = "..."]` chooses a module's file by attribute.
 PATH_ATTR = re.compile(r"#\[path[ \t]*=")
@@ -65,6 +78,45 @@ def code_lines(text: str) -> str:
     it does not know.)
     """
     return "\n".join("" if ln.lstrip().startswith("//") else ln for ln in text.splitlines())
+
+
+def without_negations(pred: str) -> str:
+    """`pred` with every `not(...)` group removed, parentheses matched.
+
+    A cfg predicate is a boolean expression; a `test` inside a `not` is a
+    *non*-test gate (`#[cfg(not(test))] mod prod {` is the production build), so
+    it must not count as a test gate. Nesting is handled by scanning to the
+    matching `)` rather than by a regex, because `not(all(test, …))` nests.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(pred):
+        m = re.compile(r"\bnot\s*\(").match(pred, i)
+        if m is None:
+            out.append(pred[i])
+            i += 1
+            continue
+        depth, j = 1, m.end()
+        while j < len(pred) and depth:
+            depth += (pred[j] == "(") - (pred[j] == ")")
+            j += 1
+        i = j
+    return "".join(out)
+
+
+def test_gate(attrs: str) -> str | None:
+    """The `#[cfg(...)]` in `attrs` that gates on `test`, or `None`.
+
+    Rule 1 must recognize the *predicate*, not one spelling: `all(test, …)` and
+    `any(test, …)` are test gates just as `test` alone is, and an item carrying
+    further attributes (`#[allow(...)]`) between the cfg and `mod` is the same
+    shape. The literal `#[cfg(test)]` match this replaces let the compound
+    spellings escape, which is [#274].
+    """
+    for m in CFG_ATTR.finditer(attrs):
+        if TEST_TOKEN.search(without_negations(m.group(1))):
+            return m.group(0)
+    return None
 
 
 def module_dir(path: str) -> str:
@@ -94,12 +146,16 @@ def check(root: str = DEFAULT_ROOT) -> list[str]:
 
     for f in files:
         code = code_lines(open(f, encoding="utf-8").read())
-        for m in INLINE_TEST_MOD.finditer(code):
+        for m in INLINE_MOD.finditer(code):
+            gate = test_gate(m.group(1))
+            if gate is None:
+                continue
+            name = m.group(2)
             line = code[: m.start()].count("\n") + 1
             problems.append(
-                f"{f}:{line}: inline `#[cfg(test)] mod {m.group(1)} {{` — move it to "
-                f"{module_dir(f)}/{m.group(1)}.rs and declare "
-                f"`#[cfg(test)] mod {m.group(1)};` (AGENTS.md, Layout)"
+                f"{f}:{line}: inline `{gate} mod {name} {{` — move it to "
+                f"{module_dir(f)}/{name}.rs and declare "
+                f"`{gate} mod {name};` (AGENTS.md, Layout)"
             )
         for m in PATH_ATTR.finditer(code):
             line = code[: m.start()].count("\n") + 1
@@ -173,6 +229,86 @@ def selftest() -> int:
             },
             1,
             ["a.rs:2", "inline `#[cfg(test)] mod tests {`"],
+        ),
+        (
+            "an extra attribute between the cfg and `mod` is the same violation",
+            {
+                "main.rs": "mod a;\nfn main() {}\n",
+                "a.rs": "pub fn f() {}\n#[cfg(test)]\n#[allow(dead_code)]\n"
+                "mod inline_attr {\n    struct S;\n}\n",
+            },
+            1,
+            ["a.rs:2", "inline `#[cfg(test)] mod inline_attr {`", "a/inline_attr.rs"],
+        ),
+        (
+            "a compound `all(test, target_arch)` cfg is the same violation (#274)",
+            {
+                "main.rs": "mod a;\nfn main() {}\n",
+                "a.rs": "pub fn f() {}\n"
+                '#[cfg(all(test, target_arch = "aarch64"))]\n'
+                "mod inline_neon {\n    fn g() {}\n}\n",
+            },
+            1,
+            [
+                "a.rs:2",
+                'inline `#[cfg(all(test, target_arch = "aarch64"))] mod inline_neon {`',
+                "a/inline_neon.rs",
+            ],
+        ),
+        (
+            "a compound cfg around a module that nests another is still caught",
+            {
+                "main.rs": "mod a;\nfn main() {}\n",
+                "a.rs": "pub fn f() {}\n"
+                '#[cfg(all(test, target_arch = "aarch64"))]\n'
+                "mod outer {\n    mod inner {\n        fn g() {}\n    }\n}\n",
+            },
+            1,
+            [
+                "a.rs:2",
+                'inline `#[cfg(all(test, target_arch = "aarch64"))] mod outer {`',
+                "a/outer.rs",
+            ],
+        ),
+        (
+            "a compound `all(test, feature)` cfg is the same violation",
+            {
+                "main.rs": "mod a;\nfn main() {}\n",
+                "a.rs": "pub fn f() {}\n"
+                '#[cfg(all(test, feature = "x"))]\n'
+                "mod inline_feat {\n    fn g() {}\n}\n",
+            },
+            1,
+            [
+                "a.rs:2",
+                'inline `#[cfg(all(test, feature = "x"))] mod inline_feat {`',
+                "a/inline_feat.rs",
+            ],
+        ),
+        (
+            "a compound `any(test, feature)` cfg is the same violation",
+            {
+                "main.rs": "mod a;\nfn main() {}\n",
+                "a.rs": "pub fn f() {}\n"
+                '#[cfg(any(test, feature = "debug_dump"))]\n'
+                "mod inline_any {\n    fn g() {}\n}\n",
+            },
+            1,
+            [
+                "a.rs:2",
+                'inline `#[cfg(any(test, feature = "debug_dump"))] mod inline_any {`',
+                "a/inline_any.rs",
+            ],
+        ),
+        (
+            "`not(test)` is not a test gate: an inline module behind it is left alone",
+            {
+                "main.rs": "mod a;\nfn main() {}\n",
+                "a.rs": "pub fn f() {}\n#[cfg(not(test))]\n"
+                "mod prod_only {\n    pub fn g() {}\n}\n",
+            },
+            0,
+            [],
         ),
         (
             "an undeclared file is a violation (its tests would not run)",
