@@ -9598,3 +9598,44 @@ name the child module (`server::batch::tests::<topic>::<leaf>`, five sites).
 **Deliberately out of scope.** The remaining five files of #267: `src/graph/alloc/tests.rs` (1,833),
 `src/tooling/tests.rs` (1,669), `src/sampler/tests.rs` (1,232), `src/conversation/tests.rs` (1,156),
 `src/graph/kvcache/tests.rs` (1,134), and `src/cuda/issue162_tests.rs` (1,186) last, after #263.
+
+#### Test-infrastructure record (#267 step 6, file 4, 2026-10-04) — `graph/alloc/tests.rs` becomes a parent plus six topic files
+
+**What landed.** `src/graph/alloc/tests.rs` (1,833 lines, 42 `#[test]` — 3 of them `#[ignore]`d or
+`#[cfg]`-gated — plus 4 helpers and a test-only `impl GraphAllocator`) is split by allocator concern into
+`src/graph/alloc/tests/{backend_fence,views,liveness,kv_arena,staging,budget}.rs`, each named by a `mod`
+declaration in the now-72-line parent (PR
+[#279](https://github.com/yusiwen/minfer/pull/279), part of [#267](https://github.com/yusiwen/minfer/issues/267)).
+The topics are `backend_fence` (4: F4's fence, the E5 offload plan and the per-engine KV format),
+`views` (8: D1 zero-copy windows, their liveness and `split_parts`), `liveness` (4: reuse along a chain,
+parallel chains, input fill and cycles), `kv_arena` (12: regions, C5 sessions, C3 defrag, C8b S3
+copy-on-write and the C6/C7 cell bounds), `staging` (4: the F5 destination key, the pending copy and the
+#138 drain) and `budget` (10: E4/E4-S3 accounting, the length contract and rebuild re-mapping). The
+parent keeps `chain` and the `impl GraphAllocator` accessors; `view_graph` moves with `views` and
+`tensor_f32` with `budget`, each used by that topic only. `src/graph/alloc.rs` keeps its
+`#[cfg(test)] mod tests;` untouched.
+
+**The non-comment edits.** Ten `super::super::` paths — `DType`, `CNode`, `ops::NodeMeta` and
+`kvformat::KvFormat`, all of which meant `graph::…` at the old module depth — become absolute
+`crate::graph::…` paths, because a topic file sits one module deeper and `super::super` would otherwise
+resolve to `alloc::`. (`super::kv_defrag_enabled_from` is unaffected: the parent's `use super::*;`
+re-exports it into the `tests` module.) These are the only test-text differences from a pure move.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the worktree:
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration |
+| `scripts/cuda_test.sh` | **567 / 0 / 42** |
+| `python3 scripts/check_source_layout.py` | `src obeys the layout rules`, exit 0 |
+| `python3 scripts/check_doc_line_anchors.py`, `check_docs_links.py`, `check_status.py --check` | exit 0 each |
+| `cargo fmt --all --check` | clean |
+| CI on PR [#279](https://github.com/yusiwen/minfer/pull/279) | **7 / 7 green** |
+
+**Mutation evidence (rule 3).** `mod staging;` → `// mod staging;`: the layout checker exits **1** with
+`src/graph/alloc/tests/staging.rs: not reachable from src/main.rs …`, and the CPU unit row drops
+**481 → 477** passed (the four staging gates), 36 ignored unchanged. Reverted.
+
+**Deliberately out of scope.** The remaining four files of #267: `src/tooling/tests.rs` (1,669),
+`src/sampler/tests.rs` (1,232), `src/conversation/tests.rs` (1,156), `src/graph/kvcache/tests.rs`
+(1,134), and `src/cuda/issue162_tests.rs` (1,186) last, after #263.
