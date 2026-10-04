@@ -9444,8 +9444,10 @@ them — the same class of rot this campaign exists to remove.
 
 #### Test-infrastructure record (#267 step 6, file 1, 2026-10-04) — the long test files start moving: `graph/cuda_backend/tests.rs` becomes a parent plus 11 topic files
 
-**What landed.** The crate's longest test file, `src/graph/cuda_backend/tests.rs` (8,603 lines, 74
-top-level `fn` items: 61 `#[test]` — two of them `#[ignore]`d — plus 13 top-level helpers), is split by
+**What landed.** The crate's longest test file, `src/graph/cuda_backend/tests.rs` (8,603 lines; 89 `fn`
+definitions in all — 74 top-level items, which are 61 `#[test]` of which **one** is `#[ignore]`d plus 13
+helpers, and 15 nested helpers: 12 inside test bodies and 3 in the test-only `impl CudaBackend` shim),
+is split by
 op family into
 `src/graph/cuda_backend/tests/<topic>.rs`, each named by a `mod` declaration in the now-106-line parent
 ([#267](https://github.com/yusiwen/minfer/issues/267), PR [#275](https://github.com/yusiwen/minfer/pull/275)).
