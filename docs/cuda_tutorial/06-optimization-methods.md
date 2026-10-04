@@ -226,10 +226,10 @@ touch, as a function of i?"
 
 - **Where minfer uses it**: the elementwise family is written warp-dense — e.g.
   `store_kv_f16` maps one lane to four *consecutive* floats (`src +
-  t*nkt + j`, `src/cuda_kernels.cu:2550`, the `float4` at :2561), and the MMVQ
+  t*nkt + j`, `src/cuda/kernels/kv_store.cu:31`, the `float4` at :2561), and the MMVQ
   decode kernels' shape gate explicitly protects against the uncoalesced case —
   doc 06 records that small shapes lose because "1–2 units per thread expose
-  the uncoalesced q5/q6 byte loads" (`src/cuda_kernels.cu:1254` and the
+  the uncoalesced q5/q6 byte loads" (`src/cuda/kernels/kv_store.cu:31` and the
   dispatch comment recorded at `src/cuda.rs`).
 - **Step records**: [11-p5-gemm-tiles-fa-rewrite.md](../cuda_optimization_steps/11-p5-gemm-tiles-fa-rewrite.md)
   (P5·1: the 1-element-per-thread elementwise kernels "left 15/16 of every
@@ -256,7 +256,7 @@ re-read from DRAM/L2 but eat shared memory, and shared memory per block
 `gemm_f16_nt_kernel_t` line by line; the design arithmetic is in step doc 02.
 
 - **Where minfer uses it**: `gemm_f16_nt_kernel_t`
-  (`src/cuda_kernels.cu:1885`) — TN=64 × TM tile, KS=32 k-step, dynamic smem
+  (`src/cuda/kernels/gemm_wmma.cu:367`) — TN=64 × TM tile, KS=32 k-step, dynamic smem
   (`extern __shared__` at :4796); the MMQ GEMM family tiles the same way with
   raw quantized bytes (`mmq_raw_nb_kernel`, `src/cuda/kernels/mmq_nb.cu:9`; its BT
   successor `mmq_raw_nb_bt_kernel` :6656; q6_K variant :6976).
@@ -282,7 +282,7 @@ when the layout does not cooperate it is a parity bug factory (nibble offsets,
 alignment).
 
 - **Where minfer uses it**: `store_kv_f16` (`float4` load + two `__half2`
-  stores, `src/cuda_kernels.cu:2561`); the q6_K B-expand reads packed data as
+  stores, `src/cuda/kernels/kv_store.cu:31`); the q6_K B-expand reads packed data as
   `uint4` groups; the q8_0 p32 decode planes are *designed around* the
   `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda/kernels/mmvq_multi.cu:657`, row
   pointer :8302, the `__ldg` group loads :8308).
@@ -355,11 +355,11 @@ never a runtime branch inside the loop), and where a fused producer reduces
 across a warp it explicitly documents the uniformity invariant.
 
 - **Where minfer uses it**: the per-type kernel families
-  (`q4_k_q8_mmvq`/`q5_k`/`q6_k…` at `src/cuda_kernels.cu:1254/:1391/:1339`)
+  (`q4_k_q8_mmvq`/`q5_k`/`q6_k…` at `src/cuda/kernels/mmvq_skipwrite.cu:201/:1391/:1339`)
   mean the hot loop never asks "which type am I?"; the fused rms+quantize
   producer quantizes "THIS warp's row (warp-uniform row ⇒ the shfl_xor
   reductions below never see divergence)" — the comment is at
-  `src/cuda_kernels.cu:1125`; the dequant kernels
+  `src/cuda/kernels/mmvq_skipwrite.cu:201`; the dequant kernels
   (`dequant_q4_0_f16`, :4449) have a single uniform body with a bounds check
   only. Divergence still shows up in the accounting: doc 43 attributes part of
   the gap between achieved and theoretical occupancy to wave-tail divergence,
@@ -387,13 +387,13 @@ add_bias×3 + rope×2 + store_kv×2 (7 launches) became one kernel, and nsys
 counted the difference.
 
 - **Where minfer uses it**: `attn_bias_rope_store_f32`
-  (`src/cuda_kernels.cu:2590`) — one launch replaces the 7-launch decode tail;
+  (`src/cuda/kernels/kv_store.cu:118`) — one launch replaces the 7-launch decode tail;
   the graph ops `Op::FusedQKV` (concat matmul + fused epilogue) and
   `Op::FusedFFN` (gate|up concat matmul + in-place swiglu) are declared in
   `src/graph/ops.rs:125/:144`, executed in `src/graph/cuda_backend.rs:843/:715`,
   and gated at build time in `src/models/qwen2/graph.rs:466–473`. The decode
   A-quantize fusion (`swiglu_quant_pad40`, `rms_norm_quant_pad40`,
-  `src/cuda_kernels.cu:2455/:2330`) writes the quantized activation plane
+  `src/cuda/kernels/ops_elementwise.cu:215/:2330`) writes the quantized activation plane
   beside the f32 output so the following matmul skips a standalone quantize
   launch.
 - **Step records**: [73-d3-8-fusedqkv-port.md](../cuda_optimization_steps/73-d3-8-fusedqkv-port.md)
@@ -486,7 +486,7 @@ the cost is none at the byte level — f16 KV is a pure traffic cut — but it i
 a *policy* decision (which tensors convert, who else reads the region), so it
 is gated and load-time-decided.
 
-- **Where minfer uses it**: `store_kv_f16` (`src/cuda_kernels.cu:2550`) and
+- **Where minfer uses it**: `store_kv_f16` (`src/cuda/kernels/kv_store.cu:31`) and
   the f16-KV attention mirror `gqa_attn_f32_f16kv` (:2677); policy in
   `src/cuda.rs` (`kv_cache_is_f16`): auto-f16 when `n_layers × n_kv_embd ≥
   8192`, `MINFER_CACHE_TYPE=f16|f32` override.
@@ -715,7 +715,7 @@ record of this exact effect is
 
 ### Exercise (b) — change dequant thread granularity in a *copy* *(medium)*
 
-**Task.** Copy `dequant_q4_0_f16` (`src/cuda_kernels.cu:1556`) into
+**Task.** Copy `dequant_q4_0_f16` (`src/cuda/kernels/gemm_wmma.cu:38`) into
 `/tmp/dq_gran.cu` with a synthetic weight buffer — **do not modify the repo**.
 The incumbent maps one thread to one 32-element block (`g = blockIdx.x *
 blockDim.x + threadIdx.x` indexes `od*nb` blocks; each thread writes 32
@@ -752,7 +752,7 @@ separation. For doc 43 the modern equivalent knob is the q6_K kernel's
 `__launch_bounds__` line itself (do not modify the repo — build a scratch
 worktree copy in `/tmp` if you want to flip it); for P5·2 note the era
 shift first: `MINFER_GEMM_TM` (64/128/256, read at
-`src/cuda_kernels.cu:1885`) retiles the *f16 wmma GEMM*, which is only
+`src/cuda/kernels/gemm_wmma.cu:367`) retiles the *f16 wmma GEMM*, which is only
 on the hot path when you run the escape side `MINFER_MMQ=0` — exactly the A/B
 frame P5·2 was measured in. Then compare your numbers with the doc's recorded
 ones.

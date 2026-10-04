@@ -350,7 +350,7 @@ kernels run the inverse, `x.to_bits()`, recovering the exact integer:
 | generic get_rows (CPU) | `ins[1][t].to_bits() as usize` (`cpu_backend.rs:311`) |
 | RoPE positions (CPU) | `ins[1][t].to_bits() as usize` (`cpu_backend.rs:352`) |
 | attention positions (CPU) | `ins[2][t].to_bits() as usize` (`cpu_backend.rs:411-415`) |
-| CUDA kernels | device-side `__float_as_int` in one pass (`cuda_kernels.cu:2483-2497`) |
+| CUDA kernels | device-side `__float_as_int` in one pass (`ops_misc.cu:156`) |
 
 Why this trick at all? Because of the uniform-pool decision. The alternatives
 were a second, integer-typed pool per backend (double the allocator state,
@@ -371,7 +371,7 @@ the decode kernels need *raw int32*, but converting on the host would need a
 sync (and would break CUDA Graph replay, doc 15). So a tiny device kernel
 `f32_bits_to_i32` reinterprets the bits *on the GPU*, "fully device-side, so
 the per-layer path needs no host sync (and stays CUDA-Graph-replayable)"
-(`cuda_kernels.cu:2485-2487`).
+(`ops_elementwise.cu:249`).
 
 Filling happens at a strict moment: after `alloc_graph`, *before* the
 scheduler runs (`models/qwen2/graph.rs:520-536`: `cache.current()` → three

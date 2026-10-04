@@ -271,7 +271,7 @@ non-mutating gates are the same at every stage: audit 130 / `--check-fixture` ex
 | G2 | `attention_decode.cu` 1 178 + `attention_prefill.cu` 512 | 1 690 | 7 828 | [#285](https://github.com/yusiwen/minfer/pull/285) |
 | G3 | MMQ: `mmq_int8.cu` 457 + `mmq_raw.cu` 645 + `mmq_nb.cu` 708 + `mmq_bt_q6k.cu` 436 | 2 246 | 5 629 | — |
 | G4 | MMVQ: `matmul_f32act.cu` 731 + `mmvq_aquant.cu` 413 + `mmvq_skipwrite.cu` 648 + `mmvq_q6k.cu` 342 + `mmvq_multi.cu` 755 | 2 889 | 2 803 | — |
-| G5 | `ops_misc.cu` + `ops_elementwise.cu` + `kv_store.cu` + `gemm_wmma.cu` + `gemm_fused_dequant.cu` | | | — |
+| G5 | `ops_misc.cu` 743 + `ops_elementwise.cu` 439 + `kv_store.cu` 435 + `gemm_wmma.cu` 937 (incl. gemm_smem) + `gemm_fused_dequant.cu` 284 | 2 838 | 14 | — |
 | G6 | the empty remainder deleted | | 0 | — |
 
 Three measured corrections to the tables above, applied as the stages land:
@@ -285,6 +285,11 @@ Three measured corrections to the tables above, applied as the stages land:
   that own *template* `__global__` instantiations the pre-warm address-takes (the other pre-warm
   entries are plain kernels and stay in the dispatcher, which is where the symbol `src/cuda.rs`
   declares it lives). The dispatcher itself moves with `mmq_bt_q6k.cu` in G3.
+- **`gemm_smem.cu` merges into `gemm_wmma.cu`** (937 lines, not 568 + 369): the
+  `MINFER_GEMM_OPTIN_SET` table, `gemm_f16_fn_for` and both GEMM launchers address-take and
+  launch `gemm_f16_nt_kernel_t` instantiations that only `gemm_wmma.cu` defines. Two files
+  would be the cross-TU *template* shape that fails to link, so route (a) merges them —
+  **18 family TUs, not the plan's 19**.
 - **The `mmq_ksplit_reduce_kernel` site appears twice.** `launch_mmq_raw_nb_bt_nt` *and*
   `launch_mmq_raw_nb_bt_q6k_nt` both launch it (fixture rows 108 and 111), so moving the reducer next
   to the NB kernels leaves the q6_K BT launcher with a cross-TU launch. That is legal where route (a)

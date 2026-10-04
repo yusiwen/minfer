@@ -15,7 +15,10 @@ use std::process::Command;
 const KERNEL_SOURCES: &[&str] = &[
     "src/cuda/kernels/attention_decode.cu",
     "src/cuda/kernels/attention_prefill.cu",
+    "src/cuda/kernels/gemm_fused_dequant.cu",
+    "src/cuda/kernels/gemm_wmma.cu",
     "src/cuda/kernels/guard.cu",
+    "src/cuda/kernels/kv_store.cu",
     "src/cuda/kernels/matmul_f32act.cu",
     "src/cuda/kernels/mmq_bt_q6k.cu",
     "src/cuda/kernels/mmq_int8.cu",
@@ -25,6 +28,8 @@ const KERNEL_SOURCES: &[&str] = &[
     "src/cuda/kernels/mmvq_multi.cu",
     "src/cuda/kernels/mmvq_q6k.cu",
     "src/cuda/kernels/mmvq_skipwrite.cu",
+    "src/cuda/kernels/ops_elementwise.cu",
+    "src/cuda/kernels/ops_misc.cu",
 ];
 const KERNEL_HEADERS: &[&str] = &["src/cuda/kernels/common.cuh"];
 // The shrinking remainder: every line not yet moved into `kernels/`. Deleted

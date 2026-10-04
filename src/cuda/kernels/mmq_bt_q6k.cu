@@ -440,14 +440,42 @@ extern "C" int launch_mmq_raw_nb_bt_q6k_nt(
     return 1;
 }
 
+// r59 rider (r57 items 4+5): force the fatbin module load + first-touch
+// attribute queries at REGISTRATION time — cudaFuncGetAttributes on the
+// launch set loads the module, moving the ~3 ms first-launch host stalls
+// (r58 CUPTI: bracketing the first mode-2 swiglu / first bt matmul) out of
+// the measured prefill window. Attribute errors are ignored (a missing
+// instantiation only means that path was never compiled in).
+//
+// #263: decomposed into one `minfer_prewarm_<family>_kernels()` per
+// translation unit. A *template* address taken across TUs is nvcc
+// warning #20280-D and can fail to link, so each family registers its own;
+// the dispatcher only makes plain host calls.
 
-
-// ─── #223 pre-warm entry for this translation unit ───────────────────────────
-// This file owns the template instantiations, so the address-taking must
-// happen here (a cross-TU template reference is nvcc #20280-D and can fail
-// to link).
-extern "C" void minfer_prewarm_mmq_bt_q6k_kernels(void) {
+// Per-family pre-warm entries, one per translation unit that owns
+// kernels the fatbin module must load.
+extern "C" void minfer_prewarm_mmq_nb_kernels(void);
+extern "C" void minfer_prewarm_mmq_raw_kernels(void);
+extern "C" void minfer_prewarm_attention_prefill_kernels(void);
+extern "C" void minfer_prewarm_attention_decode_kernels(void);
+extern "C" void minfer_prewarm_mmvq_aquant_kernels(void);
+extern "C" void minfer_prewarm_mmvq_skipwrite_kernels(void);
+extern "C" void minfer_prewarm_ops_elementwise_kernels(void);
+extern "C" void minfer_prewarm_kv_store_kernels(void);
+extern "C" void minfer_prewarm_ops_misc_kernels(void);
+extern "C" void minfer_prewarm_kernels(void) {
     cudaFuncAttributes a;
+    // mmq_bt_q6k
     MINFER_PREWARM_ONE(a, (mmq_raw_nb_bt_q6k_kernel<2, true>));
     MINFER_PREWARM_ONE(a, (mmq_raw_nb_bt_q6k_kernel<2, false>));
+    minfer_prewarm_mmq_nb_kernels();
+    minfer_prewarm_mmq_raw_kernels();
+    minfer_prewarm_attention_prefill_kernels();
+    minfer_prewarm_attention_decode_kernels();
+    minfer_prewarm_mmvq_aquant_kernels();
+    minfer_prewarm_mmvq_skipwrite_kernels();
+    minfer_prewarm_ops_elementwise_kernels();
+    minfer_prewarm_kv_store_kernels();
+    minfer_prewarm_ops_misc_kernels();
 }
+
