@@ -573,7 +573,7 @@ impl GraphBuilder {
 
     /// Softmax builder (op vocabulary; the fused attention kernels softmax
     /// internally, so no live graph emits a standalone softmax node today).
-    /// Test-only (#238): driven by `graph::cuda_backend::tests::cuda_multisplit_capture_bit_parity`; `#[cfg(test)]` keeps it out of production builds.
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::capture::cuda_multisplit_capture_bit_parity`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
     pub(crate) fn softmax(&mut self, x: NodeId, dim: usize) -> NodeId {
         let shape = self.graph.nodes[x].out_shape;

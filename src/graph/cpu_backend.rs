@@ -891,7 +891,7 @@ pub(crate) fn cpu_rope(
 /// The causal span for a single sequence, in the `attn_span` layout E1 defines:
 /// token `t` may see the cells `[0, pos[t] + 1)`. Test/reference helper — the
 /// model path resolves the span from the KV store's ownership instead.
-/// Test-only (#238): driven by `graph::cuda_backend::tests::cuda_rope_kv_attn_roundtrip`; `#[cfg(test)]` keeps it out of production builds.
+/// Test-only (#238): driven by `graph::cuda_backend::tests::kv::cuda_rope_kv_attn_roundtrip`; `#[cfg(test)]` keeps it out of production builds.
 #[cfg(test)]
 pub(crate) fn causal_span(pos: &[usize]) -> Vec<(usize, usize)> {
     pos.iter().map(|&p| (0, p + 1)).collect()

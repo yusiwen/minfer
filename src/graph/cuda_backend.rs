@@ -261,7 +261,7 @@ impl CudaBackend {
 
     /// The stream this backend issues its device work on (test introspection +
     /// the #188 concurrency gate's "two engines really do hold two streams" arm).
-    /// Test-only (#238): driven by `graph::cuda_backend::tests::cuda_capture_abort_on_error`; `#[cfg(test)]` keeps it out of production builds.
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::capture::cuda_capture_abort_on_error`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
     pub(crate) fn device_stream(&self) -> *mut std::ffi::c_void {
         self.stream
@@ -663,7 +663,7 @@ impl CudaBackend {
     /// enumerated host-visible ones (logits, KV session save, debug dumps,
     /// capture fallbacks) — see `docs/BACKEND-REGISTRY-DESIGN.md` §11.
     /// (The F5 gates are tests, so the production build has no caller.)
-    /// Test-only (#238): driven by `graph::cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise` and `models::qwen2::graph::tests::async_cross_copies_never_block_and_stay_bitwise_identical`; `#[cfg(test)]` keeps it out of production builds.
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::staging::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise` and `models::qwen2::graph::tests::async_cross_copies_never_block_and_stay_bitwise_identical`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
     pub(crate) fn blocking_readback_count(&self) -> u64 {
         self.blocking_readbacks
@@ -672,7 +672,7 @@ impl CudaBackend {
 
     /// #138: the high-water mark of cross-backend copies enqueued but not yet
     /// waited on (see [`Self::cross_inflight_peak`]). Test-only (#138): driven by
-    /// `graph::cuda_backend::tests::a_boundary_with_several_staged_inputs_defers_its_waits`;
+    /// `graph::cuda_backend::tests::staging::a_boundary_with_several_staged_inputs_defers_its_waits`;
     /// `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
     pub(crate) fn cross_inflight_peak(&self) -> usize {
@@ -697,7 +697,7 @@ impl CudaBackend {
     /// move whenever *any* other thread syncs (the parallel harness ran the F5
     /// gate beside ~27 other device tests). The process-wide counter this
     /// replaced was deleted in [#242].
-    /// Test-only (#238): driven by `graph::cuda_backend::tests::stream_sync_counts_are_per_backend_not_process_wide`; `#[cfg(test)]` keeps it out of production builds.
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::capture::stream_sync_counts_are_per_backend_not_process_wide`; `#[cfg(test)]` keeps it out of production builds.
     ///
     /// [#242]: https://github.com/yusiwen/minfer/issues/242
     #[cfg(test)]

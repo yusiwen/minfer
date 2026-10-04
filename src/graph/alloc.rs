@@ -2596,7 +2596,7 @@ impl GraphAllocator {
     /// around one workload ([`CrossCopyStats::delta`]), because the counters are
     /// cumulative for the allocator's life. (The F5 gates are tests, so the
     /// production build has no caller.)
-    /// Test-only (#238): driven by `graph::cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise` and `graph::alloc::tests::a_pending_staged_copy_is_refused_until_its_wait_is_issued`; `#[cfg(test)]` keeps it out of production builds.
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::staging::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise` and `graph::alloc::tests::a_pending_staged_copy_is_refused_until_its_wait_is_issued`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
     pub(crate) fn cross_stats(&self) -> CrossCopyStats {
         self.cross_stats

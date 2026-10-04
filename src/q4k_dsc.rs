@@ -10,7 +10,7 @@
 //! "cuda")]` would never be *run* in CI at all.
 //!
 //! The device half — the registry really gains no `__q4dsc` entry and the q4_K case
-//! still does — is `graph::cuda_backend::tests::cuda_q4dsc_plane_is_q4k_only`, and the
+//! still does — is `graph::cuda_backend::tests::weights::cuda_q4dsc_plane_is_q4k_only`, and the
 //! end-to-end half (a real non-q4_K model registers no plane) is the `#[ignore]`d
 //! `cuda_real_model_registers_q4dsc_planes_only_for_q4k`.
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
