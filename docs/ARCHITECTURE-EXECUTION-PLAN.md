@@ -9721,7 +9721,7 @@ not split here: it carries the launch-fixture column assertion (`assert_eq!(f.le
 **What landed.** The first code move of the source-layout campaign ([#262](https://github.com/yusiwen/minfer/issues/262),
 PR [#276](https://github.com/yusiwen/minfer/pull/276)): `src/cuda.rs` loses its 4,546-line `impl CudaState` and its two `extern "C"` blocks and keeps
 the module doc, `AttnWindow`, `pub struct CudaState` (all 29 fields still private), the free items, the
-ten `#[cfg(test)] mod` declarations and the re-export lines — 6,578 → **1,014** lines. New:
+ten `#[cfg(test)] mod` declarations and the re-export lines — 6 594 → **1,014** lines. New:
 `src/cuda/ffi_runtime.rs` (the cudart/driver declarations, now `pub(super)`, plus the test-only extern
 block), `src/cuda/methods.rs` (the 15 non-`pub` helpers whose callers land in a second family file, the
 18 `mod` declarations and the two-level `#[cfg(test)] pub(crate) use` chain the launch tests resolve
