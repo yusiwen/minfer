@@ -88,7 +88,7 @@ reason = "The device-tier table's fallback row index, used by the CUDA-path sele
 [[cpu]]
 name = "Interleaved"
 kind = "variant"
-file = "src/vec_ops.rs"
+file = "src/vec_ops/rope.rs"
 reason = "Kept for llama.cpp parity: `graph::op_matrix`'s RoPE cases construct it, and a LLaMA-family loader with an interleaved RoPE style would construct it in production."
 
 [[cpu]]
@@ -353,7 +353,7 @@ reason = "Deferred (ggml parity): a kernel taking an f16 activation buffer is wh
 [[cuda]]
 name = "Interleaved"
 kind = "variant"
-file = "src/vec_ops.rs"
+file = "src/vec_ops/rope.rs"
 reason = "Kept for llama.cpp parity: `graph::op_matrix`'s RoPE cases construct it, and a LLaMA-family loader with an interleaved RoPE style would construct it in production."
 
 [[cuda]]

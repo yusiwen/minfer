@@ -122,12 +122,12 @@ The invariants survive all three deltas: positions are data, windows come from `
 
 ### 3.2 Key code
 
-#### 3.2.1 RMSNorm — `vec_ops.rs:519`
+#### 3.2.1 RMSNorm — `src/vec_ops/rms_norm.rs:8`
 
 The formula: `y = x / sqrt(mean(x²) + eps) × weight`. The scalar fallback shows every piece:
 
 ```rust
-// src/vec_ops.rs:519-545 (scalar path; AVX2 path at :547)
+// src/vec_ops/rms_norm.rs:8-31 (scalar path; AVX2 path at :35)
 pub fn rms_norm_f32(n: usize, y: &mut [f32], x: &[f32], eps: f32) {
     let mut sum_sq = 0.0f64;
     for i in 0..n {
@@ -147,7 +147,7 @@ Design notes a beginner should keep:
 
 - **No mean subtraction.** Classic LayerNorm subtracts the mean before normalizing; RMSNorm skips it (`mean of squares` directly). One less pass over the vector, and empirically it works as well — llama.cpp's models all use it, and minfer matches them op-for-op. `eps` comes from the model hyperparameters (`f_norm_rms_eps`, doc 03) and just keeps `sqrt` away from zero for an all-but-zero vector.
 - **The accumulation is f64** (①) — 896-wide sums in f32 would lose real precision; the AVX2 path keeps the same f64 accumulator semantics so both paths agree.
-- **Line ③ is doc 07's aliasing made visible**: the fusion/allocator pass maps RMSNorm's output onto its input's buffer where legal, and the copy self-suppresses by pointer comparison. `rms_norm_fused_f32` (`vec_ops.rs:589`) is the variant that also multiplies the gains in one pass.
+- **Line ③ is doc 07's aliasing made visible**: the fusion/allocator pass maps RMSNorm's output onto its input's buffer where legal, and the copy self-suppresses by pointer comparison. `rms_norm_fused_f32` (`src/vec_ops/rms_norm.rs:78`) is the variant that also multiplies the gains in one pass.
 
 Worked example: `x = [1, 2, 3, 4]`, `eps ≈ 0`. `mean(x²) = (1+4+9+16)/4 = 7.5`; `scale = 1/√7.5 ≈ 0.365`; normalized `x ≈ [0.365, 0.730, 1.095, 1.461]`, then element-wise multiplied by the learned gains.
 
@@ -322,10 +322,10 @@ out2 ≈ 0.27·v0 + 0.37·v1 + 0.37·v2
 
 That is decode in miniature: one new K/V row per step, windows growing monotonically, and every past token's cached rows read again without recomputation — the entire reason §2.2's cache exists. (Doc 13 shows the loop that drives it and doc 07 the regions that hold it.)
 
-#### 3.2.5 Softmax and SiLU — `vec_ops.rs:208`, `:158`
+#### 3.2.5 Softmax and SiLU — `src/vec_ops/softmax.rs:8`, `src/vec_ops/silu.rs:8`
 
 ```rust
-// src/vec_ops.rs:208-226 (scalar path; caller supplies the max)
+// src/vec_ops/softmax.rs:8-32 (scalar path; caller supplies the max)
 pub fn vec_soft_max_f32(n: usize, y: &mut [f32], x: &[f32], max: f32) -> f64 {
     let mut sum = 0.0f64;
     for i in 0..n {
@@ -345,7 +345,7 @@ SiLU is one formula — `silu(x) = x / (1 + e^(−x))` (`vec_silu_f32`, `:158`, 
 for i in 0..n { y[i] = x[i] / (1.0 + (-x[i]).exp()); }
 ```
 
-It is the FFN's activation (doc 05's `silu(gate) × up`); doc 06 fused it into `SwiGLU`, whose CPU execution (two passes over `vec_silu_f32` then `vec_mul_f32`) you saw in doc 06 §3. The `add`/`mul`/`scale`/`muladd` helpers are the same pattern — a short SIMD-able loop each — and `attn_heads` ⑥ uses `vec_muladd_f32` for the weighted-V accumulation. The f32 weights path (`mat_mul_f32`, `vec_ops.rs:673`) closes the loop back to doc 10: norm biases and F32 tensors skip quantization entirely and use this plain dot-product matmul.
+It is the FFN's activation (doc 05's `silu(gate) × up`); doc 06 fused it into `SwiGLU`, whose CPU execution (two passes over `vec_silu_f32` then `vec_mul_f32`) you saw in doc 06 §3. The `add`/`mul`/`scale`/`muladd` helpers are the same pattern — a short SIMD-able loop each — and `attn_heads` ⑥ uses `vec_muladd_f32` for the weighted-V accumulation. The f32 weights path (`mat_mul_f32`, `src/vec_ops/vec.rs:371`) closes the loop back to doc 10: norm biases and F32 tensors skip quantization entirely and use this plain dot-product matmul.
 
 ### 3.3 Design choices (why this shape and not another)
 
