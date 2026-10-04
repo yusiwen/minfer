@@ -44,6 +44,7 @@ src/
 ├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
 ├── cuda.rs          # CUDA device layer (L1), feature-gated (graph backend: graph/cuda_backend.rs); device_memory() → allocplan::DeviceMemory
 ├── cuda/            # L2 launch/dispatch: ffi_runtime.rs + methods.rs + methods/<family>.rs (split by #262)
+├── cuda/kernels/    # L3 kernel sources: common.cuh + 17 .cu translation units, one per kernel family (split by #263)
 ├── device_tier.rs   # cc-keyed CUDA device-tier table + selector
 └── models/          # ModelDef trait + per-arch mod/graph/loader (qwen2/, qwen3/)
 ```
@@ -55,9 +56,11 @@ inside each device (`<backend>/kernels/` is where kernel sources live). A shared
 when two backends implement it and two callers use it (`allocplan::DeviceMemory` is the one candidate
 today). CPU's `quants.rs`/`vec_ops.rs` are deliberately not a device-private layer: they are the crate's
 numeric kernel library, shared with `graph/kvformat.rs` and `graph/cuda_backend.rs`. The four long
-backend files are being split along this convention — plan and target tree:
-`docs/SOURCE-LAYOUT-PLAN.md` ([#261](https://github.com/yusiwen/minfer/issues/261)); the file list above
-is updated by each step as the code moves.
+backend files are being split along this convention — the three CUDA files and the CPU trio are done
+(`src/cuda/`, `src/cuda/kernels/`, `src/quants/`, `src/vec_ops/`, `src/kernel/`); Metal is Step 4 on a
+Mac. Plan and target tree: `docs/SOURCE-LAYOUT-PLAN.md`
+([#261](https://github.com/yusiwen/minfer/issues/261)); the file list above is updated by each step as
+the code moves.
 
 `src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op + NodeMeta · `builder.rs` GraphBuilder · `scheduler.rs` assign → split → execute · `backend.rs` + `cpu_backend.rs`/`metal_backend.rs`/`cuda_backend.rs` executors · `registry.rs` backend registry (F4; F5's `copy_cross`/`await_cross`) · `alloc.rs` liveness allocator + persistent KV regions (E4) · `allocplan.rs` size-class ladder + pure plan + `DeviceMemory`/`budget_decision` · `offload.rs` layer offload plan (E5) · `kvcache.rs` cell store, removal/shift/compaction, span list, prefix sharing (C1–C3, C8b) · `kvformat.rs` KV format + `MINFER_CACHE_TYPE` gate (C4) · `kvsession.rs` versioned KV session container (C5) · `cache.rs`/`params.rs` params-only graph reuse · `fusion.rs` SwiGLU fusion · `copystats.rs` split-boundary counters · `batch.rs` batch composition · `dot.rs`/`json.rs` exporters.
 

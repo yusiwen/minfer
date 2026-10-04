@@ -79,7 +79,7 @@ there is never a silent mid-run fallback.
 | Graph executor | `src/graph/cuda_backend.rs` | Implements `Backend`: device buffer pool, per-op dispatch, positions conversion, CUDA Graph state machine, trace staging, error contract |
 | Device layer | `src/cuda.rs` | `CudaState` context: device probe, weight registry, the per-instance stream binding (`bind_stream`/`stream`/`create_stream`), `extern "C"` kernel launchers, CUDA Graph API, pinned/staging memory, per-stream activation scratches, MMQ caches and gate reads |
 | Device tier table | `src/device_tier.rs` | cc-keyed tier rows (measured GB10 + llama.cpp-adopted consumer rows + GENERIC) resolved once at init; feeds the MMQ gate, smem feasibility and plane-VRAM budget checks. Design + status: `DEVICE-ADAPTATION-PLAN.md`, docs 105–106 |
-| Kernels | `src/cuda_kernels.cu` | The `__global__` kernels (quantized matmul families, attention, norms, elementwise, KV store, embedding gather, quantize planes) |
+| Kernels | `src/cuda/kernels/*.cu` + `common.cuh` | The `__global__` kernels (quantized matmul families, attention, norms, elementwise, KV store, embedding gather, quantize planes) — 17 nvcc translation units since [#263](https://github.com/yusiwen/minfer/issues/263) |
 | Build chain | `build.rs` | Opt-in `--features cuda`, nvcc/`-ccbin` probe, per-arch SASS/PTX (incl. native sm_121), cudart link + rpath |
 
 The split is deliberate: `cuda.rs` is the only place that touches the CUDA runtime API, and
@@ -283,7 +283,7 @@ production caller; [#218](https://github.com/yusiwen/minfer/issues/218) removed 
 [#223](https://github.com/yusiwen/minfer/issues/223) put the runtime guarantee back **at the same
 site**: `CudaState::try_new` calls the production entry `gemm_prefill_smem_prewarm_one(tm, ks, af32)`
 once per process for every launchable combination (the `MINFER_GEMM_OPTIN_SET` X-macro in
-`cuda_kernels.cu`, shared with the fatbin lookup and the test seam). The placement *is* the argument:
+`src/cuda/kernels/common.cuh`, shared with the fatbin lookup and the test seam). The placement *is* the argument:
 `try_new` runs under `CUDA.get_or_init`, before the state is published, before any `CudaBackend`
 exists, and therefore before the per-instance stream `graph_begin_capture` needs — so "the attribute
 is set outside any capture window" holds **by construction**, not by inference from the warmup count
@@ -318,7 +318,7 @@ Nothing in the repository establishes whether that holds for the *adopted* mode 
 below), so the design does not rely on the call being legal in a window; it relies on the call **never
 happening in one**. The eager pre-warm makes that true by construction (above). The three emergent
 mechanisms remain, now as the lazy path's fallback — called out at their sites (`graph_replay_step` in
-`src/graph/cuda_backend.rs`, `gemm_smem_optin` in `src/cuda_kernels.cu`); any change to one is a
+`src/graph/cuda_backend.rs`, `gemm_smem_optin` in `src/cuda/kernels/gemm_wmma.cu`); any change to one is a
 design change, not a tuning knob:
 
 1. **The 3-run capture warmup** (`capture_warmup`, default 3): capture opens only from the third run
@@ -383,6 +383,36 @@ one-time **module load** (which the process pays before the first kernel from it
 and on the first cold / idle-clock invocation of the same one-time work it measured ~14.5 ms. It is
 set-size independent: looping over just `(128,64,false)` costs the same ~2.2 ms as looping over all
 twelve, so it is one module finalization, not twelve.
+
+> **Step 5 re-measure (2026-10-05, `dgxspark (aarch64, GB10 sm_121)`, master `4900298`) — the fatbin is
+> 17 modules now, and in steady state the load costs the same.** The row above was taken when
+> `src/cuda_kernels.cu` was **one** 10,215-line translation unit; since [#263](https://github.com/yusiwen/minfer/issues/263)
+> `src/cuda/kernels/` is `common.cuh` + **17 TUs / 17 fatbin modules** (13 `-gencode` targets apiece).
+> Both binaries were rebuilt in worktrees and run with the same command of record
+> (`MINFER_OP_TIMING=1 target/release/minfer <cached 0.5B q4_0> "hello"`); `nvidia-smi` before the
+> warm runs: SM clock 2 411 MHz, 0 % util, no other compute process.
+>
+> | build | modules the command forces | warm, fresh process | cold (page-cache-evicted) |
+> |---|---|---:|---:|
+> | pre-split (`bc30152`, the row above) | **1** (whole fatbin) | **2 300 µs** median (2 203–2 468, n=12) | **18 478 / 20 723 µs** |
+> | post-split (`4900298`), shipped binary | **1 of 17** (`gemm_wmma.cu`) | **350–590 µs** | **4 288 / 6 109 / 6 983 µs** |
+> | post-split, all 16 loadable TUs | **16 of 17** (temporary per-TU probe) | **≈ 2 370 µs** total | **42 671 / 44 416 / 47 412 µs** |
+>
+> Per module warm: 40 µs (`gemm_fused_dequant.cu`) … 447 µs (`attention_prefill.cu`), median ≈ 150 µs —
+> the recorded ~2.2 ms was the **whole** pre-split module, not a per-module constant, and the
+> `MINFER_OP_TIMING` line reads 2.3 ms → 0.4 ms only because it now times one seventeenth of the work.
+> **Verdict: acceptable.** Warm steady state is unchanged; a *page-cache-cold* start pays ≈ +25 ms once
+> per process (each of the 16 registrations faults the fatbin's pages again — the 284-line
+> `gemm_fused_dequant.cu` still costs 975 µs cold), ≈ 1.8 % of this model's ~1.4 s cold start, so the
+> named mitigation (trimming `minfer_prewarm_kernels`) is deliberately not applied — it would move the
+> cost into the first forward's lazy loads, not remove it.
+>
+> **Correction to the row above (same run).** The ~6× cold factor is **page-cache-cold**, not the GPU
+> clock: with a 40 s idle cooldown (SM clock back at 208 MHz) but resident pages the pre-split binary
+> reads 2 313–2 384 µs, while the same binary with its pages evicted by
+> `posix_fadvise(POSIX_FADV_DONTNEED)` reads 18 478 / 20 723 µs. "Idle-clock" was the correlation, not
+> the cause. Full per-module transcripts: the Step 5 record in `ARCHITECTURE-EXECUTION-PLAN.md`, and
+> `docs/SOURCE-LAYOUT-PLAN.md` §5.1.
 
 The **net** effect is still the proxy's conclusion: the module load **moves** rather than appears —
 but only because something later would pay it anyway. `prewarm_prefill()` (the r59 rider's
@@ -660,8 +690,8 @@ path.
 
 **KV layout.** The persistent K/V regions keep their f32 IR shape, but the store/attention kernels
 run one of three layouts, tagged by `crate::cuda::KV_LAYOUT_F32/F16/Q8_0` — the same `0/1/2` codes
-`KvFormat` uses, and a host contract the kernels are templated on (`int LAYOUT` in
-`cuda_kernels.cu`):
+`KvFormat` uses, and a host contract the kernels are templated on (`int LAYOUT` in the
+`src/cuda/kernels/*.cu` KV/attention TUs):
 
 - `KV_LAYOUT_F32` — one f32 per element;
 - `KV_LAYOUT_F16` — one f16 per element in the first half of the f32-shaped region
@@ -781,7 +811,7 @@ The hard rules live in `docs/GPU_SAFETY.md` (CUDA section); this is how the back
    `cudaGraphDestroy` called on a `cudaGraphExec_t` — both fixed at their call sites by #145, and the
    remaining unchecked sites of the same class (every MMQ dynamic-smem opt-in and launch, the
    prefill-GEMM launcher's own launch, and `graph_end_capture_to_exec`'s `cudaGraphDestroy`) by
-   #147. #162 then removed the class entirely: **every** `<<<>>>` in `cuda_kernels.cu` reads its own
+   #147. #162 then removed the class entirely: **every** `<<<>>>` in `src/cuda/kernels/*.cu` reads its own
    error, so a latched error at `sync()` is by construction an error no site read (a non-launch API
    call), never an unattributed launch.
 5. **A return value that gates a later launch is read where the call is made.** Every dynamic-smem
@@ -1196,7 +1226,7 @@ timing claim is made.
 
 ### 7.9 Issue #162 verification — every `<<<>>>` reads its own launch error (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-26)
 
-The wider #147: the **104** sites in `src/cuda_kernels.cu` that enqueued a kernel and never read the
+The wider #147: the **104** sites in the then-single TU `src/cuda_kernels.cu` (today `src/cuda/kernels/*.cu`) that enqueued a kernel and never read the
 launch's error (`grep -c '<<<'` is 122; two are `<<<>>>` in prose comments, so the audited surface is
 **120 sites in 76 `launch_*` owners at that revision** (the same audit reports **130** sites on
 `6b6d94f`; the wrappers plus the static `launch_gqa_attn_split_batched_kv` helper). Each is now preceded by `minfer_launch_prelude(site, kernel)` and
@@ -1254,7 +1284,7 @@ The sanitizer command is `compute-sanitizer --tool memcheck --target-processes a
 target/release/deps/minfer-<hash> --test-threads=1` — wrapping the test binary, not `cargo` (wrapping
 the whole wrapper script lets the tree launcher follow every build process and the harness stalls).
 
-**Mutations (reverted; `src/cuda_kernels.cu` restored to `sha256 da2e00fb79442fcd03bd3618301b4014cd835f832bbafa4153b4af4283dcdbfb`).** Deleting the read at one single-site
+**Mutations (reverted; the then-single `src/cuda_kernels.cu` restored to `sha256 da2e00fb79442fcd03bd3618301b4014cd835f832bbafa4153b4af4283dcdbfb`; today the TUs live in `src/cuda/kernels/`).** Deleting the read at one single-site
 family (`launch:add_f32`), one `switch` case (`launch:embed_rows__q4_k`) and one templated branch
 (`launch:gqa_attn_split_f16kv__hybrid_causal`) each makes the audit exit 1 naming that line; making
 `minfer_launch_ok` report but admit the launch, removing the sticky, removing `execute_node`'s drain,

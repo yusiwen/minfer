@@ -1,8 +1,12 @@
 # Source layout plan — the runtime, launch and kernel layers
 
-> **Status: Steps −1, 0 and 1 landed; Step 2 next (2026-10-04).** Baseline master `6b6d94f`
-> (`dgxspark (aarch64, GB10 sm_121)`). This is the plan of record for splitting the four long backend
-> files and for the naming convention the crate follows afterwards. Tickets:
+> **Status: every Linux step has landed (2026-10-05, baseline master `4900298`); only the Mac round is
+> left.** Steps −1, 0, 1, 2, 3 and 6 are on master with the merge SHAs in the table below; Step 5's Linux
+> half (the `MINFER_OP_TIMING` module-load re-measure and the stale-prose sweep) lands with this
+> document's own row, and its Mac half ([#53](https://github.com/yusiwen/minfer/issues/53)'s Metal
+> `DeviceMemory` answer, which is what the `common` decision waits on) stays in the Mac round with
+> Step 4. This is the plan of record for splitting the four long backend files and for the naming
+> convention the crate follows afterwards. Tickets:
 > [#261](https://github.com/yusiwen/minfer/issues/261) (umbrella) +
 > [#262](https://github.com/yusiwen/minfer/issues/262) `cuda.rs` ·
 > [#263](https://github.com/yusiwen/minfer/issues/263) `cuda/kernels/` ·
@@ -10,21 +14,21 @@
 > [#265](https://github.com/yusiwen/minfer/issues/265) Metal (Mac) ·
 > [#266](https://github.com/yusiwen/minfer/issues/266) anchor checker ·
 > [#267](https://github.com/yusiwen/minfer/issues/267) test files.
-> Step −1 lands [#138](https://github.com/yusiwen/minfer/issues/138) and
-> [#225](https://github.com/yusiwen/minfer/issues/225) first.
+> Step −1 landed [#138](https://github.com/yusiwen/minfer/issues/138) and
+> [#225](https://github.com/yusiwen/minfer/issues/225) first, as decided.
 
 ## Status
 
 | step | ticket | state |
 |---|---|---|
-| −1 #138 + #225 | #138, #225 | **#225 landed** `5386a1c` (PR #268, 7/7 green; the cold first-run row is in §2.4); **#138 in flight** on `feat/138-defer-cross-wait` |
-| 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
-| 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 594 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
-| 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5, G6): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` (1 header) + 17 TUs; audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2 |
-| 3 CPU files | #264 | **done**: stage A `quants` landed (PR [#290](https://github.com/yusiwen/minfer/pull/290)) — `src/quants.rs` 1,340 → 61 lines + 9 part files + `src/quants/neon_correctness.rs`; `scripts/check_source_layout.py` rule 1 widened ([#274](https://github.com/yusiwen/minfer/issues/274)); stage B `vec_ops` landed (PR [#291](https://github.com/yusiwen/minfer/pull/291)) — `src/vec_ops.rs` 1,344 → 52 lines + 8 part files; stage C `kernel` landed (PR [#292](https://github.com/yusiwen/minfer/pull/292)) — `src/kernel.rs` 667 → 22 lines + 3 part files; counts unchanged (481/0/36 + 10/0/6) |
-| 4 Metal (Mac-local) | #265 | not started |
-| 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
-| 6 long test files | #267 | **files 1–9 landed** (PRs #275, #277, #278, #279, #280, #281, #283): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` 1,186 → a 209-line parent + 4 `tests/<topic>.rs` (5 tests) |
+| −1 #138 + #225 | #138, #225 | **landed**: [#225](https://github.com/yusiwen/minfer/issues/225) `5386a1c` (PR [#268](https://github.com/yusiwen/minfer/pull/268), 7/7 green; the cold first-run row is in §2.4); [#138](https://github.com/yusiwen/minfer/issues/138) `cd39894` (PR [#271](https://github.com/yusiwen/minfer/pull/271), 7/7 green) |
+| 0 plan document + conventions | this file | **landed** `9174644` (PR [#269](https://github.com/yusiwen/minfer/pull/269)) + the step's own record `1c9e68d` (PR [#272](https://github.com/yusiwen/minfer/pull/272)): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
+| 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** `d08e05e` (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 594 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
+| 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5 `ee380ad`, [#289](https://github.com/yusiwen/minfer/pull/289) G6 `0cb21cb`): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` (498 lines, 1 header) + **17 TUs** (9,996 lines); audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2, and the re-measured module-load cost is in §5 |
+| 3 CPU files | #264 | **landed**: stage A `quants` `cbee81f` (PR [#290](https://github.com/yusiwen/minfer/pull/290)) — `src/quants.rs` 1,340 → 61 lines + 9 part files + `src/quants/neon_correctness.rs`, `scripts/check_source_layout.py` rule 1 widened ([#274](https://github.com/yusiwen/minfer/issues/274)); stage B `vec_ops` `395da59` (PR [#291](https://github.com/yusiwen/minfer/pull/291)) — `src/vec_ops.rs` 1,344 → 52 lines + 8 part files; stage C `kernel` `4900298` (PR [#292](https://github.com/yusiwen/minfer/pull/292)) — `src/kernel.rs` 667 → 22 lines + 3 part files; counts unchanged (481/0/36 + 10/0/6) |
+| 4 Metal (Mac-local) | #265 | **not started — this row is the Mac round's.** `src/metal.rs`/`src/metal.metal` → `src/metal/{runtime,encode,ops,policy}.rs` + `src/metal/kernels/*.metal`; not compiled on Linux, so no Linux PR can claim it (§6.5) |
+| 5 close the loop | — | **Linux half landed** (this PR, 2026-10-05): the `MINFER_OP_TIMING` module-load re-measure in §5 + the `src/cuda_kernels.cu` prose sweep + the last two #219 claims; **Mac half owed**: [#53](https://github.com/yusiwen/minfer/issues/53)'s Metal `DeviceMemory` answer, which is the second implementation the `common` rule waits on (§3) |
+| 6 long test files | #267 | **files 1–9 landed**: PR [#275](https://github.com/yusiwen/minfer/pull/275) `424c64d` (file 1), [#277](https://github.com/yusiwen/minfer/pull/277) `66446e5` (2), [#278](https://github.com/yusiwen/minfer/pull/278) `b439612` (3), [#279](https://github.com/yusiwen/minfer/pull/279) `d3edb10` (4), [#280](https://github.com/yusiwen/minfer/pull/280) `587c156` (5), [#281](https://github.com/yusiwen/minfer/pull/281) `cd2c14a` (6–8), [#283](https://github.com/yusiwen/minfer/pull/283) `bc30152` (9): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` 1,186 → a 209-line parent + 4 `tests/<topic>.rs` (5 tests) |
 
 Each step appends its dated record here when it lands (gates run, counts, box label).
 
@@ -44,6 +48,20 @@ Each step appends its dated record here when it lands (gates run, counts, box la
    `allocplan::DeviceMemory` (CUDA answers it; Metal does not — the second implementation is
    [#53](https://github.com/yusiwen/minfer/issues/53)). This rule goes into
    `docs/ARCHITECTURE.md`.
+
+   **Step 5 pre-analysis (2026-10-05, on `4900298`) — no `common` module yet, and the Linux half owes
+   none.** The candidate's three halves: the **type** (`allocplan::DeviceMemory`,
+   `src/graph/allocplan.rs:67`) and the pure **policy** (`budget_decision`/`weight_budget`,
+   `allocplan.rs:124` + `graph/offload.rs:310`, with callers in `graph/alloc.rs:888/907` and both
+   loaders) are **already device-agnostic and CI-tested**; the **device answer** has exactly **one**
+   implementation (`CudaState::device_memory()`, `src/cuda/methods/accounting.rs:31`, reached through
+   the CUDA-only resolver `models::device_memory()` at `src/models/mod.rs:74`, 3 call sites), and no
+   `Backend` trait hook for it exists. [#53](https://github.com/yusiwen/minfer/issues/53) adds the
+   second answer *behind that existing resolver*, so nothing has to move to make it possible; whether
+   the device-answer code then belongs in a `common` module stays open until it exists, and "no new
+   module" is a live answer (the type and the policy are already in `allocplan`). Creating the
+   abstraction now would be the single-real-implementation case this rule forbids, so it is
+   deliberately **not** created here.
 4. **Each backend picks its own inner axis** (this is what llama.cpp actually does — it is *not*
    uniform): CUDA = **kernel family**, Metal = **layer** (`ggml-metal-device.*` → `ggml-metal-ops.cpp`
    → `kernels/`), CPU = **ISA** (`ggml-cpu/arch/{x86,arm,…}`).
@@ -60,7 +78,7 @@ Each step appends its dated record here when it lands (gates run, counts, box la
    intermediate parent** (`src/cuda/methods.rs` — **not** `impl.rs`: `impl` is a Rust keyword, so
    `mod impl;` is a syntax error — `expected identifier, found keyword 'impl'`, verified with a
    two-file `rustc` probe on 2026-10-04), so privacy does the work: private fields of
-   `CudaState` (defined in `cuda`) and private helper methods (defined in `cuda::impl`) are visible in
+   `CudaState` (defined in `cuda`) and private helper methods (defined in `cuda::methods`) are visible in
    every family file. **The split is therefore a pure move — 0 field-visibility edits, 0
    `pub(super)`** — with exactly one mechanical edit: the 86 `extern "C"` launch declarations get
    `pub(crate)` so the two launch test files keep resolving them through `use super::*;`.
@@ -79,7 +97,7 @@ on a non-Mac box.
 |---|---|---|---|
 | **L1 device/runtime** — context, streams, memory, events, capture, resident weights, device query | `cuda.rs` 1147–1930 + `impl` families A–H | `metal.rs` (`MpsState`, `MetalDevice`, `MpsCommandBuffer`) | — (std threads; `kernel.rs`'s `Pool` is not a device layer) |
 | **L2 launch/dispatch** — one thin host wrapper per op | `cuda.rs` families I–R (~3,000 lines) + 86 `extern "C"` declarations | `metal.rs` command-buffer encoding (~1,700 lines) | `kernel.rs` + `quants.rs` + `vec_ops.rs` |
-| **L3 kernel sources** | `cuda_kernels.cu` | `metal.metal` | the `*_avx2` bodies and `mod neon_*` inside `quants.rs`/`vec_ops.rs` |
+| **L3 kernel sources** | `src/cuda/kernels/*.cu` + `common.cuh` | `metal.metal` | the `*_avx2` bodies and `mod neon_*` inside `quants.rs`/`vec_ops.rs` |
 | **L4 graph executor** — Op → backend, buffers, capture replay | `graph/cuda_backend.rs` | `graph/metal_backend.rs` | `graph/cpu_backend.rs` |
 
 L2 is **not** a layer that can be moved away from L1: the CUDA launchers are inherent methods of
@@ -430,9 +448,58 @@ route (a) and is also llama.cpp's CUDA shape. The evidence base for the split's 
   **117.3 s / 114.1 s** (two runs), 675 MB RSS, 35.8 MB object; `nvcc --threads 0` **16.4 s / 15.6 s**;
 - **the CUDA build is not bit-reproducible today** (two identical serial runs differ by 16 bytes in
   the `.text` of two cubins) — so the split's evidence is runtime gates, not binary identity;
-- the recorded per-module fatbin load is **~2.2 ms, set-size independent**
-  (`docs/CUDA-BACKEND-DESIGN.md` §2.4's cost table), so ten modules are extrapolated at ~13–22 ms one-time —
-  **unverified**, and to be measured in Step 2's first increment.
+- the recorded per-module fatbin load was **~2.2 ms, set-size independent**
+  (`docs/CUDA-BACKEND-DESIGN.md` §2.4's cost table), so ten modules were extrapolated at ~13–22 ms
+  one-time. **Step 5 measured it (2026-10-05) and the extrapolation was wrong** — see below.
+
+### 5.1 The re-measured module load (Step 5, 2026-10-05)
+
+Box **`dgxspark (aarch64, GB10 sm_121)`**, CUDA 13.0, driver 580.178.04, nvcc 13 `-gencode` targets
+(12 SASS + `compute_121` PTX) × the 17 TUs; `nvidia-smi` before the run: SM clock 2 411 MHz idle
+(warm) / 208 MHz (cold), 0 % util, no other compute process. Two binaries, both built in this
+repository's worktrees: **pre-split** = `bc30152` (`930e1e2^`, `src/cuda_kernels.cu` = one 10,215-line
+TU = 1 fatbin module) and **post-split** = `4900298` (17 TUs = 17 modules). Command of record
+(`<0.5B>` = the cached `qwen2.5-0.5b-instruct-q4_0.gguf`):
+
+```sh
+MINFER_OP_TIMING=1 target/release/minfer <0.5B> "hello"
+```
+
+which prints the prefill-GEMM smem pre-warm loop's own duration — the point at which the fatbin's
+module is finalized. `fresh process` = a new `minfer` invocation; `cold` = the binary's and the
+model's pages evicted with `posix_fadvise(POSIX_FADV_DONTNEED)` first (an agent shell cannot
+`drop_caches`), `warm` = back-to-back fresh processes with the pages resident.
+
+| build | module(s) the command forces | warm, fresh process | cold (page-cache-evicted) |
+|---|---|---:|---:|
+| pre-split `bc30152` | **1** (the whole fatbin) | **2 300 µs** median (2 203–2 468, n=12) | **18 478 / 20 723 µs** (2 runs) |
+| post-split, shipped binary | **1 of 17** (`gemm_wmma.cu`) | **350–590 µs** | **4 288 / 6 109 / 6 983 µs** |
+| post-split, all 16 loadable TUs | **16 of 17** (temporary per-TU probe) | **≈ 2 370 µs** total (15 probes 1 851–2 023 µs + the GEMM module) | **42 671 / 44 416 / 47 412 µs** |
+
+Per-module figures (post-split, warm, one live `cudaFuncGetAttributes` per TU, temporary probe inside
+`minfer_prewarm_kernels` — reverted before the PR): `mmvq_q6k` 57 · `mmvq_aquant` 57 · `mmq_raw` 70 ·
+`mmq_nb` 73 · `matmul_f32act` 85 · `mmq_int8` 93 · `mmvq_skipwrite` 100 · `kv_store` 102 ·
+`mmvq_multi` 111 · `mmq_bt_q6k` 118 · `ops_misc` 123 · `ops_elementwise` 245 · `attention_decode` 223 ·
+`gemm_fused_dequant` 40 · `attention_prefill` 447 · `gemm_wmma` ≈ 350–590 µs (its line also carries the
+12 attribute queries), i.e. **40–450 µs per module, ~150 µs median** — *not* the recorded 2.2 ms, which
+was the whole pre-split module's cost, not a per-module constant.
+
+**Verdict: the split's cost is acceptable.** In steady state the 17-module fatbin loads in the same
+~2.3 ms as the pre-split single module, because the load tracks the code a module contains, not the
+module count; the `MINFER_OP_TIMING` line moves from 2.3 ms to 0.4 ms only because it now times one
+seventeenth of the work. The honest extra is **cold**: a page-cache-cold start pays ≈ +25 ms
+(≈ 19 ms → ≈ 45 ms), because every one of the 16 module registrations faults the fatbin's pages again.
+The cold per-module figures (same probe, evicted pages, 975–5 214 µs) are ~10× their warm values across
+the whole size range — including 975 µs for the 284-line `gemm_fused_dequant.cu` — so a per-registration
+overhead rides on top of the size-proportional part, and 16 registrations pay it 16 times. That is
+≈ 1.8 % of the ~1.4 s cold-start wall time on this 0.5B model, once per process, and the mitigation the
+plan names (`minfer_prewarm_kernels` trimmed to the modules a run needs) would only *move* it into the
+first forward's lazy loads — which is why no trimming is applied. The correction also applies to §2.4's old explanation of the 14.5 ms cold
+row: it is **page-cache-cold**, not the GPU clock (a 40 s idle cooldown at a 208 MHz SM clock reads the
+warm 2.3 ms; the same binary with evicted pages reads 18.5–20.7 ms).
+
+The full per-module transcripts and the two worktrees' build logs are in the Step 5 record in
+`docs/ARCHITECTURE-EXECUTION-PLAN.md`.
 
 ## 6. Documentation plan
 
@@ -452,7 +519,9 @@ route (a) and is also llama.cpp's CUDA shape. The evidence base for the split's 
   with anchors **converted to symbol anchors** (`` `prefill_mmq` (`src/cuda/kernels/mmq_*`) ``) wherever
   the line number was only a locator.
 - **Historical records** (`docs/cuda_optimization_steps/*.md`, `docs/QWEN2.5-*.md`,
-  `docs/DEBUGGING-*.md`, `docs/KNOWN-CPU-ISSUES-*.md`, `docs/PARAMETER_AUDIT.md`'s older tables) keep
+  `docs/DEBUGGING-*.md`, `docs/KNOWN-CPU-ISSUES-*.md`, `docs/PARAMETER_AUDIT.md`'s older tables,
+  `docs/ARCHITECTURE-EXECUTION-PLAN.md`'s per-ticket entries, and `experiments/cuda/*.md` — the probe
+  run records, which quote the `nvcc … ../../src/cuda_kernels.cu` command as it was run) keep
   their text — they record a measurement taken against a revision, and rewriting them would falsify the
   record. They are resolved through the **path mapping table** this document keeps (§6.4).
 - **The checker must know about the freeze**: `scripts/check_doc_line_anchors.py` (ticket 6) carries a
@@ -539,9 +608,9 @@ code or files, or target code that this plan moves.** (#150's `worker_loop` hit 
 | [#138](https://github.com/yusiwen/minfer/issues/138) F5 late cross-backend wait | edits `copy_to_host` and consumes `stream_wait_event` / `cudaStreamWaitEvent` — both in `cuda.rs` family G, and both are the two grandfathered bare `allow(dead_code)` sites | **land #138 first if it is next**: it removes code the split would otherwise move and deletes two grandfather keys; otherwise keep it out of flight during Step 1 |
 | [#219](https://github.com/yusiwen/minfer/issues/219) two stale CUDA claims | owns `walkthrough/15-cuda-backend.md` §3.2.2 (`register_weight`) and `CUDA-BACKEND-DESIGN.md` — the same files Step 0 and Step 1 re-anchor | merge Step 0's stale-fact list into #219 (one docs PR), or land Step 0 first and reference #219 |
 | [#225](https://github.com/yusiwen/minfer/issues/225) pre-warm cost table | the split changes the **fatbin module count**, i.e. exactly what #225 records (2.2 ms per module, cold-run 14.5 ms) | land #225's correction first (cheap), then re-measure in Step 2's first increment and cross-reference |
-| [#200](https://github.com/yusiwen/minfer/issues/200) CUDA kernel for `Op::FusedQkvNorm` | **adds** a kernel to `cuda_kernels.cu` and a launcher to `cuda.rs`, in the `attn_bias_rope_store*` (family R) shape | land the split first, or rebase onto the new family files |
-| [#208](https://github.com/yusiwen/minfer/issues/208) bf16 weights on device | adds device kernels to `cuda_kernels.cu` (+ `metal.metal`) and touches `vec_ops::mat_mul_bf16` | same as #200 |
-| [#212](https://github.com/yusiwen/minfer/issues/212) packed Q8_0 residual attribution | profiles `gqa_attn_f32` in `cuda_kernels.cu` (attention family) with line-level references | finish or park it; if the split lands first, re-anchor its references to `cuda_kernels_attn.cu` |
+| [#200](https://github.com/yusiwen/minfer/issues/200) CUDA kernel for `Op::FusedQkvNorm` | **adds** a kernel and a launcher, in the `attn_bias_rope_store*` (family R) shape | the split has landed: add the kernel to `src/cuda/kernels/kv_store.cu` (or a new `kernels/<family>.cu` registered in `build.rs`'s `KERNEL_SOURCES`) and the launcher to `src/cuda/methods/kvstore.rs` |
+| [#208](https://github.com/yusiwen/minfer/issues/208) bf16 weights on device | adds device kernels (+ `metal.metal`) and touches `vec_ops::mat_mul_bf16` | same as #200 — device kernels go into `src/cuda/kernels/` |
+| [#212](https://github.com/yusiwen/minfer/issues/212) packed Q8_0 residual attribution | profiles `gqa_attn_f32` (attention family) with line-level references | the split has landed: `gqa_attn_f32` is in `src/cuda/kernels/attention_decode.cu`, so its references re-anchor there (or to the symbol) |
 | [#164](https://github.com/yusiwen/minfer/issues/164) Metal f16 matmul/embedding kernels | adds kernels to `metal.metal` | Mac round; do it after the Metal split (Step 4) |
 | [#255](https://github.com/yusiwen/minfer/issues/255) two macOS-only dead-code annotations | its two targets are `metal.rs:971` / `metal.rs:2029` — line anchors the Metal split moves | judge them first (Mac), then split |
 | [#260](https://github.com/yusiwen/minfer/issues/260) Mac round umbrella | the entry point for a Mac agent; it lists the Metal gaps and the order | update it with the Step 4 shape and the new #53 item |
@@ -723,7 +792,7 @@ columns**),
 | 2 `.cu` | Step 1's list plus `check_cuda_launch_returns.py` (+`--selftest`, `--check-fixture`), `MINFER_TEST_ISSUE162=1` device gate, `MINFER_OP_TIMING=1` cold-start record | 130 sites; 42/0 ×2 bitwise; module-load cost recorded |
 | 3 CPU | CPU suites (`cargo test --release`, plus `MINFER_NO_NEON=1`) + the two-arch dead-code set comparison | 481/0/36, 10/0/6, sets identical |
 | 4 Metal | on a Mac: `cargo build --release` (non-empty metallib), real-model gates, #255's two judgments | recorded on the Mac box |
-| 5 close | #225's table re-measured; #53's `DeviceMemory` for Metal | one interface, two implementations |
+| 5 close | Linux: #225's table re-measured (§5.1); Mac: #53's `DeviceMemory` for Metal | the measured row in `CUDA-BACKEND-DESIGN.md` §2.4 / plan §5.1; the `common` decision stays open until the Mac half exists |
 | 6 tests | the step-appropriate suite (CUDA 565/0/42 for the executor tests, CPU 480/0/36 + 10/0/6) + `check_source_layout.py` | counts **identical**; every new test file named by a `mod` |
 | all | `scripts/check_docs_links.py`, `scripts/check_status.py --check`, `scripts/build_book.sh`, `scripts/check_doc_line_anchors.py` (once ticket 6 lands) | green; no stale anchor |
 

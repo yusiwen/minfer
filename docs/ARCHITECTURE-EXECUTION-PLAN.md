@@ -9968,3 +9968,149 @@ inaccessible`. Both reverted, exit 0.
 **#264 is complete.** `src/quants.rs` 1,340 → 61 + 9 parts (+ the extracted `neon_correctness.rs` 138),
 `src/vec_ops.rs` 1,344 → 52 + 8 parts, `src/kernel.rs` 667 → 22 + 3 parts, and the three module files
 are the deciders with the same public paths. The ISA axis is now the directory tree.
+
+#### Test-infrastructure record (#261 step 2, 2026-10-04) — `src/cuda_kernels.cu` becomes `src/cuda/kernels/` (backfilled 2026-10-05)
+
+**Why this entry is retroactive.** Steps 0 (`1c9e68d`), 1 (PR #276), 3 (stages A–C) and 6 (files 1–9)
+each appended their dated record here; Step 2's lived only in `docs/SOURCE-LAYOUT-PLAN.md` §4 Step 2.
+Step 5 adds the missing entry so the campaign's own rule (§6.3: "every step: a dated entry in
+§test-infrastructure") holds for all seven, and so the module-count measurement has one home. The
+numbers below are the stage record's (plan §4 Step 2, one PR per group), not re-measured here.
+
+**What landed.** Six PRs on `dgxspark (aarch64, GB10 sm_121)`: G1 `930e1e2`
+([#284](https://github.com/yusiwen/minfer/pull/284)) `common.cuh` 498 + `guard.cu` 305 · G2 `286a5a4`
+([#285](https://github.com/yusiwen/minfer/pull/285)) `attention_decode.cu` 1,177 +
+`attention_prefill.cu` 511 · G3 `f68a542` ([#286](https://github.com/yusiwen/minfer/pull/286))
+`mmq_int8.cu` 457 + `mmq_raw.cu` 645 + `mmq_nb.cu` 708 + `mmq_bt_q6k.cu` 481 · G4 `c0ddf8b`
+([#287](https://github.com/yusiwen/minfer/pull/287)) `matmul_f32act.cu` 719 + `mmvq_aquant.cu` 413 +
+`mmvq_skipwrite.cu` 648 + `mmvq_q6k.cu` 342 + `mmvq_multi.cu` 753 · G5 `ee380ad`
+([#288](https://github.com/yusiwen/minfer/pull/288)) `ops_misc.cu` 743 + `ops_elementwise.cu` 439 +
+`kv_store.cu` 435 + `gemm_wmma.cu` 936 + `gemm_fused_dequant.cu` 284 · G6 `0cb21cb`
+([#289](https://github.com/yusiwen/minfer/pull/289)) the 14-line remainder deleted.
+`src/cuda_kernels.cu` 10,215 → **0**; `src/cuda/kernels/` = `common.cuh` + **17 TUs** (9,996 lines).
+
+**The layout invariant.** Route (a) — the launcher lives in the TU that instantiates its kernel — is
+forced by the default toolchain: a **templated** `__global__` launched or address-taken across TUs is a
+link error without `-rdc=true` (the four-pattern two-file probe in plan §5), and the plan deliberately
+does not add `-rdc`. Two launchers were the exception and were resolved by merging their kernel's home
+(`attention_hybrid.cu` into `attention_decode.cu`, the q6_K reducer next to the NB kernels). `build.rs`
+owns one explicit `KERNEL_SOURCES`/`KERNEL_HEADERS` list — the compile order, the launch audit's
+`--source` order and the fixture's row order — plus a **new-file guard** (a `.cu` in `kernels/` absent
+from the list fails the build) and one `rerun-if-changed` per file. The five measured corrections the
+plan's draft table needed (`guard.cu` 305 not 402; five per-family pre-warm entries, not six;
+`gemm_smem.cu` merged into `gemm_wmma.cu`; the two-caller `mmq_ksplit_reduce_kernel`; 17 TUs, not 19)
+are recorded in plan §4 Step 2.
+
+**Verification (rule 5 numbers, the stage record's).** Same at every stage: `check_cuda_launch_returns.py`
+**130 sites** + `--check-fixture` exit 0; `MINFER_TEST_ISSUE162=1` device gate green; CUDA unit
+**567 / 0 / 42**; CPU **481 / 0 / 36** + integration **10 / 0 / 6**; real-model **42 / 0** on both the
+0.5B and the Qwen3-0.6B configuration, greedy output bitwise identical; **0 nvcc warnings**. The
+module-load cost this step was predicted to change is re-measured in the Step 5 record below.
+
+**Deliberately out of scope.** No `-rdc=true`, no `-static-global-template-stub=false`, no behaviour
+change; the pre-warm decomposition keeps the `minfer_prewarm_kernels` symbol the Rust side declares;
+and the cold/warm module-load comparison was left to Step 5 because it needs a quiet device and a fresh
+process per configuration.
+
+#### Test-infrastructure record (#261 step 5, 2026-10-05) — the close-out: the module-load re-measure, the `.cu` prose sweep and the last two #219 claims
+
+**What landed.** The Linux half of Step 5 on `dgxspark (aarch64, GB10 sm_121)`, CUDA 13.0, driver
+580.178.04, one GPG-signed branch, PR #TBD-STEP5. Three concerns:
+
+1. **The measurement the split made necessary.** The fatbin is 17 modules since #263, so the recorded
+   "~2.2 ms per module / ~14.5 ms cold" row (`docs/CUDA-BACKEND-DESIGN.md` §2.4, [#225]) was re-measured
+   instead of extrapolated. The pre-split binary was rebuilt at `930e1e2^` (`bc30152`) in a second
+   worktree and both were driven with the command of record
+   `MINFER_OP_TIMING=1 target/release/minfer <cached 0.5B q4_0> "hello"`, warm (fresh processes,
+   back-to-back) and cold (the binary's and the model's pages evicted with
+   `posix_fadvise(POSIX_FADV_DONTNEED)` first — an agent shell cannot `drop_caches`). `nvidia-smi`
+   before the warm runs: SM clock 2,411 MHz, 0 % util, no other compute process.
+2. **The prose sweep.** Every live document that named the retired `src/cuda_kernels.cu` now names
+   `src/cuda/kernels/*.cu` (or the specific TU): `CUDA-BACKEND-DESIGN.md` (the §2.1 layer table and the
+   four current-state references), `BUILD.md`, the walkthrough's `15-cuda-backend.md` and `README.md`,
+   `GPU_SAFETY.md`, `CUDA_OPTIMIZATION.md`, `LLAMA-CPP-MMQ-ANALYSIS.md` (the r25-HEAD citation kept,
+   the current path added), `cuda_tutorial/{01,02,03,04,05,06,07,README,STYLE}.md`,
+   `CUDA-TECH-PRIMER.md`, `DEVICE-ADAPTATION-PLAN.md`, `COMPUTE-GRAPH-DESIGN.md`,
+   `ARCHITECTURE-ROADMAP.md`, `GATE-CONTRACT.md`, `README.md`, `AGENTS.md`,
+   `.github/workflows/ci.yml`, `build.rs` and the `src/**` comments. **Two dead fallbacks for the
+   deleted file were removed with it** (`build.rs::LEGACY_SOURCE` and its
+   `kernel_translation_units()`/`rerun-if-changed` arms; `check_cuda_launch_returns.py::LEGACY_SOURCE`
+   and the docstring/`--source` text describing the "legacy remainder"). Frozen records
+   (`cuda_optimization_steps/*`, `QWEN2.5-*`, `DEBUGGING-*`, `KNOWN-CPU-ISSUES-*`, `CPU_OPTIMIZATIONS.md`,
+   `PARAMETER_AUDIT.md`, this file, `experiments/cuda/*`) keep their pre-split citations by policy
+   (plan §6.2, where `experiments/cuda/*` is now named).
+3. **The claims the earlier steps missed.** `docs/ARCHITECTURE.md` still named
+   `src/cuda/impl/<family>.rs` and `src/cuda/{init,…}.rs` (the inner module is `methods`; the files are
+   under `src/cuda/methods/`) and `docs/BACKENDS.md` repeated the `impl` path;
+   `inference_e2e_walkthrough/15-cuda-backend.md` carried the pre-#262/#267 sizes (`src/cuda.rs`
+   6,578 → 1,014, `cuda_backend.rs` + its tests re-counted, the `.cu` line count corrected to 9,996);
+   and **17 already-wrong `src/cuda.rs:NNN` anchors** in `cuda_tutorial/{02,03}`,
+   `ARCHITECTURE-ROADMAP.md` and `walkthrough/03` were re-pointed at the symbol or the owning file —
+   the step-1 line map proved they named the extern-`"C"` declaration block on the *old* file too, so
+   they were pre-existing wrong citations of the same class as #219, invisible to the checker because
+   the numbers landed inside the 1,014-line remainder.
+
+**The measured row (the point of the split).** Command as above; the `MINFER_OP_TIMING=1` line is the
+prefill-GEMM smem pre-warm loop, i.e. the point at which the fatbin's module is finalized.
+
+| build | modules the command forces | warm, fresh process | cold (page-cache-evicted) |
+|---|---|---:|---:|
+| pre-split `bc30152` | **1** (whole fatbin) | **2,300 µs** median (2,203–2,468, n=12) | **18,478 / 20,723 µs** |
+| post-split shipped (`4900298`) | **1 of 17** (`gemm_wmma.cu`) | **350–590 µs** | 4,288 / 6,109 / 6,983 µs |
+| post-split, all 16 loadable TUs | **16 of 17** (temporary per-TU probe, reverted) | **≈2,370 µs** total | 42,671 / 44,416 / 47,412 µs |
+
+Per-module warm (temporary probe inside `minfer_prewarm_kernels`, plus the `try_new` GEMM module):
+`gemm_fused_dequant` 40 · `mmvq_q6k` 57 · `mmvq_aquant` 57 · `mmq_raw` 70 · `mmq_nb` 73 ·
+`matmul_f32act` 85 · `mmq_int8` 93 · `mmvq_skipwrite` 100 · `kv_store` 102 · `mmvq_multi` 111 ·
+`mmq_bt_q6k` 118 · `ops_misc` 123 · `attention_decode` 223 · `ops_elementwise` 245 ·
+`attention_prefill` 447 · `gemm_wmma` ≈350–590 µs — i.e. **40–450 µs (median ≈150 µs) per module**, not
+the recorded 2.2 ms, which was the *whole* pre-split module. Cold, the same 16 registrations are
+975–5,214 µs each: the extra is a per-registration fault of the fatbin's pages.
+
+**Verdict recorded in the docs.** Acceptable, with the honest extra named: warm steady state is
+unchanged (2,300 → ≈2,370 µs, the shipped line reads lower only because it times 1/17 of the work), and
+a page-cache-cold start pays **+25 ms once per process** (≈19 → ≈45 ms, ≈1.8 % of this model's ~1.4 s
+cold start). The plan's named mitigation (`minfer_prewarm_kernels` trimmed to the modules a run needs)
+is deliberately **not** applied: it would move the cost into the first forward's lazy loads, not remove
+it. The old "cold / idle-clock" explanation of the 14.5 ms row is corrected — it is page-cache-cold, not
+the GPU clock (40 s of cooldown at a 208 MHz SM clock reads the warm figure; evicted pages reproduce the
+cold one). See `docs/CUDA-BACKEND-DESIGN.md` §2.4 and `docs/SOURCE-LAYOUT-PLAN.md` §5.1.
+
+**Verification (rule 5 numbers).** `2026-10-05`, in the step's worktree:
+
+| Command | Result |
+|---|---|
+| `scripts/cuda_test.sh` | **567 passed / 0 failed / 42 ignored** — unchanged from `docs/status.toml` |
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration (`backend_registry_cli` 7/0, `conversation_cli` 3/0/6) — unchanged |
+| `FEATURES=cuda scripts/real_model_gates.sh` | **42 / 0** on the 0.5B and **42 / 0** with `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf` |
+| `python3 scripts/check_dead_code_oracle.py --config {cpu,cuda}` | 46 / 34 baseline entries — **0 additions, 0 removals** |
+| `python3 scripts/check_source_layout.py` / `check_dead_code_annotations.py` | exit 0 ("src obeys the layout rules"; 11 grandfathered bare sites) |
+| `python3 scripts/check_docs_links.py` / `check_status.py --check` | 990 links resolve; prose agrees with `docs/status.toml` |
+| `python3 scripts/check_doc_line_anchors.py` | **1 664 anchors · 0 bad**, 3 unchanged `UNUSED FREEZE` notices, no stale exemption |
+| `python3 scripts/check_cuda_launch_returns.py --selftest` / `--check-fixture` | 5 cases pass; **130 `<<<` sites** |
+| `cargo fmt --all --check` / `cargo build --release --features cuda` | exit 0 |
+
+**Mutation evidence (rule 3).** Two mutations, each reverted: appending `` `src/cuda.rs:99999` `` to
+`docs/GPU_SAFETY.md` → `check_doc_line_anchors.py` exits **1** with
+`OUT-OF-RANGE docs/GPU_SAFETY.md:223: src/cuda.rs:99999 → src/cuda.rs — src/cuda.rs has 1014 lines`;
+adding an unlisted `src/cuda/kernels/zz_probe_mutation.cu` → the build script panics at `build.rs:59`
+with `assertion left == right failed: build.rs KERNEL_SOURCES must list every .cu in src/cuda/kernels,
+in sorted order (an unlisted kernel file is never compiled)` and exit **101** — the guard still bites
+after the `LEGACY_SOURCE` fallback was deleted. Both reverted; the gates re-run green.
+
+**#219 closed.** The issue's two original claims and the four folded ones are all resolved: the
+walkthrough's `register_weight` section (and the same stale "blocking `cudaMemcpy`" sentence in
+`cuda_tutorial/02`) now documents the #188 stream-ordered `cudaMemcpyAsync` + `cudaStreamSynchronize`
+and the test-only `register_weight_blocking_legacy` probe; the `CudaCommandBuffer` banner was rewritten
+by Step 1 (`src/cuda/methods/dispatch.rs:124`); the `~4400 LOC`, `120 sites` and walkthrough-size
+figures were corrected by Step 0 and re-corrected here where #262/#267 invalidated them again.
+
+**Deliberately out of scope (the Mac round).** [#265](https://github.com/yusiwen/minfer/issues/265)
+(Step 4: `src/metal.rs`/`src/metal.metal` → `src/metal/{runtime,encode,ops,policy}.rs` +
+`src/metal/kernels/*.metal`) and [#53](https://github.com/yusiwen/minfer/issues/53)'s Metal
+`DeviceMemory` answer — the second implementation the `common` rule waits on. `src/main.rs` gates the
+whole Metal module on `target_os`, so no Linux build or CI job can compile it. The `common` decision
+is therefore **not taken**: plan §1.3 records the pre-analysis (the type and the policy are already in
+the device-agnostic `allocplan`/`offload`; the device answer has one implementation,
+`CudaState::device_memory()` through the CUDA-only `models::device_memory()`, with no `Backend` trait
+hook), so creating a `common` module now would be the single-real-implementation case the rule forbids.
