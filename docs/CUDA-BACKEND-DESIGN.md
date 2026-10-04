@@ -357,22 +357,47 @@ the detector for the mutation the #218 gates cannot see — a pre-warm that skip
 #218 arms run their fresh-process children with `MINFER_NO_GEMM_PREWARM=1`, the documented control, so
 their claims stay the lazy path's and the pre-warm cannot make them vacuous.
 
-**Cost, measured on the real binary (2026-09-29, GB10 sm_121, CUDA 13.0, driver 580.178.04).** The
+**Cost, measured on the real binary (2026-09-29, GB10 sm_121, CUDA 13.0, driver 580.178.04,
+`MINFER_OP_TIMING=1 ./target/release/minfer bench -p 8 -n 1 -r 1` on the cached 0.5B q4_0).** The
 proxy in #223 used a synthetic kernel pair; the real prefill-GEMM fatbin is different, and the numbers
 differ by ~15×: a pre-warm that is admitted in full is silent, and with `MINFER_OP_TIMING=1` the loop
-reports **~2.2 ms** (median 2249 µs over 25 fresh processes, range 2126–2448) — the fatbin's one-time
-module load, not the 152.9 µs the synthetic first `cudaFuncSetAttribute` cost. It is set-size
-independent: looping over just `(128,64,false)` costs the same ~2.2 ms as looping over all twelve, so
-it is one module finalization, not twelve. The **net** effect is still the proxy's conclusion: the
-~2.2 ms **moves** rather than appears. `prewarm_prefill()`
-(the r59 rider's `minfer_prewarm_kernels`, called at the end of Qwen2/Qwen3 weight registration,
-before the first forward) already pushes that fatbin load into the startup path; with the pre-warm on
-it costs ~2.3 ms, with the pre-warm off ~4.5 ms — the same ~2.2 ms, moved earlier. Controlled probe on
-the real binary (fresh process, `MINFER_MMQ=0/1` × `MINFER_GEMM_K64=0/1`): the first prefill forward
-is 2288–2314 µs with the pre-warm off and 78–120 µs with it on; `prewarm_prefill()` is 4.3–4.6 ms off
-vs 2.2–2.4 ms on. The hot path is untouched: `minfer bench -p 2048 -n 128`, same binary, 7 interleaved
-matched rounds, medians — `pp2048` 2546.55 vs 2544.34 t/s (**+0.09%**), `tg128` 236.30 vs 236.45 t/s
-(**−0.06%**), bar ±1%. The full transcript is in the #223 record.
+reports **~2.2 ms** — the fatbin's one-time module load, not the 152.9 µs the synthetic first
+`cudaFuncSetAttribute` cost.
+
+| pre-warm loop's own duration | measured | reading |
+|---|---|---|
+| warm-clock, 25 fresh processes | **median 2249 µs** (range 2126–2448) | the figure this section first recorded; it is the **warm** measurement and **not** a bound |
+| first (**cold / idle-clock**) invocation, the same one-time work | **~14 526 µs** (~6× the warm median) | what an independent three-run check saw ([#225](https://github.com/yusiwen/minfer/issues/225)); the one-time module load is **clock/state dependent** |
+
+The three consecutive runs behind the cold row (same command, same binary, same box):
+
+```text
+MINFER_OP_TIMING=1 ./target/release/minfer bench -p 8 -n 1 -r 1 <cached 0.5B q4_0>
+ CUDA: prefill-GEMM smem pre-warm (12 instantiation(s), 1 refused/skipped …) took 14526 µs   ← first run
+ CUDA: prefill-GEMM smem pre-warm … took 2157 µs
+ CUDA: prefill-GEMM smem pre-warm … took 2364 µs
+```
+
+So the recorded 2126–2448 range is **warm-clock only**, not the worst case: the cost is the fatbin's
+one-time **module load** (which the process pays before the first kernel from it can run either way),
+and on the first cold / idle-clock invocation of the same one-time work it measured ~14.5 ms. It is
+set-size independent: looping over just `(128,64,false)` costs the same ~2.2 ms as looping over all
+twelve, so it is one module finalization, not twelve.
+
+The **net** effect is still the proxy's conclusion: the module load **moves** rather than appears —
+but only because something later would pay it anyway. `prewarm_prefill()` (the r59 rider's
+`minfer_prewarm_kernels`, called at the end of Qwen2/Qwen3 weight registration, before the first
+forward) already pushes that fatbin load into the startup path; with the pre-warm on it costs ~2.3 ms,
+with the pre-warm off ~4.5 ms — the same ~2.2 ms, moved earlier. **The coupling is explicit and
+load-bearing: the ≈ 0 net holds only while a later step pays that same module load — today
+`prewarm_prefill()`, otherwise the first launch from the fatbin. Move that rider after the first
+launch, or remove it, and the pre-warm's loop becomes ~2.2 ms of net-new startup cost of the same
+clock-dependent magnitude.** Controlled probe on the real binary (fresh process, `MINFER_MMQ=0/1` ×
+`MINFER_GEMM_K64=0/1`): the first prefill forward is 2288–2314 µs with the pre-warm off and 78–120 µs
+with it on; `prewarm_prefill()` is 4.3–4.6 ms off vs 2.2–2.4 ms on. The hot path is untouched:
+`minfer bench -p 2048 -n 128`, same binary, 7 interleaved matched rounds, medians — `pp2048` 2546.55
+vs 2544.34 t/s (**+0.09%**), `tg128` 236.30 vs 236.45 t/s (**−0.06%**), bar ±1%. The full transcript
+is in the #223 record.
 
 **The same-thread `ThreadLocal` in-window case — measured (2026-09-29).** The open question this
 section used to carry — is `cudaFuncSetAttribute` legal inside a **same-thread**
