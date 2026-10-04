@@ -97,7 +97,7 @@ impl CrossCopyStats {
 
     /// Whether phase B was issued for every phase-A copy. The missing-wait gate
     /// reads this: a boundary that drops its wait leaves `waits < copies`.
-    /// Test-only (#238): driven by `graph::copystats::tests::the_two_phases_are_counted_separately_and_the_delta_is_exact` and `graph::cuda_backend::tests::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise`; `#[cfg(test)]` keeps it out of production builds.
+    /// Test-only (#238): driven by `graph::copystats::tests::the_two_phases_are_counted_separately_and_the_delta_is_exact` and `graph::cuda_backend::tests::staging::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
     pub(crate) fn all_copies_awaited(self) -> bool {
         self.waits == self.copies

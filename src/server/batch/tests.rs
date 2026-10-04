@@ -276,7 +276,7 @@ fn assert_replies_match(what: &str, got: &[Reply], serial: &[Reply]) {
 }
 
 /// The location estimate #154's timing verdict uses (the upper median for an
-/// even count, matching `cuda_backend::tests::median`).
+/// even count, matching `cuda_backend::tests::attn_window::median`).
 fn median(v: &[f64]) -> f64 {
     assert!(!v.is_empty(), "median of an empty sample");
     let mut s = v.to_vec();
