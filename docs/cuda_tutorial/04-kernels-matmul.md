@@ -436,14 +436,14 @@ The one-line answer to "which kernel does decode's Matmul dispatch to?":
 - **decode (`nt == 1`)**: `Op::MatMul` (`cuda_backend.rs:931`) →
   `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:151`) → per-type MMVQ — for Q4_0 with
   `id ≥ 2048`: `q4_0_decode_mmvq` (`src/cuda/methods/mmvq.rs:224`) → `launch_q4_0_q8_mmvq`
-  (`cuda_kernels.cu:7634`) → **`q4_0_q8_mmvq`** (`cuda_kernels.cu:7477`),
+  (`cuda_kernels.cu:5435`) → **`q4_0_q8_mmvq`** (`cuda_kernels.cu:5278`),
   after `decode_quantize_native` (`src/cuda/methods.rs:180`) has produced (or memoized,
   the MmqCache) the pad40 q8 activation plane via `quantize_q8_0_pad40`.
 - **prefill (`nt ≥ 9`)**: the same arm → `mmq_active()` → `prefill_mmq`
   (`src/cuda/methods.rs:301`) → for Q4_K: transposed-A prepass
   `quantize_q8_0_pad40_t` (`cuda_kernels.cu:794`) then
-  `launch_mmq_raw_nb_bt_nt` (`cuda_kernels.cu:7328`) →
-  **`mmq_raw_nb_bt_kernel`** (`cuda_kernels.cu:6656`); Q6_K has its own BT
+  `launch_mmq_raw_nb_bt_nt` (`mmq_nb.cu:601`) →
+  **`mmq_raw_nb_bt_kernel`** (`mmq_nb.cu:289`); Q6_K has its own BT
   kernel (:6976); older/fallback shapes land on `mmq_nt_kernel` (:5663).
 
 **The walkthrough's "MMVQ decode", verified honestly.** The e2e walkthrough's
@@ -484,7 +484,7 @@ documents the layout; the sum feeds the *MMQ* min-term correction and is
 one thread per block, tree-reduced amax — chapter 03's quantize family,
 already read.
 
-**The kernel** — `src/cuda_kernels.cu:7477`:
+**The kernel** — `src/cuda_kernels.cu:5278`:
 
 ```c
 __global__ void __launch_bounds__(256) q4_0_q8_mmvq(
@@ -528,7 +528,7 @@ __global__ void __launch_bounds__(256) q4_0_q8_mmvq(
 ```
 
 **What one thread processes: a slice of one weight row — 32-element blocks,
-round-robin.** The launcher (`cuda_kernels.cu:7634`) is `grid(od, nt)` × 256
+round-robin.** The launcher (`cuda_kernels.cu:5435`) is `grid(od, nt)` × 256
 threads, so block `row` owns output element `out[t][row]` and its 256
 threads split the row's `nb = id/32` quant blocks (`u = threadIdx.x; u +=
 256`). For `ffn_down` 0.5B: `nb = 152`, so each thread handles exactly one
@@ -733,11 +733,11 @@ its pieces in a profile:
   swizzled* into the exact layout the GEMM stages (`src/cuda/methods/dispatch.rs:193`;
   llama.cpp's `quantize_mmq_q8_1` design — "byte-identical … only
   reordered", :782-790).
-- **The GEMM**: `mmq_raw_nb_bt_kernel` (`cuda_kernels.cu:6656`) — raw
+- **The GEMM**: `mmq_raw_nb_bt_kernel` (`mmq_nb.cu:289`) — raw
   quantized weight bytes staged per tile, decoded in registers next to the
   `mma.m16n8k32.s8` instruction, per-k-block scale rescale, f32
   accumulation. The q4_K route enters at `src/cuda/methods/prefill_mmq.rs:53`
-  (`launch_mmq_raw_nb_bt_nt`, `cuda_kernels.cu:7328`); Q6_K has its own BT
+  (`launch_mmq_raw_nb_bt_nt`, `mmq_nb.cu:601`); Q6_K has its own BT
   kernel (:6976);
   non-BT-consumable shapes fall back to `mmq_nt_kernel` (:5663).
 - **Split-K**: when the grid is M-starved (small `nt`), doc 92's auto

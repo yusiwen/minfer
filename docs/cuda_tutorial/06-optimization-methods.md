@@ -104,7 +104,7 @@ chapter: the bare command printed `ERR_NVGPUCTRPERM`; the sudo form worked.
 `TMPDIR=/tmp/yourtmp` or fix the directory ownership.)
 
 The kernel lines of the observed output (Qwen3-0.6B Q8_0, 9-token prompt,
-decode `q8_0_p32_q8_mmvq` — the kernel at `src/cuda_kernels.cu:7686`):
+decode `q8_0_p32_q8_mmvq` — the kernel at `src/cuda_kernels.cu:5487`):
 
 ```text
   q8_0_p32_q8_mmvq(...) (1024, 1, 1)x(256, 1, 1), Context 1, Stream 13, Device 0, CC 12.1
@@ -258,7 +258,7 @@ re-read from DRAM/L2 but eat shared memory, and shared memory per block
 - **Where minfer uses it**: `gemm_f16_nt_kernel_t`
   (`src/cuda_kernels.cu:4787`) — TN=64 × TM tile, KS=32 k-step, dynamic smem
   (`extern __shared__` at :4796); the MMQ GEMM family tiles the same way with
-  raw quantized bytes (`mmq_raw_nb_kernel`, `src/cuda_kernels.cu:6376`; its BT
+  raw quantized bytes (`mmq_raw_nb_kernel`, `src/cuda/kernels/mmq_nb.cu:9`; its BT
   successor `mmq_raw_nb_bt_kernel` :6656; q6_K variant :6976).
 - **Step records**: [02-wmma-f16-prefill-gemm-8m.md](../cuda_optimization_steps/02-wmma-f16-prefill-gemm-8m.md)
   (the 64×64×32 tile turned prefill from 30.7 → 1204 tok/s, 39×, by cutting
@@ -284,7 +284,7 @@ alignment).
 - **Where minfer uses it**: `store_kv_f16` (`float4` load + two `__half2`
   stores, `src/cuda_kernels.cu:2561`); the q6_K B-expand reads packed data as
   `uint4` groups; the q8_0 p32 decode planes are *designed around* the
-  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda_kernels.cu:7686`, row
+  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda_kernels.cu:5487`, row
   pointer :8302, the `__ldg` group loads :8308).
 - **Step records**: [11-p5-gemm-tiles-fa-rewrite.md](../cuda_optimization_steps/11-p5-gemm-tiles-fa-rewrite.md)
   (P5·1, +4%); [44-r41-q6k-bexpand-uint4.md](../cuda_optimization_steps/44-r41-q6k-bexpand-uint4.md)
@@ -316,11 +316,11 @@ bought a 2nd block by shrinking smem, r39/40 bought a 3rd by spending
 registers.
 
 - **Where minfer uses it**: `__launch_bounds__(256, 3)` on the q6_K BT GEMM
-  (`mmq_raw_nb_bt_q6k_kernel`, `src/cuda_kernels.cu:6976`) — the compiler
+  (`mmq_raw_nb_bt_q6k_kernel`, `src/cuda/kernels/mmq_bt_q6k.cu:42`) — the compiler
   limit of 80 regs/thread to fit 3 blocks/SM (80 × 768 threads = 61,440 ≤ the
   65,536-register file, vs 87 regs → only 2 blocks); the q4_K NB kernel's
   45,056 B smem budget → 2 blocks/SM (`mmq_raw_nb_kernel`,
-  `src/cuda_kernels.cu:6376`, the r28 kernel doc 31 measures); the
+  `src/cuda/kernels/mmq_nb.cu:9`, the r28 kernel doc 31 measures); the
   MMVQ family's `__launch_bounds__(256)` everywhere.
 - **Step records**: [31-r28-nb-kernel-2blocks.md](../cuda_optimization_steps/31-r28-nb-kernel-2blocks.md)
   (smem 45,056 B ⇒ 2 blocks/SM, +2.56%; ncu
@@ -454,7 +454,7 @@ occupancy (§3.4's trap: r39 notes doubling every plane at KDR=4 is exactly the
 - **Where minfer uses it**: the q6_K BT GEMM stages every per-kt plane twice
   ("r39: DOUBLE-BUFFERED staging — two copies of every per-kt plane so kt+1's
   global→smem expansion overlaps kt's compute", comment at
-  `src/cuda_kernels.cu:6986–6988`); the A/B/dsc staging planes ride `cp.async`
+  `src/cuda/kernels/mmq_bt_q6k.cu:52–54`); the A/B/dsc staging planes ride `cp.async`
   (the r53/r56 bundles); `gemm_f16_nt_kernel_t` double-buffers its A/B panels
   (doc 02 §2.4).
 - **Step records** (this technique has both spectacular wins and instructive

@@ -268,8 +268,8 @@ non-mutating gates are the same at every stage: audit 130 / `--check-fixture` ex
 | stage | files (new) | lines | `cuda_kernels.cu` | PR |
 |---|---|---:|---:|---|
 | G1 | `common.cuh` 498 + `guard.cu` 305 | 803 | 9 475 | [#284](https://github.com/yusiwen/minfer/pull/284), `930e1e2` |
-| G2 | `attention_decode.cu` 1 178 + `attention_prefill.cu` 512 | 1 690 | 7 828 | — |
-| G3 | MMQ: `mmq_int8.cu` + `mmq_raw.cu` + `mmq_nb.cu` + `mmq_bt_q6k.cu` | | | — |
+| G2 | `attention_decode.cu` 1 178 + `attention_prefill.cu` 512 | 1 690 | 7 828 | [#285](https://github.com/yusiwen/minfer/pull/285) |
+| G3 | MMQ: `mmq_int8.cu` 457 + `mmq_raw.cu` 645 + `mmq_nb.cu` 708 + `mmq_bt_q6k.cu` 436 | 2 246 | 5 629 | — |
 | G4 | MMVQ: `matmul_f32act.cu` + `mmvq_aquant.cu` + `mmvq_skipwrite.cu` + `mmvq_q6k.cu` + `mmvq_multi.cu` | | | — |
 | G5 | `ops_misc.cu` + `ops_elementwise.cu` + `kv_store.cu` + `gemm_wmma.cu` + `gemm_fused_dequant.cu` | | | — |
 | G6 | the empty remainder deleted | | 0 | — |
