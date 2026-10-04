@@ -9639,3 +9639,40 @@ re-exports it into the `tests` module.) These are the only test-text differences
 **Deliberately out of scope.** The remaining four files of #267: `src/tooling/tests.rs` (1,669),
 `src/sampler/tests.rs` (1,232), `src/conversation/tests.rs` (1,156), `src/graph/kvcache/tests.rs`
 (1,134), and `src/cuda/issue162_tests.rs` (1,186) last, after #263.
+
+#### Test-infrastructure record (#267 step 6, file 5, 2026-10-04) — `tooling/tests.rs` becomes a parent plus seven topic files
+
+**What landed.** `src/tooling/tests.rs` (1,669 lines, **14 `#[test]` — 11 of them `#[ignore]`d**
+real-model/device gates — and 14 helpers) is split by tooling concern into
+`src/tooling/tests/{parse,f16_encode,f6_roundtrip,f141_device,f167_qwen3,quantize_bounds,bf16}.rs`,
+each named by a `mod` declaration in the now-166-line parent (PR
+[#280](https://github.com/yusiwen/minfer/pull/280), part of [#267](https://github.com/yusiwen/minfer/issues/267)).
+The topics are `parse` (2: the size parser and the split stem rule), `f16_encode` (1: the f16 writer's
+1-D/2-D contract), `f6_roundtrip` (3: the llama.cpp rewrite, HF-conversion and split references),
+`f141_device` (1), `f167_qwen3` (2), `quantize_bounds` (4: the end-to-end bounds and the byte-identical
+encoder) and `bf16` (2). The parent keeps the shared fixtures (`env_path`, `work_dir`, `cached_qwen05`,
+`PROMPT`, `logits_greedy`, `logits_greedy_on`, `logits_greedy_on_qwen3`,
+`assert_tensor_payloads_equal`); `miniature_f16_source_specs`/`tensor_of` move with `f16_encode` and
+`bf16_vs_f16_weight_value_diffs` with `bf16`, each used by that topic only. `src/tooling.rs` keeps its
+`#[cfg(test)] mod tests;` untouched.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the worktree:
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration |
+| `scripts/cuda_test.sh` | **567 / 0 / 42** |
+| `python3 scripts/check_source_layout.py` | `src obeys the layout rules`, exit 0 |
+| `python3 scripts/check_doc_line_anchors.py`, `check_docs_links.py`, `check_status.py --check` | exit 0 each |
+| `cargo fmt --all --check` | clean |
+| CI on PR [#280](https://github.com/yusiwen/minfer/pull/280) | **7 / 7 green** |
+
+**Mutation evidence (rule 3).** `mod parse;` → `// mod parse;`: the layout checker exits **1** with
+`src/tooling/tests/parse.rs: not reachable from src/main.rs …`, and the CPU unit row drops
+**481 → 479** passed (the two `parse` gates), 36 ignored unchanged. (A topic whose gates are all
+`#[ignore]`d would move only the ignored count; `parse` was chosen because it moves the running half.)
+Reverted.
+
+**Deliberately out of scope.** The remaining three files of #267 under 1,300 lines —
+`src/sampler/tests.rs` (1,232), `src/conversation/tests.rs` (1,156), `src/graph/kvcache/tests.rs`
+(1,134) — and `src/cuda/issue162_tests.rs` (1,186) last, after #263.
