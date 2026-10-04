@@ -4,7 +4,7 @@
 > now read minfer's elementwise, dequant, matmul, attention kernels and the host
 > layer that launches them).
 > **Code**: `docs/cuda_optimization_steps/` (the evidence base — one document per
-> historical optimization step), `src/cuda_kernels.cu` (the kernels each technique
+> historical optimization step), `src/cuda/kernels/*.cu` (the kernels each technique
 > lives in — verified lines).
 
 Chapters 03–05 taught you to *read* minfer's CUDA backend. This chapter teaches

@@ -14,10 +14,11 @@ execute, `docs/COMPUTE-GRAPH-DESIGN.md`) on three interchangeable backends:
 | Async model | synchronous | one `MpsCommandBuffer` per split | stream + CUDA Graph capture/replay |
 | Deep dives | [walkthrough 10](./inference_e2e_walkthrough/10-cpu-matmul-kernels.md), [11](./inference_e2e_walkthrough/11-attention-vecops-kv.md), [CPU optimizations](./CPU_OPTIMIZATIONS.md) | [walkthrough 14](./inference_e2e_walkthrough/14-metal-backend.md), [Metal optimizations](./METAL_OPTIMIZATIONS.md) | [walkthrough 15](./inference_e2e_walkthrough/15-cuda-backend.md), [backend plan](./CUDA-BACKEND-DESIGN.md), [campaign](./CUDA_OPTIMIZATION.md) |
 
-The `src/<backend>/kernels/` paths and `src/cuda/impl/*.rs` are the target of
-[the source layout plan](./SOURCE-LAYOUT-PLAN.md) ([#261](https://github.com/yusiwen/minfer/issues/261));
-until those steps land, the CUDA kernels live in `src/cuda/kernels/` and the Metal shaders the
-single `src/metal.metal`.
+The `src/<backend>/kernels/` paths and the CUDA `src/cuda/methods/*.rs` families are
+[the source layout plan](./SOURCE-LAYOUT-PLAN.md) ([#261](https://github.com/yusiwen/minfer/issues/261)):
+the CUDA half has landed (`src/cuda/kernels/*.cu`, `src/cuda/methods/`, `src/quants/`,
+`src/vec_ops/`, `src/kernel/`), while the Metal split (`src/metal/kernels/*.metal`) and [#53](https://github.com/yusiwen/minfer/issues/53)'s
+`DeviceMemory` answer are the Mac round. The Metal shaders are still the single `src/metal.metal`.
 
 This page is the overview: what the backend contract is, how nodes land on a
 backend, and where the three differ. The linked pages carry the per-backend

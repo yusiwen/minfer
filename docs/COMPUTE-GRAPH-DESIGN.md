@@ -111,7 +111,7 @@ These are the rules the rest of the document elaborates. Breaking one is a bug, 
         │
         ├── CpuBackend    (kernel.rs / vec_ops.rs)
         ├── MetalBackend  (metal.rs + metal.metal)
-        └── CudaBackend   (cuda.rs + cuda_kernels.cu)
+        └── CudaBackend   (cuda.rs + cuda/kernels/*.cu)
 ```
 
 `GraphCache` owns the graph, the allocator and the last `GraphParams`; a decode step that reuses the
@@ -1333,7 +1333,7 @@ The plan's file-change manifest, replaced by the landed inventory.
 
 `src/models/qwen2/forward.rs` was **deleted** in Phase 6; the imperative path no longer exists.
 `src/metal.rs` and `src/cuda.rs` remain the per-op kernel/device layers that the graph backends wrap;
-`src/cuda_kernels.cu` holds the CUDA kernels. `src/cache.rs` (the legacy `KVCache` the graph path
+`src/cuda/kernels/*.cu` holds the CUDA kernels (`common.cuh` + 17 translation units since [#263](https://github.com/yusiwen/minfer/issues/263)). `src/cache.rs` (the legacy `KVCache` the graph path
 ignored) was deleted in [#252](https://github.com/yusiwen/minfer/issues/252) — the allocator owns KV.
 
 ---

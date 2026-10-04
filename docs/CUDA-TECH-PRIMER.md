@@ -45,7 +45,7 @@ Code surfaces referenced throughout:
 | File | Lines | Role |
 |---|---|---|
 | `src/cuda.rs` | ~5.4k | Device layer: hand-written CUDA bindings, context/state, weight upload & registration, buffer concat, KV type management |
-| `src/cuda_kernels.cu` | ~7.3k | Every CUDA kernel (~65 `__global__` functions) + their `launch_*` C-shim wrappers, compiled by nvcc into `libcuda_kernels.a` |
+| `src/cuda/kernels/*.cu` + `common.cuh` | ~10k | Every CUDA kernel (102 `__global__` functions) + their `launch_*` C-shim wrappers, in 17 translation units since [#263](https://github.com/yusiwen/minfer/issues/263), compiled by nvcc into `libcuda_kernels.a` |
 | `src/graph/cuda_backend.rs` | ~6.1k | The `Backend` trait implementation: buffer pools, per-node dispatch, CUDA Graph capture/replay, synchronization |
 | `build.rs` | — | nvcc orchestration: compiler discovery, host-compiler pinning, arch detection, SASS/PTX emission, cudart linking |
 
@@ -79,7 +79,7 @@ src/graph/scheduler.rs          Rust: picks the backend per node, splits the gra
 src/graph/cuda_backend.rs       Rust: buffer pools, dispatch, capture/replay, sync
         │  extern "C" — hand-declared symbols (cuda.rs + backend.rs)
         ▼
-libcuda_kernels.a               nvcc-compiled from src/cuda_kernels.cu:
+libcuda_kernels.a               nvcc-compiled from src/cuda/kernels/*.cu:
   launch_q6_k_q8_mmvq(...)        every kernel + a C `launch_*` shim per kernel
         │                         (the shim contains the <<<grid,block>>> syntax,
         ▼                          which is CUDA-C++ only)

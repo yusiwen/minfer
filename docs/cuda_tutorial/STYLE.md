@@ -80,7 +80,7 @@ Neighboring chapters + linked reference docs, one line each.
 
 ## Hard rules
 
-0. **Code-extraction forensics protocol**: enumerate `src/cuda_kernels.cu`
+0. **Code-extraction forensics protocol**: enumerate `src/cuda/kernels/*.cu`
    with `grep '__global__'` first, locate the target kernel, **read a bounded
    line range**, excerpt 10–40 lines, and verify every `file:line` you cite by
    actually reading it. Line numbers move; the function name is the stable
@@ -104,7 +104,7 @@ Neighboring chapters + linked reference docs, one line each.
 
 ## Series facts every author can rely on
 
-- Kernels live in **`src/cuda_kernels.cu`** (compiled by `build.rs`, ccbin
+- Kernels live in **`src/cuda/kernels/*.cu`** (`common.cuh` + 17 translation units since [#263](https://github.com/yusiwen/minfer/issues/263); compiled by `build.rs`, ccbin
   pinned; see `docs/BUILD.md`). Host/device layer: **`src/cuda.rs`** (device
   management, FFI bindings, RAII device buffers). Backend: **`src/graph/cuda_backend.rs`**
   (`Backend` trait impl, per-node dispatch, buffer pool, CUDA Graph capture/replay).

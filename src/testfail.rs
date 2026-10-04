@@ -30,7 +30,7 @@
 //! fires those two sites, `all` fires every Rust chokepoint, and a token that
 //! is a superstring of a site (`launch:gemm` against `launch:gemm_f16_f16`)
 //! never matches. The device-side helper `minfer_test_call_fails` in
-//! `src/cuda_kernels.cu` implements the identical rule for the CUDA launch and
+//! `src/cuda/kernels/*.cu` implements the identical rule for the CUDA launch and
 //! attribute sites (`launch:*`, `attr:*`), because a C++ kernel cannot call
 //! into Rust; the Rust half is the one that is unit-tested.
 //!
@@ -42,7 +42,7 @@
 //! | `alloc_in_pool` | `graph::alloc::GraphAllocator::alloc_in_pool` | `Err` before the pool is touched |
 //! | `execute_node` | `graph::scheduler::BackendScheduler::execute` | `Err` before the backend dispatch |
 //! | `register_weight` | `models::weight_reg::register_cuda_weight` | panic in the CUDA weight registrar |
-//! | `launch:*` / `attr:*` | `src/cuda_kernels.cu` | the **real** CUDA call is made to fail (#147) |
+//! | `launch:*` / `attr:*` | `src/cuda/kernels/*.cu` | the **real** CUDA call is made to fail (#147) |
 //!
 //! # The observation half
 //!

@@ -12,7 +12,7 @@ use super::*;
 
 // ─── #145 / #147 / #162 device-gate FFI declarations ────────────────────────
 //
-// The C++ sites in `cuda_kernels.cu` write these; only the device gates read
+// The C++ sites in `src/cuda/kernels/*.cu` write these; only the device gates read
 // them. Declaring them here (rather than in the production `extern "C"` block)
 // keeps every test-only declaration out of a non-test build.
 extern "C" {

@@ -1,7 +1,7 @@
 # 02 · The minimal CUDA you actually need
 
 > **Part**: Part 2 — the minimal language/API surface. **Prereq**: [01 · What kind of machine is a GPU](01-gpu-mental-model.md) — you know what a thread, warp (a group of 32 threads that execute in lockstep), block and grid are, and what a kernel launch does conceptually.
-> **Code**: `src/cuda.rs`, `src/cuda_kernels.cu`, `build.rs` — every `file:line` was verified against the current tree at writing time (the function name is the stable address, the line number a convenience).
+> **Code**: `src/cuda.rs`, `src/cuda/kernels/*.cu`, `build.rs` — every `file:line` was verified against the current tree at writing time (the function name is the stable address, the line number a convenience).
 
 ## 1. Background — where this sits
 
@@ -34,7 +34,7 @@ shapes from the real graph (`docs/inference_e2e_walkthrough/05-graph-builder-ir.
 (`docs/inference_e2e_walkthrough/02-gguf-load.md:232` — `token_embd.weight`
 `[896, 151936]`). Both numbers are small enough to do the arithmetic in your
 head, and they are the exact shapes the elementwise kernels in
-`src/cuda_kernels.cu` process on every decode step.
+`src/cuda/kernels/*.cu` process on every decode step.
 
 ## 2. Principle — the concepts
 
@@ -52,8 +52,8 @@ answer one question — *who can call this function, from where?*
 - `__host__` — an ordinary CPU function (the default). Written explicitly only
   for functions that compile in *both* worlds — `__host__ __device__`.
 
-`src/cuda_kernels.cu` uses exactly this split: `__global__` for the 89 kernels
-(the count from `grep -c '__global__' src/cuda_kernels.cu`), plain
+`src/cuda/kernels/*.cu` uses exactly this split: `__global__` for the 89 kernels (the count of the pre-#263 single TU; 102 today)
+(the count from `grep -c '__global__' src/cuda_kernels.cu` at that revision), plain
 `__device__` helpers for shared math, and ordinary C++ for the host-side
 launcher functions below.
 
@@ -222,11 +222,11 @@ the token count) — leave this kind of comment on every launch geometry you
 write.
 
 **minfer's real elementwise family, side by side with the toy.** The kernel
-inventory (`grep -n '__global__' src/cuda_kernels.cu`) lists 89 kernels; the
+inventory (`grep -n '__global__' src/cuda/kernels/*.cu`) lists 102 kernels today (89 at the pre-#263 revision); the
 elementwise ones are the plainest and are all structured like your toy
 (global 1-D index, guard, one memory access per thread):
 
-| Kernel (`src/cuda_kernels.cu`) | Lines | Body | Used for |
+| Kernel (pre-#263 `src/cuda_kernels.cu`) | Lines | Body | Used for |
 |---|---|---|---|
 | `add_f32` | 2403-2412 | `z[i] = x[i] + y[i]` | residual add (`Op::Add`) |
 | `mul_f32` | 2416-2425 | `z[i] = x[i] * y[i]` | elementwise multiply (`Op::Mul`) |
@@ -357,7 +357,7 @@ the host — the rule just above); `cudaFree(void* ptr)` frees it; and
 function serve all three directions: H2D (host→device upload),
 `CUDA_MEMCPY_HOST_TO_DEVICE = 1`; D2H (download, `= 2`); D2D (device-internal,
 `= 3`) — the kind tells the driver which address spaces the pointers live in,
-and minfer defines the constants by hand (`cuda.rs:81-84`). A blocking
+and minfer defines the constants by hand (`src/cuda.rs:94-96`). A blocking
 host↔device `cudaMemcpy` is *synchronous*: it does not return until the
 bytes have moved. For decode-speed code that is a problem (waiting for the
 GPU), which is why the async variants (`cudaMemcpyAsync` on a stream, plus
@@ -388,12 +388,12 @@ later on the *same* stream.
 directly — no `cuda` crate, no bindgen. It *declares* the C functions it
 needs in an `extern "C"` block (FFI, Foreign Function Interface — the
 mechanism by which Rust calls C-ABI functions; `extern "C"` selects the C
-calling convention so Rust and C agree on how arguments are passed) at the
-top of `src/cuda.rs:31-77`:
+calling convention so Rust and C agree on how arguments are passed) in
+`src/cuda/ffi_runtime.rs`:
 
 ```rust
-// src/cuda.rs:31-54 (excerpt — the full block runs to line 72, incl.
-// cudaMemcpyAsync, cudaStreamSynchronize, device queries, CUDA Graph APIs)
+// src/cuda/ffi_runtime.rs:1-127 (excerpt — incl. cudaMemcpyAsync,
+// cudaStreamSynchronize, device queries, CUDA Graph APIs)
 extern "C" {
     fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
     fn cudaSetDevice(device: i32) -> i32;
@@ -417,7 +417,7 @@ How to read such a block — the skill of *reading* an FFI layer:
   rest of the file perform exactly the translation into Rust-style `Result`s.
 - **Raw pointers are not `Send`/`Sync`.** Rust assumes a raw pointer may alias
   anything, so types containing them are not thread-safe by default. minfer's
-  `CudaPtr` newtype (`src/cuda.rs:18-22`) is the deliberate, documented
+  `CudaPtr` newtype (`src/cuda.rs:71-72`) is the deliberate, documented
   exception — `unsafe impl Send/Sync` is an assertion *you* must defend:
   sound here because CUDA device allocations are process-global resources
   usable from any thread, and every access is funneled through `Mutex`es.
@@ -432,14 +432,14 @@ Initialization — the idiom where acquiring a resource in a constructor and
 releasing it in a destructor ties the resource's lifetime to an object's, so
 drops and panics cannot leak it) is how minfer keeps the *host-side* CUDA
 resources leak-proof: every pinned allocation has a `Drop` impl calling
-`cudaFreeHost` (`PinnedPool` `src/cuda.rs:397`, `PinnedBuf` `:958-961`,
-`CaptureStaging` `:1064-1071`). Device memory is the interesting
+`cudaFreeHost` (`PinnedPool` `src/cuda.rs:402`, `PinnedBuf` `src/cuda.rs:419-424`,
+`CaptureStaging` `src/cuda.rs:525-532`). Device memory is the interesting
 half-exception. A *weight* buffer is not RAII-managed at all: weights live
 for the whole process, keyed by name in the registry
-(`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `src/cuda.rs:132`), and
+(`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `src/cuda.rs:614`), and
 the registry's replace rule deliberately leaks the stale buffer because a
 live captured CUDA Graph may still reference the old pointer
-(`src/cuda.rs:669-673`) — leaking *by decision, with a bound and a comment*
+(`src/cuda/methods/weights.rs:32-37`) — leaking *by decision, with a bound and a comment*
 is legitimate, because the alternative (freeing memory a captured graph still
 points at) is a use-after-free the GPU hits mid-replay. Scratch buffers, in
 contrast, are pooled: the backend frees every pool buffer in its `Drop`
@@ -449,23 +449,28 @@ contrast, are pooled: the backend frees every pool buffer in its `Drop`
 **One complete ownership path, walked.** The simplest non-toy path in the
 file: *register a weight → use it → (never) free it*.
 
-1. **Alloc.** `register_weight(name, data)` (`src/cuda.rs:655-710`) first
+1. **Alloc.** `register_weight(name, data)` (`src/cuda/methods/weights.rs:18-97`) first
    checks the registry — same name *and* same byte size ⇒ the device copy
-   exists, reuse it and return (`:1614-1623`). Otherwise it calls `cudaMalloc`
-   for `data.len()` bytes (`:1631-1640`); on OOM (out of memory) it prints
+   exists, reuse it and return (`:24-31`). Otherwise it calls `cudaMalloc`
+   for `data.len()` bytes (`:39-48`); on OOM (out of memory) it prints
    the *byte count and tensor name* and returns without registering — the
    loader's all-weights-registered gate then refuses to enable the GPU
    backend loudly (a `docs/GPU_SAFETY.md` invariant). Nothing silently
    half-works.
-2. **Copy (H2D).** Still inside `register_weight`, a blocking
-   `cudaMemcpyHostToDevice` uploads the GGUF (the on-disk model format minfer
-   parses) bytes verbatim — quantized weights are uploaded *raw* and
+2. **Copy (H2D).** Still inside `register_weight`, a **stream-ordered**
+   `cudaMemcpyAsync` on the context stream plus a `cudaStreamSynchronize`
+   uploads the GGUF (the on-disk model format minfer parses) bytes verbatim
+   since [#188](https://github.com/yusiwen/minfer/issues/188) — the legacy
+   blocking `cudaMemcpyHostToDevice` participated in the legacy default
+   stream's implicit global synchronization and could invalidate another
+   thread's capture window (the pre-#188 probe is kept as
+   `register_weight_blocking_legacy`). Quantized weights are uploaded *raw* and
    dequantized on the device by the `dequant_*_f16` kernels at first use (a
    series fact; chapter 03 reads those kernels). On copy failure the freshly
-   allocated buffer is freed *before* returning (`:1641-1655`) — the manual
+   allocated buffer is freed *before* returning (`:49-87`) — the manual
    version of RAII: the error path releases what the success path acquired.
 3. **Register.** The pointer is wrapped and inserted
-   (`:1661-1664`):
+   (`:93-96`):
    `self.weights.lock().unwrap().insert(name.to_string(), (CudaPtr(ptr), data.len()))`.
    From here the *only* way to reach the buffer is `get_weight_ptr(name)`
    (`src/cuda/methods/init.rs:213`) — the registry is the single owner, and dispatchers
@@ -477,7 +482,7 @@ file: *register a weight → use it → (never) free it*.
    `launch_add_f32(x as *const f32, y as *const f32, z as *mut f32, n as i32,
    stream)`. The `extern` declaration sits at `src/cuda/methods/dispatch.rs:19-25` — these
    launcher symbols are provided by `libcuda_kernels.a`, the archive
-   `build.rs` produces from `src/cuda_kernels.cu` (§2.5). The `usize → i32`
+   `build.rs` produces from `src/cuda/kernels/*.cu` (§2.5). The `usize → i32`
    narrowing and the `c_void → *const f32` casts are the FFI layer's whole
    job — the *kernel* wants `const float*` and `int`, and this is where the
    host types are made to match. Note what is *absent*: no error check —
@@ -608,8 +613,8 @@ every SM cannot physically run side by side — streams give the GPU
 `cudaEventSynchronize(end)` — the event version of the §2.2 sync story.
 
 **minfer's actual stream usage.** The surprise: for all that machinery, minfer
-runs **one** non-default stream, created once at device init
-(`src/cuda.rs:482-487`) and fetched by every wrapper via `stream()`
+runs **one** context stream, created once at device init
+(`src/cuda/methods/init.rs:105`) and fetched by every wrapper via `stream()`
 (`src/cuda/methods/init.rs:244-246`, a `Mutex<CudaPtr>` deref). Why one stream, when
 streams exist for overlap? First, the workload is a dependency chain — a
 decode step is a strict sequence (norm → matmul → rope → attention → … →
@@ -847,7 +852,7 @@ worth reading for the "no early return — every thread reaches the barrier"
 discipline).
 
 **Thread-count arithmetic.** 4,864 threads is a *tiny* grid. The GB10's SM
-count is queried at runtime (`src/cuda.rs:499` reads
+count is queried at runtime (`src/cuda/methods/init.rs:121` reads
 `CUDA_DEV_ATTR_MULTIPROC_COUNT`); with a few dozen SMs each holding up to
 ~2048 resident threads, one 4,864-thread kernel cannot come close to filling
 the machine — most blocks run, finish, and leave SMs idle. That is fine for a

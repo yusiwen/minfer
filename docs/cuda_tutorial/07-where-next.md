@@ -5,7 +5,7 @@
 
 ## 1. You are here
 
-You can now read every kernel in `src/cuda_kernels.cu`, you know how minfer's
+You can now read every kernel in `src/cuda/kernels/*.cu`, you know how minfer's
 decode (GEMV + fused tail + CUDA Graph replay) and prefill (MMQ GEMM +
 `fa_prefill_f16kv`) paths are assembled, and you know the verification
 discipline that keeps kernel changes honest. This chapter hands you to the

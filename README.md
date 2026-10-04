@@ -141,7 +141,7 @@ alias their input buffer; matmuls follow the GGUF weight layout
 Key modules: `src/graph/` (IR / builder / scheduler / backends / reuse cache),
 `gguf.rs` (parser + mmap'd zero-copy loader), `models/qwen2/` (build_graph +
 loader), `kernel.rs`/`quants.rs` (quantized matmul), `metal.rs`+`metal.metal` and
-`cuda.rs`+`cuda_kernels.cu` (GPU kernels) with `device_tier.rs` (cc-keyed
+`cuda.rs`+`cuda/kernels/*.cu` (GPU kernels) with `device_tier.rs` (cc-keyed
 per-device dispatch tiers), `sampler.rs`/`tokenizer.rs`/
 `template.rs` (sampling + tokenization + chat templates), `conversation.rs`
 (multi-turn sessions), `server/` (HTTP). Supported quants:

@@ -127,7 +127,7 @@ line replaces the bespoke mock the earlier tickets each had to write:
 | `alloc_in_pool` | `graph::alloc::GraphAllocator::alloc_in_pool` | the allocation refuses before the pool is touched |
 | `execute_node` | `graph::scheduler::BackendScheduler::execute` | the backend dispatch refuses |
 | `register_weight` | `models::weight_reg::register_cuda_weight` | the CUDA weight registrar panics |
-| `launch:*` / `attr:*` | `src/cuda_kernels.cu` (`minfer_launch_ok` / `minfer_smem_optin`) | the **real** CUDA call is driven into failure (#147) |
+| `launch:*` / `attr:*` | `src/cuda/kernels/*.cu` (`minfer_launch_ok` / `minfer_smem_optin`) | the **real** CUDA call is driven into failure (#147) |
 
 The matching rule is exact-token and comma-separated
 (`MINFER_TEST_CALL_FAIL=forward_batch,launch:gemm_f16_f16`; `all` for every Rust
