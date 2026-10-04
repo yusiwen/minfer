@@ -436,7 +436,7 @@ The one-line answer to "which kernel does decode's Matmul dispatch to?":
 - **decode (`nt == 1`)**: `Op::MatMul` (`cuda_backend.rs:931`) →
   `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:151`) → per-type MMVQ — for Q4_0 with
   `id ≥ 2048`: `q4_0_decode_mmvq` (`src/cuda/methods/mmvq.rs:224`) → `launch_q4_0_q8_mmvq`
-  (`cuda_kernels.cu:8248`) → **`q4_0_q8_mmvq`** (`cuda_kernels.cu:8091`),
+  (`cuda_kernels.cu:7634`) → **`q4_0_q8_mmvq`** (`cuda_kernels.cu:7477`),
   after `decode_quantize_native` (`src/cuda/methods.rs:180`) has produced (or memoized,
   the MmqCache) the pad40 q8 activation plane via `quantize_q8_0_pad40`.
 - **prefill (`nt ≥ 9`)**: the same arm → `mmq_active()` → `prefill_mmq`
@@ -484,7 +484,7 @@ documents the layout; the sum feeds the *MMQ* min-term correction and is
 one thread per block, tree-reduced amax — chapter 03's quantize family,
 already read.
 
-**The kernel** — `src/cuda_kernels.cu:8091`:
+**The kernel** — `src/cuda_kernels.cu:7477`:
 
 ```c
 __global__ void __launch_bounds__(256) q4_0_q8_mmvq(
@@ -528,7 +528,7 @@ __global__ void __launch_bounds__(256) q4_0_q8_mmvq(
 ```
 
 **What one thread processes: a slice of one weight row — 32-element blocks,
-round-robin.** The launcher (`cuda_kernels.cu:8248`) is `grid(od, nt)` × 256
+round-robin.** The launcher (`cuda_kernels.cu:7634`) is `grid(od, nt)` × 256
 threads, so block `row` owns output element `out[t][row]` and its 256
 threads split the row's `nb = id/32` quant blocks (`u = threadIdx.x; u +=
 256`). For `ffn_down` 0.5B: `nb = 152`, so each thread handles exactly one

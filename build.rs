@@ -12,7 +12,11 @@ use std::process::Command;
 //
 // The order is the directory's sorted order; `check_kernel_file_list()`
 // verifies the set equality AND the order, so the fixture stays stable.
-const KERNEL_SOURCES: &[&str] = &["src/cuda/kernels/guard.cu"];
+const KERNEL_SOURCES: &[&str] = &[
+    "src/cuda/kernels/attention_decode.cu",
+    "src/cuda/kernels/attention_prefill.cu",
+    "src/cuda/kernels/guard.cu",
+];
 const KERNEL_HEADERS: &[&str] = &["src/cuda/kernels/common.cuh"];
 // The shrinking remainder: every line not yet moved into `kernels/`. Deleted
 // by stage 6 of #263, after which this constant's file simply does not exist.

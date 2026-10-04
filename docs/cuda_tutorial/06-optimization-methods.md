@@ -104,7 +104,7 @@ chapter: the bare command printed `ERR_NVGPUCTRPERM`; the sudo form worked.
 `TMPDIR=/tmp/yourtmp` or fix the directory ownership.)
 
 The kernel lines of the observed output (Qwen3-0.6B Q8_0, 9-token prompt,
-decode `q8_0_p32_q8_mmvq` — the kernel at `src/cuda_kernels.cu:8292`):
+decode `q8_0_p32_q8_mmvq` — the kernel at `src/cuda_kernels.cu:7686`):
 
 ```text
   q8_0_p32_q8_mmvq(...) (1024, 1, 1)x(256, 1, 1), Context 1, Stream 13, Device 0, CC 12.1
@@ -284,7 +284,7 @@ alignment).
 - **Where minfer uses it**: `store_kv_f16` (`float4` load + two `__half2`
   stores, `src/cuda_kernels.cu:2561`); the q6_K B-expand reads packed data as
   `uint4` groups; the q8_0 p32 decode planes are *designed around* the
-  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda_kernels.cu:8292`, row
+  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda_kernels.cu:7686`, row
   pointer :8302, the `__ldg` group loads :8308).
 - **Step records**: [11-p5-gemm-tiles-fa-rewrite.md](../cuda_optimization_steps/11-p5-gemm-tiles-fa-rewrite.md)
   (P5·1, +4%); [44-r41-q6k-bexpand-uint4.md](../cuda_optimization_steps/44-r41-q6k-bexpand-uint4.md)
