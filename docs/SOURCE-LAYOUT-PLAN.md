@@ -24,7 +24,7 @@
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
-| 6 long test files | #267 | **files 1–4 landed** (PRs #275, #277, #278, #279): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); 5 files left |
+| 6 long test files | #267 | **files 1–5 landed** (PRs #275, #277, #278, #279, #280): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); 4 files left |
 
 Each step appends its dated record here when it lands (gates run, counts, box label).
 
@@ -380,6 +380,7 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/models/qwen2/graph/tests.rs` | `src/models/qwen2/graph/tests/{cuda_kv,offload_copy,kv_reuse,batching,real_model}.rs` |
 | `src/server/batch/tests.rs` | `src/server/batch/tests/{kv_sharing,slots,prefill,batching,stall,http,metrics}.rs` |
 | `src/graph/alloc/tests.rs` | `src/graph/alloc/tests/{backend_fence,views,liveness,kv_arena,staging,budget}.rs` |
+| `src/tooling/tests.rs` | `src/tooling/tests/{parse,f16_encode,f6_roundtrip,f141_device,f167_qwen3,quantize_bounds,bf16}.rs` |
 
 ### 6.5 The macOS hand-off (decided 2026-10-04: Step 4 is Mac-local)
 
