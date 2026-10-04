@@ -1,7 +1,7 @@
 # 15 · The CUDA backend
 
 > **Stage**: the Metal contrast (doc 14) → **this stage: the same compute graph on NVIDIA GPUs** → end of the series ([Index](./README.md)).
-> **Code**: `src/graph/cuda_backend.rs` (`CudaBackend`, `execute_node_inner`, `graph_replay_step`), `src/cuda.rs` (`CudaState` singleton, `register_weight`, `matmul_f32_ptr_layout`, `prefill_mmq`, `gqa_attn_split`), `src/cuda_kernels.cu` (the CUDA C++ kernels, ~7,700 lines), `build.rs` (the nvcc build chain).
+> **Code**: `src/graph/cuda_backend.rs` (`CudaBackend`, `execute_node_inner`, `graph_replay_step`), `src/cuda.rs` (`CudaState` singleton, `register_weight`, `matmul_f32_ptr_layout`, `prefill_mmq`, `gqa_attn_split`), `src/cuda_kernels.cu` (the CUDA C++ kernels, ~10,200 lines; it becomes `src/cuda/kernels/*.cu` in [#263](https://github.com/yusiwen/minfer/issues/263)), `build.rs` (the nvcc build chain).
 
 ## 1. Background — where this stage sits
 
@@ -26,14 +26,14 @@ builds.
 Three source files cooperate, and keeping their roles separate makes the rest
 of the document easy to follow:
 
-- **`src/cuda.rs` (~5,600 lines of Rust)** — the *device layer*. A
+- **`src/cuda.rs` (6,578 lines of Rust)** — the *device layer*. A
   process-wide singleton, `CudaState`, owns the CUDA context pieces: the
   device, one command stream, the weight registry (name → device pointer),
   the KV-cache regions, pinned-host staging pools, and one host-side wrapper
   function per kernel. It talks to the CUDA runtime through hand-written
   `extern "C"` declarations (there is no `-lcuda` crate and no bindgen — the
   FFI surface is explicit and auditable).
-- **`src/graph/cuda_backend.rs` (~6,400 lines, mostly tests)** — the *graph
+- **`src/graph/cuda_backend.rs` (2,276 lines + 8,384 lines of tests)** — the *graph
   backend*. It implements the same `Backend` trait as the CPU and Metal
   backends (doc 08): `supports_op`, a device buffer pool, `execute_node`,
   host read/write, `synchronize`. Its job is translation, not math: turn a

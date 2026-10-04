@@ -924,8 +924,9 @@ Categories and the invariants they pin:
   (a >48 KiB prefill captures, replays bitwise, and `gemm_smem_optin_in_capture_count() == 0` proves
   the opt-in ran before the window opened). Plus `the_latched_error_message_never_blames_a_kernel`.
   #147's `issue147_tests` module adds
-  `the_graph_destroy_failure_message_names_the_matching_destructor` and
-  `the_injection_matcher_matches_only_the_named_site` (both pure) plus the three
+  `the_graph_destroy_failure_message_names_the_matching_destructor` (pure; the injection matcher itself
+  moved to `testfail::tests::the_matcher_is_exact_and_comma_separated` in
+  [#171](https://github.com/yusiwen/minfer/issues/171)) plus the three
   `cuda_issue147_*` deliberate-failure gates (device; env-gated behind `MINFER_TEST_ISSUE147=1`, which
   arms `MINFER_TEST_CALL_FAIL` per site): every dynamic-smem site names its failed opt-in and refuses
   the launch, every launch site names its failed `<<<>>>` and refuses, and the destroy site names a
@@ -1197,7 +1198,8 @@ timing claim is made.
 
 The wider #147: the **104** sites in `src/cuda_kernels.cu` that enqueued a kernel and never read the
 launch's error (`grep -c '<<<'` is 122; two are `<<<>>>` in prose comments, so the audited surface is
-**120 sites in 76 `launch_*` owners** (the wrappers plus the static `launch_gqa_attn_split_batched_kv` helper). Each is now preceded by `minfer_launch_prelude(site, kernel)` and
+**120 sites in 76 `launch_*` owners at that revision** (the same audit reports **130** sites on
+`6b6d94f`; the wrappers plus the static `launch_gqa_attn_split_batched_kv` helper). Each is now preceded by `minfer_launch_prelude(site, kernel)` and
 followed by a `minfer_launch_ok` / `minfer_launch_ok_opt` read that names the `launch:` site, the
 kernel instantiation and `cudaGetErrorName`, and clears the latch it named. The report tag is
 `(#162/<site>)` (§4 rules 4–5).
@@ -1240,7 +1242,7 @@ sticky is pending when `execute_node_inner` errs) and asserts the drain still ha
 
 | check | before | after |
 |---|---|---|
-| `scripts/check_cuda_launch_returns.py` | **104** unchecked sites | **empty list** (120 / 120) |
+| `scripts/check_cuda_launch_returns.py` | **104** unchecked sites | **empty list** (120 / 120 at that revision; 130 / 130 on `6b6d94f`) |
 | CUDA serial unit suite | **531 / 0 / 37** (master `09406ce`; the recorded 526 predated #173's +3 and #98's +2) | **536 / 0 / 37** (+5 device/env-gated tests) |
 | `MINFER_TEST_ISSUE162=1 … issue162` | — | **5 / 0** |
 | `compute-sanitizer --tool memcheck` over the test binary | 0 errors | **0 errors** over 536 |

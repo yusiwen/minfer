@@ -55,12 +55,41 @@
 | `models/qwen3/` | Qwen3 (dense): same triple — decoupled head dim + per-head Q/K norm (`qk_norm`); its ChatML+`<think>` template renders since F7 |
 | `conversation.rs` | Multi-turn session state (append-only KV) behind `--cnv` |
 | `server/` | OpenAI-compatible HTTP server (`serve`): axum + tokio, multi-slot, `/v1/chat/completions` streaming; `viz.rs` serves the viz page |
-| `metal.rs` + `metal.metal` | Apple MPS (Metal) backend: per-op kernels + command-buffer encoding (the legacy whole-layer `layer_gpu` is retained for tests) |
-| `cuda.rs` + `cuda_kernels.cu` | NVIDIA CUDA device layer + kernels (feature-gated `--features cuda`); executed through the graph via `graph/cuda_backend.rs` |
+| `metal.rs` + `src/metal/kernels/*.metal` | Apple MPS (Metal) backend: L1 runtime (`MpsState`/`MetalDevice`), L2 command-buffer encoding, L3 shaders (the legacy whole-layer `layer_gpu` is retained for tests). The split into `src/metal/{runtime,encode,ops,policy}.rs` + `src/metal/kernels/` is [the source layout plan](./SOURCE-LAYOUT-PLAN.md) ([#265](https://github.com/yusiwen/minfer/issues/265)) |
+| `cuda.rs` + `src/cuda/kernels/*.cu` | NVIDIA CUDA device layer + launch layer + kernels (feature-gated `--features cuda`); executed through the graph via `graph/cuda_backend.rs`. The split is [the source layout plan](./SOURCE-LAYOUT-PLAN.md) ([#262](https://github.com/yusiwen/minfer/issues/262), [#263](https://github.com/yusiwen/minfer/issues/263)) |
 | `device_tier.rs` | cc-keyed device tier table + selector (measured GB10 row, llama.cpp-adopted consumer rows, GENERIC fallback); resolved once at init, feeds the MMQ gate, smem feasibility and plane-VRAM budget checks (docs 105–106) |
 | `download/` | Hugging Face Hub + Ollama download, cached-name resolution, resume support |
 | `dump.rs` | Per-layer hidden-state debug dump (gated by `--features debug_dump`) |
 | `bench.rs` / `live.rs` / `trace.rs` / `spec_verify.rs` | llama-bench-style bench, live viz inference host, per-node trace export (`MINFER_TRACE`), D5 verify-step gate bench |
+
+### The backend layers — runtime, launch, kernels, executors
+
+Each device backend is organised along four layers, and **only the last one is polymorphic**:
+
+| layer | CUDA | Metal | CPU |
+|---|---|---|---|
+| L1 device/runtime | `src/cuda/{init,weights,stream,buffers,copy,events,capture}.rs` | `src/metal/runtime.rs` | — (std threads) |
+| L2 launch/dispatch | `src/cuda/impl/<family>.rs` + the `extern "C"` declarations each family owns | `src/metal/encode.rs` + `ops.rs` | `src/kernel/*.rs` |
+| L3 kernel sources | `src/cuda/kernels/*.cu` + `common.cuh` | `src/metal/kernels/*.metal` | `src/quants/*.rs`, `src/vec_ops/*.rs` |
+| L4 graph executor | `src/graph/cuda_backend.rs` | `src/graph/metal_backend.rs` | `src/graph/cpu_backend.rs` |
+
+(The CUDA and Metal paths in that table are the target of the split; `docs/SOURCE-LAYOUT-PLAN.md` §8 has
+the file-by-file tree and each step updates this table as it lands.)
+
+Two rules follow, and they are why the crate keeps **one flat interface** instead of a directory per
+layer:
+
+1. **Device is the first axis, the layer is the second.** `Backend` + `registry.rs`
+   (`src/graph/backend.rs`) are the one device seam — llama.cpp keeps `ggml-backend*.cpp/h` flat beside
+   its per-device directories for the same reason. L2 cannot leave L1: the CUDA launchers are inherent
+   methods of `CudaState`, the Metal ones methods of `MpsCommandBuffer`; splitting them out would be a
+   type refactor, not a file move.
+2. **A `common` needs a second real implementation.** A shared abstraction is added only when at least
+   two backends implement it *and* at least two callers use it with the same semantics. The one
+   candidate today is `allocplan::DeviceMemory` (CUDA answers it; the Metal half is
+   [#53](https://github.com/yusiwen/minfer/issues/53)). CPU's `quants.rs`/`vec_ops.rs` are deliberately
+   **not** a device-private layer: they are the crate's numeric kernel library, consumed by
+   `graph/kvformat.rs` and `graph/cuda_backend.rs`.
 
 ### src/graph/ — the compute graph core
 

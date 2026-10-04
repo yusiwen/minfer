@@ -14,6 +14,7 @@
 - [Architecture Overview](./ARCHITECTURE.md)
 - [Architecture Roadmap](./ARCHITECTURE-ROADMAP.md)
 - [Architecture Execution Plan](./ARCHITECTURE-EXECUTION-PLAN.md)
+- [Source Layout Plan](./SOURCE-LAYOUT-PLAN.md)
 
 # Model Support
 
