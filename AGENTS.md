@@ -205,7 +205,11 @@ counters / `next:` sentence / baseline commits and for the suite counts above;
 `scripts/check_status.py --check` (CI `check-docs`) fails when the prose disagrees, naming the file,
 line and both values — edit *that* file, not a counter. The same job runs `scripts/build_book.sh`
 (pinned mdBook + a sha384-checked Mermaid download) and `scripts/check_docs_links.py`, which fails on
-a relative link whose target does not exist. **Open doc debt:** [#62](https://github.com/yusiwen/minfer/issues/62)
+a relative link whose target does not exist, and `scripts/check_doc_line_anchors.py` (#266), which
+fails on a `path:NNN` anchor whose file or line is gone — and, when the anchor names a backticked
+symbol, on a symbol that has left the file it points at; the historical records whose anchors cite a
+pre-split revision are frozen inside it, one reason apiece, and an exemption that no longer covers a
+failure fails too. **Open doc debt:** [#62](https://github.com/yusiwen/minfer/issues/62)
 (`docs/USAGE.md` after the elastic partition). Test health was [#82](https://github.com/yusiwen/minfer/issues/82),
 **closed**. A finding from a gate run belongs in the records too — a red baseline makes every later
 gate run ambiguous.
