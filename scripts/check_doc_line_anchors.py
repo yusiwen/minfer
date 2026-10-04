@@ -61,9 +61,9 @@ longer covers a bare `allow`. An entry whose files all resolve today is printed 
 revision, not a claim that the record is broken today.
 
 **Boundary (what this does not catch).** A bare basename that names nothing in this
-tree is treated as an external citation, so once the campaign's Step 2 retires
-`src/cuda_kernels.cu`, the *bare* `cuda_kernels.cu:NNN` form passes while the
-`src/cuda_kernels.cu:NNN` form fails. That is the deliberate cost of not guessing
+tree is treated as an external citation, so now that the campaign's Step 2 has retired
+`src/cuda_kernels.cu` ([#263](https://github.com/yusiwen/minfer/issues/263)), the *bare*
+`cuda_kernels.cu:NNN` form passes while the `src/cuda_kernels.cu:NNN` form fails. That is the deliberate cost of not guessing
 between this tree and llama.cpp's, whose files share the `.cu`/`.cuh` extensions;
 converting the live anchors to symbol anchors (ticket #266 ¶c) is what removes them.
 

@@ -3,8 +3,8 @@ use std::process::Command;
 
 // ─── The CUDA kernel translation units (issue #263) ──────────────────────────
 //
-// `src/cuda_kernels.cu` was one 10 215-line translation unit; it is split into
-// `src/cuda/kernels/`. This explicit list is the compile order, the launch
+// The pre-#263 `src/cuda_kernels.cu` was one 10 215-line translation unit; it
+// is now split into `src/cuda/kernels/`. This explicit list is the compile order, the launch
 // audit's `--source` order and the launch-site fixture's row order — one list,
 // so a file added to one consumer but not another is the drift the new-file
 // guard below exists to catch. `KERNEL_HEADERS` is watched for rebuilds but not
@@ -32,9 +32,6 @@ const KERNEL_SOURCES: &[&str] = &[
     "src/cuda/kernels/ops_misc.cu",
 ];
 const KERNEL_HEADERS: &[&str] = &["src/cuda/kernels/common.cuh"];
-// The shrinking remainder: every line not yet moved into `kernels/`. Deleted
-// by stage 6 of #263, after which this constant's file simply does not exist.
-const LEGACY_SOURCE: &str = "src/cuda_kernels.cu";
 const KERNELS_DIR: &str = "src/cuda/kernels";
 
 /// Every `.cu`/`.cuh` in `KERNELS_DIR` must be listed, every listed file must
@@ -79,11 +76,7 @@ fn check_kernel_file_list() {
 
 /// The translation units to compile, in the one shared order.
 fn kernel_translation_units() -> Vec<String> {
-    let mut v: Vec<String> = KERNEL_SOURCES.iter().map(|s| s.to_string()).collect();
-    if Path::new(LEGACY_SOURCE).exists() {
-        v.push(LEGACY_SOURCE.to_string());
-    }
-    v
+    KERNEL_SOURCES.iter().map(|s| s.to_string()).collect()
 }
 
 fn main() {
@@ -263,9 +256,6 @@ fn main() {
     // split, because cargo does not compile these files itself.
     for f in KERNEL_SOURCES.iter().chain(KERNEL_HEADERS) {
         println!("cargo:rerun-if-changed={f}");
-    }
-    if Path::new(LEGACY_SOURCE).exists() {
-        println!("cargo:rerun-if-changed={LEGACY_SOURCE}");
     }
     // The new-file guard runs on EVERY build (not just a CUDA one): a kernel
     // source present in `src/cuda/kernels/` but absent from the list below is
@@ -635,7 +625,7 @@ fn detect_host_compiler(nvcc: &str, out_dir: &str, include_flag: &str) -> Option
 /// 121 require CUDA 12.8+ — simply fail the probe and are skipped, so one list
 /// works on every CUDA version and every GPU gets its native SASS when
 /// available. The minimum is sm_70 (Volta), not Pascal (sm_61): the kernels in
-/// `cuda_kernels.cu` use WMMA tensor cores (`nvcuda::wmma`, `#if __CUDA_ARCH__ >=
+/// `src/cuda/kernels/*.cu` use WMMA tensor cores (`nvcuda::wmma`, `#if __CUDA_ARCH__ >=
 /// 700` paths), which require sm_70+, so a lower target makes nvcc reject the
 /// file ("name must be a namespace name" for `nvcuda`). Volta (sm_70/72) is
 /// included: it is the gap the forward-only PTX (see below) cannot reach, and it

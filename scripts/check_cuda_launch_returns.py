@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit every CUDA ``<<<>>>`` in ``src/cuda_kernels.cu`` for a named launch read.
+"""Audit every CUDA ``<<<>>>`` in ``src/cuda/kernels/*.cu`` for a named launch read.
 
 Issue #162, sibling of the source-level checks in ``check_docs_links.py`` and
 ``check_status.py``. A ``<<<>>>`` has no return value: its error is read with the
@@ -43,8 +43,6 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 KERNELS_DIR = REPO / "src" / "cuda" / "kernels"
-# The shrinking remainder of the pre-#263 single TU; deleted by #263 stage 6.
-LEGACY_SOURCE = REPO / "src" / "cuda_kernels.cu"
 
 
 def default_sources() -> list[Path]:
@@ -52,15 +50,11 @@ def default_sources() -> list[Path]:
 
     ``build.rs``'s ``KERNEL_SOURCES``/``kernel_translation_units()`` own the list;
     this mirrors it exactly — every ``.cu`` in ``src/cuda/kernels/`` in sorted
-    order, then the legacy remainder while it still exists.  A drift between the
-    two is what the build's new-file guard and this discovery rule bound from
-    both sides; the failure mode they share is a kernel file that never compiles
-    and is never audited.
+    order.  A drift between the two is what the build's new-file guard and this
+    discovery rule bound from both sides; the failure mode they share is a kernel
+    file that never compiles and is never audited.
     """
-    sources = sorted(KERNELS_DIR.glob("*.cu")) if KERNELS_DIR.is_dir() else []
-    if LEGACY_SOURCE.exists():
-        sources.append(LEGACY_SOURCE)
-    return sources
+    return sorted(KERNELS_DIR.glob("*.cu")) if KERNELS_DIR.is_dir() else []
 
 
 def headers() -> list[Path]:
@@ -427,8 +421,7 @@ def main(argv=None) -> int:
         type=Path,
         action="append",
         help="a translation unit to audit (repeatable). Default: every .cu under "
-        "src/cuda/kernels/ in sorted order, then the legacy remainder — the same "
-        "list build.rs compiles.",
+        "src/cuda/kernels/ in sorted order — the same list build.rs compiles.",
     )
     ap.add_argument("--list", action="store_true", help="print line/owner/site/kernel")
     ap.add_argument("--fixture", type=Path, help="write the site list to PATH")
