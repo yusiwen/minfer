@@ -1,6 +1,6 @@
 # Source layout plan — the runtime, launch and kernel layers
 
-> **Status: decided; Step −1 started 2026-10-04.** Baseline master `6b6d94f`
+> **Status: Steps −1, 0 and 1 landed; Step 2 next (2026-10-04).** Baseline master `6b6d94f`
 > (`dgxspark (aarch64, GB10 sm_121)`). This is the plan of record for splitting the four long backend
 > files and for the naming convention the crate follows afterwards. Tickets:
 > [#261](https://github.com/yusiwen/minfer/issues/261) (umbrella) +
@@ -19,7 +19,7 @@
 |---|---|---|
 | −1 #138 + #225 | #138, #225 | **#225 landed** `5386a1c` (PR #268, 7/7 green; the cold first-run row is in §2.4); **#138 in flight** on `feat/138-defer-cross-wait` |
 | 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
-| 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | blocked on Step −1; blueprint ready (all 126 `impl CudaState` fns mapped to their target file) |
+| 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR #PRNUM, 7/7 green, zero code annotations): `src/cuda.rs` 6 578 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
 | 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | not started |
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |
@@ -132,39 +132,65 @@ Two honest wrinkles:
   `AGENTS.md:3` `~4400 LOC` (production code is 55,529 lines),
   `inference_e2e_walkthrough/15-cuda-backend.md:4/29/36` line counts,
   `CUDA-BACKEND-DESIGN.md` §"the gates" — `120 sites / 120 / 120` (the count at that revision;
-  130 on `6b6d94f`),
-  `cuda.rs:3471`'s banner naming the deleted `CudaCommandBuffer`. If #219 is not widened, they become
-  ticket 7 in §7.4.
+  130 on `6b6d94f`). The banner naming the deleted `CudaCommandBuffer` was rewritten to
+  `src/cuda/methods/dispatch.rs:124` by Step 1 ([#262](https://github.com/yusiwen/minfer/issues/262)),
+  the step that moved it. If #219 is not widened, the rest become ticket 7 in §7.4.
 - Add the interface-eligibility rule (§1.3) and the layer definition (§2) to `docs/ARCHITECTURE.md`.
 - Acceptance: `check-docs` green (`check_docs_links.py`, `check_status.py --check`, book build).
   No counter in `docs/status.toml` changes (the suite counts do not move in this step).
 
-### Step 1 — `src/cuda.rs` → `src/cuda/*.rs`
+### Step 1 — `src/cuda.rs` → `src/cuda/*.rs` (landed)
 
-- `src/cuda.rs` keeps: the module doc, `AttnWindow`, `pub struct CudaState` (1616–1745, **all fields
-  stay private**), the free items (`cuda_error_name`, `cstr_owned`, `layout_of`/`format_of`,
-  `concat_rows`, `bind_stream`, the KV-layout constants, …), the ten `#[cfg(test)] mod` declarations,
-  and `pub(crate) use` lines.
-- `src/cuda/methods.rs` — the 16 methods called across families (`get_or_grow` is called by seven) plus
-  the `mod` declarations for the family files. Private here means visible in every family file, so
-  **no `pub(super)` is needed anywhere**.
-- 18 family files under `src/cuda/methods/`: each holds its `impl CudaState` block **and its own
-  `pub(crate)` `extern "C"` launch declarations** (the 86 declarations move with their family; no
-  symbol is used by two families).
-- `src/cuda/ffi_runtime.rs` — the cudart/driver FFI block and the test-only extern block.
-- `src/cuda/policy.rs` — `mmq_gate_on`, `mmq_enabled`, `mmq_active`, `mmq_a_fuse_mode`, the `no_*`
-  knobs, `fused_b_on`, `no_w16cache`, `no_prefill_gemm`, `no_fa_prefill`, `plane_budget_ok`,
-  `gemm_prewarm_disabled` as pure predicates with unit tests (no device).
+- `src/cuda.rs` (6 578 → **1 014** lines) keeps: the module doc, `AttnWindow`, `pub struct CudaState`
+  (**all 29 fields stay private**), the free items (`cuda_error_name`, `cstr_owned`, `CudaPtr`,
+  `CudaDevicePropBuf`, the memcpy/attribute consts, `StreamScratch`/`StreamBinding`/`bind_stream`,
+  `ModelLoadGuard`, `PinnedPool`/`PinnedBuf`, `CaptureStaging`, `MmqCache`, `layout_of`/`format_of`,
+  `concat_rows`, the KV-layout constants, `gemm_prewarm_disabled`, …), the ten `#[cfg(test)] mod`
+  declarations, and the `mod`/`use`/`#[cfg(test)] pub(crate) use` lines that re-export the two moved
+  FFI surfaces.
+- `src/cuda/methods.rs` (**323** lines) — the **15** non-`pub` helpers whose callers land in a second
+  family file, computed as the transitive closure of the cross-file call graph: `context_stream`,
+  `get_or_grow` (called from seven families), `mmq_quantize_transposed`, `mmq_quantize_native`,
+  `decode_quantize_native`, `record_mmq_cache_native`, `prefill_gemm_f16`, the four `no_*_mmvq`
+  predicates, `no_q80_p32`, `fused_b_on`, `no_w16cache`, `no_prefill_gemm`, `no_fa_prefill`; plus the 18
+  `mod <family>;` declarations and the `#[cfg(test)] pub(crate) use <family>::*;` re-exports the two
+  launch test files resolve through `use super::*`. `plane_budget_ok` stays in `methods/weights.rs`
+  (every caller is there), so the split has **0 field-visibility edits and 0 `pub(super)`**.
+- 18 family files under `src/cuda/methods/` (28–728 lines each): each holds its `impl CudaState` block
+  **and its own `pub(crate)` `extern "C"` launch declarations** (the 86 declarations move with their
+  family; no symbol is used by two families). The declarations are re-exported two levels
+  (`methods.rs` → `cuda.rs`) under `#[cfg(test)]`, because a single-level glob does not reach
+  `cuda::tests` and an ungated one is an `unused_import` under `deny(warnings)`; the families whose
+  declarations a `methods.rs` helper calls are re-exported ungated.
+- `src/cuda/ffi_runtime.rs` (**145** lines) — the cudart/driver FFI block (its declarations become
+  `pub(crate)`, the second mechanical widening) and the test-only extern block.
+- `src/cuda/methods/policy.rs` (113 lines) holds the MMQ gate family J (`mmq_gate_on`, `mmq_enabled`,
+  `mmq_active`, `cc`, `mmq_a_fuse_mode`). The `no_*`/`fused_b_on` predicates are **cross-family**
+  (dispatch, prefill_f16, attention), so they live in `methods.rs` with the other shared helpers:
+  parking them in a sibling `policy.rs` is exactly what would have forced the `pub(super)` edits this
+  step avoids.
 - Acceptance: CUDA unit **567 / 0 / 42**; CPU **481 / 0 / 36** on `dgxspark (aarch64, GB10 sm_121)`
   (**479** on the CI runner) + integration **10 / 0 / 6** — the rows [#138](https://github.com/yusiwen/minfer/issues/138)
   moved when it landed (565 → 567, 480 → 481 / 478 → 479);
   `cargo fmt --all --check`; `check_source_layout.py`; `check_dead_code_annotations.py` (its two
-  `src/cuda.rs:` keys still valid **because the file keeps its name**); `check_dead_code_oracle.py
-  --config {cpu,cuda}` unchanged; real-model gates `FEATURES=cuda scripts/real_model_gates.sh` **42 / 0 ×2**.
+  `src/cuda.rs:` keys re-pointed to `src/cuda/ffi_runtime.rs:cudaStreamWaitEvent` and
+  `src/cuda/methods/events.rs:stream_wait_event`); `check_dead_code_oracle.py
+  --config {cpu,cuda}` with only the two moved `file =` lines in `docs/dead-code-baseline.toml`;
+  real-model gates `FEATURES=cuda scripts/real_model_gates.sh` **42 / 0 ×2** with bitwise-identical
+  greedy output; `check_doc_line_anchors.py` green (the split's per-line map is
+  `/home/yusiwen/minfer-split/step1/line-map.tsv`, and the anchors whose old line was only a locator
+  were re-anchored to the symbol).
 
 ### Step 2 — `src/cuda_kernels.cu` → `src/cuda/kernels/` (1 header + guard TU + 19 TUs)
 
-Route (a): launchers move with the kernels they launch (llama.cpp's CUDA shape). No `-rdc=true`, no
+Route (a): launchers move with the kernels they launch (llama.cpp's CUDA shape). **Two of the 77
+launchers are the exception** (blueprint: `/home/yusiwen/minfer-split/step2/README.md` §2) — they
+launch kernels that land in two different target files, so "the launcher moves to its kernel's file"
+needs the qualification: `launch_gqa_attn_split_f16kv` launches both `gqa_attn_split_partial`
+(decode) and `gqa_attn_split_partial_hybrid` (hybrid), resolved by merging `attention_hybrid.cu` into
+`attention_decode.cu`; `launch_mmq_raw_nb_bt_nt` launches `mmq_raw_nb_bt_kernel` (nb) and
+`mmq_ksplit_reduce_kernel` (bt_q6k), resolved by moving `mmq_ksplit_reduce_kernel` next to the NB
+kernels. No `-rdc=true`, no
 new nvcc flag (route (b), `-static-global-template-stub=false`, is the recorded fallback; see §5).
 **Prerequisite:** ticket 6 in §7.4 (the documentation-anchor checker) lands first or in parallel,
 because this step moves 163 line anchors in 23 documents.
@@ -206,7 +232,7 @@ above; that is why `matmul_f32act` and `attention_*` look slightly over their se
 
 - `minfer_prewarm_kernels` (9188–9237) is decomposed into one `extern "C"
   minfer_prewarm_<family>_kernels()` per file plus a dispatcher that **keeps the symbol name** the
-  Rust side declares at `src/cuda.rs:618`.
+  Rust side declares at `src/cuda/methods/prefill_mmq.rs:48`.
 - **Grouping into PRs (revised): 5–6 groups, not one family each** — the file count grew from 10 to 20,
   so the natural batches are: (1) `common.cuh` + `guard.cu` (the infrastructure), (2) attention (3
   files), (3) the MMQ prefill family (4 files), (4) the MMVQ decode family (4 files), (5) ops/KV/gemm
@@ -374,7 +400,7 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/cuda_kernels.cu` 20–50, 2655–2793, 5521–5922 | `src/cuda/kernels/{common.cuh, guard.cu}` |
 | `src/cuda_kernels.cu` 4050–5135 | distributed: each launcher to its kernel's file |
 | `src/cuda_kernels.cu` *other ranges* | the §4 Step 2 table (one row per new file) |
-| `src/cuda.rs` 1147–1930, 1934–6479 | `src/cuda/{ffi_runtime,policy}.rs` + `src/cuda/methods/*.rs` (the §4 Step 1 family table) |
+| `src/cuda.rs` 82–1128, 1141–1153, 1942–6495 | `src/cuda/ffi_runtime.rs` + `src/cuda/methods.rs` + `src/cuda/methods/*.rs` (the §8 tree; per-line map `/home/yusiwen/minfer-split/step1/line-map.tsv`) |
 | `src/metal.rs`, `src/metal.metal` | the §4 Step 4 table |
 | `src/graph/cuda_backend/tests.rs` | `src/graph/cuda_backend/tests/{staging,pool,elementwise,matmul,mmvq,prefill,weights,kv,attention,attn_window,capture}.rs` |
 | `src/models/qwen2/graph/tests.rs` | `src/models/qwen2/graph/tests/{cuda_kv,offload_copy,kv_reuse,batching,real_model}.rs` |
@@ -455,37 +481,41 @@ of §6. The former "stale size/claim sweep" ticket was folded into
 `src/kernel/`, `src/quants/`, `src/vec_ops/`, `src/metal/` and `src/cuda/` **already exist** today —
 they hold only `tests.rs` (plus `metal/mmap_align_test.rs` and `cuda/`'s ten issue probes). The plan
 therefore does not create a new convention: the production parts simply join the directories that are
-already there. `[S1]`…`[S4]` name the step that produces each entry; line ranges refer to the
+already there. `[S1]`…`[S4]` name the step that produces each entry; a parenthesised line count
+is the file's length after the step that created it, and the `.cu`/`.metal` ranges refer to the
 pre-split file.
 
 ```text
 src/
 ├── main.rs                                    (unchanged)
-├── cuda.rs                          [S1]  module cuda: doc + AttnWindow + `pub struct CudaState`
-│                                             (fields stay private) + free items + `pub(crate) use`
-│                                             + the ten `#[cfg(test)] mod` declarations
+├── cuda.rs                          [S1]  module cuda: doc + `AttnWindow` + `pub struct CudaState`
+│                                             (fields stay private) + free items + `mod methods;`
+│                                             `mod ffi_runtime;` + the `#[cfg(test)] pub(crate) use`
+│                                             re-exports + the ten `#[cfg(test)] mod` declarations (1 014)
 ├── cuda/                                    (exists: 10 test files today, unchanged)
-│   ├── impl.rs                      [S1]  the 16 cross-family helpers + `mod` declarations
-│   ├── impl/
-│   │   ├── init.rs                  [S1]  A  1945–2251   device probe / tier / singleton
-│   │   ├── accounting.rs            [S1]  B  2252–2276   weights_bytes / device_memory
-│   │   ├── weights.rs               [S1]  C  2277–2901   register_weight + q6k/q4k expansion
-│   │   ├── stream.rs                [S1]  D  2902–2964   bound/context stream, create/destroy
-│   │   ├── buffers.rs               [S1]  E  2965–3016   get_or_grow, cuda_malloc/free
-│   │   ├── copy.rs                  [S1]  F  3017–3188   H2D / async / D2H / pinned / D2D
-│   │   ├── events.rs                [S1]  G  3189–3341   events, async staging, sync, latch
-│   │   ├── capture.rs               [S1]  H  3342–3470   CUDA-graph capture / replay
-│   │   ├── dispatch.rs              [S1]  I/J 3471–3918  matmul_f32_ptr*, MMQ gates
-│   │   ├── mmq_quant.rs             [S1]  K  3919–4295   A-quantize + MmqCache
-│   │   ├── prefill_mmq.rs           [S1]  L  4296–4667   auto_ksplit, prefill_mmq
-│   │   ├── prefill_f16.rs           [S1]  M  4668–4919   f16 GEMM + w16 cache
-│   │   ├── gpu_act.rs               [S1]  N  4920–5083   on-GPU quantize/gather/embed
-│   │   ├── elementwise.rs           [S1]  O  5084–5223   norm/add/mul/silu/swiglu/rope
-│   │   ├── attention.rs             [S1]  P  5224–5636   gqa / split / batched / prefill
-│   │   ├── mmvq.rs                  [S1]  Q  5637–6274   decode MMVQ + q8_0 p32 planes
-│   │   └── kvstore.rs               [S1]  R  6275–6479   KV store + fused QKV epilogue
-│   ├── ffi_runtime.rs               [S1]  cudart/driver FFI + CudaPtr/CudaDevicePropBuf + test FFI
-│   ├── policy.rs                    [S1]  pure predicates (env knobs / gates) + unit tests
+│   ├── methods.rs                   [S1]  the 15 cross-family helpers + the 18 `mod` declarations
+│   │                                        + the `#[cfg(test)] pub(crate) use` re-exports (323)
+│   ├── methods/
+│   │   ├── accounting.rs            [S1]  B   42   weights_bytes / device_memory
+│   │   ├── attention.rs             [S1]  P  516   gqa / split / batched / prefill
+│   │   ├── buffers.rs               [S1]  E   28   cuda_malloc / cuda_free
+│   │   ├── capture.rs               [S1]  H  137   CUDA-graph capture / replay
+│   │   ├── copy.rs                  [S1]  F  182   H2D / async / D2H / pinned / D2D
+│   │   ├── dispatch.rs              [S1]  I  440   matmul_f32_ptr* + the MMQ dispatch tree
+│   │   ├── elementwise.rs           [S1]  O  195   norm / add / mul / silu / swiglu / rope
+│   │   ├── events.rs                [S1]  G  183   events, async staging, sync, latch
+│   │   ├── gpu_act.rs               [S1]  N  233   on-GPU quantize / gather / embed
+│   │   ├── init.rs                  [S1]  A  331   device probe / tier / singleton
+│   │   ├── kvstore.rs               [S1]  R  350   KV store + fused QKV epilogue
+│   │   ├── mmq_quant.rs             [S1]  K  306   A-quantize + MmqCache
+│   │   ├── mmvq.rs                  [S1]  Q  728   decode MMVQ + q8_0 p32 planes
+│   │   ├── policy.rs                [S1]  J  113   MMQ gate predicates
+│   │   ├── prefill_f16.rs           [S1]  M  307   f16 GEMM + w16 cache
+│   │   ├── prefill_mmq.rs           [S1]  L  488   auto_ksplit, prefill_mmq
+│   │   ├── stream.rs                [S1]  D   67   bound/context stream, create/destroy
+│   │   └── weights.rs               [S1]  C  726   register_weight + q6k/q4k expansion
+│   ├── ffi_runtime.rs               [S1]  cudart/driver FFI (`pub(crate)`) + the test-only extern
+│   │                                        block (145)
 │   └── kernels/                     [S2]  the CUDA translation units (kernels + their host
 │       │                                   launchers; `<backend>/kernels/` is the one rule both
 │       │                                   device backends share)

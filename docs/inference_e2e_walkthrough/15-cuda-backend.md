@@ -143,7 +143,7 @@ is why `matmul_f32_ptr_layout` — the single dispatch every CUDA matmul flows
 through — opens with a token-count gate:
 
 ```rust
-// cuda.rs:2754-2776 (dispatch gate; abridged comment)
+// src/cuda/methods/weights.rs:487-509 (dispatch gate; abridged comment)
 if (nt >= 9 || small_m_gemm)
     && id % 32 == 0
     && !Self::no_prefill_gemm()
@@ -465,7 +465,7 @@ Weights register through `register_weight` — a `cudaMalloc` plus one
 blocking H2D `cudaMemcpy` of the raw GGUF bytes:
 
 ```rust
-// cuda.rs:1701-1737 (core of register_weight)
+// src/cuda.rs:676-712 (core of register_weight)
 let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
 let err = unsafe { cudaMalloc(&mut ptr, data.len()) };
 if err != 0 || ptr.is_null() {
@@ -680,7 +680,7 @@ GEMM). What falls through is the decode-side dispatch, and reading one arm
 teaches you the shape of all of them:
 
 ```rust
-// cuda.rs:2886-2902 (Q4_K arm; abridged comment)
+// src/cuda/methods/dispatch.rs:312 (Q4_K arm; abridged comment)
 TensorType::Q4_K => {
     // 8e-reversal: decode (nt == 1) runs the MMVQ structure
     // (dp4a over q8 activations, one row per 256-thread block) —
@@ -737,7 +737,7 @@ picks the Q6_K block stride (224 padded vs 210 raw), and then walks a
 first and each failure falls through cleanly:
 
 ```rust
-// cuda.rs:3652-3727 (the q4_K raw-byte branch, abridged)
+// src/cuda/methods/dispatch.rs:289-364 (the q4_K raw-byte branch, abridged)
 // P6: raw-byte staging variant (q4_K, whole super-blocks only).
 // Same quantized activations; the GEMM stages RAW weight bytes via
 // cp.async and dequants in registers (docs/CUDA_OPTIMIZATION.md).
@@ -779,7 +779,7 @@ fail — which is how the ladder degrades to the generic `launch_mmq_nt`
 fallback at the bottom:
 
 ```rust
-// cuda.rs:3820-3837 (generic tail)
+// src/cuda/methods/prefill_mmq.rs:466 (generic tail)
 unsafe {
     let q8 = self.mmq_quantize_native(x as *const f32, id as i32, nt as i32, stream);
     if q8 == 0 {
@@ -807,7 +807,7 @@ correctness fallbacks are not, and the code keeps the distinction visible.
 
 #### 3.2.7 Split-KV attention, the kernel
 
-The host side (`gqa_attn_split`, `cuda.rs:4558`) computes the partial-row
+The host side (`gqa_attn_split`, `src/cuda/methods/attention.rs:397`) computes the partial-row
 stride `pstr = (4 + hd + 3) & !3` (running max, running sum, then the
 `hd`-wide output accumulator, rounded to a 16-byte boundary for the `float4`
 writes), grows the partials scratch *once* (a fixed `[32][nh][pstr]` slab —
@@ -1064,7 +1064,7 @@ i32 conversion), because at a boundary the pool reuses buffer ids for
 The sync itself is bounded and checked, per GPU_SAFETY:
 
 ```rust
-// cuda.rs:2392-2401
+// src/cuda/methods/weights.rs:125-134
 pub fn sync(&self) {
     let err = unsafe { cudaGetLastError() };
     if err != 0 {
@@ -1102,7 +1102,7 @@ against the `mma` instruction, and the plan doc lists "cuBLAS paths" under
 deliberately-skipped llama.cpp machinery. The payoff is that weights are
 *never* materialized in f32 — the 8p f16 cache, the one exception, costs
 +8.6 GB on 7B and was itself made obsolete by MMQ (the MMQ gate skips the
-warm pass, `cuda.rs:3022-3025`).
+warm pass, `src/cuda/methods/prefill_f16.rs:89`).
 
 **Why is capture keyed on `(uid, range, pool_gen)` instead of llama.cpp's
 node-props snapshot?** llama.cpp memcmps per-node properties and can update a

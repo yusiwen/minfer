@@ -335,7 +335,7 @@ softmax treat out-of-range keys uniformly and exclude them with the one
 `gcol < kv_end` test instead of a second control path.
 
 **Which models take this path.** The host wrapper
-`gqa_attn_f16kv` (`cuda.rs:4485`) gates it:
+`gqa_attn_f16kv` (`src/cuda/methods/prefill_mmq.rs:294`) gates it:
 
 ```rust
 // 8n: prefill (nt >= 64) runs the FA-style tiled attention. ...
@@ -345,11 +345,11 @@ if nt >= 2 && hd == 128 && !Self::no_fa_prefill() {
 }
 ```
 
-(`cuda.rs:4513-4531`.) Three conditions, each with a reason: `nt >= 2`
+(`src/cuda/methods/prefill_mmq.rs:322-340`.) Three conditions, each with a reason: `nt >= 2`
 (doc 86 lowered the gate from `nt >= 16` because the kernel masks causally from
 the positions array, so verify-shaped short batches are safe); `hd == 128`
 (FA_HQ is hard-wired to `hd/4 = 32`); and `MINFER_NO_FA_PREFILL=1`
-(`cuda.rs:4884-4885`) as the A/B escape hatch. If the shared-memory opt-in
+(`src/cuda/methods/prefill_f16.rs:256-257`) as the A/B escape hatch. If the shared-memory opt-in
 fails at launch (`cuda_kernels.cu:4398-4413`) the launcher returns `−1`, prints
 one loud warning, and the wrapper falls back to the legacy per-token kernel —
 the one visible fallback in the attention path, and it is *announced*, not
@@ -569,12 +569,12 @@ ends.
 
 **f16 KV: half the bytes, same addresses.** The `kv_f16` flag
 (`cuda_backend.rs:20-26`) is fixed at backend construction from the process
-policy (`kv_cache_is_f16`, `cuda.rs:1415`, set by the loader at
+policy (`kv_cache_is_f16`, `src/metal.rs:141`, set by the loader at
 `src/models/qwen2/loader.rs:347`). When it is on, every store converts to
 `__half` and every attention read converts back; §3.2's kernel shows both
 sides of that. The `store_kv_f16` header comment states the trade
 (`cuda_kernels.cu:2542-2549`): "halves attention read bandwidth", and
-`cuda.rs:5243-5245` adds the fine print — *the region stays f32-sized; the
+`src/cuda/methods/attention.rs:154-156` adds the fine print — *the region stays f32-sized; the
 f16 view uses the first half of the bytes*: allocation does not shrink, the
 bytes written per store and read per attention call do (§4 does the
 arithmetic). The correctness story for the f16 round trip is test
@@ -652,7 +652,7 @@ Three representative arms (all cites `src/graph/cuda_backend.rs`):
   kernel left the GPU idle, 48% of the 7B decode step per nsys), `2..=16` →
   the batched variant (`1130-1145`), `nt > 16` → the prefill kernels
   (`1146-1175`), where the host wrapper `gqa_attn_kv_prefill`
-  (`cuda.rs:5334`) internally routes to the FA prefill kernel.
+  (`src/cuda/methods/attention.rs:245`) internally routes to the FA prefill kernel.
 - `Op::KvcacheStore` (`1028-1061`) — the unfused prefill store: verifies the
   output buffer *is* the K region (`1031-1035`), derives `nt` from the element
   count, converts positions device-side, and launches
@@ -747,7 +747,7 @@ fn synchronize(&mut self) {
 
 (`cuda_backend.rs:1428-1440`.) It is deliberately the *only* place a split
 boundary waits: memos expire, an open capture window closes here, and the
-actual wait is `CudaState::sync` (`cuda.rs:2392-2401`) —
+actual wait is `CudaState::sync` (`src/cuda/methods/events.rs:143`) —
 `cudaGetLastError` checked, then `cudaStreamSynchronize`, and its error code
 checked. That is the CUDA expression of the GPU-safety rule "synchronize() is
 the one choke point: stream-ordered work is waited with a bounded loop and the

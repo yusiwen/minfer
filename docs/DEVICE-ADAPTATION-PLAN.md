@@ -53,9 +53,9 @@ discipline.
 
 | Location | Responsibility today |
 |---|---|
-| `src/cuda.rs` init (`:1463–1539`) | queries cc / SM count / free mem / name; only cc is consumed by dispatch |
-| `src/cuda.rs` dispatch arms (`~:2700–2870`) | inline shape gates (nt / id / od·id), all GB10-measured constants |
-| `src/cuda.rs:2928` `mmq_active()` | cc ≥ 800 feature gate |
+| `src/cuda/methods/init.rs` (`try_new`) | queries cc / SM count / free mem / name; only cc is consumed by dispatch |
+| `src/cuda/methods/dispatch.rs` (`matmul_f32_ptr_layout`) | inline shape gates (nt / id / od·id), all GB10-measured constants |
+| `src/cuda/methods/policy.rs:39` `mmq_active()` | cc ≥ 800 feature gate |
 | `src/cuda.rs` plane registration | load-time p32 / q4k_dsc / q6k decisions, no VRAM budget check |
 | `src/cuda_kernels.cu:5452` | `MMQ_BI/BJ/WS/KD` tile macros, single config for all archs |
 | `src/cuda_kernels.cu:7608` | `cuda_shared_per_sm` / `_block_optin` externs — **written, never consumed** |

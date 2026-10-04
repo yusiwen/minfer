@@ -652,8 +652,8 @@ swizzle (r22)**; keep the **rank-1 two-term rescale (r15/r16)** and the **f16-sc
 rescale is what the campaign kept for exactness). Do **NOT** copy llama's sram layout (sram_stride=76
 ints, mmq.cuh:137) — it is 1-byte-per-nibble and is not the halving. What is adopted from llama is only
 the *concept* of a raw nibble B plane, but **packed 2/byte** (the `block_q4_K.qs[128]` plane,
-ggml-common.h), which is what actually halves the smem. The dispatch guard `(id/32)%8 == 0` (cuda.rs:2030)
-applies unchanged (same pad40 q8 quantize, cuda.rs:2038).
+ggml-common.h), which is what actually halves the smem. The dispatch guard `(id/32)%8 == 0` (src/cuda/methods/init.rs:111)
+applies unchanged (same pad40 q8 quantize, src/cuda/methods/init.rs:119).
 
 ### 11.4 Numerics
 
@@ -678,7 +678,7 @@ Raw-nibble semantics are **exactly** the r13-era two-term rescale (the parity-sa
 |---|---|---|---|
 | 1 | **Nibble-layout mistake** at in-loop unpack (wrong nibble=k, sign-extend the high 4 bits, double dmin) | the r13-era **82.896 max-diff** parity mode | `cuda_prefill_mmq` parity arm (§11.6) must run BEFORE the first perf run; a garbage-magnitude diff (like r14's uint4-tiling corrupting qb8) = layout bug; ~1e-6 diff = legit fp rounding. |
 | 2 | **Token identity** — any fp add reordering | greedy token identity diverges | the design does NOT reorder (same per-chunk mma + same two-term fp fold order); still gate on greedy-32 (r24 rung-3 convention). |
-| 3 | **Smem-cap overrun** (the r7-era silent-attr-failure regression, phantom 2124) | launcher quietly fallback/corrupts | launcher re-derives smem and **return 0** (→ narrow fallback, cuda.rs:2059-2071) if over cap; `cudaFuncSetAttribute` result checked (cuda_kernels.cu:4787-4790, 4795-4798). KD=8 @ 45,056 B safe; KD=16 or O=256 would not be. |
+| 3 | **Smem-cap overrun** (the r7-era silent-attr-failure regression, phantom 2124) | launcher quietly fallback/corrupts | launcher re-derives smem and **return 0** (→ narrow fallback, src/cuda/methods/init.rs:140-152) if over cap; `cudaFuncSetAttribute` result checked (cuda_kernels.cu:4787-4790, 4795-4798). KD=8 @ 45,056 B safe; KD=16 or O=256 would not be. |
 | 4 | **Register spill at KD=8** (in-loop B-expand temps + sum[32]) | ptxas → 255 regs + local spill (the r22 Lever-2 failure) | `-Xptxas -v` gate: expect ~110–130 regs, 0 spill; `REG > 160` → risk. |
 | 5 | **Occupancy gained but wall flat** (ncu ~4 warps/sched, duration unchanged) | falsifies the occupancy hypothesis | this is the designed kill criterion (§11.8), not a bug — it closes the line. |
 | 6 | **A-side re-staging for the smaller T** | more A per od-tile | A re-reads unchanged (od/O held at 128); only B re-reads grow (the designed sacrifice). |
@@ -762,7 +762,7 @@ this order:
 
 So every M has a dedicated kernel: 1–8 → MMVQ, 9–∞ → MMQ. minfer's hole
 (nt=2–15 → legacy `*_f32_matmul`, from the `nt >= 16` tiled-GEMM gate at
-`src/cuda.rs:2494` and the `nt == 1` MMVQ gates, e.g. `src/cuda.rs:2572`)
+`src/cuda/methods/weights.rs:227` and the `nt == 1` MMVQ gates, e.g. `src/cuda/methods/weights.rs:305`)
 is exactly the seam between two tuned regimes that this chain does not
 have.
 
