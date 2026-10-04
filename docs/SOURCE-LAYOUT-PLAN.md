@@ -20,7 +20,7 @@
 | −1 #138 + #225 | #138, #225 | **#225 landed** `5386a1c` (PR #268, 7/7 green; the cold first-run row is in §2.4); **#138 in flight** on `feat/138-defer-cross-wait` |
 | 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
 | 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 594 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
-| 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **in progress, 2 of 6 stages landed** (PR [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, 7/7 green); the per-stage record is at the end of §4 Step 2 |
+| 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5, G6): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` + 18 TUs; audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2 |
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
@@ -181,7 +181,7 @@ Two honest wrinkles:
   `/home/yusiwen/minfer-split/step1/line-map.tsv`, and the anchors whose old line was only a locator
   were re-anchored to the symbol).
 
-### Step 2 — `src/cuda_kernels.cu` → `src/cuda/kernels/` (1 header + guard TU + 19 TUs)
+### Step 2 — `src/cuda_kernels.cu` → `src/cuda/kernels/` (landed: 1 header + 18 TUs)
 
 Route (a): launchers move with the kernels they launch (llama.cpp's CUDA shape). **Two of the 77
 launchers are the exception** (blueprint: `/home/yusiwen/minfer-split/step2/README.md` §2) — they
@@ -272,7 +272,7 @@ non-mutating gates are the same at every stage: audit 130 / `--check-fixture` ex
 | G3 | MMQ: `mmq_int8.cu` 457 + `mmq_raw.cu` 645 + `mmq_nb.cu` 708 + `mmq_bt_q6k.cu` 436 | 2 246 | 5 629 | — |
 | G4 | MMVQ: `matmul_f32act.cu` 731 + `mmvq_aquant.cu` 413 + `mmvq_skipwrite.cu` 648 + `mmvq_q6k.cu` 342 + `mmvq_multi.cu` 755 | 2 889 | 2 803 | — |
 | G5 | `ops_misc.cu` 743 + `ops_elementwise.cu` 439 + `kv_store.cu` 435 + `gemm_wmma.cu` 937 (incl. gemm_smem) + `gemm_fused_dequant.cu` 284 | 2 838 | 14 | — |
-| G6 | the empty remainder deleted | | 0 | — |
+| G6 | the 14-line remainder deleted; `src/cuda_kernels.cu` retired | 0 | — | — |
 
 Three measured corrections to the tables above, applied as the stages land:
 
