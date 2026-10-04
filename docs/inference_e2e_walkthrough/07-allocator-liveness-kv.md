@@ -118,7 +118,7 @@ input buffer. Contrast a **parallel** shape — `a2 = add(silu(a0), a0)` and
 `b2 = add(silu(b0), b0)` computed independently — where both branches are live
 simultaneously and *must* get separate buffers. minfer's unit tests assert
 exactly these two behaviors: `liveness_reuses_buffers_along_chain` (fewer
-buffers than nodes) and `parallel_chains_do_not_share` (`alloc/tests.rs:319`).
+buffers than nodes) and `parallel_chains_do_not_share` (`alloc/tests/liveness.rs:24`).
 
 Two bookkeeping rules extend the basic window, and both exist because of
 execution-order realities rather than graph theory:
