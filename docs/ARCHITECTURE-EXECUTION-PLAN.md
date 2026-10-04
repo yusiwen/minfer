@@ -10015,7 +10015,7 @@ process per configuration.
 #### Test-infrastructure record (#261 step 5, 2026-10-05) — the close-out: the module-load re-measure, the `.cu` prose sweep and the last two #219 claims
 
 **What landed.** The Linux half of Step 5 on `dgxspark (aarch64, GB10 sm_121)`, CUDA 13.0, driver
-580.178.04, one GPG-signed branch, PR #TBD-STEP5. Three concerns:
+580.178.04, one GPG-signed branch, PR [#293](https://github.com/yusiwen/minfer/pull/293). Three concerns:
 
 1. **The measurement the split made necessary.** The fatbin is 17 modules since #263, so the recorded
    "~2.2 ms per module / ~14.5 ms cold" row (`docs/CUDA-BACKEND-DESIGN.md` §2.4, [#225]) was re-measured
