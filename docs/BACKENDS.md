@@ -6,7 +6,7 @@ execute, `docs/COMPUTE-GRAPH-DESIGN.md`) on three interchangeable backends:
 | | **CPU** | **Metal** | **CUDA** |
 |---|---|---|---|
 | Executor | `src/graph/cpu_backend.rs` | `src/graph/metal_backend.rs` | `src/graph/cuda_backend.rs` |
-| Device layer | — (std threads) | `src/metal.rs` + `src/metal.metal` shaders | `src/cuda.rs` + `src/cuda_kernels.cu` |
+| Device layer | — (std threads) | `src/metal.rs` + `src/metal.metal` shaders | `src/cuda.rs` + `src/cuda/kernels/*.cu` |
 | Platform | any | macOS (Apple GPU) | NVIDIA, **opt-in** `--features cuda` |
 | Assign priority | last (always answers) | first on macOS | second, when built in |
 | Activations | quantized to Q8_0 (Q8_K for K-quant weights) | read as f32 | f32; int8 MMQ for prefill |
@@ -16,7 +16,7 @@ execute, `docs/COMPUTE-GRAPH-DESIGN.md`) on three interchangeable backends:
 
 The `src/<backend>/kernels/` paths and `src/cuda/impl/*.rs` are the target of
 [the source layout plan](./SOURCE-LAYOUT-PLAN.md) ([#261](https://github.com/yusiwen/minfer/issues/261));
-until those steps land, the CUDA kernels are the single `src/cuda_kernels.cu` and the Metal shaders the
+until those steps land, the CUDA kernels live in `src/cuda/kernels/` and the Metal shaders the
 single `src/metal.metal`.
 
 This page is the overview: what the backend contract is, how nodes land on a
