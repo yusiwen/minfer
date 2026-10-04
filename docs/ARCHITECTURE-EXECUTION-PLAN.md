@@ -9676,3 +9676,42 @@ Reverted.
 **Deliberately out of scope.** The remaining three files of #267 under 1,300 lines —
 `src/sampler/tests.rs` (1,232), `src/conversation/tests.rs` (1,156), `src/graph/kvcache/tests.rs`
 (1,134) — and `src/cuda/issue162_tests.rs` (1,186) last, after #263.
+
+#### Test-infrastructure record (#267 step 6, files 6–8, 2026-10-04) — the four sub-1,300-line files land in one PR, a commit apiece
+
+**What landed.** The three remaining files under the ticket's 1,300-line grouping threshold are split
+in one PR ([#281](https://github.com/yusiwen/minfer/pull/281), part of
+[#267](https://github.com/yusiwen/minfer/issues/267)), one commit per file, each keeping its shared
+fixtures in `tests.rs` and declaring one `mod <topic>;` per topic file:
+
+| file | before | after | tests |
+|---|---:|---|---:|
+| `src/sampler/tests.rs` | 1,232 | a 140-line parent + `{greedy_topk,penalties,stops,minp_typical,xtc,dry,mirostat,bias_validate,defaults,grammar}.rs` | 47 |
+| `src/conversation/tests.rs` | 1,156 | a 209-line parent + `{turns,regen,spec,snapshot,overflow,real_model}.rs` (the mock engine and 12 fixtures stay up) | 27 |
+| `src/graph/kvcache/tests.rs` | 1,134 | a 122-line parent + `{cells,spans,sharing,resize,defrag}.rs` | 33 |
+
+All three are pure moves: every item is byte-identical apart from rustfmt and the test-name sets are
+unchanged. None of the three files contained a `super::super::` reference, so no test-body path needed
+the absolute rewrite that #278 and #279 carried. The two live walkthrough anchors for
+`conversation/tests.rs` are re-pointed at `conversation/tests/turns.rs:48` and
+`conversation/tests/overflow.rs:22` in the same commit.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the worktree:
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration |
+| `scripts/cuda_test.sh` | **567 / 0 / 42** |
+| `python3 scripts/check_source_layout.py` | `src obeys the layout rules`, exit 0 |
+| `python3 scripts/check_doc_line_anchors.py`, `check_docs_links.py`, `check_status.py --check` | exit 0 each |
+| `cargo fmt --all --check` | clean |
+| CI on PR [#281](https://github.com/yusiwen/minfer/pull/281) | **7 / 7 green** |
+
+**Mutation evidence (rule 3).** One mutation per file, each reverted — the checker names the orphan and
+the CPU row drops: `mod dry;` in `sampler/tests.rs` → `src/sampler/tests/dry.rs` and **481 → 476**;
+`mod overflow;` in `conversation/tests.rs` → `src/conversation/tests/overflow.rs` and **481 → 475**;
+`mod spans;` in `graph/kvcache/tests.rs` → `src/graph/kvcache/tests/spans.rs` and **481 → 475**.
+
+**What is left.** `src/cuda/issue162_tests.rs` (1,186 lines) is the last file of #267 and is deliberately
+not split here: it carries the launch-fixture column assertion (`assert_eq!(f.len(), 4)`) that Step 2
+(#263) changes, so it moves after #263 merges.
