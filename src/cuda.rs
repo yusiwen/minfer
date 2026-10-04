@@ -127,10 +127,18 @@ extern "C" {
     fn cudaEventRecord(event: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> i32;
     fn cudaEventSynchronize(event: *mut std::ffi::c_void) -> i32;
     fn cudaEventDestroy(event: *mut std::ffi::c_void) -> i32;
-    /// Kept ahead of its only caller: #138 (the F5 device→device overlap) names
-    /// this as the device-consumer wait, and `docs/BACKEND-REGISTRY-DESIGN.md` §11
-    /// documents it as the mechanism for the one copy class no backend implements
-    /// yet.
+    /// Kept for the one copy class no backend implements yet, and named by the
+    /// census brief [#244](https://github.com/yusiwen/minfer/issues/244):
+    /// `docs/BACKEND-REGISTRY-DESIGN.md` §11 documents it as a device consumer's
+    /// synchronization point.
+    ///
+    /// Still dead in every compilable configuration. #138 (the F5 deferred wait,
+    /// landed 2026-10-04) was the ticket expected to wire it, and it did **not**
+    /// create a caller: the only pair that could express a device destination
+    /// would need two device backends, `copy_across` early-returns on a
+    /// same-backend pair, and Metal declines phase A. The reachable
+    /// device-consumer direction (CPU → device) needs no event — its fill is
+    /// stream-ordered on the consuming pool's own stream.
     #[allow(dead_code)]
     fn cudaStreamWaitEvent(
         stream: *mut std::ffi::c_void,
@@ -3256,9 +3264,17 @@ impl CudaState {
     /// F5: make every later operation on the stream wait for `ev`, **without
     /// blocking the host** — the synchronization point of a device consumer.
     ///
-    /// No caller yet by construction: #138 is the ticket that wires it into the
-    /// device→device staging copy, and `docs/BACKEND-REGISTRY-DESIGN.md` §11 keeps
-    /// it as that path's mechanism.
+    /// Still dead in every compilable configuration. #138 (the F5 deferred wait,
+    /// landed 2026-10-04) was the ticket expected to wire it into a device→device
+    /// staging copy, and it deliberately left it unwired: the only pair that could
+    /// express a device destination would need two device backends, `copy_across`
+    /// early-returns on a same-backend pair, and CUDA→Metal declines phase A — so
+    /// a call site would be unreachable code rather than a caller. The reachable
+    /// device-consumer direction (CPU → device) needs no event: its fill is issued
+    /// on the consuming pool's own stream, so stream order is the whole wait. Kept
+    /// because the census brief names it and
+    /// `docs/BACKEND-REGISTRY-DESIGN.md` §11 documents it as that copy class's
+    /// mechanism.
     #[allow(dead_code)]
     pub fn stream_wait_event(&self, ev: *mut std::ffi::c_void) -> Result<(), String> {
         let err = unsafe { cudaStreamWaitEvent(self.stream(), ev, 0) };
