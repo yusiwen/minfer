@@ -77,7 +77,7 @@ Sanity check with a real number: `token_embd` of Qwen2.5-0.5B in Q4_0 with `id =
 
 ### 2.4 Two activation formats, one pairing rule
 
-The entry-point branch (`kernel.rs:12-33`, below) is not cosmetic — each weight family pairs with a **specific activation format**, fixed by the kernels' inner loops:
+The entry-point branch (`src/kernel/dispatch.rs:9-31`, below) is not cosmetic — each weight family pairs with a **specific activation format**, fixed by the kernels' inner loops:
 
 | Weight family | Weight block | Paired activation format | Activation block |
 |---|---|---|---|
@@ -123,7 +123,7 @@ Every number here comes straight from the formulas of §2.3/§3.2 — this table
 **The entry point: quantize activations, then dispatch.** `cpu_quant_matmul_f32` is what the CPU backend's `MatMul` arm calls (doc 08):
 
 ```rust
-// src/kernel.rs:12-33
+// src/kernel/dispatch.rs:9-31
 pub fn cpu_quant_matmul_f32(w: &Tensor, x: &[f32], out: &mut [f32],
                             od: usize, id: usize, nt: usize) {
     match w.ttype {
@@ -148,7 +148,7 @@ The two activation formats of §2.4 are chosen *here*, once, so no call site can
 **The row kernel: `mm_rows`.** One function handles every weight type; the type only changes the byte arithmetic and which `dot_*` gets called:
 
 ```rust
-// src/kernel.rs:130-152 (Q4_0 arm; the other 7 arms are the same shape)
+// src/kernel/pool.rs:98-120 (Q4_0 arm; the other 7 arms are the same shape)
 unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
     let od = job.od;          // outputs (weight rows)
     let id = job.id;          // input dim
@@ -408,7 +408,7 @@ The Q4_K value formula is `value = q · d_s − min_s` per sub-block `s` (a *non
 **The persistent thread pool.** Decode runs ~250 matmuls per token (doc 13), each tiny (one token row through `od` rows of weights). Spawning threads per matmul measured **~170 µs** (kernel.rs's own comment) — against a per-token budget of a few milliseconds, that alone would be the bottleneck:
 
 ```text
-// src/kernel.rs:274-281 (the dispatch every worker wakes for)
+// src/kernel/pool.rs:242-249 (the dispatch every worker wakes for)
 let job = *pool.job.lock().unwrap();
 match job {
     PoolJob::MatMul(m) => {
@@ -424,15 +424,15 @@ The design (kernel.rs comment block, lines ~274–287):
 
 - Workers are spawned **once**, lazily, by `get_pool` (`OnceLock`, process lifetime) and spin on an atomic `gen` counter — 8000 spin iterations, then `yield_now`, so idle workers cost nothing but wake in microseconds.
 - The submitting thread publishes a `MmJob` under `job`, bumps `gen`, and waits on `done == n+1` (the main thread participates as the last worker — no wasted idle main).
-- A `gate` `Mutex` serializes submissions: the comment (`kernel.rs:246-252`) records the real hazard — two concurrent callers (parallel tests, the multi-slot server) would clobber `job` and share `done`, letting one caller return before *its* range was computed while workers still read its stack-local context. That is a use-after-free, and the fix is one lock around submit→wait.
+- A `gate` `Mutex` serializes submissions: the comment (`src/kernel/pool.rs:212-218`) records the real hazard — two concurrent callers (parallel tests, the multi-slot server) would clobber `job` and share `done`, letting one caller return before *its* range was computed while workers still read its stack-local context. That is a use-after-free, and the fix is one lock around submit→wait.
 - `chunk(parts, idx, total)` splits `od` rows evenly; each row belongs to exactly one worker → bit-identical results at any thread count (§2.3's promise).
-- Worker count: `set_cpu_threads` (CLI `--threads`, `kernel.rs:54`) must run before the first matmul because the pool is spawned lazily on first use; `cpu_threads()` (`:61`) reads the `CPU_THREADS` atomic where `0` means auto-detect.
-- The same pool also serves `par_for` (`kernel.rs:362`) — which is exactly what attention reuses for per-head parallelism in doc 11.
+- Worker count: `set_cpu_threads` (CLI `--threads`, `src/kernel/pool.rs:21`) must run before the first matmul because the pool is spawned lazily on first use; `cpu_threads()` (`:28`) reads the `CPU_THREADS` atomic where `0` means auto-detect.
+- The same pool also serves `par_for` (`src/kernel/pool.rs:290`) — which is exactly what attention reuses for per-head parallelism in doc 11.
 
-**The embedding "matmul".** `embed_tokens` (`kernel.rs:389`) is not a matmul at all: for each token id it walks the quantized `token_embd` row block-by-block, dequantizing (scale × nibble for Q4_0/Q4_1, scale × byte for Q8_0) into the output row:
+**The embedding "matmul".** `embed_tokens` (`src/kernel/embed.rs:5`) is not a matmul at all: for each token id it walks the quantized `token_embd` row block-by-block, dequantizing (scale × nibble for Q4_0/Q4_1, scale × byte for Q8_0) into the output row:
 
 ```rust
-// src/kernel.rs:389-410 (Q4_0/Q8_0/Q4_1 arm, abridged)
+// src/kernel/embed.rs:5-26 (Q4_0/Q8_0/Q4_1 arm, abridged)
 pub fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usize) {
     for (ti, &id) in ids.iter().enumerate() {
         let idx = id as usize;                       // the token's row in the table
@@ -466,7 +466,7 @@ This is the `GetRows` node of doc 05 made concrete — "the embedding table is a
 - **Block-size divisibility is a format contract, not a hint.** `id % 32 == 0` (and `id % 256 == 0` for K-quants) is guaranteed by GGUF conversion tools and asserted in the quantizer; a model that broke it would silently misindex without the assert.
 - **The transposed-output bug that decode hid** (`src/vec_ops/vec.rs:366-370`, the `mat_mul_f32` comment): an earlier version wrote `C[row*n + col]` — an `[m,n]` output — while every caller wanted `[nt][od]`. For decode (`nt == 1`) the two layouts coincide, so no decode-only test caught it; prefill output was transposed. Lesson the repo kept: **test with `nt > 1` or the token-major convention will bite.**
 - **Row ownership = bit-identical parallelism.** Never "optimize" the pool into splitting a row's reduction; that trades away the determinism the verification gates rely on (§3.3).
-- **The `gate` lock is load-bearing** (kernel.rs:246-252): removing it works in single-threaded tests and corrupts memory the first time two threads submit concurrently (the server's multi-slot path).
+- **The `gate` lock is load-bearing** (`src/kernel/pool.rs:212-218`): removing it works in single-threaded tests and corrupts memory the first time two threads submit concurrently (the server's multi-slot path).
 - **K-quant weights need Q8_K activations, 32-value weights need Q8_0** — crossing the pairing (e.g. feeding Q8_0 blocks to `dot_q4_k_q8_k`) misindexes the super-block scales. The `cpu_quant_matmul_f32` branch exists to make the pairing unstateable from the call site.
 - **The activation-Q8_K layout is kernel-pair-defined** — 306 bytes as written by `quantize_row_q8_k_buf` (`src/quants/quantize_q8_k.rs:8-18` comment), *not* the `BlockQ8_K` struct layout (`block.rs:173`); doc 02 flagged the same nuance on the on-disk side. When touching either side, re-verify the quantizer→kernel byte contract together.
 - **Scales fold once per block, integers stay exact** — any refactor that converts intermediate integer dots to float mid-block changes the numerics and breaks parity with llama.cpp.

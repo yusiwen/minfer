@@ -9909,6 +9909,7 @@ entry naming this file; its two `file =` fields (the `cpu` and `cuda` arms) now 
 | `python3 scripts/check_dead_code_annotations.py` | exit 0 (11 grandfathered bare sites) |
 | `python3 scripts/check_dead_code_oracle.py --config cpu` | 46 baseline entries, **0 additions, 0 removals** |
 | `python3 scripts/check_doc_line_anchors.py` | the 10 live `vec_ops.rs:NNN` anchors re-pointed, 0 out-of-range |
+| CI run [37215810834](https://github.com/yusiwen/minfer/actions/runs/37215810834) | **7 / 7 green**, zero code annotations |
 
 **Mutation evidence (rule 3).** Renaming `src/vec_ops/rms_norm.rs` to a name no `mod` declares →
 `check_source_layout` exits 1 with
@@ -9920,3 +9921,50 @@ reverted, exit 0.
 
 **Deliberately out of scope.** No value, order or algorithm changed. Stage C (`src/kernel.rs`) follows.
 `docs/CPU_OPTIMIZATIONS.md` is frozen and keeps its `vec_ops.rs:NNN` numbers.
+
+#### Test-infrastructure record (#264 stage C, 2026-10-04) — `src/kernel.rs` becomes `src/kernel/*.rs`
+
+**What landed.** Stage C closes the CPU trio ([#264](https://github.com/yusiwen/minfer/issues/264),
+PR [#VERIFY]()): `src/kernel.rs` 667 → **22** lines (the module decider) and three part files —
+`dispatch.rs` 72 · `pool.rs` 313 · `embed.rs` 278. The old file had 10 `fn` definitions and the new
+files have the same 10 (excluding the pre-existing `tests.rs`).
+
+**The layout invariant.** `dispatch.rs` submits through the pool, so `MmJob` (and its seven fields),
+`ParForJob`, `PoolJob`, `Pool` (and its five fields), `mm_rows`, `chunk` and `get_pool` become
+`pub(super)` — the same `pub(in kernel)` reach they had as private items of `kernel` — and
+`dispatch.rs` imports them explicitly (`use super::pool::{chunk, get_pool, mm_rows, MmJob, PoolJob};`)
+rather than through the parent, which keeps the dependency visible. `Pool`'s `gate` field carries its
+hazard comment (the concurrent-submission use-after-free the lock prevents) into `pool.rs` verbatim.
+`pool.rs` also keeps the thread-locals and the `use std::sync::…` lines the one-file version had
+mid-file.
+
+**One re-export deliberately not carried.** `cpu_quant_matmul` (the byte-in/byte-out worker entry)
+stays `pub` in `dispatch.rs` but is not re-exported at the `kernel` root: its one caller is
+`cpu_quant_matmul_f32` in the same file, no `crate::kernel::cpu_quant_matmul` path is named anywhere in
+the tree, and a `pub use` of an unused name is an `unused_imports` error under `#![deny(warnings)]`.
+Every path that exists is preserved.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the step's worktree:
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration — identical to `docs/status.toml` |
+| `MINFER_NO_NEON=1 cargo test --release` | **481 / 0 / 36** + **10 / 0 / 6** — the scalar arm, identical |
+| `cargo check --release --target x86_64-unknown-linux-gnu` | exit 0 |
+| `cargo fmt --all --check` | exit 0 |
+| `python3 scripts/check_source_layout.py` (`--selftest`) | exit 0; 12 cases pass |
+| `python3 scripts/check_dead_code_annotations.py` | exit 0 (11 grandfathered bare sites) |
+| `python3 scripts/check_dead_code_oracle.py --config cpu` | 46 baseline entries, **0 additions, 0 removals** |
+| `python3 scripts/check_doc_line_anchors.py` | the 14 live `kernel.rs:NNN` anchors re-pointed, 0 out-of-range |
+
+**Mutation evidence (rule 3).** Renaming `src/kernel/embed.rs` to a name no `mod` declares →
+`check_source_layout` exits 1 with
+`not reachable from src/main.rs — no `mod` declaration names it, so it is never compiled (tests in it would silently not run)`.
+Deleting `pub use pool::{cpu_threads, par_for, set_cpu_threads};` → `cargo check --release` exits 101
+with `error[E0425]: cannot find function `set_cpu_threads` in module `crate::kernel`` at
+`src/bench.rs:138:36` and the note `function `crate::kernel::pool::set_cpu_threads` exists but is
+inaccessible`. Both reverted, exit 0.
+
+**#264 is complete.** `src/quants.rs` 1,340 → 61 + 9 parts (+ the extracted `neon_correctness.rs` 138),
+`src/vec_ops.rs` 1,344 → 52 + 8 parts, `src/kernel.rs` 667 → 22 + 3 parts, and the three module files
+are the deciders with the same public paths. The ISA axis is now the directory tree.
