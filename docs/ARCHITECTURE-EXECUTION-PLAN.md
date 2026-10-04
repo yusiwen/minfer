@@ -5342,10 +5342,11 @@ is still zero.** Date/device/command: 2026-09-29, GB10 sm_121, CUDA 13.0, driver
 
 | bar (named before measuring) | proxy in #223 | measured | verdict |
 |---|---|---|---|
-| pre-warm loop's own duration | ≲ 0.2 ms (first attr call 152.9 µs) | **median 2249 µs** (range 2126–2448, n=25) | above the stated bar — it is the fatbin's one-time module load, not 152.9 µs; set-size independent (n=1 ≈ n=12 ≈ 2.2 ms) |
+| pre-warm loop's own duration | ≲ 0.2 ms (first attr call 152.9 µs) | **median 2249 µs** (range 2126–2448, n=25) | above the stated bar — it is the fatbin's one-time module load, not 152.9 µs; set-size independent (n=1 ≈ n=12 ≈ 2.2 ms). The range is **warm-clock only** — see the cold row below |
+| pre-warm loop's own duration, first (**cold / idle-clock**) invocation | same one-time work, no separate bar named | **~14 526 µs** (~6× the warm median; the three consecutive runs were 14526, 2157, 2364 µs) | the 2126–2448 range is **not** the worst case: the module load is clock/state dependent, and its first cold run measured ~14.5 ms ([#225](https://github.com/yusiwen/minfer/issues/225)) |
 | `minfer bench -p 2048 -n 128` `tg128` | within ±1% | ON 236.30 vs OFF 236.45 t/s (**−0.06%**) | pass (7 interleaved matched rounds, medians, same binary) |
 | `minfer bench -p 2048 -n 128` `pp2048` | within ±1% | ON 2546.55 vs OFF 2544.34 t/s (**+0.09%**) | pass |
-| startup (model load → first token) | net new ≈ 10 µs | **net ≈ 0**: the ~2.2 ms **moves** into the existing `prewarm_prefill()` module load | the proxy's qualitative reading survives |
+| startup (model load → first token) | net new ≈ 10 µs | **net ≈ 0**: the ~2.2 ms **moves** into the existing `prewarm_prefill()` module load | the proxy's qualitative reading survives. The ≈ 0 net is **coupled**: it holds only while a later step pays that same module load — move `prewarm_prefill()` after the first launch, or remove it, and the pre-warm's loop becomes ~2.2 ms of net-new startup cost |
 
 The "the ~150 µs moves rather than appears" reading **did** survive on the real path, with a different
 magnitude. Controlled fresh-process probe on the same binary (the tiny `gemm_f16_nt_kernel_t` fixture,
@@ -5359,6 +5360,14 @@ consistent with that but cannot resolve the net to better than a few ms: paired 
 residual: if the module load ever stops being paid by `prewarm_prefill()` (e.g. that rider is removed),
 the pre-warm's loop becomes ~2.2 ms of **net new** startup cost, so the two are coupled and the next
 person to touch `prewarm_prefill` must know.
+
+> **#225 forward note (2026-10-04):** the table's 2126–2448 range is a **warm-clock** measurement of
+> the one-time fatbin **module load**, not a bound. An independent three-run check under the same
+> command (2026-09-29, GB10 sm_121) saw the first, cold / idle-clock invocation take **14 526 µs**
+> (~6× the warm median; the next two runs 2157 µs and 2364 µs), so the range above is warm-only and
+> the load's magnitude is clock/state dependent. `CUDA-BACKEND-DESIGN.md` §2.4's cost table now
+> carries both readings. The coupling is load-bearing: the ≈ 0 net holds **only while a later step
+> pays the same module load** — today `prewarm_prefill()`, otherwise the first launch from the fatbin.
 
 **Counts (rule 5).** `scripts/cuda_test.sh` → **566 / 0 / 42**, GB10 sm_121, 2026-09-29 (was 565 / 0 /
 42; +1 device gate, `cuda::issue223_tests`). `compute-sanitizer --tool memcheck --target-processes all
