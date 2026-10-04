@@ -9441,3 +9441,68 @@ and a `docs/BACKENDS.md` footnote. Four of the six stale claims folded into
 rewritten by the step that moves the code; its two `docs/CUDA-BACKEND-DESIGN.md` line citations were
 replaced by section references in the follow-up that carries this record, because step 0 itself shifted
 them — the same class of rot this campaign exists to remove.
+
+#### Test-infrastructure record (#267 step 6, file 1, 2026-10-04) — the long test files start moving: `graph/cuda_backend/tests.rs` becomes a parent plus 11 topic files
+
+**What landed.** The crate's longest test file, `src/graph/cuda_backend/tests.rs` (8,603 lines, 74
+top-level `fn` items: 61 `#[test]` — two of them `#[ignore]`d — plus 13 top-level helpers), is split by
+op family into
+`src/graph/cuda_backend/tests/<topic>.rs`, each named by a `mod` declaration in the now-106-line parent
+([#267](https://github.com/yusiwen/minfer/issues/267), PR [#275](https://github.com/yusiwen/minfer/pull/275)).
+It is a pure move: every top-level `fn`/`const` item is byte-identical apart from rustfmt, the 61 test
+*leaf* names are the same set, and nothing was added, removed, renamed, re-gated or relaxed. The topic
+file is `staging` (4 tests), `pool` (2), `elementwise` (4), `matmul` (6), `mmvq` (3), `prefill` (4),
+`weights` (6), `kv` (9), `attention` (4), `attn_window` (6) and `capture` (13); the shared fixtures
+(`device`, `pool`, `assert_close`), the `use` lines and the test-only `impl CudaBackend` shim stay in
+the parent, which every topic reaches through `use super::*;`. `src/graph/cuda_backend.rs` keeps its
+`#[cfg(test)] mod tests;` untouched — only the parent gained child `mod`s, and the layout checker's
+declaration walk reaches `tests/<topic>.rs` through `module_dir()`.
+
+**This is the shape the guard exists for.** A test file no `mod` names is never compiled, so its tests
+silently stop running while `cargo test` and CI stay green. `scripts/check_source_layout.py` rule 2 is
+the only thing that catches it, and this is the first `src/` tree in the repo where a test module is a
+*directory*; `AGENTS.md`'s test-file paragraph records the convention in one sentence.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the step's worktree,
+with the pre-move baseline taken in that same worktree first:
+
+| Command | Result |
+|---|---|
+| `scripts/cuda_test.sh` | **567 / 0 / 42** (pre-move baseline in the same worktree: 567 / 0 / 42) |
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration (baseline 481 / 0 / 36 + 10 / 0 / 6) |
+| `python3 scripts/check_source_layout.py` | `src obeys the layout rules`, exit 0 |
+| `python3 scripts/check_doc_line_anchors.py` | exit 0 (4 `OUT-OF-RANGE` anchors re-pointed at the moved tests) |
+| `python3 scripts/check_docs_links.py`, `scripts/check_status.py --check` | exit 0 each |
+| `cargo fmt --all --check` | clean |
+| CI run on PR [#275](https://github.com/yusiwen/minfer/pull/275) | **7 / 7 green**, zero code annotations |
+
+**Mutation evidence (rule 3).** `mod staging;` → `// mod staging;` in the parent, then reverted. The
+layout checker exits **1** and names the orphan:
+`src/graph/cuda_backend/tests/staging.rs: not reachable from src/main.rs — no \`mod\` declaration names it, so it is never compiled (tests in it would silently not run)`.
+The CUDA unit row drops **567 → 563** passed (the four `staging` tests), 42 ignored unchanged — so the
+tests really did move out of `tests.rs` into a file that only the declaration compiles.
+
+**Docs swept.** `AGENTS.md` (the one-sentence convention, in the existing test-file paragraph),
+`docs/SOURCE-LAYOUT-PLAN.md` (§6.4 gains the `tests.rs` → `tests/<topic>.rs` mapping row; the §Status
+table's step-6 row), and the four live anchors in `docs/cuda_tutorial/05-kernels-attention-host.md`,
+which now name `cuda_kv_f16_roundtrip_attn` at `cuda_backend/tests/kv.rs:1011` and
+`cuda_graph_replay_bit_parity` at `cuda_backend/tests/capture.rs:274`. The `#238`/`#239` test-only
+annotations in `src/graph/{cuda_backend,alloc,copystats,builder,cpu_backend}.rs`, `src/q4k_dsc.rs` and
+`src/server/batch/tests.rs` are re-anchored to the deeper module path (`…::tests::<topic>::<leaf>`);
+`src/cuda.rs` is deliberately left alone because #262 owns it in a parallel worktree, and re-anchoring
+its four `#238` paths is the one follow-up.
+
+**What the brief had wrong (the tree wins).** The ticket and the step-6 blueprint both said the file has
+"88 `fn` items = 61 `#[test]` + 1 `#[ignore]`d test + 26 helpers". Measured on the pre-split file: `61
+#[test]`, of which **2** are `#[ignore]`d (`cuda_map_window_costs_no_more_than_the_span_it_replaces` at
+`#[ignore = "timing: needs a CUDA device"]`, and `cuda_real_model_registers_q4dsc_planes_only_for_q4k`)
+plus 13 top-level helpers = **74 top-level `fn` items**; 12 further helper `fn`s are nested inside test
+bodies and 3 inside the test-only `impl CudaBackend` shim, for **89 `fn` definitions** in all. The "88"
+counted those nested helpers as items and double-counted the ignored test. The numbers that matter — 61
+tests, 2 ignored — are unchanged, and `docs/status.toml` is not edited: the suite counts do not move.
+
+**Deliberately out of scope.** The other eight files of #267 are untouched here, largest first next:
+`src/models/qwen2/graph/tests.rs` (3,399), `src/server/batch/tests.rs` (2,629),
+`src/graph/alloc/tests.rs` (1,833), `src/tooling/tests.rs` (1,669), `src/sampler/tests.rs` (1,232),
+`src/conversation/tests.rs` (1,156), `src/graph/kvcache/tests.rs` (1,134), and
+`src/cuda/issue162_tests.rs` (1,186) last, after #263 changes its launch-fixture column assertion.
