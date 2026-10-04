@@ -9752,7 +9752,7 @@ guess: `plane_budget_ok` stays in `methods/weights.rs` (all four callers are the
 | `python3 scripts/check_dead_code_oracle.py --config {cpu,cuda}` | 0 additions, 0 removals; only the two moved `file =` lines in `docs/dead-code-baseline.toml` |
 | `python3 scripts/check_doc_line_anchors.py` | **81 out-of-range → 0** (99 anchors re-pointed by the split's line map, 28 re-anchored to the symbol, 5 rebuilt by hand) |
 | `FEATURES=cuda scripts/real_model_gates.sh` ×2 | **42 / 0 ×2**, greedy output bitwise identical |
-| CI run [37200610475](https://github.com/yusiwen/minfer/actions/runs/37200610475) | **7 / 7 green**, zero code annotations |
+| CI run [37201132854](https://github.com/yusiwen/minfer/actions/runs/37201132854) | **7 / 7 green**, zero code annotations |
 
 **Mutation evidence (rule 3).** Two mutations in the worktree, each reverted:
 `src/cuda/methods/orphan.rs` → `check_source_layout` prints
