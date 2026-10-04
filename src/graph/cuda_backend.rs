@@ -663,7 +663,7 @@ impl CudaBackend {
     /// enumerated host-visible ones (logits, KV session save, debug dumps,
     /// capture fallbacks) — see `docs/BACKEND-REGISTRY-DESIGN.md` §11.
     /// (The F5 gates are tests, so the production build has no caller.)
-    /// Test-only (#238): driven by `graph::cuda_backend::tests::staging::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise` and `models::qwen2::graph::tests::async_cross_copies_never_block_and_stay_bitwise_identical`; `#[cfg(test)]` keeps it out of production builds.
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::staging::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise` and `models::qwen2::graph::tests::offload_copy::async_cross_copies_never_block_and_stay_bitwise_identical`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
     pub(crate) fn blocking_readback_count(&self) -> u64 {
         self.blocking_readbacks

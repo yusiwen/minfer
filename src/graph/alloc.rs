@@ -1206,7 +1206,7 @@ impl GraphAllocator {
     /// rows of every layer's KV arena and re-rope the survivors by `-drop`, so
     /// the same tokens become addressable at `pos - drop`. Returns the new
     /// written-row count.
-    /// Test-only (#238): driven by `models::qwen2::graph::tests::kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class`; `#[cfg(test)]` keeps it out of production builds.
+    /// Test-only (#238): driven by `models::qwen2::graph::tests::kv_reuse::kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class`; `#[cfg(test)]` keeps it out of production builds.
     #[cfg(test)]
     pub(crate) fn kv_shift(
         &mut self,

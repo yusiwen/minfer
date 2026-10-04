@@ -246,7 +246,7 @@ pub trait ModelDef: Send + Sync {
     /// Graph-based forward (Phase 6); defaults to the imperative path.
     ///
     /// Reachable from a `#[cfg(target_os = "macos")]` **test** block only
-    /// (`models::qwen2::graph::tests::graph_metal_matches_cpu_logits`), so the
+    /// (`models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits`), so the
     /// allowance names both halves of the configuration in which it is unused —
     /// a non-test build or a non-macOS host ([#244]; [#243]'s rule).
     ///
