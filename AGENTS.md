@@ -1,6 +1,6 @@
 # minfer — AI Agent Context
 
-Pure-Rust LLM inference engine written from scratch (~4400 LOC), llama.cpp-inspired, 0 ML framework deps.
+Pure-Rust LLM inference engine written from scratch (~55k LOC of Rust, ~93k with tests), llama.cpp-inspired, 0 ML framework deps.
 Qwen2/Qwen2.5 + Qwen3 (dense) · CPU + Metal (macOS) + CUDA (opt-in) · GGUF v3.
 Inference runs through a **declarative compute graph** (builder → scheduler → per-backend kernels) — design + implementation record: `docs/COMPUTE-GRAPH-DESIGN.md`.
 
@@ -43,6 +43,17 @@ src/
 ├── device_tier.rs   # cc-keyed CUDA device-tier table + selector
 └── models/          # ModelDef trait + per-arch mod/graph/loader (qwen2/, qwen3/)
 ```
+
+The backend layers: each device backend is organised as L1 runtime, L2 launch/dispatch, L3 kernel
+sources and L4 graph executor, and **only L4 is polymorphic** — `graph/backend.rs` + `graph/registry.rs`
+stay the single device seam, so the directory tree is device-first and the layer is the *second* axis
+inside each device (`<backend>/kernels/` is where kernel sources live). A shared `common` is added only
+when two backends implement it and two callers use it (`allocplan::DeviceMemory` is the one candidate
+today). CPU's `quants.rs`/`vec_ops.rs` are deliberately not a device-private layer: they are the crate's
+numeric kernel library, shared with `graph/kvformat.rs` and `graph/cuda_backend.rs`. The four long
+backend files are being split along this convention — plan and target tree:
+`docs/SOURCE-LAYOUT-PLAN.md` ([#261](https://github.com/yusiwen/minfer/issues/261)); the file list above
+is updated by each step as the code moves.
 
 `src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op + NodeMeta · `builder.rs` GraphBuilder · `scheduler.rs` assign → split → execute · `backend.rs` + `cpu_backend.rs`/`metal_backend.rs`/`cuda_backend.rs` executors · `registry.rs` backend registry (F4; F5's `copy_cross`/`await_cross`) · `alloc.rs` liveness allocator + persistent KV regions (E4) · `allocplan.rs` size-class ladder + pure plan + `DeviceMemory`/`budget_decision` · `offload.rs` layer offload plan (E5) · `kvcache.rs` cell store, removal/shift/compaction, span list, prefix sharing (C1–C3, C8b) · `kvformat.rs` KV format + `MINFER_CACHE_TYPE` gate (C4) · `kvsession.rs` versioned KV session container (C5) · `cache.rs`/`params.rs` params-only graph reuse · `fusion.rs` SwiGLU fusion · `copystats.rs` split-boundary counters · `batch.rs` batch composition · `dot.rs`/`json.rs` exporters.
 
@@ -177,6 +188,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | Qwen3-4B perf vs llama.cpp | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
 | **Architecture roadmap (system layers: IR, scheduler, allocator, KV, batching, backends — gaps + prioritized backlog)** | `docs/ARCHITECTURE-ROADMAP.md` |
 | **Architecture execution plan (phase-by-phase tickets, acceptance criteria, verification matrix; also the per-ticket history)** | `docs/ARCHITECTURE-EXECUTION-PLAN.md` |
+| **Source layout plan (device-first layering: L1 runtime / L2 launch / L3 `<backend>/kernels/` / L4 executors; the split of `cuda.rs`, `cuda_kernels.cu`, `metal.rs`, `metal.metal` — target tree + doc plan)** | `docs/SOURCE-LAYOUT-PLAN.md` |
 | **Grammar / JSON-schema constrained decoding (F2): accepted subset, refusals, mask position** | `docs/GRAMMAR-DESIGN.md` |
 | Model support roadmap (which model families to port next) | `docs/MODEL-SUPPORT-ROADMAP.md` |
 | OpenAI chat API plan | `docs/OPENAI-CHAT-API-PLAN.md` |
