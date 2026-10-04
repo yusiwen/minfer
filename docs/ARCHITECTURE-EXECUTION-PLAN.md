@@ -9820,8 +9820,8 @@ declarations, the generated `use`/`mod` preambles and the `CudaCommandBuffer` ba
 PR [#290](https://github.com/yusiwen/minfer/pull/290)): `src/quants.rs` 1,340 → **61** lines (the module
 decider: `mod` declarations + the `pub use` list + the cross-module wiring) and nine part files —
 `dot_q4_0.rs` 71 · `dot_q4_1.rs` 44 · `dot_q5.rs` 94 · `dot_q8_0.rs` 64 · `kquant.rs` 185 ·
-`quantize_q8_0.rs` 125 · `quantize_q8_k.rs` 111 · `avx2.rs` 81 · `neon.rs` 414 — plus the extracted
-`src/quants/neon_correctness.rs` 138.
+`quantize_q8_0.rs` 125 · `quantize_q8_k.rs` 114 · `avx2.rs` 81 · `neon.rs` 407 — plus the extracted
+`src/quants/neon_correctness.rs` 137.
 
 **The layout invariant.** `neon_kernels` and `neon_q8k` are **flattened** into the one `neon.rs`: their
 item names do not collide (`enabled`/`fp16`/`dot16`/`sdot_vec` + the five `dot_*` kernels vs the three
@@ -9925,7 +9925,7 @@ reverted, exit 0.
 #### Test-infrastructure record (#264 stage C, 2026-10-04) — `src/kernel.rs` becomes `src/kernel/*.rs`
 
 **What landed.** Stage C closes the CPU trio ([#264](https://github.com/yusiwen/minfer/issues/264),
-PR [#VERIFY]()): `src/kernel.rs` 667 → **22** lines (the module decider) and three part files —
+PR [#292](https://github.com/yusiwen/minfer/pull/292)): `src/kernel.rs` 667 → **22** lines (the module decider) and three part files —
 `dispatch.rs` 72 · `pool.rs` 313 · `embed.rs` 278. The old file had 10 `fn` definitions and the new
 files have the same 10 (excluding the pre-existing `tests.rs`).
 
