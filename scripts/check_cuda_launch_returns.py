@@ -42,7 +42,37 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_SOURCE = REPO / "src" / "cuda_kernels.cu"
+KERNELS_DIR = REPO / "src" / "cuda" / "kernels"
+# The shrinking remainder of the pre-#263 single TU; deleted by #263 stage 6.
+LEGACY_SOURCE = REPO / "src" / "cuda_kernels.cu"
+
+
+def default_sources() -> list[Path]:
+    """The translation units to audit, in the order ``build.rs`` compiles them.
+
+    ``build.rs``'s ``KERNEL_SOURCES``/``kernel_translation_units()`` own the list;
+    this mirrors it exactly — every ``.cu`` in ``src/cuda/kernels/`` in sorted
+    order, then the legacy remainder while it still exists.  A drift between the
+    two is what the build's new-file guard and this discovery rule bound from
+    both sides; the failure mode they share is a kernel file that never compiles
+    and is never audited.
+    """
+    sources = sorted(KERNELS_DIR.glob("*.cu")) if KERNELS_DIR.is_dir() else []
+    if LEGACY_SOURCE.exists():
+        sources.append(LEGACY_SOURCE)
+    return sources
+
+
+def headers() -> list[Path]:
+    """The ``.cuh`` headers, which must hold **no** launch site.
+
+    A `<<<>>>` in a header would be compiled into every TU that includes it: the
+    site would be audited zero times by a per-``.cu`` walk while still shipping.
+    Asserting the header is launch-free is half of what keeps "every launch site
+    reads its own error" complete (the per-file audit is the other half).
+    """
+    return sorted(KERNELS_DIR.glob("*.cuh")) if KERNELS_DIR.is_dir() else []
+
 
 
 def code_only(text: str):
@@ -392,7 +422,14 @@ def audit(source: Path):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    ap.add_argument(
+        "--source",
+        type=Path,
+        action="append",
+        help="a translation unit to audit (repeatable). Default: every .cu under "
+        "src/cuda/kernels/ in sorted order, then the legacy remainder — the same "
+        "list build.rs compiles.",
+    )
     ap.add_argument("--list", action="store_true", help="print line/owner/site/kernel")
     ap.add_argument("--fixture", type=Path, help="write the site list to PATH")
     ap.add_argument("--check-fixture", type=Path, help="compare against PATH")
@@ -402,7 +439,32 @@ def main(argv=None) -> int:
     if args.selftest:
         return selftest()
 
-    rows, problems = audit(args.source)
+    sources = args.source or default_sources()
+    if not sources:
+        print(
+            "cuda launch-return audit: no .cu sources found under %s" % KERNELS_DIR,
+            file=sys.stderr,
+        )
+        return 1
+
+    rows = []
+    problems = []
+    # The header invariant first: `<<<>>>` must never live in a `.cuh`.
+    for header in headers():
+        _code, blanked = code_only(header.read_text())
+        if "<<<" in blanked:
+            problems.append(
+                "%s: a header must not hold a launch site (%d `<<<`) — it would be "
+                "compiled into every TU that includes it and audited by none"
+                % (header.relative_to(REPO), blanked.count("<<<"))
+            )
+    for source in sources:
+        if source.suffix == ".cuh":
+            continue  # covered by the assertion above
+        file_rows, file_problems = audit(source)
+        rows.extend(file_rows)
+        problems.extend("%s: %s" % (source.relative_to(REPO), p) for p in file_problems)
+
     if args.list or args.fixture:
         for lineno, owner, site, frag in rows:
             print("%d\t%s\t%s\t%s" % (lineno, owner, site, frag))
@@ -418,8 +480,10 @@ def main(argv=None) -> int:
         ]
         # The line column is documentation for the PR table, not identity: a
         # comment above a site shifts every line and must not turn the gate red.
-        # (owner, site, kernel-fragment) is what the device gate compares.
-        want = [w[1:4] for w in want if len(w) == 4]
+        # (owner, site, kernel-fragment) is what the device gate compares.  The
+        # filter is `>= 4` so a future column (a file name, say) does not silently
+        # empty the fixture — the failure mode of the old `== 4` filter.
+        want = [w[1:4] for w in want if len(w) >= 4]
         have = [(b, c, d) for _a, b, c, d in rows]
         if want != have:
             for i, (w, h) in enumerate(zip(want, have)):
@@ -434,17 +498,13 @@ def main(argv=None) -> int:
                 )
             return 1
     if problems:
-        print(
-            "cuda launch-return audit: %d unchecked site(s) in %s"
-            % (len(problems), args.source)
-        )
+        print("cuda launch-return audit: %d unchecked site(s):" % len(problems))
         for p in problems:
             print("  " + p)
         return 1
     print(
         "cuda launch-return audit: every one of the %d <<< sites reads its own "
-        "error through minfer_launch_ok/_opt and names a launch: site"
-        % len(rows)
+        "error through minfer_launch_ok/_opt and names a launch: site" % len(rows)
     )
     return 0
 

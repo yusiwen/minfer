@@ -1,64 +1,9 @@
-// CUDA kernels for minfer — Q4_0 matmul + element-wise ops.
-
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cstdio>
-#include <cstdarg>
-#include <cstring>
-#include <mma.h>
-#include <cstdint>
-
-// ─── Block size constants (must match src/block.rs) ───────────
-#define Q4B  18   // sizeof(BlockQ4_0): half d + uchar qs[16]
-#define Q41B 20   // sizeof(BlockQ4_1): half d + half m + uchar qs[16]
-#define Q8B  34   // sizeof(BlockQ8_0): half d + char qs[32]
-#define Q4KB 144  // sizeof(BlockQ4_K)
-#define Q5KB 176  // sizeof(BlockQ5_K)
-#define Q6KB 210  // sizeof(BlockQ6_K)
-#define WARP 32
-
-// ─── #162: every `<<<>>>` reads its own launch error ─────────────────────────
-// The #147 checked-launch helpers are *defined* further down (next to the MMQ
-// launchers they were first written for), but every launch wrapper in this file
-// now uses them, and the first site (`launch_gqa_attn_split_batched_kv`) is a
-// `static` function defined well before that block. These are the C++-linkage
-// forward declarations; they live OUTSIDE any `extern "C" {` block so their
-// linkage matches the definitions.
+// CUDA kernels for minfer — the shrinking remainder of the single
+// pre-#263 translation unit.
 //
-//   minfer_launch_ok      — a REQUIRED launch: names the site and the kernel
-//                           instantiation, clears the latch it named, and records
-//                           a sticky failure that `CudaBackend::execute_node`
-//                           (ONE Rust-side check, not 65 signature changes)
-//                           turns into an `Err`, so no consumer ever reads a
-//                           stale output.
-//   minfer_launch_ok_opt  — a launch on a path with a DOCUMENTED fallback (the
-//                           MMQ fast paths, the fa-prefill smem fallback, and the
-//                           int-returning launchers whose Rust caller already
-//                           makes the decision): names the site, clears the
-//                           latch, and does NOT set the sticky.
-//   minfer_launch_block — the launch geometry with the #162 injection lever: at
-//                         an armed site the block dim becomes deliberately
-//                         illegal, so the launch fails for real with a real latch
-//                         (`cudaErrorInvalidValue`, probed on sm_121) and the
-//                         kernel never runs. Data, not 65 bespoke mechanisms.
-static void minfer_launch_prelude(const char* site, const char* kernel_name);
-static bool minfer_launch_ok(const char* site, const char* kernel_name);
-static bool minfer_launch_ok_opt(const char* site, const char* kernel_name);
-static size_t minfer_launch_smem(const char* site, size_t smem);
-static dim3 minfer_launch_block(const char* site, dim3 block);
-static dim3 minfer_launch_block(const char* site, unsigned block);
-
-// ─── Helper: warp-level sum reduction ─────────────────────────
-__device__ float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
-
-// ─── Helper: fp16 → f32 (using CUDA intrinsics) ──────────────
-__device__ float h2f(uint16_t h) {
-    return __half2float(*reinterpret_cast<const __half*>(&h));
-}
+// Each stage of #263 moved one kernel family into src/cuda/kernels/;
+// this file is deleted when it is empty (stage 6).
+#include "cuda/kernels/common.cuh"
 
 // ─── Q4_0 × Q8_0 matrix multiplication (bit-exact with CPU) ──
 // Thread block: 64 threads (2 warps × 32 lanes)
@@ -506,9 +451,6 @@ __global__ void q5_1_f32_matmul(
 
 }
 
-// forward declaration (defined with the Q4_K section below)
-__device__ void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m);
-
 // ─── Q5_K × f32 matrix multiplication ─────────────────────────
 // Q5_K super-block: 176 bytes / 256 elements — f16 d, f16 dmin, scales[12]
 // (same 6-bit packing as Q4_K), qh[32] (bit s of byte l = the >16 bit of
@@ -584,20 +526,6 @@ __global__ void q5_k_f32_matmul(
     for (int rr = 0; rr < NR0; rr++) {
         float v = warp_reduce_sum(acc[rr]);
         if (lane_id == 0 && r0 + rr < od) output[t * od + r0 + rr] = v;
-    }
-}
-
-// ─── Helper: unpack Q4_K 6-bit scale and min ────────────────
-// Q4_K stores 16 × 6-bit values (8 scales + 8 mins) packed into 12 bytes.
-// This mirrors Metal's get_scale_min_k4 and Rust block.rs::unpack_q4k_scales.
-
-__device__ void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
-    if (j < 4) {
-        *d = q[j] & 63;
-        *m = q[j + 4] & 63;
-    } else {
-        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *m = (q[j + 4] >> 4)  | ((q[j]   >> 6) << 4);
     }
 }
 
@@ -702,62 +630,8 @@ __global__ void q4_k_f32_matmul(
 // 256 threads (8 warps), int dp4a dots over q8-quantized activations, and a
 // block-wide reduction — ~917K threads in flight at the same shape.
 // Measured (bench8e2, L2-defeated, 7B shapes): 194–207 GB/s vs 112–117,
-// i.e. +74–77% per matmul; at id < 2048 the win collapses to noise
-// (launch-latency bound), so dispatch gates on id >= 2048.
-//
-// Activation layout: padded 40-byte q8_0 blocks — [f16 d][2B pad][32B int8]
-// — so the int8 payload is 4-byte aligned for the uint32/dp4a reads. The
-// scratch (buf_q8_decode) is size-stable per graph (id fixed), grown during
-// the warmup runs, never inside a capture window.
-#define Q8PB 40
 
 
-// --- D3-5 1a: fused-producer decode A-quantize ------------------------------
-// The prefill analogue is rms_norm_quant_f32_t (r51). At decode (nt==1) an
-// activation row feeds ONE MMVQ matmul group, and the standalone
-// quantize_q8_0_pad40 launch in front of every matmul is pure launch +
-// global-round-trip overhead (D3-1: ~265 launches = 0.46 ms/step). Fusing the
-// quantize into the PRODUCER (rms_norm / swiglu) removes the launch while
-// keeping every MMVQ consumer byte-identical: the epilogue below is the
-// standalone kernel's per-32-block body VERBATIM (max is exact for any
-// association; the rintf/clamp pass is elementwise), so the pad40 q8 bytes
-// are bit-identical by construction. MINFER_NO_DECODE_A_FUSE=1 reverts to the
-// standalone pair (A/B gate).
-__device__ __forceinline__ void quantize_pad40_block(
-    const float* __restrict__ src, uint8_t* __restrict__ dst
-) {
-    float4 sv[8];
-    #pragma unroll
-    for (int v = 0; v < 8; v++)
-        sv[v] = *reinterpret_cast<const float4*>(src + 4 * v);
-    float am = 0.0f;
-    #pragma unroll
-    for (int v = 0; v < 8; v++)
-        am = fmaxf(am, fmaxf(fmaxf(fabsf(sv[v].x), fabsf(sv[v].y)),
-                             fmaxf(fabsf(sv[v].z), fabsf(sv[v].w))));
-    float d = am / 127.0f;
-    float di = (d != 0.0f) ? 1.0f / d : 0.0f;
-    *reinterpret_cast<__half*>(dst) = __float2half(d);
-    int s = 0;
-    uint32_t packed[8];
-    #pragma unroll
-    for (int v = 0; v < 8; v++) {
-        const float* e = &sv[v].x;
-        uint32_t p = 0;
-        #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            int q = int(rintf(e[j] * di));
-            q = max(-128, min(127, q));
-            p |= (uint32_t)(uint8_t)(int8_t)q << (8 * j);
-            s += q;
-        }
-        packed[v] = p;
-    }
-    #pragma unroll
-    for (int v = 0; v < 8; v++)
-        *reinterpret_cast<uint32_t*>(dst + 4 + 4 * v) = packed[v];
-    *reinterpret_cast<uint32_t*>(dst + 36) = uint32_t(s);
-}
 
 // 40B layout: 2B f16 d, 2B pad, 32B int8 payload (offset 4), 4B i32 sum of the
 // quantized values (offset 36 — the pad40 slack). The sum feeds the MMQ prefill
@@ -821,9 +695,6 @@ __global__ void quantize_q8_0_pad40(
 // packed scale into [ntb][nchunk][256], both byte-identical (after the stored
 // swizzle) to what the old NB smem staging produced — the quantized values
 // (qs bytes, d, ssum) are bit-identical to quantize_q8_0_pad40, only reordered.
-#define MMQ_A_BLK 64          // tokens per A block == MMQ_NBI
-#define MMQ_A_QASZ (MMQ_A_BLK * 32)   // 2048 B: one block's swizzled qs plane
-#define MMQ_A_SDASZ (MMQ_A_BLK * 4)   // 256 B: one block's packed d|ssum
 __global__ void quantize_q8_0_pad40_t(
     const float* __restrict__ x,
     uint8_t* __restrict__ yqs,    // [ntb][nchunk][2048]
@@ -907,9 +778,6 @@ __global__ void quantize_q8_0_pad40_t(
 // registers it keyed on the f32 output's device pointer, so prefill_mmq
 // needs no change. Gated by MINFER_MMQ_A_FUSE=1 ANDed with the full MMQ
 // gate set; see CudaState::rms_norm_quant / swiglu_quant (src/cuda.rs).
-
-// rms rows per block (one warp per row, the rms_norm_f32 mapping).
-#define RMSQ_RPB 8
 
 __global__ void rms_norm_quant_f32_t(
     const float* __restrict__ x,
@@ -1335,24 +1203,6 @@ __global__ void __launch_bounds__(256) q4_k_q8_mmvq(
         #pragma unroll
         for (int k = 0; k < 8; k++) v += warp_sums[k];
         output[(size_t)t * od + row] = v;
-    }
-}
-
-// 8e follow-up: the warp+block reduction shared by the q5_K/q6_K MMVQ
-// kernels (same shape as the inline one in q4_k_q8_mmvq).
-__device__ __forceinline__ void mmvq_block_reduce(
-    float acc, float* __restrict__ output, int od, int t
-) {
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFF, acc, off);
-    __shared__ float warp_sums[8];
-    if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = acc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float v = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < 8; k++) v += warp_sums[k];
-        output[(size_t)t * od + (size_t)blockIdx.x] = v;
     }
 }
 
@@ -2652,144 +2502,6 @@ __global__ void rope_f32(
     }
 }
 
-// ─── C4 S2b: the KV layout tag and the one load idiom ────────────────────────
-//
-// A packed Q8_0 cell cannot be addressed as a typed element array, so every KV
-// address from here on is formed in BYTES: `kv_row` gives a cell's first byte and
-// `kv4<LAYOUT>` loads four elements out of a row. The three tags are a host
-// contract — the Rust side stores the same 0/1/2 codes (the `KvFormat`
-// discriminants) and every launcher takes the tag as an `int`, so a packed region
-// can never be handed to a kernel that would address it as f32 rows.
-//
-// F32 and F16 are the pre-C4 addresses verbatim (`float4`; two `__half2`), so the
-// instruction streams of those two instantiations are unchanged. Q8_0 reads block
-// `elem/32`'s f16 scale plus four quants at `2 + elem%32`: a 4-element group never
-// straddles a block, because a KV head's base is `hd`-aligned and `hd % 32 == 0`
-// (`ensure_kv`'s packed-width check enforces exactly that).
-#define KV_LAYOUT_F32 0
-#define KV_LAYOUT_F16 1
-#define KV_LAYOUT_Q8_0 2
-
-/// Elements per Q8_0 block and bytes per Q8_0 block (`block::BlockQ8_0`: one f16
-/// scale followed by 32 int8 quants).
-#define Q8_0_BLOCK_ELEMS 32
-#define Q8_0_BLOCK_BYTES 34
-
-__device__ __forceinline__ const char* kv_row(const void* base, long long cell, size_t row_bytes) {
-    return reinterpret_cast<const char*>(base) + (size_t)cell * row_bytes;
-}
-
-// `WIDE` (issue #202) selects how a four-element Q8_0 group's quants are loaded:
-// false is the incumbent four byte loads, true is two 16-bit loads. It has no
-// meaning for F32/F16, whose loads are already one / two vector loads, so only
-// the `kv4<*, false>` specialisations exist for them.
-template <int LAYOUT, bool WIDE = false>
-__device__ __forceinline__ float4 kv4(const char* row, int elem);
-
-template <>
-__device__ __forceinline__ float4 kv4<KV_LAYOUT_F32, false>(const char* row, int elem) {
-    return *reinterpret_cast<const float4*>(row + (size_t)elem * 4);
-}
-
-template <>
-__device__ __forceinline__ float4 kv4<KV_LAYOUT_F16, false>(const char* row, int elem) {
-    const __half* p = reinterpret_cast<const __half*>(row) + elem;
-    __half2 a = *reinterpret_cast<const __half2*>(p);
-    __half2 b = *reinterpret_cast<const __half2*>(p + 2);
-    float2 x = __half22float2(a);
-    float2 y = __half22float2(b);
-    return make_float4(x.x, x.y, y.x, y.y);
-}
-
-// The four quants of one 4-element group, as an `int` in little-endian byte
-// order, plus the group's Q8_0 block scale as a float.
-//
-// The incumbent load: four separate `signed char` accesses. A Q8_0 block is
-// `f16 d; i8 qs[32]` (34 B), so `blk + 2 + (elem & 31)` has no 4-byte alignment
-// guarantee (`34 * k` alternates parity) and no single 32-bit load can replace
-// them. #202 measured this as the L1 request-count cost of the packed cell: at
-// hd 64 the packed decode arm issues 1.71x the f16 arm's load sectors while
-// reading 0.57x its L2 sectors.
-__device__ __forceinline__ void q8_0_load4_bytes(
-    const unsigned char* blk, int off, int& q, float& d) {
-    d = __half2float(*reinterpret_cast<const __half*>(blk));
-    const signed char* p = reinterpret_cast<const signed char*>(blk + 2) + off;
-    q = ((int)(unsigned char)p[0]) | ((int)(unsigned char)p[1] << 8) |
-        ((int)(unsigned char)p[2] << 16) | ((int)(unsigned char)p[3] << 24);
-}
-
-// #202: the same four bytes in HALF the load instructions. `34 * k + 2 + 4m` is
-// even for every block index `k` and every 4-element-aligned offset `4m` (`34k`
-// is even, `2 + 4m` is even), so a group is always 2-byte aligned even though it
-// is only 4-byte aligned when `k` is odd. Two `unsigned short` loads therefore
-// fetch the four bytes with two L1 requests instead of four, and the two halves
-// are recombined exactly as the byte loads were. The values are bit-identical to
-// `q8_0_load4_bytes`, so this is an access-pattern change, not a numerics change.
-__device__ __forceinline__ void q8_0_load4_wide(
-    const unsigned char* blk, int off, int& q, float& d) {
-    d = __half2float(*reinterpret_cast<const __half*>(blk));
-    const unsigned char* p = blk + 2 + off;
-    const unsigned lo = *reinterpret_cast<const unsigned short*>(p);
-    const unsigned hi = *reinterpret_cast<const unsigned short*>(p + 2);
-    q = (int)(lo | (hi << 16));
-}
-
-template <bool WIDE>
-__device__ __forceinline__ void q8_0_load4(
-    const unsigned char* blk, int off, int& q, float& d) {
-    if (WIDE) q8_0_load4_wide(blk, off, q, d);
-    else q8_0_load4_bytes(blk, off, q, d);
-}
-
-template <bool WIDE>
-__device__ __forceinline__ float4 kv4_q8_0_impl(const char* row, int elem) {
-    const unsigned char* blk =
-        reinterpret_cast<const unsigned char*>(row) + (size_t)(elem >> 5) * Q8_0_BLOCK_BYTES;
-    int q;
-    float d;
-    q8_0_load4<WIDE>(blk, elem & 31, q, d);
-    return make_float4(d * (float)(signed char)(q & 0xff),
-                       d * (float)(signed char)((q >> 8) & 0xff),
-                       d * (float)(signed char)((q >> 16) & 0xff),
-                       d * (float)(signed char)((q >> 24) & 0xff));
-}
-
-template <>
-__device__ __forceinline__ float4 kv4<KV_LAYOUT_Q8_0, false>(const char* row, int elem) {
-    return kv4_q8_0_impl<false>(row, elem);
-}
-
-template <>
-__device__ __forceinline__ float4 kv4<KV_LAYOUT_Q8_0, true>(const char* row, int elem) {
-    return kv4_q8_0_impl<true>(row, elem);
-}
-
-// #186: the same four quants as `kv4<KV_LAYOUT_Q8_0>` but left in `int8`, packed
-// little-endian into one `int` for `__dp4a`, plus the block's f16 scale as a
-// float. #202's `WIDE` picks the two-16-bit-load form above.
-template <bool WIDE = false>
-__device__ __forceinline__ void kv4_q8_0_packed(const char* row, int elem, int& q, float& d) {
-    const unsigned char* blk =
-        reinterpret_cast<const unsigned char*>(row) + (size_t)(elem >> 5) * Q8_0_BLOCK_BYTES;
-    q8_0_load4<WIDE>(blk, elem & 31, q, d);
-}
-
-// #144: dequantize EIGHT consecutive elements of one packed Q8_0 KV cell into
-// eight halves (one 16-byte tensor-core staging slot). `elem` must be a multiple
-// of 8 and every head base is 32-element aligned (`ensure_kv`), so the group
-// never straddles a Q8_0 block — the same precondition `kv4<Q8_0>` relies on.
-// The dequant is `kv4<Q8_0>`'s, element for element (block scale times the signed
-// quant), rounded to half because the FA path's smem tile is f16.
-__device__ __forceinline__ void kv8_q8_0(__half* dst, const char* row, int elem) {
-    const unsigned char* blk =
-        reinterpret_cast<const unsigned char*>(row) + (size_t)(elem >> 5) * Q8_0_BLOCK_BYTES;
-    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
-    const signed char* q = reinterpret_cast<const signed char*>(blk + 2) + (elem & 31);
-    __half2* h = reinterpret_cast<__half2*>(dst);
-    #pragma unroll
-    for (int i = 0; i < 4; i++)
-        h[i] = __floats2half2_rn(d * (float)q[2 * i], d * (float)q[2 * i + 1]);
-}
 
 // ─── KV cache store: scatter nt rows into persistent cache ───
 
@@ -3075,13 +2787,6 @@ __global__ void attn_bias_rope_store_q8_0(
     }
 }
 
-// helper: convert a half4 (hd is a multiple of 4) to float4
-__device__ __forceinline__ float4 h4_to_f4(const __half* p) {
-    float2 a = __half22float2(*reinterpret_cast<const __half2*>(p));
-    float2 b = __half22float2(*reinterpret_cast<const __half2*>(p + 2));
-    return make_float4(a.x, a.y, b.x, b.y);
-}
-
 // ─── GQA Attention (online softmax, 32 threads/head/token) ───
 // q/k/v/o layout: [nt][nh][hd]; k/v stored as [nkv][nk][hd]
 
@@ -3089,103 +2794,6 @@ __device__ __forceinline__ float4 h4_to_f4(const __half* p) {
 // gqa_attn_f32 (same online softmax, same reductions); the ONLY difference
 // is the K/V load mechanics: half4 → float4 conversions, f32 accumulation
 // everywhere (Metal pl_gqa_attn_f16 precision class).
-// ─── E1: the per-query attention window ───────────────────────────────────────
-// `CAUSAL` is the pre-E1 behaviour, still what every single-sequence caller uses:
-// the bound is `positions[t] + 1` and rows start at 0. The windowed
-// instantiation (E1b, reached only when the node is `Attn { explicit_span: true }`)
-// reads the `[lo, hi)` pair the KV store's ownership resolved, with `lo` at
-// `bound[t]` and `hi` at `bound[nt + t]`.
-//
-// `CAUSAL` is a template parameter, not a runtime flag, so the causal kernels
-// compile to exactly the instructions they did before E1b — no extra index
-// arithmetic in the hot loop, which the SASS diff of the two revisions checks.
-template <bool CAUSAL>
-__device__ __forceinline__ void attn_window(
-    const int* __restrict__ bound, int t, int nt, int& row0, int& nkv) {
-    if (CAUSAL) {
-        row0 = 0;
-        nkv = bound[t] + 1;
-    } else {
-        row0 = bound[t];
-        nkv = bound[nt + t] - bound[t];
-    }
-}
-
-// ─── C8b S4: the `kv_map` window ──────────────────────────────────────────────
-// A sequence that reads a prefix in place has a window that is **not** one
-// contiguous range: `[0, r)` lives in the donor's cells and `[r, p]` in its own
-// run. `kv_map` carries it as a zero-padded list of `(cell, len)` runs, and the
-// `MAP` template flag below makes the kernels name their rows through that list.
-//
-// `MAP` is a template parameter for the same reason `CAUSAL` is (E1b): the
-// causal instantiation must compile to exactly the pre-E1 instructions, so no
-// runtime branch may enter the row walk. A map window's key set is a **prefix**
-// of the sequence's address space — every run before the query's own, plus its
-// own row — so every kernel's existing `index < limit` mask stays valid; only
-// the row *address* and the limit's value change. The window mode is the input's
-// size, so it is a build-time property (C8b S2's departure 2).
-#define KV_MAP_MAX_SPANS 4 // mirrors kvcache::KV_MAP_MAX_SPANS
-#define ATTN_WIN_CAUSAL 0  // `positions`: rows [0, positions[t] + 1)
-#define ATTN_WIN_SPAN 1    // `attn_span`: one [lo, hi) pair per query
-#define ATTN_WIN_MAP 2     // `kv_map`: (cell, len) runs per query
-
-// The map window's row count for query `t` (every run before its own, plus its
-// own row).
-__device__ __forceinline__ int attn_map_nkv(const int* __restrict__ bound, int t) {
-    const int* m = bound + (size_t)t * KV_MAP_MAX_SPANS * 2;
-    int n = 0;
-    #pragma unroll
-    for (int r = 0; r < KV_MAP_MAX_SPANS; r++) n += m[r * 2 + 1];
-    return n;
-}
-
-// The per-query window: `row0`/`nkv` for the contiguous modes, the row count for
-// the map mode (`row0` is then unused, because rows resolve through `kv_cell`).
-template <bool CAUSAL, bool MAP>
-__device__ __forceinline__ void attn_extent(
-    const int* __restrict__ bound, int t, int nt, int& row0, int& nkv) {
-    if (MAP) {
-        row0 = 0;
-        nkv = attn_map_nkv(bound, t);
-    } else {
-        attn_window<CAUSAL>(bound, t, nt, row0, nkv);
-    }
-}
-
-// The arena row that linear window index `i` names. The contiguous modes are the
-// resolved base plus the index; the map mode walks the runs, which the compiler
-// unrolls — a sharing sequence has two, so the first answers nearly every index.
-// `left` (map only) is how many rows that run still holds from `i` on, which is
-// what lets a 4-row batch resolve once and then add (see the split body): the
-// walk is per batch, not per row.
-template <bool MAP>
-__device__ __forceinline__ int kv_cell_left(
-    const int* __restrict__ bound, int qt, int row0, int i, int& left) {
-    if (!MAP) {
-        left = 4; // >= any batch the split body stages
-        return row0 + i;
-    }
-    const int* m = bound + (size_t)qt * KV_MAP_MAX_SPANS * 2;
-    int off = i;
-    #pragma unroll
-    for (int r = 0; r < KV_MAP_MAX_SPANS; r++) {
-        const int len = m[r * 2 + 1];
-        if (off < len) {
-            left = len - off;
-            return m[r * 2] + off;
-        }
-        off -= len;
-    }
-    left = 0;
-    return m[0]; // unreachable: the runs' lengths sum to nkv
-}
-
-template <bool MAP>
-__device__ __forceinline__ int kv_cell(
-    const int* __restrict__ bound, int qt, int row0, int i) {
-    int left;
-    return kv_cell_left<MAP>(bound, qt, row0, i, left);
-}
 
 template <bool CAUSAL, bool MAP>
 __global__ void gqa_attn_f32_f16kv(
@@ -5517,304 +5125,6 @@ __global__ void fa_prefill_kv(
         }
     }
 }
-
-// ─── #147/#162: read a gating return value where the call is made ───────────
-// Follow-on to #145 (docs/GPU_SAFETY.md rules 4-5). A discarded
-// `cudaFuncSetAttribute` return, a `<<<>>>` launch whose error is only seen by a
-// *later* `cudaGetLastError()` (attribution by position), and an unchecked
-// `cudaGraphDestroy` all let an error latch and resurface at a sync as a phantom
-// "kernel launch error". Every dynamic-smem opt-in and launch below goes through
-// `minfer_smem_optin()` / `minfer_launch_ok()`, which:
-//
-//   * read the call's own return value and name the failure where it is made —
-//     the site, the kernel instantiation, the attribute, the requested bytes,
-//     the device's queried `cudaDevAttrMaxSharedMemoryPerBlockOptin` limit and
-//     `cudaGetErrorName`;
-//   * SKIP a request the queried device limit already excludes, without calling
-//     it: the call could only return `cudaErrorInvalidValue` (which
-//     compute-sanitizer counts) and the launch cannot succeed anyway (#145's
-//     rule);
-//   * clear the latch they named, so nothing is left for `CudaState::sync` to
-//     mis-attribute;
-//   * return false → the caller REFUSES the launch instead of launching into a
-//     checked error.
-//
-// #162 extended that pattern from the gating sites to **every** `<<<>>>` in this
-// file, and split the answer in two: `minfer_launch_ok` is a REQUIRED launch and
-// also records a sticky failure that `CudaBackend::execute_node` — one Rust-side
-// check, not 65 signature changes — turns into an `Err`, while
-// `minfer_launch_ok_opt` names and clears for a path with a DOCUMENTED fallback
-// (the MMQ fast paths, the fa-prefill smem fallback, the int-returning launchers
-// whose Rust caller already decides). `minfer_launch_block` is the injection
-// lever every ordinary site shares. `scripts/check_cuda_launch_returns.py` audits
-// the source, the `issue162_tests` device gates drive each audited site.
-//
-// The last report is also kept in statics (`minfer_site_fail_*`) and the ordered
-// history (`minfer_site_hist_*`), so the `issue147_tests` / `issue162_tests`
-// device gates can assert the site, the requested value, the kernel
-// instantiation and the error *name* — a gate that only asserts "a message
-// appeared" cannot see a message that names the wrong call. Serial device runs
-// only, like `CudaState` itself.
-#define MINFER_SITE_MSG_MAX 640
-
-// 0 = none, 1 = dynamic-smem attribute, 2 = kernel launch, 3 = a latched error
-// found *before* a launch (an earlier call's, never blamed on the launch).
-enum {
-    MINFER_SITE_NONE = 0,
-    MINFER_SITE_ATTR = 1,
-    MINFER_SITE_LAUNCH = 2,
-    MINFER_SITE_PREEXISTING = 3
-};
-
-static char g_site_msg[MINFER_SITE_MSG_MAX];
-static char g_site_name[96];
-static int g_site_fail_count = 0;
-static int g_site_last_kind = MINFER_SITE_NONE;
-static int g_site_last_code = 0;
-static int g_site_last_bytes = 0;
-static int g_site_last_limit = 0;
-
-// ─── #162: the sticky required-launch failure ────────────────────────────────
-// A `<<<>>>` in a launcher whose output nothing else recomputes must not let the
-// op proceed: `minfer_launch_ok` records the failure here, and
-// `CudaBackend::execute_node` — ONE Rust-side check, not one per launcher —
-// drains it and returns `Err` naming the site. `minfer_launch_ok_opt` (a
-// documented fallback) deliberately does not set it. Serial device runs only.
-static int g_launch_fail_pending = 0;
-static char g_launch_fail_site[96];
-static char g_launch_fail_name[80];
-static int g_launch_fail_code = 0;
-
-// Every launch failure named at a site, in order, so the #162 gate can assert
-// that a driven dispatch reached *this* site (the report's single "last" slot
-// cannot see a second launch in the same call).
-#define MINFER_SITE_HIST_MAX 1024
-static char g_site_hist_site[MINFER_SITE_HIST_MAX][96];
-static char g_site_hist_name[MINFER_SITE_HIST_MAX][96];
-static char g_site_hist_msg[MINFER_SITE_HIST_MAX][256];
-static int g_site_hist_len = 0;
-
-extern "C" int minfer_site_fail_count(void) { return g_site_fail_count; }
-extern "C" int minfer_site_fail_kind(void) { return g_site_last_kind; }
-extern "C" int minfer_site_fail_code(void) { return g_site_last_code; }
-extern "C" int minfer_site_fail_bytes(void) { return g_site_last_bytes; }
-extern "C" int minfer_site_fail_limit(void) { return g_site_last_limit; }
-extern "C" const char* minfer_site_fail_site(void) { return g_site_name; }
-extern "C" const char* minfer_site_fail_message(void) { return g_site_msg; }
-extern "C" int minfer_launch_fail_pending(void) { return g_launch_fail_pending; }
-extern "C" const char* minfer_launch_fail_site(void) { return g_launch_fail_site; }
-extern "C" const char* minfer_launch_fail_name(void) { return g_launch_fail_name; }
-extern "C" int minfer_launch_fail_code(void) { return g_launch_fail_code; }
-extern "C" void minfer_launch_fail_clear(void) {
-    g_launch_fail_pending = 0;
-    g_launch_fail_site[0] = '\0';
-    g_launch_fail_name[0] = '\0';
-    g_launch_fail_code = 0;
-}
-extern "C" int minfer_site_hist_len(void) { return g_site_hist_len; }
-extern "C" const char* minfer_site_hist_site(int i) {
-    return (i >= 0 && i < g_site_hist_len) ? g_site_hist_site[i] : "";
-}
-extern "C" const char* minfer_site_hist_name(int i) {
-    return (i >= 0 && i < g_site_hist_len) ? g_site_hist_name[i] : "";
-}
-extern "C" const char* minfer_site_hist_msg(int i) {
-    return (i >= 0 && i < g_site_hist_len) ? g_site_hist_msg[i] : "";
-}
-extern "C" void minfer_site_hist_reset(void) { g_site_hist_len = 0; }
-
-// Called *after* `minfer_site_report`, so the entry carries the message the site
-// printed (the gate asserts the full text, not just the site token).
-static void minfer_site_history_add(const char* site, const char* name) {
-    if (g_site_hist_len >= MINFER_SITE_HIST_MAX) return;
-    snprintf(g_site_hist_site[g_site_hist_len], sizeof(g_site_hist_site[0]), "%s", site);
-    snprintf(g_site_hist_name[g_site_hist_len], sizeof(g_site_hist_name[0]), "%s", name);
-    snprintf(g_site_hist_msg[g_site_hist_len], sizeof(g_site_hist_msg[0]), "%s", g_site_msg);
-    g_site_hist_len++;
-}
-
-// Start a fresh observation: the device gates assert one failure at a time.
-extern "C" void minfer_site_fail_reset(void) {
-    g_site_fail_count = 0;
-    g_site_last_kind = MINFER_SITE_NONE;
-    g_site_last_code = 0;
-    g_site_last_bytes = 0;
-    g_site_last_limit = 0;
-    g_site_name[0] = '\0';
-    g_site_msg[0] = '\0';
-    minfer_launch_fail_clear();
-    minfer_site_hist_reset();
-}
-
-static void minfer_site_report(const char* site, int kind, int code, int bytes, int limit,
-                               const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(g_site_msg, sizeof(g_site_msg), fmt, ap);
-    va_end(ap);
-    g_site_fail_count++;
-    g_site_last_kind = kind;
-    g_site_last_code = code;
-    g_site_last_bytes = bytes;
-    g_site_last_limit = limit;
-    snprintf(g_site_name, sizeof(g_site_name), "%s", site);
-    fprintf(stderr, "minfer/cuda: %s\n", g_site_msg);
-}
-
-// Test injection (issue #147), env-gated like #145's `MINFER_TEST_LATCH_ERROR`:
-// `MINFER_TEST_CALL_FAIL` is a comma-separated list of site tokens, or `all`.
-// This is the device half of the one failure-injection seam (issue #171,
-// `src/testfail.rs` documents the Rust half and the shared matching rule); the
-// Rust matcher `testfail::injection_names_site` and this function must stay
-// exact-token identical (no substring matching).
-// A named site performs its REAL call with a value that makes it fail — an
-// over-limit attribute request, an over-limit dynamic-smem launch, or (Rust
-// side) `cudaGraphDestroy` on the `cudaGraphExec_t` — so the failure is a real
-// latch the site must name and clear, not a synthetic return value. That is what
-// makes "no latched error reaches sync" a meaningful assertion. The knob is off
-// in every default run, so `compute-sanitizer --tool memcheck` over the suite
-// never sees such a call. Token matching is exact (no substring surprises).
-static bool minfer_test_call_fails(const char* site) {
-    const char* v = getenv("MINFER_TEST_CALL_FAIL");
-    if (v == 0) return false;
-    const size_t sl = strlen(site);
-    const char* p = v;
-    while (*p != '\0') {
-        while (*p == ',' || *p == ' ') p++;
-        const char* q = p;
-        while (*q != '\0' && *q != ',') q++;
-        size_t n = (size_t)(q - p);
-        while (n > 0 && p[n - 1] == ' ') n--;
-        if ((n == 3 && strncmp(p, "all", 3) == 0) || (n == sl && strncmp(p, site, n) == 0))
-            return true;
-        p = q;
-    }
-    return false;
-}
-
-// The device's `cudaDevAttrMaxSharedMemoryPerBlockOptin`, queried once.
-// Negative = the query failed ("unknown"), in which case no request is skipped
-// on its account and the call's own return value decides.
-static int g_minfer_optin_limit = -2;
-static int minfer_optin_limit(void) {
-    if (g_minfer_optin_limit == -2) {
-        int dev = 0, v = 0;
-        cudaGetDevice(&dev);
-        cudaError_t e = cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-        if (e != cudaSuccess) {
-            cudaGetLastError();
-            v = -1;
-        }
-        g_minfer_optin_limit = v;
-    }
-    return g_minfer_optin_limit;
-}
-
-// The dynamic-smem opt-in for one kernel instantiation (issue #147), the single
-// place a `cudaFuncSetAttribute` return value is read. Returns true when `bytes`
-// bytes are in force for `fn`; false means the following launch must be REFUSED,
-// because it cannot succeed.
-static bool minfer_smem_optin(const char* site, const char* kernel_name, const void* fn,
-                              int bytes) {
-    const bool injected = minfer_test_call_fails(site);
-    // The 48 KiB default cap admits it — nothing to opt into, nothing to check.
-    if (!injected && bytes <= 48 * 1024) return true;
-    const int limit = minfer_optin_limit();
-    if (!injected && limit > 0 && bytes > limit) {
-        // #145's rule: a request the queried device limit already excludes is
-        // skipped WITHOUT calling it — the call could only return
-        // cudaErrorInvalidValue, which compute-sanitizer counts, and the launch
-        // cannot succeed anyway.
-        minfer_site_report(site, MINFER_SITE_ATTR, (int)cudaErrorInvalidValue, bytes, limit,
-                           "cudaFuncSetAttribute(%s, "
-                           "cudaFuncAttributeMaxDynamicSharedMemorySize, %d B) SKIPPED: the "
-                           "request exceeds cudaDevAttrMaxSharedMemoryPerBlockOptin (%d B), the "
-                           "launch cannot succeed and the call is not made (#147/%s)",
-                           kernel_name, bytes, limit, site);
-        return false;
-    }
-    // The injection asks one page over the device limit: a real failing call
-    // with a real latch, which the failure path below must name and clear.
-    const int ask = injected ? (limit > 0 ? limit + 4096 : 48 * 1024 + 4096) : bytes;
-    cudaError_t e = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, ask);
-    if (e != cudaSuccess) {
-        minfer_site_report(site, MINFER_SITE_ATTR, (int)e, ask, limit,
-                           "cudaFuncSetAttribute(%s, "
-                           "cudaFuncAttributeMaxDynamicSharedMemorySize, %d B) failed: %s (%d); "
-                           "device cudaDevAttrMaxSharedMemoryPerBlockOptin = %d B — the launch "
-                           "is refused (#147/%s)",
-                           kernel_name, ask, cudaGetErrorName(e), (int)e, limit, site);
-        cudaGetLastError();  // this site owns the error; never leave it for sync
-        return false;
-    }
-    return true;
-}
-
-// A pre-launch latch is an *earlier* call's error and is reported as such, so
-// the post-launch read below is a launch check and not attribution by position.
-static void minfer_launch_prelude(const char* site, const char* kernel_name) {
-    cudaError_t pre = cudaGetLastError();
-    if (pre != cudaSuccess) {
-        minfer_site_report(site, MINFER_SITE_PREEXISTING, (int)pre, 0, 0,
-                           "a latched CUDA error %s (%d) was found before the %s launch and is "
-                           "NOT attributed to it: an earlier call on this thread did not check "
-                           "its own return value (#147/%s)",
-                           cudaGetErrorName(pre), (int)pre, kernel_name, site);
-    }
-}
-
-// The launch's dynamic-smem argument, made over-limit when the test knob names
-// the launch site. Probed on GB10/sm_121: an over-limit dynamic-smem launch is
-// rejected by the launch call itself with cudaErrorInvalidValue and the kernel
-// never runs (see the closing comment on #147).
-static size_t minfer_launch_smem(const char* site, size_t smem) {
-    return minfer_test_call_fails(site) ? smem + (16u << 20) : smem;
-}
-
-// #162: the launch geometry, the injection lever every site shares. When the test
-// knob names the site the block becomes 4096 threads (over the 1024/block device
-// limit), so `<<<>>>` itself returns cudaErrorInvalidValue for real and the
-// kernel never runs — probed on GB10/sm_121. A thread-count lever (rather than a
-// dynamic-smem one) works for every launcher, including those with no dynamic
-// smem: adding a site's coverage is data, not another bespoke mechanism.
-#define MINFER_ILLEGAL_BLOCK 4096u
-static dim3 minfer_launch_block(const char* site, dim3 block) {
-    return minfer_test_call_fails(site) ? dim3(MINFER_ILLEGAL_BLOCK, 1, 1) : block;
-}
-static dim3 minfer_launch_block(const char* site, unsigned block) {
-    return minfer_test_call_fails(site) ? dim3(MINFER_ILLEGAL_BLOCK, 1, 1)
-                                        : dim3(block, 1, 1);
-}
-
-// The error of the launch just issued: a `<<<>>>` has no return value, and the
-// immediately-following cudaGetLastError is the documented *launch* check
-// (nothing runs in between). `required` selects the severity: a required launch
-// also records the sticky that `CudaBackend::execute_node` turns into an `Err`,
-// while an `_opt` site (a documented fallback) only names and clears.
-static bool minfer_launch_read(const char* site, const char* kernel_name, bool required) {
-    cudaError_t e = cudaGetLastError();
-    if (e == cudaSuccess) return true;
-    minfer_site_report(site, MINFER_SITE_LAUNCH, (int)e, 0, 0,
-                       "kernel launch %s failed: %s (%d) — the launch is refused (#162/%s)",
-                       kernel_name, cudaGetErrorName(e), (int)e, site);
-    minfer_site_history_add(site, kernel_name);
-    cudaGetLastError();  // this site owns the error
-    if (required) {
-        g_launch_fail_pending = 1;
-        g_launch_fail_code = (int)e;
-        snprintf(g_launch_fail_site, sizeof(g_launch_fail_site), "%s", site);
-        snprintf(g_launch_fail_name, sizeof(g_launch_fail_name), "%s", kernel_name);
-    }
-    return false;
-}
-
-static bool minfer_launch_ok(const char* site, const char* kernel_name) {
-    return minfer_launch_read(site, kernel_name, true);
-}
-static bool minfer_launch_ok_opt(const char* site, const char* kernel_name) {
-    return minfer_launch_read(site, kernel_name, false);
-}
-
 extern "C" {
 
 int launch_fa_prefill_kv(
@@ -6159,15 +5469,6 @@ __device__ __forceinline__ void gemm_load_tile_sync(
 }
 
 #if __CUDA_ARCH__ >= 800
-__device__ __forceinline__ void gemm_cp16(__half* smem_dst, const __half* gsrc, bool full) {
-    unsigned d = (unsigned)__cvta_generic_to_shared(smem_dst);
-    int sz = full ? 16 : 0; // src-size 0 => zero-fill the 16B chunk
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d),
-                 "l"(gsrc), "r"(sz));
-}
-__device__ __forceinline__ void gemm_cp_commit() { asm volatile("cp.async.commit_group;\n"); }
-__device__ __forceinline__ void gemm_cp_wait1() { asm volatile("cp.async.wait_group 1;\n"); }
-__device__ __forceinline__ void gemm_cp_wait0() { asm volatile("cp.async.wait_group 0;\n"); }
 
 __device__ __forceinline__ void gemm_load_tile_async(
     const __half* __restrict__ A, const __half* __restrict__ B,
@@ -7168,10 +6469,6 @@ void launch_gemm_qb_nt(
 // threads per row (one 16B half each) so consecutive threads read
 // consecutive bytes instead of striding across rows.
 
-#define MMQ_BI 64   // tokens (i) per block tile
-#define MMQ_BJ 64   // od rows (j) per block tile
-#define MMQ_WS 9    // shared words per tile row: 8 data + 1 bank-conflict pad
-#define MMQ_KD 8    // 32-k chunks staged per buffer (256-k, llama.cpp-style);
                 // ~94KB smem/block, llama.cpp ITER_K-style; measured faster than
                 // KD=4 (2 blocks/SM) under load — revisit on a quiet GPU
 
@@ -7356,22 +6653,6 @@ __device__ __forceinline__ void mmq_stage_b(
             qb[r * MMQ_WS + w] = __vsubss4((int)(nib | hi), 0x20202020);
         }
     }
-}
-
-__device__ __forceinline__ void mmq_mma_k32(int* d, const int* a, const int* b) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
-__device__ __forceinline__ void mmq_mma_k16(int* d, const int* a, int b) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
-        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
-        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(b));
 }
 
 // TYPE: 0 q8_0, 1 q4_0, 2 q4_1, 3 q5_0, 4 q5_1, 5 q4_K, 6 q5_K, 7 q6_K.
@@ -8089,8 +7370,6 @@ __global__ void __launch_bounds__(256) mmq_raw_wide_nt_kernel(
 //   reg0 byte j = nibble(sg&1 ? hi : lo) of qs[(sg>>1)*32 + (l&3)*4 + j]
 //   reg1 byte j = nibble(sg&1 ? hi : lo) of qs[(sg>>1)*32 + 16 + (l&3)*4 + j]
 // (0x0F0F0F0F low, (v>>4)&0x0F0F0F0F high; upper nibble zero => positive int8).
-static constexpr int MMQ_NBI = 64;   // tokens (i) per block tile
-static constexpr int MMQ_NBJ = 128;  // od rows (j) per block tile
 template <int KDR>
 __global__ void __launch_bounds__(256) mmq_raw_nb_kernel(
     const uint8_t* __restrict__ W, const uint8_t* __restrict__ q8x,
@@ -9420,25 +8699,6 @@ extern "C" int launch_mmq_nt(
 // Per (row, token) the op order matches the sibling single-token kernel,
 // so a multi launch is bitwise-equal to nt separate single launches.
 
-__device__ __forceinline__ void mmvq_block_reduce_multi(
-    const float* acc /* [8] */, float* __restrict__ output, int od, int nt, int t0
-) {
-    __shared__ float warp_sums[8];
-    for (int t = 0; t < nt; ++t) {
-        float a = acc[t];
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xFFFFFFFF, a, off);
-        if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = a;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float v = 0.0f;
-            #pragma unroll
-            for (int k = 0; k < 8; k++) v += warp_sums[k];
-            output[(size_t)(t0 + t) * od + (size_t)blockIdx.x] = v;
-        }
-        __syncthreads(); // warp_sums is rewritten by the next iteration
-    }
-}
 
 __global__ void __launch_bounds__(256) q4_k_q8_mmvq_multi(
     const uint8_t* __restrict__ weights,
