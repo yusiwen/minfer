@@ -588,7 +588,7 @@ repo's files by split prefix, matches the requested quant
 case-insensitively against the group base name (`…-q4_k_m`), expands an
 exact part filename to its whole group, and errors with the available
 choices when the request is missing or ambiguous. Unit tests cover all of
-those branches (`src/download/mod.rs:544-633`).
+those branches (`src/download/tests.rs:14-89`).
 
 #### Cache layout and `minfer list`
 
@@ -798,7 +798,7 @@ because the seed is stable.
   have.
 - **Split models enter through part 0.** Both resolution paths (cached-name
   collapse, `match_model` group expansion) guarantee the returned path is
-  `…-00001-of-0000N.gguf`, because `gguf::resolve_splits` (`gguf.rs:1979`)
+  `…-00001-of-0000N.gguf`, because `gguf::resolve_splits` (`gguf.rs:1790`)
   refuses to act as the entry when handed a later part. The resolver and
   the loader co-own that convention.
 - **Server-like modes never consume stdin.** `serve`/`viz`/`--cnv` read
@@ -824,9 +824,9 @@ because the seed is stable.
 - **`minfer download hf Qwen/Qwen2.5-0.5B-Instruct-GGUF q4_0`** — shows the
   whole download path: API listing, quant match, curl progress bar, and on
   a second run the `Already cached: …` line proving the size check passed.
-- **Unit tests** — `src/download/mod.rs:544-633` covers quant matching
+- **Unit tests** — `src/download/tests.rs:14-89` covers quant matching
   (single/split, case-insensitivity, ambiguity, exact-filename expansion)
-  and `src/gguf.rs:2059` covers split-filename parsing — the two pieces of
+  and `src/gguf/tests.rs:6` covers split-filename parsing — the two pieces of
   logic the resolver leans on.
 - **Integration tests** — `tests/conversation_cli.rs` spawns the real
   binary with piped stdin: it asserts `--cnv --no-template` errors before

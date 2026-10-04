@@ -1244,7 +1244,7 @@ rebuild with the unfused node set — reliable A/B. The flip side: the fused
 and unfused graphs must be *bit-identical* in output, and the unfused path
 must still run the FusionPass (AGENTS.md rule 7) so that the only
 difference between the two runs is the QKV fusion itself. The test
-`fuse_flags_are_part_of_the_reuse_identity` (`cache.rs:135-169`) pins the
+`fuse_flags_are_part_of_the_reuse_identity` (`cache/tests.rs:36`) pins the
 identity half.
 
 **6. Graph uid discipline.** A reused graph keeps its `uid`; a rebuilt one
@@ -1325,18 +1325,18 @@ the evidence is on stderr of any plain run.
   (128 f32) — which is the append-only KV made tangible; the per-step
   logits dumps let you diff GPU vs CPU decode runs layer by layer.
 - **Unit tests.** `src/graph/cache.rs` covers the reuse contract directly:
-  `reuse_requires_equal_params` (`cache.rs:172-200` — n_tokens / gtype /
+  `reuse_requires_equal_params` (`cache/tests.rs:126` — n_tokens / gtype /
   weights_version changes all force rebuilds),
-  `allocator_survives_rebuild` (`cache.rs:203-217` — a persistent region
+  `allocator_survives_rebuild` (`cache/tests.rs:159` — a persistent region
   registered before a rebuild is still there after),
-  `fuse_flags_are_part_of_the_reuse_identity` (`cache.rs:135-169`), and
-  `structural_check_detects_different_graph` (`cache.rs:220-234`). On the
+  `fuse_flags_are_part_of_the_reuse_identity` (`cache/tests.rs:36`), and
+  `structural_check_detects_different_graph` (`cache/tests.rs:176`). On the
   model side, `forward_cached_isolates_kv_between_caches`
-  (`src/models/qwen2/graph.rs:1321`) proves two caches don't share KV. The
+  (`src/models/qwen2/graph/tests.rs:3306`) proves two caches don't share KV. The
   conversation state machine is tested without a model via a mock engine:
-  `second_turn_appends_only_delta` (`conversation.rs:767-792`) asserts the
+  `second_turn_appends_only_delta` (`conversation/tests.rs:223`) asserts the
   delta prefill is smaller than the first turn's, and
-  `context_fill_during_decode_stops_cleanly` (`conversation.rs:935-951`)
+  `context_fill_during_decode_stops_cleanly` (`conversation/tests.rs:575`)
   pins the cursor-vs-`n_ctx` guard.
 - **`bench -n N <model>`.** Runs decode for a fixed `N` and reports the
   pure-decode rate in md/csv/json — the reproducible version of the

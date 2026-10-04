@@ -103,8 +103,8 @@ Two honest wrinkles:
   launcher must live in the TU that instantiates its kernel (§5). `src/cuda/kernels/` therefore means
   "the CUDA translation units", not "device code only"; the Rust half of L2 is `src/cuda/impl/`.
 - **CPU is the exception**: `quants.rs` and `vec_ops.rs` are not device-private layers — they are the
-  crate's numeric kernel library (`graph/kvformat.rs:277/291/377/379` uses
-  `quants::quantize_row_q8_0_into`, `graph/cuda_backend.rs:14` uses `vec_ops::RopeStyle`), so they
+  crate's numeric kernel library (`graph/kvformat.rs` uses
+  `quants::quantize_row_q8_0_into`, `graph/cuda_backend.rs` uses `vec_ops::RopeStyle`), so they
   stay where they are and are split by ISA, not into a `kernels/` directory.
 
 ## 4. Steps
