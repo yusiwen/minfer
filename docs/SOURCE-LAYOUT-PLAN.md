@@ -24,7 +24,7 @@
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
-| 6 long test files | #267 | **files 1–5 landed** (PRs #275, #277, #278, #279, #280): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); 4 files left |
+| 6 long test files | #267 | **files 1–8 landed** (PRs #275, #277, #278, #279, #280, #281): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` left, after #263 |
 
 Each step appends its dated record here when it lands (gates run, counts, box label).
 
@@ -381,6 +381,9 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/server/batch/tests.rs` | `src/server/batch/tests/{kv_sharing,slots,prefill,batching,stall,http,metrics}.rs` |
 | `src/graph/alloc/tests.rs` | `src/graph/alloc/tests/{backend_fence,views,liveness,kv_arena,staging,budget}.rs` |
 | `src/tooling/tests.rs` | `src/tooling/tests/{parse,f16_encode,f6_roundtrip,f141_device,f167_qwen3,quantize_bounds,bf16}.rs` |
+| `src/sampler/tests.rs` | `src/sampler/tests/{greedy_topk,penalties,stops,minp_typical,xtc,dry,mirostat,bias_validate,defaults,grammar}.rs` |
+| `src/conversation/tests.rs` | `src/conversation/tests/{turns,regen,spec,snapshot,overflow,real_model}.rs` |
+| `src/graph/kvcache/tests.rs` | `src/graph/kvcache/tests/{cells,spans,sharing,resize,defrag}.rs` |
 
 ### 6.5 The macOS hand-off (decided 2026-10-04: Step 4 is Mac-local)
 
