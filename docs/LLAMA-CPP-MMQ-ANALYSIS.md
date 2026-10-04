@@ -10,7 +10,7 @@ r25 SASS opcode-class census, both reproduced verbatim below.
 `ggml/src/ggml-cuda/{mmq.cuh, mmq-vec-dot.cuh, mmq-load-tiles.cuh, mma.cuh,
 mmq-config-ampere.cuh, mmq.cu, quantize.cu}`, plus `ggml/src/ggml-common.h` and
 `ggml/src/ggml-quants.c`. minfer at the r25 HEAD: `src/cuda_kernels.cu`
-(`mmq_raw_wide_nt_kernel<KDR>` + `mmq_stage_b`). Where the campaign document and the source
+(today `src/cuda/kernels/mmq_raw.cu`; `mmq_raw_wide_nt_kernel<KDR>` + `mmq_stage_b`). Where the campaign document and the source
 disagree, the discrepancy is listed in §Corrections rather than silently repeated. (This write-up
 was re-verified against the source line-by-line by the post-r25 audit; the audit's corrections are
 the resolved items in §Corrections.)

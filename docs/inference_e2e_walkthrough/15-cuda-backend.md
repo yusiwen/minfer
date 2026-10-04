@@ -1,7 +1,7 @@
 # 15 · The CUDA backend
 
 > **Stage**: the Metal contrast (doc 14) → **this stage: the same compute graph on NVIDIA GPUs** → end of the series ([Index](./README.md)).
-> **Code**: `src/graph/cuda_backend.rs` (`CudaBackend`, `execute_node_inner`, `graph_replay_step`), `src/cuda.rs` (`CudaState` singleton, `register_weight`, `matmul_f32_ptr_layout`, `prefill_mmq`, `gqa_attn_split`), `src/cuda_kernels.cu` (the CUDA C++ kernels, ~10,200 lines; it becomes `src/cuda/kernels/*.cu` in [#263](https://github.com/yusiwen/minfer/issues/263)), `build.rs` (the nvcc build chain).
+> **Code**: `src/graph/cuda_backend.rs` (`CudaBackend`, `execute_node_inner`, `graph_replay_step`), `src/cuda.rs` (`CudaState` singleton, `register_weight`, `matmul_f32_ptr_layout`, `prefill_mmq`, `gqa_attn_split`), `src/cuda/kernels/*.cu` (the CUDA C++ kernels — `common.cuh` + 17 translation units, 9,996 lines, since [#263](https://github.com/yusiwen/minfer/issues/263)), `build.rs` (the nvcc build chain).
 
 ## 1. Background — where this stage sits
 
@@ -16,7 +16,8 @@ allocation rules, the same safety contract — executed on an NVIDIA GPU.
 The CUDA backend is the third backend of the engine and the only one that is
 **opt-in at build time**. A plain `cargo build --release` never touches the
 CUDA toolchain at all; adding `--features cuda` makes `build.rs` locate
-`nvcc`, compile `src/cuda_kernels.cu` into a static library, and link it in
+`nvcc`, compile each `src/cuda/kernels/*.cu` into an object file, archive them
+into `libcuda_kernels.a`, and link it in
 (`docs/BUILD.md` records the full recipe, including which GPU architectures
 get machine code baked in). That opt-in flag is why the file
 `src/graph/cuda_backend.rs` — the subject of most of this document — is
@@ -26,21 +27,24 @@ builds.
 Three source files cooperate, and keeping their roles separate makes the rest
 of the document easy to follow:
 
-- **`src/cuda.rs` (6,578 lines of Rust)** — the *device layer*. A
+- **`src/cuda.rs` (1,014 lines of Rust)** plus the 18 `src/cuda/methods/*.rs` family files — the
+  *device layer*. A
   process-wide singleton, `CudaState`, owns the CUDA context pieces: the
   device, one command stream, the weight registry (name → device pointer),
   the KV-cache regions, pinned-host staging pools, and one host-side wrapper
   function per kernel. It talks to the CUDA runtime through hand-written
   `extern "C"` declarations (there is no `-lcuda` crate and no bindgen — the
   FFI surface is explicit and auditable).
-- **`src/graph/cuda_backend.rs` (2,276 lines + 8,384 lines of tests)** — the *graph
+- **`src/graph/cuda_backend.rs` (2,351 lines + 8,511 lines of tests in a 106-line parent and 11
+  `tests/<topic>.rs` files)** — the *graph
   backend*. It implements the same `Backend` trait as the CPU and Metal
   backends (doc 08): `supports_op`, a device buffer pool, `execute_node`,
   host read/write, `synchronize`. Its job is translation, not math: turn a
   `CNode` into one or two kernel launches on the shared stream, and enforce
   the kernel invariants loudly (`Err`) when they are violated.
-- **`src/cuda_kernels.cu`** — the *kernels themselves*, CUDA C++ compiled by
-  nvcc. Every function the backend calls is a `launch_*` wrapper in
+- **`src/cuda/kernels/*.cu`** — the *kernels themselves*, CUDA C++ compiled by
+  nvcc, one translation unit per kernel family (`common.cuh` holds the shared
+  macros/helpers). Every function the backend calls is a `launch_*` wrapper in
   `cuda.rs` that eventually reaches a `__global__` kernel here.
 
 Everything upstream of this doc is unchanged by the backend swap: the graph
@@ -462,10 +466,17 @@ the reasoning and the gates that pin it are in
 `docs/CUDA-BACKEND-DESIGN.md` §2.4.
 
 Weights register through `register_weight` — a `cudaMalloc` plus one
-blocking H2D `cudaMemcpy` of the raw GGUF bytes:
+**stream-ordered** H2D copy of the raw GGUF bytes. Since
+[#188](https://github.com/yusiwen/minfer/issues/188) that copy is
+`cudaMemcpyAsync` on the **context** stream followed by a
+`cudaStreamSynchronize`, deliberately *not* the legacy-null-stream blocking
+`cudaMemcpy`: the blocking form is not a stream operation at all, so while
+another thread holds a capture window open on a different stream it
+participates in the legacy default stream's implicit global synchronization —
+exactly the call that invalidated the capture before #188.
 
 ```rust
-// src/cuda.rs:676-712 (core of register_weight)
+// src/cuda/methods/weights.rs:39-87 (core of register_weight)
 let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
 let err = unsafe { cudaMalloc(&mut ptr, data.len()) };
 if err != 0 || ptr.is_null() {
@@ -473,13 +484,22 @@ if err != 0 || ptr.is_null() {
     return;
 }
 let err = unsafe {
-    cudaMemcpy(
+    // Issue #188: stream-ordered, not the legacy-null-stream blocking
+    // `cudaMemcpy`. ... Queuing the copy on the context's own stream
+    // and waiting on that stream keeps the registration a bounded,
+    // stream-scoped operation.
+    cudaMemcpyAsync(
         ptr,
         data.as_ptr() as *const std::ffi::c_void,
         data.len(),
         CUDA_MEMCPY_HOST_TO_DEVICE,
+        self.context_stream(),
     )
 };
+if err == 0 {
+    let serr = unsafe { cudaStreamSynchronize(self.context_stream()) };
+    // ... a non-zero `serr` names the error and frees the buffer
+}
 if err != 0 {
     eprintln!("CUDA: failed to copy '{}' to device", name);
     unsafe { cudaFree(ptr) };
@@ -491,6 +511,11 @@ self.padded_weights.lock().unwrap().remove(name);
 self.weights.lock().unwrap()
     .insert(name.to_string(), (CudaPtr(ptr), data.len()));
 ```
+
+The pre-#188 blocking form survives only as the test-only
+`register_weight_blocking_legacy` probe (`weights.rs:99-131`), which the capture
+acceptance probe needs in order to measure the capture mode against the
+*historical* setup.
 
 The comment lines this excerpt elides contain two ownership rules that
 matter: a re-registration with the **same name and size reuses the existing

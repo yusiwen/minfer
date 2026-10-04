@@ -68,12 +68,14 @@ Each device backend is organised along four layers, and **only the last one is p
 
 | layer | CUDA | Metal | CPU |
 |---|---|---|---|
-| L1 device/runtime | `src/cuda/{init,weights,stream,buffers,copy,events,capture}.rs` | `src/metal/runtime.rs` | — (std threads) |
-| L2 launch/dispatch | `src/cuda/impl/<family>.rs` + the `extern "C"` declarations each family owns | `src/metal/encode.rs` + `ops.rs` | `src/kernel/*.rs` |
+| L1 device/runtime | `src/cuda/methods/{init,weights,stream,buffers,copy,events,capture}.rs` | `src/metal/runtime.rs` | — (std threads) |
+| L2 launch/dispatch | `src/cuda/methods/<family>.rs` + the `extern "C"` declarations each family owns (under `src/cuda/methods.rs`) | `src/metal/encode.rs` + `ops.rs` | `src/kernel/*.rs` |
 | L3 kernel sources | `src/cuda/kernels/*.cu` + `common.cuh` | `src/metal/kernels/*.metal` | `src/quants/*.rs`, `src/vec_ops/*.rs` |
 | L4 graph executor | `src/graph/cuda_backend.rs` | `src/graph/metal_backend.rs` | `src/graph/cpu_backend.rs` |
 
-(The CUDA and Metal paths in that table are the target of the split; `docs/SOURCE-LAYOUT-PLAN.md` §8 has
+(The CUDA paths in that table have landed ([#262](https://github.com/yusiwen/minfer/issues/262),
+[#263](https://github.com/yusiwen/minfer/issues/263)); the Metal ones are still the target of Step 4
+([#265](https://github.com/yusiwen/minfer/issues/265), Mac-local). `docs/SOURCE-LAYOUT-PLAN.md` §8 has
 the file-by-file tree and each step updates this table as it lands.)
 
 Two rules follow, and they are why the crate keeps **one flat interface** instead of a directory per

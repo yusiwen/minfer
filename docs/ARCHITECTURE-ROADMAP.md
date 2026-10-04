@@ -83,7 +83,7 @@ and mostly *enabled* by fixing (1) and (2) first.
 | `src/` Rust | 44,105 LOC across 48 files |
 | Largest files | `graph/cuda_backend.rs` 6,664 · `src/cuda.rs` 6,340 · `metal.rs` 3,944 · `models/qwen2/graph.rs` 2,253 · `gguf.rs` 2,096 |
 | Compute-graph core (`src/graph/`) | 13,052 LOC; 3,391 LOC excluding the three backends |
-| CUDA kernels | `src/cuda_kernels.cu` (single TU, compiled by `build.rs` only under `--features cuda`) |
+| CUDA kernels | `src/cuda/kernels/*.cu` (17 translation units + `common.cuh`, compiled by `build.rs` only under `--features cuda`; [#263](https://github.com/yusiwen/minfer/issues/263)) |
 | Metal shaders | `src/metal.metal` → `minfer.metallib` at build time, source-compile fallback |
 | Tests | 5 integration files (`tests/`, ~3.1k LOC, four of them Metal-only) + inline `#[cfg(test)]` |
 | Docs | ~182 Markdown files; 41 in `docs/`, 106 numbered CUDA campaign records |
@@ -268,7 +268,7 @@ scan a free list for an exact byte-length match and otherwise allocate fresh.
    generation — stops moving) and gave `GraphCache` one graph per `GraphParams`,
    so a switch is a re-map, not a build (§14 row 3, closed by E4 S3).
 3. **No VRAM budget or feasibility check.** `cudaMemGetInfo` is queried once at
-   init and only printed (`src/cuda.rs:500-521`); the sole consumer of free-memory
+   init and only printed (`src/cuda/methods/init.rs:126`); the sole consumer of free-memory
    information today is a valve guarding the optional f16 weight cache
    (`src/cuda/methods.rs:57-62`) — the activation/KV allocator has no accounting at all.
    Out-of-memory surfaces as a null pointer that fails at execute time
@@ -451,7 +451,7 @@ sites, each of which had to be taught about a new backend.
 GPU participation is decided by an all-or-nothing model-level gate: every weight
 must be registered on the GPU or the model runs on CPU (`ARCHITECTURE.md §5.2`;
 `CUDA-BACKEND-DESIGN.md:251-255`). The engine enumerates devices and honours
-`--gpu N` but uses exactly one (`src/cuda.rs:440-476`); there is no
+`--gpu N` but uses exactly one (`src/cuda/methods/init.rs:63-81`); there is no
 `tensor_split`, no peer copies, and no remote-device backend.
 
 **Gap.** 🟠 Two axes.
@@ -814,7 +814,7 @@ hazards that the larger work would otherwise have to work around.
 | Backend trait | `src/graph/backend.rs` |
 | Backend registry (F4) | `src/graph/registry.rs`, `docs/BACKEND-REGISTRY-DESIGN.md` |
 | CPU execution | `src/graph/cpu_backend.rs`, `src/kernel.rs`, `src/quants.rs` |
-| CUDA execution | `src/graph/cuda_backend.rs`, `src/cuda.rs`, `src/cuda_kernels.cu` |
+| CUDA execution | `src/graph/cuda_backend.rs`, `src/cuda.rs`, `src/cuda/kernels/*.cu` |
 | Metal execution | `src/graph/metal_backend.rs`, `src/metal.rs`, `src/metal.metal` |
 | Models | `src/models/mod.rs`, `models/qwen2/graph.rs`, `models/qwen3/graph.rs` |
 | Serving | `src/server/{mod,chat,slot}.rs`, `src/conversation.rs` |

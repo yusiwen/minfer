@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// How an attention node's KV window is expressed (mirrors `ATTN_WIN_*` in
-/// `cuda_kernels.cu`). The **size** of the node's window input is what selects it
+/// `src/cuda/kernels/common.cuh`). The **size** of the node's window input is what selects it
 /// (C8b S2's departure 2: the layout is topology, so it is fixed at build time),
 /// and each mode is a separate template instantiation — the causal one keeps the
 /// pre-E1 instruction stream (E1b).
@@ -933,7 +933,7 @@ mod issue145_tests;
 // ────────────────────────────────────────────────────────────────────
 // Issue #147: the remaining unchecked attribute / launch / destroy returns.
 //
-// The C++ sites (cuda_kernels.cu) report through `minfer_site_fail_*`; the Rust
+// The C++ sites (src/cuda/kernels/*.cu) report through `minfer_site_fail_*`; the Rust
 // destroy site formats its own message (`graph_destroy_failure_message`). The
 // deliberate failures are env-gated behind `MINFER_TEST_ISSUE147=1` because they
 // *really* fail a CUDA call — a `compute-sanitizer --tool memcheck` run must not
@@ -944,7 +944,7 @@ mod issue145_tests;
 mod issue147_tests;
 
 // ────────────────────────────────────────────────────────────────────
-// #162: the launch-return gate. Every `<<<>>>` in src/cuda_kernels.cu now reads
+// #162: the launch-return gate. Every `<<<>>>` in src/cuda/kernels/*.cu now reads
 // its own error through `minfer_launch_ok` / `minfer_launch_ok_opt` and carries
 // an injection lever (`minfer_launch_block` / `minfer_launch_smem`), which
 // `scripts/check_cuda_launch_returns.py` audits statically and the CI job runs.

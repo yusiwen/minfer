@@ -436,7 +436,7 @@ impl CudaState {
                 let dmin = half::f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
                 let sc = &blk[4..16]; // 12 packed 6-bit scales+mins
                 for cc in 0..8usize {
-                    // host mirror of the device get_scale_min_k4 (cuda_kernels.cu)
+                    // host mirror of the device get_scale_min_k4 (src/cuda/kernels/common.cuh)
                     let (s, m) = if cc < 4 {
                         (sc[cc] & 63, sc[cc + 4] & 63)
                     } else {

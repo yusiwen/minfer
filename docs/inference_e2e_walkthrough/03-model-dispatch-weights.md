@@ -638,7 +638,7 @@ the fused `attn_qkv`/`ffn_gu` concat weights (built in RAM at load,
 `qwen2/loader.rs:391-426,446-491`) and `MINFER_WEIGHT_COPY=1`, an A/B switch
 that makes the cost of the zero-copy path measurable.
 
-Excerpt 9 — CUDA's upload-once registry. (`src/cuda.rs:655-712`, abridged)
+Excerpt 9 — CUDA's upload-once registry. (`src/cuda/methods/weights.rs:18-97`, abridged)
 
 ```rust
     pub fn register_weight(&self, name: &str, data: &[u8]) {
@@ -871,7 +871,7 @@ deletion, so keeping the parameter bought nothing.
   measured 635 ms per prefill→decode switch.
 - **CUDA device buffers are never freed on replace.** A captured graph may
   reference them; the leak is bounded by distinct (architecture, tensor)
-  shapes ever loaded (`src/cuda.rs:655-676`).
+  shapes ever loaded (`src/cuda/methods/weights.rs:24-37`).
 - **The gate and the registration must enumerate the same weights.** Loader
   registers; `weights_on_gpu`/`weights_on_cuda` check the same field list
   spelled out twice. That duplication is intentional — a new weight field

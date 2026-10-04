@@ -177,7 +177,7 @@ impl CudaState {
             }
         };
         // T2 (plan §6.2): BT dynamic-smem feasibility — the tile config's
-        // demand (single-source formula in cuda_kernels.cu) must fit the
+        // demand (single-source formula in src/cuda/kernels/gemm_wmma.cu) must fit the
         // device's opt-in limit. Degrading here routes prefill to the f16
         // GEMM path instead of failing launches on 100 KB-class devices.
         // GB10 passes (identical to the previous unconditional behavior).

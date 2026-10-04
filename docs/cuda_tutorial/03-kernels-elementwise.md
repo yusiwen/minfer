@@ -1,7 +1,7 @@
 # 03 · Reading minfer's kernels I — elementwise, dequant, embedding
 
 > **Part**: Part 3a — first real kernels. **Prereq**: chapters [01](01-gpu-mental-model.md)–[02](02-minimal-cuda.md) (you can write an elementwise kernel, you know the index formulas and the device memory API).
-> **Code**: `src/cuda_kernels.cu`, `src/block.rs`, `src/graph/cuda_backend.rs` — all `file:line` citations verified against the tree at writing time (the function name is the stable address, the line number a convenience).
+> **Code**: `src/cuda/kernels/*.cu`, `src/block.rs`, `src/graph/cuda_backend.rs` — all `file:line` citations verified against the tree at writing time (the function name is the stable address, the line number a convenience).
 
 ## 1. Background — where this sits
 
@@ -31,7 +31,7 @@ reuses:
 ```mermaid
 flowchart LR
     A["Rust: Op match arm<br/>graph/cuda_backend.rs"] --> B["Rust device layer<br/>CudaState method (cuda.rs)"]
-    B --> C["C launcher: grid sizing<br/>launch_* (cuda_kernels.cu)"]
+    B --> C["C launcher: grid sizing<br/>launch_* (cuda/kernels/*.cu)"]
     C --> D["__global__ kernel<br/>one thread's worth of math"]
 ```
 
@@ -44,12 +44,12 @@ routing.
 
 ## 2. Principle — the concepts
 
-### 2.1 The kernel inventory — the map of `cuda_kernels.cu`
+### 2.1 The kernel inventory — the map of `src/cuda/kernels/`
 
 The forensics protocol from `STYLE.md` starts with enumeration. Run:
 
 ```bash
-grep -n '__global__' src/cuda_kernels.cu
+grep -n '__global__' src/cuda/kernels/*.cu
 ```
 
 Today that prints **89 kernels** in an 8,386-line file. Nobody memorizes 89
@@ -417,7 +417,7 @@ kernels in a profile:
 - Why a cache at all: the two-pass prefill GEMM used to dequantize W on
   *every* call — "288 ms per 7B @2K forward" — because weights are immutable
   after registration, the dequant result is cached per weight pointer
-  (`w16_cache` comment, `src/cuda.rs:133`).
+  (`w16_cache` comment, `src/cuda/methods/prefill_f16.rs:131`).
 
 And why dequantize at all, when the CPU side made a point of *never*
 dequantizing at load (walkthrough doc 10 §2.1's bandwidth argument)? The
@@ -581,7 +581,7 @@ What that does to bandwidth, both directions:
 - **The one-time dequant itself moves ≈ 349 MB** (read 76.6 + write 272.3)
   per weight tensor of that size, which is why the campaign cached the
   result: doing it per call cost a measured 288 ms per 7B @2K forward before
-  Phase 8p (`src/cuda.rs:135`).
+  Phase 8p (`src/cuda/methods/prefill_f16.rs:131`).
 - Versus f32, the f16 copy still halves weight traffic — the same 2× argument
   that made the *KV* cache f16 (Phase 8b).
 

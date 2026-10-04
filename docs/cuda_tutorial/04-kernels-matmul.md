@@ -2,7 +2,7 @@
 
 > **Part**: Part 3b — the matmul ladder. **Prereq**: [chapter 03](03-kernels-elementwise.md)
 > (the dispatch chain, quant block layout, index formulas — this chapter uses all three).
-> **Code**: `src/cuda_kernels.cu`, `src/graph/cuda_backend.rs` — all `file:line` citations
+> **Code**: `src/cuda/kernels/*.cu`, `src/graph/cuda_backend.rs` — all `file:line` citations
 > verified against the tree at writing time (the function name is the stable address, the
 > line number a convenience).
 
@@ -43,11 +43,11 @@ both ends.
 ### 2.1 The matmul corner of the kernel inventory
 
 The forensics protocol starts with enumeration. Chapter 03 counted **89
-`__global__` kernels** in `src/cuda_kernels.cu` (8,386 lines — re-run the
+`__global__` kernels** in `src/cuda/kernels/*.cu` (8,386 lines in the pre-#263 single TU, 9,996 in the 17 TUs today — re-run the
 grep to confirm before citing):
 
 ```bash
-grep -n '__global__' src/cuda_kernels.cu
+grep -n '__global__' src/cuda/kernels/*.cu
 ```
 
 Of those 89, **42 are matmul-family kernels** (names matching
@@ -535,7 +535,7 @@ threads split the row's `nb = id/32` quant blocks (`u = threadIdx.x; u +=
 block and 104 threads idle — a tail you accept because the structure is
 per-row on purpose. Line by line:
 
-- **`row_stride = nb * Q4B`** — `Q4B` is 18 (`cuda_kernels.cu:10`), chapter
+- **`row_stride = nb * Q4B`** — `Q4B` is 18 (`src/cuda/kernels/common.cuh`), chapter
   03's Q4_0 block. One thread's block pointer is `row·2736 + u·18` — a
   stride-18 walk, the row streamed linearly.
 - **`d4`, `d8`** — the two f16 scales: the weight block's and the

@@ -8,7 +8,7 @@ use super::tests::{
     minfer_site_fail_site,
 };
 
-/// `minfer_site_fail_kind` values (cuda_kernels.cu).
+/// `minfer_site_fail_kind` values (`src/cuda/kernels/*.cu`).
 const SITE_ATTR: i32 = 1;
 const SITE_LAUNCH: i32 = 2;
 

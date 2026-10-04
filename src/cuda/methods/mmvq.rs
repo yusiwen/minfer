@@ -35,7 +35,7 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     );
     // doc 103: q4_0 / q8_0 decode MMVQ (the 8e structure on the legacy
-    // f32-activation types; new code only — see cuda_kernels.cu tail).
+    // f32-activation types; new code only — see src/cuda/kernels/mmvq_multi.cu).
     pub(crate) fn launch_q4_0_q8_mmvq(
         weights: *const u8,
         acts8: *const u8,

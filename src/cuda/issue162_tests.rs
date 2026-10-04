@@ -12,9 +12,9 @@ mod control;
 mod node;
 mod severity;
 mod sites;
-/// `minfer_site_fail_kind` for a kernel launch (`cuda_kernels.cu`).
+/// `minfer_site_fail_kind` for a kernel launch (`src/cuda/kernels/*.cu`).
 const SITE_LAUNCH: i32 = 2;
-/// `MINFER_SITE_*` / `ATTN_WIN_*` mirrors (cuda_kernels.cu).
+/// `MINFER_SITE_*` / `ATTN_WIN_*` mirrors (`src/cuda/kernels/common.cuh`).
 const CAUSAL: i32 = 0;
 const SPAN: i32 = 1;
 const MAP: i32 = 2;
@@ -44,7 +44,7 @@ fn gate_enabled() -> bool {
 }
 /// The committed audit fixture (`scripts/check_cuda_launch_returns.py
 /// --fixture tests/fixtures/cuda_launch_sites.tsv`): `line, owner, site,
-/// kernel-fragment` for every `<<<` site in `cuda_kernels.cu`. The gate
+/// kernel-fragment` for every `<<<` site in `src/cuda/kernels/*.cu`. The gate
 /// asserts the *driven* set against it, so a launcher the driver misses, or a
 /// new site added without a driver, is a red gate rather than a silent gap.
 fn fixture() -> Vec<(String, String, String, String)> {

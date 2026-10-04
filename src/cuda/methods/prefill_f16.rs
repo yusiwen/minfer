@@ -8,7 +8,7 @@ use super::*;
 extern "C" {
     // 8m: prefill dequant-to-f16 + wmma HGEMM. The f16 pointers cross the
     // boundary as c_void (Rust has no __half); the type_id mapping is
-    // documented at launch_dequant_f16 in cuda_kernels.cu.
+    // documented at launch_dequant_f16 in src/cuda/kernels/gemm_wmma.cu.
     pub(crate) fn launch_dequant_f16(
         type_id: i32,
         w: *const u8,

@@ -38,7 +38,7 @@
 #                       and `--selftest` runs the checker's own cases. The ancestry
 #                       test needs history, so this job fetches with `fetch-depth: 0`.
 #                       It also runs the source-level CUDA launch-return audit (#162):
-#                       every `<<<>>>` in src/cuda_kernels.cu must read its own error
+#                       every `<<<>>>` in src/cuda/kernels/*.cu must read its own error
 #                       and carry an injection lever, which needs no GPU.
 #                       It also runs Layer 1 of the dead-code ratchet (#254): a
 #                       shape audit of every `allow(dead_code)` (a bare form is
@@ -225,7 +225,7 @@ jobs:
         run: python3 scripts/check_status.py --check
       - name: The status checker's own pass/fail cases
         run: python3 scripts/check_status.py --selftest
-      # #162: every `<<<>>>` in src/cuda_kernels.cu must read its own launch
+      # #162: every `<<<>>>` in src/cuda/kernels/*.cu must read its own launch
       # error through minfer_launch_ok/_opt and carry a real-failure injection
       # lever. A source audit needs no GPU, and the CUDA container's python3 is
       # not guaranteed — this job's is. `--check-fixture` pins the site list the

@@ -241,7 +241,7 @@ the step-function q8_1 GEMM-prologue fusion, not incremental optimization.**
 
 ### 1.3 What the engine does now (dispatch shape)
 
-All in `src/cuda_kernels.cu` + `src/cuda.rs`, dispatched by
+All in `src/cuda/kernels/*.cu` + `src/cuda.rs`, dispatched by
 `src/graph/cuda_backend.rs`:
 
 - **Weights resident at load**: every matmul weight uploaded once and

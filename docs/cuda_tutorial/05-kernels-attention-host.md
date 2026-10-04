@@ -2,7 +2,7 @@
 
 > **Part**: Part 3c — attention kernels + the Rust host layer. **Prereq**: chapters 03–04
 > (the matmul ladder, tiling, dispatch — and why decode is memory-bound).
-> **Code**: `src/cuda_kernels.cu` (`fa_prefill_f16kv`:4157, `attn_bias_rope_store_f32`:2590),
+> **Code**: `src/cuda/kernels/attention_prefill.cu` (`fa_prefill_f16kv`), `src/cuda/kernels/kv_store.cu` (`attn_bias_rope_store_f32`),
 > `src/graph/cuda_backend.rs` (the `Backend` trait implementation),
 > `src/graph/scheduler.rs` (splits, cross-backend copies, replay trigger).
 

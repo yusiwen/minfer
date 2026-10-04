@@ -208,7 +208,7 @@ impl CudaState {
         nt: usize,
     ) {
         let pstr = ((4 + hd + 3) & !3) as i32;
-        const ATTN_SPLITS: usize = 32; // mirrors #define ATTN_SPLITS in cuda_kernels.cu
+        const ATTN_SPLITS: usize = 32; // mirrors #define ATTN_SPLITS in src/cuda/kernels/attention_decode.cu
         let need = nt * ATTN_SPLITS * nh * (pstr as usize) * 4;
         let partial = Self::get_or_grow(&self.buf_attn_partial, need);
         let stream = self.stream();
@@ -440,7 +440,7 @@ impl CudaState {
         row_bytes: usize,
     ) {
         let pstr = ((4 + hd + 3) & !3) as i32;
-        const ATTN_SPLITS: usize = 32; // mirrors #define ATTN_SPLITS in cuda_kernels.cu
+        const ATTN_SPLITS: usize = 32; // mirrors #define ATTN_SPLITS in src/cuda/kernels/attention_decode.cu
         let need = ATTN_SPLITS * nh * (pstr as usize) * 4;
         let partial = Self::get_or_grow(&self.buf_attn_partial, need);
         let stream = self.stream();

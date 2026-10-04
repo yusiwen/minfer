@@ -1,7 +1,7 @@
 # CUDA Tutorial for minfer contributors — from zero to optimization
 
 This tutorial takes a minfer contributor who has **never written CUDA** to the
-point where they can read every kernel in `src/cuda_kernels.cu`, modify the
+point where they can read every kernel in `src/cuda/kernels/*.cu`, modify the
 CUDA backend safely, and follow the optimization records in
 `docs/cuda_optimization_steps/` — including reproducing a historical step's
 measurement. It teaches by **reading minfer's real code**: each kernel chapter
@@ -27,7 +27,7 @@ the CPU counterpart from the
 ## What you will be able to do afterwards
 
 - Predict what a kernel launch does — threads, blocks, memory traffic — before running it.
-- Read any kernel in `src/cuda_kernels.cu` and any dispatch site in `src/graph/cuda_backend.rs`.
+- Read any kernel in `src/cuda/kernels/*.cu` and any dispatch site in `src/graph/cuda_backend.rs`.
 - Explain why minfer's decode path is GEMV + CUDA Graph replay while prefill is int8 MMQ GEMM.
 - Profile with `ncu`/`nsys`, read the numbers, and **prove** an optimization instead of trusting it (the campaign's gate chain).
 

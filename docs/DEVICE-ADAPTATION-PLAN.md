@@ -82,12 +82,12 @@ src/
 ├── device_calib.rs  ☆ T3 — load-time auto-calibration harness + frozen CalibTable
 ├── cuda.rs          T1/T2 consumer — resolves tier once at init; dispatch arms
 │                          read tier values; new smem fields; plane VRAM budgets
-├── cuda_kernels.cu  T2 minor — expose `cuda_mmq_smem_bytes(tile_id)` extern;
+├── cuda/kernels/*.cu  T2 minor — expose `cuda_mmq_smem_bytes(tile_id)` extern;
 │                            (optional, last) tile multi-instantiation
 └── models/*/loader.rs   unchanged (plane budget gates live in cuda.rs methods)
 
 Dependency rule:  loader.rs → cuda.rs → device_tier.rs  (one-way)
-                  cuda.rs ↔ cuda_kernels.cu  (extern boundary: queries/timing)
+                  cuda.rs ↔ cuda/kernels/*.cu  (extern boundary: queries/timing)
                   device_calib.rs → writes CudaState.CalibTable; dispatch reads
 ```
 
@@ -279,7 +279,7 @@ measurement opportunity and doubles as the T1 field-validation run.
 target, build.rs:534):** MMVQ family (dp4a works on Turing), f16 GEMM prefill
 (`gemm_f16_nt` compiles for sm_75), f32 fallbacks. The BT kernel family is
 **compile-time excluded** on sm_75 (`#if __CUDA_ARCH__ >= 800` guards in
-cuda_kernels.cu) on top of the runtime `cc ≥ 800` gate — so a Turing run
+cuda/kernels/*.cu) on top of the runtime `cc ≥ 800` gate — so a Turing run
 exercises everything except BT.
 
 **Phase A — T1 validation + #4 data (no code changes):**

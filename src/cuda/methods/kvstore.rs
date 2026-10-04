@@ -99,7 +99,7 @@ impl CudaState {
     /// the partials' row stride keeps the oc section 16-byte aligned. The
     /// scratch must be at least ATTN_SPLITS * nh * pstr floats (see
     /// buf_attn_partial). ATTN_SPLITS must mirror the `ATTN_SPLITS` define
-    /// in cuda_kernels.cu (fixed grid — the graph-replay capture depends on
+    /// in src/cuda/kernels/kv_store.cu (fixed grid — the graph-replay capture depends on
     /// it; idle splits write an mx=-INF/S=0 partial the combine weights to
     /// zero).
     /// C3: move `rows` rows of `elems` f32 elements inside one KV arena, from

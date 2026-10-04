@@ -38,7 +38,7 @@ ladder is taught in steps:
 |---|---|
 | **01 (this one)** | The mental model: host vs device, SIMT execution, the memory hierarchy, and one runnable toy (vector add). |
 | **02** | The minimal CUDA you actually need: kernel syntax in full, the runtime API surface, and the error-handling discipline. |
-| **03–05** | Reading minfer's real kernels in `src/cuda_kernels.cu`, easiest first: elementwise → decode GEMV/matvec → prefill GEMM and attention. |
+| **03–05** | Reading minfer's real kernels in `src/cuda/kernels/*.cu`, easiest first: elementwise → decode GEMV/matvec → prefill GEMM and attention. |
 | **06** | Optimization: the techniques the CUDA campaign actually measured, each linked to the step record that used it. |
 
 Three runnable toys carry the hands-on thread (vector add here; an
