@@ -20,7 +20,7 @@
 | −1 #138 + #225 | #138, #225 | **#225 landed** `5386a1c` (PR #268, 7/7 green; the cold first-run row is in §2.4); **#138 in flight** on `feat/138-defer-cross-wait` |
 | 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
 | 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 594 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
-| 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | not started |
+| 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **in progress, 2 of 6 stages landed** (PR [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, 7/7 green); the per-stage record is at the end of §4 Step 2 |
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
@@ -257,6 +257,39 @@ above; that is why `matmul_f32act` and `attention_*` look slightly over their se
   CUDA unit **565 / 0 / 42**; real-model gates **42 / 0 ×2** with bitwise-identical greedy output;
   cold-start timing recorded (the fatbin module count changes — see §7 and
   [#225](https://github.com/yusiwen/minfer/issues/225)).
+
+**Stage record (2026-10-04, `dgxspark (aarch64, GB10 sm_121)`).** One PR per group. Every stage
+regenerates `tests/fixtures/cuda_launch_sites.tsv` in `build.rs`'s order (still 130 rows, still four
+columns) and states the three numbers — the moved files, the remaining `src/cuda_kernels.cu`, the
+audit's site count — so "nothing lost" is checkable in each PR rather than only at the end. The
+non-mutating gates are the same at every stage: audit 130 / `--check-fixture` exit 0, CUDA unit
+567/0/42 + integration 10/0/6, CPU 481/0/36 + 10/0/6, real-model 42/0 on both models, 0 nvcc warnings.
+
+| stage | files (new) | lines | `cuda_kernels.cu` | PR |
+|---|---|---:|---:|---|
+| G1 | `common.cuh` 498 + `guard.cu` 305 | 803 | 9 475 | [#284](https://github.com/yusiwen/minfer/pull/284), `930e1e2` |
+| G2 | `attention_decode.cu` 1 178 + `attention_prefill.cu` 512 | 1 690 | 7 828 | — |
+| G3 | MMQ: `mmq_int8.cu` + `mmq_raw.cu` + `mmq_nb.cu` + `mmq_bt_q6k.cu` | | | — |
+| G4 | MMVQ: `matmul_f32act.cu` + `mmvq_aquant.cu` + `mmvq_skipwrite.cu` + `mmvq_q6k.cu` + `mmvq_multi.cu` | | | — |
+| G5 | `ops_misc.cu` + `ops_elementwise.cu` + `kv_store.cu` + `gemm_wmma.cu` + `gemm_fused_dequant.cu` | | | — |
+| G6 | the empty remainder deleted | | 0 | — |
+
+Three measured corrections to the tables above, applied as the stages land:
+
+- **`guard.cu` is 305 lines, not 402.** The §4 range 5521–5922 also covered `launch_fa_prefill_kv`
+  (102 lines), but that launcher launches `fa_prefill_kv`, whose instantiations live in the FA-prefill
+  section — route (a) puts it in `attention_prefill.cu`, so G1 takes only the #147/#162 state and its
+  one-owner `minfer_launch_*` definitions.
+- **`minfer_prewarm_kernels` needs five per-family registration functions, not six**: `mmq_nb`,
+  `mmq_raw`, `mmq_bt_q6k`, `attention_prefill`, `attention_decode` are the only translation units
+  that own *template* `__global__` instantiations the pre-warm address-takes (the other pre-warm
+  entries are plain kernels and stay in the dispatcher, which is where the symbol `src/cuda.rs`
+  declares it lives). The dispatcher itself moves with `mmq_bt_q6k.cu` in G3.
+- **The `mmq_ksplit_reduce_kernel` site appears twice.** `launch_mmq_raw_nb_bt_nt` *and*
+  `launch_mmq_raw_nb_bt_q6k_nt` both launch it (fixture rows 108 and 111), so moving the reducer next
+  to the NB kernels leaves the q6_K BT launcher with a cross-TU launch. That is legal where route (a)
+  forbids a cross-TU reference: the reducer is a plain `__global__`, and only a *template*
+  instantiation fails without `-rdc` (blueprint §6 fact 2 vs §7.3).
 
 ### Step 3 — CPU files
 
