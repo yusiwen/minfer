@@ -9549,3 +9549,52 @@ logits parity + the Metal gates). The 6 shared fixtures (`cached_model_path`, `m
 `src/graph/alloc/tests.rs` (1,833), `src/tooling/tests.rs` (1,669), `src/sampler/tests.rs` (1,232),
 `src/conversation/tests.rs` (1,156), `src/graph/kvcache/tests.rs` (1,134), and
 `src/cuda/issue162_tests.rs` (1,186) last, after #263.
+
+#### Test-infrastructure record (#267 step 6, file 3, 2026-10-04) — `server/batch/tests.rs` becomes a parent plus seven topic files
+
+**What landed.** `src/server/batch/tests.rs` (2,630 lines, **21 `#[test]` — 13 of them `#[ignore]`d**
+device/real-model gates — plus 19 helpers, two structs and three `impl` blocks) is split by topic into
+`src/server/batch/tests/{kv_sharing,slots,prefill,batching,stall,http,metrics}.rs`, each named by a `mod`
+declaration in the now-356-line parent (PR
+[#278](https://github.com/yusiwen/minfer/pull/278), part of [#267](https://github.com/yusiwen/minfer/issues/267)).
+The topics are `kv_sharing` (4: a copied prefix, the copy-on-write store, the planned cells, the
+whole-arena request), `slots` (2: the table round trip and a resumed snapshot), `prefill` (5: chunk size,
+chunked-vs-unchunked, the interleaved ticks), `batching` (1: the batched-vs-serial verdict), `stall` (5:
+the injected `FailingForward` double and the one-answer-per-run gates), `http` (2: the 503 and the SSE
+error frame) and `metrics` (2: queue/running depth and the counter deltas). The parent keeps the shared
+fixtures (`cached_model`, `Reply`, `sampling_params`, `run_batched`, `run_serial`, the
+`STEP_BUDGET_*`/`WorkBound` cluster the helpers themselves call, and the `impl BatchEngine` accessors).
+`src/server/batch.rs` keeps its `#[cfg(test)] mod tests;` untouched.
+
+**The one non-comment edit.** The file's only `super::super::` reference —
+`super::super::chat_template_from_gguf`, which meant `server::chat_template_from_gguf` at the old module
+depth — becomes `crate::server::chat_template_from_gguf`. A topic file sits one module deeper, so the
+relative path would otherwise resolve to `batch::`; the absolute path names the same item. This is the
+only line of test text that differs from a pure move, and it is called out in the PR body too. (The
+`super::serve_loop` references are unaffected: the parent's `use super::*;` re-exports `batch::serve_loop`
+into the `tests` module.)
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the worktree:
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration |
+| `scripts/cuda_test.sh` | **567 / 0 / 42** |
+| `python3 scripts/check_source_layout.py` | `src obeys the layout rules`, exit 0 |
+| `python3 scripts/check_doc_line_anchors.py`, `check_docs_links.py`, `check_status.py --check` | exit 0 each |
+| `cargo fmt --all --check` | clean |
+| CI on PR [#278](https://github.com/yusiwen/minfer/pull/278) | **7 / 7 green** |
+
+**Mutation evidence (rule 3).** `mod stall;` → `// mod stall;`: the layout checker exits **1** with
+`src/server/batch/tests/stall.rs: not reachable from src/main.rs …`, and the CPU unit row drops
+**481 → 477** passed and **36 → 35** ignored — the four running `stall` gates and the one `#[ignore]`d
+one, which is why the ignored count is the sharper half of this mutation. Reverted.
+
+**Docs swept.** `docs/SOURCE-LAYOUT-PLAN.md` (§6.4 now carries the qwen2 and batch rows, so the three
+landed splits are all in the mapping table; the §Status step-6 row reads files 1–3) and this record. No
+live document anchors `server/batch/tests.rs` by line number, and the parent's own `#239` annotations now
+name the child module (`server::batch::tests::<topic>::<leaf>`, five sites).
+
+**Deliberately out of scope.** The remaining five files of #267: `src/graph/alloc/tests.rs` (1,833),
+`src/tooling/tests.rs` (1,669), `src/sampler/tests.rs` (1,232), `src/conversation/tests.rs` (1,156),
+`src/graph/kvcache/tests.rs` (1,134), and `src/cuda/issue162_tests.rs` (1,186) last, after #263.
