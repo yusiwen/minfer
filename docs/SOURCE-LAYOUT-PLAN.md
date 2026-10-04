@@ -19,7 +19,7 @@
 |---|---|---|
 | −1 #138 + #225 | #138, #225 | **#225 landed** `5386a1c` (PR #268, 7/7 green; the cold first-run row is in §2.4); **#138 in flight** on `feat/138-defer-cross-wait` |
 | 0 plan document + conventions | this file | **landed** `9174644` (PR #269, 7/7 green, zero code annotations): this document + `SUMMARY.md` + `AGENTS.md` + `ARCHITECTURE.md` + `BACKENDS.md`, plus 4 of #219's 6 stale claims |
-| 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR #PRNUM, 7/7 green, zero code annotations): `src/cuda.rs` 6 578 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
+| 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 578 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
 | 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | not started |
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |

@@ -9719,7 +9719,7 @@ not split here: it carries the launch-fixture column assertion (`assert_eq!(f.le
 #### Test-infrastructure record (#261 step 1, 2026-10-04) — `src/cuda.rs` becomes `src/cuda/{ffi_runtime,methods}.rs` + 18 family files
 
 **What landed.** The first code move of the source-layout campaign ([#262](https://github.com/yusiwen/minfer/issues/262),
-PR #PRNUM): `src/cuda.rs` loses its 4,546-line `impl CudaState` and its two `extern "C"` blocks and keeps
+PR [#276](https://github.com/yusiwen/minfer/pull/276)): `src/cuda.rs` loses its 4,546-line `impl CudaState` and its two `extern "C"` blocks and keeps
 the module doc, `AttnWindow`, `pub struct CudaState` (all 29 fields still private), the free items, the
 ten `#[cfg(test)] mod` declarations and the re-export lines — 6,578 → **1,014** lines. New:
 `src/cuda/ffi_runtime.rs` (the cudart/driver declarations, now `pub(super)`, plus the test-only extern
@@ -9750,7 +9750,7 @@ guess: `plane_budget_ok` stays in `methods/weights.rs` (all four callers are the
 | `python3 scripts/check_dead_code_oracle.py --config {cpu,cuda}` | 0 additions, 0 removals; only the two moved `file =` lines in `docs/dead-code-baseline.toml` |
 | `python3 scripts/check_doc_line_anchors.py` | **81 out-of-range → 0** (99 anchors re-pointed by the split's line map, 28 re-anchored to the symbol, 5 rebuilt by hand) |
 | `FEATURES=cuda scripts/real_model_gates.sh` ×2 | **42 / 0 ×2**, greedy output bitwise identical |
-| CI run RUNID | **7 / 7 green**, zero code annotations |
+| CI run [37200610475](https://github.com/yusiwen/minfer/actions/runs/37200610475) | **7 / 7 green**, zero code annotations |
 
 **Mutation evidence (rule 3).** Two mutations in the worktree, each reverted:
 `src/cuda/methods/orphan.rs` → `check_source_layout` prints
