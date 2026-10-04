@@ -24,7 +24,7 @@
 | 3 CPU files | #264 | not started |
 | 4 Metal (Mac-local) | #265 | not started |
 | 5 close the loop (#225 re-measure, #53 `DeviceMemory`) | — | not started |
-| 6 long test files | #267 | **files 1–8 landed** (PRs #275, #277, #278, #279, #280, #281): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` left, after #263 |
+| 6 long test files | #267 | **files 1–9 landed** (PRs #275, #277, #278, #279, #280, #281, #283): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` 1,186 → a 209-line parent + 4 `tests/<topic>.rs` (5 tests) |
 
 Each step appends its dated record here when it lands (gates run, counts, box label).
 
@@ -410,6 +410,7 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/sampler/tests.rs` | `src/sampler/tests/{greedy_topk,penalties,stops,minp_typical,xtc,dry,mirostat,bias_validate,defaults,grammar}.rs` |
 | `src/conversation/tests.rs` | `src/conversation/tests/{turns,regen,spec,snapshot,overflow,real_model}.rs` |
 | `src/graph/kvcache/tests.rs` | `src/graph/kvcache/tests/{cells,spans,sharing,resize,defrag}.rs` |
+| `src/cuda/issue162_tests.rs` | `src/cuda/issue162_tests/{sites,severity,control,node}.rs` |
 
 ### 6.5 The macOS hand-off (decided 2026-10-04: Step 4 is Mac-local)
 

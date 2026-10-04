@@ -9718,6 +9718,54 @@ the CPU row drops: `mod dry;` in `sampler/tests.rs` → `src/sampler/tests/dry.r
 not split here: it carries the launch-fixture column assertion (`assert_eq!(f.len(), 4)`) that Step 2
 (#263) changes, so it moves after #263 merges.
 
+#### Test-infrastructure record (#267 step 6, file 9, 2026-10-04) — `cuda/issue162_tests.rs` becomes a parent plus four topic files
+
+**What landed.** `src/cuda/issue162_tests.rs` (1,186 lines, **5 `#[test]` — all device +
+`MINFER_TEST_ISSUE162=1` gated, none `#[ignore]`d — plus 18 non-test top-level items: 3 `use`, 5
+consts, 2 structs, 3 `impl` blocks and 5 helper `fn`s**) is split by topic into
+`src/cuda/issue162_tests/{sites,severity,control,node}.rs`, each named by a `mod` declaration in the
+now-209-line parent (PR [#283](https://github.com/yusiwen/minfer/pull/283), part of
+[#267](https://github.com/yusiwen/minfer/issues/267)). The topics are `sites` (1: the union driver that
+arms every audited `<<<` site and asserts armed set == observed set == the fixture), `severity` (1: a
+required site sets the sticky, a documented-fallback `_opt` site does not), `control` (1: the knob-off
+positive control that really computes `1 + 2`) and `node` (2: a required launch failure fails a real
+`Op::Add` node with an `Err` naming `launch:add_f32`, and the f16-matmul `Err` arm still drains the
+sticky). Every `use`, const, fixture and helper stays in the parent — `device`, `cstr`,
+`gate_enabled`, `fixture`, `Arm`, `Ctx` and the `run` driver — so the `#239` annotations in
+`src/cuda/tests.rs`, which name `cuda::issue162_tests::run`, keep resolving unchanged. A pure move:
+every top-level item is byte-identical apart from rustfmt and the 5 test names are the same set.
+`src/cuda.rs` keeps its `#[cfg(test)] mod issue162_tests;` untouched.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-04, in the worktree:
+
+| Command | Result |
+|---|---|
+| `scripts/cuda_test.sh` | **567 / 0 / 42** |
+| `MINFER_TEST_ISSUE162=1 scripts/cuda_test.sh issue162` | **5 / 0** before and after the move |
+| `cargo test --release` | **481 / 0 / 36** unit + **10 / 0 / 6** integration |
+| `python3 scripts/check_source_layout.py` | `src obeys the layout rules`, exit 0 |
+| `check_doc_line_anchors.py`, `check_docs_links.py`, `check_status.py --check`, `check_dead_code_annotations.py` | exit 0 each |
+| `cargo fmt --all --check` | clean |
+| CI on PR [#283](https://github.com/yusiwen/minfer/pull/283) | **7 / 7 green** |
+
+**Mutation evidence (rule 3).** `mod node;` → `// mod node;`: the layout checker exits **1** with
+`src/cuda/issue162_tests/node.rs: not reachable from src/main.rs — no \`mod\` declaration names it, so it
+is never compiled (tests in it would silently not run)`, the CUDA unit row drops **567 → 565** (the two
+`node` gates) and this file's own `MINFER_TEST_ISSUE162=1 … issue162` gate drops **5 → 3**. Reverted.
+
+**What the brief had wrong (the tree wins).** The step-6 note deferred this file until after #263,
+because its launch-fixture `assert_eq!(f.len(), 4)` was expected to change. That change was measured
+unnecessary — the fixture keeps its four columns, its identity key being the ordered
+`(owner, site, kernel-fragment)` triple — so #263 touches neither this file nor the fixture and the
+split proceeds. No anchor re-point was needed either: `assert_eq!(f.len(), 4)` still lands on
+`src/cuda/issue162_tests.rs:56` in the parent, so the live `src/cuda/issue162_tests.rs:55` anchor in
+`docs/SOURCE-LAYOUT-PLAN.md` §4 Step 2 resolves unchanged. All nine files of #267 are now split.
+
+**Docs swept.** `docs/SOURCE-LAYOUT-PLAN.md` (§6.4 gains the `issue162_tests` mapping row; the §Status
+step-6 row reads files 1–9) and `docs/CUDA-BACKEND-DESIGN.md` (the #162 runtime-gate paragraph names the
+four topic files). The `ARCHITECTURE-EXECUTION-PLAN.md` anchor into this file (line 6697) is inside this
+frozen record and keeps its pre-split text.
+
 #### Test-infrastructure record (#261 step 1, 2026-10-04) — `src/cuda.rs` becomes `src/cuda/{ffi_runtime,methods}.rs` + 18 family files
 
 **What landed.** The first code move of the source-layout campaign ([#262](https://github.com/yusiwen/minfer/issues/262),
