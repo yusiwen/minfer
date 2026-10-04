@@ -1229,10 +1229,12 @@ every `<<<`, requires a `launch:`-prefixed prelude before it in the same functio
 the geometry; it prints the offending lines and exits 1. It runs in the `check-docs` CI job with
 `--selftest` (five pass/fail cases) and `--check-fixture tests/fixtures/cuda_launch_sites.tsv` (the
 committed site list; line numbers are documentation, owner/site/fragment are identity). The runtime
-half is `cuda::issue162_tests` (`MINFER_TEST_ISSUE162=1`, five tests): the coverage test drives every
-audited site through the branches that reach it, asserts armed set == observed set, the message names
-the site, the fixture's kernel fragment and `cudaErrorInvalidValue`, `cudaGetLastError() == 0` after
-every scenario, and the union of driven tokens equals the fixture; the severity test asserts a
+half is `cuda::issue162_tests` (`MINFER_TEST_ISSUE162=1`, five tests split by topic into
+`tests/{sites,severity,control,node}.rs`, [#267](https://github.com/yusiwen/minfer/issues/267)): the
+coverage test drives every audited site through the branches that reach it, asserts armed set ==
+observed set, the message names the site, the fixture's kernel fragment and
+`cudaErrorInvalidValue`, `cudaGetLastError() == 0` after every scenario, and the union of driven
+tokens equals the fixture; the severity test asserts a
 required site sets the sticky and an `_opt` site does not; the positive control (knob off) actually
 computes `1 + 2`; the node-level test makes a real `Op::Add` node fail with `Err` naming
 `launch:add_f32`; and the Err-arm test drives an f16 matmul whose Rust wrapper returns `Err` (so the
