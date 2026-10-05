@@ -438,11 +438,25 @@ Phase A returning `Ok(true)` means "this backend issued the transfer";
 is not a silent CPU fallback: the allocator *does* perform the pair, just
 synchronously, and the boundary counters record it as a blocking copy.
 
+**Mechanism choice on Metal ([#137]).** Three primitives were candidates. A
+command-buffer **completion handler** can only notify the host — it is not
+waitable, so it cannot express phase B at all. A plain **`MTLEvent`** is
+device-scoped and exposes no host wait. **`MTLSharedEvent`** is the one primitive
+that both `MTLCommandBuffer::encodeSignalEvent` / `encodeWaitForEvent` accept
+*and* that exposes a bounded host wait
+(`waitUntilSignaledValue:timeoutMS:`); it is therefore what the port uses, and it
+is also the reserved device-side mechanism. The two waits are enumerated in
+§11.3. The blit is encoded into the producer split's own command buffer rather
+than a dedicated one; §11.5 records why that is a correctness requirement, not
+tidiness.
+
+[#137]: https://github.com/yusiwen/minfer/issues/137
+
 | backend | phase A (`copy_cross`) | phase B (`await_cross`) |
 |---|---|---|
 | **cpu** | **synchronous host round trip** — the CPU has no device memory, so there is no transfer to make asynchronous. The device leg of CPU→device is the destination pool's own stream-ordered `write_host` (pinned + `cudaMemcpyAsync`, 7e⑥), which never blocked the host either. | **documented no-op** — nothing was enqueued that needs waiting for; the destination device orders its own fill on its stream. Still counted, so the one-wait-per-copy contract is backend-independent. |
 | **cuda** | device→host: `cudaMemcpyAsync` D2H into a pinned slab + `cudaEventRecord`, both stream-ordered after the producing kernels. Any other destination **declines**: a device→device staging copy (unreachable — `copy_across` early-returns when the source and destination backends match), CUDA→Metal on a macOS+CUDA build. | device→host: `cudaEventSynchronize` — **the** host block, and the only one the async path takes for that copy — then the bytes are published into the staging buffer. A device consumer uses `cudaStreamWaitEvent` (no host block). |
-| **metal** | **declines** (`Ok(false)`): the async form is a `MTLBlitCommandEncoder` copy plus a completion handler or an `MTLEvent` the consumer waits on — a different mechanism from CUDA's, and this ticket was developed on a Linux box with no Metal device and no macOS toolchain, so it could not be compiled or verified. The port is a filed follow-up; until then a Metal source keeps the pre-F5 synchronous behaviour. | no-op (phase A declined). |
+| **metal** | device→host: a `MTLBlitCommandEncoder` copy of the source `StorageModeShared` `MTLBuffer` into a fresh shared staging buffer, plus `MTLCommandBuffer::encodeSignalEvent` on a fresh `MTLSharedEvent`. Both are encoded into the **producer split's own command buffer** (one command buffer per split — see §11.5). Any other destination **declines**: a Metal→Metal staging copy is unreachable (`copy_across` early-returns when the source and destination backends match) and CUDA does not run on Apple Silicon, so no device→device pair exists on macOS. | device→host: `MTLSharedEvent::waitUntilSignaledValue:timeoutMS:` with a 10 s bound — **the** host block, and the only one the async path takes for that copy — then the bytes are published into the staging buffer. A timeout is a loud `Err` naming the value waited for, the observed `signaledValue` and the command buffer's real `status()` / `error()`; never an unbounded block (`MetalBackend::cross_take`). A device consumer would use `MTLCommandBuffer::encodeWaitForEvent` (no host block); it is **reserved**, because the device→device pair is unreachable on macOS. |
 
 ### 11.3 The synchronization points, enumerated
 
@@ -460,28 +474,40 @@ Every execution, in order:
    after-the-last-split flush.
 2. **Phase A, per staged input** — `copy_across`. A CUDA→host copy enqueues
    `cudaMemcpyAsync` + `cudaEventRecord`; a CUDA→device copy would use
-   `cudaMemcpyAsync` D2D; the CPU does its host memcpy; Metal does the
-   synchronous read. **No host wait here**, and *all* of the boundary's inputs are
-   enqueued before any of them is waited on.
+   `cudaMemcpyAsync` D2D; the CPU does its host memcpy; Metal encodes a
+   `MTLBlitCommandEncoder` copy plus `encodeSignalEvent` into the **producer
+   split's own command buffer** (it runs before that split's `retire`, so the
+   copy is ordered with the kernels that wrote its source — §11.5). **No host
+   wait here**, and *all* of the boundary's inputs are enqueued before any of
+   them is waited on.
 3. **Phase B, per staged input** — `await_cross`, issued at the **consumer's first
    read** of that staging buffer (or, for an entry nothing reads, by the
    end-of-execution drain):
-   - **device→host**: `cudaEventSynchronize` on the event recorded in step 2.
-     *Invariant that makes it necessary*: the D2H destination is host memory, and
-     the host is about to read it; without the wait the consumer reads bytes the
-     DMA may not have written yet. Deferring it to the read is what lets the other
-     copies of the same boundary stay in flight.
+   - **device→host, CUDA**: `cudaEventSynchronize` on the event recorded in
+     step 2. *Invariant that makes it necessary*: the D2H destination is host
+     memory, and the host is about to read it; without the wait the consumer reads
+     bytes the DMA may not have written yet. Deferring it to the read is what lets
+     the other copies of the same boundary stay in flight.
+   - **device→host, Metal**: `MTLSharedEvent::waitUntilSignaledValue:timeoutMS:`
+     with a 10 s bound, then a host read of the shared staging buffer.
+     *Invariant*: the event is signaled at the end of the producer split's
+     command buffer, and the host's `StorageModeShared` read is only ordered after
+     that signal; the wait is deferred to the consumer's read exactly as CUDA's
+     is. A timeout is a loud `Err` naming the real status. The bound and the
+     loudness are the GPU-safety contract (`docs/GPU_SAFETY.md` §2.4).
    - **host→device**: no host wait; the fill is ordered on the consuming
      backend's own stream ahead of the kernels that read it.
      *Invariant*: stream order — the copy and the first consumer share one stream,
      so no host synchronization is needed and none is taken. This is the
      device-consumer direction the ticket's first bullet names, and it is already
      host-free by construction.
-   - **device→device** (no backend implements it today): `cudaStreamWaitEvent`
-     on the consuming stream would be the mechanism; the host never blocks. It
-     stays reserved: `copy_across` early-returns when source and destination match,
-     and the one other device destination today (Metal) declines phase A, so there
-     is no reachable pair. See the census note in the execution plan.
+   - **device→device** (no backend implements it today): `cudaStreamWaitEvent` on
+     the consuming stream, or `MTLCommandBuffer::encodeWaitForEvent` with the
+     signalling `MTLSharedEvent`, would be the mechanism; the host never blocks.
+     It stays reserved: `copy_across` early-returns when source and destination
+     match, and no other device destination is reachable on a macOS build (CUDA
+     does not run on Apple Silicon), so there is no pair to exercise. See the
+     census note in the execution plan.
    - The *contract* invariant, independent of backend: one phase-B wait per
      phase-A copy, enforced by `cross_input`'s refusal.
 4. **The next boundary's retire**, or the final flush after the last split —
@@ -492,9 +518,12 @@ The gated evidence for 2–3 is `copystats::CrossCopyStats` (per allocator:
 `event_syncs`, `stream_waits`), `CudaBackend::blocking_readback_count()` (a
 device-level count of blocking `cudaMemcpy` D2H calls),
 `CudaBackend::stream_sync_count()` (host stalls; per backend since [#185], the
-process-wide counter deleted in [#242]) and `CudaBackend::cross_inflight_peak()`
+process-wide counter deleted in [#242]), `CudaBackend::cross_inflight_peak()`
 (how many staging copies were enqueued but not yet waited on at once — the
-device-side overlap metric of [#138]).
+device-side overlap metric of [#138]) and, on Metal,
+`MetalBackend::sync_readback_count()` (host reads of a `StorageModeShared` pool
+buffer — there is no blocking-copy API to count, so this is the device-level
+analogue; the async path never moves it).
 `MINFER_SYNC_COPIES=1` restores the pre-F5 synchronous path as the bitwise
 reference; `copystats::set_sync_for_test` is its programmatic form.
 
@@ -526,4 +555,33 @@ produced.
 [#138]: https://github.com/yusiwen/minfer/issues/138
 [#185]: https://github.com/yusiwen/minfer/issues/185
 [#242]: https://github.com/yusiwen/minfer/issues/242
+
+### 11.5 The Metal port ([#137]): why the blit shares the split's command buffer
+
+`MetalBackend` keeps **one `MpsCommandBuffer` per split** (compute-graph rule 8);
+the producer submits and bounded-waits it in `Backend::retire`. The first cut of
+this port gave each staging copy its **own** command buffer, committed from
+`copy_cross` *after* the retire. That is a second submission overlapping the next
+split's, and on the measurement box it changed the kernels' results: the same
+mixed 0.5B offload graph run twice with the copy mode toggled differed by
+max |Δlogit| ≈ 1.4, while each mode compared with itself was bitwise stable. The
+staged bytes were **identical** (the source was read at enqueue and compared with
+the staging buffer at the wait), so the divergence was the extra in-flight
+command buffer perturbing Metal kernel execution — a pre-existing fragility of the
+backend, not the copy.
+
+Encoding the blit into the **producer split's own** command buffer fixes it and
+restores the one-command-buffer invariant: `copy_across` for a Metal→CPU boundary
+now runs *before* `BackendScheduler::execute` calls `retire_backend`, so
+`MetalBackend::cross_enqueue` appends an `MTLBlitCommandEncoder` pass (and
+`encodeSignalEvent`) to the still-open split buffer, and the split's own
+submission carries the copy **behind the kernels that wrote its source**. A source
+with no open split buffer gets a standalone buffer that `cross_enqueue` submits
+itself; the synchronous reference (`MINFER_SYNC_COPIES=1`) keeps the post-retire
+order, because its host read must see the producer's finished output.
+
+Measured on `macbook (macOS 27.0.1, Apple M4 Pro)` — the #137 record in
+the F5 S3 record in `docs/ARCHITECTURE-EXECUTION-PLAN.md`.
+
+[#137]: https://github.com/yusiwen/minfer/issues/137
 

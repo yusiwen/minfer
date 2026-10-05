@@ -73,6 +73,28 @@ checked assumptions:
 - `ne/nqt/nkt/nf % 32 != 0` — quantized-matmul block alignment.
 - `ne % 32 != 0` in the output matmul.
 
+### 2.4 The cross-backend staging copy (F5/#137) — bounded wait, loud status
+
+The split boundary's Metal→host staging copy is a `MTLBlitCommandEncoder` copy
+plus a `MTLSharedEvent` signal, encoded into the **producer split's own** command
+buffer (`docs/BACKEND-REGISTRY-DESIGN.md` §11.2/§11.5). The consumer's wait:
+
+- **is bounded** — `MTLSharedEvent::waitUntilSignaledValue:timeoutMS:` with a
+  10 s bound (`MetalBackend::cross_take`), the same order as `submit()`'s. A GPU
+  that never signals the event is an `Err`, never an unbounded host block.
+- **is loud** — a timeout reports the value waited for, the observed
+  `signaledValue`, and the command buffer's real `status()` / `error()`. There is
+  no silent CPU fallback: `BackendScheduler::execute` propagates the `Err` and the
+  run stops.
+- **happens once per copy**, at the consumer's first read — the blit is *encoded*
+  (and the split submitted) without a per-copy host wait; the one wait is the
+  documented synchronization point.
+- **stays inside the split's command buffer** — the blit is encoded into the
+  producer's open buffer *before* `retire` submits it. A separate boundary
+  command buffer overlapped the producer and changed the kernels' results
+  (measured on `macbook (macOS 27.0.1, Apple M4 Pro)`); the #137 record in
+  the F5 S3 record in `docs/ARCHITECTURE-EXECUTION-PLAN.md` carries it.
+
 ## 3. Audit findings (2026-08-02) — status
 
 Review of all 30 Metal kernels for the same failure classes (barrier deadlock,

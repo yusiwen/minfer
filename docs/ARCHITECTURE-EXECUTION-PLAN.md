@@ -8245,7 +8245,8 @@ and **42 / 0** with `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf`. `cargo b
 
 **Honest scope.** (a) **Metal is still unported** ([#137](https://github.com/yusiwen/minfer/issues/137)):
 its `copy_cross` declines, `Backend::retire`'s default keeps its boundary blocking, and its copies
-still count as blocking — no half-written blit/event code. (b) **The `cudaStreamWaitEvent`
+still count as blocking — no half-written blit/event code. *(Superseded by the **F5 S3** record below,
+2026-10-05, which ports it; the sentence is kept as the state this record measured.)* (b) **The `cudaStreamWaitEvent`
 device-consumer arm is not reached**: the ticket's first bullet asks for it, but the only pair that
 could express a device destination would need two device backends, `copy_across` early-returns on a
 same-backend pair, and CUDA→Metal (macOS + CUDA) declines phase A — so a call site would be
@@ -8262,6 +8263,98 @@ same **11** grandfathered bare sites (this PR adds no annotation and tightens no
 oracle run with `RUSTFLAGS=--cap-lints=warn` and `RUSTUP_TOOLCHAIN` unset reports **0 additions** in
 both configurations — the `(name, kind)` set difference against
 `docs/dead-code-baseline.toml` is empty, so neither site became live and neither entry went stale.
+
+### F5 S3 — the async staging copy ported to Metal (#137) — **DONE 2026-10-05**
+
+**The ticket.** [#137](https://github.com/yusiwen/minfer/issues/137) is F5's Metal half: the
+`BackendEntry::copy_cross` / `await_cross` hooks had a CUDA implementation and a Metal one that
+**declined** phase A (`Ok(false)`), so a Metal source kept the pre-F5 synchronous host round trip and
+its boundary copies counted as `blocking_host_copies`. The port needs a `MTLBlitCommandEncoder` copy
+plus an event, the mechanism chosen and justified, and the same counter / bitwise / loud-`Err`
+acceptance the CUDA side has.
+
+**What landed.**
+
+- `src/metal/encode.rs` — `MpsCommandBuffer::encode_blit_signal` (a blit copy of the source window
+  into the staging buffer plus `encodeSignalEvent`) and `command_buffer()`.
+- `src/metal/runtime.rs` — `MpsState::new_shared_event()`; `src/metal.rs` — the `MetalSharedEvent`
+  alias.
+- `src/graph/metal_backend.rs` — `MetalBackend::cross_enqueue` / `cross_take`, the `copy_cross` /
+  `await_cross` hooks, `cross_pending_len` and `sync_readback_count`.
+- `src/graph/scheduler.rs` — phase A for a Metal→CPU boundary runs **before** `retire_backend`, so the
+  blit lands in the producer split's own command buffer.
+- `src/graph/alloc.rs` — the `cross_stats_mut` / `cross_buffer` cfgs widened to `target_os = "macos"`.
+
+**Mechanism choice.** `MTLSharedEvent`, not `MTLEvent` and not a completion handler: a completion
+handler can only notify the host, and a plain `MTLEvent` has no host wait; `MTLSharedEvent` is the one
+primitive that both `encodeSignalEvent` / `encodeWaitForEvent` accept *and* that exposes a bounded host
+wait. Phase A enqueues (blit + signal) and never blocks; phase B's single wait is
+`waitUntilSignaledValue:timeoutMS:` with a 10 s bound, at the consumer's first read. The
+device-consumer arm (`encodeWaitForEvent`) is reserved and unreachable (see Honest scope).
+
+**The finding the port forced (fixed in the same commit).** The first cut gave each staging copy its
+**own** command buffer, committed *after* `retire`. On this box the same mixed 0.5B graph then differed
+between async and `MINFER_SYNC_COPIES=1` by max |Δlogit| **1.46**, while each mode compared with itself
+was bitwise stable. Reading the source at enqueue and comparing it with the staging buffer at the wait
+showed the staged bytes were **identical**, so the divergence was the extra in-flight command buffer
+perturbing Metal kernel execution (the backend already has 20 red tests on this box — a red baseline
+makes the mode difference ambiguous). Encoding the blit into the producer split's own command buffer —
+`copy_across` before `retire` for a Metal→CPU boundary — restores the one-command-buffer rule and makes
+the comparison **bitwise**.
+
+**Measured acceptance (box `macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-05).**
+
+`cargo test --release --bin minfer async_cross_copies_never_block_and_stay_bitwise_identical_on_metal -- --ignored --test-threads=1`:
+
+```text
+[f5-metal] async: copies=35 waits=35 deferred_waits=35 blocking_host_copies=0 async_host_copies=21 event_syncs=21 stream_waits=0 sync_readbacks=0
+[f5-metal] sync : copies=35 waits=35 blocking_host_copies=21 async_host_copies=0 sync_readbacks=21
+[f5-metal] 6 decode steps + 1 prefill over 4/24 Metal blocks: max |Δlogit| = 0; blocking host copies 21 -> 0, device readbacks 21 -> 0
+```
+
+The cheap device gate
+(`graph::metal_backend::tests::staging::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise`,
+3 nodes CPU → Metal → CPU) reads async `copies=2 waits=2 deferred=2 blocking=0 async_host=1
+event_syncs=1 sync_readbacks=0` against sync `copies=2 waits=2 blocking=1 sync_readbacks=1`.
+
+**Mutation evidence (each caught by a named gate).**
+
+| mutation | gate | result |
+|---|---|---|
+| drop a staged input's wait (read `cross_input` directly) | `graph::metal_backend::tests::staging::a_staged_entry_read_before_its_wait_is_refused` | loud `Err` "… read before its boundary wait …" |
+| re-request `(graph, node, dst)` while in flight | `…staging::a_re_request_while_in_flight_is_the_same_transfer` | one copy, one wait, one record (`cross_pending_len() == 1`), no leak |
+| make a blit/wait end in a failing status (`MINFER_TEST_CALL_FAIL=metal_cross_copy`) | `…staging::a_timed_out_cross_wait_is_a_loud_err` | `Err` naming the value waited for, the observed `signaledValue`, and the command buffer status |
+
+**Suite counts.** `cargo test --release` **490 / 20 / 39** unit (baseline **486 / 20 / 38**; +4 Metal
+staging gates, +1 `#[ignore]`d real-model gate; the 20 failures are the box's pre-existing red baseline
+and are **exactly the same set**). `scripts/real_model_gates.sh` (the default parallel form on a
+CPU-only build) **37 / 2** on the cached 0.5B and **37 / 2** with
+`MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf`, against the baseline **37 / 1**; the extra failure is
+`server::batch::tests::prefill::a_long_prefill_keeps_another_slot_decoding`, a pre-existing Metal path
+(the batch engine offloads all 24 blocks and hits the G5 `copy_cells` refusal / a CPU index bound), not
+a boundary copy. The new Metal gate passes **in isolation** —
+`cargo test --release --bin minfer async_cross_copies_never_block_and_stay_bitwise_identical_on_metal
+-- --ignored --test-threads=1` → **1 passed** — and one Qwen3 parallel run was **36 / 3** with the gate
+itself at Δ = 0.285: other concurrently-running tests submit to the same `MpsState` command queue
+without taking `crate::metal::metal_test_lock()` (the lock's own doc comment records that this drops
+kernel writes), so the gate can be corrupted by the shared harness. `cargo build --release` and
+`cargo fmt --all --check` are clean on the pinned 1.97.1 toolchain.
+
+**A cross-process CLI check is not usable on this box, and is recorded as such.** `minfer --gpu-layers
+4 -n 8 --greedy <0.5B q4_0> "The capital of France is"` is stable within one mode across repeats but
+produces *different* continuations in async and `MINFER_SYNC_COPIES=1` runs, and neither matches the
+`--backend cpu`/`--gpu-layers 0` reference (`"The capital of France is Paris. It"`) — the pre-existing
+Metal graph-graph divergence the box's 20 red tests already record. The controlled same-process
+async-vs-sync comparison (both arms on the same loaded engine, mode toggled with
+`copystats::set_sync_for_test`) is bitwise and is the acceptance evidence.
+
+**Honest scope.** (a) The **device-consumer arm** (`encodeWaitForEvent`) is reserved, not exercised:
+Metal→Metal early-returns and CUDA does not run on Apple Silicon, so no device→device pair exists on
+macOS. (b) **Not verified on CUDA**: the scheduler reorder is not `#[cfg]`-gated but only the Metal
+branch takes it (`pb == BackendTag::METAL`), so a CUDA build's order is unchanged; this box has no CUDA
+device and CI only compiles the CUDA harness. (c) The 20 red Metal tests on this box were **not** fixed
+and are not claimed to be. (d) The port adds no *cross-split* overlap — the split loop is still
+sequential; the wait is deferred to the consumer read, as on CUDA.
 
 ### F6 — Quantizer tooling: convert, quantize, split (#49) — **DONE 2026-09-24**
 
