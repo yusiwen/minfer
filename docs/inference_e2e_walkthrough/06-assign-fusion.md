@@ -97,7 +97,7 @@ Two facts make GPU assignment possible at all, and both are decided before this 
   (`src/models/qwen2/graph.rs:425-427`; the CUDA arm is the same shape at line 435). This is why
   doc 03 (weight registration) is a *precondition* of this stage.
 - **The user can opt out.** `MINFER_DISABLE_MPS=1` makes `metal_available()` false
-  (`src/metal.rs:2032`), so the priority question falls straight through to CPU.
+  (`src/metal/runtime.rs`), so the priority question falls straight through to CPU.
 
 And one design rule makes the assignment trustworthy: **it is a build-time decision, full stop.**
 Three concrete consequences, all visible in the code:

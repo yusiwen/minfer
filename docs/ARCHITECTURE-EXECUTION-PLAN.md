@@ -10189,3 +10189,81 @@ that [#231](https://github.com/yusiwen/minfer/issues/231) says "has never been e
 220 vs GPU 353). They belong to [#231](https://github.com/yusiwen/minfer/issues/231)/[#260](https://github.com/yusiwen/minfer/issues/260),
 not here, and this ticket adds no fix for them. [#265](https://github.com/yusiwen/minfer/issues/265)
 carries the same failing set before and after, which is what a pure move must show.
+
+#### Test-infrastructure record (#265, 2026-10-05) — the Metal split, in the three increments Addendum 2 asked for
+
+**The ticket.** [#265](https://github.com/yusiwen/minfer/issues/265) is Step 4 of the source-layout
+campaign: split `src/metal.rs` (2 472 lines at `a7fc07e`) into `src/metal/{runtime,encode,ops,policy}.rs`
+and `src/metal.metal` (5 151 lines) into `src/metal/kernels/*.metal` + `*.h`. It is a Mac-local task —
+`src/main.rs` gates the module on `target_os` — and the ticket's Addendum 2 (2026-10-05) required three
+increments, each verified on the Mac, rather than one step. Box
+`macbook (macOS 27.0.1, Apple M4 Pro)`, toolchain pinned at `1.97.1` (`RUSTUP_TOOLCHAIN` unset),
+worktree `.worktrees/265` branched from the landed [#255](https://github.com/yusiwen/minfer/issues/255).
+
+**Increment 1 — build plumbing, shader set unchanged.** `build.rs` gains an explicit
+`SHADER_SOURCES` list, concatenates it into `$OUT_DIR/minfer.metal`, compiles that into the one
+`minfer.metallib`, emits one `cargo:rerun-if-changed` per listed part, and runs
+`check_shader_file_list()` on every build (every `.metal`/`.h` under `src/` must be listed; a listed
+file must exist). `src/metal.rs`'s `newLibraryWithSource` fallback now `include_str!`s the same
+generated file. The generated source is byte-identical to `src/metal.metal`, and the metallib is
+unchanged at **410 942 B / sha256 `13af518e…`** — expected, because no shader and no flag moved.
+
+**Increment 2 — one family per commit (16 commits), then `src/metal.metal` deleted.** The final
+partition, verified by reassembling the ranges: **212 923 B, 5 151 lines, 61 `kernel void kernel_*`
+names, identical sets**. `src/metal/kernels/` is `common.h` 13 + `dequantize.h` 198 +
+`mul_q4_0_q8_0` 350 · `mul_f32act_q4q5` 504 · `mul_f32act_kquant` 492 · `mul_mm` 397 · `mul_mm_kq` 640 ·
+`get_rows` 184 · `norm_elementwise` 219 · `rope` 37 · `fa_parallel` 129 · `kv` 115 · `qkv_fused` 283 ·
+`fa_split` 262 · `fa_decode` 516 · `fa_prefill` 812. Every family was built and run (0.5B Metal) before
+its commit; the metallib hash moved to `7a4a7cd4…` (same size — the functions are the same, the
+concatenation order is not). **Three corrections against plan §4 Step 4's table:** no `quantize.h`
+(the tree has no GPU-side quantize helper — the only `quantize` strings are comments); `get_rows.metal`
+includes the warm-up kernel (2 340–2 523); `rope.metal` is 37 lines because `kernel_rope_f32` sits after
+the P1 parallel-attention section. The tree wins; the plan's table is corrected in place.
+
+**Increment 3 — the Rust split, 0 visibility edits.** `src/metal.rs` 2 480 → **453** lines; the type
+definitions (`MpsState`, `MpsStateInner`, `MpsCommandBuffer`), the objc2 aliases, the free items and the
+private dispatch primitives (`trace_op`/`set_params`/`barrier`/`dispatch_1d`/`dispatch_2d`/`dispatch_3d`/
+`gemm_enabled`/`gemm_dispatch`, plus the test-only `matmul_on_gpu_buf` and `get_or_grow`) stay in the
+parent, so the four children reach private fields and methods with **no `pub(super)`** — the same shape
+that kept `CudaState` in `src/cuda.rs`. `metal/ops.rs` 1 431 · `metal/runtime.rs` 476 ·
+`metal/encode.rs` 116 · `metal/policy.rs` 66 (re-exported through `pub use policy::{…}` so
+`crate::metal::kv_cache_is_f16` etc. still resolve). Two findings from doing it: `get_or_grow` is **not**
+internal to `impl MpsState` as the #255 note said — `ops.rs` calls it four times, so it moved to the
+parent; and `matmul_on_gpu_buf` had to stay in the parent (or move to `tests.rs`) because a private
+method of `metal::ops` is invisible to `metal::tests`.
+
+**A fourth compile entry point.** The ticket names two (build.rs, the runtime fallback); the tree has
+four: `tests/{flash_attn,flash_attn_blk,gqa_attn,gemm}_isolation.rs` `include_str!` the shader at 9
+sites and compile it themselves. They now read the same `$OUT_DIR/minfer.metal`, so all four consumers
+cover one file set by construction (`env!("OUT_DIR")` **is** available to integration tests). Leaving
+them on `src/metal.metal` is what first broke `cargo test`.
+
+**Gate counts, before (#255 baseline) → after.**
+`macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-05:
+
+| Command | #255 baseline | #265 |
+|---|---|---|
+| `cargo build --release` | exit 0, metallib 410 942 B / `13af518e…` | exit 0, 410 942 B / `7a4a7cd4…` |
+| `cargo test --release` | **483 / 20 / 38** | **483 / 20 / 38** (one run 482/21 — `cuda_conversation_multiturn_reuse` is flaky under the parallel harness; it passes 3/3 alone) |
+| `scripts/real_model_gates.sh` (0.5B) | 37 / 1 | **37 / 1** (same `a_slot_snapshot_resumes_the_context_without_re_prefilling`) |
+| `scripts/real_model_gates.sh` + Qwen3-0.6B | 37 / 1 | **37 / 1** (same) |
+| `check_doc_line_anchors.py` | 1672 anchors, exit 0 | 1542 anchors, exit 0 |
+| `check_source_layout.py` / `check_dead_code_annotations.py` | exit 0 / 9 bare | exit 0 / 9 bare |
+| `cargo fmt --all --check` | exit 0 | exit 0 |
+
+**Runtime fallback verified, not assumed.** With the build-time `metal` compile forced to fail (a bad
+flag), `build.rs` wrote the empty marker and the 0.5B model still loaded and ran through
+`newLibraryWithSource`; `MINFER_METALLIB_FILE=/tmp/empty.metallib` exercises the override-failure arm.
+
+**Mutation evidence.** An unlisted `src/zz_probe_mutation.metal` (plus a `build.rs` touch, because cargo
+only reruns the script on a watched change) → `build.rs:77` panics with
+`build.rs SHADER_SOURCES must list every .metal/.h under src (a shader absent from the list is never
+compiled)`, exit **101**.
+
+**Doc sweep.** 130 live anchor occurrences re-pointed across 13 documents (line numbers dropped for the
+symbol anchor, the policy's preference) and the plain `metal.rs`/`metal.metal` mentions updated in 26
+live files; `README.md`'s mention too, even though the checker does not watch it. Frozen records
+(`PARAMETER_AUDIT.md`, `ARCHITECTURE-EXECUTION-PLAN.md`, `QWEN2.5-*`, `KNOWN-CPU-ISSUES-*`,
+`cuda_optimization_steps/*`) keep their pre-split anchors. The five `cuda_tutorial` anchors that cited
+`src/metal.rs` for CUDA symbols were re-pointed at the CUDA files (`cuda/methods/elementwise.rs`,
+`cuda/methods.rs`, `graph/kvformat.rs`) instead of the new Metal ones.

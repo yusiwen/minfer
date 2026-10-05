@@ -95,7 +95,7 @@ flowchart LR
 | Attention + vec ops + KV | [11](11-attention-vecops-kv.md) | `vec_ops.rs`, `graph/cpu_backend.rs` | RMSNorm, RoPE (two styles), softmax, SiLU; GQA attention; `kvcache_store/load` — positions are data, not structure |
 | Sampler | [12](12-sampler.md) | `sampler.rs::sample_with_penalties` | Penalties (repeat/frequency/presence, last-64 window) → top-k → top-p → temperature → seeded sample; stop-string byte matching |
 | Decode loop + reuse | [13](13-decode-loop-graph-reuse.md) | `main.rs` (decode loop), `graph/cache.rs::try_reuse`, `conversation.rs` | One token per step: only input *data* changes; first decode step rebuilds the graph, KV survives; multi-turn append-only prefill |
-| Metal backend | [14](14-metal-backend.md) | `metal.rs` (`MpsState`), `graph/metal_backend.rs`, `metal.metal` | Same graph on Apple GPU: zero-copy weight buffers, per-op shaders, one command buffer per split, fused decode kernels, flash attention |
+| Metal backend | [14](14-metal-backend.md) | `src/metal/` (`MpsState`), `graph/metal_backend.rs`, `src/metal/kernels/` | Same graph on Apple GPU: zero-copy weight buffers, per-op shaders, one command buffer per split, fused decode kernels, flash attention |
 | CUDA backend | [15](15-cuda-backend.md) | `graph/cuda_backend.rs`, `cuda.rs`, `cuda/kernels/*.cu` | Same graph on NVIDIA: resident weights, int8 MMQ prefill / MMVQ decode, split-KV attention, CUDA Graph capture/replay, pinned async staging |
 
 ## Reading orders

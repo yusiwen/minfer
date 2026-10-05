@@ -477,7 +477,7 @@ file: *register a weight → use it → (never) free it*.
    resolve by name at execution time.
 4. **Use.** A decode step later, dispatch resolves the name to a device
    pointer and passes it to a launcher. The Rust side of `add_f32`
-   (`src/metal.rs:1139`) is a 17-line translation unit from safe Rust to
+   (`src/cuda/methods/elementwise.rs`) is a 17-line translation unit from safe Rust to
    the C launcher: fetch `self.stream()`, then one `unsafe` call
    `launch_add_f32(x as *const f32, y as *const f32, z as *mut f32, n as i32,
    stream)`. The `extern` declaration sits at `src/cuda/methods/dispatch.rs:19-25` — these
@@ -494,7 +494,7 @@ file: *register a weight → use it → (never) free it*.
    implicitly synchronizes the device — that is why the `Drop` first takes
    the stream lock (`src/graph/cuda_backend.rs:358-367`). For the
    grow-on-demand scratch slots there is a middle pattern, `get_or_grow`
-   (`src/metal.rs:2449`): if the slot's allocation is too small, *free
+   (`src/cuda/methods.rs`): if the slot's allocation is too small, *free
    the old buffer then allocate the new one*, only under the slot's own
    `Mutex` so two graph executions cannot grow the same slot concurrently.
 
@@ -791,7 +791,7 @@ enqueues `cudaMemcpyDeviceToDevice` on the shared stream. Two GPU operations
 the stream.
 
 Then the descent from §2.3 step 4: `CudaState::silu_f32`
-(`src/metal.rs:1223`) fetches the shared stream and calls the extern
+(`src/cuda/methods/elementwise.rs`) fetches the shared stream and calls the extern
 launcher (declared at `src/cuda/methods/dispatch.rs:33`); the C launcher computes
 `grid = (4864 + 255) / 256 = 19` and enqueues
 `silu_f32<<<19, 256, 0, stream>>>`; the kernel gives each of the 4,864

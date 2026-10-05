@@ -1,6 +1,6 @@
 # minfer Apple Silicon Metal Inference Path — Analysis Report
 
-> Baseline comparison: llama.cpp ggml-metal (~10,000+ lines) vs minfer metal.rs + metal.metal (~1,700 lines)
+> Baseline comparison: llama.cpp ggml-metal (~10,000+ lines) vs minfer src/metal/ + src/metal/kernels/ (~1,700 lines)
 > Date: 2026-07-27
 
 ---
@@ -34,7 +34,7 @@
 
 ### CRITICAL #1 — No Flash Attention
 
-**Files**: `metal.metal:710-794`
+**Files**: `src/metal/kernels/dequantize.h`
 
 The current `kernel_gqa_attn_f32` uses one threadgroup per (token, head) pair to sequentially iterate over all KV entries. At 4096-token context, each head loops 4096 times — no tiling, no shared-memory K/V reuse.
 
@@ -47,7 +47,7 @@ The current `kernel_gqa_attn_f32` uses one threadgroup per (token, head) pair to
 
 ### CRITICAL #2 — No Matrix-Matrix Multiply
 
-**Files**: `metal.rs:163-178`, `metal.metal:13-82`
+**Files**: `src/metal/policy.rs`, `src/metal/kernels/common.h`
 
 minfer only has mat-vec kernels (`NR0=2-4` rows per threadgroup). During prefill with N tokens, it dispatches N separate threadgroup columns via `dispatch_2d(..., nt, ...)`. Each token re-reads the same weight matrix independently, wasting memory bandwidth by a factor of N.
 
@@ -57,17 +57,17 @@ minfer only has mat-vec kernels (`NR0=2-4` rows per threadgroup). During prefill
 
 ### CRITICAL #3 — Duplicate KV Cache
 
-**Files**: `cache.rs` vs `metal.rs:57-58`
+**Files**: `cache.rs` vs `src/metal/ops.rs`
 
 Two independent KV caches are maintained:
 - CPU side: `KVCache.layers[i].k/v` (`Vec<f32>`, `cache.rs:6-11`)
-- GPU side: `kv_k`/`kv_v` (`Vec<metal::Buffer>`, `metal.rs:57-58`)
+- GPU side: `kv_k`/`kv_v` (`Vec<metal::Buffer>`, `src/metal/ops.rs`)
 
 The GPU path writes KV via `store_kv_f32`, but the CPU KV cache is never updated. If the inference falls back from GPU to CPU path, KV data is lost.
 
 ### HIGH #4 — Single CommandBuffer, No Parallelism
 
-**Files**: `metal.rs`, `forward.rs:62-75`
+**Files**: `src/metal/`, `forward.rs:62-75`
 
 All layers are encoded into one `MpsCommandBuffer`, then `submit()` blocks until completion. The GPU sits idle while the CPU encodes.
 
@@ -75,7 +75,7 @@ All layers are encoded into one `MpsCommandBuffer`, then `submit()` blocks until
 
 ### HIGH #5 — Weight Data Full-Copy
 
-**Files**: `metal.rs:466-478`, `loader.rs:183`
+**Files**: `src/metal/`, `loader.rs:183`
 
 Every weight tensor is copied into a new `MTLBuffer` via `copy_nonoverlapping`, even though Apple Silicon has a unified memory architecture.
 
@@ -83,25 +83,25 @@ Every weight tensor is copied into a new `MTLBuffer` via `copy_nonoverlapping`, 
 
 ### HIGH #6 — CPU-Side Quantization Blocking
 
-**Files**: `metal.rs:598`, `src/kernel/dispatch.rs:9`
+**Files**: `src/metal/ops.rs`, `src/kernel/dispatch.rs:9`
 
 Before each GPU matmul dispatch, `quantize_row_q8_0_buf` runs on the CPU to quantize activations to Q8_0, then uploads to GPU. This is a synchronous bottleneck in the GPU pipeline.
 
 ### HIGH #7 — No Non-Mac GPU Path
 
-**Files**: `metal.rs:16-17`, `main.rs:17-18`
+**Files**: `src/metal/`, `main.rs:17-18`
 
 `MpsStateInner` is entirely wrapped in `#[cfg(target_os = "macos")]`. There is no Vulkan/MoltenVK fallback for Intel Macs.
 
 ### MEDIUM #8 — RoPE Limited to Qwen2 Style
 
-**Files**: `metal.metal:662-687`
+**Files**: `src/metal/kernels/dequantize.h`
 
 The RoPE shader hardcodes the Qwen2 non-interleaved layout. It does not support the interleaved format used by LLaMA/Mistral, nor YaRN extended-context RoPE.
 
 ### MEDIUM #9 — Unaligned float4 in RMSNorm
 
-**Files**: `metal.metal:570-586`
+**Files**: `src/metal/kernels/mul_mm.metal`
 
 Reads `float4` from arbitrary addresses at `x + row * d`. While Metal tolerates misaligned `float4` reads with a performance penalty, some devices may fault. If `d % 16 != 0`, the reads are unaligned.
 

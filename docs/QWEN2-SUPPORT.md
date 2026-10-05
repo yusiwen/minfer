@@ -78,7 +78,7 @@ backends; greedy output matches llama.cpp where noted):
 |---|---|---|
 | **Qwen2.5-0.5B** | Q4_0, Q4_K_M, Q5_K_M | 24 layers · `n_embd=896` · 14 query heads / 2 KV heads (GQA 7:1) · `hd=64`, `n_kv_embd=128` · tied embeddings · KV cost 24 KB/token across all layers (walkthrough 11 §2.2) |
 | **Qwen2.5-7B** | Q4_K_M | the 7B decode-bandwidth reference (28 GB→4.4 GB quantization argument, walkthrough 10 §2.1) |
-| **Qwen2.5-1.5B** | historical | had a dedicated debugging era — `docs/QWEN2.5-1.5B-BUGS.md`, `docs/QWEN2.5-DEBUGGING-NOTES.md` (predates the graph refactor; the kernel fixes it drove — Metal attention hd=128 overflow, Q4_K interleaved scale/min layout, Q6_K embedding-scale indexing — are folded into `metal.metal`/`quants.rs` and regression-tested) |
+| **Qwen2.5-1.5B** | historical | had a dedicated debugging era — `docs/QWEN2.5-1.5B-BUGS.md`, `docs/QWEN2.5-DEBUGGING-NOTES.md` (predates the graph refactor; the kernel fixes it drove — Metal attention hd=128 overflow, Q4_K interleaved scale/min layout, Q6_K embedding-scale indexing — are folded into `src/metal/kernels/`/`quants.rs` and regression-tested) |
 | DeepSeek-R1-Distill-Qwen-1.5B | works | needs the tokenizer special-token match (same Qwen2 architecture) |
 
 Any GGUF with `general.architecture = "qwen2"` that stays inside the supported

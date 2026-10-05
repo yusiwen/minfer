@@ -5,7 +5,7 @@
 > **Code**: `models/mod.rs::load_model` (dispatch), `models/qwen2/loader.rs::load`
 > and `models/qwen3/loader.rs::load` (the two implementations), `main.rs:637-657`
 > (GPU init + legacy KV cache), `tensor.rs` (`Cow<'static,[u8]>` weight bytes),
-> `graph/alloc.rs::register_weight`, `metal.rs::register_weight` /
+> `graph/alloc.rs::register_weight`, `src/metal/::register_weight` /
 > `cuda.rs::register_weight` (per-backend registries),
 > `models/qwen2/graph.rs::weights_on_gpu` (the GPU participation gate).
 
@@ -200,7 +200,7 @@ registered as `(buffer, byte offset)` into that one buffer. The GPU reads the
 file's pages directly; there is no GPU-side allocation and no memcpy, ever.
 The one cost is a first-touch one: the very first GPU access to file-backed
 pages pays ~44 ms of page/TLB setup, which the loader deliberately triggers
-once at load time, outside the timed inference window (`metal.rs:2350-2355`).
+once at load time, outside the timed inference window (`src/metal/runtime.rs`).
 
 **CUDA — one upload, resident forever.** NVIDIA GPUs have *discrete* memory
 (device memory, VRAM) that the CPU cannot address; bytes must be copied
@@ -342,7 +342,7 @@ forward note under the annotations)
 
 Annotations: `MpsState::init()` is a `OnceLock` singleton init — inside, it
 honors `MINFER_DISABLE_MPS` by returning `None`, so "disabled" and "no
-device" are the same state downstream (`metal.rs:2031-2035`). CUDA likewise
+device" are the same state downstream (`src/metal/runtime.rs`). CUDA likewise
 honors `MINFER_DISABLE_CUDA` and takes the `--gpu N` index here. The
 `load_model` call is where this entire doc's work happens — note `.expect`:
 an unsupported architecture is fatal, by design (§2.2). The final three lines
@@ -553,7 +553,7 @@ value. The Qwen3 loader reads it *before* the KV type pick (its comment says
 why: the f16 auto-select multiplies `n_layers × n_kv_embd`), and its assert
 turns a wrong `key_length` fallback into a load-time crash instead of
 silently corrupting attention. The policy `set_kv_cache_type` implements
-(`metal.rs:132-153`): if `MINFER_CACHE_TYPE` says `f16`/`f32`, obey (since C4 the
+(`src/metal/policy.rs`): if `MINFER_CACHE_TYPE` says `f16`/`f32`, obey (since C4 the
 value is parsed strictly on every device — an unknown spelling, or `q8_0`, which
 only the CPU kernels read, fails the load instead of quietly running f32);
 otherwise auto-select — f16 (half precision: 2 bytes per value instead of 4)
@@ -592,7 +592,7 @@ table when absent (`load_one(tn::OUTPUT).unwrap_or_else(|| tok_embd.clone())`
 projection instead of shipping a second matrix), and every per-layer tensor
 is `Option` because Qwen3 has no biases while Qwen2.5-7B does.
 
-Excerpt 8 — Metal's zero-copy registry. (`src/metal.rs`, annotated
+Excerpt 8 — Metal's zero-copy registry. (`src/metal/`, annotated
 condensation of `register_part` :2320-2372 and `register_weight` :2374-2424)
 
 ```rust
@@ -858,7 +858,7 @@ deletion, so keeping the parameter bought nothing.
   *before* any `register_weight`. The zero-copy lookup finds weights by
   pointer containment in a registered part; weights registered first would
   silently take the copy path. Page alignment of the mmap base is a
-  `debug_assert`, not a hope (`metal.rs:2332`).
+  `debug_assert`, not a hope (`src/metal/runtime.rs`).
 - **CUDA init must complete before the first registration.** The loaders
   call `CudaState::init()` up front and hold a model-load guard for the whole
   load (`qwen2/loader.rs:295-306`). The recorded failure mode: lazy init

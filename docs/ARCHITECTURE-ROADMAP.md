@@ -81,10 +81,10 @@ and mostly *enabled* by fixing (1) and (2) first.
 | Metric | Value |
 |---|---|
 | `src/` Rust | 44,105 LOC across 48 files |
-| Largest files | `graph/cuda_backend.rs` 6,664 · `src/cuda.rs` 6,340 · `metal.rs` 3,944 · `models/qwen2/graph.rs` 2,253 · `gguf.rs` 2,096 |
+| Largest files | `graph/cuda_backend.rs` 6,664 · `src/cuda.rs` 6,340 · `src/metal/` 3,944 · `models/qwen2/graph.rs` 2,253 · `gguf.rs` 2,096 |
 | Compute-graph core (`src/graph/`) | 13,052 LOC; 3,391 LOC excluding the three backends |
 | CUDA kernels | `src/cuda/kernels/*.cu` (17 translation units + `common.cuh`, compiled by `build.rs` only under `--features cuda`; [#263](https://github.com/yusiwen/minfer/issues/263)) |
-| Metal shaders | `src/metal.metal` → `minfer.metallib` at build time, source-compile fallback |
+| Metal shaders | `src/metal/kernels/` → `minfer.metallib` at build time, source-compile fallback |
 | Tests | 5 integration files (`tests/`, ~3.1k LOC, four of them Metal-only) + inline `#[cfg(test)]` |
 | Docs | ~182 Markdown files; 41 in `docs/`, 106 numbered CUDA campaign records |
 
@@ -815,7 +815,7 @@ hazards that the larger work would otherwise have to work around.
 | Backend registry (F4) | `src/graph/registry.rs`, `docs/BACKEND-REGISTRY-DESIGN.md` |
 | CPU execution | `src/graph/cpu_backend.rs`, `src/kernel.rs`, `src/quants.rs` |
 | CUDA execution | `src/graph/cuda_backend.rs`, `src/cuda.rs`, `src/cuda/kernels/*.cu` |
-| Metal execution | `src/graph/metal_backend.rs`, `src/metal.rs`, `src/metal.metal` |
+| Metal execution | `src/graph/metal_backend.rs`, `src/metal/`, `src/metal/kernels/` |
 | Models | `src/models/mod.rs`, `models/qwen2/graph.rs`, `models/qwen3/graph.rs` |
 | Serving | `src/server/{mod,chat,slot}.rs`, `src/conversation.rs` |
 | Sampling | `src/sampler.rs`, `src/tokenizer.rs`, `src/template.rs` |

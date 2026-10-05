@@ -95,7 +95,7 @@ The multi-token kernel analysis in this document (structural comparison with lla
 
 ### 1. Q4_K Block Format Interpretation
 
-**minfer** (`metal.metal:583-588`):
+**minfer** (`src/metal/kernels/dequantize.h`):
 ```metal
 for (int j = 0; j < 16; j++) {
     uchar b0 = qb0[j];
@@ -121,7 +121,7 @@ FOR_UNROLL (short i = 0; i < 4; ++i) {
 
 ### 2. Scale/Min Unpacking
 
-**minfer** (`metal.metal:409-416`):
+**minfer** (`src/metal/kernels/mul_f32act_q4q5.metal`):
 ```metal
 inline void get_scale_min_k4(int j, device const uchar * q, thread uchar & d, thread uchar & m) {
     if (j < 4) {
@@ -218,7 +218,7 @@ The actual root cause was **IQ4_NL quantization support**: the model used GGUF q
 | `tensor.rs` | Add `TensorType::Q5_K` (type_size=176, blck_size=256, from_ggml_type mapping) | Q5_K model loading + CPU inference |
 | `kernel.rs` | Add `cpu_q5_k_matmul_f32` | Q5_K CPU dequant for matmul |
 | `forward.rs` | Q5_K dequant in `embed_tokens` | Token embedding lookup for Q5_K models |
-| `metal.rs` | Guard layer_gpu against Q5_K + Raw | GPU→CPU fallback for unsupported types |
+| `src/metal/` | Guard layer_gpu against Q5_K + Raw | GPU→CPU fallback for unsupported types |
 | `gguf.rs` | (pre-existing) All IQ type codes already parsed correctly | — |
 
 ## Unresolved: IQ Type Support

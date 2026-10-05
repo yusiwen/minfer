@@ -569,7 +569,7 @@ ends.
 
 **f16 KV: half the bytes, same addresses.** The `kv_f16` flag
 (`cuda_backend.rs:20-26`) is fixed at backend construction from the process
-policy (`kv_cache_is_f16`, `src/metal.rs:141`, set by the loader at
+policy (`kv_cache_is_f16`, `src/graph/kvformat.rs`, set by the loader at
 `src/models/qwen2/loader.rs:347`). When it is on, every store converts to
 `__half` and every attention read converts back; §3.2's kernel shows both
 sides of that. The `store_kv_f16` header comment states the trade

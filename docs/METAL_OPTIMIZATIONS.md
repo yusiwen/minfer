@@ -125,7 +125,7 @@ decode scalar kernel, so only the 0.5B class fuses FFN.
 | 32 | **lm_head / final-norm output-rows-only (2026-08-21, §3.7)**: llama computes the final norm + last-layer FFN + lm_head on **n_outputs rows only** (`ggml_get_rows(cur, inp_out_ids)` at qwen2.cpp:106-108; graph dump shows output GEMM `out=[152064 1]` and last-layer gate/down `[.. 1]`); minfer computed `[152064×495]`. **§3.6's "7.000 TFLOP" was WRONG** (assumed output N=495; correct llama total ≈ 6.26 TFLOP — the kernel-level "gap" was mostly this over-count). Fix: `forward()`/`output_norm_gpu`/CUDA all take `n_out`; final rms_norm + lm_head run on the tail n_out rows (n_out=1), logits buffer/download shrink 301 MB → 608 KB | 7B pp495 GPU **~1354 → ~1255 ms** (stable; pre-change noisy 1354-2754), **download ~150 ms → ~0.1 ms** (wall −~150 ms); 0.5B GPU output byte-identical pre/post; 1.5B/7B greedy generation correct | `43989da` |
 | 33 | **GPU Q4_K embedding (get_rows) (2026-08-21)**: minfer's `kernel_get_rows_q4_0` was Q4_0-only, so the 7B/1.5B (Q4_K `token_embd.weight`) fell back to CPU scalar dequant + 7 MB `upload_hidden` per prefill (O(nt) wall: ~5-15 ms @ 495 tok, ~100-200 ms @ 8K). Added `kernel_get_rows_q4_k` (reuses the validated `dequant_q4_k_16`, llama `kernel_get_rows_q`-equivalent) + pipeline + type routing in `embed_tokens_gpu` | 7B/1.5B embedding now on GPU; greedy output **byte-identical** pre/post (same seed); `get_rows_q4_k_isolation` test bit-exact vs CPU; no prefill GPU regression | uncommitted |
 | 34 | **Last-layer FFN output-rows-only (2026-08-21, §3.7 follow-up)**: llama reduces `cur` + `inpSA` to **n_out rows BEFORE the last layer's FFN** (`ggml_get_rows(cur, inp_out_ids)` + `get_rows(inpSA, inp_out_ids)` at qwen2.cpp:106-108) — the last layer's ffn_norm, gate/up/down, swiglu and BOTH residuals run on 1 row. minfer ran layer-27's entire FFN on all nt. Fix: `layer_gpu` now takes `n_out`/`is_last`; the wo matmul stays on all nt (llama `build_attn` precedes the reduction), then the wo-residual, ffn_norm (byte-offset read of the hidden tail), gate/up/down (dispatched with nt=n_out via the new `x_off` matmul param), swiglu and the final residual all run on the tail n_out rows (`add_f32_off`); CPU path mirrors. minfer's total graph work drops 6.46 → ≈6.26 TFLOP — **now exactly llama's total** | 7B pp499 GPU **~1278 → ~1234 ms (~44 ms, ~3.4 %)** — the doc's ~40 ms estimate confirmed; byte-identical (7B/0.5B GPU greedy + 0.5B CPU fallback, same seeds); decode unchanged (nt==1 path untouched); 33/34 bin tests green (1 pre-existing env-dependent failure: `attn_parallel_realdata_correctness` needs `/tmp/dp3` dumps) | `b6ecbd3` |
-| 35 | **Precompiled metallib (2026-08-21, §4.2 to-do #1)**: build.rs compiles `src/metal.metal` → embedded `.metallib` (`xcrun metal -O3` + `metallib`, llama's exact flags; clang module cache redirected via `-fmodules-cache-path` since the default cache dir is unwritable under the build sandbox) → loaded with `newLibraryWithData`; empty-marker fallback to `newLibraryWithSource` when the toolchain is absent. Numerics verified **byte-identical** to the runtime source compile (7B @615/499 + 0.5B greedy, all 4 isolation suites, 33/34 bin tests) — a first apparent divergence was an A/B reference prompt-mixup, not a compiler difference; `-O0` metallib lacks `kernel_q4_1_f32_matmul` (falls back to CPU), so `-O3` only. Runtime hook `MINFER_METALLIB_FILE=<path>` loads an external metallib without rebuilds | 0.5B process wall **~1.32 → ~1.09 s** (warm driver cache; the first-ever run benefits most — no per-process compile), prefill/decode perf unchanged (equal within noise); shader errors now caught at build time | `d09b8db` |
+| 35 | **Precompiled metallib (2026-08-21, §4.2 to-do #1)**: build.rs compiles `src/metal/kernels/` → embedded `.metallib` (`xcrun metal -O3` + `metallib`, llama's exact flags; clang module cache redirected via `-fmodules-cache-path` since the default cache dir is unwritable under the build sandbox) → loaded with `newLibraryWithData`; empty-marker fallback to `newLibraryWithSource` when the toolchain is absent. Numerics verified **byte-identical** to the runtime source compile (7B @615/499 + 0.5B greedy, all 4 isolation suites, 33/34 bin tests) — a first apparent divergence was an A/B reference prompt-mixup, not a compiler difference; `-O0` metallib lacks `kernel_q4_1_f32_matmul` (falls back to CPU), so `-O3` only. Runtime hook `MINFER_METALLIB_FILE=<path>` loads an external metallib without rebuilds | 0.5B process wall **~1.32 → ~1.09 s** (warm driver cache; the first-ever run benefits most — no per-process compile), prefill/decode perf unchanged (equal within noise); shader errors now caught at build time | `d09b8db` |
 | 36 | **GGUF mmap + zero-copy weights (2026-08-21, §4.2 to-do #2)**: `std::fs::read` (4.4 GB) + per-tensor `extend_from_slice` copy + GPU `new_buffer`+memcpy were THREE full-weight copies (~8.8 GB RAM + 4.4 GB GPU). Now: each part is `mmap`'d (MAP_PRIVATE, zero-dep raw `mmap`/`munmap` FFI, leaked for the process) and `Tensor.data` is a `Cow<'static,[u8]>` **Borrowed** slice of it (zero per-tensor copy; the `output = tok_embd.clone()` weight-tying fallback is now a shallow clone too); the Metal backend wraps each part with ONE page-aligned `newBufferWithBytesNoCopy` (`register_part`) and registers weights as **(buffer, byte offset)** into it — llama's exact design (`ggml_metal_buffer_map` page-aligns; `newBufferWithBytesNoCopy` requires a page-aligned base — per-weight NoCopy at 32-aligned bases was tried first and reads SHIFTED data on the GPU, hence the offset design). `MINFER_WEIGHT_COPY=1` forces the old copy path for A/B | 7B load+prefill wall **~4.3 → ~2.7 s** (warm; first-run 7.2 → 3.3 s); peak RSS **20.9 → 4.7 GB (~4.4×)** — the weights are file-backed pages shared with CPU/GPU; 7B/0.5B greedy byte-identical + CPU fallback identical; prefill/decode perf unchanged (equal within noise); 34/35 bin tests green (1 pre-existing env-dependent) | `d51e8b8` |
 | 37 | **f16 KV auto-default (2026-08-21)**: `set_kv_cache_type(n_layers, n_kv_embd)` at model load auto-selects the GPU KV element type — **f16 for the 7B class** (n_layers×n_kv_embd ≥ 8192: KV bandwidth-bound decode), f32 for small models; `MINFER_CACHE_TYPE=f16/f32` overrides. llama always defaults F16 (`llama-context.cpp:3539`); minfer had kept f32 default because 0.5B f16 measured ~3% slower (§0 decided-not #8) — the auto rule applies f16 exactly where it wins and keeps the 0.5B class on f32 | 7B @2K ctx steady decode **f16 ≈ 20.15 ms vs f32 21.13 ms/token (~1 ms, ~5 %)**; 7B greedy byte-identical across auto/f32/f16 (16 tokens); 0.5B untouched (auto→f32); 34/35 bin tests green | this commit  `9099f79` |
 | 38 | **GPU get_rows for the remaining embedding types (2026-08-21)**: llama's `kernel_get_rows_q` covers every quant; minfer had Q4_0+Q4_K only (#33), so the 0.5B Q5_0/Q5_1/Q8_0/Q6_K-embedding models (q4_k_m embd=Q5_0, q5_k_m embd=Q5_1, q5_0/q8_0/q6_k models) fell back to CPU scalar dequant + `upload_hidden` per prefill. Added MSL templates `kernel_get_rows_q32` (Q4_1/Q5_0/Q5_1/Q8_0, one thread per 32-elem block, reuses the validated `dequant_*_16` helpers) + `kernel_get_rows_q256` (Q6_K/Q5_K, one thread per 16-elem group, same structure as the Q4_K kernel) + pipeline routing/guards (ne%32 / ne%256) in `embed_tokens_gpu` | `tests/gemm_isolation.rs::get_rows_multi_type_isolation` — all 6 new kernels **bit-exact vs CPU** (rel 0); end-to-end q5_0/q5_k_m/q8_0 GPU == CPU greedy (same seed); 0.5B q4_k_m (embd Q5_0) now embeds on GPU (was CPU fallback); 1.5B Q4_K / 7B Q4_K unchanged; 34/35 bin tests green. **Note**: the 0.5B q6_k model shows a PRE-EXISTING GPU-vs-CPU greedy divergence (reproduced on the pre-#38 binary — not from this change; its 896-dim Q6_K embd is ne%256≠0 → CPU fallback) — flagged for later investigation | this commit |
@@ -350,7 +350,7 @@ lm_head output-rows-only fix (#32, §3.7), and the GPU Q4_K embedding port (#33)
 
 ### 2.3 Per-kernel non-matmul profile (2026-08-10, P0)
 
-`metal.rs::tests::non_matmul_bandwidth_profile` (batched-cb, median of 3) — a
+`src/metal/::tests::non_matmul_bandwidth_profile` (batched-cb, median of 3) — a
 single dispatch is dominated by the ~165 µs cb launch+sync floor, so batch dozens
 and take the median:
 
@@ -400,7 +400,7 @@ amortizes natively via its f16 cache + flash.
 ### 3.1 Correctness fixes (Metal backend foundation)
 
 4 early bugs (all affected output correctness, Qwen2-0.5B):
-1. **RoPE freq_scale not applied** (`metal.rs` `rope_f32` got the param +
+1. **RoPE freq_scale not applied** (`src/metal/` `rope_f32` got the param +
    `forward.rs` passes `hp.rope_freq_scale`).
 2. **output_b not applied** (`output_norm_gpu` adds the bias).
 3. **softmax max initialization** (`-INFINITY` instead of 0, prevents NaN).
@@ -670,7 +670,7 @@ it.
 `[nt][ne]` hidden). The final `rms_norm` + output GEMM + bias + logits buffer +
 download all operate on `n_out` rows (n_out=1 for the minfer CLI). Host:
 `src/models/qwen2/forward.rs` (GPU `output_norm_gpu(…, n_out, …)`, CUDA path,
-CPU fallback slices `hidden[(nt-n_out)*ne..]`), `src/metal.rs:2012` +
+CPU fallback slices `hidden[(nt-n_out)*ne..]`), `src/metal/runtime.rs` +
 `rms_norm(.., off)` byte-offset, `src/main.rs` passes `n_out=1`.
 
 **Measured** (7B Q4_K_M pp495, interleaved A/B same window):
@@ -686,7 +686,7 @@ CPU fallback slices `hidden[(nt-n_out)*ne..]`), `src/metal.rs:2012` +
 **Follow-up — DONE 2026-08-21 (#34)**: the last layer's FFN now runs on the
 output rows only, exactly matching llama's `get_rows(inp_out_ids)` reduction
 (qwen2.cpp:106-108 reduces `cur` + `inpSA` BEFORE the last layer's FFN). Fix in
-`layer_gpu` (`metal.rs`): the wo matmul stays on all nt (llama `build_attn`
+`layer_gpu` (`src/metal/`): the wo matmul stays on all nt (llama `build_attn`
 precedes the reduction), then the wo-residual, ffn_norm (byte-offset read of the
 hidden tail), gate/up/down (dispatched with nt=n_out via the new `x_off` matmul
 param) and the final residual all run on the tail n_out rows (`add_f32_off`);
@@ -732,7 +732,7 @@ the minfer-vs-llama prefill work difference 6.46 vs 6.26 TFLOP) is now **DONE
 Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 KV: prefill dequantizes to f16 scratch via
 `kernel_flash_attn_ext_kv_f16` when `ne01≥32`; decode reads quantized blocks
 directly in the flash vec kernel). Analyzed against llama source (ops.cpp:2805-
-2831, ggml-metal.metal:6328-6366/7864-7885) and **deferred**: the shipped models cap
+2831, ggml-src/metal/kernels//7864-7885) and **deferred**: the shipped models cap
 at `max_seq=32768` — f16 KV (#37) needs only 1.9 GB at 32K (within the 8.7 GB
 mmap-era RSS), so Q8_0 KV (0.96 GB) has no validation target on the current
 models. Revisit when a >32K-context model is the user-facing one.
@@ -748,13 +748,13 @@ models. Revisit when a >32K-context model is the user-facing one.
 |---|---|---|
 | **GPU weight-buffer cold state (run 1)** | the 5.2 GB weights are freshly CPU-memcpy'd into Shared buffers at load; the GPU's first read hits cold MMU/TLB + page residency → slower prefill + decode on run 1 | decode 32.6 t/s (~84 GB/s) run 1 vs 46.4 t/s (~119 GB/s) run 2 |
 | **GPU clock ramp** | first GPU burst after idle starts below max clock | secondary |
-| **Model-load wall (not in `Total`, but real wall time)** | 4.4 GB `std::fs::read` (gguf.rs:1711,1736) + Metal shader source compile (`newLibraryWithSource`, metal.rs:1120) — run 2 mitigated by the OS page cache + the Metal driver's on-disk shader cache | run 1 load visibly slow, run 2 ~free |
+| **Model-load wall (not in `Total`, but real wall time)** | 4.4 GB `std::fs::read` (gguf.rs:1711,1736) + Metal shader source compile (`newLibraryWithSource`, src/metal/ops.rs) — run 2 mitigated by the OS page cache + the Metal driver's on-disk shader cache | run 1 load visibly slow, run 2 ~free |
 
 Warm steady-state = run 2's numbers (pp30 ~0.17 s, decode ~46 t/s). Not a bug.
 
 | # | Item | Current | Approach (llama parity) | Expected | Blocker / Risk |
 |---|---|---|---|---|---|
-| 1 | **Precompiled metallib** | ~~every process compiles `metal.metal` from source via `newLibraryWithSource`~~ → **DONE 2026-08-21 (#35)** | build-time `metal` compiler → embed a `.metallib` → load with `newLibraryWithData` | remove the per-invocation shader compile — 0.5B process wall 1.32 → **1.09 s** (warm; the first-ever run benefits most) | the standalone Metal toolchain (`xcrun metal`) IS installed; build.rs falls back to source compile when absent — no numerics risk (byte-identical, verified) |
+| 1 | **Precompiled metallib** | ~~every process compiles `src/metal/kernels/` from source via `newLibraryWithSource`~~ → **DONE 2026-08-21 (#35)** | build-time `metal` compiler → embed a `.metallib` → load with `newLibraryWithData` | remove the per-invocation shader compile — 0.5B process wall 1.32 → **1.09 s** (warm; the first-ever run benefits most) | the standalone Metal toolchain (`xcrun metal`) IS installed; build.rs falls back to source compile when absent — no numerics risk (byte-identical, verified) |
 | 2 | **GGUF mmap + zero-copy weight buffers** | ~~`std::fs::read` the whole file into a Vec, then copy each weight into a Shared GPU buffer (2 passes)~~ → **DONE 2026-08-21 (#36)** | mmap the GGUF; `newBufferWithBytesNoCopy` over the mapped data (llama `ggml-metal-device.m:1668`) | remove the 4.4 GB copy pass + the 4.4 GB intermediate Vec; the GPU reads the mapped file pages directly — 7B load wall 4.3→**2.7 s**, peak RSS 20.9→**4.7 GB** | `newBufferWithBytesNoCopy` requires a page-aligned base → ONE buffer per mmap'd part + per-weight (buffer, offset), exactly llama's design. **Cold-start regression (fixed #39)**: the first GPU access to file-backed pages cost ~44 ms per process (short prompts) — absorbed at load by a dummy GPU warm-up read (`kernel_warmup_read`) |
 | 3 | **Persistent / server mode** (note) | one-shot CLI: every invocation re-loads the model | keep the process alive and reuse the loaded model (llama-server pattern) | removes reload for repeated calls — the definitive fix for the observed run-1/run-2 gap | out of the current CLI scope |
 
@@ -851,9 +851,9 @@ only**:
 
 > Line-by-line structural comparison behind the §3.3 ~7-10× attention gap
 > (minfer split attention 42.8 µs/layer vs llama flash ~4-6 µs/layer at
-> nkv=430). Source: llama `kernel_flash_attn_ext_vec` (ggml-metal.metal:7218),
+> nkv=430). Source: llama `kernel_flash_attn_ext_vec` (ggml-src/metal/kernels/),
 > llama dispatch (ggml-metal-ops.cpp:2959), minfer `kernel_gqa_attn_partial_f32`
-> (metal.metal:2995), `_f16` (:3127), `kernel_gqa_attn_combine_f32` (:3243).
+> (src/metal/kernels/kv.metal), `_f16` (:3127), `kernel_gqa_attn_combine_f32` (:3243).
 
 #### A. Overall design
 
@@ -1025,7 +1025,7 @@ For Qwen2.5-0.5B (hd=64, nh=14, nk=2, gqa=7, nt==1 decode):
 | `simdgroup_barrier` | simdgroup-wide barrier (cheaper, single warp) |
 | `float4`/`half4` | 4-wide vector types (128-bit / 64-bit) used for SIMD loads |
 
-> minfer kernels (src/metal.metal unless noted):
+> minfer kernels (src/metal/kernels/ unless noted):
 
 | Function | Meaning |
 |---|---|

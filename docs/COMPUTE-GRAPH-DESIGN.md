@@ -110,7 +110,7 @@ These are the rules the rest of the document elaborates. Breaking one is a bug, 
  scheduler.execute(&graph, &alloc)              split → sync → copy → execute
         │
         ├── CpuBackend    (kernel.rs / vec_ops.rs)
-        ├── MetalBackend  (metal.rs + metal.metal)
+        ├── MetalBackend  (src/metal/ + src/metal/kernels/)
         └── CudaBackend   (cuda.rs + cuda/kernels/*.cu)
 ```
 
@@ -132,7 +132,7 @@ cached graph skips the first three stages and only refills inputs.
 | `graph/scheduler.rs` | `BackendScheduler` — `assign_backends`, `split_graph`, `execute` |
 | `graph/fusion.rs` | `FusionPass` — pattern-matching rewrite |
 | `graph/cpu_backend.rs` | CPU executor over `kernel.rs` / `vec_ops.rs` |
-| `graph/metal_backend.rs` | Metal executor over `metal.rs` per-op methods |
+| `graph/metal_backend.rs` | Metal executor over `src/metal/` per-op methods |
 | `graph/cuda_backend.rs` | CUDA executor over `cuda.rs`, including CUDA Graph capture/replay |
 | `graph/dot.rs` | Graphviz DOT export |
 | `graph/json.rs` | JSON export for the interactive visualizer (`viz/`) |
@@ -1332,7 +1332,7 @@ The plan's file-change manifest, replaced by the landed inventory.
 | `src/models/qwen3/graph.rs` | 1132 | Qwen3 build + weights + tests |
 
 `src/models/qwen2/forward.rs` was **deleted** in Phase 6; the imperative path no longer exists.
-`src/metal.rs` and `src/cuda.rs` remain the per-op kernel/device layers that the graph backends wrap;
+`src/metal/` and `src/cuda.rs` remain the per-op kernel/device layers that the graph backends wrap;
 `src/cuda/kernels/*.cu` holds the CUDA kernels (`common.cuh` + 17 translation units since [#263](https://github.com/yusiwen/minfer/issues/263)). `src/cache.rs` (the legacy `KVCache` the graph path
 ignored) was deleted in [#252](https://github.com/yusiwen/minfer/issues/252) — the allocator owns KV.
 

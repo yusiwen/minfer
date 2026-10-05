@@ -1,7 +1,7 @@
 # minfer Metal Backend Design
 
-How minfer runs the compute graph on an Apple GPU: the `MetalBackend` graph executor, the `metal.rs`
-device/kernel layer, the `metal.metal` shaders, the command-buffer rhythm, and the memory and safety
+How minfer runs the compute graph on an Apple GPU: the `MetalBackend` graph executor, the `src/metal/`
+device/kernel layer, the `src/metal/kernels/` shaders, the command-buffer rhythm, and the memory and safety
 rules that hold it together.
 
 > **Status.** Landed. The backend arrived with compute-graph Phase 3, and the G1–G6 wiring passes
@@ -28,7 +28,7 @@ rules that hold it together.
 ### 1.1 Goal
 
 Implement `MetalBackend` (`src/graph/metal_backend.rs`) as the macOS backend of the compute graph by
-**wiring the existing per-op kernels** on `MpsState` (`src/metal.rs`) — no new kernels required — so
+**wiring the existing per-op kernels** on `MpsState` (`src/metal/`) — no new kernels required — so
 that on Apple Silicon the whole per-layer chain runs on the GPU through the standard
 `build → assign → fuse → alloc → execute` pipeline, with the same correctness contract as CPU:
 backend placement is decided at build time, kernel-invariant violations return `Err`, and there is
@@ -49,7 +49,7 @@ never a silent mid-run fallback.
 
 ### 1.3 Non-goals
 
-- **A whole-layer `layer_gpu` fast path.** The pre-graph imperative path was removed; `metal.rs` is
+- **A whole-layer `layer_gpu` fast path.** The pre-graph imperative path was removed; `src/metal/` is
   the per-op device/kernel layer only (the name survives solely in the legacy CUDA code).
 - **f16/bf16 activations.** Graph activations are f32; the f16 story is the KV cache
   (`MINFER_CACHE_TYPE`) and the flash-attention f16-KV kernel variants.
@@ -80,11 +80,11 @@ never a silent mid-run fallback.
 | Layer | File | Role |
 |---|---|---|
 | Graph executor | `src/graph/metal_backend.rs` | Implements `Backend`: shared-memory buffer pool, name→buffer-offset weight resolution, per-op dispatch, split-scoped `MpsCommandBuffer`, capture staging, error contract |
-| Device/kernel layer | `src/metal.rs` | `MpsState` singleton: device/queue/library init, zero-copy weight registry, `MpsCommandBuffer` (encoder, barriers, submit), and one Rust method per op/kernel |
-| Shaders | `src/metal.metal` | The Metal Shading Language kernels (norms, matmul tiers, attention variants, elementwise, KV store, get_rows, fused epilogues) |
+| Device/kernel layer | `src/metal/` | `MpsState` singleton: device/queue/library init, zero-copy weight registry, `MpsCommandBuffer` (encoder, barriers, submit), and one Rust method per op/kernel |
+| Shaders | `src/metal/kernels/` | The Metal Shading Language kernels (norms, matmul tiers, attention variants, elementwise, KV store, get_rows, fused epilogues) |
 | Build chain | `build.rs` | Runtime shader compilation (default) or a precompiled metallib (`MINFER_METALLIB_FILE`/`_PATH`); the objc2 framework links |
 
-The split follows CUDA: `metal.rs` is the only place that touches Objective-C/Metal APIs, and
+The split follows CUDA: `src/metal/` is the only place that touches Objective-C/Metal APIs, and
 `metal_backend.rs` is the only place that knows about graph nodes.
 
 ### 2.2 The `MetalBackend` surface
@@ -143,9 +143,9 @@ One `MpsCommandBuffer` is kept for the current split:
 ### 2.5 Legacy surface
 
 The pre-graph whole-layer `layer_gpu` path was removed when the graph became the default: there is
-no `layer_gpu` function in `metal.rs` (the name survives only in the legacy CUDA code), and
+no `layer_gpu` function in `src/metal/` (the name survives only in the legacy CUDA code), and
 `src/graph/metal_backend.rs` is the only live consumer of the device layer. What remains is a
-`#[allow(dead_code)]` block in `metal.rs` holding the old-forward scaffolding and a few methods kept
+`#[allow(dead_code)]` block in `src/metal/` holding the old-forward scaffolding and a few methods kept
 for tests (e.g. `matmul_on_gpu_buf`); the loaders, the graph backend and the kernel tests are the
 live callers. (The legacy `KVCache` type in `src/cache.rs` was likewise unused by the graph path; KV
 lives in the allocator's persistent regions, and the type — with the `ModelDef::forward` argument
@@ -488,7 +488,7 @@ the Done / To-do / Decided tables reuse the same numbers.
 | 4 | Concurrent MPS access under parallel tests flips fused/unfused greedy tokens | **Mitigated for tests**: `metal_test_lock()` + `MpsState::init()`; production runs one scheduler thread |
 | 5 | Q8_0 multi-token matmul race (missing trailing `threadgroup_barrier`) | **Fixed**; pinned by `metal_prefill_determinism` |
 | 6 | Metal gate failure is silent (no diagnostic like CUDA's `CUDA GATE:`) | **Open (diagnostics)**: a missing/unregistered weight drops the model to CPU with only the init line to explain it |
-| 7 | Whole-layer `layer_gpu` reference path still referenced in comments/tests | **Open (cleanup)**: the function is gone from `metal.rs`; the `#[allow(dead_code)]` block and comments remain |
+| 7 | Whole-layer `layer_gpu` reference path still referenced in comments/tests | **Open (cleanup)**: the function is gone from `src/metal/`; the `#[allow(dead_code)]` block and comments remain |
 | 8 | 7B prefill ~10% behind the old path | **Accepted**: GEMM-bound; the GEMM transfers fully, and the prefill-GEMM investigation closed as "decided not to change" (`METAL_OPTIMIZATIONS.md` §3.6) |
 | 9 | Warm-up / cold-start costs | **Tracked**: mmap first-touch solved by the load-time warm-up; remaining cold-start to-dos in `METAL_OPTIMIZATIONS.md` §4.2 |
 
@@ -559,6 +559,6 @@ on Linux the Metal-only tests self-skip and the isolation binaries are empty.
   llama's; decided not to change), and the flash/split/parallel attention lineup.
 - **Remaining research** (`METAL_OPTIMIZATIONS.md` §4.1/§4.2): cold-start items and the residual
   7B-prefill gap; see that document's roadmap section rather than duplicating it here.
-- **Cleanup candidates**: the `#[allow(dead_code)]` legacy block/comments in `metal.rs`, and adding a
+- **Cleanup candidates**: the `#[allow(dead_code)]` legacy block/comments in `src/metal/`, and adding a
   Metal gate diagnostic to match CUDA's `CUDA GATE:` line (§6 #6/#7).
 
