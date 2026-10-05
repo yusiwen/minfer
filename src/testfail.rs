@@ -42,6 +42,7 @@
 //! | `alloc_in_pool` | `graph::alloc::GraphAllocator::alloc_in_pool` | `Err` before the pool is touched |
 //! | `execute_node` | `graph::scheduler::BackendScheduler::execute` | `Err` before the backend dispatch |
 //! | `register_weight` | `models::weight_reg::register_cuda_weight` | panic in the CUDA weight registrar |
+//! | `metal_device_memory` | `metal::MpsState::device_memory` | `Reported` → `QueryFailed` (the E4/E5 device answer on macOS, [#53]) |
 //! | `launch:*` / `attr:*` | `src/cuda/kernels/*.cu` | the **real** CUDA call is made to fail (#147) |
 //!
 //! # The observation half

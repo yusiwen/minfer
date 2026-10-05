@@ -67,14 +67,22 @@ pub fn class_bytes(elems: usize) -> usize {
 pub enum DeviceMemory {
     /// The backend answered: `free` of `total` bytes.
     ///
-    /// Only the CUDA query constructs these two variants today (`cuda.rs`) and
-    /// the planner's own tests construct them. `allow` rather than `#[cfg]`
-    /// because removing a variant changes the enum's shape and would force the
-    /// same cfg onto every `match` arm here and in `offload.rs`.
+    /// Two device queries construct these variants today — CUDA's `cudaMemGetInfo`
+    /// (`cuda.rs`) and Metal's `recommendedMaxWorkingSetSize` (`metal/runtime.rs`,
+    /// [#53]) — and the planner's own tests construct them. `allow` rather than
+    /// `#[cfg]` because removing a variant changes the enum's shape and would force
+    /// the same cfg onto every `match` arm here and in `offload.rs`. The predicate is
+    /// the pre-existing one and therefore also covers macOS, where Metal now uses the
+    /// variant: an unnecessary `allow` there, kept because the #254 oracle strips only
+    /// single-line attributes and a precise `not(any(feature = "cuda", target_os =
+    /// "macos", test))` exceeds rustfmt's attribute width and is wrapped.
+    ///
+    /// [#53]: https://github.com/yusiwen/minfer/issues/53
     #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
     Reported { free: usize, total: usize },
     /// The query itself failed. `code` is the backend's error code and `name` its
-    /// symbolic name (for CUDA, `cudaGetErrorName`, e.g. `cudaErrorIllegalAddress`).
+    /// symbolic name (for CUDA, `cudaGetErrorName`, e.g. `cudaErrorIllegalAddress`;
+    /// Metal has no numeric code, so it uses `0` and names the reason in `name`).
     #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
     QueryFailed { code: i32, name: String },
     /// There is no device state to ask (CPU, or a device whose state could not be
