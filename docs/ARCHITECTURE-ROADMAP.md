@@ -65,7 +65,7 @@ and mostly *enabled* by fixing (1) and (2) first.
 | 1 | KV cache redesign (cells, seq ids, prefix reuse, shift/defrag) | L4 | XL | 2–5 w |
 | 4 | Persistent server context (no per-request rebuild/realloc) | L5+L3 | M | 3–5 d |
 | 7 | IR expressiveness: strided views/aliasing + multi-output nodes | L1 | L | 1–2 w |
-| 8–9 | Memory placement policy: VRAM budget, layer offload, size-class allocator — **E4 complete (accounting/gate, size-class pools, reserve/assign + the multi-graph cache) and E5 complete (explicit per-block offload and the `auto` fit); only a Metal free-bytes query (so `auto` works there) and per-block tuning remain** | L3+L6 | L | 1–2 w |
+| 8–9 | Memory placement policy: VRAM budget, layer offload, size-class allocator — **E4 complete (accounting/gate, size-class pools, reserve/assign + the multi-graph cache) and E5 complete (explicit per-block offload and the `auto` fit); the Metal free-bytes query landed as [#53](https://github.com/yusiwen/minfer/issues/53)'s `DeviceMemory` answer, so `auto` and `headroom_bytes()` work on macOS too; only per-block tuning remains** | L3+L6 | L | 1–2 w |
 | 12 | Backend registry (drop the hard-coded 3-way enum/match) — **DONE (F4, 2026-09-24)**: the enum is a `Copy`/`Hash`/`Ord` handle over a fixed id space and the name-keyed table lives in `graph/registry.rs`; the nine match sites are gone. The set is still closed at compile time — this makes it data, not pluggable at runtime | L6 | M | 4–7 d |
 | 11 | CPU: AVX2/AVX-512 for the K-quant dots + weight repacking | L7 | L | 1–2 w |
 | 10 | Chunked prefill (`n_batch` actually used) — **E3, landed 2026-09-22** | L2+L5 | M | 3–5 d |
