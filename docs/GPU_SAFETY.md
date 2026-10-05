@@ -34,7 +34,7 @@ semaphore and never checked `MTLCommandBufferStatus`. A single GPU fault would
 block minfer forever (and, since Metal clients share the GPU, could stall
 WindowServer → whole-machine freeze).
 
-Now (`src/metal.rs`):
+Now (`src/metal/`):
 - Bounded wait: `dispatch_semaphore_wait(sem, dispatch_time(NOW, 10s))`.
 - On completion, checks `MTLCommandBufferStatus` — non-`Completed` reports an
   error instead of silently continuing.
@@ -52,7 +52,7 @@ Now (`src/metal.rs`):
 `threadgroup_barrier`. When `nh % nk != 0`, some simdgroups exit early while
 others wait on the barrier → GPU permanent deadlock = machine freeze.
 
-Fix (`src/metal.metal`, both kernels): no early return. Invalid heads
+Fix (`src/metal/kernels/`, both kernels): no early return. Invalid heads
 (`h0 >= nh`) run the full loop with a dummy head index (`h = 0`, keeps pointers
 in-bounds) so **all** simdgroups reach every barrier, then **skip the output
 write** via a `valid_head` flag.
@@ -99,7 +99,7 @@ visibility (not a deadlock, but a correctness race)**:
   dispatches are ordered but write-visibility across them is NOT guaranteed by
   Metal. `bn` reused as RMSNorm output / QKV input / WO output / ffn_down output
   raced → last-2-token garbage. Fixed with `memoryBarrierWithScope` after every
-  `dispatch_*` (`src/metal.rs`), matching llama.cpp. Rule for future code: any
+  `dispatch_*` (`src/metal/`), matching llama.cpp. Rule for future code: any
   buffer written by one dispatch and read by the next in the same encoder needs
   the barrier; do not rely on "it's serialized".
 - **GEMM partial-tile `temp_str` overlaps `sa`/`sb`**: after the K-loop, a fast
@@ -121,7 +121,7 @@ limit" for the M4 Pro. The correct approach (what llama.cpp does,
 `ggml-metal-device.m:851` + `ggml-metal-ops.cpp:2367`) is:
 
 ```rust
-// metal.rs — query the real limit and guard against it:
+// src/metal/ — query the real limit and guard against it:
 let shmem = 2 * 32 * hd * 4; // Bc * hd * 2 * sizeof(f32)
 let max = self.inner.device.max_threadgroup_memory_length(); // real device value
 if shmem > max {

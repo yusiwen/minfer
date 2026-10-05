@@ -13,7 +13,7 @@ Previous fixes (Bugs 1-5) addressed dequantization issues but didn't solve the p
 **Bug 6: GPU Attention KV Cache Indexing Error** (CRITICAL)
 
 ### Location
-`src/metal.metal` — `kernel_gqa_attn_f32`, lines 735-736
+`src/metal/kernels/` — `kernel_gqa_attn_f32`, lines 735-736
 
 ### The Bug
 The GPU attention kernel computed wrong memory addresses when reading from the KV cache:
@@ -96,7 +96,7 @@ Speed: ~4 tok/s (CPU only - running on Linux, no Metal support)
 
 | File | Lines Changed | Description |
 |------|--------------|-------------|
-| `src/metal.metal` | 4 lines (756, 762, 778, 782) | Fixed KV cache addressing in `kernel_gqa_attn_f32` |
+| `src/metal/kernels/` | 4 lines (756, 762, 778, 782) | Fixed KV cache addressing in `kernel_gqa_attn_f32` |
 
 ## Verification Steps
 

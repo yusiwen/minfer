@@ -1,8 +1,8 @@
 # Metal Backend: objc 0.2 → objc2 Migration Plan
 
-**Status:** ✅ Implemented (2026-08-25). The plan was executed and committed: `metal`/`block`+`vendor/block` removed, `src/metal.rs` + `src/graph/metal_backend.rs` + the `tests/*_isolation.rs` migrated to objc2-metal/block2. All `cargo test` targets pass (164 tests incl. Metal-vs-CPU + kernel isolation) and end-to-end Metal inference produces correct output. This doc is kept as the record of what changed and the pitfalls found (keep the `commandBuffer()` vs Metal-4 `newCommandBuffer` distinction, `NSUInteger=usize`, `NonNull` contents, `unsafe` wrapping, `MTLBarrierScope`).  
+**Status:** ✅ Implemented (2026-08-25). The plan was executed and committed: `metal`/`block`+`vendor/block` removed, `src/metal/` + `src/graph/metal_backend.rs` + the `tests/*_isolation.rs` migrated to objc2-metal/block2. All `cargo test` targets pass (164 tests incl. Metal-vs-CPU + kernel isolation) and end-to-end Metal inference produces correct output. This doc is kept as the record of what changed and the pitfalls found (keep the `commandBuffer()` vs Metal-4 `newCommandBuffer` distinction, `NSUInteger=usize`, `NonNull` contents, `unsafe` wrapping, `MTLBarrierScope`).  
 **Estimated effort:** 4–6 working days (senior Rust + Metal dev)  
-**Scope:** `src/metal.rs` (2226 LOC), `src/graph/metal_backend.rs` (1420 LOC), `build.rs`, `Cargo.toml`, tests
+**Scope:** `src/metal/` (2226 LOC), `src/graph/metal_backend.rs` (1420 LOC), `build.rs`, `Cargo.toml`, tests
 
 ---
 
@@ -108,7 +108,7 @@ See [`METAL_OBJC-ECOSYSTEM.md`](METAL_OBJC-ECOSYSTEM.md) for the full ecosystem 
 - **Remove `[lints.rust] unexpected_cfgs`** (`Cargo.toml:38-43`) — exists solely to quiet objc 0.2.7's `sel_impl!` macro; dead config once `objc` is gone
 - ⚠️ **Version-couple these four crates.** `objc2` / `objc2-foundation` / `objc2-metal` / `block2` must resolve to one compatible `objc2`. Pin them together and confirm with `cargo tree` (a common mismatch is `objc2 0.6` + `objc2-foundation 0.2` → two `objc2` versions). Follow whatever set `cargo add` resolves, not the literal versions above.
 
-### 3.2 `src/metal.rs` (2226 LOC)
+### 3.2 `src/metal/` (2226 LOC)
 
 This is the primary rewrite target. Changes organized by section:
 
@@ -186,7 +186,7 @@ type MetalLibrary = Retained<ProtocolObject<dyn MTLLibrary>>;
 type MetalCompileOptions = Retained<MTLCompileOptions>;
 ```
 
-> ⚠️ `MetalBuffer` uses `dyn MTLBuffer`, **not** `dyn MTLResource`. `MTLResource` does not expose `.length()`/`.contents()` (those live on the `MTLBuffer` sub-protocol), and minfer calls them at `metal.rs:348/431` and `metal_backend.rs:83/115/197/206/208`. Aliasing to `MTLResource` will not compile.
+> ⚠️ `MetalBuffer` uses `dyn MTLBuffer`, **not** `dyn MTLResource`. `MTLResource` does not expose `.length()`/`.contents()` (those live on the `MTLBuffer` sub-protocol), and minfer calls them at `src/metal//431` and `metal_backend.rs:83/115/197/206/208`. Aliasing to `MTLResource` will not compile.
 >
 > ⚠️ **objc2-metal 0.3.2 introduced `MTL4*` types.** The queue's command-buffer method is **`commandBuffer() → Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>`** (the one minfer uses); `MTLDevice::newCommandBuffer()` is the separate **Metal-4** API returning `MTL4CommandBuffer` and is **not** used here. The completion-handler block arg is `NonNull<ProtocolObject<dyn MTLCommandBuffer>>`. Alias `MetalCommandBuffer` to the queue's returned type.
 
@@ -205,7 +205,7 @@ type MetalCompileOptions = Retained<MTLCompileOptions>;
 +let lib = device.newLibraryWithSource_options_error(&ns_source, None)?;
 ```
 
-**Embedded metallib (`metal.rs:1140`) & `MINFER_METALLIB_FILE` override (`metal.rs:1187`)** — ⚠️ `newLibraryWithData_error` takes a **`&DispatchData`** (dispatch2 / objc2-foundation), **not** `&[u8]`; returns `Result<Retained<...>, Retained<NSError>>`. Wrap the metallib bytes:
+**Embedded metallib (`src/metal/ops.rs`) & `MINFER_METALLIB_FILE` override (`src/metal/ops.rs`)** — ⚠️ `newLibraryWithData_error` takes a **`&DispatchData`** (dispatch2 / objc2-foundation), **not** `&[u8]`; returns `Result<Retained<...>, Retained<NSError>>`. Wrap the metallib bytes:
 ```diff
 -use dispatch2::DispatchData;
 -let data = DispatchData::from_bytes(&bytes);
@@ -214,7 +214,7 @@ type MetalCompileOptions = Retained<MTLCompileOptions>;
 +let data = DispatchData::from_bytes(&bytes);
 +let lib = device.newLibraryWithData_error(&data)?;
 ```
-`load_embedded_or_source`/`compile_metal_source` (`metal.rs:1126/1138`) are also in this phase — update their return type (`Option<MetalLibrary>`) and error handling alongside `try_new`.
+`load_embedded_or_source`/`compile_metal_source` (`src/metal/ops.rs/1138`) are also in this phase — update their return type (`Option<MetalLibrary>`) and error handling alongside `try_new`.
 
 **Function/Pipeline creation:**
 ```diff
@@ -295,7 +295,7 @@ The current code uses `unsafe { msg_send![obj, retain] }` and the `Drop` impl wi
 -unsafe { let _: () = msg_send![self.enc, memoryBarrierWithScope: 1u64]; }
 +self.enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
 ```
-> ⚠️ `MTLBarrierScope` is a typed bit-flag type in objc2-metal — pass `MTLBarrierScope::Buffers` (or `from_bits(1)`), **not** a raw `1u64`. `metal.rs:312` currently passes the raw `1u64` through `msg_send!`.
+> ⚠️ `MTLBarrierScope` is a typed bit-flag type in objc2-metal — pass `MTLBarrierScope::Buffers` (or `from_bits(1)`), **not** a raw `1u64`. `src/metal/` currently passes the raw `1u64` through `msg_send!`.
 
 #### 3.2.7 `MpsCommandBuffer::submit()` — Block Completion Handler
 
@@ -322,7 +322,7 @@ In objc2-metal 0.3.2 the handler method is **`unsafe fn addCompletedHandler(&sel
 
 #### 3.2.8 `dispatch_*` FFI — keep the `extern "C"` block (optional `dispatch2` move)
 
-The semaphore functions (`dispatch_semaphore_create`, `dispatch_semaphore_signal`, `dispatch_semaphore_wait`, `dispatch_time`, `dispatch_release`) are from libdispatch, not Metal. **They stay as `extern "C"` blocks — no change needed.** In particular **keep `dispatch_release`**: `submit()` still calls it after the wait (`metal.rs:1085` `dispatch_release(sem)`), so deleting the declaration would break the build. The `dispatch_*` FFI is unrelated to the `objc`/`block` migration — treat a switch to `dispatch2` as optional cleanup, not part of this task:
+The semaphore functions (`dispatch_semaphore_create`, `dispatch_semaphore_signal`, `dispatch_semaphore_wait`, `dispatch_time`, `dispatch_release`) are from libdispatch, not Metal. **They stay as `extern "C"` blocks — no change needed.** In particular **keep `dispatch_release`**: `submit()` still calls it after the wait (`src/metal/ops.rs` `dispatch_release(sem)`), so deleting the declaration would break the build. The `dispatch_*` FFI is unrelated to the `objc`/`block` migration — treat a switch to `dispatch2` as optional cleanup, not part of this task:
 
 ```diff
  extern "C" {
@@ -341,7 +341,7 @@ This file mostly accesses `MpsState` methods and `MpsCommandBuffer` methods — 
 1. **MetalBackend::pool** — type change:
    ```diff
    -pool: Vec<metal::Buffer>,
-   +pool: Vec<MetalBuffer>,  // type alias from metal.rs
+   +pool: Vec<MetalBuffer>,  // type alias from src/metal/
    ```
 
 2. **MetalBackend::buf()** — return type:
@@ -399,7 +399,7 @@ No changes needed. `xcrun metal` compilation is independent of the Rust bindings
 
 ### 3.6 Tests
 
-All test modules in both `src/metal.rs` and `src/graph/metal_backend.rs` use the public API surface (`MpsState::init()`, `MpsState::get()`, `MpsCommandBuffer` methods, `MetalBackend::new()`). Since these are already abstracted, most tests require **no code changes** — only type-level compatibility.
+All test modules in both `src/metal/` and `src/graph/metal_backend.rs` use the public API surface (`MpsState::init()`, `MpsState::get()`, `MpsCommandBuffer` methods, `MetalBackend::new()`). Since these are already abstracted, most tests require **no code changes** — only type-level compatibility.
 
 The test `metal_pipelines_compile()` handles the new `Retained<NSError>` error type from `newComputePipelineStateWithFunction_error`.
 
@@ -417,7 +417,7 @@ The test `metal_pipelines_compile()` handles the new `Retained<NSError>` error t
 
 ### Phase 1: Type Aliases & Skeleton (1 day)
 
-- [ ] Define type aliases for all `metal::*` types in `metal.rs`
+- [ ] Define type aliases for all `metal::*` types in `src/metal/`
 - [ ] Change `MpsStateInner` fields to new types (compile, don't implement yet)
 - [ ] Change `MpsCommandBuffer` fields (owned types, drop `Drop` impl)
 - [ ] Change `MetalBackend::pool` type
@@ -427,7 +427,7 @@ The test `metal_pipelines_compile()` handles the new `Retained<NSError>` error t
 
 - [ ] Rewrite device initialization (`MTLCreateSystemDefaultDevice`)
 - [ ] Rewrite library loading (`newLibraryWithSource_options_error`)
-- [ ] Rewrite embedded-metallib load (`newLibraryWithData_error`, `metal.rs:1140`) and the `MINFER_METALLIB_FILE` override path (`metal.rs:1187`) — both return `Result<_, Retained<NSError>>`; wrap bytes in `DispatchData`
+- [ ] Rewrite embedded-metallib load (`newLibraryWithData_error`, `src/metal/ops.rs`) and the `MINFER_METALLIB_FILE` override path (`src/metal/ops.rs`) — both return `Result<_, Retained<NSError>>`; wrap bytes in `DispatchData`
 - [ ] Rewrite `load_embedded_or_source` / `compile_metal_source` return types (`Option<MetalLibrary>`)
 - [ ] Rewrite pipeline creation loop (`.get_pl()` closure)
 - [ ] Rewrite `register_part()` — `newBufferWithBytesNoCopy_length_options_deallocator` (unsafe, `NonNull` ptr)
@@ -438,7 +438,7 @@ The test `metal_pipelines_compile()` handles the new `Retained<NSError>` error t
 ### Phase 3: `MpsCommandBuffer` Methods (1 day)
 
 - [ ] Rewrite `cmd_buffer()` factory
-- [ ] Rewrite `set_bytes()` — `setBytes_length_atIndex` (objc2 drops the trailing `_`; **argument order flips**: old `set_bytes(index, length, bytes)` → `(bytes, length, index)`; `set_params` at `metal.rs:295` is affected)
+- [ ] Rewrite `set_bytes()` — `setBytes_length_atIndex` (objc2 drops the trailing `_`; **argument order flips**: old `set_bytes(index, length, bytes)` → `(bytes, length, index)`; `set_params` at `src/metal/` is affected)
 - [ ] Rewrite `barrier()` — `memoryBarrierWithScope(MTLBarrierScope::Buffers)`
 - [ ] Rewrite `end_compute()` — `endEncoding`
 - [ ] Rewrite `encode_captures()` — `blitCommandEncoder()` (returns `Option`), `copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size` (unsafe, buffer→buffer)
@@ -490,17 +490,17 @@ The test `metal_pipelines_compile()` handles the new `Retained<NSError>` error t
 
 2. **Error types:** objc2-metal errors are `Result<_, Retained<NSError>>` (from objc2-foundation), **not** a generic `ObjCError`. Update all `.expect()`/error handlers accordingly.
 
-3. **There is no "fat" `metal::Buffer`:** the old type is an opaque `foreign_obj_type!` pointer wrapper (see `metal-0.28.0/src/buffer.rs`) with **no offset field** — minfer already passes the byte offset as a **separate** parameter (`set_buffer(idx, Some(&buf), off)` at `metal.rs:1428`) and stores weights as `(buffer, u64)` tuples. The migration just retypes `metal::Buffer` → `MetalBuffer` (`Retained<ProtocolObject<dyn MTLBuffer>>`); the `(buffer, offset)` convention is unchanged. ⚠️ Use `dyn MTLBuffer`, **not** `dyn MTLResource` (the latter lacks `.length()`/`.contents()`).
+3. **There is no "fat" `metal::Buffer`:** the old type is an opaque `foreign_obj_type!` pointer wrapper (see `metal-0.28.0/src/buffer.rs`) with **no offset field** — minfer already passes the byte offset as a **separate** parameter (`set_buffer(idx, Some(&buf), off)` at `src/metal/ops.rs`) and stores weights as `(buffer, u64)` tuples. The migration just retypes `metal::Buffer` → `MetalBuffer` (`Retained<ProtocolObject<dyn MTLBuffer>>`); the `(buffer, offset)` convention is unchanged. ⚠️ Use `dyn MTLBuffer`, **not** `dyn MTLResource` (the latter lacks `.length()`/`.contents()`).
 
-4. **`device.max_threadgroup_memory_length()`:** maps to objc2-metal `device.maxThreadgroupMemoryLength()`. ⚠️ **Not** `maxThreadExecutionLength()` — that is not this property (nor a real Metal API name; there's `maxThreadExecutionWidth` and `maxThreadsPerThreadgroup`). The stored field stays `u64` (`metal.rs:163`, used as the guard at `metal.rs:386`).
+4. **`device.max_threadgroup_memory_length()`:** maps to objc2-metal `device.maxThreadgroupMemoryLength()`. ⚠️ **Not** `maxThreadExecutionLength()` — that is not this property (nor a real Metal API name; there's `maxThreadExecutionWidth` and `maxThreadsPerThreadgroup`). The stored field stays `u64` (`src/metal/policy.rs`, used as the guard at `src/metal/encode.rs`).
 
 5. **MTLResourceOptions enum:** `StorageModeShared` still exists in objc2-metal (it's a bit-flag struct, so use `MTLResourceOptions::StorageModeShared`). The `CPUCacheModeDefaultCache` naming in the original draft was a red herring — just confirm each variant you use is present, and don't assume a raw-integer cast (use the typed constants or `from_bits`).
 
 6. **Method names are camelCase (Objective-C selectors preserved).** objc2-metal 0.3.2 exposes methods under their selector-derived camelCase names — `commandBuffer`, `computeCommandEncoder`, `blitCommandEncoder`, `setComputePipelineState`, `setBuffer_offset_atIndex`, `setBytes_length_atIndex`, `dispatchThreadgroups_threadsPerThreadgroup`, `endEncoding`, `memoryBarrierWithScope`, `addCompletedHandler`, `newFunctionWithName`, `newLibraryWithSource_options_error`, `copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size`, `hasUnifiedMemory`, `waitUntilCompleted` — **not** the snake_case names shown in early drafts or the old `metal` crate. Several are `unsafe fn` (e.g. `setBytes_length_atIndex`, `setBuffer_offset_atIndex`, `addCompletedHandler`, `copyFromBuffer_...`, `newBufferWithBytesNoCopy_length_options_deallocator`).
 
-7. **`contents()` returns `NonNull<c_void>` (not `*mut c_void`).** All `buf.contents()` call sites (`metal.rs:1465`, `metal_backend.rs:116/198/208`) need `.as_ptr()`/`.cast::<T>()` (e.g. `b.contents().as_ptr() as *mut u8`).
+7. **`contents()` returns `NonNull<c_void>` (not `*mut c_void`).** All `buf.contents()` call sites (`src/metal/ops.rs`, `metal_backend.rs:116/198/208`) need `.as_ptr()`/`.cast::<T>()` (e.g. `b.contents().as_ptr() as *mut u8`).
 
-8. **`newLibraryWithData_error` takes `&DispatchData`, not `&[u8]`.** The embedded-metallib path (`metal.rs:1140`, included `include_bytes!`) and `MINFER_METALLIB_FILE` (`metal.rs:1187`) must wrap the bytes in a `dispatch2::DispatchData`.
+8. **`newLibraryWithData_error` takes `&DispatchData`, not `&[u8]`.** The embedded-metallib path (`src/metal/ops.rs`, included `include_bytes!`) and `MINFER_METALLIB_FILE` (`src/metal/ops.rs`) must wrap the bytes in a `dispatch2::DispatchData`.
 
 
 ---

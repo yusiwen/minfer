@@ -588,7 +588,7 @@ call appends a kernel dispatch; nothing runs on the GPU yet. The actual
 submission happens in `synchronize` (L1023–1024), which just calls
 `submit_pending` (L159–186): take the box, `cb.submit()`, clear the pointer.
 
-`submit()` (`src/metal.rs` L1935–1978) is where the GPU_SAFETY rules get
+`submit()` (`src/metal/` L1935–1978) is where the GPU_SAFETY rules get
 enforced. It commits the command buffer, then waits on a dispatch semaphore
 with a **10-second timeout** and checks the final `MTLCommandBufferStatus`:
 `Completed` → `Ok(())`; any other status → `Err` with the recent dispatch

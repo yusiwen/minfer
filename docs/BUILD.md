@@ -111,7 +111,7 @@ The formatting gate is provided by [git-hooks.nix](https://github.com/cachix/git
 ## macOS / Metal notes
 
 On macOS the Metal backend is built in automatically: `build.rs` compiles
-`src/metal.metal` → a precompiled `.metallib` via `/usr/bin/xcrun` at build
+`src/metal/kernels/` → a precompiled `.metallib` via `/usr/bin/xcrun` at build
 time (no per-run shader compile). If Xcode tools are unavailable the build
 still succeeds and the shader is compiled from source at first run.
 

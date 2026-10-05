@@ -193,7 +193,7 @@ without global synchronization.
 
 The Rust call chain: the backend's `Op::Add` arm checks that both inputs have
 the same element count as the output and calls
-`CudaState::add_f32` (`src/metal.rs:1139`), which is a three-line FFI shim.
+`CudaState::add_f32` (`src/cuda/methods/elementwise.rs`), which is a three-line FFI shim.
 The dispatch site is `src/graph/cuda_backend.rs:478`:
 
 ```rust

@@ -1,11 +1,12 @@
 # Source layout plan — the runtime, launch and kernel layers
 
-> **Status: every Linux step has landed (2026-10-05, baseline master `4900298`); only the Mac round is
-> left.** Steps −1, 0, 1, 2, 3 and 6 are on master with the merge SHAs in the table below; Step 5's Linux
-> half (the `MINFER_OP_TIMING` module-load re-measure and the stale-prose sweep) lands with this
-> document's own row, and its Mac half ([#53](https://github.com/yusiwen/minfer/issues/53)'s Metal
-> `DeviceMemory` answer, which is what the `common` decision waits on) stays in the Mac round with
-> Step 4. This is the plan of record for splitting the four long backend files and for the naming
+> **Status: every step has landed (2026-10-05); one Mac-round item is still owed.** Steps −1, 0, 1,
+> 2, 3, 4 and 6 are on master with the merge SHAs in the table below; Step 5's Linux half (the
+> `MINFER_OP_TIMING` module-load re-measure and the stale-prose sweep) landed with this document's own
+> row, and its Mac half ([#53](https://github.com/yusiwen/minfer/issues/53)'s Metal `DeviceMemory`
+> answer, which is what the `common` decision waits on) is the last open item of the campaign. Step 4
+> (Metal, [#265](https://github.com/yusiwen/minfer/issues/265)) landed from a Mac in three increments.
+> This is the plan of record for splitting the four long backend files and for the naming
 > convention the crate follows afterwards. Tickets:
 > [#261](https://github.com/yusiwen/minfer/issues/261) (umbrella) +
 > [#262](https://github.com/yusiwen/minfer/issues/262) `cuda.rs` ·
@@ -26,7 +27,7 @@
 | 1 `src/cuda.rs` → `src/cuda/*.rs` | #262 | **landed** `d08e05e` (PR [#276](https://github.com/yusiwen/minfer/pull/276), 7/7 green, zero code annotations): `src/cuda.rs` 6 594 → 1 014 lines, `src/cuda/{ffi_runtime,methods}.rs` + 18 `src/cuda/methods/*.rs`; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6); 0 visibility edits, 0 newly dead |
 | 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5 `ee380ad`, [#289](https://github.com/yusiwen/minfer/pull/289) G6 `0cb21cb`): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` (498 lines, 1 header) + **17 TUs** (9,996 lines); audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2, and the re-measured module-load cost is in §5 |
 | 3 CPU files | #264 | **landed**: stage A `quants` `cbee81f` (PR [#290](https://github.com/yusiwen/minfer/pull/290)) — `src/quants.rs` 1,340 → 61 lines + 9 part files + `src/quants/neon_correctness.rs`, `scripts/check_source_layout.py` rule 1 widened ([#274](https://github.com/yusiwen/minfer/issues/274)); stage B `vec_ops` `395da59` (PR [#291](https://github.com/yusiwen/minfer/pull/291)) — `src/vec_ops.rs` 1,344 → 52 lines + 8 part files; stage C `kernel` `4900298` (PR [#292](https://github.com/yusiwen/minfer/pull/292)) — `src/kernel.rs` 667 → 22 lines + 3 part files; counts unchanged (481/0/36 + 10/0/6) |
-| 4 Metal (Mac-local) | #265 | **not started — this row is the Mac round's.** `src/metal.rs`/`src/metal.metal` → `src/metal/{runtime,encode,ops,policy}.rs` + `src/metal/kernels/*.metal`; not compiled on Linux, so no Linux PR can claim it (§6.5) |
+| 4 Metal (Mac-local) | #265 | **landed** in three increments (2026-10-05, `macbook (macOS 27.0.1, Apple M4 Pro)`): `src/metal.rs` 2 480 → 453 lines + `src/metal/{runtime,encode,ops,policy}.rs` (476/116/1431/66) and `src/metal.metal` 5 151 lines → deleted, replaced by `src/metal/kernels/` = 2 headers (`common.h` 13, `dequantize.h` 198) + **14 family `.metal`** (largest `fa_prefill.metal` 812, §9 decision 2); `build.rs` compiles the concatenated parts into the one metallib and the runtime + the 4 `tests/*_isolation.rs` read the same generated `$OUT_DIR/minfer.metal`; **0 visibility edits**; counts unchanged (macOS 483/20/38, real-model 37/1 ×2 — the same red baseline as #255, `src/metal.metal` is gone, so no anchor survives in the live docs) |
 | 5 close the loop | — | **Linux half landed** (PR [#293](https://github.com/yusiwen/minfer/pull/293), 2026-10-05): the `MINFER_OP_TIMING` module-load re-measure in §5 + the `src/cuda_kernels.cu` prose sweep + the last two #219 claims; **Mac half owed**: [#53](https://github.com/yusiwen/minfer/issues/53)'s Metal `DeviceMemory` answer, which is the second implementation the `common` rule waits on (§3) |
 | 6 long test files | #267 | **files 1–9 landed**: PR [#275](https://github.com/yusiwen/minfer/pull/275) `424c64d` (file 1), [#277](https://github.com/yusiwen/minfer/pull/277) `66446e5` (2), [#278](https://github.com/yusiwen/minfer/pull/278) `b439612` (3), [#279](https://github.com/yusiwen/minfer/pull/279) `d3edb10` (4), [#280](https://github.com/yusiwen/minfer/pull/280) `587c156` (5), [#281](https://github.com/yusiwen/minfer/pull/281) `cd2c14a` (6–8), [#283](https://github.com/yusiwen/minfer/pull/283) `bc30152` (9): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` 1,186 → a 209-line parent + 4 `tests/<topic>.rs` (5 tests) |
 
@@ -397,9 +398,37 @@ rule as CUDA (`<backend>/kernels/` = the shader sources), which is also llama.cp
 | `kernels/fa_prefill.metal` | 4085–4896 — flash attention prefill (812 lines — **accepted as one unit**, decision 2 in §9) | 812 |
 
 `build.rs` compiles the parts into one metallib, and the runtime `newLibraryWithSource` fallback
-(`metal.rs:2002` `include_str!`) needs the parts joined (`concat!`) or a thin umbrella source; both
+(`src/metal/runtime.rs` `include_str!`) needs the parts joined (`concat!`) or a thin umbrella source; both
 entry points must see the same set. Then [#53](https://github.com/yusiwen/minfer/issues/53)
 (reserve/assign + the `DeviceMemory` report) lands on top of the new layout.
+
+**Landed (2026-10-05, `macbook (macOS 27.0.1, Apple M4 Pro)`) — three increments as Addendum 2 asked.**
+Increment 1 made `build.rs`'s shader set an explicit `SHADER_SOURCES` list plus a
+`check_shader_file_list()` guard, concatenated it into `$OUT_DIR/minfer.metal`, and pointed the runtime
+`include_str!` at the same file (shader set unchanged; the metallib stayed byte-identical,
+`13af518e…`). Increment 2 moved one family per commit (16 commits) and deleted `src/metal.metal`; the
+generated source is byte-for-byte the old one (212 923 B, 5 151 lines, 61 `kernel void` names, same
+set), and the metallib hash moved to `7a4a7cd4…`. Increment 3 split `src/metal.rs` with **0 visibility
+edits** — the type definitions and the private dispatch primitives stay in the parent module, so the
+children reach them without `pub(super)` (the `CudaState`-stays-in-`cuda.rs` shape) — and moved the
+test-only `matmul_on_gpu_buf` with them so `src/metal/tests.rs` still resolves it.
+
+Three measured corrections to the table above, applied as the increments landed:
+
+- **`quantize.h` is not created.** The plan's `dequantize.h + quantize.h` row assumed GPU-side
+  quantize helpers; the tree has none (the only `quantize` strings are comments — activations are
+  quantized on the CPU). The pragmatic source of truth is the tree, so `src/metal/kernels/` holds
+  `common.h` + `dequantize.h` only; a `quantize.h` with no helper would be a file the guard must list
+  and nothing reads.
+- **`get_rows.metal` includes the warm-up kernel** (2 340–2 523), so it is 184 lines, not 169.
+- **`rope.metal` is 37 lines** (the 2 743–2 746 banner is not adjacent to `kernel_rope_f32`, which is
+  at 2 876–2 908 after the P1 parallel-attention section); `fa_parallel.metal` is 129 lines
+  (2 747–2 875). The plan's "≈60 / 162" rows mixed the two.
+
+A fourth compile entry point the ticket did not name: the four `tests/*_isolation.rs` integration tests
+`include_str!` the shader source and compile it themselves (9 sites). They now `include_str!` the same
+`$OUT_DIR/minfer.metal`, so all four consumers — `build.rs`, `src/metal.rs`'s fallback and the
+integration tests — see one file set by construction.
 
 ### Step 5 — close the loop
 
@@ -554,7 +583,27 @@ The frozen records resolve old paths through this table, and the live sweeps are
 | `src/cuda_kernels.cu` 4050–5135 | distributed: each launcher to its kernel's file |
 | `src/cuda_kernels.cu` *other ranges* | the §4 Step 2 table (one row per new file) |
 | `src/cuda.rs` 82–1128, 1141–1153, 1942–6495 | `src/cuda/ffi_runtime.rs` + `src/cuda/methods.rs` + `src/cuda/methods/*.rs` (the §8 tree; per-line map `/home/yusiwen/minfer-split/step1/line-map.tsv`) |
-| `src/metal.rs`, `src/metal.metal` | the §4 Step 4 table |
+| `src/metal.metal` 1–13 | `src/metal/kernels/common.h` |
+| `src/metal.metal` 577–593, 595–756, 1662–1679 | `src/metal/kernels/dequantize.h` |
+| `src/metal.metal` 14–363 | `src/metal/kernels/mul_q4_0_q8_0.metal` |
+| `src/metal.metal` 364–567, 1530–1661, 1680–1847 | `src/metal/kernels/mul_f32act_q4q5.metal` |
+| `src/metal.metal` 1848–2339 | `src/metal/kernels/mul_f32act_kquant.metal` |
+| `src/metal.metal` 568–576, 757–1144 | `src/metal/kernels/mul_mm.metal` |
+| `src/metal.metal` 1145–1529, 4897–5151 | `src/metal/kernels/mul_mm_kq.metal` |
+| `src/metal.metal` 2340–2523 | `src/metal/kernels/get_rows.metal` |
+| `src/metal.metal` 2524–2742 | `src/metal/kernels/norm_elementwise.metal` |
+| `src/metal.metal` 2743–2746, 2876–2908 | `src/metal/kernels/rope.metal` |
+| `src/metal.metal` 2747–2875 | `src/metal/kernels/fa_parallel.metal` |
+| `src/metal.metal` 2909–3023 | `src/metal/kernels/kv.metal` |
+| `src/metal.metal` 3024–3306 | `src/metal/kernels/qkv_fused.metal` |
+| `src/metal.metal` 3307–3568 | `src/metal/kernels/fa_split.metal` |
+| `src/metal.metal` 3569–4084 | `src/metal/kernels/fa_decode.metal` |
+| `src/metal.metal` 4085–4896 | `src/metal/kernels/fa_prefill.metal` |
+| `src/metal.rs` 1–131, 193–312, 314–348, 392–493, 966–987, 2455–2473 | `src/metal.rs` (module doc, aliases, type definitions, dispatch primitives, `matmul_on_gpu_buf`, `get_or_grow`) |
+| `src/metal.rs` 132–191 | `src/metal/policy.rs` |
+| `src/metal.rs` 349–391, 1936–1985 | `src/metal/encode.rs` |
+| `src/metal.rs` 495–965, 988–1935 | `src/metal/ops.rs` |
+| `src/metal.rs` 1997–2454 | `src/metal/runtime.rs` |
 | `src/graph/cuda_backend/tests.rs` | `src/graph/cuda_backend/tests/{staging,pool,elementwise,matmul,mmvq,prefill,weights,kv,attention,attn_window,capture}.rs` |
 | `src/models/qwen2/graph/tests.rs` | `src/models/qwen2/graph/tests/{cuda_kv,offload_copy,kv_reuse,batching,real_model}.rs` |
 | `src/server/batch/tests.rs` | `src/server/batch/tests/{kv_sharing,slots,prefill,batching,stall,http,metrics}.rs` |
@@ -612,7 +661,7 @@ code or files, or target code that this plan moves.** (#150's `worker_loop` hit 
 | [#208](https://github.com/yusiwen/minfer/issues/208) bf16 weights on device | adds device kernels (+ `metal.metal`) and touches `vec_ops::mat_mul_bf16` | same as #200 — device kernels go into `src/cuda/kernels/` |
 | [#212](https://github.com/yusiwen/minfer/issues/212) packed Q8_0 residual attribution | profiles `gqa_attn_f32` (attention family) with line-level references | the split has landed: `gqa_attn_f32` is in `src/cuda/kernels/attention_decode.cu`, so its references re-anchor there (or to the symbol) |
 | [#164](https://github.com/yusiwen/minfer/issues/164) Metal f16 matmul/embedding kernels | adds kernels to `metal.metal` | Mac round; do it after the Metal split (Step 4) |
-| [#255](https://github.com/yusiwen/minfer/issues/255) two macOS-only dead-code annotations | its two targets are `metal.rs:971` / `metal.rs:2029` — line anchors the Metal split moves | judge them first (Mac), then split |
+| [#255](https://github.com/yusiwen/minfer/issues/255) two macOS-only dead-code annotations | its two targets are `src/metal/ops.rs` / `src/metal/runtime.rs` — line anchors the Metal split moves | judge them first (Mac), then split |
 | [#260](https://github.com/yusiwen/minfer/issues/260) Mac round umbrella | the entry point for a Mac agent; it lists the Metal gaps and the order | update it with the Step 4 shape and the new #53 item |
 | [#53](https://github.com/yusiwen/minfer/issues/53) Metal reserve/assign (+ the device-memory gap) | the only issue that already owns the one interface this plan promotes; its pool code moves in Step 4 | Step 4 first, then #53; #53 supplies the second `DeviceMemory` implementation |
 | [#44](https://github.com/yusiwen/minfer/issues/44) Metal KV cell store / explicit span | adds Metal kernels + `copy_cells` work in `metal_backend.rs`/`metal.metal` | Mac round, after Step 4 |

@@ -348,7 +348,7 @@ KV cache memory management is abstracted by the `llama_memory_context_i` interfa
 |-----------|-----------|--------|
 | **Execution model** | Declarative DAG, build graph first then execute | Imperative forward, compute while building |
 | **Memory management** | Backend scheduler auto-allocates + reuses | Manual tensor lifecycle management |
-| **Multi-backend** | Auto split + async copy | Manual GPU dispatch (`metal.rs`) |
+| **Multi-backend** | Auto split + async copy | Manual GPU dispatch (`src/metal/`) |
 | **Operator fusion** | Done at graph-construction time by the model code / backend kernel layer (`LLM_FUSED_OP_FLASH_ATTN` etc.; the CUDA backend uses `ggml_can_fuse` to fuse op sequences at the kernel layer; CUDA Graph capture is keyed on `uid`), and the scheduler has **no** general fusion pass | Already has manual fusion (GPU: swiglu/attn_bias_rope_store/fused qkv+gu kernel; CPU: batched matmul) |
 | **Graph reuse** | `can_reuse()` skips reconstruction | Recompute every step |
 | **Complexity** | ~3800 lines graph framework + ~100-200 lines per model | No independent graph layer, direct implementation in forward.rs |

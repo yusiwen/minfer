@@ -1,7 +1,7 @@
 # Metal Backend and the Objective-C Crate Ecosystem (objc 0.2 vs objc2)
 
-**Context (ℹ️ superseded).** minfer's Metal backend (`src/metal.rs`,
-`src/metal.metal`) was built on the
+**Context (ℹ️ superseded).** minfer's Metal backend (`src/metal/`,
+`src/metal/kernels/`) was built on the
 [`metal`](https://crates.io/crates/metal) crate, which was locked into the
 **legacy `objc` 0.2 ecosystem**. This document records what that meant, why it
 mattered for building/running minfer, and what the modern alternative (`objc2`)
@@ -120,7 +120,7 @@ same relationship.
 - **✅ DONE (2026-08-25)**: the Metal layer was migrated to the `objc2`
   ecosystem (`objc2-metal` + `block2` + `objc2-foundation`), dropping the
   `metal` crate, `block` crate, `vendor/block` and the `[patch.crates-io]`
-  entry (see `docs/METAL-OBJC2-MIGRATION-PLAN.md`). `src/metal.rs`,
+  entry (see `docs/METAL-OBJC2-MIGRATION-PLAN.md`). `src/metal/`,
   `src/graph/metal_backend.rs` and `tests/*_isolation.rs` now use objc2-metal;
   `metal`/`block` are no longer dependencies.
 

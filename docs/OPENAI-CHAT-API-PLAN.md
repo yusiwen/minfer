@@ -98,7 +98,7 @@
 > test was previously skipping because its layer-0 q/k/v dump files came from the **deleted** layer_gpu
 > dump path (removed in the Phase 6 graph refactor, commit `6af12a4`). Restored with a one-time
 > generator instead of the old path:
-> - `#[test] #[ignore] gen_layer0_realdata_dump` in `src/metal.rs` runs a real 35-token prefill on the
+> - `#[test] #[ignore] gen_layer0_realdata_dump` in `src/metal/` runs a real 35-token prefill on the
 >   cached Qwen2.5-0.5B q4_0 through the current **graph** path (embedding → rms_norm → q/k/v matmul,
 >   pre-RoPE, token-major) and writes
 >   `$MINFER_TEST_DUMP` (default `/tmp/dp3`) `/minfer_gpu_dump_layer0_b{q,k,v}.f32`.
@@ -191,7 +191,7 @@ touch behavior):
 
 > **Update (2026-09-15):** the f16 KV cache, listed as deferred in rev 5, has
 > since shipped — `MINFER_CACHE_TYPE=f16` with auto-selection for 7B-class
-> models (`src/metal.rs:141-153`). It is no longer a post-MVP item. See
+> models (`src/metal/policy.rs`). It is no longer a post-MVP item. See
 > `docs/ARCHITECTURE-ROADMAP.md` §2.4/§2.7 for what remains open around the KV
 > cache (quantized KV, prefix reuse, sequence addressing).
 
@@ -863,7 +863,7 @@ always sized for the model's full max_seq_len (32768 for Qwen2.5-7B) and the div
 
 Memory note: the KV element type is selectable and **auto-selects f16 for
 7B-class models** (`n_layers * n_kv_embd >= 8192`; `MINFER_CACHE_TYPE`
-overrides — `src/metal.rs:141-153`), so the earlier "always f32" figures no
+overrides — `src/metal/policy.rs`), so the earlier "always f32" figures no
 longer apply. For Qwen2.5-7B at n_ctx 4096 the cache is ~230 MB/slot at f16
 (~460 MB if forced to f32). Sizing n_ctx_slot remains the main lever; a
 quantized KV would be the next one (not implemented).

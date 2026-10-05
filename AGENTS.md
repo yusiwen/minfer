@@ -41,7 +41,9 @@ src/
 ├── conversation.rs  # multi-turn session (append-only KV; C2 overflow drops oldest + re-ropes)
 ├── server/          # OpenAI-compatible axum server; batch.rs = continuous batching, metrics.rs = /metrics
 ├── download/mod.rs  # HuggingFace + Ollama auto-download
-├── metal.rs + metal.metal  # MPS kernels + shaders (graph backend: graph/metal_backend.rs)
+├── metal.rs         # MPS module root: type defs + private dispatch primitives (split by #265)
+├── metal/           # L1/L2: runtime.rs · encode.rs · ops.rs · policy.rs (split by #265)
+│   └── kernels/     # L3 kernel sources: common.h · dequantize.h + 14 family .metal (split by #265)
 ├── cuda.rs          # CUDA device layer (L1), feature-gated (graph backend: graph/cuda_backend.rs); device_memory() → allocplan::DeviceMemory
 ├── cuda/            # L2 launch/dispatch: ffi_runtime.rs + methods.rs + methods/<family>.rs (split by #262)
 ├── cuda/kernels/    # L3 kernel sources: common.cuh + 17 .cu translation units, one per kernel family (split by #263)
@@ -56,9 +58,9 @@ inside each device (`<backend>/kernels/` is where kernel sources live). A shared
 when two backends implement it and two callers use it (`allocplan::DeviceMemory` is the one candidate
 today). CPU's `quants.rs`/`vec_ops.rs` are deliberately not a device-private layer: they are the crate's
 numeric kernel library, shared with `graph/kvformat.rs` and `graph/cuda_backend.rs`. The four long
-backend files are being split along this convention — the three CUDA files and the CPU trio are done
-(`src/cuda/`, `src/cuda/kernels/`, `src/quants/`, `src/vec_ops/`, `src/kernel/`); Metal is Step 4 on a
-Mac. Plan and target tree: `docs/SOURCE-LAYOUT-PLAN.md`
+backend files are split along this convention — the three CUDA files, the CPU trio and the two Metal
+files are done (`src/cuda/`, `src/cuda/kernels/`, `src/quants/`, `src/vec_ops/`, `src/kernel/`,
+`src/metal/`, `src/metal/kernels/`). Plan and target tree: `docs/SOURCE-LAYOUT-PLAN.md`
 ([#261](https://github.com/yusiwen/minfer/issues/261)); the file list above is updated by each step as
 the code moves.
 
@@ -195,7 +197,7 @@ All docs live in `docs/` (root keeps only `AGENTS.md` + `README.md`).
 | Qwen3-4B perf vs llama.cpp | `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` |
 | **Architecture roadmap (system layers: IR, scheduler, allocator, KV, batching, backends — gaps + prioritized backlog)** | `docs/ARCHITECTURE-ROADMAP.md` |
 | **Architecture execution plan (phase-by-phase tickets, acceptance criteria, verification matrix; also the per-ticket history)** | `docs/ARCHITECTURE-EXECUTION-PLAN.md` |
-| **Source layout plan (device-first layering: L1 runtime / L2 launch / L3 `<backend>/kernels/` / L4 executors; the split of `cuda.rs`, `cuda_kernels.cu`, `metal.rs`, `metal.metal` — target tree + doc plan)** | `docs/SOURCE-LAYOUT-PLAN.md` |
+| **Source layout plan (device-first layering: L1 runtime / L2 launch / L3 `<backend>/kernels/` / L4 executors; the split of `cuda.rs`, `cuda_kernels.cu`, `src/metal/`, `src/metal/kernels/` — target tree + doc plan)** | `docs/SOURCE-LAYOUT-PLAN.md` |
 | **Grammar / JSON-schema constrained decoding (F2): accepted subset, refusals, mask position** | `docs/GRAMMAR-DESIGN.md` |
 | Model support roadmap (which model families to port next) | `docs/MODEL-SUPPORT-ROADMAP.md` |
 | OpenAI chat API plan | `docs/OPENAI-CHAT-API-PLAN.md` |

@@ -45,18 +45,18 @@
 
 | # | Phase | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
-| P0 | Backend & scheduler init | Create Metal backend, MTLCommandQueue, kernel library, scheduler; pre-reserve compute buffers | `ggml-metal.cpp:689` `ggml-metal-context.m:84` `llama-context.cpp:581` `ggml-backend.cpp:1792` | `src/metal.rs:1090` (MpsState::try_new) |
-| P1 | Model loading / weight registration | Allocate Metal buffers per tensor and upload quantized weights | `llama-model.cpp:1401` `llama-model-loader.cpp:1426` `ggml-metal-device.m:1631` | `src/models/qwen2/loader.rs` + `src/metal.rs:1302` (register_weight) |
+| P0 | Backend & scheduler init | Create Metal backend, MTLCommandQueue, kernel library, scheduler; pre-reserve compute buffers | `ggml-metal.cpp:689` `ggml-metal-context.m:84` `llama-context.cpp:581` `ggml-backend.cpp:1792` | `src/metal/ops.rs` (MpsState::try_new) |
+| P1 | Model loading / weight registration | Allocate Metal buffers per tensor and upload quantized weights | `llama-model.cpp:1401` `llama-model-loader.cpp:1426` `ggml-metal-device.m:1631` | `src/models/qwen2/loader.rs` + `src/metal/ops.rs` (register_weight) |
 | P2 | Batch preparation & microbatching | Split the API batch into micro-batches, reserve host output buffers | `llama-context.cpp:1635` `llama-batch.cpp:25` | `src/main.rs` (single batch, no split) "N/A" |
 | P3 | Compute graph build (Qwen2) | Build the ggml compute graph (DFS topological order) | `src/models/qwen2.cpp:53` `llama-graph.cpp` `ggml.c:7188` | `src/models/qwen2/graph.rs:432` (declarative graph build) |
 | P4 | Scheduler split & allocation | Assign nodes to backends, split into runs, gallocr allocation | `ggml-backend.cpp:1936`→`:1055` | "N/A" (single MPS backend, static buffers) |
 | P5 | Scheduler compute | Per-split: copy inputs, call backend graph_compute | `ggml-backend.cpp:1594` `ggml-metal.cpp:535` | `forward.rs:88-134` (single CB, all layers) |
-| P6 | Metal graph compute | Multi-command-buffer encode (main thread + n_cb workers) | `ggml-metal-context.m:438` `:663` | `src/metal.rs:1032` (submit, single CB) |
-| P7 | Per-op encoding & concurrency/barrier | Filter empty nodes, concurrency check, insert memoryBarrier | `ggml-metal-ops.cpp:175` `device.m:513` | `src/metal.rs:321` (barrier), `:327` (dispatch_2d) |
-| P8 | Per-op kernel dispatch | Per op type: set pipeline + args + threadgroups | `ggml-metal-ops.cpp:265-497` | `src/metal.rs:392` (quant_matmul_f32_on_gpu_buf) et al. |
-| P9 | GPU kernel execution | Metal shader compute | `ggml-metal.metal` | `src/metal.metal` |
-| P10 | KV cache | In-graph write (set_rows) & read (flash/matmul direct) | `llama-kv-cache.cpp:1301` `llama-graph.cpp:2800` | `src/metal.rs:866` (store_kv) + `src/cache.rs` |
-| P11 | logits/embd readback | GPU→host copy | `ggml-metal-context.m:351` `llama-context.cpp:1854` | `src/metal.rs:2012` (output_norm_gpu then download_logits, now `n_out` rows / 608 KB) |
+| P6 | Metal graph compute | Multi-command-buffer encode (main thread + n_cb workers) | `ggml-metal-context.m:438` `:663` | `src/metal/ops.rs` (submit, single CB) |
+| P7 | Per-op encoding & concurrency/barrier | Filter empty nodes, concurrency check, insert memoryBarrier | `ggml-metal-ops.cpp:175` `device.m:513` | `src/metal/` (barrier), `:327` (dispatch_2d) |
+| P8 | Per-op kernel dispatch | Per op type: set pipeline + args + threadgroups | `ggml-metal-ops.cpp:265-497` | `src/metal/` (quant_matmul_f32_on_gpu_buf) et al. |
+| P9 | GPU kernel execution | Metal shader compute | `ggml-metal.metal` | `src/metal/kernels/` |
+| P10 | KV cache | In-graph write (set_rows) & read (flash/matmul direct) | `llama-kv-cache.cpp:1301` `llama-graph.cpp:2800` | `src/metal/ops.rs` (store_kv) + `src/cache.rs` |
+| P11 | logits/embd readback | GPU→host copy | `ggml-metal-context.m:351` `llama-context.cpp:1854` | `src/metal/runtime.rs` (output_norm_gpu then download_logits, now `n_out` rows / 608 KB) |
 
 ## 2. Detailed step table (end-to-end execution order)
 
@@ -65,8 +65,8 @@
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
 | 0.1 | Register Metal backend | Construct backend per device, call `ggml_metal_init` | `ggml-metal.cpp:689` | — |
-| 0.2 | Create `struct ggml_metal` context | MTLDevice + shared MTLCommandQueue, load kernel library, create concurrent dispatch queue, fusion/concurrency flags | `ggml-metal-context.m:84-175` | `src/metal.rs:1090-1200` (MpsState singleton) — **2026-08-21: kernel library is now a build-time precompiled `.metallib` embedded in the binary (`build.rs`, llama's `-O3` flags, `newLibraryWithData`), with a runtime `newLibraryWithSource` fallback when the toolchain is absent** |
-| 0.3 | Init low-level device | `MTLCreateSystemDefaultDevice` + `newCommandQueue`, probe capabilities (simdgroup_mm / unified_memory / bfloat / tensor) | `ggml-metal-device.m:714-760` | `src/metal.rs` (`new_device` capability probe) |
+| 0.2 | Create `struct ggml_metal` context | MTLDevice + shared MTLCommandQueue, load kernel library, create concurrent dispatch queue, fusion/concurrency flags | `ggml-metal-context.m:84-175` | `src/metal/ops.rs` (MpsState singleton) — **2026-08-21: kernel library is now a build-time precompiled `.metallib` embedded in the binary (`build.rs`, llama's `-O3` flags, `newLibraryWithData`), with a runtime `newLibraryWithSource` fallback when the toolchain is absent** |
+| 0.3 | Init low-level device | `MTLCreateSystemDefaultDevice` + `newCommandQueue`, probe capabilities (simdgroup_mm / unified_memory / bfloat / tensor) | `ggml-metal-device.m:714-760` | `src/metal/` (`new_device` capability probe) |
 | 0.4 | **tensor-API gate** | `has_tensor` defaults to OFF for pre-M5/M6/A19/A20 (disabled on M4) | `ggml-metal-device.m:753-760` | "N/A" (llama itself doesn't use the tensor API on M4) |
 | 0.5 | Create scheduler | `ggml_backend_sched_new` (backend array + gallocr + events) | `ggml-backend.cpp:1792` | "N/A" |
 | 0.6 | Pre-reserve worst-case graphs | Reserve pp (prefill) and tg (decode) graphs | `llama-context.cpp:630-657` | "N/A" (static buffers) |
@@ -77,8 +77,8 @@
 |---|---|---|---|---|
 | 1.1 | Load architecture tensors | Qwen2's `load_arch_tensors` creates all weight tensors | `src/models/qwen2.cpp:19-47` | `src/models/qwen2/loader.rs` |
 | 1.2 | Per-layer device split | Layers 0..i_gpu_start-1 stay on CPU; the rest split to GPU devices by free memory | `llama-model.cpp:1314-1323` | "N/A" (all-on-GPU or MINFER_DISABLE_MPS all-CPU) |
-| 1.3 | Allocate Metal buffers | `ggml_backend_alloc_ctx_tensors_from_buft` → `ggml_metal_buffer_init`; mmap path `ggml_metal_buffer_map` | `llama-model.cpp:1637` `ggml-metal-device.m:1631,1701` | `src/metal.rs` (register_part: ONE page-aligned `newBufferWithBytesNoCopy` per mmap'd part) — **2026-08-21: weights are (buffer, byte-offset) into the part buffer, llama's exact design** |
-| 1.4 | Buffer storage mode | shared = `newBufferWithBytesNoCopy` (mmap/weights); private = `newBufferWithLength` | `ggml-metal-device.m:1668,1673` | `src/metal.rs` (mmap parts `StorageModeShared` NoCopy; scratch/KV buffers `StorageModeShared` copies) |
+| 1.3 | Allocate Metal buffers | `ggml_backend_alloc_ctx_tensors_from_buft` → `ggml_metal_buffer_init`; mmap path `ggml_metal_buffer_map` | `llama-model.cpp:1637` `ggml-metal-device.m:1631,1701` | `src/metal/` (register_part: ONE page-aligned `newBufferWithBytesNoCopy` per mmap'd part) — **2026-08-21: weights are (buffer, byte-offset) into the part buffer, llama's exact design** |
+| 1.4 | Buffer storage mode | shared = `newBufferWithBytesNoCopy` (mmap/weights); private = `newBufferWithLength` | `ggml-metal-device.m:1668,1673` | `src/metal/` (mmap parts `StorageModeShared` NoCopy; scratch/KV buffers `StorageModeShared` copies) |
 | 1.5 | Mark weight buffers | `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` | `llama-model.cpp:1657` | — |
 | 1.6 | Upload weight data | mmap direct reference; non-mmap uses blit `set_tensor_async` | `llama-model-loader.cpp:1548,1558` `ggml-metal-context.m:307` | **2026-08-21: zero-copy — weights are Borrowed slices of the mmap'd GGUF (`Tensor.data: Cow<'static,[u8]>`) wrapped by `newBufferWithBytesNoCopy` at the part level; no memcpy anywhere** |
 
@@ -96,20 +96,20 @@
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
 | 3.1 | Entry | `llama_model::build_graph` → `build_arch_graph` | `llama-model.cpp:2457` | `src/models/qwen2/graph.rs:432` (forward) |
-| 3.2 | Input embd | `build_inp_embd`: token ids + `ggml_get_rows(tok_embd, inp_tokens)` | `llama-graph.cpp:2284` | `src/metal.rs` (embed_tokens_gpu, get_rows — **2026-08-21: all minfer quants on GPU + dispatched into the MAIN command buffer, llama-graph-style single submit, #38/#39**) |
-| 3.3 | Position input | `build_inp_pos` | `llama-graph.cpp:2373` | `src/metal.rs:1565` (upload_positions) |
-| 3.4 | KV graph inputs | `build_attn_inp_kv` (k_idxs/v_idxs, mask, rotation tensors) | `llama-graph.cpp:2729` | `src/metal.rs` (store_kv uses pos_buf) |
-| 3.5 | Per layer: attn_norm | `build_norm` (RMSNorm + Mul + optional Add) | `llama-graph.cpp:1556` | `src/metal.rs:614` (rms_norm) + `:648` (add) |
-| 3.6 | Per layer: QKV | `build_qkv` (3× `build_lora_mm` = ggml_mul_mat for wq/wk/wv) | `llama-graph.cpp:1592` | `src/metal.rs:392` (3× quant_matmul) |
-| 3.7 | Per layer: RoPE | `ggml_rope_ext` (once each for Q, K) | `src/models/qwen2.cpp:86-96` | `src/metal.rs:719` (rope_f32 ×2) |
-| 3.8 | Per layer: KV write | `mctx_cur->cpy_k/cpy_v` → `ggml_set_rows` | `llama-graph.cpp:2800-2801` `llama-kv-cache.cpp:1301,1336` | `src/metal.rs:866` (store_kv) |
-| 3.9 | Per layer: attention | `build_attn` → `build_attn_mha`: flash path `ggml_flash_attn_ext`; non-flash `mul_mat(k,q)`+`soft_max_ext`+`mul_mat(v,kq)` | `llama-graph.cpp:2517,2557` | `src/metal.rs:949` (attn_flash_prefill) / `:741` (gqa_attn_f32) |
-| 3.10 | Per layer: wo + residual | `build_attn` inner `build_lora_mm(wo)` + `ggml_add` | `llama-graph.cpp:2677` `src/models/qwen2.cpp:110` | `src/metal.rs:392` (wo matmul) + `:648` (add) |
+| 3.2 | Input embd | `build_inp_embd`: token ids + `ggml_get_rows(tok_embd, inp_tokens)` | `llama-graph.cpp:2284` | `src/metal/` (embed_tokens_gpu, get_rows — **2026-08-21: all minfer quants on GPU + dispatched into the MAIN command buffer, llama-graph-style single submit, #38/#39**) |
+| 3.3 | Position input | `build_inp_pos` | `llama-graph.cpp:2373` | `src/metal/ops.rs` (upload_positions) |
+| 3.4 | KV graph inputs | `build_attn_inp_kv` (k_idxs/v_idxs, mask, rotation tensors) | `llama-graph.cpp:2729` | `src/metal/` (store_kv uses pos_buf) |
+| 3.5 | Per layer: attn_norm | `build_norm` (RMSNorm + Mul + optional Add) | `llama-graph.cpp:1556` | `src/metal/ops.rs` (rms_norm) + `:648` (add) |
+| 3.6 | Per layer: QKV | `build_qkv` (3× `build_lora_mm` = ggml_mul_mat for wq/wk/wv) | `llama-graph.cpp:1592` | `src/metal/` (3× quant_matmul) |
+| 3.7 | Per layer: RoPE | `ggml_rope_ext` (once each for Q, K) | `src/models/qwen2.cpp:86-96` | `src/metal/ops.rs` (rope_f32 ×2) |
+| 3.8 | Per layer: KV write | `mctx_cur->cpy_k/cpy_v` → `ggml_set_rows` | `llama-graph.cpp:2800-2801` `llama-kv-cache.cpp:1301,1336` | `src/metal/ops.rs` (store_kv) |
+| 3.9 | Per layer: attention | `build_attn` → `build_attn_mha`: flash path `ggml_flash_attn_ext`; non-flash `mul_mat(k,q)`+`soft_max_ext`+`mul_mat(v,kq)` | `llama-graph.cpp:2517,2557` | `src/metal/ops.rs` (attn_flash_prefill) / `:741` (gqa_attn_f32) |
+| 3.10 | Per layer: wo + residual | `build_attn` inner `build_lora_mm(wo)` + `ggml_add` | `llama-graph.cpp:2677` `src/models/qwen2.cpp:110` | `src/metal/` (wo matmul) + `:648` (add) |
 | 3.11 | Per layer: ffn_norm | `build_norm` | `src/models/qwen2.cpp:114` | `rms_norm` |
-| 3.12 | Per layer: FFN | `build_ffn`: SILU-gated `mul(gate,up)` + `mul_mat(down)` | `llama-graph.cpp:1669` | `src/metal.rs:692` (swiglu) + `:392` (down matmul) — **2026-08-21: last layer runs on `n_out` rows only (llama's `get_rows` reduction, #34)** |
+| 3.12 | Per layer: FFN | `build_ffn`: SILU-gated `mul(gate,up)` + `mul_mat(down)` | `llama-graph.cpp:1669` | `src/metal/ops.rs` (swiglu) + `:392` (down matmul) — **2026-08-21: last layer runs on `n_out` rows only (llama's `get_rows` reduction, #34)** |
 | 3.13 | Per layer: residual | `ggml_add` | `src/models/qwen2.cpp:127` | `add_f32` — **2026-08-21: last layer's both residuals on the tail `n_out` rows (`add_f32_off`, #34)** |
-| 3.14 | Output norm | `build_norm` (result_norm) | `src/models/qwen2.cpp:137` | `src/metal.rs:2072` (rms_norm inside output_norm_gpu) — **2026-08-21: also output-rows-only (`n_out`), matching llama** |
-| 3.15 | lm_head | `build_lora_mm(model.output)` + optional bias | `src/models/qwen2.cpp:145-150` | `src/metal.rs:2078` (output GEMM) — **2026-08-21: now output-rows-only (`n_out`), matching llama** |
+| 3.14 | Output norm | `build_norm` (result_norm) | `src/models/qwen2.cpp:137` | `src/metal/runtime.rs` (rms_norm inside output_norm_gpu) — **2026-08-21: also output-rows-only (`n_out`), matching llama** |
+| 3.15 | lm_head | `build_lora_mm(model.output)` + optional bias | `src/models/qwen2.cpp:145-150` | `src/metal/runtime.rs` (output GEMM) — **2026-08-21: now output-rows-only (`n_out`), matching llama** |
 | 3.16 | Node ordering | `ggml_build_forward_expand` → `ggml_build_forward_impl` → `ggml_visit_parents_graph` (DFS, parents before children) | `ggml.c:7188,7120` | "N/A" (minfer encodes imperatively in layer order) |
 
 ### P4 Scheduler split & allocation
@@ -135,7 +135,7 @@
 | 6.2 | Main-thread encode | Create `cmd_bufs[n_cb]`, enqueue, `encode_async(n_cb)` | `ggml-metal-context.m:510-523` | — |
 | 6.3 | Worker encode | `dispatch_apply(n_cb, d_queue, encode_async)` encodes remaining CBs concurrently | `ggml-metal-context.m:530-550` | — |
 | 6.4 | encode_async block | Per CB: compute node range, `ggml_metal_op_init` → loop `ggml_metal_op_encode` → `ggml_metal_op_free` → commit | `ggml-metal-context.m:676-721` | — |
-| 6.5 | Async return | graph_compute returns immediately (only capture mode waits + checks status) | `ggml-metal-context.m:557-611` | `src/metal.rs:1032` (submit blocks + 10 s cap) |
+| 6.5 | Async return | graph_compute returns immediately (only capture mode waits + checks status) | `ggml-metal-context.m:557-611` | `src/metal/ops.rs` (submit blocks + 10 s cap) |
 | 6.6 | Synchronize | `ggml_metal_synchronize`: wait + check all CB statuses, set `has_error` on failure | `ggml-metal-context.m:239-295` | `submit()` `MTLCommandBufferStatus` check |
 
 > **n_cb value**: `ggml_backend_metal_set_n_cb(backend, 1)` (`ggml-metal.cpp:612,707`),
@@ -147,55 +147,55 @@
 
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
-| 7.1 | Create encoder | `ggml_metal_encoder_init`: `MTLDispatchTypeConcurrent` (when use_concurrency) or serial | `ggml-metal-ops.cpp:42` `ggml-metal-device.m:464` | `src/metal.rs:1324` (cmd_buffer: `new_compute_command_encoder`, serial) |
+| 7.1 | Create encoder | `ggml_metal_encoder_init`: `MTLDispatchTypeConcurrent` (when use_concurrency) or serial | `ggml-metal-ops.cpp:42` `ggml-metal-device.m:464` | `src/metal/ops.rs` (cmd_buffer: `new_compute_command_encoder`, serial) |
 | 7.2 | Filter empty nodes | Skip empty / no-op nodes | `ggml-metal-ops.cpp:55-62` | "N/A" (minfer has no empty-node concept) |
 | 7.3 | Op support check | `ggml_metal_device_supports_op` big switch | `ggml-metal-ops.cpp:201` `ggml-metal-device.m:1086` | quant-type checks in `layer_gpu` |
-| 7.4 | Concurrency check | If the current node's read/write ranges conflict with existing `mem_ranges`, insert `memoryBarrierWithScope:MTLBarrierScopeBuffers` and clear ranges; else record ranges and run concurrently | `ggml-metal-ops.cpp:159-173,220-225` `ggml-metal-device.m:513` | `src/metal.rs:321` (barrier: **after every dispatch**) + `:333` |
+| 7.4 | Concurrency check | If the current node's read/write ranges conflict with existing `mem_ranges`, insert `memoryBarrierWithScope:MTLBarrierScopeBuffers` and clear ranges; else record ranges and run concurrently | `ggml-metal-ops.cpp:159-173,220-225` `ggml-metal-device.m:513` | `src/metal/` (barrier: **after every dispatch**) + `:333` |
 | 7.5 | Op dispatch switch | Dispatch to `ggml_metal_op_*` by `node->op`; returns fusion count n_fuse | `ggml-metal-ops.cpp:265-497` | encode in fixed sequence inside `layer_gpu` |
 
 > **Key difference**: llama uses `mem_ranges` for **dependency-aware barriers**
 > (non-conflicting adjacent ops run concurrently in the same encoder,
 > `MTLDispatchTypeConcurrent`); minfer inserts an unconditional barrier after
-> every dispatch (`dispatch_2d` → `barrier()`, `src/metal.rs:333`).
+> every dispatch (`dispatch_2d` → `barrier()`, `src/metal/`).
 
 ### P8 Per-op kernel dispatch (forward-path ops)
 
 | ggml_op | llama.cpp encoder | Selected kernel (variants) | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
-| `MUL_MAT` | `ggml_metal_op_mul_mat` (3-way selection, §3.2) | `kernel_mul_mm_*` / `kernel_mul_mv_ext_*` / `kernel_mul_mv_*` | `ops.cpp:2299-2541` | `src/metal.rs:392` (quant_matmul_f32_on_gpu_buf) + `:352` (gemm_dispatch) |
-| `FLASH_ATTN_EXT` | `ggml_metal_op_flash_attn_ext` | `_kv_f16` / `_pad` / `_blk` / main kernel / `_vec` / `_vec_reduce` | `ops.cpp:2990-3492` | `src/metal.rs:949` (attn_flash_prefill) |
-| `RMS_NORM` | `ggml_metal_op_norm` (fuses Mul+Add) | `kernel_rms_norm_fuse_impl` | `ops.cpp:3887-4006` `ggml-metal.metal:3181` | `src/metal.rs:614` (rms_norm) + separate `:648` (add) |
-| `ROPE` | `ggml_metal_op_rope` | `kernel_rope_norm/neox/multi/vision` | `ops.cpp:4025-4126` `ggml-metal.metal:4664-4868` | `src/metal.rs:719` (rope_f32) |
-| `ADD/SUB/MUL/DIV` | `ggml_metal_op_bin` (ADD fusion ×8) | `kernel_add` / `kernel_mul` (n_fuse specialization) | `ops.cpp:3578` | `src/metal.rs:648` (add_f32 single op) |
-| `GET_ROWS` | `ggml_metal_op_get_rows` | `kernel_get_rows_q/_f` | `ops.cpp:1165` `ggml-metal.metal:10061` | `src/metal.rs:599` (embed_tokens_gpu → **2026-08-21: all minfer-supported quants — Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 (32-elem) + Q4_K/Q6_K/Q5_K (256-elem)**, matching llama's template coverage) |
-| `SET_ROWS` | `ggml_metal_op_set_rows` | `kernel_set_rows_*` | `ops.cpp:1210` `ggml-metal.metal:10156` | `src/metal.rs:866` (store_kv dedicated kernel) |
-| `CPY/DUP/CONT` | `ggml_metal_op_cpy` | `kernel_cpy_t_t/_f32_q/_q_f32` | `ops.cpp:2078` `ggml-metal.metal:8023-8122` | "N/A" (f16 KV converted directly by store_kv) |
+| `MUL_MAT` | `ggml_metal_op_mul_mat` (3-way selection, §3.2) | `kernel_mul_mm_*` / `kernel_mul_mv_ext_*` / `kernel_mul_mv_*` | `ops.cpp:2299-2541` | `src/metal/` (quant_matmul_f32_on_gpu_buf) + `:352` (gemm_dispatch) |
+| `FLASH_ATTN_EXT` | `ggml_metal_op_flash_attn_ext` | `_kv_f16` / `_pad` / `_blk` / main kernel / `_vec` / `_vec_reduce` | `ops.cpp:2990-3492` | `src/metal/ops.rs` (attn_flash_prefill) |
+| `RMS_NORM` | `ggml_metal_op_norm` (fuses Mul+Add) | `kernel_rms_norm_fuse_impl` | `ops.cpp:3887-4006` `ggml-src/metal/kernels/qkv_fused.metal` | `src/metal/ops.rs` (rms_norm) + separate `:648` (add) |
+| `ROPE` | `ggml_metal_op_rope` | `kernel_rope_norm/neox/multi/vision` | `ops.cpp:4025-4126` `ggml-src/metal/kernels/fa_prefill.metal` | `src/metal/ops.rs` (rope_f32) |
+| `ADD/SUB/MUL/DIV` | `ggml_metal_op_bin` (ADD fusion ×8) | `kernel_add` / `kernel_mul` (n_fuse specialization) | `ops.cpp:3578` | `src/metal/ops.rs` (add_f32 single op) |
+| `GET_ROWS` | `ggml_metal_op_get_rows` | `kernel_get_rows_q/_f` | `ops.cpp:1165` `ggml-src/metal/kernels/` | `src/metal/ops.rs` (embed_tokens_gpu → **2026-08-21: all minfer-supported quants — Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 (32-elem) + Q4_K/Q6_K/Q5_K (256-elem)**, matching llama's template coverage) |
+| `SET_ROWS` | `ggml_metal_op_set_rows` | `kernel_set_rows_*` | `ops.cpp:1210` `ggml-src/metal/kernels/` | `src/metal/ops.rs` (store_kv dedicated kernel) |
+| `CPY/DUP/CONT` | `ggml_metal_op_cpy` | `kernel_cpy_t_t/_f32_q/_q_f32` | `ops.cpp:2078` `ggml-src/metal/kernels/` | "N/A" (f16 KV converted directly by store_kv) |
 
 ### P9 GPU kernel execution (key kernels)
 
 | kernel | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|
-| `kernel_mul_mm<...>` | simdgroup/tensor matmul (64×32 tile, §3.2 variants) | `ggml-metal.metal:10658-11040` (template + instantiations) | `src/metal.metal:758` (kernel_q4_0_mm_f32) and 7 more mm kernels |
-| `kernel_mul_mv_*` | mat-vec (decode, per quant type) | `ggml-metal.metal:3847` (q4_0), `:8498` (q4_K), etc. | `src/metal.metal` `*_f32_matmul` kernels |
-| `kernel_mul_mv_ext_*` | small-batch (ne11∈[2,8]) mat-mv | `ggml-metal.metal:4196` | "N/A" |
-| `kernel_flash_attn_ext_kv_f16` | **quantized KV → f16 dequant pre-pass** (Q4_0/1, Q5_0/1, Q8_0) | `ggml-metal.metal:6328-6366` | "N/A" (minfer KV stores f32/f16 raw, `MINFER_CACHE_TYPE=f16`) |
-| `kernel_flash_attn_ext_pad` | pad pre-pass for partial KV blocks | `ggml-metal.metal:6373` | `src/metal.metal: kernel_kv_tail_pad` (equivalent) |
-| `kernel_flash_attn_ext_blk` | mask pre-pass (nqptg/ncpsg blocks) | `ggml-metal.metal:6445` | inline causal mask (`kernel_flash_attn_blk_f32`) |
-| `kernel_flash_attn_ext` / `_impl` | flash attention main kernel (half8x8) | `ggml-metal.metal:6546,7184` | `src/metal.metal: kernel_flash_attn_blk_f32` |
-| `kernel_flash_attn_ext_vec` / `_vec_reduce` | decode small-batch flash (half4x4, ne01<20) | `ggml-metal.metal:7411,7980` | `src/metal.metal: kernel_flash_attn_ext_f32` |
-| `kernel_rms_norm_fuse_impl` | RMSNorm + Mul + Add fusion | `ggml-metal.metal:3181` | `rms_norm_256` + separate add |
-| `kernel_soft_max*` | non-flash path softmax | `ggml-metal.metal:2011,2117` | "N/A" (inlined in flash; or a dedicated `softmax` kernel) |
-| `kernel_rope_*` | RoPE | `ggml-metal.metal:4664-4868` | `src/metal.metal: kernel_rope_f32` |
-| `kernel_get_rows_*` | embedding lookup | `ggml-metal.metal:10061,10092` | `src/metal.metal: kernel_get_rows_q4_0/q4_1/q5_0/q5_1/q8_0/q4_k/q6_k/q5_k` (templates `kernel_get_rows_q32`/`_q256`) |
+| `kernel_mul_mm<...>` | simdgroup/tensor matmul (64×32 tile, §3.2 variants) | `ggml-src/metal/kernels/` (template + instantiations) | `src/metal/kernels/mul_mm.metal` (kernel_q4_0_mm_f32) and 7 more mm kernels |
+| `kernel_mul_mv_*` | mat-vec (decode, per quant type) | `ggml-src/metal/kernels/fa_decode.metal` (q4_0), `:8498` (q4_K), etc. | `src/metal/kernels/` `*_f32_matmul` kernels |
+| `kernel_mul_mv_ext_*` | small-batch (ne11∈[2,8]) mat-mv | `ggml-src/metal/kernels/fa_prefill.metal` | "N/A" |
+| `kernel_flash_attn_ext_kv_f16` | **quantized KV → f16 dequant pre-pass** (Q4_0/1, Q5_0/1, Q8_0) | `ggml-src/metal/kernels/` | "N/A" (minfer KV stores f32/f16 raw, `MINFER_CACHE_TYPE=f16`) |
+| `kernel_flash_attn_ext_pad` | pad pre-pass for partial KV blocks | `ggml-src/metal/kernels/` | `src/metal/kernels/: kernel_kv_tail_pad` (equivalent) |
+| `kernel_flash_attn_ext_blk` | mask pre-pass (nqptg/ncpsg blocks) | `ggml-src/metal/kernels/` | inline causal mask (`kernel_flash_attn_blk_f32`) |
+| `kernel_flash_attn_ext` / `_impl` | flash attention main kernel (half8x8) | `ggml-src/metal/kernels/,7184` | `src/metal/kernels/: kernel_flash_attn_blk_f32` |
+| `kernel_flash_attn_ext_vec` / `_vec_reduce` | decode small-batch flash (half4x4, ne01<20) | `ggml-src/metal/kernels/,7980` | `src/metal/kernels/: kernel_flash_attn_ext_f32` |
+| `kernel_rms_norm_fuse_impl` | RMSNorm + Mul + Add fusion | `ggml-src/metal/kernels/qkv_fused.metal` | `rms_norm_256` + separate add |
+| `kernel_soft_max*` | non-flash path softmax | `ggml-src/metal/kernels/mul_f32act_kquant.metal,2117` | "N/A" (inlined in flash; or a dedicated `softmax` kernel) |
+| `kernel_rope_*` | RoPE | `ggml-src/metal/kernels/fa_prefill.metal` | `src/metal/kernels/: kernel_rope_f32` |
+| `kernel_get_rows_*` | embedding lookup | `ggml-src/metal/kernels/,10092` | `src/metal/kernels/: kernel_get_rows_q4_0/q4_1/q5_0/q5_1/q8_0/q4_k/q6_k/q5_k` (templates `kernel_get_rows_q32`/`_q256`) |
 
 ### P10 KV cache
 
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
 | 10.1 | KV tensor creation | `ggml_new_tensor_3d(ctx, type_k/v, n_embd_k_gqa, kv_size, n_stream)`, default **F16** | `llama-kv-cache.cpp:231-232` | `src/cache.rs` (GPU KV f16 auto for 7B class / f32 for small, `MINFER_CACHE_TYPE` overrides) |
-| 10.2 | Per-layer device allocation | per-layer backend buft, allocate + clear | `llama-kv-cache.cpp:299,307` | `src/metal.rs` (KV buffer allocation) |
-| 10.3 | Slot lookup | `find_slot`: ring-buffer cell range + k/v idx tensors | `llama-kv-cache.cpp:894` | `src/metal.rs: store_kv` writes by `pos_buf` |
-| 10.4 | In-graph write | `cpy_k`/`cpy_v` → `ggml_set_rows` (K always cache-row indexed; V per FA/non-FA layout) | `llama-kv-cache.cpp:1301-1389` | `src/metal.rs:866` (store_kv, `nkt`/`nt` strides) |
+| 10.2 | Per-layer device allocation | per-layer backend buft, allocate + clear | `llama-kv-cache.cpp:299,307` | `src/metal/` (KV buffer allocation) |
+| 10.3 | Slot lookup | `find_slot`: ring-buffer cell range + k/v idx tensors | `llama-kv-cache.cpp:894` | `src/metal/: store_kv` writes by `pos_buf` |
+| 10.4 | In-graph write | `cpy_k`/`cpy_v` → `ggml_set_rows` (K always cache-row indexed; V per FA/non-FA layout) | `llama-kv-cache.cpp:1301-1389` | `src/metal/ops.rs` (store_kv, `nkt`/`nt` strides) |
 | 10.5 | In-graph read | flash reads cache tensor directly; non-flash `mul_mat(k,q)`/`mul_mat(v,kq)` | `llama-graph.cpp:2807-2808,2491,2535` | `attn_flash_prefill` / `gqa_attn_f32` read KV buffers directly |
 
 > **Layout**: llama KV = f16 `[nkv][nk*hd]`, token stride `nk*hd*elem` (after
@@ -207,7 +207,7 @@
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
 | 11.1 | Locate backend | `ggml_backend_sched_get_tensor_backend(t_logits)` | `llama-context.cpp:1948` | — |
-| 11.2 | Async readback | `ggml_backend_tensor_get_async` → `ggml_metal_get_tensor_async`: `newBufferWithBytesNoCopy` wraps host memory + **blit encoder** GPU→host, queued into `cmd_bufs_ext` | `llama-context.cpp:1854` `ggml-metal-context.m:351-391` | `src/metal.rs` (`copy_from_gpu`: Shared buffer direct memcpy, no blit) — **2026-08-21: now `n_out×nv` (608 KB for single output; was 301 MB)** |
+| 11.2 | Async readback | `ggml_backend_tensor_get_async` → `ggml_metal_get_tensor_async`: `newBufferWithBytesNoCopy` wraps host memory + **blit encoder** GPU→host, queued into `cmd_bufs_ext` | `llama-context.cpp:1854` `ggml-metal-context.m:351-391` | `src/metal/` (`copy_from_gpu`: Shared buffer direct memcpy, no blit) — **2026-08-21: now `n_out×nv` (608 KB for single output; was 301 MB)** |
 | 11.3 | Synchronize | before the next decode, `ggml_backend_sched_synchronize` waits for the blit | `ggml-backend.cpp` | `submit()` blocks + `download_logits` |
 
 ## 3. Supplementary mapping tables
@@ -244,7 +244,7 @@ Complete forward-path mapping (non-forward ops omitted):
 
 **On M4, llama disables the tensor API** (§0.4) and actually uses branch ②'s
 legacy `simdgroup_matrix` path — which is **level-for-level equivalent** to
-minfer's `kernel_q4_k_mm_f32` (`src/metal.metal:4692`, 64×32 tile, 32×4
+minfer's `kernel_q4_k_mm_f32` (`src/metal/kernels/fa_prefill.metal`, 64×32 tile, 32×4
 threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §3.6`).
 
 ### 3.3 `FLASH_ATTN_EXT` variant selection (`ggml-metal-ops.cpp:2990-3492`)
@@ -266,7 +266,7 @@ threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §3.6`).
 |---|---|---|
 | RMSNorm + Mul(weight) + Add(bias) | `kernel_rms_norm_fuse_impl` (`ops.cpp:3929-3974`) | not fused: `rms_norm` + separate `add_f32` |
 | Consecutive ADD ×N | `op_bin` (`ops.cpp:3195+`) | single add_f32 |
-| flash attention (QK^T+softmax+PV) | single kernel + aux passes | `attn_flash_prefill` (`src/metal.rs:949`) |
+| flash attention (QK^T+softmax+PV) | single kernel + aux passes | `attn_flash_prefill` (`src/metal/ops.rs`) |
 | KV write + RoPE | RoPE writes into the KV path (graph k/v expanded together) | `store_kv` dedicated kernel |
 | GLU/SiLU | `op_glu` / `op_snake_fused` | `swiglu_f32` (single kernel) |
 | mul_mat + bias / residual | **not fused** (bias/residual is a separate `kernel_add`) | same (separate add_f32 after wo) |

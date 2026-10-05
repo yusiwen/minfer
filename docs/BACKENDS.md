@@ -6,7 +6,7 @@ execute, `docs/COMPUTE-GRAPH-DESIGN.md`) on three interchangeable backends:
 | | **CPU** | **Metal** | **CUDA** |
 |---|---|---|---|
 | Executor | `src/graph/cpu_backend.rs` | `src/graph/metal_backend.rs` | `src/graph/cuda_backend.rs` |
-| Device layer | — (std threads) | `src/metal.rs` + `src/metal.metal` shaders | `src/cuda.rs` + `src/cuda/kernels/*.cu` |
+| Device layer | — (std threads) | `src/metal/` + `src/metal/kernels/` shaders | `src/cuda.rs` + `src/cuda/kernels/*.cu` |
 | Platform | any | macOS (Apple GPU) | NVIDIA, **opt-in** `--features cuda` |
 | Assign priority | last (always answers) | first on macOS | second, when built in |
 | Activations | quantized to Q8_0 (Q8_K for K-quant weights) | read as f32 | f32; int8 MMQ for prefill |
@@ -18,7 +18,7 @@ The `src/<backend>/kernels/` paths and the CUDA `src/cuda/methods/*.rs` families
 [the source layout plan](./SOURCE-LAYOUT-PLAN.md) ([#261](https://github.com/yusiwen/minfer/issues/261)):
 the CUDA half has landed (`src/cuda/kernels/*.cu`, `src/cuda/methods/`, `src/quants/`,
 `src/vec_ops/`, `src/kernel/`), while the Metal split (`src/metal/kernels/*.metal`) and [#53](https://github.com/yusiwen/minfer/issues/53)'s
-`DeviceMemory` answer are the Mac round. The Metal shaders are still the single `src/metal.metal`.
+`DeviceMemory` answer are the Mac round. The Metal shaders are still the single `src/metal/kernels/`.
 
 This page is the overview: what the backend contract is, how nodes land on a
 backend, and where the three differ. The linked pages carry the per-backend

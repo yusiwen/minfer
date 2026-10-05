@@ -115,7 +115,7 @@ The final `output.weight` projection might have quantization issues:
 
 **Check:**
 ```rust
-// In metal.rs output_norm_gpu:
+// In src/metal/ output_norm_gpu:
 println!("output weight type: {:?}", output.ttype); // Should be Q6_K for Qwen2.5-1.5B
 println!("output norm weight loaded: {}", output_norm.is_some());
 

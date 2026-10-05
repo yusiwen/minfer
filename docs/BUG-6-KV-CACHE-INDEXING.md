@@ -2,7 +2,7 @@
 
 ## Location
 
-`src/metal.metal` — `kernel_gqa_attn_f32`, lines 735-736
+`src/metal/kernels/` — `kernel_gqa_attn_f32`, lines 735-736
 
 ## Problem
 
@@ -74,7 +74,7 @@ The second case shows the error: we're accessing position `kv0`'s data at an off
 
 ## Fix
 
-In `src/metal.metal`, `kernel_gqa_attn_f32`, replace lines 735-736:
+In `src/metal/kernels/`, `kernel_gqa_attn_f32`, replace lines 735-736:
 
 **Before:**
 ```metal
@@ -180,7 +180,7 @@ Key changes:
 
 | File | Change |
 |------|--------|
-| `src/metal.metal` | Fix 4 KV cache accesses in `kernel_gqa_attn_f32` |
+| `src/metal/kernels/` | Fix 4 KV cache accesses in `kernel_gqa_attn_f32` |
 
 ## Testing
 

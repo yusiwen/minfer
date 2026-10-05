@@ -696,7 +696,7 @@ pub fn map(path: &std::path::Path) -> Option<Self> {
         if ptr as isize == -1 {
             return None;
         }
-        // (The GPU-side warm-up read happens in metal.rs register_part —
+        // (The GPU-side warm-up read happens in src/metal/ register_part —
         // the first GPU access to file-backed pages costs ~44 ms of one-time
         // page/TLB setup per process, METAL_OPTIMIZATIONS #39. A CPU-side
         // madvise/touch does NOT fix it — the cost is the GPU's own access.)
@@ -883,7 +883,7 @@ it" enum: scratch/activation tensors are `Cow::Owned(Vec<u8>)`, weights are
 sites is free for borrowed data; `graph/cpu_backend.rs` line 37 notes this).
 
 And the final link in the zero-copy chain, doc 14's anchor
-(`metal.rs` lines 2330–2344):
+(`src/metal/` lines 2330–2344):
 
 ```rust
 let page = 16384; // macOS page size on Apple Silicon
