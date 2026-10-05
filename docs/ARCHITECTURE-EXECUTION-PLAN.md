@@ -3315,7 +3315,8 @@ below);
 
 **What S2 does not do** (it stays on [#55](https://github.com/yusiwen/minfer/issues/55)): the
 **reserve/assign re-map** (a reserved region a rebuild re-maps without touching the device — the
-literal "split reservation from assignment", which Metal's G6 adopts) and the **multi-graph cache**
+literal "split reservation from assignment", which the later E4 S3 landed for *every* backend in the
+allocator itself, Metal included) and the **multi-graph cache**
 (§14 row 3, which is what removes E3's per-chunk rebuild). Cross-boundary staging is charged to
 `pool_bytes` but is still allocated at its exact length, and backend-internal scratch (Metal capture
 staging, CUDA `positions` scratch) is outside the report.
@@ -3407,16 +3408,18 @@ at execute time), and peak memory was not a number anyone could read.
   memory), `live_bytes` is what is handed out right now, and the peak is tracked as the
   build proceeds. `weights_bytes` comes from the backend (a new `Backend` trait method with
   a 0 default; CPU sums its registry, CUDA sums the device registry — Metal inherits the
-  default until G6 adopts the split).
+  default; it does not track its device-resident weights, which are mmap-backed or
+  per-weight copies).
 - **The feasibility gate** — `alloc_in_pool` is fallible and checks
   `weights + pooled + this allocation (at its class size)` against the backend's budget
   *before* the pool is asked for anything. The default budget is the backend's own answer:
-  CUDA's current free bytes with a quarter held back, resolved through the pure
-  `allocplan::budget_decision` over an explicit `allocplan::DeviceMemory` outcome — a
-  **failed** query is not a number (it falls back to weights-only accounting with its CUDA
-  error named once; see the S4 record below). CPU and Metal are unbounded unless
-  `set_memory_budget` sets one (tests, and a future offload policy). The refusal names the
-  numbers: weights, pooled bytes, this request, budget, all in MiB.
+  CUDA's current free bytes, or Metal's `recommendedMaxWorkingSetSize` since
+  [#53](https://github.com/yusiwen/minfer/issues/53), with a quarter held back, resolved
+  through the pure `allocplan::budget_decision` over an explicit `allocplan::DeviceMemory`
+  outcome — a **failed** query is not a number (it falls back to weights-only accounting
+  with the real device error named once; see the S4 record below). CPU is unbounded unless
+  `set_memory_budget` sets one (tests). The refusal names the numbers: weights, pooled
+  bytes, this request, budget, all in MiB.
 
 **Acceptance, as measured** (in CI, no device needed):
 
@@ -3631,6 +3634,83 @@ failures: the CPU-only packed gate and the load-sensitive timing margin),
 [#128](https://github.com/yusiwen/minfer/issues/128) (the API-level
 `cudaErrorInvalidValue` findings: `cudaGraphDestroy` on an exec handle, which leaks the
 exec, and the eager `cudaFuncSetAttribute` opt-in failing at init).
+
+#### E4/E5 record, Metal half (#53, 2026-10-05) — Metal answers the device-memory question
+
+Box `macbook (macOS 27.0.1, Apple M4 Pro)`, Rust 1.97.1 (the repo pin), commands as stated.
+
+**What was wrong.** `allocplan::DeviceMemory` had exactly **one** implementation —
+`CudaState::device_memory()` — so on macOS `models::device_memory()` answered `NoDevice` for every
+backend. Two consequences: E5's `--gpu-layers auto` fell through `weight_budget(NoDevice) → Ok(0)`,
+fitted nothing, and planned every block on the CPU unless `MINFER_GPU_MEM` was set; and E4's
+`memory_report(Metal)` carried `budget = None`, so the accounting surface had no `headroom_bytes()`
+on a Mac. `graph/alloc.rs::memory_budget` also had a CUDA-only inline arm, so the E4 gate would not
+have seen a Metal budget even if one had been answered.
+
+**What landed.**
+
+1. `MpsState::device_memory()` (`src/metal/runtime.rs`) — `MTLDevice.recommendedMaxWorkingSetSize`,
+   answered through the same three-way outcome: a non-zero value → `Reported { free, total }` (both
+   the same number, because Apple Silicon's unified-memory device exposes no separate total); `0` →
+   `QueryFailed` (a device that gives no figure is not a measured zero, [#122]); the shared seam
+   `MINFER_TEST_CALL_FAIL=metal_device_memory` → `QueryFailed` ([#171]). `code` is `0` — Metal has no
+   numeric error here — and `name` carries the reason.
+2. `models::device_memory()` (`src/models/mod.rs`) — the one resolver now routes Metal first on
+   macOS, then CUDA, then `NoDevice`; it is the **same** function E4's gate and both loaders' `auto`
+   fits read, so the fit and the gate cannot disagree.
+3. `GraphAllocator::memory_budget` (`src/graph/alloc.rs`) — every non-CPU backend asks that resolver
+   instead of the CUDA-only inline arm; CPU stays `NoDevice` (unbounded). The pure `budget_decision` /
+   `weight_budget` and the `DeviceMemory` variants are **unchanged**.
+
+The `common`-module decision the campaign left open is recorded in `docs/SOURCE-LAYOUT-PLAN.md` §1.3
+rule 3: **no new module** — 2 implementations (CUDA, Metal), 3 same-semantics callers of the resolver
+(E4's gate + the two loaders), and the type/policy already live in the device-agnostic
+`allocplan`/`offload`.
+
+**Acceptance, as measured** (box `macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-05).
+
+- `recommendedMaxWorkingSetSize` on this machine is **40 200 896 512 bytes** (`38 339 MiB`), asserted
+  equal to the value the gate reports.
+- `./target/release/minfer --gpu-layers auto <qwen2.5-0.5b q4_0> "hello"` →
+  `auto: 24 of 24 blocks fit — weights budget 28754 MiB, 7188 MiB reserved for KV/activations;
+  device free 38339 MiB (three quarters of it, the E4 default budget)`, and the model runs on Metal
+  (a follow-up prompt generated tokens). Before this change the same command planned 0 blocks.
+- `MINFER_GPU_MEM=1024 … --gpu-layers auto` → `weights budget 1024 MiB, 256 MiB reserved …;
+  MINFER_GPU_MEM=1024 MiB` — the explicit cap still wins and is named.
+- `MINFER_TEST_CALL_FAIL=metal_device_memory … --gpu-layers auto` → the load refuses with `the device
+  free-memory query failed with [testfail] … (code 0); set MINFER_GPU_MEM=<MiB> …` — a `QueryFailed`,
+  never a fabricated zero.
+- `memory_report(Backend::METAL)` carries `budget = 3/4 × free` and `headroom_bytes() == budget` on an
+  empty pool (`graph::alloc::tests::budget::metal_memory_report_carries_the_device_budget`); a graph
+  pinned to Metal with a 4095-byte explicit budget is refused **before the pool is touched**
+  (`pool_bytes == 0`).
+
+**Mutation evidence** (each reverted before landing; `cargo test --release`, box as above).
+
+| mutation | gate | result |
+|---|---|---|
+| delete the `testfail::guard("metal_device_memory")` arm | `metal::tests::a_forced_device_memory_query_failure_is_not_zero` | **0 passed; 1 failed** — "a forced failure must be QueryFailed, got `Reported { … }`" |
+| `memory_budget` returns `NoDevice` for every backend (the pre-change shape) | `graph::alloc::tests::budget::metal_memory_report_carries_the_device_budget` | **0 passed; 1 failed** — "Metal must now answer a budget" |
+| `Reported { free: 0, … }` instead of the API value | `metal::tests::device_memory_reports_the_recommended_working_set` | **0 passed; 1 failed** — `left: 0, right: 40200896512` |
+
+**Honest scope.**
+
+- **The macOS suite baseline is red and stays red**: on this box `cargo test --release --no-fail-fast`
+  is **483 passed / 20 failed / 38 ignored** unit + 21/0/6 integration at `119b9da`, and **485 passed /
+  21 failed / 38 ignored** after this change. The three new unit gates all pass; the extra failure is
+  the pre-existing order-dependent flake `models::qwen2::graph::tail_tests::cuda_conversation_multiturn_reuse`,
+  which is part of the #255 red baseline (482/21 in one fail-fast baseline run before this change,
+  483/20 in a `--no-fail-fast` one; alone it passes 3/3 on master). No new failure is attributable to
+  this change, but the suite is **not green** and this record does not claim it is.
+- **Metal's `weights_bytes` stays the trait default `0`**: Metal's weights are mmap-backed `NoCopy`
+  buffers or per-weight copies, not a registry the pool owns, so the E4 gate charges the device's own
+  budget without a weights term there. CUDA and CPU keep their sums. This is the documented default
+  ("a backend that does not track its weights is not charged"), not a new gap.
+- **No CUDA re-run**: the allocator's CUDA arm now calls `models::device_memory()`, which on a CUDA
+  build returns `CudaState::device_memory()` exactly as before; CI's `build-linux-cuda` compiles it,
+  but the device behaviour is not re-measured here (no GPU).
+- The **real-model set** was not re-run as a set (the branch's `#[ignore]`d Mac baseline is already red
+  per #255); the `auto` acceptance above is a single real-model CLI run, not the suite.
 
 #### Test-hygiene record (#123, 2026-09-24) — the serial `#[ignore]`d set goes green on a CUDA build
 
@@ -8724,7 +8804,9 @@ compile-verified or left behind a build-time gate when it cannot be run here.
 and removes a way Metal can be *wrong* (missing guard, `debug_assert!` on a release
 path, a silent weightless-RMSNorm fallback). Then **G5 after C7/C8**, deliberately:
 porting the cell store before the arena becomes elastic (C7) and shareable (C8) would
-mean writing the same semantics into Metal twice. G4/G6/G7 follow G5.
+mean writing the same semantics into Metal twice. G4/G7 follow G5; **G6 landed** on a Mac
+(2026-10-05) — its delta is Metal's `DeviceMemory` answer, because the allocator's reserve/assign
+split is backend-agnostic and Metal's pool already ran through it.
 
 | ID | Origin | Work | Position |
 |---|---|---|---|
@@ -8733,7 +8815,7 @@ mean writing the same semantics into Metal twice. G4/G6/G7 follow G5.
 | G3 | A8 | Remove the silent weightless-RMSNorm fallback (`metal_backend.rs:403-414`, `:457-468`) · [#40](https://github.com/yusiwen/minfer/issues/40) | now |
 | G5 | C1/C2/E1 | Port the cell store, the KV removal/shift and the explicit attention span to Metal (`supports_attn_span()` becomes true; today `copy_kv_to_cpu` has no Metal arm, so a Metal session re-renders instead of shifting, and a multi-sequence batch is refused outright) · [#44](https://github.com/yusiwen/minfer/issues/44) | after C8 |
 | G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` · [#52](https://github.com/yusiwen/minfer/issues/52) | after G5 |
-| G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool · [#53](https://github.com/yusiwen/minfer/issues/53) | after G5 |
+| G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool · [#53](https://github.com/yusiwen/minfer/issues/53) | **landed** on a Mac (2026-10-05): the allocator split was already backend-agnostic (E4 S3), so the delta is Metal's `DeviceMemory` answer (`recommendedMaxWorkingSetSize`) — record under the E4 record |
 | G7 | METAL-OBJ | Re-run the Metal gap/parity measurements after G2–G3 (and again after G5), since each changes a kernel path · [#54](https://github.com/yusiwen/minfer/issues/54) | last |
 
 **G5 acceptance** (on a Mac; the CPU/CUDA equivalents are the gates already in the
@@ -9416,7 +9498,8 @@ tables, the tooling changes, the documentation-anchor plan and the interaction t
 open issues), its mdBook chapter, the four-layer convention in `AGENTS.md` (L1 runtime / L2 launch /
 L3 `<backend>/kernels/` / L4 executors; device-first, one polymorphic seam), the backend-layer section in
 `docs/ARCHITECTURE.md` — including the rule that a shared `common` needs two real implementations, of
-which `allocplan::DeviceMemory` is the only candidate today (second implementation: [#53](https://github.com/yusiwen/minfer/issues/53)) —
+which `allocplan::DeviceMemory` was the one candidate (its second real implementation, Metal, landed
+as [#53](https://github.com/yusiwen/minfer/issues/53) — and the answer was still no `common` module: plan §1.3 rule 3) —
 and a `docs/BACKENDS.md` footnote. Four of the six stale claims folded into
 [#219](https://github.com/yusiwen/minfer/issues/219) are fixed here; `register_weight`'s prose and the
 `src/cuda.rs:3471` banner naming the deleted `CudaCommandBuffer` ride with step 1
@@ -10114,6 +10197,10 @@ is therefore **not taken**: plan §1.3 records the pre-analysis (the type and th
 the device-agnostic `allocplan`/`offload`; the device answer has one implementation,
 `CudaState::device_memory()` through the CUDA-only `models::device_memory()`, with no `Backend` trait
 hook), so creating a `common` module now would be the single-real-implementation case the rule forbids.
+
+*(Mac half, 2026-10-05: [#53](https://github.com/yusiwen/minfer/issues/53) landed Metal's
+`DeviceMemory` answer, so the decision this paragraph deferred is now taken — **no new module**; see
+plan §1.3 rule 3 and the E4/E5 Metal-half record above.)*
 
 #### Test-infrastructure record (#255, 2026-10-05) — the two macOS-only `allow(dead_code)` sites are judged, and the macOS test build is unblocked
 

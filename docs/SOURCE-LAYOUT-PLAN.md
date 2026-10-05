@@ -1,10 +1,11 @@
 # Source layout plan — the runtime, launch and kernel layers
 
-> **Status: every step has landed (2026-10-05); one Mac-round item is still owed.** Steps −1, 0, 1,
+> **Status: every step has landed (2026-10-05).** Steps −1, 0, 1,
 > 2, 3, 4 and 6 are on master with the merge SHAs in the table below; Step 5's Linux half (the
 > `MINFER_OP_TIMING` module-load re-measure and the stale-prose sweep) landed with this document's own
 > row, and its Mac half ([#53](https://github.com/yusiwen/minfer/issues/53)'s Metal `DeviceMemory`
-> answer, which is what the `common` decision waits on) is the last open item of the campaign. Step 4
+> answer, the second implementation the `common` decision waits on) landed on
+> `macbook (macOS 27.0.1, Apple M4 Pro)` — the decision itself is recorded in §1.3 rule 3. Step 4
 > (Metal, [#265](https://github.com/yusiwen/minfer/issues/265)) landed from a Mac in three increments.
 > This is the plan of record for splitting the four long backend files and for the naming
 > convention the crate follows afterwards. Tickets:
@@ -28,7 +29,7 @@
 | 2 `src/cuda_kernels.cu` → `src/cuda/kernels/` | #263 (after #266) | **landed** (PRs [#284](https://github.com/yusiwen/minfer/pull/284) G1 `930e1e2`, [#285](https://github.com/yusiwen/minfer/pull/285) G2 `286a5a4`, [#286](https://github.com/yusiwen/minfer/pull/286) G3 `f68a542`, [#287](https://github.com/yusiwen/minfer/pull/287) G4 `c0ddf8b`, [#288](https://github.com/yusiwen/minfer/pull/288) G5 `ee380ad`, [#289](https://github.com/yusiwen/minfer/pull/289) G6 `0cb21cb`): `src/cuda_kernels.cu` 10,215 lines → deleted; `src/cuda/kernels/` = `common.cuh` (498 lines, 1 header) + **17 TUs** (9,996 lines); audit 130 sites; counts unchanged (CUDA 567/0/42, CPU 481/0/36, integration 10/0/6, real-model 42/0 ×2); the per-stage record is at the end of §4 Step 2, and the re-measured module-load cost is in §5 |
 | 3 CPU files | #264 | **landed**: stage A `quants` `cbee81f` (PR [#290](https://github.com/yusiwen/minfer/pull/290)) — `src/quants.rs` 1,340 → 61 lines + 9 part files + `src/quants/neon_correctness.rs`, `scripts/check_source_layout.py` rule 1 widened ([#274](https://github.com/yusiwen/minfer/issues/274)); stage B `vec_ops` `395da59` (PR [#291](https://github.com/yusiwen/minfer/pull/291)) — `src/vec_ops.rs` 1,344 → 52 lines + 8 part files; stage C `kernel` `4900298` (PR [#292](https://github.com/yusiwen/minfer/pull/292)) — `src/kernel.rs` 667 → 22 lines + 3 part files; counts unchanged (481/0/36 + 10/0/6) |
 | 4 Metal (Mac-local) | #265 | **landed** in three increments (2026-10-05, `macbook (macOS 27.0.1, Apple M4 Pro)`): `src/metal.rs` 2 480 → 451 lines + `src/metal/{runtime,encode,ops,policy}.rs` (475/114/1428/66) and `src/metal.metal` 5 151 lines → deleted, replaced by `src/metal/kernels/` = 2 headers (`common.h` 13, `dequantize.h` 198) + **14 family `.metal`** (largest `fa_prefill.metal` 812, §9 decision 2); `build.rs` compiles the concatenated parts into the one metallib and the runtime + the 4 `tests/*_isolation.rs` read the same generated `$OUT_DIR/minfer.metal`; **0 visibility edits**; counts unchanged (macOS 483/20/38, real-model 37/1 ×2 — the same red baseline as #255, `src/metal.metal` is gone, so no anchor survives in the live docs); PR [#295](https://github.com/yusiwen/minfer/pull/295) |
-| 5 close the loop | — | **Linux half landed** (PR [#293](https://github.com/yusiwen/minfer/pull/293), 2026-10-05): the `MINFER_OP_TIMING` module-load re-measure in §5 + the `src/cuda_kernels.cu` prose sweep + the last two #219 claims; **Mac half owed**: [#53](https://github.com/yusiwen/minfer/issues/53)'s Metal `DeviceMemory` answer, which is the second implementation the `common` rule waits on (§3) |
+| 5 close the loop | — | **landed**: Linux half (PR [#293](https://github.com/yusiwen/minfer/pull/293), 2026-10-05) — the `MINFER_OP_TIMING` module-load re-measure in §5 + the `src/cuda_kernels.cu` prose sweep + the last two #219 claims; Mac half (PR [#296](https://github.com/yusiwen/minfer/pull/296), 2026-10-05, `macbook (macOS 27.0.1, Apple M4 Pro)`) — [#53](https://github.com/yusiwen/minfer/issues/53)'s Metal `DeviceMemory` answer (§4 Step 5), and the `common` decision it unblocked is recorded in §1.3 rule 3: **no new module** |
 | 6 long test files | #267 | **files 1–9 landed**: PR [#275](https://github.com/yusiwen/minfer/pull/275) `424c64d` (file 1), [#277](https://github.com/yusiwen/minfer/pull/277) `66446e5` (2), [#278](https://github.com/yusiwen/minfer/pull/278) `b439612` (3), [#279](https://github.com/yusiwen/minfer/pull/279) `d3edb10` (4), [#280](https://github.com/yusiwen/minfer/pull/280) `587c156` (5), [#281](https://github.com/yusiwen/minfer/pull/281) `cd2c14a` (6–8), [#283](https://github.com/yusiwen/minfer/pull/283) `bc30152` (9): `graph/cuda_backend/tests.rs` 8,603 → a 106-line parent + 11 `tests/<topic>.rs` (61 tests); `models/qwen2/graph/tests.rs` 3,399 → a 111-line parent + 5 (21); `server/batch/tests.rs` 2,630 → a 356-line parent + 7 (21); `graph/alloc/tests.rs` 1,833 → a 72-line parent + 6 (42); `tooling/tests.rs` 1,669 → a 166-line parent + 7 (14); `sampler/tests.rs` 1,232 → a 140-line parent + 10 (47); `conversation/tests.rs` 1,156 → a 209-line parent + 6 (27); `graph/kvcache/tests.rs` 1,134 → a 122-line parent + 5 (33); `cuda/issue162_tests.rs` 1,186 → a 209-line parent + 4 `tests/<topic>.rs` (5 tests) |
 
 Each step appends its dated record here when it lands (gates run, counts, box label).
@@ -45,9 +46,8 @@ Each step appends its dated record here when it lands (gates run, counts, box la
    directories. **No new trait is introduced by this plan.**
 3. **A `common` is only allowed to exist when it has a second real implementation.** Interface
    eligibility = at least two real implementations **and** at least two callers using it with the
-   same semantics. Today only one candidate qualifies and it already exists in part:
-   `allocplan::DeviceMemory` (CUDA answers it; Metal does not — the second implementation is
-   [#53](https://github.com/yusiwen/minfer/issues/53)). This rule goes into
+   same semantics. The one candidate is `allocplan::DeviceMemory`: CUDA answered it first and, since
+   [#53](https://github.com/yusiwen/minfer/issues/53), Metal answers it too. This rule goes into
    `docs/ARCHITECTURE.md`.
 
    **Step 5 pre-analysis (2026-10-05, on `4900298`) — no `common` module yet, and the Linux half owes
@@ -63,6 +63,24 @@ Each step appends its dated record here when it lands (gates run, counts, box la
    module" is a live answer (the type and the policy are already in `allocplan`). Creating the
    abstraction now would be the single-real-implementation case this rule forbids, so it is
    deliberately **not** created here.
+
+   **Post-analysis (2026-10-05, on the #53 branch) — the second implementation landed, and the
+   answer is still "no new module".** #53 added `MpsState::device_memory()` (Metal's
+   `recommendedMaxWorkingSetSize`, `src/metal/runtime.rs`), so `allocplan::DeviceMemory` now has the
+   two real implementations the rule asks for. The eligible *interface* is not the enum alone,
+   though: it is the whole device-answer path, and that path has three parts whose homes are already
+   right. The **type** and the pure **policy** (`budget_decision`, `weight_budget`) stay in
+   `graph/allocplan.rs` / `graph/offload.rs` — device-agnostic and CI-tested. Each **device answer**
+   stays in its own device module, next to the state it queries (`CudaState::device_memory()`,
+   `src/cuda/methods/accounting.rs`; `MpsState::device_memory()`, `src/metal/runtime.rs`). The
+   **routing** is the four-line `models::device_memory()` (Metal > CUDA > CPU), and it is the
+   two-caller seam the rule is about: `graph/alloc.rs::memory_budget` (E4's feasibility gate) and
+   both loaders' `auto` fit (`models/qwen2/loader.rs`, `models/qwen3/loader.rs`) read it with the
+   same semantics. A `common` module would therefore have to hold either the two device methods —
+   moving them out of the modules that own the device state, for no caller's benefit — or the
+   routing, a four-line `match`: a module with one function is the abstraction-for-one-caller case
+   this rule exists to refuse. Counts at the decision: **2 implementations** (CUDA, Metal) and **3
+   same-semantics callers** (the E4 gate + the two loaders) of the **resolver**; **0** new modules.
 4. **Each backend picks its own inner axis** (this is what llama.cpp actually does — it is *not*
    uniform): CUDA = **kernel family**, Metal = **layer** (`ggml-metal-device.*` → `ggml-metal-ops.cpp`
    → `kernels/`), CPU = **ISA** (`ggml-cpu/arch/{x86,arm,…}`).
@@ -437,6 +455,13 @@ Re-measure the N-module cold start and update the §2.4 pre-warm table
 ([#53](https://github.com/yusiwen/minfer/issues/53), CUDA already answers it) so that "the device
 memory report" becomes the first interface with two real implementations; add the mechanical
 documentation-anchor check (§6) if it is not already landed.
+
+**Landed.** The `MINFER_OP_TIMING` re-measure is §5.1 (Linux half, PR [#293](https://github.com/yusiwen/minfer/pull/293));
+the anchor checker is [#266](https://github.com/yusiwen/minfer/issues/266). The Metal `DeviceMemory`
+half landed on `macbook (macOS 27.0.1, Apple M4 Pro)` (PR [#296](https://github.com/yusiwen/minfer/pull/296))
+— the measured record (before/after counts, the red-baseline note, the mutation transcript) is the
+E4/E5 "Metal half" record in `docs/ARCHITECTURE-EXECUTION-PLAN.md`, and the `common` decision it
+unblocks is §1.3 rule 3 above: **two implementations, three same-semantics callers, no new module.**
 
 ### Step 6 — the long test files (in scope, decided 2026-10-04)
 
@@ -841,7 +866,7 @@ columns**),
 | 2 `.cu` | Step 1's list plus `check_cuda_launch_returns.py` (+`--selftest`, `--check-fixture`), `MINFER_TEST_ISSUE162=1` device gate, `MINFER_OP_TIMING=1` cold-start record | 130 sites; 42/0 ×2 bitwise; module-load cost recorded |
 | 3 CPU | CPU suites (`cargo test --release`, plus `MINFER_NO_NEON=1`) + the two-arch dead-code set comparison | 481/0/36, 10/0/6, sets identical |
 | 4 Metal | on a Mac: `cargo build --release` (non-empty metallib), real-model gates, #255's two judgments | recorded on the Mac box |
-| 5 close | Linux: #225's table re-measured (§5.1); Mac: #53's `DeviceMemory` for Metal | the measured row in `CUDA-BACKEND-DESIGN.md` §2.4 / plan §5.1; the `common` decision stays open until the Mac half exists |
+| 5 close | Linux: #225's table re-measured (§5.1); Mac: #53's `DeviceMemory` for Metal | the measured row in `CUDA-BACKEND-DESIGN.md` §2.4 / plan §5.1; the `common` decision resolved on the Mac half (§1.3 rule 3: 2 implementations, 3 callers, **no new module**) |
 | 6 tests | the step-appropriate suite (CUDA 565/0/42 for the executor tests, CPU 480/0/36 + 10/0/6) + `check_source_layout.py` | counts **identical**; every new test file named by a `mod` |
 | all | `scripts/check_docs_links.py`, `scripts/check_status.py --check`, `scripts/build_book.sh`, `scripts/check_doc_line_anchors.py` (once ticket 6 lands) | green; no stale anchor |
 
