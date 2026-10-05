@@ -10114,3 +10114,78 @@ is therefore **not taken**: plan §1.3 records the pre-analysis (the type and th
 the device-agnostic `allocplan`/`offload`; the device answer has one implementation,
 `CudaState::device_memory()` through the CUDA-only `models::device_memory()`, with no `Backend` trait
 hook), so creating a `common` module now would be the single-real-implementation case the rule forbids.
+
+#### Test-infrastructure record (#255, 2026-10-05) — the two macOS-only `allow(dead_code)` sites are judged, and the macOS test build is unblocked
+
+**The ticket.** [#255](https://github.com/yusiwen/minfer/issues/255) is the Mac hand-off of the
+#238–#244 dead-code series: the two bare `allow(dead_code)` sites in `src/metal.rs` (macOS-only, so no
+Linux capture can compile them). It is `[#260](https://github.com/yusiwen/minfer/issues/260)`'s first
+item and a prerequisite of [#265](https://github.com/yusiwen/minfer/issues/265) (the Metal split).
+
+**Box.** `macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-05, toolchain pinned at `1.97.1`
+(`RUSTUP_TOOLCHAIN` is `stable` in this shell, so it is unset for every run). Worktree
+`.worktrees/255`, branch `255-metal-dead-code`.
+
+**Oracle method.** `allow(dead_code)` is stripped line-preservingly across `src/**.rs` (43 attribute
+lines on `a7fc07e`; the issue's 61 is the `f47e4c3` count — master has since lost 18). Then
+`RUSTFLAGS=--cap-lints=warn cargo check --release --message-format=json` is captured on the Mac; every
+`src/` span of every `dead_code` diagnostic is read (60 spans). This is the first capture in the series
+that compiles `src/metal.rs` at all.
+
+**Verdict 1 — `src/metal.rs:972` `MpsCommandBuffer::matmul_on_gpu_buf` → D3, `#[cfg(test)]`.** The
+stripped macOS non-test build reports `method 'matmul_on_gpu_buf' is never used`; its only readers are
+`src/metal/tests.rs:147/201/212`. It stays in place under `#[cfg(test)]` (the T1 shape), because it is
+an inherent method on a lifetime-parameterised type whose body is a one-line forward to the live
+`quant_matmul_f32_on_gpu_buf`.
+
+**Verdict 2 — `src/metal.rs:2029`, the container-level blanket on `impl MpsState` → D1, delete.** The
+stripped macOS non-test build reports **no** dead member of the impl: `try_new`/`init` (via `main.rs`),
+`register_part`/`register_weight` (both loaders), `has_weight` (both graph builders), `cmd_buffer`,
+`weight_buf`, `new_f32_buffer` (`graph/metal_backend.rs`), `get`/`get_or_grow` all have non-test
+readers. The comment's "layer-gpu reference path" claim was false since
+[#240/#241](https://github.com/yusiwen/minfer/issues/240) deleted that path, so the blanket and the
+comment both go.
+
+**Prerequisite found and fixed: the macOS test build did not compile.** The ticketed acceptance asks
+for a warning-free `cargo check --release --tests`, but on clean master that command exits **101** with
+16× `E0599: no associated function or constant named 'Metal' found for struct
+'graph::registry::Backend'` — `src/graph/metal_backend/tests.rs` still spells the pre-F4 enum variant
+`Tag::Metal` where the F4 registry handle is `Backend::METAL`. CI's `build-macos` runs `cargo build`,
+never `--tests`, so the breakage was invisible to CI and predates this ticket; the byte-identical clean
+capture (`clean_tests.log`) proves it is not caused by the strip. The 16 sites are renamed and the
+test build then exits **0**.
+
+**Step 6 of the issue, confirmed.** `src/models/mod.rs`'s
+`#[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]` on `as_any`/`forward_graph`:
+the macOS test build emits **no** `dead_code` warning for either, so the annotation applies no allow
+there and the items are live exactly where the caller (`models::qwen2::graph::tests`) is compiled. The
+annotation is correct as written and is left alone.
+
+**Manifests.** `scripts/check_dead_code_annotations.py`'s `GRANDFATHERED_BARE` drops both
+`src/metal.rs:` keys (11 → 9 sites) and its `[#255]` comment is rewritten; the ratchet only turns one
+way. `docs/dead-code-baseline.toml` needs **no** row: the issue predicted a `file = "src/metal.rs"`
+entry, but the manifest only carries `[[cpu]]`/`[[cuda]]` rows and metal is not compiled on Linux, so
+the stripped Linux oracle cannot see either site — the tree is the authority here, not the issue text.
+
+**Verification (rule 5 numbers), `macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-05.**
+
+| Command | Result |
+|---|---|
+| `cargo build --release` (unstripped, after the change) | exit **0** — the `deny(warnings)` non-test gate is clean; `target/release/build/minfer-*/out/minfer.metallib` = **410 942 B**, sha256 `13af518ed447d71f10439a894380eb1bddcdb6e2d737a396e99cd6a823ef3523` |
+| `RUSTFLAGS=--cap-lints=warn cargo check --release` (stripped) | exit **0**; 60 `dead_code` `src/` spans — `matmul_on_gpu_buf` present, zero `impl MpsState` members |
+| `RUSTFLAGS=--cap-lints=warn cargo check --release --tests` (clean master) | exit **101**, 16× `E0599 Tag::Metal` |
+| same, after the rename | exit **0** |
+| `cargo test --release` | **483 passed / 20 failed / 38 ignored** — see the note below |
+| `scripts/real_model_gates.sh` (0.5B) and `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf` | **37 / 1** each; the single failure is `server::batch::tests::slots::a_slot_snapshot_resumes_the_context_without_re_prefilling` ("KV session: layer 0 host read failed"), a pre-existing Metal KV-session gap |
+| `python3 scripts/check_dead_code_annotations.py` | exit 0, 9 grandfathered bare sites |
+| `cargo fmt --all --check` | exit 0 |
+
+**The macOS suite is red, and this record is the first honest measurement of it.** With the compile
+fix in place the macOS-only tests run for the first time; 20 fail, and their causes are pre-existing,
+not this change: five `graph::metal_backend::tests` attention-input sites panic with
+`attn: query 0 has span [0, 0)` (the [#228](https://github.com/yusiwen/minfer/issues/228) migration
+that [#231](https://github.com/yusiwen/minfer/issues/231) says "has never been executed"), and the
+`models::qwen2/qwen3` Metal comparisons diverge (`graph_metal_matches_cpu_logits`: CPU greedy token
+220 vs GPU 353). They belong to [#231](https://github.com/yusiwen/minfer/issues/231)/[#260](https://github.com/yusiwen/minfer/issues/260),
+not here, and this ticket adds no fix for them. [#265](https://github.com/yusiwen/minfer/issues/265)
+carries the same failing set before and after, which is what a pure move must show.

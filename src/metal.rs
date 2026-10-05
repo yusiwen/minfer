@@ -967,8 +967,9 @@ impl MpsCommandBuffer<'_> {
     /// matching llama.cpp's Metal backend which does not Q8_0-quantize activations).
     /// Pre-looked-up weight buffer and type — avoids per-matmul HashMap locking.
     /// (Only exercised by the `matmul_bandwidth_profile` test; the graph backend
-    /// calls `quant_matmul_f32_on_gpu_buf` directly.)
-    #[allow(dead_code)]
+    /// calls `quant_matmul_f32_on_gpu_buf` directly — so this wrapper is
+    /// `#[cfg(test)]`, judged by the #255 macOS oracle.)
+    #[cfg(test)]
     fn matmul_on_gpu_buf(
         &self,
         wb: &MetalBuffer,
@@ -2024,9 +2025,12 @@ fn load_embedded_or_source(device: &MetalDevice, metallib: &[u8]) -> Option<Meta
     compile_metal_source(device)
 }
 
-// Retained layer-gpu / old-forward methods: the graph backend replaces them,
-// but they stay for tests and the layer-gpu reference path (AGENTS.md).
-#[allow(dead_code)]
+// L1 device/runtime surface: the singleton, weight registration, f32 buffer
+// allocation and command-buffer creation. The #255 macOS oracle (`cargo check
+// --release`, annotations stripped) reports no dead member here — loaders,
+// `main.rs`, `graph/metal_backend.rs` and `get_or_grow`/`cmd_buffer` all read
+// them — so the former container-level `#[allow(dead_code)]` is deleted rather
+// than narrowed.
 impl MpsState {
     pub fn try_new() -> Option<Self> {
         if std::env::var("MINFER_DISABLE_MPS").is_ok() {
