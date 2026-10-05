@@ -56,6 +56,7 @@ const SHADER_SOURCES: &[&str] = &[
     "src/metal/kernels/rope.metal",
     "src/metal/kernels/fa_parallel.metal",
     "src/metal/kernels/kv.metal",
+    "src/metal/kernels/qkv_fused.metal",
     "src/metal.metal",
 ];
 /// The tree the shader-file guard walks. Every `.metal`/`.h` found under it must
