@@ -17,11 +17,30 @@
 
 use crate::metal::MpsState;
 #[cfg(target_os = "macos")]
-use objc2_metal::MTLBuffer;
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLSharedEvent};
 
 use super::backend::Backend;
 use super::ops::{FusedOp, NodeMeta, Op};
 use super::{BufRef, CNode, DType};
+
+/// F5 (#137): the `MINFER_TEST_CALL_FAIL` site of the Metal cross-backend
+/// staging copy ([`docs/GATE-CONTRACT.md`]). Under injection the enqueue
+/// suppresses its `MTLSharedEvent` signal, so phase B's bounded wait genuinely
+/// times out and the mutation gate reads the real timeout status. Unset in every
+/// default, bench and device run.
+///
+/// [`docs/GATE-CONTRACT.md`]: ../docs/GATE-CONTRACT.md
+pub(crate) const CROSS_COPY_SITE: &str = "metal_cross_copy";
+
+/// F5 (#137): the bound on the phase-B host wait, in milliseconds. The same 10 s
+/// order as the split submission's bound (`MpsCommandBuffer::submit`): a GPU
+/// that never signals the event is a loud `Err`, never an unbounded host block
+/// (`docs/GPU_SAFETY.md`).
+const CROSS_WAIT_TIMEOUT_MS: u64 = 10_000;
+
+/// F5 (#137): the value the staging blit signals and phase B waits for. Each
+/// copy owns a fresh event, so 1 is always "this copy finished".
+const CROSS_EVENT_VALUE: u64 = 1;
 
 // ─── op profiler (MINFER_OP_PROFILE=1, debug aid) ────────────────────
 // Host-side encode time per op label (accumulated across the process) plus
@@ -67,6 +86,40 @@ pub struct MetalBackend {
     /// access happens sequentially through &self/&mut self methods on the
     /// scheduler thread, so the raw pointer is contained.
     cb_ptr: *mut crate::metal::MpsCommandBuffer<'static>,
+    /// F5 (#137): in-flight cross-backend staging copies, keyed by the same
+    /// `(graph uid, node, destination backend)` triple the allocator's `cross`
+    /// map uses. Each record owns the staging buffer the blit wrote, the shared
+    /// event the consumer waits on, and the command buffer it was encoded into
+    /// (so phase B can report the GPU's real status). An entry is removed by
+    /// phase B; `copy_across` makes a re-request while the entry is still here a
+    /// no-op, so a record can never be silently replaced.
+    cross: std::collections::HashMap<(u64, super::NodeId, super::Backend), MetalCrossCopy>,
+    /// F5 (#137): how many times this backend handed a pool buffer's bytes to
+    /// the host directly (`Backend::read_host`) — the synchronous staging path's
+    /// readback. Metal's buffers are `StorageModeShared`, so there is no
+    /// separate blocking-copy API to count; this is the device-level analogue of
+    /// `CudaBackend::blocking_readback_count` and the async path never touches
+    /// it (it publishes its own staging bytes instead). See
+    /// `docs/BACKEND-REGISTRY-DESIGN.md` §11.3.
+    sync_readbacks: std::sync::atomic::AtomicU64,
+}
+
+/// F5 (#137): one in-flight Metal cross-backend staging copy (see
+/// [`MetalBackend::cross`]).
+struct MetalCrossCopy {
+    /// The `StorageModeShared` buffer the GPU blit wrote; valid once `event`
+    /// reaches `value`.
+    staging: crate::metal::MetalBuffer,
+    /// The `MTLSharedEvent` the blit signals and phase B waits on. Each copy has
+    /// its own event, so the value space is never shared between concurrent
+    /// copies.
+    event: crate::metal::MetalSharedEvent,
+    /// The command buffer the blit was encoded into, retained so phase B can
+    /// report a real `status()` / `error()` after the event wait.
+    cmd: crate::metal::MetalCommandBuffer,
+    /// The value the blit signals (and the host waits for). Always 1 today; the
+    /// field exists so the wait names the value it was waiting for.
+    value: u64,
 }
 
 // Safety: every field is either owned (pool/free), a 'static reference
@@ -126,6 +179,162 @@ impl MetalBackend {
         self.free_staging = (0..self.staging.len()).collect();
     }
 
+    /// F5 (#137) **phase A**: enqueue the staging copy of `src` (a Metal pool
+    /// reference) for `(uid, node_id, dst_backend)` and return **without
+    /// waiting** for it.
+    ///
+    /// One fresh `StorageModeShared` staging buffer and one fresh
+    /// `MTLSharedEvent`, plus a `MTLBlitCommandEncoder` copy and
+    /// `encodeSignalEvent` encoded into the split's own command buffer (a
+    /// standalone one when no split buffer is open). Nothing here blocks the
+    /// host, and the encoding is ordered behind the split's kernels in the same
+    /// submission, so the copy reads exactly the bytes the split wrote.
+    ///
+    /// The record is keyed exactly as the allocator's staging map is, so a
+    /// re-request (which `copy_across` already turns into a no-op while the
+    /// entry is pending) could never overwrite a live event.
+    pub(crate) fn cross_enqueue(
+        &mut self,
+        uid: u64,
+        node_id: super::NodeId,
+        dst_backend: super::Backend,
+        src: BufRef,
+    ) -> Result<(), String> {
+        if self.cross.contains_key(&(uid, node_id, dst_backend)) {
+            // `copy_across` no-ops a re-request while the entry is pending, so
+            // this is a backstop, not a path: replacing the record would drop
+            // the first copy's event and staging buffer on the floor.
+            return Err(format!(
+                "metal cross_enqueue: a staging copy for node {node_id} on {dst_backend:?} is \
+                 already in flight"
+            ));
+        }
+        let src_buf = self
+            .pool
+            .get(src.id)
+            .ok_or_else(|| format!("metal: no buffer {}", src.id))?
+            .clone();
+        let bytes = src.len * 4;
+        let staging = self.state.new_f32_buffer(src.len);
+        let event = self
+            .state
+            .new_shared_event()
+            .ok_or("MTLDevice.newSharedEvent returned nil")?;
+        // The injection suppresses the signal, so phase B's *bounded* wait takes
+        // its real timeout branch instead of succeeding. Off by default.
+        let signal = !crate::testfail::requested(CROSS_COPY_SITE);
+        // F5 (#137): encode the blit into the **producer split's** command buffer
+        // when one is still open, so the copy is ordered behind that split's
+        // kernels in the same submission (one command buffer per split, and the
+        // source is read in the same submission that wrote it). At a boundary the
+        // scheduler calls this before `Backend::retire` submits the split, so the
+        // open buffer is the norm; a source with no open split buffer gets a
+        // standalone command buffer that is committed here.
+        let had_split_cb = !self.cb_ptr.is_null();
+        let cb = self.cb();
+        cb.encode_blit_signal(
+            &src_buf,
+            src.offset * 4,
+            &staging,
+            bytes,
+            &event,
+            CROSS_EVENT_VALUE,
+            signal,
+        )?;
+        // Retain the underlying buffer for a real `status()` / `error()` on the
+        // failure path before the (standalone) submission consumes `cb`.
+        let cmd = cb.command_buffer();
+        if !had_split_cb {
+            self.submit_pending();
+        }
+        self.cross.insert(
+            (uid, node_id, dst_backend),
+            MetalCrossCopy {
+                staging,
+                event,
+                cmd,
+                value: CROSS_EVENT_VALUE,
+            },
+        );
+        Ok(())
+    }
+
+    /// F5 (#137) **phase B**: wait on the event phase A recorded — once, at the
+    /// documented synchronization point — and publish the staging bytes to the
+    /// host.
+    ///
+    /// The wait is **bounded** (10 s, the same order as the split submission's
+    /// bound); a GPU that never signals is a loud `Err` naming the value waited
+    /// for, the observed `signaledValue`, and the command buffer's real
+    /// `status()` / `error()` — never an unbounded block. A blit that faults on
+    /// the device never signals its event, so it lands in exactly this branch
+    /// with its real status attached; a successful signal **is** the completion
+    /// guarantee for the shared staging buffer (the command buffer's own status
+    /// can still read `Scheduled` at that instant, which is why it is not
+    /// consulted on the success path). `Ok(None)` means this backend never
+    /// enqueued a copy for the key (a device destination declined phase A),
+    /// which is a no-op for the caller.
+    pub(crate) fn cross_take(
+        &mut self,
+        uid: u64,
+        node_id: super::NodeId,
+        dst_backend: super::Backend,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let Some(rec) = self.cross.remove(&(uid, node_id, dst_backend)) else {
+            return Ok(None);
+        };
+        let injected = crate::testfail::requested(CROSS_COPY_SITE);
+        // A 1 ms bound under injection keeps the mutation gate fast while still
+        // exercising the real timeout branch.
+        let timeout_ms = if injected { 1 } else { CROSS_WAIT_TIMEOUT_MS };
+        let signaled = rec
+            .event
+            .waitUntilSignaledValue_timeoutMS(rec.value, timeout_ms);
+        if !signaled {
+            let status = rec.cmd.status();
+            return Err(format!(
+                "Metal cross-backend staging copy: the bounded wait on MTLSharedEvent timed out \
+                 after {timeout_ms} ms (waited for value {}, observed signaledValue {}; command \
+                 buffer status={status:?}{}){}",
+                rec.value,
+                rec.event.signaledValue(),
+                match rec.cmd.error() {
+                    Some(e) => format!(", error={e:?}"),
+                    None => String::new(),
+                },
+                if injected {
+                    format!(" — MINFER_TEST_CALL_FAIL={CROSS_COPY_SITE} suppressed the signal")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        let len = (rec.staging.length() as usize) / 4;
+        let data = unsafe {
+            std::slice::from_raw_parts(rec.staging.contents().as_ptr() as *const f32, len)
+        };
+        Ok(Some(data.to_vec()))
+    }
+
+    /// F5 (#137): how many in-flight staging copies this backend holds. The
+    /// idempotence gate reads it to prove a re-request did not create a second
+    /// record (and therefore did not leak a staging buffer or an event).
+    /// Test-only (#238): driven by `graph::metal_backend::tests::staging::a_re_request_while_in_flight_is_the_same_transfer`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn cross_pending_len(&self) -> usize {
+        self.cross.len()
+    }
+
+    /// F5 (#137): the device-level count of host readbacks of a Metal pool
+    /// buffer (see the `sync_readbacks` field). The async boundary path must not
+    /// move it; the synchronous reference must.
+    /// Test-only (#238): driven by `graph::metal_backend::tests::staging::a_split_graph_waits_once_per_staged_copy_and_stays_bitwise` and the `#[ignore]`d real-model gate `models::qwen2::graph::tests::offload_copy::async_cross_copies_never_block_and_stay_bitwise_identical_on_metal`; `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn sync_readback_count(&self) -> u64 {
+        self.sync_readbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// None when MPS is unavailable or not initialized (MpsState::init()).
     pub fn new() -> Option<Self> {
         let state = MpsState::get()?;
@@ -136,6 +345,8 @@ impl MetalBackend {
             staging: Vec::new(),
             free_staging: Vec::new(),
             cb_ptr: std::ptr::null_mut(),
+            cross: std::collections::HashMap::new(),
+            sync_readbacks: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -312,46 +523,100 @@ pub const SUPPORTS_ATTN_SPAN: bool = false;
 /// [#87]: https://github.com/yusiwen/minfer/issues/87
 pub const READS_PACKED_KV: bool = false;
 
-/// F5 ([#58]): registry hook **phase A** of a cross-backend staging copy out of
-/// Metal — **declines**: it returns `Ok(false)`, so the allocator's synchronous
-/// host round trip handles the pair exactly as it did before F5.
+/// F5 ([#58], ported by [#137]): registry hook **phase A** of a cross-backend
+/// staging copy out of Metal.
 ///
-/// That is a deliberate, written decision rather than a half-implementation. The
-/// async form on Metal is a `MTLBlitCommandEncoder` copy into a staging buffer
-/// plus a completion handler or an `MTLEvent`/`MTLSharedEvent` the consumer waits
-/// on — a different mechanism from CUDA's — and this ticket was developed on a
-/// **Linux** box with no Metal device and no macOS toolchain, so none of it could
-/// be compiled, let alone verified bitwise. Shipping un-compilable device code
-/// would be the "half-implemented" failure the ticket warns about; declining keeps
-/// the pre-F5 behaviour (correct, blocking) and leaves the port as a filed
-/// follow-up. The boundary counters therefore report a Metal source's copies as
-/// `blocking_host_copies`, which is the honest number on macOS until it lands.
+/// Metal is a **device source on unified memory**: its pool buffers are
+/// `MTLBuffer`s with `StorageModeShared`, and every split's submission is closed
+/// by `Backend::retire` (Metal's default `synchronize`, a bounded-wait
+/// `submit`). So the transfer here is not a device→host DMA but a GPU-side blit
+/// into a fresh shared staging buffer, plus an `MTLSharedEvent` the consumer
+/// waits on — Metal's counterpart of CUDA's `cudaMemcpyAsync` + `cudaEventRecord`.
+/// Phase A only **enqueues** (commits the dedicated command buffer and returns);
+/// the host block happens once, in [`await_cross`], at the consumer's first read.
 ///
-/// The CPU→Metal direction is unaffected either way: its device leg is Metal's own
-/// `write_host` staging fill.
+/// **Mechanism choice.** `MTLSharedEvent`, not `MTLEvent` and not a completion
+/// handler: a completion handler can only notify the **host**, and a plain
+/// `MTLEvent` cannot be waited on from the host at all (only `MTLSharedEvent`
+/// exposes `waitUntilSignaledValue:timeoutMS:`) — and it is `MTLSharedEvent`
+/// that `MTLCommandBuffer::encodeSignalEvent` / `encodeWaitForEvent` accept, so
+/// it is the one primitive that covers *both* the host wait this port needs and
+/// the device-side wait a device consumer would need. See §11.2.
+///
+/// Every destination other than the CPU **declines** (`Ok(false)`) and the
+/// allocator's synchronous host round trip handles it, exactly as CUDA declines
+/// a non-CPU destination: a Metal→Metal staging copy is unreachable
+/// (`copy_across` early-returns when source and destination backends match), and
+/// CUDA does not run on Apple Silicon, so no device→device pair exists on macOS.
+/// The reserved device-side mechanism is named in §11.3; declining is deliberate
+/// and the boundary counters record the resulting synchronous copy.
 ///
 /// [#58]: https://github.com/yusiwen/minfer/issues/58
+/// [#137]: https://github.com/yusiwen/minfer/issues/137
 pub(crate) fn copy_cross(
-    _alloc: &mut super::alloc::GraphAllocator,
-    _uid: u64,
-    _node_id: super::NodeId,
-    _dst_backend: super::Backend,
+    alloc: &mut super::alloc::GraphAllocator,
+    uid: u64,
+    node_id: super::NodeId,
+    dst_backend: super::Backend,
 ) -> Result<bool, String> {
-    Ok(false)
+    if dst_backend != super::Backend::CPU {
+        return Ok(false);
+    }
+    let src = alloc
+        .node_buffer(node_id)
+        .ok_or_else(|| format!("node {node_id} has no buffer"))?;
+    if src.backend != super::Backend::METAL {
+        return Err(format!(
+            "metal copy_cross: node {node_id} is on {:?}, not Metal",
+            src.backend
+        ));
+    }
+    alloc
+        .metal_mut()
+        .ok_or("Metal backend not enabled")?
+        .cross_enqueue(uid, node_id, dst_backend, src)?;
+    alloc.cross_stats_mut().async_host_copies += 1;
+    Ok(true)
 }
 
-/// F5 ([#58]): registry hook **phase B** for a Metal source — a no-op, because
-/// [`copy_cross`] declined and the allocator's synchronous path already produced
-/// the bytes. See that function for why the Metal port is not in this ticket.
+/// F5 ([#58], ported by [#137]): registry hook **phase B** for a Metal source —
+/// wait on the event phase A recorded, exactly once, then publish the staging
+/// bytes into the destination's staging buffer.
+///
+/// This is the **one** host block of the async Metal device→host path, and it is
+/// bounded: [`MetalBackend::cross_take`] waits `waitUntilSignaledValue` with a
+/// 10 s timeout and turns a timeout or a non-`Completed` blit into a loud `Err`
+/// naming the real status — never a silent read of in-flight bytes and never a
+/// CPU fallback.
+///
+/// A no-op when this backend holds no record for the key (the pair declined
+/// phase A, e.g. a device destination), matching the CUDA hook.
 ///
 /// [#58]: https://github.com/yusiwen/minfer/issues/58
+/// [#137]: https://github.com/yusiwen/minfer/issues/137
 pub(crate) fn await_cross(
-    _alloc: &mut super::alloc::GraphAllocator,
-    _uid: u64,
-    _node_id: super::NodeId,
-    _dst_backend: super::Backend,
+    alloc: &mut super::alloc::GraphAllocator,
+    uid: u64,
+    node_id: super::NodeId,
+    dst_backend: super::Backend,
 ) -> Result<(), String> {
-    Ok(())
+    if dst_backend != super::Backend::CPU {
+        return Ok(());
+    }
+    let Some(data) = alloc
+        .metal_mut()
+        .ok_or("Metal backend not enabled")?
+        .cross_take(uid, node_id, dst_backend)?
+    else {
+        return Ok(());
+    };
+    // Resolve the destination before borrowing the counters (the two borrows
+    // cannot be live at once).
+    let dst = alloc
+        .cross_buffer(uid, node_id, dst_backend)
+        .ok_or_else(|| format!("node {node_id} has no staging buffer on {dst_backend:?}"))?;
+    alloc.cross_stats_mut().event_syncs += 1;
+    alloc.write_cross_staging(dst, &data)
 }
 
 /// F4: this backend's registry entry (see `cpu_backend::entry`).
@@ -367,8 +632,11 @@ pub fn entry() -> super::registry::BackendEntry {
         pool: |a| a.metal().map(|m| m as &dyn Backend),
         pool_mut: |a| a.metal_mut().map(|m| m as &mut dyn Backend),
         host_read: |a, id| a.metal().and_then(|m| m.read_host(id)).map(|s| s.to_vec()),
-        // F5: Metal declines phase A (see `copy_cross` above — no Mac to compile
-        // or verify the blit/event port on) and its phase B is therefore a no-op.
+        // F5 (#137): Metal's async staging copy — a `MTLBlitCommandEncoder`
+        // copy into a shared staging buffer plus an `MTLSharedEvent` signal
+        // (phase A), waited on once at the consumer's first read (phase B).
+        // See `copy_cross` / `await_cross` above for the mechanism and the
+        // declined directions.
         copy_cross,
         await_cross,
         // The MPS device layer holds the process-wide f16 policy (C5 records it
@@ -1157,6 +1425,12 @@ impl Backend for MetalBackend {
     }
 
     fn read_host(&self, id: usize) -> Option<&[f32]> {
+        // F5 (#137): the synchronous staging path reaches a Metal source through
+        // here (the registry entry's `host_read` hook), so this is the
+        // device-level readback counter. The async path publishes its own
+        // staging bytes in `cross_take` and never comes through here.
+        self.sync_readbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let buf = self.pool.get(id)?;
         let len = (buf.length() as usize) / 4;
         Some(unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const f32, len) })

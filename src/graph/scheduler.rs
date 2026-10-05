@@ -219,6 +219,35 @@ impl BackendScheduler {
         for split in &splits {
             if let Some(pb) = prev_backend {
                 if pb != split.backend {
+                    // F5 (#137, Metal): a Metal source's staging blit is encoded
+                    // into the **producer split's still-open command buffer**, so
+                    // it is ordered behind that split's kernels in the same
+                    // submission — the repo's "one Metal command buffer per split"
+                    // rule, and a correctness requirement (a separate command
+                    // buffer overlapping the producer changed the kernels'
+                    // results; see the #137 record in
+                    // the F5 S3 record in `docs/ARCHITECTURE-EXECUTION-PLAN.md`).
+                    // Those copies therefore run *before* `retire` submits that
+                    // buffer, but only when the async substrate is active: the
+                    // `MINFER_SYNC_COPIES=1` reference must read the source after
+                    // the producer finished, exactly as it always did. Every other
+                    // copy keeps the post-retire order (CUDA's D2H must not land
+                    // inside an open capture window; a device destination declines
+                    // phase A anyway). The post-retire loop below re-requests every
+                    // input; the pre-run ones are a pending no-op there.
+                    let pre_retire = pb == BackendTag::METAL
+                        && split.backend == BackendTag::CPU
+                        && crate::graph::copystats::async_copies_enabled();
+                    if pre_retire {
+                        for &inp in &split.inputs {
+                            if alloc
+                                .node_buffer(inp)
+                                .map_or(false, |b| b.backend == BackendTag::METAL)
+                            {
+                                alloc.copy_across(graph.uid, inp, split.backend)?;
+                            }
+                        }
+                    }
                     // 1. #138 ([#138]): retire the previous backend's async work
                     //    **without blocking the host** where the backend can order
                     //    it on its own stream. The close itself is not skipped — a
@@ -239,7 +268,9 @@ impl BackendScheduler {
                     //    `cudaMemcpyAsync` plus a recorded event; nothing here
                     //    blocks the host on a copy, and the boundary enqueues every
                     //    input before any of them is waited on, so the copies overlap
-                    //    each other and the consumer's independent work.
+                    //    each other and the consumer's independent work. An input
+                    //    already staged before the retire (the Metal case above) is
+                    //    a pending no-op here.
                     for &inp in &split.inputs {
                         alloc.copy_across(graph.uid, inp, split.backend)?;
                     }

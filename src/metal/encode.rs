@@ -5,7 +5,7 @@
 
 use super::*;
 use block2::RcBlock;
-use objc2_metal::{MTLBlitCommandEncoder, MTLCommandBufferStatus, MTLCommandEncoder};
+use objc2_metal::{MTLBlitCommandEncoder, MTLCommandBufferStatus, MTLCommandEncoder, MTLEvent};
 use std::ffi::c_void;
 
 #[cfg(target_os = "macos")]
@@ -110,5 +110,88 @@ impl MpsCommandBuffer<'_> {
     fn recent_trace(&self) -> String {
         let t = self.state.dispatch_trace.lock().unwrap();
         t.iter().cloned().collect::<Vec<_>>().join(" -> ")
+    }
+
+    /// A retained handle to the underlying `MTLCommandBuffer`, so a caller that
+    /// hands this buffer to async work can read its real `status()` / `error()`
+    /// later. Cheap: it is an Objective-C retain.
+    pub fn command_buffer(&self) -> MetalCommandBuffer {
+        self.cmd_buf.clone()
+    }
+
+    /// F5 (#137): **phase A** of a Metal cross-backend staging copy — encode a
+    /// `MTLBlitCommandEncoder` copy of the source window into the staging buffer
+    /// and record a signal on the shared event, **into this command buffer**.
+    ///
+    /// The blit goes into the **split's own** command buffer (the one
+    /// `MetalBackend::cb` already opened for the producing split), which is the
+    /// repo's "one Metal command buffer per split" rule; it is not a second
+    /// submission. That is also a correctness requirement, not just tidiness:
+    /// the source is a `StorageModeShared` pool buffer the split's kernels may
+    /// still be writing, and a separate command buffer that overlapped them
+    /// changed the kernel results (the M4 Pro measurement recorded in
+    /// the F5 S3 record in `docs/ARCHITECTURE-EXECUTION-PLAN.md`). Encoding the
+    /// blit after `end_compute` puts it behind those kernels in the *same*
+    /// submission, so the copy sees exactly the split's final bytes.
+    ///
+    /// `bytes` is the node's **logical** window (`BufRef::len`), not the pool
+    /// buffer's class-rounded length: the destination staging buffer is allocated
+    /// exactly, so copying the padding would overflow it (and would copy another
+    /// node's recycled bytes). `src_offset` is the view offset (`BufRef::offset`),
+    /// in bytes.
+    ///
+    /// `signal` is `false` only under the `MINFER_TEST_CALL_FAIL=metal_cross_copy`
+    /// injection, which suppresses the signal so that phase B's **bounded** wait
+    /// takes its real timeout branch (see `MetalBackend::cross_take`).
+    ///
+    /// The caller commits (or, when this is a split's buffer, lets `submit`
+    /// commit) and retains the buffer if it wants to read its status.
+    pub fn encode_blit_signal(
+        &mut self,
+        src: &MetalBuffer,
+        src_offset: usize,
+        dst: &MetalBuffer,
+        bytes: usize,
+        event: &MetalSharedEvent,
+        value: u64,
+        signal: bool,
+    ) -> Result<(), String> {
+        if bytes == 0 {
+            return Err("Metal cross-backend staging blit of 0 bytes".to_string());
+        }
+        if src_offset + bytes > src.length() {
+            return Err(format!(
+                "Metal cross-backend staging blit runs past the source buffer: \
+                 offset {src_offset} + {bytes} bytes > {} bytes",
+                src.length()
+            ));
+        }
+        if bytes > dst.length() {
+            return Err(format!(
+                "Metal cross-backend staging blit runs past the staging buffer: \
+                 {bytes} bytes > {} bytes",
+                dst.length()
+            ));
+        }
+        // Close the compute pass first (Metal allows one active encoder). If a
+        // capture blit pass already closed it, this is a no-op.
+        self.end_compute();
+        let blit = self
+            .cmd_buf
+            .blitCommandEncoder()
+            .ok_or("MTLCommandBuffer.blitCommandEncoder returned nil")?;
+        unsafe {
+            blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                src, src_offset, dst, 0, bytes,
+            );
+        }
+        blit.endEncoding();
+        if signal {
+            // `MTLSharedEvent` refines `MTLEvent`; `ProtocolObject::from_ref` is
+            // the objc2 upcast to the super-protocol the command buffer asks for.
+            let as_event = ProtocolObject::<dyn MTLEvent>::from_ref(&**event);
+            self.cmd_buf.encodeSignalEvent_value(as_event, value);
+        }
+        Ok(())
     }
 }

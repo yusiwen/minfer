@@ -43,7 +43,11 @@
 //! | `execute_node` | `graph::scheduler::BackendScheduler::execute` | `Err` before the backend dispatch |
 //! | `register_weight` | `models::weight_reg::register_cuda_weight` | panic in the CUDA weight registrar |
 //! | `metal_device_memory` | `metal::MpsState::device_memory` | `Reported` → `QueryFailed` (the E4/E5 device answer on macOS, [#53]) |
+//! | `metal_cross_copy` | `graph::metal_backend::MetalBackend::cross_enqueue` | suppresses the staging copy's `MTLSharedEvent` signal, so phase B's bounded wait takes its real timeout branch ([#137]) |
 //! | `launch:*` / `attr:*` | `src/cuda/kernels/*.cu` | the **real** CUDA call is made to fail (#147) |
+//!
+//! [#53]: https://github.com/yusiwen/minfer/issues/53
+//! [#137]: https://github.com/yusiwen/minfer/issues/137
 //!
 //! # The observation half
 //!

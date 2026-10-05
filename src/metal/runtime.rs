@@ -341,6 +341,24 @@ impl MpsState {
         }
     }
 
+    /// F5 (#137): a fresh `MTLSharedEvent` for one cross-backend staging copy.
+    ///
+    /// Each copy gets its own event, so the event's value space never has to be
+    /// shared between copies that may be in flight at the same time. `None` means
+    /// the device refused to create one — a loud error at the call site, never a
+    /// silent fallback to the synchronous path.
+    pub fn new_shared_event(&self) -> Option<MetalSharedEvent> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = self;
+            None
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.device.newSharedEvent()
+        }
+    }
+
     /// Register an mmap'd GGUF part for zero-copy weight wrapping. The part
     /// data pointer must be page-aligned (mmap returns page-aligned addresses):
     /// newBufferWithBytesNoCopy requires a page-aligned base (llama

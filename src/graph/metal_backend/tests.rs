@@ -7,6 +7,8 @@ use crate::graph::builder::GraphBuilder;
 use crate::graph::scheduler::BackendScheduler;
 use crate::graph::{Backend as Tag, DType};
 
+mod staging;
+
 fn f32t(name: &str, shape: [i64; 4], data: Vec<f32>) -> crate::tensor::Tensor {
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for x in data {
