@@ -59,7 +59,7 @@ const SHADER_SOURCES: &[&str] = &[
     "src/metal/kernels/qkv_fused.metal",
     "src/metal/kernels/fa_split.metal",
     "src/metal/kernels/fa_decode.metal",
-    "src/metal.metal",
+    "src/metal/kernels/fa_prefill.metal",
 ];
 /// The tree the shader-file guard walks. Every `.metal`/`.h` found under it must
 /// be listed; `.cuh` (CUDA) is deliberately not matched.
