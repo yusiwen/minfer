@@ -580,8 +580,8 @@ with no open split buffer gets a standalone buffer that `cross_enqueue` submits
 itself; the synchronous reference (`MINFER_SYNC_COPIES=1`) keeps the post-retire
 order, because its host read must see the producer's finished output.
 
-Measured on `macbook (macOS 27.0.1, Apple M4 Pro)` — the #137 record in
-the F5 S3 record in `docs/ARCHITECTURE-EXECUTION-PLAN.md`.
+Measured on `macbook (macOS 27.0.1, Apple M4 Pro)` — the F5 S3 record in
+`docs/ARCHITECTURE-EXECUTION-PLAN.md`.
 
 [#137]: https://github.com/yusiwen/minfer/issues/137
 
