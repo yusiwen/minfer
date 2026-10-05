@@ -45,6 +45,7 @@ const KERNELS_DIR: &str = "src/cuda/kernels";
 // failure `check_shader_file_list()` exists to catch (the #263 pattern).
 const SHADER_SOURCES: &[&str] = &[
     "src/metal/kernels/common.h",
+    "src/metal/kernels/dequantize.h",
     "src/metal.metal",
 ];
 /// The tree the shader-file guard walks. Every `.metal`/`.h` found under it must
