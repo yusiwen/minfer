@@ -34,6 +34,73 @@ const KERNEL_SOURCES: &[&str] = &[
 const KERNEL_HEADERS: &[&str] = &["src/cuda/kernels/common.cuh"];
 const KERNELS_DIR: &str = "src/cuda/kernels";
 
+// ─── The Metal shader sources (issue #265) ───────────────────────────────────
+//
+// The pre-#265 `src/metal.metal` is one 5 151-line source; it is being split into
+// `src/metal/kernels/`. This explicit list is the concatenation order — the one
+// source string `build.rs` compiles into `$OUT_DIR/minfer.metallib` and the
+// runtime `newLibraryWithSource` fallback `include_str!`s, so both entry points
+// cover exactly the same shader set by construction. A part present in the
+// directory but absent from the list is never compiled, which is the silent
+// failure `check_shader_file_list()` exists to catch (the #263 pattern).
+const SHADER_SOURCES: &[&str] = &["src/metal.metal"];
+/// The tree the shader-file guard walks. Every `.metal`/`.h` found under it must
+/// be listed; `.cuh` (CUDA) is deliberately not matched.
+const SHADER_ROOT: &str = "src";
+
+/// Every `.metal`/`.h` under `SHADER_ROOT` must appear in `SHADER_SOURCES`, and
+/// every listed file must exist. Runs on every build (all platforms), because the
+/// directory is tracked even where the Metal toolchain is not.
+fn check_shader_file_list() {
+    fn walk(dir: &Path, found: &mut Vec<String>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("metal") | Some("h")
+            ) {
+                found.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    let mut found: Vec<String> = Vec::new();
+    walk(Path::new(SHADER_ROOT), &mut found);
+    found.sort();
+    let mut listed: Vec<String> = SHADER_SOURCES.iter().map(|s| s.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        listed, found,
+        "build.rs SHADER_SOURCES must list every .metal/.h under {SHADER_ROOT} \
+         (a shader absent from the list is never compiled)"
+    );
+    for f in SHADER_SOURCES {
+        assert!(
+            Path::new(f).exists(),
+            "build.rs lists {f}, which does not exist"
+        );
+    }
+}
+
+/// Concatenate the shader parts in list order into one source file in `out_dir`,
+/// and return its path. This is the single source both compile entry points see.
+fn write_combined_shader_source(out_dir: &str) -> String {
+    let mut combined = String::new();
+    for f in SHADER_SOURCES {
+        combined.push_str(
+            &std::fs::read_to_string(f).unwrap_or_else(|e| panic!("read shader part {f}: {e}")),
+        );
+    }
+    let path = format!("{out_dir}/minfer.metal");
+    std::fs::write(&path, combined).unwrap_or_else(|e| panic!("write {path}: {e}"));
+    path
+}
+
 /// Every `.cu`/`.cuh` in `KERNELS_DIR` must be listed, every listed file must
 /// exist, and the `.cu` order must be the directory's sorted order.
 fn check_kernel_file_list() {
@@ -108,12 +175,21 @@ fn main() {
     // apparent divergence was a prompt-mixup in the A/B reference). On any
     // failure (no xcrun / no SDK / compile error) an EMPTY marker file is
     // emitted and src/metal.rs falls back to newLibraryWithSource.
-    println!("cargo:rerun-if-changed=src/metal.metal");
     println!("cargo:rerun-if-changed=build.rs");
+    // One `rerun-if-changed` per shader part: a part edited without triggering a
+    // rebuild leaves a silently stale embedded metallib (#265). The guard runs on
+    // every build, not just macOS, so an unlisted part fails everywhere.
+    for f in SHADER_SOURCES {
+        println!("cargo:rerun-if-changed={f}");
+    }
+    check_shader_file_list();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let air = format!("{out_dir}/minfer.air");
         let metallib = format!("{out_dir}/minfer.metallib");
+        // The one source string: concatenate the parts in SHADER_SOURCES order.
+        // `src/metal.rs` compiles the same generated file in its runtime fallback.
+        let shader_src = write_combined_shader_source(&out_dir);
 
         // Capture stderr so a failed compile prints the REAL compiler error —
         // previously the failure was swallowed and only a bare "compile
@@ -145,7 +221,7 @@ fn main() {
                 // only accepts the `=` form of -fmodules-cache-path)
                 &format!("-fmodules-cache-path={out_dir}"),
                 "-c",
-                "src/metal.metal",
+                shader_src.as_str(),
                 "-o",
             ])
             .arg(&air)

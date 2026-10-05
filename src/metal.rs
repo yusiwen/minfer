@@ -1996,11 +1996,15 @@ extern "C" {
 
 // ─── MpsState (global singleton) ─────────────────────────────────────
 
-/// Compile metal.metal from source at runtime (fallback when the build-time
-/// metallib is unavailable — see try_new). ~0.3-1 s per process start.
+/// Compile the shader source at runtime (fallback when the build-time metallib is
+/// unavailable — see try_new). ~0.3-1 s per process start.
+///
+/// The source is the SAME concatenation `build.rs` compiles into the metallib:
+/// build.rs writes `$OUT_DIR/minfer.metal` from its `SHADER_SOURCES` list (#265),
+/// so the two compile entry points cannot drift apart.
 #[cfg(target_os = "macos")]
 fn compile_metal_source(device: &MetalDevice) -> Option<MetalLibrary> {
-    let src = include_str!("metal.metal");
+    let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     match device.newLibraryWithSource_options_error(&*NSString::from_str(src), None) {
         Ok(l) => Some(l),
         Err(e) => {
