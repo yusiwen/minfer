@@ -92,8 +92,8 @@ buffer (`docs/BACKEND-REGISTRY-DESIGN.md` §11.2/§11.5). The consumer's wait:
 - **stays inside the split's command buffer** — the blit is encoded into the
   producer's open buffer *before* `retire` submits it. A separate boundary
   command buffer overlapped the producer and changed the kernels' results
-  (measured on `macbook (macOS 27.0.1, Apple M4 Pro)`); the #137 record in
-  the F5 S3 record in `docs/ARCHITECTURE-EXECUTION-PLAN.md` carries it.
+  (measured on `macbook (macOS 27.0.1, Apple M4 Pro)`); the F5 S3 record in
+  `docs/ARCHITECTURE-EXECUTION-PLAN.md` carries it.
 
 ## 3. Audit findings (2026-08-02) — status
 

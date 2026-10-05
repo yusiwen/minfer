@@ -129,7 +129,7 @@ impl MpsCommandBuffer<'_> {
     /// submission. That is also a correctness requirement, not just tidiness:
     /// the source is a `StorageModeShared` pool buffer the split's kernels may
     /// still be writing, and a separate command buffer that overlapped them
-    /// changed the kernel results (the M4 Pro measurement recorded in
+    /// changed the kernel results (the M4 Pro measurement is in
     /// the F5 S3 record in `docs/ARCHITECTURE-EXECUTION-PLAN.md`). Encoding the
     /// blit after `end_compute` puts it behind those kernels in the *same*
     /// submission, so the copy sees exactly the split's final bytes.

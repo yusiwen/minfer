@@ -225,8 +225,8 @@ impl BackendScheduler {
                     // submission — the repo's "one Metal command buffer per split"
                     // rule, and a correctness requirement (a separate command
                     // buffer overlapping the producer changed the kernels'
-                    // results; see the #137 record in
-                    // the F5 S3 record in `docs/ARCHITECTURE-EXECUTION-PLAN.md`).
+                    // results; see the F5 S3 record in
+                    // `docs/ARCHITECTURE-EXECUTION-PLAN.md`).
                     // Those copies therefore run *before* `retire` submits that
                     // buffer, but only when the async substrate is active: the
                     // `MINFER_SYNC_COPIES=1` reference must read the source after
