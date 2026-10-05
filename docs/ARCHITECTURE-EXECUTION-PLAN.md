@@ -10220,13 +10220,13 @@ concatenation order is not). **Three corrections against plan §4 Step 4's table
 includes the warm-up kernel (2 340–2 523); `rope.metal` is 37 lines because `kernel_rope_f32` sits after
 the P1 parallel-attention section. The tree wins; the plan's table is corrected in place.
 
-**Increment 3 — the Rust split, 0 visibility edits.** `src/metal.rs` 2 480 → **453** lines; the type
+**Increment 3 — the Rust split, 0 visibility edits.** `src/metal.rs` 2 480 → **451** lines; the type
 definitions (`MpsState`, `MpsStateInner`, `MpsCommandBuffer`), the objc2 aliases, the free items and the
 private dispatch primitives (`trace_op`/`set_params`/`barrier`/`dispatch_1d`/`dispatch_2d`/`dispatch_3d`/
 `gemm_enabled`/`gemm_dispatch`, plus the test-only `matmul_on_gpu_buf` and `get_or_grow`) stay in the
 parent, so the four children reach private fields and methods with **no `pub(super)`** — the same shape
-that kept `CudaState` in `src/cuda.rs`. `metal/ops.rs` 1 431 · `metal/runtime.rs` 476 ·
-`metal/encode.rs` 116 · `metal/policy.rs` 66 (re-exported through `pub use policy::{…}` so
+that kept `CudaState` in `src/cuda.rs`. `metal/ops.rs` 1 428 · `metal/runtime.rs` 475 ·
+`metal/encode.rs` 114 · `metal/policy.rs` 66 (re-exported through `pub use policy::{…}` so
 `crate::metal::kv_cache_is_f16` etc. still resolve). Two findings from doing it: `get_or_grow` is **not**
 internal to `impl MpsState` as the #255 note said — `ops.rs` calls it four times, so it moved to the
 parent; and `matmul_on_gpu_buf` had to stay in the parent (or move to `tests.rs`) because a private
