@@ -45,7 +45,7 @@ fn metal_elementwise_matches_cpu() {
     // Metal run (assign all to Metal)
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -119,7 +119,7 @@ fn metal_rmsnorm_matches_cpu() {
     let mut sched = BackendScheduler::new();
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -161,7 +161,7 @@ fn metal_cross_backend_copy() {
     // only silu on Metal -> its input (CPU) and output (CPU consumer) cross backends
     let mut g2 = g.clone();
     g2.nodes[0].backend = Some(Tag::CPU);
-    g2.nodes[1].backend = Some(Tag::Metal);
+    g2.nodes[1].backend = Some(Tag::METAL);
     g2.nodes[2].backend = Some(Tag::CPU);
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -263,7 +263,7 @@ fn metal_matmul_q8_matches_cpu() {
     let mut sched = BackendScheduler::new();
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -338,7 +338,7 @@ fn metal_rmsnorm_real_scale() {
 
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -384,7 +384,7 @@ fn metal_cross_backend_copy_large() {
 
     let mut g2 = g.clone();
     g2.nodes[0].backend = Some(Tag::CPU);
-    g2.nodes[1].backend = Some(Tag::Metal);
+    g2.nodes[1].backend = Some(Tag::METAL);
     g2.nodes[2].backend = Some(Tag::CPU);
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -464,7 +464,7 @@ fn metal_embed_then_rmsnorm_cross_backend() {
     let mut g2 = g.clone();
     g2.nodes[0].backend = Some(Tag::CPU);
     g2.nodes[1].backend = Some(Tag::CPU);
-    g2.nodes[2].backend = Some(Tag::Metal);
+    g2.nodes[2].backend = Some(Tag::METAL);
     let mut alloc = GraphAllocator::new();
     alloc.register_weight("embq8", emb);
     alloc.register_weight("nwE", nw2);
@@ -528,11 +528,11 @@ fn metal_multi_split_alternation() {
     let mut g2 = g.clone();
     // 0 CPU, 1 Metal, 2 CPU, 3 Metal, 4 CPU, 5 Metal
     g2.nodes[0].backend = Some(Tag::CPU);
-    g2.nodes[1].backend = Some(Tag::Metal);
+    g2.nodes[1].backend = Some(Tag::METAL);
     g2.nodes[2].backend = Some(Tag::CPU);
-    g2.nodes[3].backend = Some(Tag::Metal);
+    g2.nodes[3].backend = Some(Tag::METAL);
     g2.nodes[4].backend = Some(Tag::CPU);
-    g2.nodes[5].backend = Some(Tag::Metal);
+    g2.nodes[5].backend = Some(Tag::METAL);
     let mut alloc = GraphAllocator::new();
     alloc.register_weight("nwM", nw2);
     alloc.enable_metal();
@@ -604,7 +604,7 @@ fn metal_attn_kv_matches_cpu() {
 
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -709,7 +709,7 @@ fn metal_matmul_q4_matches_reference() {
     let mut sched = BackendScheduler::new();
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -786,7 +786,7 @@ fn metal_attn_kv_real_scale() {
 
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -871,7 +871,7 @@ fn metal_attn_decode_step() {
 
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -946,7 +946,7 @@ fn metal_store_after_gpu_op() {
     let expect = ca.get_buffer(&g, o).unwrap().to_vec();
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
@@ -1022,7 +1022,7 @@ fn metal_store_real_dims() {
     let expect = ca.get_buffer(&g, o).unwrap().to_vec();
     let mut g2 = g.clone();
     for n in &mut g2.nodes {
-        n.backend = Some(Tag::Metal);
+        n.backend = Some(Tag::METAL);
     }
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();

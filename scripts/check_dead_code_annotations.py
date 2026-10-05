@@ -142,8 +142,10 @@ REASON_MARKERS = (
 #: item says what would construct or read it. Tighten one and its entry here must
 #: go — a stale entry is a failure (the ratchet only turns one way).
 #:
-#: `src/metal.rs` is macOS-only and cannot be compiled on Linux; both sites are
-#: [#255]'s, and the reason on the item names the test that consumes it.
+#: The two former `src/metal.rs` entries were judged on a Mac by
+#: [#255]: `matmul_on_gpu_buf` is `#[cfg(test)]` (its only readers are
+#: `src/metal/tests.rs`) and the `impl MpsState` blanket was deleted (the macOS
+#: non-test oracle reports no dead member).
 GRANDFATHERED_BARE = {
     "src/convert.rs:order",
     "src/cuda/ffi_runtime.rs:cudaStreamWaitEvent",
@@ -152,8 +154,6 @@ GRANDFATHERED_BARE = {
     "src/device_tier.rs:Mthreads",
     "src/device_tier.rs:Apple",
     "src/graph/ops.rs:Mha",
-    "src/metal.rs:matmul_on_gpu_buf",
-    "src/metal.rs:MpsState",
     "src/tokenizer.rs:id_to_score",
     "src/tokenizer.rs:id_to_type",
 }
