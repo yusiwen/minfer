@@ -67,7 +67,7 @@ fn cpu_q4_0_mm(weights: &[u8], acts: &[f32], od: usize, id: usize, nt: usize) ->
 #[test]
 fn gemm_isolation() {
     let device = MTLCreateSystemDefaultDevice().expect("no metal device");
-    let src = include_str!("../src/metal.metal");
+    let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     let lib = device
         .newLibraryWithSource_options_error(&*NSString::from_str(src), None)
         .unwrap_or_else(|e| panic!("shader compile: {e}"));
@@ -367,7 +367,7 @@ fn dq_q5_k(blk: &[u8], e: usize) -> f32 {
 #[test]
 fn non_q4_0_gemm_isolation() {
     let device = MTLCreateSystemDefaultDevice().expect("no metal device");
-    let src = include_str!("../src/metal.metal");
+    let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     let lib = device
         .newLibraryWithSource_options_error(&*NSString::from_str(src), None)
         .unwrap_or_else(|e| panic!("shader compile: {e}"));
@@ -559,7 +559,7 @@ fn non_q4_0_gemm_isolation() {
 #[test]
 fn get_rows_q4_k_isolation() {
     let device = MTLCreateSystemDefaultDevice().expect("no metal device");
-    let src = include_str!("../src/metal.metal");
+    let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     let lib = device
         .newLibraryWithSource_options_error(&*NSString::from_str(src), None)
         .unwrap_or_else(|e| panic!("shader compile: {e}"));
@@ -709,7 +709,7 @@ fn get_rows_q4_k_isolation() {
 #[test]
 fn get_rows_multi_type_isolation() {
     let device = MTLCreateSystemDefaultDevice().expect("no metal device");
-    let src = include_str!("../src/metal.metal");
+    let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     let lib = device
         .newLibraryWithSource_options_error(&*NSString::from_str(src), None)
         .unwrap_or_else(|e| panic!("shader compile: {e}"));

@@ -90,7 +90,7 @@ fn cpu_attn(
 #[test]
 fn gqa_attn_isolation() {
     let device = MTLCreateSystemDefaultDevice().expect("no metal device");
-    let src = include_str!("../src/metal.metal");
+    let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     let lib = device
         .newLibraryWithSource_options_error(&*NSString::from_str(src), None)
         .unwrap_or_else(|e| panic!("shader compile: {e}"));
@@ -299,7 +299,7 @@ fn gqa_attn_isolation() {
 #[test]
 fn gqa_attn_split_isolation() {
     let device = MTLCreateSystemDefaultDevice().expect("no metal device");
-    let src = include_str!("../src/metal.metal");
+    let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     let lib = device
         .newLibraryWithSource_options_error(&*NSString::from_str(src), None)
         .unwrap_or_else(|e| panic!("shader compile: {e}"));
@@ -581,7 +581,7 @@ fn gqa_attn_split_isolation() {
 #[test]
 fn gqa_attn_split_timing() {
     let device = MTLCreateSystemDefaultDevice().expect("no metal device");
-    let src = include_str!("../src/metal.metal");
+    let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     let lib = device
         .newLibraryWithSource_options_error(&*NSString::from_str(src), None)
         .unwrap_or_else(|e| panic!("shader: {e}"));

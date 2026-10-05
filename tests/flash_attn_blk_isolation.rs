@@ -198,7 +198,7 @@ struct Ctx {
 impl Ctx {
     fn new() -> Self {
         let device = MTLCreateSystemDefaultDevice().expect("no metal device");
-        let src = include_str!("../src/metal.metal");
+        let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
         let lib = device
             .newLibraryWithSource_options_error(&*NSString::from_str(src), None)
             .unwrap_or_else(|e| panic!("shader compile: {e}"));
