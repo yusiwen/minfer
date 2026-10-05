@@ -54,6 +54,7 @@ const SHADER_SOURCES: &[&str] = &[
     "src/metal/kernels/get_rows.metal",
     "src/metal/kernels/norm_elementwise.metal",
     "src/metal/kernels/rope.metal",
+    "src/metal/kernels/fa_parallel.metal",
     "src/metal.metal",
 ];
 /// The tree the shader-file guard walks. Every `.metal`/`.h` found under it must
