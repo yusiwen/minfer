@@ -2446,9 +2446,9 @@ impl GraphAllocator {
                 return Ok(());
             }
         }
-        // The synchronous host round trip: the pre-F5 path, the metal path until
-        // it is ported, and the `MINFER_SYNC_COPIES=1` reference side of the
-        // bitwise A/B.
+        // The synchronous host round trip: the pre-F5 path, a backend whose
+        // phase-A hook declined a direction it does not implement, and the
+        // `MINFER_SYNC_COPIES=1` reference side of the bitwise A/B.
         self.copy_across_blocking(node_id, dst)
     }
 
@@ -2604,8 +2604,10 @@ impl GraphAllocator {
     /// F5: the counters are mutated by the boundary and by the registry hooks;
     /// this is the hook-facing accessor.
     ///
-    /// Only the CUDA hooks mutate them today; #137's Metal port widens this cfg.
-    #[cfg(feature = "cuda")]
+    /// The CUDA hooks and, since #137, the Metal hooks mutate them; a build with
+    /// neither device has no hook to mutate them, so the accessor compiles out
+    /// there.
+    #[cfg(any(feature = "cuda", target_os = "macos"))]
     pub fn cross_stats_mut(&mut self) -> &mut CrossCopyStats {
         &mut self.cross_stats
     }
@@ -2697,9 +2699,9 @@ impl GraphAllocator {
     /// **Raw accessor**: it does not check the phase-B contract (F5) — use
     /// [`Self::cross_input`] on the consumer path.
     ///
-    /// The CUDA staging hooks are its only production readers today; the CPU
-    /// tests read it, and #137's Metal port widens this cfg.
-    #[cfg(any(feature = "cuda", test))]
+    /// The CUDA and (since #137) Metal staging hooks are its production readers;
+    /// the CPU tests read it.
+    #[cfg(any(feature = "cuda", target_os = "macos", test))]
     pub fn cross_buffer(&self, uid: u64, node_id: NodeId, backend: Backend) -> Option<BufRef> {
         self.cross.get(&(uid, node_id, backend)).copied()
     }

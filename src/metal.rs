@@ -14,7 +14,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 #[cfg(target_os = "macos")]
 use objc2_metal::{
     MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSharedEvent, MTLSize,
 };
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -28,6 +28,13 @@ pub type MetalDevice = Retained<ProtocolObject<dyn MTLDevice>>;
 pub type MetalCommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 #[cfg(target_os = "macos")]
 pub type MetalCommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+/// F5 (#137): the synchronization primitive of the cross-backend staging copy.
+/// `MTLSharedEvent` is chosen over a completion handler because it is the only
+/// Metal event that supports a **device-side** wait (`encodeWaitForEvent`), and
+/// it also supports a bounded **host** wait (`waitUntilSignaledValue`). See
+/// `docs/BACKEND-REGISTRY-DESIGN.md` §11.2.
+#[cfg(target_os = "macos")]
+pub type MetalSharedEvent = Retained<ProtocolObject<dyn MTLSharedEvent>>;
 #[cfg(target_os = "macos")]
 pub type MetalComputeCommandEncoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 #[cfg(target_os = "macos")]

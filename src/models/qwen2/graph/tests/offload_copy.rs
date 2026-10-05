@@ -487,6 +487,214 @@ fn async_cross_copies_never_block_and_stay_bitwise_identical() {
         a.blocking_host_copies
     );
 }
+/// F5 ([#58]) + #138 ([#138]) acceptance on the real model, **Metal source** —
+/// the port of [#137] ([#137]): a split graph's cross-backend staging copies out
+/// of Metal are asynchronous (a `MTLBlitCommandEncoder` copy into a shared
+/// staging buffer plus an `MTLSharedEvent` signal), every staged input owes
+/// exactly one event wait — issued since #138 at the consumer's first use rather
+/// than at the split boundary — and the results are **bitwise identical** to the
+/// synchronous reference over a repeated loop.
+///
+/// This is the same comparison the CUDA gate
+/// (`async_cross_copies_never_block_and_stay_bitwise_identical`) makes, with the
+/// two Metal-specific differences the port forces:
+///
+/// - the **device-level evidence** is `MetalBackend::sync_readback_count()`:
+///   Metal's `MTLBuffer`s are `StorageModeShared` and there is no blocking
+///   `cudaMemcpy` API to count, so the counter counts the host read of a pool
+///   buffer (`Backend::read_host`), which is exactly what the synchronous
+///   boundary path does. The async path publishes its own staging bytes and
+///   never moves it.
+/// - there is no CUDA-style `stream_sync_count` to compare: Metal has no
+///   separate stream-sync counter, so the "no host stall" claim rests on the
+///   readback counter and on `blocking_host_copies == 0`.
+///
+/// Ignored because it needs the cached 0.5B and a Metal device. Run alone:
+///
+/// ```text
+/// cargo test --release --bin minfer async_cross_copies_never_block_and_stay_bitwise_identical_on_metal -- --ignored --test-threads=1
+/// ```
+///
+/// [#137]: https://github.com/yusiwen/minfer/issues/137
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the cached 0.5B model and a Metal device"]
+fn async_cross_copies_never_block_and_stay_bitwise_identical_on_metal() {
+    use crate::graph::cache::GraphCache;
+    use crate::graph::copystats::{self, CrossCopyStats};
+    use crate::graph::offload::OffloadRequest;
+    use crate::models::{Device, ModelDef};
+
+    let _g = crate::metal::metal_test_lock();
+    // The Metal device must be up **before** the load, or the loader decides the
+    // weights are not usable there and answers `Device::Cpu`.
+    crate::metal::MpsState::init();
+    let Some(path) = cached_model_path() else {
+        eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the Metal F5 async-copy gate");
+        return;
+    };
+    let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+    let n_layers = crate::models::qwen2::loader::hparams_from_gguf(&gguf.parts[0].ctx)
+        .expect("hparams")
+        .n_layer as usize;
+    // A prefix of blocks on the device: the graph then alternates CPU → Metal →
+    // CPU, so both copy directions are exercised. The `f5metal.` registry
+    // namespace keeps this load's Metal weights out of the way of the other
+    // real-model gates that run concurrently in the parallel ignored-set harness
+    // (`MpsState`'s weight table is process-global and name-keyed, so two engines
+    // loaded without a namespace overwrite each other).
+    let k = 4.min(n_layers);
+    let model = crate::models::qwen2::loader::load(&gguf, "f5metal.", OffloadRequest::Layers(k))
+        .expect("load the mixed model");
+    if model.device() != Device::Metal {
+        eprintln!(
+            "no Metal participation (device {:?}); skipping",
+            model.device()
+        );
+        return;
+    }
+
+    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let ids = tok.encode("The capital of France is");
+    let n = ids.len();
+    let n_ctx = 256;
+    let steps = 6;
+    // The mode override is process-wide; hold the gate for the whole comparison
+    // so no other test flips it mid-measurement.
+    let gate = copystats::gate();
+    let run = |sync: bool| -> (Vec<Vec<f32>>, CrossCopyStats, u64) {
+        let _mode = copystats::set_sync_for_test(sync);
+        let mut cache = GraphCache::new();
+        cache.alloc().kv_set_capacity(n_ctx);
+        assert!(
+            cache.alloc().enable_metal(),
+            "a Metal device is participating"
+        );
+        let before = cache.alloc().cross_stats();
+        let readbacks_before = cache
+            .alloc()
+            .metal()
+            .expect("the Metal pool is enabled")
+            .sync_readback_count();
+
+        let mut l =
+            model.forward_graph_cached(&ids, &(0..n).collect::<Vec<_>>(), 1, n_ctx, &mut cache);
+        let mut out = vec![l.clone()];
+        let mut next = argmax(&l);
+        for s in 0..steps {
+            l = model.forward_graph_cached(&[next], &[n + s], 1, n_ctx, &mut cache);
+            out.push(l.clone());
+            next = argmax(&l);
+        }
+
+        let stats = cache.alloc().cross_stats().delta(before);
+        let readbacks = cache
+            .alloc()
+            .metal()
+            .expect("the Metal pool is enabled")
+            .sync_readback_count()
+            - readbacks_before;
+        (out, stats, readbacks)
+    };
+
+    let (async_logits, a, a_readbacks) = run(false);
+    let (sync_logits, s, s_readbacks) = run(true);
+    drop(gate);
+
+    eprintln!(
+        "[f5-metal] async: copies={} waits={} deferred_waits={} blocking_host_copies={} \
+         async_host_copies={} event_syncs={} stream_waits={} sync_readbacks={}",
+        a.copies,
+        a.waits,
+        a.deferred_waits,
+        a.blocking_host_copies,
+        a.async_host_copies,
+        a.event_syncs,
+        a.stream_waits,
+        a_readbacks
+    );
+    eprintln!(
+        "[f5-metal] sync : copies={} waits={} blocking_host_copies={} async_host_copies={} \
+         sync_readbacks={}",
+        s.copies, s.waits, s.blocking_host_copies, s.async_host_copies, s_readbacks
+    );
+
+    // The workload really does cross a backend boundary.
+    assert!(
+        a.copies > 0,
+        "the mixed offload graph must stage at least one cross-backend copy (got {})",
+        a.copies
+    );
+
+    // ── the missing-wait gate ────────────────────────────────────────────
+    assert!(
+        a.all_copies_awaited(),
+        "every staged input must be waited on: {} copies, {} waits",
+        a.copies,
+        a.waits
+    );
+    assert_eq!(
+        s.copies, s.waits,
+        "the synchronous reference issues the same one-wait-per-copy contract"
+    );
+    // ── the deferred-wait half (#138) ────────────────────────────────────
+    assert!(
+        a.deferred_waits >= a.async_host_copies,
+        "the host consumer's reads must be what issues the device→host waits: \
+         {} deferred vs {} async device→host copies",
+        a.deferred_waits,
+        a.async_host_copies
+    );
+
+    // ── the no-blocking-copy-on-the-hot-path gate ────────────────────────
+    assert_eq!(
+        a.blocking_host_copies, 0,
+        "the async boundary must issue no blocking device→host copy (got {})",
+        a.blocking_host_copies
+    );
+    assert!(
+        a.async_host_copies > 0,
+        "the Metal→host direction must have taken the async path"
+    );
+    assert_eq!(
+        a.event_syncs, a.async_host_copies,
+        "each async device→host copy owes exactly one event wait"
+    );
+    assert_eq!(
+        a_readbacks, 0,
+        "the async path must not read a Metal pool buffer back to the host (got {a_readbacks})"
+    );
+    assert!(
+        s.blocking_host_copies > 0,
+        "the synchronous reference must block on its Metal→host copies — this is the \
+         'before' number (got 0 of {} copies)",
+        s.copies
+    );
+    assert!(s.blocking_host_copies <= s.copies);
+    assert_eq!(s.async_host_copies, 0);
+    assert!(
+        s_readbacks > 0,
+        "the device-level counter must see the synchronous path's readbacks"
+    );
+
+    // ── bitwise equality over the repeated loop ──────────────────────────
+    assert_eq!(async_logits.len(), sync_logits.len());
+    let mut worst = 0.0f32;
+    for (i, (x, y)) in async_logits.iter().zip(&sync_logits).enumerate() {
+        let d = max_delta(x, y);
+        worst = worst.max(d);
+        assert_eq!(
+            d, 0.0,
+            "step {i}: the async Metal staging copies must be bitwise identical to the \
+             synchronous reference (max |Δlogit| = {d})"
+        );
+    }
+    eprintln!(
+        "[f5-metal] {steps} decode steps + 1 prefill over {k}/{n_layers} Metal blocks: \
+         max |Δlogit| = {worst}; blocking host copies {} -> {}, device readbacks {} -> {}",
+        s.blocking_host_copies, a.blocking_host_copies, s_readbacks, a_readbacks
+    );
+}
 /// E5 S2's acceptance on the real model: **`auto` picks the block count from the budget**.
 ///
 /// The gate pins a small budget with `OffloadRequest::AutoWithBudget(64)` so the fit is a
