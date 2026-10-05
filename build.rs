@@ -43,7 +43,10 @@ const KERNELS_DIR: &str = "src/cuda/kernels";
 // cover exactly the same shader set by construction. A part present in the
 // directory but absent from the list is never compiled, which is the silent
 // failure `check_shader_file_list()` exists to catch (the #263 pattern).
-const SHADER_SOURCES: &[&str] = &["src/metal.metal"];
+const SHADER_SOURCES: &[&str] = &[
+    "src/metal/kernels/common.h",
+    "src/metal.metal",
+];
 /// The tree the shader-file guard walks. Every `.metal`/`.h` found under it must
 /// be listed; `.cuh` (CUDA) is deliberately not matched.
 const SHADER_ROOT: &str = "src";
