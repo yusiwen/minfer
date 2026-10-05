@@ -50,6 +50,7 @@ const SHADER_SOURCES: &[&str] = &[
     "src/metal/kernels/mul_f32act_q4q5.metal",
     "src/metal/kernels/mul_f32act_kquant.metal",
     "src/metal/kernels/mul_mm.metal",
+    "src/metal/kernels/mul_mm_kq.metal",
     "src/metal.metal",
 ];
 /// The tree the shader-file guard walks. Every `.metal`/`.h` found under it must
