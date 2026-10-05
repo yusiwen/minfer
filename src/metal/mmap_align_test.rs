@@ -1,8 +1,9 @@
 //! `#[cfg(test)] mod mmap_align_test` for `src/metal.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
+use objc2_foundation::NSString;
 #[cfg(target_os = "macos")]
-use objc2_metal::{MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize};
+use objc2_metal::{MTLCommandEncoder, MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 #[test]
