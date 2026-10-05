@@ -408,6 +408,63 @@ fn a_rebuild_does_not_touch_the_device_pool() {
         .collect();
     assert_eq!(same, mapping, "and onto the same slots");
 }
+
+/// [#53]: E4's accounting on Metal is the same surface as on every other backend —
+/// `memory_report(METAL)` carries the device's own **bounded** budget and a headroom,
+/// and a graph that cannot fit is refused **before the Metal pool is touched**.
+///
+/// macOS-only: enabling the Metal pool needs a live MPS device, and CI has none.
+///
+/// [#53]: https://github.com/yusiwen/minfer/issues/53
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_memory_report_carries_the_device_budget() {
+    // The process-wide Metal lock keeps the injection half of the Metal gate
+    // (`metal::tests::a_forced_device_memory_query_failure_is_not_zero`) from flipping
+    // this test's device answer while it runs.
+    let _g = crate::metal::metal_test_lock();
+    crate::metal::MpsState::init();
+    if crate::metal::MpsState::get().is_none() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let mut alloc = GraphAllocator::new();
+    assert!(alloc.enable_metal(), "the Metal pool must enable on a Mac");
+    let report = alloc.memory_report(Backend::METAL);
+    let budget = report.budget.expect("Metal must now answer a budget");
+    assert!(budget > 0, "{report:?}");
+    assert!(report.budget_is_bounded(), "{report:?}");
+    assert_eq!(
+        report.headroom_bytes(),
+        Some(budget),
+        "an empty pool is all headroom"
+    );
+    // The budget is the device's own three-quarter default, not a literal: the oracle
+    // is the API answer the report is built from.
+    match crate::models::device_memory() {
+        crate::graph::allocplan::DeviceMemory::Reported { free, .. } => {
+            assert_eq!(budget, free / 4 * 3)
+        }
+        other => panic!("Metal must answer Reported, got {other:?}"),
+    }
+
+    // An explicit budget one byte short of the 4 KiB activation is refused with the
+    // numbers, and the pool is untouched (the gate runs before the backend call).
+    let mut b = GraphBuilder::new();
+    let x = b.input("x", [1024, 1, 1, 1], crate::graph::DType::F32);
+    let y = b.silu(x);
+    b.output(y);
+    let mut g = b.build();
+    // The Metal pool is what this half is about: every node on Metal.
+    for n in g.nodes.iter_mut() {
+        n.backend = Some(Backend::METAL);
+    }
+    alloc.set_memory_budget(Backend::METAL, Some(4095));
+    let err = alloc.alloc_graph(&g).unwrap_err();
+    assert!(err.contains("out of Metal memory"), "{err}");
+    assert!(err.contains("budget") && err.contains("MiB"), "{err}");
+    assert_eq!(alloc.memory_report(Backend::METAL).pool_bytes, 0);
+}
 /// The tiny f32 tensor the accounting tests register (`Tensor` carries raw bytes).
 fn tensor_f32(name: &str, shape: [i64; 4], data: Vec<f32>) -> crate::tensor::Tensor {
     let mut bytes = Vec::with_capacity(data.len() * 4);

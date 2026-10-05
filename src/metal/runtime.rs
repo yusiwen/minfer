@@ -472,4 +472,54 @@ impl MpsState {
             }
         }
     }
+
+    /// E4/E5 ([#53](https://github.com/yusiwen/minfer/issues/53)): this device's own
+    /// memory answer, with the query's outcome explicit — the Metal half of the
+    /// three-way [`crate::graph::allocplan::DeviceMemory`] CUDA answers with.
+    ///
+    /// Metal has no `cudaMemGetInfo` equivalent: `recommendedMaxWorkingSetSize` is the
+    /// OS's own ceiling for what this process may hold on the device, which is the
+    /// API-level analogue of CUDA's *free* read and the number llama.cpp's Metal backend
+    /// plans against. It is answered as `Reported { free, total }`, `total` mirroring
+    /// `free` because Apple Silicon's unified-memory `MTLDevice` exposes no separate
+    /// total — so the **pure** `budget_decision` holds back the same quarter it does for
+    /// CUDA and E5's `weight_budget` consumes one number on both backends.
+    ///
+    /// A `recommendedMaxWorkingSetSize` of `0` is "this device gave no figure", **not** a
+    /// measured "0 bytes free": answering `Reported { free: 0 }` would make the E4 gate
+    /// refuse every later allocation while blaming a budget nobody measured ([#122]). It
+    /// is `QueryFailed`, exactly like a failed `cudaMemGetInfo`; `code` is `0` because
+    /// Metal has no numeric error here, and `name` carries the real reason. The
+    /// `MINFER_TEST_CALL_FAIL=metal_device_memory` seam forces the same outcome for the
+    /// gate's mutation check and is off in every default run.
+    pub fn device_memory(&self) -> crate::graph::allocplan::DeviceMemory {
+        use crate::graph::allocplan::DeviceMemory;
+        if let Err(reason) = crate::testfail::guard("metal_device_memory") {
+            return DeviceMemory::QueryFailed {
+                code: 0,
+                name: reason,
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = self;
+            DeviceMemory::NoDevice
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let recommended = self.inner.device.recommendedMaxWorkingSetSize();
+            if recommended == 0 {
+                return DeviceMemory::QueryFailed {
+                    code: 0,
+                    name: "MTLDevice.recommendedMaxWorkingSetSize returned 0 (the device \
+                           reports no working-set size)"
+                        .to_string(),
+                };
+            }
+            DeviceMemory::Reported {
+                free: recommended as usize,
+                total: recommended as usize,
+            }
+        }
+    }
 }

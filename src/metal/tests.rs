@@ -24,6 +24,75 @@ fn metal_pipelines_compile() {
     );
 }
 
+/// [#53] / [#122]: Metal answers the E4/E5 device-memory question through the same
+/// three-way `DeviceMemory` CUDA does, and its value is the device's own
+/// `recommendedMaxWorkingSetSize` — not a hardcoded or guessed number.
+///
+/// The oracle is the API call itself: the gate asserts the reported `free`/`total`
+/// are what the device says, so a mutation that returned a literal (or swapped the
+/// two) is red.
+///
+/// [#53]: https://github.com/yusiwen/minfer/issues/53
+/// [#122]: https://github.com/yusiwen/minfer/issues/122
+#[test]
+fn device_memory_reports_the_recommended_working_set() {
+    use crate::graph::allocplan::DeviceMemory;
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let mps = MpsState::get().expect("MPS must be active on a Mac");
+    let expected = mps.inner.device.recommendedMaxWorkingSetSize() as usize;
+    match mps.device_memory() {
+        DeviceMemory::Reported { free, total } => {
+            assert!(expected > 0, "a real Mac reports a non-zero working set");
+            assert_eq!(free, expected, "`free` must be the device's own number");
+            assert_eq!(
+                total, expected,
+                "`total` mirrors `free` (no separate total)"
+            );
+        }
+        other => panic!("expected Reported, got {other:?}"),
+    }
+}
+
+/// The failure half ([#122]): a forced query failure is `QueryFailed`, **not**
+/// `Reported { free: 0 }`. The pure `budget_decision` then keeps the backend usable
+/// (weights-only accounting, unbounded) with the real reason named once, and E5's
+/// `auto` refuses with that reason instead of planning 0 device blocks.
+///
+/// Mutation: without the `testfail::guard` chokepoint the outcome is `Reported`, so
+/// this gate is red whenever the failure channel is dropped.
+///
+/// [#122]: https://github.com/yusiwen/minfer/issues/122
+#[test]
+fn a_forced_device_memory_query_failure_is_not_zero() {
+    use crate::graph::allocplan::{budget_decision, DeviceMemory};
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let mps = MpsState::get().expect("MPS must be active on a Mac");
+    let _arm = crate::testfail::InjectionGuard::arm("metal_device_memory");
+    let mem = mps.device_memory();
+    let name = match &mem {
+        DeviceMemory::QueryFailed { name, .. } => name.clone(),
+        other => panic!("a forced failure must be QueryFailed, got {other:?}"),
+    };
+    assert!(
+        name.contains("metal_device_memory"),
+        "the reason must name the real site: {name}"
+    );
+    // #122's rule: a failed query is unbounded weights-only accounting, not a 0 budget.
+    let decision = budget_decision(None, &mem);
+    assert_eq!(decision.budget, Some(usize::MAX));
+    let note = decision.note.expect("a failed query must carry its reason");
+    assert!(note.contains("metal_device_memory"), "{note}");
+    // E5's `auto` refuses with the real reason; an explicit cap still plans.
+    let err = crate::graph::offload::weight_budget(&mem, None).unwrap_err();
+    assert!(err.contains("metal_device_memory"), "{err}");
+    assert_eq!(
+        crate::graph::offload::weight_budget(&mem, Some("64")).unwrap(),
+        64 << 20
+    );
+}
+
 /// Batched-cb bandwidth profile of each nt==1 matmul kernel (decode path).
 /// Dispatches the SAME matmul N times in one command buffer (per the
 /// 2026-08-03 methodology: a single dispatch is dominated by the ~165 µs

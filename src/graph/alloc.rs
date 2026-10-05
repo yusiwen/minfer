@@ -43,7 +43,7 @@ pub struct MemoryReport {
 
 impl MemoryReport {
     /// Whether `budget` is a real bound the gate compares against, as opposed to
-    /// "unbounded" — `None` (CPU/Metal), or the `usize::MAX` an *unaccounted* device falls
+    /// "unbounded" — `None` (CPU), or the `usize::MAX` an *unaccounted* device falls
     /// back to when its free-memory query failed. The metrics surface omits the
     /// budget/headroom families when this is false rather than publishing a number that
     /// was never measured (issue #122).
@@ -879,7 +879,7 @@ impl GraphAllocator {
     }
 
     /// The memory budget for a backend (E4): an explicit one if it was set, else the
-    /// device's *free* bytes with a quarter held back, else unbounded. The default is the
+    /// device's own answer with a quarter held back, else unbounded. The default is the
     /// device's own answer, not a guess: the query already reports what is left after
     /// every weight and KV region is resident.
     ///
@@ -889,21 +889,20 @@ impl GraphAllocator {
     /// (issue #122's happy path, byte for byte), a measured zero still refuses, and a
     /// failed query falls back to weights-only accounting with its reason printed once
     /// (see `unaccounted_budget_note`). Nothing derives a budget from a non-measurement.
+    ///
+    /// A device backend reads `models::device_memory()` — the **same** resolver E5's
+    /// `auto` fit reads — so the feasibility gate and the offload fit cannot disagree
+    /// about the device's number, and Metal answers it too since
+    /// [#53](https://github.com/yusiwen/minfer/issues/53).
     fn memory_budget(&self, backend: Backend) -> Option<usize> {
         let explicit = self.budget.get(&backend).copied();
-        #[cfg(feature = "cuda")]
-        let mem = if backend == Backend::CUDA {
-            match crate::cuda::CudaState::get() {
-                Some(c) => c.device_memory(),
-                // A CUDA graph with no device state is a configuration error the
-                // assignment pass catches; the budget is simply unbounded here.
-                None => allocplan::DeviceMemory::NoDevice,
-            }
-        } else {
+        // CPU has no device state to ask. A device backend with no state (the assignment
+        // pass catches a graph on an unavailable device) resolves to `NoDevice` inside.
+        let mem = if backend == Backend::CPU {
             allocplan::DeviceMemory::NoDevice
+        } else {
+            crate::models::device_memory()
         };
-        #[cfg(not(feature = "cuda"))]
-        let mem = allocplan::DeviceMemory::NoDevice;
         let decision = allocplan::budget_decision(explicit, &mem);
         if let Some(note) = &decision.note {
             unaccounted_budget_note(note);

@@ -64,21 +64,32 @@ pub fn device_name(device: Device) -> &'static str {
 
 /// E5 S2: the device's own memory answer, with the query's outcome explicit (issue #122).
 /// The `auto` offload fit consumes it, with the same quarter held back that E4's
-/// feasibility gate uses.
+/// feasibility gate uses; `graph::alloc::GraphAllocator::memory_budget` reads this same
+/// function for every non-CPU backend, so the fit and the feasibility gate share one
+/// resolver instead of two copies of the per-backend routing.
 ///
 /// This used to return `Option<usize>` with `None` meaning "no device" — but a **failed**
 /// CUDA query came back as `Some(0)`, and `auto` then read it as "0 bytes free" and
 /// silently planned 0 device blocks. The three-way [`DeviceMemory`] keeps the two apart:
 /// the fit refuses a failed query with the real error and still fits nothing on a platform
 /// that reports no free-bytes number at all.
+///
+/// Two device answers now sit behind this one resolver: CUDA's `cudaMemGetInfo` free read
+/// and, since [#53], Metal's `MTLDevice.recommendedMaxWorkingSetSize`. The device is
+/// chosen in the graph's own assignment-preference order (Metal > CUDA > CPU; there is no
+/// macOS+CUDA build today), and `NoDevice` means exactly "no device *state* to ask" —
+/// never "a device answered zero".
+///
+/// [#53]: https://github.com/yusiwen/minfer/issues/53
 pub fn device_memory() -> crate::graph::allocplan::DeviceMemory {
+    #[cfg(target_os = "macos")]
+    if let Some(metal) = crate::metal::MpsState::get() {
+        return metal.device_memory();
+    }
     #[cfg(feature = "cuda")]
     if let Some(cuda) = crate::cuda::CudaState::get() {
         return cuda.device_memory();
     }
-    // Metal reports no free-bytes number through the current wrapper, so `auto` on macOS falls
-    // back to an explicit `MINFER_GPU_MEM` (or fits nothing) — the device still participates,
-    // it just cannot be planned against. Documented in rule 14.
     crate::graph::allocplan::DeviceMemory::NoDevice
 }
 

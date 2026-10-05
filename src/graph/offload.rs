@@ -305,8 +305,12 @@ pub fn report(plan: OffloadPlan, device: &str, device_bytes: usize, source: &str
 /// were a measurement. `auto` asks for a measurement, so when none exists the load is
 /// refused with the real error name rather than silently planned around.
 ///
-/// "No device at all" is unchanged and deliberate: it is the documented Metal behaviour
-/// (`auto` fits nothing without `MINFER_GPU_MEM`), not a failed query.
+/// "No device state at all" is unchanged and deliberate: the CPU has no device budget,
+/// and a device whose singleton could not be created is not a failed *query* — `auto`
+/// then fits nothing without `MINFER_GPU_MEM`, not a fabricated zero. Metal used to be
+/// that case on every Mac; since [#53](https://github.com/yusiwen/minfer/issues/53) it
+/// answers through `MpsState::device_memory`, so `auto` plans against
+/// `recommendedMaxWorkingSetSize` there too.
 pub fn weight_budget(mem: &DeviceMemory, cap_mib: Option<&str>) -> Result<usize, String> {
     match cap_mib.map(str::trim) {
         Some(v) if !v.is_empty() => v
