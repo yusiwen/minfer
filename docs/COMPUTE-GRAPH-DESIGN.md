@@ -932,7 +932,7 @@ attention, KV, `GetRows` and decode-fused ops; `View`/`Reshape`/`Permute` are ac
 | `RoPE` | `rope_f32` (copy_in first when not aliased) |
 | `SwiGLU` | `swiglu_f32` |
 | `Attn` | G1 dispatch (below) |
-| `KvcacheStore` | two `store_kv` calls (K then V); f32 or f16 KV selected by `kv_cache_is_f16()` / `MINFER_CACHE_TYPE` |
+| `KvcacheStore` | two `store_kv` calls (K then V); f32 or f16 KV selected by the engine's per-instance `kv_format` (`MINFER_CACHE_TYPE` / auto policy) |
 | `KvcacheLoad` | no-op (view of the K region) |
 | `FusedQKV` | concat `quant_matmul_f32_on_gpu_buf` + `attn_bias_rope_store` (3 bias + q/k rope + K/V store in one pass) |
 | `FusedFFN` | concat matmul + `swiglu_f32_off` (in-place on the concat buffer, gate at offset 0, up at `nf`) |

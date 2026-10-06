@@ -29,22 +29,6 @@ const NKT: usize = NK * HD;
 const NQT: usize = NH * HD;
 const N_CTX: usize = 128;
 
-/// Drop guard for the test-only process-wide f16 override (the production tag
-/// is an `OnceLock`, so one process would otherwise be stuck on its first
-/// value; see `metal::set_kv_f16_for_test`).
-struct F16Override;
-impl F16Override {
-    fn force(f16: bool) -> Self {
-        crate::metal::set_kv_f16_for_test(f16);
-        F16Override
-    }
-}
-impl Drop for F16Override {
-    fn drop(&mut self) {
-        crate::metal::clear_kv_f16_for_test();
-    }
-}
-
 /// Windows that differ row by row: when a window resolves to the wrong cell the
 /// returned V row changes, so a wrong window cannot alias the expected one.
 fn fixture_row(seed: usize, row: usize) -> f32 {
@@ -189,7 +173,6 @@ fn metal_attn_span_matches_cpu() {
     }
 
     for fmt in [KvFormat::F32, KvFormat::F16] {
-        let _f16 = F16Override::force(fmt == KvFormat::F16);
         for nt in [1usize, 8, 40] {
             let (g, out) = make_graph(nt, fmt);
             let q = q_data(nt);
@@ -277,7 +260,6 @@ fn metal_attn_span_multi_key_matches_cpu() {
 
     const START: usize = 9;
     for fmt in [KvFormat::F32, KvFormat::F16] {
-        let _f16 = F16Override::force(fmt == KvFormat::F16);
         for nt in [1usize, 8, 40] {
             let (g, out) = make_graph(nt, fmt);
             let q = q_data(nt);
@@ -348,7 +330,6 @@ fn metal_attn_span_nonzero_start() {
 
     const START: usize = 37;
     for fmt in [KvFormat::F32, KvFormat::F16] {
-        let _f16 = F16Override::force(fmt == KvFormat::F16);
         let nt = 1usize;
         let (g, out) = make_graph(nt, fmt);
         let q = q_data(nt);

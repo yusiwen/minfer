@@ -262,7 +262,8 @@ fn gen_layer0_realdata_dump() {
 /// QKV rope+store pass, no attention biases) against a scalar CPU
 /// reference. Exercises the q-rope (in place), k-rope+store and v-store
 /// sections of the concat q|k|v buffer, for both the f32 and f16 KV cache
-/// paths (the store type comes from `kv_cache_is_f16()`).
+/// paths (the store type is the `f16` argument the engine's `kv_format`
+/// stamps into the dispatch).
 #[test]
 fn attn_rope_store_isolated() {
     let _g = crate::metal::metal_test_lock();
@@ -278,112 +279,125 @@ fn attn_rope_store_isolated() {
     let freq_base = 10000.0f32;
     let freq_scale = 1.0f32;
     let rope_style = 0i32; // NonInterleaved (Qwen3)
-    let kv_f16 = crate::metal::kv_cache_is_f16();
-    let total = nqt + 2 * nkt;
+    for kv_f16 in [false, true] {
+        let total = nqt + 2 * nkt;
 
-    let bqkv = dev
-        .newBufferWithLength_options((total * 4) as usize, MTLResourceOptions::StorageModeShared)
-        .unwrap();
-    let kv_k = dev
-        .newBufferWithLength_options(
-            ((pos as usize + 1) * nkt * if kv_f16 { 2 } else { 4 }) as usize,
-            MTLResourceOptions::StorageModeShared,
-        )
-        .unwrap();
-    let kv_v = dev
-        .newBufferWithLength_options(
-            ((pos as usize + 1) * nkt * if kv_f16 { 2 } else { 4 }) as usize,
-            MTLResourceOptions::StorageModeShared,
-        )
-        .unwrap();
-    // deterministic q|k|v: sin over index with a per-section offset. Keep a
-    // host copy (`orig`) to compute the CPU reference against the PRE-kernel
-    // values (the kernel applies the rope in place on the concat buffer).
-    let mut orig = vec![0.0f32; total];
-    unsafe {
-        let p = bqkv.contents().as_ptr() as *mut f32;
-        for i in 0..total {
-            let v = ((i as f32) * 0.37).sin() + (i as f32) * 0.001;
-            *p.add(i) = v;
-            orig[i] = v;
-        }
-    }
-
-    let cb = mps.cmd_buffer();
-    cb.attn_rope_store(
-        &bqkv, &kv_k, &kv_v, nqt, nkt, hd, freq_base, freq_scale, pos, rope_style,
-    );
-    cb.submit().expect("submit");
-
-    // CPU reference: rope q in place, rope + store k, store v — applied to a
-    // copy of `orig` (the pre-kernel q|k|v).
-    let read_f32 = |buf: &MetalBuffer, n: usize| -> Vec<f32> {
-        let mut v = vec![0.0f32; n];
+        let bqkv = dev
+            .newBufferWithLength_options(
+                (total * 4) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        let kv_k = dev
+            .newBufferWithLength_options(
+                ((pos as usize + 1) * nkt * if kv_f16 { 2 } else { 4 }) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        let kv_v = dev
+            .newBufferWithLength_options(
+                ((pos as usize + 1) * nkt * if kv_f16 { 2 } else { 4 }) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        // deterministic q|k|v: sin over index with a per-section offset. Keep a
+        // host copy (`orig`) to compute the CPU reference against the PRE-kernel
+        // values (the kernel applies the rope in place on the concat buffer).
+        let mut orig = vec![0.0f32; total];
         unsafe {
-            std::ptr::copy_nonoverlapping(buf.contents().as_ptr() as *const f32, v.as_mut_ptr(), n)
+            let p = bqkv.contents().as_ptr() as *mut f32;
+            for i in 0..total {
+                let v = ((i as f32) * 0.37).sin() + (i as f32) * 0.001;
+                *p.add(i) = v;
+                orig[i] = v;
+            }
+        }
+
+        let cb = mps.cmd_buffer();
+        cb.attn_rope_store(
+            &bqkv, &kv_k, &kv_v, nqt, nkt, hd, freq_base, freq_scale, pos, rope_style, kv_f16,
+        );
+        cb.submit().expect("submit");
+
+        // CPU reference: rope q in place, rope + store k, store v — applied to a
+        // copy of `orig` (the pre-kernel q|k|v).
+        let read_f32 = |buf: &MetalBuffer, n: usize| -> Vec<f32> {
+            let mut v = vec![0.0f32; n];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.contents().as_ptr() as *const f32,
+                    v.as_mut_ptr(),
+                    n,
+                )
+            };
+            v
         };
-        v
-    };
-    let mut ref_buf = orig.clone();
-    let half_dim = hd / 2;
-    let rope_pair = |buf: &mut [f32], off: usize, h: usize, d: usize| {
-        let base = h * hd;
-        let i0 = off + base + d;
-        let i1 = off + base + d + half_dim;
-        let freq = freq_scale / freq_base.powf((2.0 * d as f32) / hd as f32);
-        let theta = pos as f32 * freq;
-        let (cs, sn) = (theta.cos(), theta.sin());
-        let (x0, x1) = (buf[i0], buf[i1]);
-        buf[i0] = x0 * cs - x1 * sn;
-        buf[i1] = x0 * sn + x1 * cs;
-    };
-    // q section 0..nqt
-    for h in 0..nh {
-        for d in 0..half_dim {
-            rope_pair(&mut ref_buf, 0, h, d);
+        let mut ref_buf = orig.clone();
+        let half_dim = hd / 2;
+        let rope_pair = |buf: &mut [f32], off: usize, h: usize, d: usize| {
+            let base = h * hd;
+            let i0 = off + base + d;
+            let i1 = off + base + d + half_dim;
+            let freq = freq_scale / freq_base.powf((2.0 * d as f32) / hd as f32);
+            let theta = pos as f32 * freq;
+            let (cs, sn) = (theta.cos(), theta.sin());
+            let (x0, x1) = (buf[i0], buf[i1]);
+            buf[i0] = x0 * cs - x1 * sn;
+            buf[i1] = x0 * sn + x1 * cs;
+        };
+        // q section 0..nqt
+        for h in 0..nh {
+            for d in 0..half_dim {
+                rope_pair(&mut ref_buf, 0, h, d);
+            }
         }
-    }
-    // k section nqt..nqt+nkt (rope + store)
-    for h in 0..nk {
-        for d in 0..half_dim {
-            rope_pair(&mut ref_buf, nqt, h, d);
+        // k section nqt..nqt+nkt (rope + store)
+        for h in 0..nk {
+            for d in 0..half_dim {
+                rope_pair(&mut ref_buf, nqt, h, d);
+            }
         }
-    }
-    // v section unchanged
+        // v section unchanged
 
-    let got_buf = read_f32(&bqkv, total);
-    let mut maxd = 0.0f32;
-    for (x, y) in got_buf.iter().zip(ref_buf.iter()) {
-        maxd = maxd.max((x - y).abs());
-    }
-    assert!(
-        maxd < 1e-6,
-        "attn_rope_store concat buffer diverges (max {maxd:.3e})"
-    );
+        let got_buf = read_f32(&bqkv, total);
+        let mut maxd = 0.0f32;
+        for (x, y) in got_buf.iter().zip(ref_buf.iter()) {
+            maxd = maxd.max((x - y).abs());
+        }
+        assert!(
+            maxd < 1e-6,
+            "attn_rope_store concat buffer diverges (max {maxd:.3e})"
+        );
 
-    // KV store: k = roped k, v = raw v, at the position offset `pos*nkt`.
-    // NOTE: the kernel's `pow`/`cos`/`sin` (Metal libm) differ from Rust's
-    // `powf`/`cos`/`sin` by ~1e-6, so compare with a tolerance, not ==.
-    let kv_off = pos as usize * nkt;
-    let mut kd = 0.0f32;
-    let mut vd = 0.0f32;
-    if kv_f16 {
-        let kk = read_f16(&kv_k, (pos as usize + 1) * nkt);
-        let vv = read_f16(&kv_v, (pos as usize + 1) * nkt);
-        for j in 0..nkt {
-            kd = kd.max((kk[kv_off + j].to_f32() - ref_buf[nqt + j]).abs());
-            vd = vd.max((vv[kv_off + j].to_f32() - ref_buf[nqt + nkt + j]).abs());
+        // KV store: k = roped k, v = raw v, at the position offset `pos*nkt`.
+        // NOTE: the kernel's `pow`/`cos`/`sin` (Metal libm) differ from Rust's
+        // `powf`/`cos`/`sin` by ~1e-6, so compare with a tolerance, not ==.
+        let kv_off = pos as usize * nkt;
+        let mut kd = 0.0f32;
+        let mut vd = 0.0f32;
+        if kv_f16 {
+            let kk = read_f16(&kv_k, (pos as usize + 1) * nkt);
+            let vv = read_f16(&kv_v, (pos as usize + 1) * nkt);
+            for j in 0..nkt {
+                kd = kd.max((kk[kv_off + j].to_f32() - ref_buf[nqt + j]).abs());
+                vd = vd.max((vv[kv_off + j].to_f32() - ref_buf[nqt + nkt + j]).abs());
+            }
+        } else {
+            let kk = read_f32(&kv_k, (pos as usize + 1) * nkt);
+            let vv = read_f32(&kv_v, (pos as usize + 1) * nkt);
+            for j in 0..nkt {
+                kd = kd.max((kk[kv_off + j] - ref_buf[nqt + j]).abs());
+                vd = vd.max((vv[kv_off + j] - ref_buf[nqt + nkt + j]).abs());
+            }
         }
-    } else {
-        let kk = read_f32(&kv_k, (pos as usize + 1) * nkt);
-        let vv = read_f32(&kv_v, (pos as usize + 1) * nkt);
-        for j in 0..nkt {
-            kd = kd.max((kk[kv_off + j] - ref_buf[nqt + j]).abs());
-            vd = vd.max((vv[kv_off + j] - ref_buf[nqt + nkt + j]).abs());
-        }
+        // The f16 arm's comparison carries the **storage** rounding (the store
+        // writes `half`, and `read_f16` converts back), which is one half ulp —
+        // ~1e-4 at this fixture's magnitudes — so it uses the f16 class; the f32
+        // arm keeps the tight bar.
+        let kv_tol = if kv_f16 { 2e-3 } else { 1e-5 };
+        assert!(kd < kv_tol, "kv_k store diverges (max {kd:.3e})");
+        assert!(vd < kv_tol, "kv_v store diverges (max {vd:.3e})");
     }
-    assert!(kd < 1e-5, "kv_k store diverges (max {kd:.3e})");
-    assert!(vd < 1e-5, "kv_v store diverges (max {vd:.3e})");
 }
 
 fn read_f16(buf: &MetalBuffer, n: usize) -> Vec<half::f16> {

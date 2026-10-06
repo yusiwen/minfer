@@ -29,7 +29,7 @@ refreshed_against = "f663750"
 
 # The one honest `next:` sentence. It replaced a stale one that still called
 # E4/E5 upcoming years after they landed (issue #94).
-next = "the Metal round G5 (on a Mac) and F1 (needs x86)"
+next = "the remaining Metal gaps (G4, G7) and F1 (needs x86)"
 
 # --- prose locations for the three scalars ----------------------------------
 

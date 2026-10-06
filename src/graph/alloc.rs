@@ -259,6 +259,13 @@ impl GraphAllocator {
     pub fn enable_metal(&mut self) -> bool {
         if self.metal.is_none() {
             self.metal = super::metal_backend::MetalBackend::new();
+            // C4 per-engine (issue #44 part (b)): the pool starts with the
+            // engine's already-resolved format (the CPU backend holds the stamp
+            // `set_kv_format` writes), the same way `enable_cuda` builds its
+            // backend with `self.cpu.kv_format()`.
+            if let Some(m) = self.metal.as_mut() {
+                m.set_kv_format(self.cpu.kv_format());
+            }
         }
         self.metal.is_some()
     }
@@ -279,16 +286,22 @@ impl GraphAllocator {
     /// dispatch and the region width cannot disagree within one engine.
     ///
     /// The **CPU** backend stores the format; the **CUDA** backend, if it exists, gets
-    /// the matching `KV_LAYOUT_*` tag (`cuda::layout_of`). A backend created later
-    /// (`enable_cuda`) picks the format up from this same stamp, so the tag follows the
-    /// engine and never a process global. `set_kv_layout` invalidates captured graphs
-    /// whose kernels were instantiated for the old tag.
+    /// the matching `KV_LAYOUT_*` tag (`cuda::layout_of`); the **Metal** backend, if it
+    /// exists, stores it on the pool (issue #44 part (b)). A backend created later
+    /// (`enable_cuda`/`enable_metal`) picks the format up from this same stamp, so the
+    /// tag follows the engine and never a process global. `set_kv_layout` invalidates
+    /// captured graphs whose kernels were instantiated for the old tag.
     ///
-    /// Honest scope (#153): the CUDA half is per-engine now; **Metal's**
-    /// `metal::kv_cache_is_f16` is still a process-wide tag its kernels read, so a
-    /// Metal run keeps the documented discipline until Metal is ported (G5).
+    /// Per-engine on all three backends as of #44 part (b): there is no
+    /// process-wide Metal tag any more (the old `metal::kv_cache_is_f16` OnceLock),
+    /// so two engines in one process hold their own layouts and a C5 session is
+    /// described under the width its region really uses.
     pub fn set_kv_format(&mut self, format: KvFormat) {
         self.cpu.set_kv_format(format);
+        #[cfg(target_os = "macos")]
+        if let Some(m) = self.metal.as_mut() {
+            m.set_kv_format(format);
+        }
         #[cfg(feature = "cuda")]
         if let Some(c) = self.cuda.as_mut() {
             c.set_kv_layout(crate::cuda::layout_of(format));
@@ -298,10 +311,9 @@ impl GraphAllocator {
     /// The KV format this allocator's engine resolved (the CPU backend's stamp, set
     /// by [`Self::set_kv_format`]). The CUDA backend's tag is derived from it.
     ///
-    /// The only non-test reader is the CUDA registry entry's `kv_format` hook
-    /// (`graph/cuda_backend.rs::entry`), which is compiled out of a CPU-only build,
-    /// so the method is dead there — `#[cfg_attr(not(feature = "cuda"), ...)]` (#243).
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    /// Read by the CUDA registry entry's `kv_format` hook
+    /// (`graph/cuda_backend.rs::entry`) and, since #44 part (b), by
+    /// [`Self::kv_rm`]'s f16 refusal, so it is live in every configuration.
     pub fn kv_format(&self) -> KvFormat {
         self.cpu.kv_format()
     }
@@ -1132,6 +1144,21 @@ impl GraphAllocator {
         // knowledge), and then each survivor's K row is dequantized, re-roped in f32
         // and quantized back — see `kvformat::map_q8_0_cells`.
         let packed = self.kv.any_packed();
+        // #306: an **f16** region has no such map. The host read below returns the
+        // region's raw bytes reinterpreted as f32 words (`copy_kv_to_cpu` ->
+        // `read_host`), and `rope_shift_kv` would rotate those halves as if they
+        // were f32 — a silent corruption, on CUDA too. This is not widened here:
+        // refuse loudly and name the missing map, so the caller's documented
+        // fallback (re-render) takes over instead of a wrong re-rope.
+        if self.kv_format() == super::kvformat::KvFormat::F16 {
+            return Err(format!(
+                "kv_rm: the KV region is the f16 storage format, whose host round trip has no f16 \
+                 path — the survivors are raw half bytes, not f32 rows, so the re-rope would \
+                 reinterpret them. A physical shift on an f16 region needs a \
+                 dequantize -> re-rope -> requantize map (issue #306); refusing rather than \
+                 corrupting the arena"
+            ));
+        }
         // Validate every layer first: a rejected removal must not leave the
         // arenas half-shifted.
         for &layer in &layers {
@@ -2118,17 +2145,26 @@ impl GraphAllocator {
     /// id — doc 95 identity debugging (the graph holds one KvcacheLoad node
     /// per layer, so the V half is reachable only through `kv_pair`).
     pub fn copy_kv_to_cpu(&mut self, layer: usize) -> Option<(Vec<f32>, Vec<f32>)> {
-        // Kept CPU/CUDA-only as before (the pre-F4 arm for Metal was `None`): this
-        // is a CPU identity-debug helper, and widening it is not this ticket's job.
-        let rd = |s: &mut Self, br: BufRef| -> Option<Vec<f32>> {
-            if br.backend != Backend::CPU && br.backend != Backend::CUDA {
-                return None;
-            }
+        let (k, v) = {
+            let l = self.kv.get(layer)?;
+            (l.k, l.v)
+        };
+        // F4: every backend's registered `host_read` hook is the one read path —
+        // CPU's borrowed slice, CUDA's stream-ordered `copy_to_host`, and (since
+        // #44 part (b)) Metal's shared-memory view. The pre-F4 `CPU || CUDA`
+        // hardcode is gone, so a Metal session shifts/saves instead of re-rendering.
+        //
+        // **Ordering first (#301).** `MetalBackend::read_host` takes `&self` and
+        // does not submit: reading while the split's command buffer is still
+        // pending would return stale bytes. `copy_kv_to_cpu` takes `&mut self`, so
+        // flush the owning backend before the read (CPU/Metal's `synchronize` is
+        // the documented no-op / submit; CUDA's `copy_to_host` syncs its own stream
+        // anyway, so the extra `synchronize` orders nothing new there).
+        self.sync_backend(k.backend);
+        let rd = |s: &Self, br: BufRef| -> Option<Vec<f32>> {
             (br.backend.entry()?.host_read)(s, br.id)
         };
-        let l = self.kv.get(layer)?;
-        let pair = [l.k, l.v];
-        Some((rd(self, pair[0])?, rd(self, pair[1])?))
+        Some((rd(self, k)?, rd(self, v)?))
     }
 
     /// The KV element type a session on `backend` stores its rows in (C5). A

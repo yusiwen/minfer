@@ -8,11 +8,13 @@ use crate::models::Device;
 /// now gets.
 #[test]
 fn batch_mode_follows_the_device_and_honours_the_override() {
-    // Unset: follow the device. CUDA batches (measured 1.9x), CPU and Metal
-    // do not (CPU is measured slower; Metal refuses the span node until G5).
+    // Unset: follow the device. CUDA batches (measured 1.9x); **Metal joined
+    // CUDA in #44 part (b)** when the `copy_cells` / `copy_kv_to_cpu` arms
+    // landed (the batching and server gates are green on the Mac). CPU still
+    // does not (measured slower per token — the E2 record).
     assert_eq!(batch_mode(None, Device::Cuda), BatchMode::Batched);
+    assert_eq!(batch_mode(None, Device::Metal), BatchMode::Batched);
     assert_eq!(batch_mode(None, Device::Cpu), BatchMode::Serial);
-    assert_eq!(batch_mode(None, Device::Metal), BatchMode::Serial);
 
     // Explicit override wins on every device.
     for d in [Device::Cpu, Device::Metal, Device::Cuda] {

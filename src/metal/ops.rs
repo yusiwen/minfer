@@ -831,8 +831,9 @@ impl MpsCommandBuffer<'_> {
         hd: usize,
         scale: f32,
         nt: usize,
+        f16: bool,
     ) {
-        self.gqa_attn_f32_off(q, 0, k, 0, v, 0, o, positions, nh, nk, hd, scale, nt);
+        self.gqa_attn_f32_off(q, 0, k, 0, v, 0, o, positions, nh, nk, hd, scale, nt, f16);
     }
 
     /// Offset variant of `gqa_attn_f32` — K/V may live at byte offsets inside a
@@ -852,11 +853,12 @@ impl MpsCommandBuffer<'_> {
         hd: usize,
         scale: f32,
         nt: usize,
+        f16: bool,
     ) {
         self.trace_op("gqa_attn");
         let gqa = nh / nk;
         self.enc.setComputePipelineState(
-            &**(if kv_cache_is_f16() {
+            &**(if f16 {
                 &self.state.pl_gqa_attn_f16
             } else {
                 &self.state.pl_gqa_attn
@@ -919,11 +921,12 @@ impl MpsCommandBuffer<'_> {
         hd: usize,
         scale: f32,
         nt: usize,
+        f16: bool,
     ) {
         self.trace_op("gqa_attn_window");
         let gqa = nh / nk;
         self.enc.setComputePipelineState(
-            &**(if kv_cache_is_f16() {
+            &**(if f16 {
                 &self.state.pl_gqa_attn_window_f16
             } else {
                 &self.state.pl_gqa_attn_window
@@ -981,6 +984,7 @@ impl MpsCommandBuffer<'_> {
         scale: f32,
         nt: usize,
         n_chunks: usize,
+        f16: bool,
     ) {
         self.trace_op("gqa_attn_split");
         let gqa = nh / nk;
@@ -990,7 +994,7 @@ impl MpsCommandBuffer<'_> {
         // pass 1: partials per (token, KV_head, chunk) — f16 cache picks the
         // f16 partial kernel (K/V read as half, staged to f32 float4 tiles).
         self.enc.setComputePipelineState(
-            &**(if kv_cache_is_f16() {
+            &**(if f16 {
                 &self.state.pl_gqa_attn_partial_f16
             } else {
                 &self.state.pl_gqa_attn_partial
@@ -1071,6 +1075,7 @@ impl MpsCommandBuffer<'_> {
         scale: f32,
         nt: usize,
         n_chunks: usize,
+        f16: bool,
     ) {
         self.trace_op("gqa_attn_flash");
         let need = (nt * nh * n_chunks * (2 + hd) * 4) as u64;
@@ -1078,7 +1083,7 @@ impl MpsCommandBuffer<'_> {
 
         // pass 1: flash partials — f16 cache reads the half K/V directly.
         self.enc.setComputePipelineState(
-            &**(match (kv_cache_is_f16(), hd) {
+            &**(match (f16, hd) {
                 (false, 128) => &self.state.pl_flash_attn_hd128,
                 (true, 128) => &self.state.pl_flash_attn_hd128_f16,
                 (false, _) => &self.state.pl_flash_attn,
@@ -1148,10 +1153,11 @@ impl MpsCommandBuffer<'_> {
         nt: usize,
         positions: &MetalBuffer,
         off: usize,
+        f16: bool,
     ) {
         self.trace_op("store_kv");
         self.enc.setComputePipelineState(
-            &**(if kv_cache_is_f16() {
+            &**(if f16 {
                 &self.state.pl_store_kv_f16
             } else {
                 &self.state.pl_store_kv
@@ -1300,10 +1306,10 @@ impl MpsCommandBuffer<'_> {
         nk: usize,
         hd: usize,
         scale: f32,
+        f16: bool,
     ) {
         self.trace_op("attn_flash_blk");
         let dev = &self.state.device;
-        let f16 = kv_cache_is_f16();
         let elem = if f16 { 2u64 } else { 4u64 };
         let pad =
             MpsState::get_or_grow(&self.state.buf_attn_pad, (2 * 64 * nkt as u64) * elem, dev);
@@ -1388,7 +1394,7 @@ impl MpsCommandBuffer<'_> {
     /// add_bias×3 + rope×2 + store_kv×2 (7 dispatches). `bqkv` layout is
     /// [q: 0..nqt][k: nqt..nqt+nkt][v: nqt+nkt..nqt+2nkt]; biases are the raw
     /// per-section buffers. `pos` = the single token position. The KV store
-    /// writes f32 or f16 (per kv_cache_is_f16) into kv_k/kv_v.
+    /// writes f32 or f16 (per the engine's `kv_format`) into kv_k/kv_v.
     pub fn attn_bias_rope_store(
         &self,
         bqkv: &MetalBuffer,
@@ -1407,6 +1413,7 @@ impl MpsCommandBuffer<'_> {
         freq_scale: f32,
         pos: i32,
         rope_style: i32,
+        f16: bool,
     ) {
         self.trace_op("attn_bias_rope_store");
         self.enc.setComputePipelineState(&*self.state.pl_attn_bsr);
@@ -1441,7 +1448,7 @@ impl MpsCommandBuffer<'_> {
         self.set_params(10, &(freq_scale.to_bits() as i32));
         self.set_params(11, &pos);
         self.set_params(12, &rope_style);
-        self.set_params(13, &(if kv_cache_is_f16() { 1 } else { 0 }));
+        self.set_params(13, &(if f16 { 1 } else { 0 }));
         let grid = nqt / 2 + nkt / 2 + nkt;
         self.dispatch_1d(grid as u64, 256);
     }
@@ -1465,6 +1472,7 @@ impl MpsCommandBuffer<'_> {
         freq_scale: f32,
         pos: i32,
         rope_style: i32,
+        f16: bool,
     ) {
         self.trace_op("attn_rope_store");
         self.enc
@@ -1488,7 +1496,7 @@ impl MpsCommandBuffer<'_> {
         self.set_params(7, &(freq_scale.to_bits() as i32));
         self.set_params(8, &pos);
         self.set_params(9, &rope_style);
-        self.set_params(10, &(if kv_cache_is_f16() { 1 } else { 0 }));
+        self.set_params(10, &(if f16 { 1 } else { 0 }));
         let grid = nqt / 2 + nkt / 2 + nkt;
         self.dispatch_1d(grid as u64, 256);
     }

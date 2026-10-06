@@ -85,14 +85,18 @@ pub trait Backend: Send + Sync {
     /// Move `rows` rows of `elems_per_cell` f32 elements between two rows of the
     /// **same** pool buffer — C3's compaction primitive.
     ///
-    /// Contract: `dst_row <= src_row` and the two ranges may **overlap**, which
-    /// is the entire point of the primitive (a compaction slides a run down to
-    /// the lowest free gap, and the gap is usually inside the same buffer). A
-    /// GPU backend therefore cannot use a bulk device-to-device copy — CUDA
-    /// documents overlapping `cudaMemcpyAsync` as undefined — and must walk rows
-    /// in the safe (ascending) direction instead. A backend that supports the KV
-    /// ops but not this one returns `Err`: the compaction is then refused, never
-    /// silently skipped (standing rule 2).
+    /// Contract: `dst_row` may be **below or above** `src_row`, and the two
+    /// ranges may **overlap**, which is the entire point of the primitive — a
+    /// compaction slides a run down into the lowest free gap (usually inside the
+    /// same buffer), and C7b extends a run upward when it grows
+    /// (`kv_set_cap_with_defrag`). The move must therefore be overlap-safe in
+    /// **both** directions: walk the rows ascending when `dst_row <= src_row`
+    /// and descending otherwise, so a row is never overwritten before it is
+    /// read. A GPU backend cannot use a bulk device-to-device copy — CUDA
+    /// documents overlapping `cudaMemcpyAsync` as undefined and Apple documents
+    /// an overlapping same-buffer blit as undefined — so both walk rows. A
+    /// backend that supports the KV ops but not this one returns `Err`: the
+    /// compaction is then refused, never silently skipped (standing rule 2).
     ///
     /// The destination buffer may be larger than `rows * elems_per_cell`; only
     /// the named rows are touched, so a stale tail needs no clearing (the cell

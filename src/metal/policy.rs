@@ -4,64 +4,14 @@
 // switches the `graph/metal_backend.rs` op gate and the model loaders read; none
 // of them holds device state.
 
-/// KV cache element type for the GPU path. `MINFER_CACHE_TYPE=f16` forces a
-/// half cache (llama.cpp's default); `MINFER_CACHE_TYPE=f32` forces f32. When
-/// unset, `set_kv_cache_type` (called at model load with the model dims)
-/// auto-selects: f16 for the 7B class (n_layers×n_kv_embd ≥ 8192 — KV
-/// bandwidth-bound decode; measured 7B @2K ctx f16 ≈ −1 ms/token vs f32),
-/// f32 for small models (0.5B measured f16 ~3% SLOWER — dispatch-latency-bound,
-/// see §0 decided-not #8 / §2.5).
-static KV_F16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-/// Test-only override of [`kv_cache_is_f16`] (issue #44's `attn_span` gate): the
-/// production answer is a process-wide `OnceLock` — the first `set_kv_cache_type`
-/// wins — so one test cannot exercise both KV widths in a single process by
-/// calling the production setter twice. `0` = defer to `KV_F16`, `1` = force f32,
-/// `2` = force f16. The real machine has a Mac, and the production reader is
-/// unchanged (the override is `#[cfg(test)]`-only); the override exists exactly
-/// because a per-engine `kv_format` on Metal is part (b) [#306]/G5's write side,
-/// not this read-side PR.
-#[cfg(test)]
-static KV_F16_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-pub fn kv_cache_is_f16() -> bool {
-    #[cfg(test)]
-    {
-        match KV_F16_TEST.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => return false,
-            2 => return true,
-            _ => {}
-        }
-    }
-    *KV_F16.get_or_init(|| false)
-}
-
-/// Test-only: force [`kv_cache_is_f16`] to `f16`/`f32` for the current test.
-/// Paired with [`clear_kv_f16_for_test`] (or a drop guard) so the override does
-/// not leak into another test sharing the process.
-#[cfg(test)]
-pub fn set_kv_f16_for_test(f16: bool) {
-    KV_F16_TEST.store(
-        if f16 { 2 } else { 1 },
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
-
-/// Test-only: restore the production `OnceLock` answer.
-#[cfg(test)]
-pub fn clear_kv_f16_for_test() {
-    KV_F16_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Called once at model load with the model dims, BEFORE the first forward:
-/// sets the GPU KV cache element type (auto-select or MINFER_CACHE_TYPE).
-pub fn set_kv_cache_type(n_layers: usize, n_kv_embd: usize) {
-    let f16 = std::env::var("MINFER_CACHE_TYPE").map_or(
-        n_layers * n_kv_embd >= 8192, // auto: 7B class → f16
-        |v| v == "f16",
-    );
-    let _ = KV_F16.set(f16);
-}
+// The process-wide `KV_F16` OnceLock, `kv_cache_is_f16`, `set_kv_cache_type` and
+// the `#[cfg(test)]` override lived here until issue #44 part (b). The GPU KV
+// element type is now **per engine**: `MetalBackend::kv_format` is stamped from
+// `GraphAllocator::set_kv_format` (the loaded engine's resolved
+// `MINFER_CACHE_TYPE`/auto policy) and every kernel dispatch reads that instance
+// — exactly the #99/#153 lesson. The old global let the first load win, so two
+// engines could not hold different layouts and a C5 session could be described
+// under the wrong width.
 
 /// Use the 256-thread multi-simdgroup rms_norm in the decode path (P1 2026-08-10
 /// A/B gate; ON by default after it measured ~2x faster than the 32-thread kernel).
