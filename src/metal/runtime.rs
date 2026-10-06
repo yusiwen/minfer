@@ -169,6 +169,9 @@ impl MpsState {
             let pl_rope = get_pl("kernel_rope_f32")?;
             let pl_gqa_attn = get_pl("kernel_gqa_attn_f32")?;
             let pl_gqa_attn_f16 = get_pl("kernel_gqa_attn_f16")?;
+            // E1 `attn_span` read path (issue #44, G5a).
+            let pl_gqa_attn_window = get_pl("kernel_gqa_attn_window_f32")?;
+            let pl_gqa_attn_window_f16 = get_pl("kernel_gqa_attn_window_f16")?;
             let pl_gqa_attn_partial = get_pl("kernel_gqa_attn_partial_f32")?;
             let pl_gqa_attn_partial_f16 = get_pl("kernel_gqa_attn_partial_f16")?;
             let pl_gqa_attn_combine = get_pl("kernel_gqa_attn_combine_f32")?;
@@ -239,6 +242,8 @@ impl MpsState {
                 pl_rope,
                 pl_gqa_attn,
                 pl_gqa_attn_f16,
+                pl_gqa_attn_window,
+                pl_gqa_attn_window_f16,
                 pl_gqa_attn_partial,
                 pl_gqa_attn_partial_f16,
                 pl_gqa_attn_combine,

@@ -854,10 +854,11 @@ fn support_table_matches_support_matrix_doc() {
             true,
             true,
         ),
-        // E1's asymmetric row: CPU and CUDA have a windowed attention path that
-        // reads the explicit span (E1b ported CUDA's kernels); Metal still
-        // derives its bound from positions and must refuse a multi-sequence
-        // attention node (`backend_takes`), so it cannot be assigned one.
+        // E1's explicit-span row: CPU, Metal and CUDA all read a one-range
+        // `attn_span` window now (Metal's windowed kernel landed in #44 part (a),
+        // G5a). Metal still refuses the other explicit layout — the `kv_map`
+        // `(cell, len)` runs — because `Device::gathers_attn_map` stays false
+        // there; that is a separate capability (C8b S4), not this op's.
         (
             "Attn explicit-span",
             Op::Attn {
@@ -865,7 +866,7 @@ fn support_table_matches_support_matrix_doc() {
                 explicit_span: true,
             },
             true,
-            false,
+            true,
             true,
         ),
         (

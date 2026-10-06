@@ -313,6 +313,32 @@ Pre-dispatch guards return `Err`: `nkt == n_head_kv * hd` (the classic kernel st
   the classic `gqa_attn_f32`.
 - **Other head dims** always take the classic kernel.
 
+**Window modes (E1, issue #44 part (a), landed on a Mac 2026-10-06).** The dispatch above is the
+**causal** path: every kernel derives token `t`'s window from `positions`
+(`nkv = positions[t] + 1`, or a host `max_pos + 1` for prefill). When the node is
+`Op::Attn { explicit_span: true }` — more than one sequence in a batch, or a run that does not start
+at cell 0 — the arm selects the mode from the **size** of the window input (topology, fixed at build
+time), mirroring CUDA's arm:
+
+- `in_bufs[3].len == 2 * nt` → the **`attn_span`** layout (one `[lo, hi)` pair per query):
+  `gqa_attn_window_f32` / `_f16` (`src/metal/kernels/attn_window.metal`) reads K/V at the run's cells
+  `[lo, hi)` instead of `[0, positions[t] + 1)`, with the same `Bc = 32` tiling, online softmax and
+  reduction order as the classic `gqa_attn_f32` (the CPU gather `cpu_gqa_attn_runs` is the structural
+  reference). `nt == 1` and `nt > 1` both use it, so a decode and a batched prefill share one launch;
+  f32/f16 is selected from the engine's KV format.
+- `in_bufs[3].len == nt * KV_MAP_MAX_SPANS * 2` → the **`kv_map`** layout (a list of `(cell, len)`
+  runs per query, C8b S2/S4). Metal has no gather for it (`Device::gathers_attn_map` is false), so
+  the arm returns a loud `Err` rather than parsing the runs as `(lo, hi)` and attending to the wrong
+  rows (risk 1 of the issue's plan).
+- anything else → a loud `Err` naming the accepted sizes.
+
+`supports_attn_span()` is now `true` (`SUPPORTS_ATTN_SPAN`). The causal paths (flash / split /
+parallel-prefill / classic) are **byte-untouched**: the windowed kernel is a separate family used
+only for an explicit window, so a single-sequence causal forward keeps its previous numbers. The
+write/move side of G5 is still owed (part (b)): `copy_cells` (C3 compaction), the `copy_kv_to_cpu`
+Metal arm (C2 shift / C5 sessions), the packed `q8_0` read (`READS_PACKED_KV` stays false) and the
+per-engine `kv_format`.
+
 The decode chunk count is `MINFER_ATTN_CHUNKS` or `((max_pos + 1 + 31) / 32).clamp(1, 16)` — one
 chunk per 32 KV rows, capped at 16. `nkv` for the prefill kernels and the chunk count come from a
 host read of the positions buffer; that is safe because positions are host-written input data, never

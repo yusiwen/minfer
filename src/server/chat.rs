@@ -650,8 +650,11 @@ pub(crate) enum BatchMode {
 ///
 /// Pure on purpose: CI has no GPU, so the matrix (unset / "1" / "0" / invalid x
 /// cpu / metal / cuda) is unit-tested here instead of being discovered in
-/// production. `Device::Metal` follows CPU: the batched path needs an explicit
-/// attention span, which Metal refuses until G5 (see the caller).
+/// production. `Device::Metal` still follows CPU: the batched path needs the
+/// write/move side of G5 — a slot's run can be compacted or shifted mid-session
+/// (`copy_cells` / `copy_kv_to_cpu`), which Metal does not implement yet (issue
+/// #44 part (b)) — so the default waits for those gates (see the caller). The
+/// read side (`supports_attn_span()`, #44 part (a)) landed 2026-10-06.
 pub(crate) fn batch_mode(requested: Option<&str>, device: crate::models::Device) -> BatchMode {
     match requested {
         Some("1") => BatchMode::Batched,
@@ -689,9 +692,10 @@ pub fn worker_loop(
     //   MINFER_BATCH=0     -> serial (forced)
     //
     // Metal is deliberately not included even where a Metal device participates:
-    // the batched path needs an explicit attention span and Metal refuses that
-    // node (`supports_attn_span()` is false there), so batching would fail loudly
-    // rather than serve — it waits for G5.
+    // a batched slot's run can be compacted or shifted mid-session, and the
+    // write/move half of G5 (`copy_cells` / `copy_kv_to_cpu`) is not ported yet
+    // (issue #44 part (b)), so batching would fail on the first move rather than
+    // serve. The read half (`supports_attn_span()`) landed 2026-10-06.
     //
     // A session with a speculative draft keeps the per-slot caches and the
     // run-to-completion loop below too, because doc 94/97's identity contract is

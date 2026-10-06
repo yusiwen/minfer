@@ -896,6 +896,73 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d(nt as u64, nk as u64, 32, gqa as u64);
     }
 
+    /// E1 `attn_span` windowed attention (issue #44, G5a): the read side of the
+    /// explicit window. Same grid and threadgroup shape as [`Self::gqa_attn_f32`]
+    /// — one threadgroup per `(query, KV head)`, `gqa` simdgroups — but `window`
+    /// (buffer 4) is the `attn_span` input: `lo` at `window[t]`, `hi` at
+    /// `window[nt + t]`, and K/V are read at the run's cells `[lo, hi)` rather
+    /// than `[0, positions[t] + 1)`. f32/f16 selected from the engine's KV format.
+    ///
+    /// `dispatch_2d(nt, nk, 32, gqa)` keeps every simdgroup inside the
+    /// threadgroup on a barrier-bearing path even when `nh % nk != 0`, exactly as
+    /// the causal kernel does; the kernel handles the window length internally,
+    /// so `nt == 1` (a decode) and `nt > 1` (a batch prefill) use one launch.
+    pub fn gqa_attn_window(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        o: &MetalBuffer,
+        window: &MetalBuffer,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        nt: usize,
+    ) {
+        self.trace_op("gqa_attn_window");
+        let gqa = nh / nk;
+        self.enc.setComputePipelineState(
+            &**(if kv_cache_is_f16() {
+                &self.state.pl_gqa_attn_window_f16
+            } else {
+                &self.state.pl_gqa_attn_window
+            }),
+        );
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(k)), (0) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(v)), (0) as usize, (2) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(o)), (0) as usize, (3) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(window)), (0) as usize, (4) as usize)
+        };
+        self.set_params(5, &(nh as i32));
+        self.set_params(6, &(nk as i32));
+        self.set_params(7, &(hd as i32));
+        self.set_params(8, &(scale.to_bits() as i32));
+        self.set_params(9, &(nt as i32));
+        const BC: u64 = 32;
+        let shmem = BC * hd as u64 * 2 * std::mem::size_of::<f32>() as u64;
+        unsafe {
+            self.enc
+                .setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize)
+        };
+        self.dispatch_2d(nt as u64, nk as u64, 32, gqa as u64);
+    }
+
     /// KV-parallel split attention for nt==1 decode (the classic kernel's grid
     /// is only (1, nk) threadgroups that loop the KV sequentially — the measured
     /// #1 decode bottleneck). Two passes: partial per KV chunk (grid (nt,nk,P)),

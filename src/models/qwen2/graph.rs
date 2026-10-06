@@ -570,9 +570,11 @@ impl Qwen2Graph {
                 // C6/S3: the fused epilogue stores K/V at the
                 // allocator-resolved `cells` row, so the CUDA path may stay
                 // fused even when the run does not start at cell 0
-                // (`explicit_span`). Metal keeps the pre-C6 gate: it has no
-                // explicit-span attention at all (G5), so every run it can
-                // fuse starts at cell 0 and positions == cells.
+                // (`explicit_span`). Metal's fused epilogue stores at a single
+                // host-read `pos` (the pre-C6 form), so Metal keeps the
+                // `!explicit_span` gate even though its attention *read* side
+                // now handles an explicit span (#44 part (a), 2026-10-06): a
+                // fused Metal store at `pos != cell` would write the wrong row.
                 fuse_qkv: nt == 1
                     && (metal_on || cuda_on)
                     && (cuda_on || !explicit_span)

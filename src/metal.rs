@@ -198,6 +198,9 @@ struct MpsStateInner {
     pl_rope: MetalComputePipelineState,
     pl_gqa_attn: MetalComputePipelineState,
     pl_gqa_attn_f16: MetalComputePipelineState,
+    // E1 `attn_span` read path (issue #44, G5a): the windowed kernel family.
+    pl_gqa_attn_window: MetalComputePipelineState,
+    pl_gqa_attn_window_f16: MetalComputePipelineState,
     pl_gqa_attn_partial: MetalComputePipelineState,
     pl_gqa_attn_partial_f16: MetalComputePipelineState,
     pl_gqa_attn_combine: MetalComputePipelineState,
@@ -446,6 +449,8 @@ mod ops;
 mod policy;
 mod runtime;
 
+#[cfg(test)]
+pub use policy::{clear_kv_f16_for_test, set_kv_f16_for_test};
 pub use policy::{
     flash_attn_enabled, kv_cache_is_f16, matmul_attn_enabled, prefill_flash_enabled,
     rms_norm_256_enabled, set_kv_cache_type,
