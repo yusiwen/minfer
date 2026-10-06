@@ -150,9 +150,9 @@ impl CudaState {
         }
     }
 
-    /// 8b: f16 KV cache — see `kv_cache_is_f16`. Same trade-off as Metal:
-    /// halves attention KV read bandwidth; the region stays f32-sized (the
-    /// f16 view uses the first half of the bytes).
+    /// 8b: f16 KV cache (the engine's per-instance `KvFormat::F16`). Same
+    /// trade-off as Metal: halves attention KV read bandwidth; the region stays
+    /// f32-sized (the f16 view uses the first half of the bytes).
     pub fn store_kv_f16(
         &self,
         src: *mut std::ffi::c_void,
