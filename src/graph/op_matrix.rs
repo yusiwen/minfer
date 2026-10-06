@@ -133,6 +133,13 @@ fn backend_claims(tag: Backend, op: &Op) -> Result<bool, String> {
     if tag == Backend::METAL {
         #[cfg(target_os = "macos")]
         {
+            // Mirror the CUDA arm below: `MpsState::get()` stays `None` until
+            // something initializes the process-wide state, so without this the
+            // Metal column silently depends on *test order* — it ran on a device
+            // in a full-suite run and skipped in a filtered one (#317). The
+            // status/answer is read from the registry either way; this only makes
+            // the device state exist first.
+            crate::metal::MpsState::init();
             return match super::metal_backend::MetalBackend::new() {
                 Some(m) => Ok(super::backend_takes(&m, op, DType::F32)),
                 None => Err("no Metal device".into()),
@@ -808,6 +815,29 @@ fn matrix_cases_match_their_reference() {
         ran > 0,
         "no backend claimed any case — the matrix is not running"
     );
+    // #317: the Metal column's participation must not depend on test order. The
+    // `backend_claims` METAL arm now initializes the device state itself, so on a
+    // Mac with a device this run always reports at least one Metal PASS. If that
+    // init regresses, every Metal cell reports "no Metal device" and the suite
+    // looks green without touching the device at all — this catches that, while
+    // still tolerating a deliberate `MINFER_DISABLE_MPS` run.
+    #[cfg(target_os = "macos")]
+    {
+        // Initialize here too: if the `backend_claims` init regressed, the column
+        // above already reported SKIP (the device did not exist yet) and *this*
+        // call is what lets the assertion see the device and fire. It is a no-op
+        // when the harness initialized correctly.
+        crate::metal::MpsState::init();
+        if crate::metal::MpsState::get().is_some() {
+            assert!(
+                report
+                    .iter()
+                    .any(|l| l.contains("Metal") && l.contains("PASS")),
+                "the Metal column did not run although a device exists — the harness \
+                 must initialize MpsState itself, not inherit it from test order"
+            );
+        }
+    }
     assert!(
         fails.is_empty(),
         "op matrix failures:\n{}",

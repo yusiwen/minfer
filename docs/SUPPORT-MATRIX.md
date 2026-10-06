@@ -27,7 +27,10 @@ minfer supports GGUF v3 files with the following quantized weight types. The CPU
 (nt==1) and tiny small-od batches. The compute-graph `MetalBackend` dispatches
 these kernels **per op** (`quant_matmul_f32_on_gpu_buf`), so every quant type
 above runs on the GPU.
-² F32 weights (RMSNorm, biases) are supported on GPU but not for matmul.
+² F32 weights are supported on both GPUs: 1-D norms/biases through the norm kernels and 2-D matmul
+weights through CUDA's `launch_f32_f32_matmul` and Metal's `kernel_f32_f32_matmul`
+([#317](https://github.com/yusiwen/minfer/issues/317)). Before #317 an f32 weight on Metal had no
+arm and silently ran the Q4_0 kernel.
 ³ F16 has no block: 2 B per element, so there is no integer dot to run. The CPU
 dot is vectorized — AVX2 uses `F16C` (`_mm256_cvtph_ps`) and aarch64 uses
 baseline NEON `FCVTL` (`vcvt_f32_f16`) — with an f64 scalar oracle/fallback

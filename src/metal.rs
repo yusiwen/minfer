@@ -181,6 +181,8 @@ struct MpsStateInner {
     pl_q5_k_mm_f32: MetalComputePipelineState,
     // #164: f16 weights stay 2 B/element on the device (matmul + embed).
     pl_f16_f32: MetalComputePipelineState,
+    // #317: f32-weight matmul (parity with CUDA's `launch_f32_f32_matmul`).
+    pl_f32_f32: MetalComputePipelineState,
     pl_get_rows_q4_0: MetalComputePipelineState,
     pl_get_rows_f32: MetalComputePipelineState,
     pl_get_rows_q4_k: MetalComputePipelineState,

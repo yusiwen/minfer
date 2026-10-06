@@ -53,6 +53,7 @@ const SHADER_SOURCES: &[&str] = &[
     "src/metal/kernels/mul_mm_kq.metal",
     "src/metal/kernels/get_rows.metal",
     "src/metal/kernels/f16.metal",
+    "src/metal/kernels/f32.metal",
     "src/metal/kernels/norm_elementwise.metal",
     "src/metal/kernels/rope.metal",
     "src/metal/kernels/fa_parallel.metal",
