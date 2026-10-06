@@ -174,9 +174,22 @@ differs by platform:
 - **`FusedQkvNorm` is Metal-only.** Qwen3 decode on CUDA takes the unfused
   `QkNorm` path, which is numerically equivalent but issues more dispatches.
   Making CUDA fused is a Phase G / CUDA-verifiable ticket, not a correctness gap.
-- **`QkvBiasRopeStore` is CUDA-only.** On Metal the mixed-quant decode layers
-  keep the unfused bias+rope+store chain; the graph builder never emits the node
-  there (`metal_backend.rs`'s `false` arm is a design statement, not a gap).
+- **`QkvBiasRopeStore` is CUDA-only — a recorded decision ([#52](https://github.com/yusiwen/minfer/issues/52)),
+  not a gap.** It is the *mixed-quant* decode epilogue: q/k/v use different quant
+  types (so they cannot share `FusedQKV`'s single concat weight), so three separate
+  matmuls (no bias) feed one bias×3 + RoPE×2 + store×2 pass. CUDA fuses it (10
+  dispatches → 4 per layer, −6); Metal keeps the unfused chain and the graph builder
+  never emits the node there (`metal_backend.rs`'s `false` arm is a design statement).
+  Porting would save **6 dispatches per mixed-quant layer — 84 per decode token on
+  Qwen2.5-7B-Q4_K_M**, the realistic case, whose 14 of 28 layers carry `attn_v` as
+  Q6_K against Q4_K q/k — with **no numerical difference** (`supports_op` is a
+  build-time gate and the unfused chain is the reference). The whole forward's
+  host-encode is ~0.2 ms against a ~20 ms/token decode, so those 84 dispatches are a
+  sub-1% slice of decode time; the A/B of the *concat*-class fusion that removes more
+  dispatches (`MINFER_NO_FUSE_QKV=1`, −8 on the same 14 layers) sits within run-to-run
+  variance on `macbook (macOS 27.0.1, Apple M4 Pro)` (2026-10-06, five interleaved
+  `bench -p 0 -n 128 -r 4` pairs: 48.06 vs 46.49 t/s means, individual pairs crossing
+  zero), so a second kernel path and its bitwise gate are not earned by a ~1% ceiling.
 - **Interleaved RoPE is CPU-only.** Both loaders hard-code `NonInterleaved`
   today, so no shipped model hits this; a family that needs interleaved RoPE
   needs a loader change plus a CUDA kernel.

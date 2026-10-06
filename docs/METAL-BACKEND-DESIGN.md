@@ -239,7 +239,7 @@ Alongside the trait, `MetalBackend` exposes the capture helpers (`capture_split`
 | `FusedQKV`, `FusedQkvNorm`, `FusedFFN` | F32 |
 | `View`, `Reshape`, `Permute` | yes (identity copy) |
 | `Scale`, `Softmax`, `BatchMatMul` | no (vocabulary only) |
-| `QkvBiasRopeStore` | no — the mixed-quant decode epilogue is CUDA-only; on macOS the builder never emits it |
+| `QkvBiasRopeStore` | no — the mixed-quant decode epilogue is CUDA-only; on macOS the builder never emits it (the [#52](https://github.com/yusiwen/minfer/issues/52) recorded decision, with the dispatch arithmetic, is in `docs/SUPPORT-MATRIX.md`) |
 
 Two layers of checks are deliberately elsewhere:
 
