@@ -19,7 +19,7 @@ minfer supports GGUF v3 files with the following quantized weight types. The CPU
 | **Q6_K** | 6 | 210 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q8_0** | 8 | 34 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
 | **F16** | 16 | 2 B / 1 val | ✅³ | ✅³ | ✅⁴ | ✅⁵ |
-| **BF16** | 16 | 2 B / 1 val | ✅⁶ | — | ❌⁷ | ❌⁷ |
+| **BF16** | 16 | 2 B / 1 val | ✅⁶ | — | ✅⁷ | ❌⁸ |
 | **F32** | 32 | 4 B / 1 val | ✅ | — | ✅² | ✅² |
 
 ¹ Metal prefill uses a simdgroup GEMM for every quant type (dispatched when
@@ -71,12 +71,34 @@ no separate SIMD kernel to mark in the AVX2 column (the dot itself is the
 vectorized `vec_dot_f32`). `minfer convert --outtype bf16` writes 2-D bf16 /
 1-D f32 and is byte-identical to `llama-quantize --pure <f32>.gguf … BF16`
 (docs/GGUF-TOOLING.md §4.1.1).
-⁷ **CUDA and Metal do not register bf16** (`models::weight_reg::cuda_weight_reg`
-answers `None` and neither loader's device branch admits the type), so a bf16
-GGUF drops to the CPU through the loader's all-or-nothing check — loudly, with
-its "weights are not usable there — running on CPU" line, never a silent wrong
-path. The device bf16 path is
-[#208](https://github.com/yusiwen/minfer/issues/208).
+⁷ CUDA registers the raw 2 B/element bf16 words and promotes in-register —
+`bf16_f32_matmul_vec` / `_scalar` (the `uint4` word load split by a `bits << 16`
+shift, the f16 pair's exact sibling) and `embed_rows_bf16` — selected by the
+`TensorType::BF16` arms of `matmul_f32_ptr_layout` / `embed_rows_on_gpu`
+([#208](https://github.com/yusiwen/minfer/issues/208), the **CUDA half**;
+[#141](https://github.com/yusiwen/minfer/issues/141) is the f16 template). The
+decode is **exact** (`f32::from_bits(bits << 16)`), so unlike the quantized types
+there is no rounding at all; the weights stay half width on the device — no
+registration-time f32 copy — and, like f16, a bf16 prefill runs the
+f32-activation kernel, not the int8 MMQ GEMM (MMQ streams quantized bytes and
+bf16 is not one of its formats). Both loaders admit the type through the shared
+`models::weight_reg::cuda_weight_reg` rule, so `weights_on_cuda`'s all-or-nothing
+check passes for **both** supported architectures and the graph's `BF16` matmul /
+embed nodes are assigned `Backend::CUDA`; 1-D norms/biases stay f32 (the file
+contract above). bf16 does not fuse: `cuda::concat_rows` has no 2 B/element arm,
+so the `attn_qkv` / `ffn_gu` concat copies are not registered and the unfused
+matmul chain runs. Measured on a GB10 (2026-10-06, `dgxspark`): a 0.5B bf16 GGUF
+registers 942.4 MiB of device weights (the same number as its f16 twin, i.e. the
+2 B/element claim is real), 169 bf16 matmul + 1 embed nodes on CUDA, device-vs-CPU
+max |Δlogit| **7.82e-5** absolute / **4.24e-6** relative (bar 0.01 / 1e-3) with an
+identical greedy continuation `[12095, 13, 1084, 374]`.
+⁸ **Metal does not register bf16**: the Metal branch of each loader registers
+`matches!(ttype, F32 | F16)` only, so a bf16 GGUF on a Metal build still drops to
+the CPU through the loader's all-or-nothing check — loudly, with its "weights are
+not usable there — running on CPU" line, never a silent wrong path. That is
+[#208](https://github.com/yusiwen/minfer/issues/208)'s **Metal half**, a separate
+later PR that needs `kernel_bf16_f32_matmul` + `kernel_get_rows_bf16` beside the
+#164 f16 pair.
 
 **CUDA notes**: prefill (`nt ≥ 16`) runs the default int8 tensor-core MMQ path
 for the common quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K via the f16-wmma GEMM,

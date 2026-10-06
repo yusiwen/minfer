@@ -8892,6 +8892,67 @@ arithmetic exercised through the pure path, and the device arm is run here on GB
 `norm_weight` change adds one size lookup per norm node at execute time; no timing was measured and
 none is claimed.
 
+#### F6f — bf16 weights on the CUDA device, CUDA half (#208, 2026-10-06)
+
+**What landed.** The device half of the second 2 B/element dtype, mirroring #141/#164 exactly:
+`bf16_f32_matmul_vec` / `bf16_f32_matmul_scalar` / `embed_rows_bf16` in
+`src/cuda/kernels/ops_misc.cu` (plus the `b2f` helper in `common.cuh`), selected by the new
+`TensorType::BF16` arms of `CudaState::matmul_f32_ptr_layout` / `embed_rows_on_gpu`; the raw
+registration arm in `models::weight_reg::cuda_weight_reg`; and the type gate in both
+`Qwen2Graph::weights_on_cuda` / `Qwen3Graph::weights_on_cuda` lists. The design decision — **its own
+kernel, no flag on the f16 one** — is argued in `docs/CUDA-BACKEND-DESIGN.md` §4.4: bf16 is f32's top
+16 bits, so the promotion is a `bits << 16` shift the vec kernel performs on one `uint4` per 8
+elements, materially cheaper than `__half22float2`, and a flag would put a per-element branch in the
+hottest device kernel. Registering raw keeps the 2 B/element claim: the 0.5B bf16 file registers
+**942.4 MiB** of device weights, the same number its f16 twin reports (a dequantized copy would be
+~1.9 GiB). bf16 never enters the int8 MMQ GEMM (not a quantized format) and it does not fuse:
+`cuda::concat_rows` has no 2 B/element arm, so `blk.{i}.attn_qkv` / `blk.{i}.ffn_gu` are not
+registered and the census is the unfused 169 matmul + 1 embed shape. **Metal's arm is deliberately
+untouched** (`matches!(ttype, F32 | F16)`), so a bf16 GGUF on a Metal build still drops to the CPU
+loudly; that half is the ticket's second PR.
+
+**Verification (rule 5 numbers).** `dgxspark (aarch64, GB10 sm_121)`, 2026-10-06, in the worktree:
+
+| Command | Result |
+|---|---|
+| `cargo build --release --features cuda` | exit 0, warning-free (`deny(warnings)` off-test) |
+| `cargo build --release` | exit 0, warning-free |
+| `scripts/cuda_test.sh` | **570 / 0 / 45** (was 567 / 0 / 42) |
+| `cargo test --release` | **482 / 0 / 39** unit + **10 / 0 / 6** integration (was 481 / 0 / 36) |
+| `FEATURES=cuda scripts/real_model_gates.sh` (0.5B) | **45 / 0** (was 42 / 0) |
+| `FEATURES=cuda MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf scripts/real_model_gates.sh` | **45 / 0** (was 42 / 0) |
+| `PARALLEL=0 scripts/real_model_gates.sh` (CPU) | **39 / 0** (was 36 / 0) |
+| `python3 scripts/check_{source_layout,dead_code_annotations,dead_code_oracle --config cpu,dead_code_oracle --config cuda,doc_line_anchors,docs_links,status --check}.py` | exit 0 each (`check_doc_line_anchors` still prints its two pre-existing unused freezes) |
+| `cargo fmt --all --check` | clean |
+
+The fixture is `minfer convert --outtype bf16 ~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct
+/tmp/f6-work/f208/f208-bf16.gguf` (994 156 352 bytes; `minfer quantize` has no bf16 encoder), and the
+gate takes it from `$MINFER_F208_BF16_GGUF` or converts the cached checkpoint itself.
+
+**The bar, named before measuring.** Both arms read the *same* bf16 weights, so weight precision is
+not part of the device-vs-CPU difference at all — it is accumulation order plus the attention
+exp/softmax kernel (graph rule §9), the same class as #141's f16 measurement (7.34e-5 / 4.0e-6) and
+#142's CPU bf16-vs-f16 record (2.29e-5 / 1.24e-6). Stated bound: **max |Δlogit| ≤ 0.01 and max
+relative ≤ 1e-3, greedy continuation identical**. Measured: **7.82e-5 absolute / 4.24e-6 relative**,
+greedy `[12095, 13, 1084, 374]` on both arms (the same continuation #142 recorded for the CPU).
+
+**Mutation evidence (rule 3), each reverted.**
+
+| Mutation | Gate | Result |
+|---|---|---|
+| `cuda_weight_reg`'s BF16 arm disabled (`if false && ttype == TensorType::BF16`) | `f208_bf16_weights_run_on_the_cuda_device` | FAILED at the placement assertion: `left: Cpu, right: Cuda`, with the loader's own `CUDA GATE: weight 'f208:token_embd.weight' (type BF16) has no CUDA kernel or is not registered` + "running on CPU" lines — the all-or-nothing gate really is what routes the model |
+| the BF16 arm of `matmul_f32_ptr_layout` calls `launch_f16_f32_matmul` instead | `cuda_bf16_matmul_matches_the_exact_shift_reference` | FAILED on the first element: `bf16 matmul [0,0] (od=10 id=64 nt=3): got 1.875 want 1` (an f16 misread of the same words) |
+| both | — | reverted; `sha256sum -c` of the two files matches the pre-mutation hashes, and the gates are green again |
+
+**Honest scope.** (a) The device gates are `#[ignore]`d and device-only — CI has no GPU, so its only
+half is the compile check in `build-linux-cuda` plus the pure `cuda_weight_reg` unit test. (b) The
+**Metal half is not in this PR**: no Metal registration arm, no Metal kernel, no Metal claim — a bf16
+GGUF on a Metal build still drops to the CPU loudly, by construction. (c) The real-model gate is the
+0.5B (Qwen2) only; Qwen3-bf16 would need a second converted checkpoint (the `weights_on_cuda` arm is
+added to both architectures and is covered by the pure unit test, but no device run exercises a bf16
+Qwen3 file). (d) bf16 is unfused and non-MMQ by construction, so this PR measures the f32-activation
+path only; no prefill-GEMM or fused-node bf16 census is claimed.
+
 ## 10. Phase G — Metal alignment round (**scheduled**; device claims need a Mac)
 
 Metal is a first-class target — it is the default backend on macOS and a plain
@@ -8916,6 +8977,7 @@ split is backend-agnostic and Metal's pool already ran through it.
 | G5 | C1/C2/E1 | Port the cell store, the KV removal/shift and the explicit attention span to Metal (`supports_attn_span()` becomes true; today `copy_kv_to_cpu` has no Metal arm, so a Metal session re-renders instead of shifting, and a multi-sequence batch is refused outright) · [#44](https://github.com/yusiwen/minfer/issues/44) | **landed** on a Mac (2026-10-06), both halves. **(a) read side** — `kernel_gqa_attn_window_f32/_f16` (`src/metal/kernels/attn_window.metal`) reads the one-range `attn_span` window for `nt == 1` and `nt > 1` at both KV widths, the `Op::Attn` arm selects the mode by the window input's *size* (causal / span / a refused map) and `supports_attn_span()` is true; the causal kernels are byte-untouched (PR [#313](https://github.com/yusiwen/minfer/pull/313)). **(b) write/move side** (PR [#316](https://github.com/yusiwen/minfer/pull/316)) — `Backend::copy_cells` moves rows one at a time with `MTLBlitCommandEncoder` in the overlap-safe order (both directions; f16 halves the stride), `GraphAllocator::copy_kv_to_cpu` reads through the registry `host_read` hook after flushing the split (so a Metal session shifts/saves instead of re-rendering), `MetalBackend` holds a per-engine `kv_format` (the process-wide `KV_F16`/`kv_cache_is_f16`/`set_kv_cache_type` are deleted) and `batch_mode(Metal)` follows the device. The packed `q8_0` read stays refused ([#310](https://github.com/yusiwen/minfer/issues/310)) and a physical shift of an f16 region refuses loudly ([#306](https://github.com/yusiwen/minfer/issues/306), CUDA exposed too). Records: `docs/METAL-BACKEND-DESIGN.md` §4.4.2; gates `metal_copy_cells_moves_overlapping_rows_in_both_directions` / `metal_f16_kv_cell_move_strides_by_row_bytes` / `metal_kv_format_is_per_engine` / `metal_copy_kv_to_cpu_reads_after_the_pending_split`, the Metal arms of `a_compaction_between_steps_keeps_the_continuation` / `kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class` / `reused_cache_across_prompts_matches_a_fresh_cache` and `a_long_prefill_keeps_another_slot_decoding`, plus `metal_attn_span_*` |
 | G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` · [#52](https://github.com/yusiwen/minfer/issues/52) | **landed** on a Mac (2026-10-06): the decision is **keep the refusal** — the mixed-quant epilogue port would save 6 dispatches per mixed layer (10 → 4), **84/token** on Qwen2.5-7B-Q4_K_M (14/28 layers carry `attn_v` as Q6_K against Q4_K q/k), with no numerical difference and a sub-1% time ceiling, so the asymmetry is recorded instead of closed; record in `docs/SUPPORT-MATRIX.md` (PR [#318](https://github.com/yusiwen/minfer/pull/318)) |
 | G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool · [#53](https://github.com/yusiwen/minfer/issues/53) | **landed** on a Mac (2026-10-05): the allocator split was already backend-agnostic (E4 S3), so the delta is Metal's `DeviceMemory` answer (`recommendedMaxWorkingSetSize`) — record under the E4 record |
+| G9 | F6/#49 | bf16 weight matmul + embedding kernels on **CUDA** (a bf16 GGUF runs on the CUDA device instead of falling to the CPU) · [#208](https://github.com/yusiwen/minfer/issues/208) | **CUDA half landed** on `dgxspark (aarch64, GB10 sm_121)` (2026-10-06): `bf16_f32_matmul_vec` / `bf16_f32_matmul_scalar` / `embed_rows_bf16` (`src/cuda/kernels/ops_misc.cu`, with `b2f` in `common.cuh`) are the f32-activation matmul pair and the embedding gather, selected by the `TensorType::BF16` arms of `matmul_f32_ptr_layout` / `embed_rows_on_gpu`; `models::weight_reg::cuda_weight_reg` gained the BF16 raw arm and both loaders' CUDA branch admits the type through that one shared rule, while **Metal's arm stays `F32 | F16`** (its half is owed). bf16 registers 2 B/element with no f32 copy and never enters the MMQ GEMM; `cuda::concat_rows` has no 2 B/element arm, so bf16 runs the unfused matmul chain. The Metal half is [#208](https://github.com/yusiwen/minfer/issues/208)'s second PR (needs `kernel_bf16_f32_matmul` + `kernel_get_rows_bf16`). Record under `docs/SUPPORT-MATRIX.md` (the BF16 row is ✅ on CUDA, ❌ on Metal) and `AGENTS.md`'s bf16 bullet; gates `cuda_bf16_matmul_matches_the_exact_shift_reference` / `cuda_bf16_embed_gather_matches_the_exact_shift_reference` (kernel-exact, non-ignored, bitwise against `f32::from_bits(bits << 16)`) and the ignored real-model gate `f208_bf16_weights_run_on_the_cuda_device` (169 bf16 matmul + 1 embed nodes all assigned `Backend::CUDA`, 942.4 MiB of device weights, greedy identical, max |Δlogit| 7.82e-5 / 4.24e-6 relative against the bar 0.01 / 1e-3; PR [#320](https://github.com/yusiwen/minfer/pull/320)) |
 | G7 | METAL-OBJ | Re-run the Metal gap/parity measurements after G2–G3 (and again after G5), since each changes a kernel path · [#54](https://github.com/yusiwen/minfer/issues/54) | last |
 | G8 | F6/#49 | f16 weight matmul + embedding kernels on Metal (an f16 GGUF runs on the device instead of falling to the CPU) · [#164](https://github.com/yusiwen/minfer/issues/164) | **landed** on a Mac (2026-10-06): `kernel_f16_f32_matmul` + `kernel_get_rows_f16` (`src/metal/kernels/f16.metal`, listed in `build.rs`'s `SHADER_SOURCES`) are the f32-activation matmul and the embedding gather, selected by the `TensorType::F16` arms of `quant_matmul_f32_on_gpu_buf` / `embed_tokens_gpu` through the new `pl_f16_f32` / `pl_get_rows_f16` pipelines; both loaders' Metal branch registers raw 2 B/element f16 (`matches!(ttype, F32 | F16)`), so `weights_on_gpu` passes and `Qwen2Model::device()`/`Qwen3Model::device()` answer `Device::Metal` — no registration-time f32 copy, and (like CUDA) an f16 prefill runs the f32-activation kernel, not a simdgroup GEMM. Record under `docs/SUPPORT-MATRIX.md` (the F16 row is ✅ on Metal) and `AGENTS.md`'s f16 bullet; gates `f16_matmul_matches_the_exact_integer_reference` / `f16_embed_gather_matches_the_reference` (kernel-exact, non-ignored) and the ignored real-model gates `f164_f16_weights_run_on_the_metal_device` / `..._qwen3` (169+1 / 197+1 f16 nodes all assigned `Backend::METAL`, greedy identical, max |Δlogit| 2.4e-3 / 7.9e-3 against the bar 0.05; PR [#319](https://github.com/yusiwen/minfer/pull/319)) |
 | G9 | #317 | f32-weight matmul on Metal — `quant_matmul_f32_on_gpu_buf` had no `F32` arm, so an f32 weight hit the catch-all `_` arm (`kernel_q4_0_f32_matmul`, which reads the f32 bytes as Q4_0 blocks and writes zeros); the order-dependent `graph::op_matrix::matrix_cases_match_their_reference` was the only reporter because its Metal column only ran when an earlier test had initialized `MpsState` · [#317](https://github.com/yusiwen/minfer/issues/317) | **landed** on a Mac (2026-10-06): `kernel_f32_f32_matmul` (`src/metal/kernels/f32.metal`, the `pl_f32_f32` pipeline) is dispatched by the new `TensorType::F32` arm (CUDA parity: `launch_f32_f32_matmul`), and op_matrix's Metal arm calls `MpsState::init()` like the CUDA arm — so the column no longer depends on test order — record in `docs/METAL-BACKEND-DESIGN.md` §4.4 and `docs/SUPPORT-MATRIX.md` footnote 2; gates `metal_matmul_f32_matches_cpu` and the device-present assertion in `matrix_cases_match_their_reference` (PR [#320](https://github.com/yusiwen/minfer/pull/320)) |
