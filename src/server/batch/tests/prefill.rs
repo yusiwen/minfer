@@ -170,12 +170,17 @@ fn a_chunked_prefill_answers_like_an_unchunked_one() {
     assert!(!chunked.is_empty(), "the chunked run produced no text");
     // The comparison class is the repo's standing one: **bitwise** on CPU (its
     // kernels are per-token, so shape never enters the arithmetic) and a named
-    // tolerance on CUDA, whose prefill tiles by `nt` and quantizes activations to
-    // int8 — the same tokens at a different width land on different scores
-    // (measured <= 0.37 absolute on this repo's fixtures; 1.0 is the gross-error
-    // bound `cross_shape_tolerance` uses). The *continuation* is asserted only on
-    // CPU: on a degenerate repeated-token prompt a sub-tolerance logit shift can
-    // flip an argmax, which is a fact about the prompt, not about chunking.
+    // tolerance on a device, whose prefill tiles by `nt` — the same tokens at a
+    // different width land on different scores. CUDA quantizes activations to
+    // int8 (measured <= 0.37 absolute; 1.0 is the gross-error bound
+    // `cross_shape_tolerance` uses). Metal reads f32 but its prefill GEMM and
+    // flash attention reduce in a different block order per `nt`; the class is
+    // the same one `cross_shape_tolerance` names for Metal (0.1, observed
+    // <= 0.0153 there). Named before this gate's re-measurement; the measured
+    // drift is 0.0087 (0.5B) / 0.0078 (Qwen3-0.6B). The *continuation* is
+    // asserted only on CPU: on a degenerate repeated-token prompt a
+    // sub-tolerance logit shift can flip an argmax, which is a fact about the
+    // prompt, not about chunking.
     assert_eq!(
         plain_logits.len(),
         chunked_logits.len(),
@@ -196,7 +201,23 @@ fn a_chunked_prefill_answers_like_an_unchunked_one() {
             false
         }
     };
-    let tol = if on_cuda { 1.0 } else { 0.0 };
+    let on_metal = {
+        #[cfg(target_os = "macos")]
+        {
+            crate::metal::MpsState::get().is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    };
+    let tol = if on_cuda {
+        1.0
+    } else if on_metal {
+        0.1
+    } else {
+        0.0
+    };
     let agree = plain
         .bytes()
         .zip(chunked.bytes())
@@ -210,7 +231,7 @@ fn a_chunked_prefill_answers_like_an_unchunked_one() {
         worst <= tol,
         "chunking moved the prefill's logits by {worst} (class {tol})"
     );
-    if !on_cuda {
+    if !on_cuda && !on_metal {
         assert_eq!(
             plain, chunked,
             "chunking changed the continuation (must be bitwise on CPU)"
