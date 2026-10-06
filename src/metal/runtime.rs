@@ -152,6 +152,8 @@ impl MpsState {
             let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
             // #164: f16 weight matmul + embedding gather (Metal twin of #141).
             let pl_f16_f32 = get_pl("kernel_f16_f32_matmul")?;
+            // #317: f32 weight matmul (twin of CUDA's `launch_f32_f32_matmul`).
+            let pl_f32_f32 = get_pl("kernel_f32_f32_matmul")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_get_rows_f32 = get_pl("kernel_get_rows_f32")?;
             let pl_get_rows_q4_k = get_pl("kernel_get_rows_q4_k")?;
@@ -227,6 +229,7 @@ impl MpsState {
                 pl_q5_k_f32_multi,
                 pl_q5_k_mm_f32,
                 pl_f16_f32,
+                pl_f32_f32,
                 pl_get_rows_q4_0,
                 pl_get_rows_f32,
                 pl_get_rows_q4_k,

@@ -288,8 +288,9 @@ supported quant type has the tiers that matter. Guards: K-quant `id % 256 != 0` 
 `gpu_abort`; the GEMM checks the threadgroup-memory request against the device limit queried at
 init. `MINFER_GEMM=0` disables the GEMM tier for A/B.
 
-**f16 weights run on the device (#164, landed on a Mac 2026-10-06).** The tiers above exist for f32
-and the quantized types; f16 now has its own arm. The loader registers `TensorType::F16` raw (2
+**f16 weights run on the device (#164, landed on a Mac 2026-10-06).** The tiers above exist for
+the quantized types; f16 and f32 have their own single-token arms. The loader registers
+`TensorType::F16` raw (2
 B/element — no registration-time f32 copy) via the Metal branch's `matches!(ttype, F32 | F16)`, and
 `quant_matmul_f32_on_gpu_buf`'s `TensorType::F16` arm dispatches `kernel_f16_f32_matmul`
 (`src/metal/kernels/f16.metal`), a f32-activation matmul that promotes each `half` weight in-register
@@ -304,6 +305,19 @@ type was refused here — registering a weight type a kernel cannot consume woul
 claim true while the op silently ran the wrong (or no) kernel, exactly what the registration gate
 exists to prevent. A second 2 B/element dtype (bf16, [#208](https://github.com/yusiwen/minfer/issues/208))
 slots in the same way. Per `docs/SUPPORT-MATRIX.md`, `f16` is now on both device columns.
+
+**f32 weights run on the device too (#317, landed on a Mac 2026-10-06).** The loader's
+`matches!(ttype, F32 | F16)` branch registers an f32 2-D weight raw (4 B/element), and
+`quant_matmul_f32_on_gpu_buf`'s `TensorType::F32` arm dispatches `kernel_f32_f32_matmul`
+(`src/metal/kernels/f32.metal`, the `pl_f32_f32` pipeline) — the f32 twin of the f16 kernel and the
+peer of CUDA's `launch_f32_f32_matmul`. Before #317 an f32 weight had no arm and hit the catch-all
+`_` arm (the Q4_0 kernel): `kernel_q4_0_f32_matmul` reads the f32 bytes as Q4_0 blocks (the first two
+bytes of `1.0f32` are `0x0000`, an f16 scale of 0) and writes zeros. The gap was invisible because
+the reporting test, `graph::op_matrix::matrix_cases_match_their_reference`, only ran its Metal column
+when some earlier test in the process had already initialized `MpsState`; its Metal arm now calls
+`MpsState::init()` explicitly, exactly as its CUDA arm calls `CudaState::init()`, so the column no
+longer depends on test order. That silent-wrong-kernel fallback is the registration-gate failure the
+f16 paragraph above describes, and `docs/SUPPORT-MATRIX.md`'s footnote 2 is updated to match.
 
 **Aliasing.** Only `Silu`, `RoPE` and the view ops call `copy_in(dst, src)`, and only when the
 allocator did *not* alias them; an aliased node runs its in-place kernel directly on `out_buf`.

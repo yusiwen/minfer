@@ -446,6 +446,39 @@ impl MpsCommandBuffer<'_> {
                     self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
                 }
             }
+            TensorType::F32 => {
+                // #317: f32 weight rows × f32 activations. Before this arm an
+                // F32 weight fell through to `_ =>`, which dispatches the Q4_0
+                // kernel — it reads the f32 bytes as Q4_0 blocks (the first two
+                // bytes of 1.0f32 are 0x0000, an f16 scale of 0) and writes
+                // zeros. CUDA has the same arm (`launch_f32_f32_matmul`), so this
+                // is device parity, and `docs/SUPPORT-MATRIX.md`'s MatMul row
+                // already treats F32 weights as a device input.
+                self.enc.setComputePipelineState(&*self.state.pl_f32_f32);
+                unsafe {
+                    self.enc
+                        .setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize)
+                };
+                unsafe {
+                    self.enc
+                        .setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize)
+                };
+                unsafe {
+                    self.enc
+                        .setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize)
+                };
+                let mm_p = [od as i32, id as i32, nt as i32];
+                unsafe {
+                    self.enc.setBytes_length_atIndex(
+                        NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void)
+                            .unwrap(),
+                        (12) as usize,
+                        (3) as usize,
+                    )
+                };
+                // Same geometry as the f16 arm: NR0*NSG = 8 rows / threadgroup.
+                self.dispatch_2d(((od + 7) / 8) as u64, 1, 32, 2);
+            }
             TensorType::F16 => {
                 // #164: f16 weight rows × f32 activations; the weights stay 2
                 // B/element on the device (no registration-time f32 copy). A

@@ -326,6 +326,76 @@ fn metal_matmul_q8_matches_cpu() {
     );
 }
 
+/// #317: an F32 weight matmul on Metal must use the f32 kernel, not the Q4_0
+/// fallback. Before the fix `quant_matmul_f32_on_gpu_buf` had no `F32` arm, so an
+/// F32 weight hit the catch-all `_` arm — `kernel_q4_0_f32_matmul` reading the f32
+/// bytes as Q4_0 blocks (the first two bytes of `1.0f32` are `0x0000`, an f16
+/// scale of 0) and writing zeros. This drives the production graph path and
+/// compares it against the CPU f32 matmul (`vec_ops::mat_mul_f32`).
+#[test]
+fn metal_matmul_f32_matches_cpu() {
+    let _g = crate::metal::metal_test_lock();
+    crate::metal::MpsState::init();
+    let Some(_b) = MetalBackend::new() else {
+        eprintln!("MPS unavailable; skipping");
+        return;
+    };
+    let od = 64usize;
+    let inn = 128usize;
+    let wf: Vec<f32> = (0..od * inn)
+        .map(|i| ((i * 2654435761) % 1000) as f32 / 500.0 - 1.0)
+        .collect();
+    let wt = f32t("w", [inn as i64, od as i64, 1, 1], wf);
+    crate::metal::MpsState::get()
+        .unwrap()
+        .register_weight("w", wt.data());
+
+    let nt = 4usize;
+    let xd: Vec<f32> = (0..inn * nt)
+        .map(|i| ((i * 1103515245) % 997) as f32 / 500.0 - 1.0)
+        .collect();
+
+    let mut gb = GraphBuilder::new();
+    let x = gb.input("x", [inn, nt, 1, 1], DType::F32);
+    let m = gb.matmul(x, &wt, None);
+    gb.output(m);
+    let g = gb.build();
+
+    // CPU reference (the production f32 matmul path).
+    let mut ca = GraphAllocator::new();
+    ca.register_weight("w", wt.clone());
+    ca.alloc_graph(&g).unwrap();
+    ca.fill_input(&g, "x", &xd).unwrap();
+    BackendScheduler::new().execute(&g, &mut ca).unwrap();
+    let expect = ca.get_buffer(&g, m).unwrap().to_vec();
+
+    // Metal
+    let mut g2 = g.clone();
+    for n in &mut g2.nodes {
+        n.backend = Some(Tag::METAL);
+    }
+    let mut alloc = GraphAllocator::new();
+    alloc.enable_metal();
+    alloc.alloc_graph(&g2).unwrap();
+    alloc.fill_input(&g2, "x", &xd).unwrap();
+    BackendScheduler::new().execute(&g2, &mut alloc).unwrap();
+    let got = alloc.copy_to_cpu(m).unwrap();
+
+    // Bar named before measuring: the two f32 paths differ only in accumulation
+    // order, so a relative 1e-4 tolerance is generous — the pre-fix all-zero
+    // output is O(1) off.
+    let mut maxd = 0.0f32;
+    for i in 0..got.len() {
+        let d = (got[i] - expect[i]).abs() / (1.0 + expect[i].abs());
+        maxd = maxd.max(d);
+    }
+    eprintln!("[matmul f32] Metal vs CPU max rel diff {maxd:.3e}");
+    assert!(
+        maxd < 1e-4,
+        "f32 matmul Metal diverges from CPU: {maxd:.3e}"
+    );
+}
+
 /// rms_norm at REAL scale (d=896, nt=8, like attn_norm) Metal vs CPU.
 #[test]
 fn metal_rmsnorm_real_scale() {
