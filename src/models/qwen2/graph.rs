@@ -866,11 +866,11 @@ impl Qwen2Graph {
     /// the weights the graph executes, now INCLUDING `tok_embd` (7e③ gave the
     /// embedding a device gather+dequant kernel — the exclusion was removed).
     /// Two conditions per weight: registered on the CUDA registry, and a type
-    /// with the matching kernel — matmuls cover Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and
-    /// the K-quants, embed gathers every type EXCEPT Q4_1 (no embed kernel).
-    /// The loader registers some unsupported types for the legacy path, so the
-    /// type check is required here. Norm/bias weights are f32 and only need
-    /// registration.
+    /// with the matching kernel — matmuls cover Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, the
+    /// K-quants and the 2 B/element f16/bf16 weights; embed gathers every type
+    /// EXCEPT Q4_1 (no embed kernel). The loader registers some unsupported
+    /// types for the legacy path, so the type check is required here.
+    /// Norm/bias weights are f32 and only need registration.
     #[cfg(feature = "cuda")]
     fn weights_on_cuda(model: &Qwen2Model) -> bool {
         use crate::tensor::TensorType;
@@ -882,6 +882,12 @@ impl Qwen2Graph {
                 | TensorType::Q6_K
                 | TensorType::F32
                 | TensorType::F16
+                // #208 (CUDA half): the loader registers bf16 raw and
+                // `bf16_f32_matmul_vec` / `_scalar` are its device kernels. Both
+                // supported architectures list it (qwen3's twin below), because
+                // the shared registration rule (`models::weight_reg`) admits it
+                // for both.
+                | TensorType::BF16
                 | TensorType::Q5_1
                 | TensorType::Q5_K)
                 && cuda.has_weight_of_size(&t.name, t.data().len())
@@ -899,6 +905,8 @@ impl Qwen2Graph {
                 | TensorType::Q5_0
                 | TensorType::Q6_K
                 | TensorType::F16
+                // #208 (CUDA half): `embed_rows_bf16` is the device gather.
+                | TensorType::BF16
                 | TensorType::Q5_1
                 | TensorType::Q5_K)
                 && cuda.has_weight_of_size(&t.name, t.data().len())

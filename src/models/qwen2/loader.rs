@@ -244,6 +244,12 @@ fn load_tensor(
                 // matmul/embed kernels promote in-register, so an f16 norm can
                 // never reach a `d*2` buffer (1-D tensors stay f32 per the file
                 // contract). The F32 arm is the norms/biases.
+                //
+                // #208 deliberately does **not** add `TensorType::BF16` here: the
+                // Metal half of the bf16 ticket is a separate, later delegation
+                // (it needs `kernel_bf16_f32_matmul` + `kernel_get_rows_bf16`),
+                // so until that lands a bf16 GGUF on a Metal build still drops to
+                // the CPU loudly through the all-or-nothing gate.
                 mps.register_weight(&reg_name, tensor.data());
                 device_bytes.set(device_bytes.get() + tensor.data().len());
             }
@@ -256,6 +262,8 @@ fn load_tensor(
             // for the dispatch and for why the q4_K `W_dsc` plane (r59/#165) and the
             // f16 arm (#141) live there instead of in a per-loader copy. The failure
             // mode this closes is real: the two copies had already drifted twice.
+            // #208 adds `TensorType::BF16` to that same shared rule (the CUDA half
+            // only; the Metal arm above stays `F32 | F16` until its own ticket).
             crate::models::weight_reg::register_cuda_weight(
                 cuda,
                 &reg_name,

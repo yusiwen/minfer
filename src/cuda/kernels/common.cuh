@@ -98,6 +98,17 @@ static __device__ __forceinline__ float h2f(uint16_t h) {
     return __half2float(*reinterpret_cast<const __half*>(&h));
 }
 
+// ─── Helper: bf16 → f32 (#208) ───────────────────────────────
+// bf16 is f32's **top** 16 bits: the decode is a left shift of the raw word
+// with the low 16 bits cleared, and it is exact for every value (no rounding,
+// no bias, and a NaN payload survives as a NaN). This is the same expression
+// the CPU path uses (`crate::block::bf16_to_f32` == `f32::from_bits(bits << 16)`),
+// which is what makes the kernel-level exactness gate a bitwise comparison
+// rather than a tolerance.
+static __device__ __forceinline__ float b2f(uint16_t b) {
+    return __uint_as_float(static_cast<unsigned>(b) << 16);
+}
+
 // ─── Helper: unpack Q4_K 6-bit scale and min ────────────────
 // Q4_K stores 16 × 6-bit values (8 scales + 8 mins) packed into 12 bytes.
 // This mirrors Metal's get_scale_min_k4 and Rust block.rs::unpack_q4k_scales.
