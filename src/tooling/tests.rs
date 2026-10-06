@@ -8,6 +8,7 @@ mod f141_device;
 mod f164_metal;
 mod f167_qwen3;
 mod f16_encode;
+mod f208_device;
 mod f6_roundtrip;
 mod parse;
 mod quantize_bounds;
