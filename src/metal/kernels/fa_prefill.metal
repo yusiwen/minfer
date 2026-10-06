@@ -6,7 +6,10 @@
 // with two GPU-safety deviations: the causal mask is computed inline (no
 // mask/pad pre-pass kernels), and the PARTIAL last KV block (nkv % 64 != 0) is
 // read from the [2][64][nkt] tail-pad buffer filled by kernel_kv_tail_pad
-// (padded rows are zero + masked to -MINF, so they never contribute).
+// (padded rows are zero + masked to -MINF, so they never contribute). The
+// partial block covers `[ic, ic + C)` (pos0 = ic) — NOT the last C rows
+// (`nkv - C`): that window overlaps the previous full block when
+// `nkv % C != 0 && nkv > C`, and the online softmax double-counts the overlap.
 //
 // shmem (7168 B): sq[512 half] | so[512 f32] | ss[1024 f32]
 kernel void kernel_flash_attn_blk_f32(
@@ -88,7 +91,7 @@ kernel void kernel_flash_attn_blk_f32(
     for (int ic0 = 0; ic0 < nblk; ++ic0) {
         const int ic = ic0 * C;
         const bool partial = (ic + C > nkv);
-        const int pos0 = partial ? (nkv - C) : ic;
+        const int pos0 = ic;
         // K/V source: direct cache rows (K at ic*nkt + head hoff) or the tail pad.
         device const float * ksrc = partial ? (pad + hoff) : (k + ic * nkt + hoff);
         device const float * vsrc = partial ? (pad + C * nkt + hoff) : (v + ic * nkt + hoff);
@@ -266,7 +269,7 @@ kernel void kernel_flash_attn_blk_f16(
     for (int ic0 = 0; ic0 < nblk; ++ic0) {
         const int ic = ic0 * C;
         const bool partial = (ic + C > nkv);
-        const int pos0 = partial ? (nkv - C) : ic;
+        const int pos0 = ic;
         device const half * ksrc = partial ? (pad + hoff) : (k + ic * nkt + hoff);
         device const half * vsrc = partial ? (pad + C * nkt + hoff) : (v + ic * nkt + hoff);
 
@@ -447,7 +450,7 @@ kernel void kernel_flash_attn_blk_hd128_f32(
     for (int ic0 = 0; ic0 < nblk; ++ic0) {
         const int ic = ic0 * C;
         const bool partial = (ic + C > nkv);
-        const int pos0 = partial ? (nkv - C) : ic;
+        const int pos0 = ic;
         // K/V source: direct cache rows (K at ic*nkt + head hoff) or the tail pad.
         device const float * ksrc = partial ? (pad + hoff) : (k + ic * nkt + hoff);
         device const float * vsrc = partial ? (pad + C * nkt + hoff) : (v + ic * nkt + hoff);
@@ -627,7 +630,7 @@ kernel void kernel_flash_attn_blk_hd128_f16(
     for (int ic0 = 0; ic0 < nblk; ++ic0) {
         const int ic = ic0 * C;
         const bool partial = (ic + C > nkv);
-        const int pos0 = partial ? (nkv - C) : ic;
+        const int pos0 = ic;
         device const half * ksrc = partial ? (pad + hoff) : (k + ic * nkt + hoff);
         device const half * vsrc = partial ? (pad + C * nkt + hoff) : (v + ic * nkt + hoff);
 
@@ -745,7 +748,9 @@ kernel void kernel_kv_tail_pad(
     const int d   = (int)tgpig.x;
     const int t   = (int)tgpig.y;
     const int e   = f16 ? 2 : 4;
-    const int pos = nkv - 64 + t;
+    // Pad row t holds cache row `(nkv / 64) * 64 + t` — the partial block's own
+    // `[ic, ic + C)` window — so it never overlaps the previous full block.
+    const int pos = (nkv / 64) * 64 + t;
     const bool valid = pos >= 0 && pos < nkv;
     const int dst = (t * nkt + d) * e;
     if (valid) {

@@ -964,6 +964,149 @@ fn attn_parallel_prefill_correctness() {
     );
 }
 
+/// Correctness of the flash prefill attention (`attn_flash_prefill`,
+/// `kernel_flash_attn_blk_*`) vs the CPU scalar reference, at every KV length
+/// class. The bug this pins: the partial last KV block used to read the **last
+/// `C` rows** (`pos0 = nkv - C`), which overlaps the previous full block whenever
+/// `nkv % C != 0 && nkv > C`; the online softmax then double-counted the
+/// overlapped rows (measured 0.05-0.16 attention error). The partial block must
+/// read its own `[ic, ic + C)` window with the tail masked. `nkv = 72/96/98`
+/// are the failing shapes, `24/48/128` the controls (`128` is a multiple of `C`).
+///
+/// Bar named before measuring: **0.01** — the f32-vs-f32 accumulation noise of
+/// the reference is ~2e-4, and the overlap bug is 5-16x above this bar on the
+/// failing shapes.
+#[test]
+fn flash_prefill_matches_the_cpu_reference_at_every_kv_tail() {
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let mps = MpsState::get().expect("MPS must be active");
+    let dev = &mps.inner.device;
+    let (nh, nk, hd, nkt, nqt) = (14usize, 2usize, 64usize, 128usize, 896usize);
+    for nkv_real in [24usize, 48, 72, 96, 98, 128] {
+        let nt = nkv_real;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let q = dev
+            .newBufferWithLength_options(
+                ((nt * nqt * 4) as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        let k = dev
+            .newBufferWithLength_options(
+                ((nkv_real * nkt * 4) as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        let v = dev
+            .newBufferWithLength_options(
+                ((nkv_real * nkt * 4) as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        let out = dev
+            .newBufferWithLength_options(
+                ((nt * nqt * 4) as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        let pos = dev
+            .newBufferWithLength_options(
+                ((nt * 4) as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        unsafe {
+            let qp = q.contents().as_ptr() as *mut f32;
+            for i in 0..(nt * nqt) {
+                *qp.add(i) = ((i as f32) * 0.37).sin() * 1.5;
+            }
+            let kp = k.contents().as_ptr() as *mut f32;
+            for i in 0..(nkv_real * nkt) {
+                *kp.add(i) = ((i as f32) * 0.11).cos() * 1.2;
+            }
+            let vp = v.contents().as_ptr() as *mut f32;
+            for i in 0..(nkv_real * nkt) {
+                *vp.add(i) = ((i as f32) * 0.23).sin() * 0.9;
+            }
+            let pp = pos.contents().as_ptr() as *mut i32;
+            for t in 0..nt {
+                *pp.add(t) = t as i32;
+            }
+        }
+        let cb = mps.cmd_buffer();
+        cb.attn_flash_prefill(
+            &q, &k, &v, &out, &pos, nkv_real, nkt, nt, nh, nk, hd, scale, false,
+        );
+        cb.submit().expect("submit");
+
+        let qs: Vec<f32> = (0..nt * nqt)
+            .map(|i| ((i as f32) * 0.37).sin() * 1.5)
+            .collect();
+        let ks: Vec<f32> = (0..nkv_real * nkt)
+            .map(|i| ((i as f32) * 0.11).cos() * 1.2)
+            .collect();
+        let vs: Vec<f32> = (0..nkv_real * nkt)
+            .map(|i| ((i as f32) * 0.23).sin() * 0.9)
+            .collect();
+        let gqa = nh / nk;
+        let mut ref_out = vec![0.0f32; nt * nqt];
+        let mut scrs = vec![0.0f32; nkv_real];
+        for h in 0..nh {
+            let hk = h / gqa;
+            for t in 0..nt {
+                let qq = t * nqt + h * hd;
+                let vl = (t + 1).min(nkv_real);
+                let mut mx = f32::NEG_INFINITY;
+                for kv in 0..vl {
+                    let ks_ = kv * nkt + hk * hd;
+                    let s = (0..hd).map(|d| qs[qq + d] * ks[ks_ + d]).sum::<f32>() * scale;
+                    scrs[kv] = s;
+                    if s > mx {
+                        mx = s;
+                    }
+                }
+                for kv in vl..nkv_real {
+                    scrs[kv] = f32::NEG_INFINITY;
+                }
+                let mut sum = 0.0f32;
+                for kv in 0..nkv_real {
+                    scrs[kv] = if scrs[kv] == f32::NEG_INFINITY {
+                        0.0
+                    } else {
+                        (scrs[kv] - mx).exp()
+                    };
+                    sum += scrs[kv];
+                }
+                for kv in 0..nkv_real {
+                    scrs[kv] /= sum;
+                }
+                let oo = t * nqt + h * hd;
+                for d in 0..hd {
+                    ref_out[oo + d] = 0.0;
+                }
+                for kv in 0..nkv_real {
+                    let vbase = kv * nkt + hk * hd;
+                    for d in 0..hd {
+                        ref_out[oo + d] += scrs[kv] * vs[vbase + d];
+                    }
+                }
+            }
+        }
+        let got =
+            unsafe { std::slice::from_raw_parts(out.contents().as_ptr() as *const f32, nt * nqt) };
+        let mut maxerr = 0.0f32;
+        for i in 0..nt * nqt {
+            maxerr = maxerr.max((got[i] - ref_out[i]).abs());
+        }
+        eprintln!("  flash_prefill nkv={nkv_real}: maxerr vs CPU {maxerr:.5}");
+        assert!(
+            maxerr < 0.01,
+            "flash prefill attention wrong vs CPU at nkv={nkv_real} (maxerr {maxerr})"
+        );
+    }
+}
+
 /// Prefill GEMM (nt=430) throughput — P1 prefill-gap investigation (2026-08-11):
 /// minfer pp430 ~1860 t/s vs llama-Metal ~6940 t/s (3.7x). GEMM params match
 /// (64x32 tile, 4 sg, both legacy-simdgroup on M4). This measures the GEMM
