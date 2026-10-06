@@ -7,9 +7,10 @@
 // kernels load `half` and promote each value in-register. This is the Metal twin
 // of CUDA's #141 kernels (`f16_f32_matmul_vec`/`_scalar`, `embed_rows_f16`).
 //
-// A second 2 B/element dtype (bf16, #208) slots in the same way: a new
-// `kernel_bf16_f32_matmul` + `kernel_get_rows_bf16` selected by the F16 arm's
-// sibling in `quant_matmul_f32_on_gpu_buf` and `embed_tokens_gpu`.
+// A second 2 B/element dtype (bf16, #208) slots in the same way: its own
+// `kernel_bf16_f32_matmul` + `kernel_get_rows_bf16` (now in `bf16.metal`)
+// selected by the F16 arm's sibling in `quant_matmul_f32_on_gpu_buf` and
+// `embed_tokens_gpu`.
 
 // f16 weight × f32 activation matmul. One threadgroup covers NR0*NSG output
 // rows; each simdgroup owns NR0 of them. Grid is (ceil(od / (NR0*NSG)), 1) and

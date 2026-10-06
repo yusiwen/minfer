@@ -252,13 +252,15 @@ fn load_tensor(
             ) {
                 mps.register_weight(&reg_name, tensor.data());
                 device_bytes.set(device_bytes.get() + tensor.data().len());
-            } else if matches!(ttype, TensorType::F32 | TensorType::F16) {
+            } else if matches!(ttype, TensorType::F32 | TensorType::F16 | TensorType::BF16) {
                 // #164: f16 weights register raw (2 B/element) — see qwen2's
                 // loader twin for the reason. 1-D norms/biases stay f32.
                 //
-                // #208 deliberately does not add `TensorType::BF16` here; the
-                // Metal half of the ticket is a separate delegation (qwen2's
-                // twin comment names the kernels it needs).
+                // #208: bf16 registers raw too, now that its Metal kernel pair
+                // exists (`kernel_bf16_f32_matmul` + `kernel_get_rows_bf16`, the
+                // `TensorType::BF16` arms of `quant_matmul_f32_on_gpu_buf` /
+                // `embed_tokens_gpu`); see qwen2's twin for why registering it
+                // without those kernels would be the `_`-fallback trap.
                 mps.register_weight(&reg_name, tensor.data());
                 device_bytes.set(device_bytes.get() + tensor.data().len());
             }
@@ -271,8 +273,9 @@ fn load_tensor(
             // for the dispatch and for why the q4_K `W_dsc` plane (r59/#165) and the
             // f16 arm (#141) live there instead of in a per-loader copy. The failure
             // mode this closes is real: the two copies had already drifted twice.
-            // #208 adds `TensorType::BF16` to that same shared rule (the CUDA half
-            // only; the Metal arm above stays `F32 | F16` until its own ticket).
+            // #208 adds `TensorType::BF16` to that same shared rule (the CUDA half;
+            // the Metal arm above admits it in the same change, now that its kernel
+            // pair exists).
             crate::models::weight_reg::register_cuda_weight(
                 cuda,
                 &reg_name,

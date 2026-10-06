@@ -154,6 +154,8 @@ impl MpsState {
             let pl_f16_f32 = get_pl("kernel_f16_f32_matmul")?;
             // #317: f32 weight matmul (twin of CUDA's `launch_f32_f32_matmul`).
             let pl_f32_f32 = get_pl("kernel_f32_f32_matmul")?;
+            // #208: bf16 weight matmul (twin of CUDA's `bf16_f32_matmul_*`).
+            let pl_bf16_f32 = get_pl("kernel_bf16_f32_matmul")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_get_rows_f32 = get_pl("kernel_get_rows_f32")?;
             let pl_get_rows_q4_k = get_pl("kernel_get_rows_q4_k")?;
@@ -164,6 +166,7 @@ impl MpsState {
             let pl_get_rows_q6_k = get_pl("kernel_get_rows_q6_k")?;
             let pl_get_rows_q5_k = get_pl("kernel_get_rows_q5_k")?;
             let pl_get_rows_f16 = get_pl("kernel_get_rows_f16")?;
+            let pl_get_rows_bf16 = get_pl("kernel_get_rows_bf16")?;
             let pl_rms_norm = get_pl("kernel_rms_norm_f32")?;
             let pl_rms_norm_256 = get_pl("kernel_rms_norm_f32_256")?;
             let pl_add = get_pl("kernel_add_f32")?;
@@ -230,6 +233,7 @@ impl MpsState {
                 pl_q5_k_mm_f32,
                 pl_f16_f32,
                 pl_f32_f32,
+                pl_bf16_f32,
                 pl_get_rows_q4_0,
                 pl_get_rows_f32,
                 pl_get_rows_q4_k,
@@ -240,6 +244,7 @@ impl MpsState {
                 pl_get_rows_q6_k,
                 pl_get_rows_q5_k,
                 pl_get_rows_f16,
+                pl_get_rows_bf16,
                 pl_rms_norm,
                 pl_rms_norm_256,
                 pl_add,
