@@ -987,7 +987,12 @@ impl Backend for MetalBackend {
                 let (k_id, v_id) =
                     kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
                 let nkt = node.out_shape[0];
-                let nt = (self.pool[in_bufs[0].id].length() as usize / 4) / nkt;
+                // Logical length, not the pool buffer's: the allocation is rounded
+                // up to its size class (E4 S2), so `pool[id].length()` would
+                // over-count `nt` whenever `nkt * nt` is not itself a class size
+                // and the store would read past the filled `cells` into the
+                // class's uninitialised tail, writing garbage rows into the arena.
+                let nt = in_bufs[0].len / nkt;
                 // #38: bound every row against the region the kernel writes into
                 // (`node.out_shape[1]` is the `n_ctx` the region was sized with).
                 self.check_kv_store_rows(self.buf(in_bufs[2].id), nt, node.out_shape[1], *layer)?;
