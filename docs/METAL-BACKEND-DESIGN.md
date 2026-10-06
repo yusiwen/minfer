@@ -419,6 +419,16 @@ One `MpsCommandBuffer` per split, submitted at boundaries, is the whole executio
    the last read and the first write.
 5. **`Err` from `execute_node`, never a CPU fallback** — missing weight, bad shapes, missing KV
    regions, unsupported op.
+   - **KV-store bound (#38, gap-table G1).** Every Metal arm that writes the persistent K/V region
+     — `KvcacheStore` (row = `cells`), `FusedQKV` and `FusedQkvNorm` (row = `positions`) — reads the
+     small `StorageModeShared` index buffer back and returns `Err` naming the offending cell and the
+     region's `n_ctx` *before* any dispatch (`MetalBackend::check_kv_store_rows`). The allocator
+     already bounds the same input on the `fill_input_i32` path
+     (`GraphAllocator::check_positions_bound`), so the arm guard closes the fill paths that do not go
+     through it; a kernel-side range check would be a *silent* no-write, which this rule forbids. The
+     gate `metal_kvcache_store_refuses_a_cell_past_the_arena` drives the real `KvcacheStore` dispatch
+     with an out-of-range cell written through the generic f32 `fill_input` (bypassing the
+     allocator's i32-only check), so it fails if the arm stops guarding.
 6. **`gpu_abort` for configurations the GPU path cannot run** — dimension misalignment, device-limit
    overruns, kernel-array overflow: print the actual values and exit.
 7. **Recurrence playbook** — reproduce with one app and a bounded `-n`; bisect with `MINFER_GEMM=0`
