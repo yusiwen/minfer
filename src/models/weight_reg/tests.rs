@@ -34,8 +34,8 @@ fn f16_weights_are_registered_raw_and_clear_the_nb_bt_flag() {
 /// from admitting one 2 B/element dtype and forgetting the other.
 ///
 /// The Metal half is *not* covered here: it lives in each loader's inline
-/// `matches!(ttype, F32 | F16)` arm and is a separate, later ticket, so a bf16 GGUF
-/// on a Metal build still falls to the CPU loudly.
+/// `matches!(ttype, F32 | F16 | BF16)` arm (landed with #208's Metal half, PR #323),
+/// so a bf16 GGUF runs on Metal as well and this module stays the CUDA side's rule.
 #[test]
 fn bf16_weights_are_registered_raw_and_clear_the_nb_bt_flag() {
     // A Qwen3-0.6B bf16 `ffn_gate` is [in=1024, out=3072] → id=ne[0]=1024, od=ne[1]=3072.
