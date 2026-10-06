@@ -7,8 +7,9 @@ use objc2_metal::{MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-/// Regression guard: the Metal shader program (metal.metal) is compiled at
-/// RUNTIME by `try_new` — `cargo build` does NOT catch shader errors. A
+/// Regression guard: the Metal shader program (`src/metal/kernels/*.metal` and
+/// `*.h`, concatenated by `build.rs` into `$OUT_DIR/minfer.metal`) is compiled
+/// at RUNTIME by `try_new` — `cargo build` does NOT catch shader errors. A
 /// duplicate/missing kernel or a Metal compile error makes `MpsState::init`
 /// fall back to CPU silently, which looks like a "GPU throttling" slowdown
 /// (2026-08-06: the Q5_0 `block_q5_0_dot_y` redefine bug did exactly this).
@@ -19,7 +20,7 @@ fn metal_pipelines_compile() {
     MpsState::init();
     assert!(
         MpsState::get().is_some(),
-        "MPS unavailable — Metal shader compilation failed (check src/metal.metal for \
+        "MPS unavailable — Metal shader compilation failed (check src/metal/kernels/*.metal for \
          duplicate/missing kernel definitions); the model would run on CPU"
     );
 }

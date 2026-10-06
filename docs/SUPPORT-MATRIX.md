@@ -190,6 +190,16 @@ models run at full GPU speed.
 (`docs/ARCHITECTURE.md` §5). This table is the contract, generated from the
 three implementations — keep it in step with them.
 
+The table's concrete **F32 `Op` rows** are pinned by
+`graph::op_matrix::support_table_matches_support_matrix_doc`, which fails when a
+backend's `supports_op` disagrees (each backend column is checked wherever it is
+compiled in). Two kinds of row it *cannot* check, so they are prose plus their
+own gates: the **composite rows** (one line spelling several ops) and the
+**capability nuances that are not an `Op` field** — a *partial* `View` at offset
+0 (the allocator backstops it; `supports_op` sees only the offset), the
+set-valued `kv_map` attention window (`Device::gathers_attn_map`), and a packed
+`q8_0` KV region (`BackendCaps::reads_packed_kv`).
+
 | Operator | CPU | Metal | CUDA |
 |---|:---:|:---:|:---:|
 | `Input`, `KvcacheLoad`, `View`/`Reshape`/`Permute` | ✅ | ✅ | ✅ |

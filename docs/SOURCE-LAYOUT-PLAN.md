@@ -799,11 +799,15 @@ src/
 │   ├── ops.rs                       [S4]  L2: the op → encoding table
 │   ├── policy.rs                    [S4]  pure predicates (MINFER_METAL_* / MINFER_* knobs)
 │   └── kernels/                     [S4]  L3, ≤~800 lines each:
-│       ├── common.h · dequantize.h · quantize.h
+│       ├── common.h · dequantize.h          (no `quantize.h` — the plan's row
+│       │                                    assumed GPU-side quantize helpers
+│       │                                    and the tree has none; §4 Step 4)
 │       ├── mul_q4_0_q8_0.metal · mul_f32act_q4q5.metal · mul_f32act_kquant.metal
 │       ├── mul_mm.metal · mul_mm_kq.metal · get_rows.metal · norm_elementwise.metal · rope.metal
 │       ├── kv.metal · qkv_fused.metal
-│       └── fa_parallel.metal · fa_split.metal · fa_decode.metal · fa_prefill.metal
+│       ├── fa_parallel.metal · fa_split.metal · fa_decode.metal · fa_prefill.metal
+│       ├── f16.metal (#164) · f32.metal (#317) · bf16.metal (#208) · attn_window.metal (#44a)
+│                                            (the four added by the Metal round after S4)
 │                                            (runtime fallback joins them with `concat!`)
 ├── kernel.rs                        [S3]  module kernel: `mod` + `pub use`
 ├── kernel/

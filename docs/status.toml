@@ -29,7 +29,7 @@ refreshed_against = "f663750"
 
 # The one honest `next:` sentence. It replaced a stale one that still called
 # E4/E5 upcoming years after they landed (issue #94).
-next = "the remaining Metal gap (G7) and F1 (needs x86)"
+next = "F1 (needs x86)"
 
 # --- prose locations for the three scalars ----------------------------------
 
@@ -99,9 +99,9 @@ regex = 'Phase F\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]
 
 [[phase]]
 id = "G"
-done = 0
+done = 7
 total = 7
-state = "scheduled"
+state = "complete"
 file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
 regex = 'Phase G\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
 

@@ -80,8 +80,8 @@ impl MpsState {
                 eprintln!("MPS: GPU capture started");
             }
 
-            // Prefer the build-time precompiled metallib (build.rs compiles
-            // src/metal.metal → minfer.metallib, llama-style: embedded
+            // Prefer the build-time precompiled metallib (build.rs concatenates
+            // src/metal/kernels/*.metal → minfer.metallib, llama-style: embedded
             // default.metallib, ggml-metal-device.m:128-234). The embedded
             // file is EMPTY when the Metal toolchain was unavailable at build
             // time → fall back to newLibraryWithSource (per-process compile,

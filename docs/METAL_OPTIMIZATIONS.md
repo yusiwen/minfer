@@ -5,6 +5,11 @@
 > llama (0.5B pure GPU 1.1-1.4×; **7B decode now ≈ llama parity, ~19.3 ms/token
 > GPU vs 50.5 t/s**, after the q4_K decode matmul port, to-do #7), long prefill ~2.6-2.7× (down
 > from 2.8-3.6× via the prefill flash port, `5974eb1`). See [§1 Current state](#1-current-state).
+> **This llama comparison is the 2026-08-17 record and was not re-measured this
+> round** — no llama.cpp binary was run on this box. The re-measured *minfer-only*
+> rows (throughput on the cached models + Metal-vs-CPU parity) live in
+> [§0.1](#01-graph-path-metalbackend-integration-status-2026-08-21), taken
+> 2026-10-06 at `6b95763` on `macbook (macOS 27.0.1, Apple M4 Pro)`.
 >
 > ⚠️ **The §0 progress table is the single source of truth for tracking**; §1-§6
 > are the detailed explanations behind it. Update §0 first before changing code.
@@ -53,26 +58,55 @@ already transfer:
 | `n_out` tail-row optimization (#32/#34) | tail `GetRows` + reduced last layer (G3) | ✅ **G3** — full-nt FFN/lm_head work dropped (prefill ↑~1.5× on 0.5B) |
 
 **Graph-path measured numbers** (M4 Pro, `--temp 0` greedy; old-path figures
-from §1/§1.6 — same models; graph-path numbers current as of **G1+G2+G3**):
+from §1/§1.6 — same models; the graph-path column was **re-measured 2026-10-06**
+at `6b95763` on `macbook (macOS 27.0.1, Apple M4 Pro)`, `minfer bench -p <P> -n 128
+-r 3 <model>` with the Metal default except the CPU row (`MINFER_DISABLE_MPS=1 -p 0`).
+The pre-round figures it replaces were taken before the Metal round; the `Δ` column
+is against the old path, not against the pre-round figure):
 
-| Scenario | Old path (layer_gpu) | Graph path | Δ |
-|---|---|---|
-| 0.5B Q4_0 decode, KV ~200+ | ~279 t/s (§1.1, 128 tok) | **~256 t/s** (KV206, pre-G4) / **~299-331 t/s** (KV440, G4+G5) | ≈ parity→**+~15 % over old** (2.1× vs pre-G1 ~122) |
-| 0.5B Q4_0 prefill pp390–440 | ~2530–2620 t/s (§1.1 pp430) | **~3900–4000 t/s** (pp440) | **+~55 % over old** (G3 tail reduction; was ~1663 pre-G1, ~2600 post-G1/G2) |
-| 7B Q4_K_M decode, KV ~200+ | ~48 t/s steady | **~49 t/s** (KV206) | ≈ parity (was ~32.5 pre-G1) |
-| 7B Q4_K_M prefill pp206 | ~240 t/s (§1.6 pp252) | ~217 t/s (pp206) | ≈ −10 % (unchanged by G1–G3) |
-| 0.5B CPU decode | ~5.9 t/s | ~5.9 t/s | 0 % (exact parity) |
-| Qwen3-4B Q4_K_M decode | — | **~75.9 t/s** (KV64) | llama-Metal 79.7 → **≈ parity** (full A/B: `docs/PERF-QWEN3-4B-VS-LLAMACPP.md`) |
-| Qwen3-4B Q4_K_M prefill steady-state | — | ~800–1000 t/s marginal | llama ~900 → ≈ parity |
-| Qwen3-4B first-request prefill (241 tok) | — | 552 ms → **~370 ms** | was 1.76× wall; **fixed** — single-shot KV now sized by `--n-ctx` (default 4096), clamped to `max_seq_len` (was 40960 → 12.1 GB + ~275 ms first-submit Metal tax) |
+| Scenario | Old path (layer_gpu) | Graph path (2026-10-06) | Δ |
+|---|---|---|---|
+| 0.5B Q4_0 decode, KV ~200+ | ~279 t/s (§1.1, 128 tok) | **306.19 ± 1.00 t/s** (tg128, pp440, n_ctx 584) | ≈ parity→+~10 % over old |
+| 0.5B Q4_0 prefill pp390–440 | ~2530–2620 t/s (§1.1 pp430) | **6249.60 ± 10.52 t/s** (pp440, n_ctx 584) | **+~140 % over old** |
+| 7B Q4_K_M decode, KV ~200+ | ~48 t/s steady | **48.52 ± 0.18 t/s** (tg128, pp206, n_ctx 350) | ≈ parity |
+| 7B Q4_K_M prefill pp206 | ~240 t/s (§1.6 pp252) | **406.51 ± 0.83 t/s** (pp206, n_ctx 350) | **+~70 % over old** |
+| 0.5B CPU decode | ~5.9 t/s | **149.69 ± 1.79 t/s** (tg128, pp0, n_ctx 144) | the old ~5.9 t/s is **not reproduced** — see the note below |
+| Qwen3-4B Q4_K_M decode | — | **74.11 ± 0.19 t/s** (tg128, pp241, n_ctx 385) | llama-Metal 79.7 → ≈ parity |
+| Qwen3-4B Q4_K_M prefill steady-state | — | **729.83 ± 0.20 t/s** (pp241) | llama ~900 → ≈ 0.81× |
+| Qwen3-4B first-request prefill (241 tok) | — | **~330 ms** (241 / 729.83) | was 552 ms |
+
+> **Parity (re-measured 2026-10-06).** `graph_metal_matches_llama_reference`
+> (Qwen3-0.6B) reproduces the pinned llama-Metal greedy prefix
+> `[12095, 13, 576, 6722, 315, 9625, 374, 1083, 279]` — the one *model-level*
+> oracle that compares Metal against an **external** reference. The per-op
+> Metal-vs-CPU gates (`metal_*_matches_cpu` in `src/graph/metal_backend/tests.rs`)
+> and the four kernel isolation suites are green in the full macOS run
+> (**531 / 0 / 43** unit, **21 / 0 / 6** integration). **The Metal-vs-CPU
+> *logits* row cannot be taken from `graph_metal_matches_cpu_logits`**: in the
+> graph era both `ModelDef::forward` and `forward_graph` route through
+> `Qwen2Graph::forward` (`src/models/qwen2/mod.rs:56`/`:96`), so its
+> `max |Δ| = 0` compares the Metal graph with itself — the test's "CPU reference"
+> comment is stale. Filed as [#324](https://github.com/yusiwen/minfer/issues/324); no
+> parity regression is implied. The
+> f16/bf16 device-gate max |Δlogit| numbers are in `docs/SUPPORT-MATRIX.md`
+> (their model files are not cached for a fresh run here).
+>
+> **The old `~5.9 t/s` CPU row is not reproduced** at `6b95763`: the same 0.5B
+> Q4_0 file decodes at **149.69 ± 1.79 t/s** on the CPU with `-p 0`. A 25× gap is
+> not measurement noise, so the old figure describes a different configuration
+> (it is quoted from the pre-graph §1 table and may predate the CPU kernel work);
+> it is left visible in the `Old path` column but must not be read as the current
+> CPU number.
 
 **Reading**: G1 (attention dispatch: flash/split/parallel) closed the decode
 KV-growth regression (−44 %/−32 % → parity; 0.5B 2.1×, 7B ~1.5×); G3 (n_out
 tail-row reduction) cut the full-nt last-layer FFN + lm_head work so 0.5B
-prefill now **exceeds the old path** (~3900–4000 vs ~2530–2620 t/s). Remaining
-graph-path gap: 7B prefill ~−10 % (attention is not the bottleneck there —
-GEMM dominates and transfers fully). Greedy outputs are byte-identical to the
-pre-G1 graph path (flash/split/parallel and tail-reduced paths all verified).
+prefill now **exceeds the old path**. Remaining
+graph-path gap: 7B prefill is now well **ahead of the old path** too; the
+residual llama gap (attention is not the bottleneck there — GEMM dominates and
+transfers fully) is the 2026-08-17 figure above and was not re-measured. Greedy
+outputs are byte-identical to the pre-G1 graph path (flash/split/parallel and
+tail-reduced paths all verified).
 
 **Graph-path TODO (wire into `MetalBackend`)**: ① ✅ G1 attention dispatch;
 ② ✅ G2 `rms_norm_256`; ③ ✅ G3 n_out tail-row `GetRows`; ④ ✅ G4 fused decode
