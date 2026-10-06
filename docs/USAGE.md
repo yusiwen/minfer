@@ -172,7 +172,8 @@ Qwen3-style `<think>…</think>` reasoning blocks are gray-highlighted
 
 Continuous batching (the worker composes one decode batch across the active slots
 instead of one forward per slot — Phase E / E2) is **on by default when the
-model's forwards run on CUDA, and off on CPU/Metal** (E6). The reason is measured,
+model's forwards run on CUDA or Metal, and off on CPU** (E6; Metal joined in
+[#44](https://github.com/yusiwen/minfer/issues/44) part (b), 2026-10-06). The reason is measured,
 not assumed: on this project's reference CPU batching is *slower* than serving
 requests one at a time (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0 with `--n-slots 4`
 — the CPU decode kernels gain nothing from `nt > 1`, and concurrency forfeits the

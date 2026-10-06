@@ -207,7 +207,7 @@ set-valued `kv_map` attention window (`Device::gathers_attn_map`), and a packed
 | `RmsNorm`, `QkNorm` | ✅ | ✅ | ✅ |
 | `MatMul` | ✅ | ✅ | ✅ |
 | `GetRows` (embedding, tail rows) | ✅ | ✅ | ✅ |
-| `View` with `offset != 0` or a partial window (D1) | ✅ | ❌ | ✅ — Metal's kernels take a buffer and a length with no element offset, so it can express exact views only (G5); the allocator backstops the partial case, which `supports_op` cannot see |
+| `View` with `offset != 0` or a partial window (D1) | ✅ | ❌ | ✅ — Metal's kernels take a buffer and a length with no element offset, so it can express exact views only: a **standing design limit**, not a pending port (G5 landed the attention window and the KV cell store, *not* offset views — `Op::View { offset, .. } => *offset == 0`); it is what keeps the hand-written `Op::FusedFFN` on Metal (§D3). The allocator backstops the partial case, which `supports_op` cannot see |
 | `Attn` | ✅ | ✅ | ✅ |
 | `Attn` with `explicit_span` (a window that starts at a non-zero cell, or several sequences in one batch) | ✅ | ✅ | ✅ — the one-range `attn_span` window is read on all three backends (Metal's `kernel_gqa_attn_window_f32/_f16` landed in #44 part (a), and #44 part (b) gave Metal the matching write/move side so a batched and compacted multi-sequence run serves; CUDA's E1b instantiation is **device-verified** on GB10, including a bitwise batch-order-invariance gate). The set-valued `kv_map` window is CPU + CUDA only (`Device::gathers_attn_map`), and a packed `q8_0` KV cache is refused on Metal ([#310](https://github.com/yusiwen/minfer/issues/310)) |
 | `KvcacheStore` | ✅ | ✅ | ✅ |

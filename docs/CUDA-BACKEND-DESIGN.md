@@ -635,7 +635,9 @@ Two layers of checks are deliberately *not* in `supports_op`:
   placement/real-model gate is `f208_bf16_weights_run_on_the_cuda_device` (169 bf16 matmul + 1 embed
   nodes all on CUDA; device vs CPU max |Δlogit| 7.82e-5 / 4.24e-6 relative, bar 0.01 / 1e-3, greedy
   identical). The Metal twin is [#208](https://github.com/yusiwen/minfer/issues/208)'s other half and
-  is **not** in this change — Metal's registration arm stays `matches!(ttype, F32 | F16)`.
+  landed separately (PR [#323](https://github.com/yusiwen/minfer/pull/323)), which widened the Metal
+  registration arm to `matches!(ttype, F32 | F16 | BF16)` — see
+  `METAL-BACKEND-DESIGN.md` §4.4.
 - **Bias** is applied by `add_bias_f32` after the GEMM; its last argument is the **row count** `nt`
   (the kernel maps one block row per token).
 
