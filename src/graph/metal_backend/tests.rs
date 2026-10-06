@@ -3,9 +3,10 @@
 use super::*;
 use crate::graph::alloc::GraphAllocator;
 use crate::graph::backend::Backend;
+use crate::graph::batch::Batch;
 use crate::graph::builder::GraphBuilder;
 use crate::graph::scheduler::BackendScheduler;
-use crate::graph::{Backend as Tag, DType};
+use crate::graph::{Backend as Tag, ComputeGraph, DType};
 
 mod fusion_shape;
 mod norm_weight;
@@ -19,6 +20,28 @@ fn f32t(name: &str, shape: [i64; 4], data: Vec<f32>) -> crate::tensor::Tensor {
     let mut t = crate::tensor::Tensor::from_data(crate::tensor::TensorType::F32, &shape, bytes);
     t.name = name.to_string();
     t
+}
+
+/// Fill a single-sequence graph's inputs the way **production** does: the
+/// sequence-relative `positions`, then `GraphAllocator::fill_batch_inputs`
+/// (`Batch::single`), which resolves `seq_ids`, `cells` and `attn_span` from the
+/// cell store (E1; the migration [#228] put the other macOS-only call sites on).
+///
+/// The fixtures below build through `GraphBuilder::attn`, whose `attn_span`
+/// window input is explicit, so filling only `positions` leaves the window at
+/// its zero initialisation and the CPU reference arm refuses
+/// (`decode_window`). A hand-rolled span here would re-create exactly the drift
+/// [#228] removed, so this goes through the production entry point.
+///
+/// `tokens` is unused by the fill (these graphs have no token input), but
+/// `Batch::single` requires one row per query.
+fn fill_seq_inputs(alloc: &mut GraphAllocator, g: &ComputeGraph, positions: &[u32]) {
+    alloc.fill_input_i32(g, "positions", positions).unwrap();
+    let tokens = vec![0u32; positions.len()];
+    let rel: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+    alloc
+        .fill_batch_inputs(g, &Batch::single(&tokens, &rel))
+        .unwrap();
 }
 
 /// GPU graph (silu + add) must match the CPU graph bit-for-bit.
@@ -599,7 +622,7 @@ fn metal_attn_kv_matches_cpu() {
     let mut sched = BackendScheduler::new();
     let mut ca = GraphAllocator::new();
     ca.alloc_graph(&g).unwrap();
-    ca.fill_input_i32(&g, "positions", &[0, 1]).unwrap();
+    fill_seq_inputs(&mut ca, &g, &[0, 1]);
     ca.fill_input(&g, "q", &qd).unwrap();
     ca.fill_input(&g, "k", &kd).unwrap();
     ca.fill_input(&g, "v", &vd).unwrap();
@@ -613,7 +636,7 @@ fn metal_attn_kv_matches_cpu() {
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
     alloc.alloc_graph(&g2).unwrap();
-    alloc.fill_input_i32(&g2, "positions", &[0, 1]).unwrap();
+    fill_seq_inputs(&mut alloc, &g2, &[0, 1]);
     alloc.fill_input(&g2, "q", &qd).unwrap();
     alloc.fill_input(&g2, "k", &kd).unwrap();
     alloc.fill_input(&g2, "v", &vd).unwrap();
@@ -781,7 +804,7 @@ fn metal_attn_kv_real_scale() {
     let mut sched = BackendScheduler::new();
     let mut ca = GraphAllocator::new();
     ca.alloc_graph(&g).unwrap();
-    ca.fill_input_i32(&g, "positions", &posd).unwrap();
+    fill_seq_inputs(&mut ca, &g, &posd);
     ca.fill_input(&g, "q", &qd).unwrap();
     ca.fill_input(&g, "k", &kd).unwrap();
     ca.fill_input(&g, "v", &vd).unwrap();
@@ -795,7 +818,7 @@ fn metal_attn_kv_real_scale() {
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
     alloc.alloc_graph(&g2).unwrap();
-    alloc.fill_input_i32(&g2, "positions", &posd).unwrap();
+    fill_seq_inputs(&mut alloc, &g2, &posd);
     alloc.fill_input(&g2, "q", &qd).unwrap();
     alloc.fill_input(&g2, "k", &kd).unwrap();
     alloc.fill_input(&g2, "v", &vd).unwrap();
@@ -866,7 +889,7 @@ fn metal_attn_decode_step() {
     let mut sched = BackendScheduler::new();
     let mut ca = GraphAllocator::new();
     ca.alloc_graph(&g).unwrap();
-    ca.fill_input_i32(&g, "positions", &posd).unwrap();
+    fill_seq_inputs(&mut ca, &g, &posd);
     ca.fill_input(&g, "q", &qd).unwrap();
     ca.fill_input(&g, "k", &kd).unwrap();
     ca.fill_input(&g, "v", &vd).unwrap();
@@ -880,7 +903,7 @@ fn metal_attn_decode_step() {
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
     alloc.alloc_graph(&g2).unwrap();
-    alloc.fill_input_i32(&g2, "positions", &posd).unwrap();
+    fill_seq_inputs(&mut alloc, &g2, &posd);
     alloc.fill_input(&g2, "q", &qd).unwrap();
     alloc.fill_input(&g2, "k", &kd).unwrap();
     alloc.fill_input(&g2, "v", &vd).unwrap();
@@ -942,7 +965,7 @@ fn metal_store_after_gpu_op() {
     let mut sched = BackendScheduler::new();
     let mut ca = GraphAllocator::new();
     ca.alloc_graph(&g).unwrap();
-    ca.fill_input_i32(&g, "positions", &[0, 1]).unwrap();
+    fill_seq_inputs(&mut ca, &g, &[0, 1]);
     ca.fill_input(&g, "q", &qd).unwrap();
     ca.fill_input(&g, "k", &kd).unwrap();
     ca.fill_input(&g, "v", &vd).unwrap();
@@ -955,7 +978,7 @@ fn metal_store_after_gpu_op() {
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
     alloc.alloc_graph(&g2).unwrap();
-    alloc.fill_input_i32(&g2, "positions", &[0, 1]).unwrap();
+    fill_seq_inputs(&mut alloc, &g2, &[0, 1]);
     alloc.fill_input(&g2, "q", &qd).unwrap();
     alloc.fill_input(&g2, "k", &kd).unwrap();
     alloc.fill_input(&g2, "v", &vd).unwrap();
@@ -1018,7 +1041,7 @@ fn metal_store_real_dims() {
     let mut sched = BackendScheduler::new();
     let mut ca = GraphAllocator::new();
     ca.alloc_graph(&g).unwrap();
-    ca.fill_input_i32(&g, "positions", &posd).unwrap();
+    fill_seq_inputs(&mut ca, &g, &posd);
     ca.fill_input(&g, "q", &qd).unwrap();
     ca.fill_input(&g, "k", &kd).unwrap();
     ca.fill_input(&g, "v", &vd).unwrap();
@@ -1031,7 +1054,7 @@ fn metal_store_real_dims() {
     let mut alloc = GraphAllocator::new();
     alloc.enable_metal();
     alloc.alloc_graph(&g2).unwrap();
-    alloc.fill_input_i32(&g2, "positions", &posd).unwrap();
+    fill_seq_inputs(&mut alloc, &g2, &posd);
     alloc.fill_input(&g2, "q", &qd).unwrap();
     alloc.fill_input(&g2, "k", &kd).unwrap();
     alloc.fill_input(&g2, "v", &vd).unwrap();
