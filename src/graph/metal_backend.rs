@@ -418,6 +418,40 @@ impl MetalBackend {
         p.iter().map(|&x| x as usize).max().unwrap_or(0)
     }
 
+    /// #38: refuse a KV-store row that is past the layer's persistent region.
+    ///
+    /// `rows` is the I32 index buffer the store kernel dereferences — `cells`
+    /// for a plain [`Op::KvcacheStore`], `positions` for the fused epilogue —
+    /// and `n_ctx` the region's cell count. The allocator bounds the same input
+    /// on the `fill_input_i32` path (`GraphAllocator::check_positions_bound`),
+    /// but that is an upstream guard on one filler; the arm that indexes the
+    /// persistent region is the last line before the kernel, so it owns the
+    /// bound. A Metal `MTLBuffer` is `StorageModeShared`, so the small index
+    /// buffer is read back here; a kernel-side range check would be a *silent*
+    /// no-write, which `docs/GPU_SAFETY.md` forbids.
+    fn check_kv_store_rows(
+        &self,
+        rows: &crate::metal::MetalBuffer,
+        count: usize,
+        n_ctx: usize,
+        layer: usize,
+    ) -> Result<(), String> {
+        if count == 0 {
+            return Ok(());
+        }
+        let idx =
+            unsafe { std::slice::from_raw_parts(rows.contents().as_ptr() as *const u32, count) };
+        for &cell in idx {
+            if cell as usize >= n_ctx {
+                return Err(format!(
+                    "Metal KV store layer {layer}: cell {cell} is past the {n_ctx}-cell \
+                     arena (refusing to write past the persistent region)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn copy_in(&self, dst: usize, src: usize) {
         // in-place-ish ops (silu/rope) may alias; snapshot to dst first
         let src_buf = self.buf(src);
@@ -961,6 +995,9 @@ impl Backend for MetalBackend {
                     kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
                 let nkt = node.out_shape[0];
                 let nt = (self.pool[in_bufs[0].id].length() as usize / 4) / nkt;
+                // #38: bound every row against the region the kernel writes into
+                // (`node.out_shape[1]` is the `n_ctx` the region was sized with).
+                self.check_kv_store_rows(self.buf(in_bufs[2].id), nt, node.out_shape[1], *layer)?;
                 cb.store_kv(
                     self.buf(in_bufs[0].id),
                     self.buf(k_id),
@@ -1227,6 +1264,15 @@ impl Backend for MetalBackend {
                 // 2) fused bias + rope + KV store in one kernel pass
                 let (k_id, v_id) =
                     kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                // #38: the epilogue stores K/V at the row `positions` names
+                // (Metal keeps the pre-C6 gate, so positions == cells here);
+                // bound it against the region's cell count.
+                self.check_kv_store_rows(
+                    self.buf(in_bufs[1].id),
+                    nt,
+                    meta.kv_elems / meta.nkt.max(1),
+                    *layer,
+                )?;
                 let bias_off =
                     |name: &Option<String>| -> Result<(crate::metal::MetalBuffer, u64), String> {
                         match name {
@@ -1317,6 +1363,14 @@ impl Backend for MetalBackend {
                 );
                 let (k_id, v_id) =
                     kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                // #38: same store bound as the plain/fused QKV arms — the
+                // no-bias epilogue writes the KV row `positions` names.
+                self.check_kv_store_rows(
+                    self.buf(in_bufs[1].id),
+                    nt,
+                    meta.kv_elems / meta.nkt.max(1),
+                    *layer,
+                )?;
                 // 2) per-head RMSNorm on q/k IN PLACE on the concat buffer
                 //    (llama build_norm(Qcur/Kcur, attn_q_norm/attn_k_norm) before
                 //    ggml_rope_ext). q section is at byte offset 0; k section at

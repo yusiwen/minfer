@@ -333,12 +333,15 @@ Two concrete defects live here as well:
   Today no caller changes `n_ctx` on a live cache, so it is latent rather than
   live — but it is a landmine directly under the "grow the context" feature
   that a server wants.
-- **GPU `KvcacheStore` has no bounds validation.**
-  `cpu_backend.rs:170` returns `Err` when `pos >= n_ctx`; the CUDA path
-  (`cuda_backend.rs:1028-1061`) and the Metal path write unconditionally. A
-  caller violating the documented contract produces an out-of-bounds device
-  write instead of an error. `docs/GPU_SAFETY.md`'s rule — "guard failures abort
-  with actual values" — is enforced on CPU and not on GPU here.
+- **GPU `KvcacheStore` had no bounds validation** — **closed**. A3 moved the
+  check to the backend-agnostic `GraphAllocator::fill_input_i32`
+  (`check_positions_bound`), the single point where positions/cells become graph
+  data, so CPU, CUDA and Metal all refuse an out-of-range row before execution;
+  the Metal gap-table G1 ticket [#38](https://github.com/yusiwen/minfer/issues/38)
+  then added the arm-level guard for fill paths that bypass `fill_input_i32`
+  (`MetalBackend::check_kv_store_rows`, covering `KvcacheStore`, `FusedQKV` and
+  `FusedQkvNorm`). A caller violating the documented contract now gets an `Err`
+  naming the cell and the arena instead of an out-of-bounds device write.
 
 **What C1/C2 landed (2026-09-16).** `src/graph/kvcache.rs` now owns a
 per-layer arena with an owner per cell, and `GraphAllocator::kv_rm(start, len,

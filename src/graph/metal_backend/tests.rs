@@ -1042,3 +1042,57 @@ fn metal_store_real_dims() {
     eprintln!("[store real dims] max diff {maxd:.3e}");
     assert!(maxd < 1e-3, "store at real dims diverges: {maxd:.3e}");
 }
+
+/// #38: a Metal `KvcacheStore` whose row is past the arena refuses loudly —
+/// naming the actual cell and the arena size — and never dispatches the store.
+///
+/// The allocator bounds the `cells` input when it is filled through
+/// `fill_input_i32` (`GraphAllocator::check_positions_bound`). This gate
+/// deliberately fills it through the generic f32 `fill_input`, which carries
+/// the same `f32::from_bits` layout (compute-graph rule 4) but not the
+/// i32-specific check, so the Metal arm is reached with a row the allocator
+/// guard does not see — the remaining input path the ticket closes. Gate
+/// contract rule 2: the control must not be refused by an earlier check, which
+/// is exactly why `fill_input_i32` is *not* used here.
+#[test]
+fn metal_kvcache_store_refuses_a_cell_past_the_arena() {
+    let _g = crate::metal::metal_test_lock();
+    crate::metal::MpsState::init();
+    let Some(_b) = MetalBackend::new() else {
+        eprintln!("MPS unavailable; skipping");
+        return;
+    };
+    let nkt = 8usize;
+    let n_ctx = 16usize;
+    let nt = 2usize;
+    let mut gb = GraphBuilder::new();
+    let k = gb.input("k", [nkt, nt, 1, 1], DType::F32);
+    let v = gb.input("v", [nkt, nt, 1, 1], DType::F32);
+    let store = gb.kvcache_store(0, k, v, n_ctx);
+    gb.output(store);
+    let g = gb.build();
+
+    let mut g2 = g.clone();
+    for n in &mut g2.nodes {
+        n.backend = Some(Tag::METAL);
+    }
+    let mut alloc = GraphAllocator::new();
+    alloc.enable_metal();
+    alloc.alloc_graph(&g2).unwrap();
+    let kd: Vec<f32> = (0..nkt * nt).map(|i| i as f32 * 0.25).collect();
+    alloc.fill_input(&g2, "k", &kd).unwrap();
+    alloc.fill_input(&g2, "v", &kd).unwrap();
+    // Row 1 is the last cell of the 16-cell arena plus one (cell 16).
+    let cells: [u32; 2] = [0, n_ctx as u32];
+    let bits: Vec<f32> = cells.iter().map(|&c| f32::from_bits(c)).collect();
+    alloc.fill_input(&g2, "cells", &bits).unwrap();
+
+    let mut sched = BackendScheduler::new();
+    let err = sched
+        .execute(&g2, &mut alloc)
+        .expect_err("a store at cell 16 of a 16-cell arena must refuse, not write");
+    assert!(
+        err.contains("cell 16") && err.contains("16-cell arena"),
+        "the refusal must name the actual cell and the arena size, got: {err}"
+    );
+}
