@@ -135,11 +135,10 @@ pub(crate) fn cuda_weight_reg(
         // activations, so a mode-2 skip-write producer upstream would feed it a dead
         // buffer).
         //
-        // **Metal is the other half and is deliberately NOT here.** The Metal
-        // registration arm lives inline in each loader (`matches!(ttype, F32 | F16)`)
-        // and #208's Metal half is a separate, later delegation, so a bf16 GGUF on a
-        // Metal build still drops to the CPU loudly. Flipping it needs
-        // `kernel_bf16_f32_matmul` + `kernel_get_rows_bf16` on that side.
+        // **The Metal registration arm is not here** — it lives inline in each
+        // loader and has read `matches!(ttype, F32 | F16 | BF16)` since #208's Metal
+        // half (PR #323), so a bf16 GGUF runs on Metal too; this module is the CUDA
+        // side's shared rule.
         return CudaWeightReg::Raw {
             q80_p32: false,
             clear_nb_bt_only: true,

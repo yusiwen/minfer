@@ -50,7 +50,11 @@ which a device build requires (the CUDA state is a process-wide singleton, issue
 otherwise — on a CPU-only build that reason does not exist, and the parallel
 harness is where the [server batching
 gate](https://github.com/yusiwen/minfer/issues/154) checks its own robustness.
-`PARALLEL=1`/`0` overrides. Since the KV storage format became **per engine**
+`PARALLEL=1`/`0` overrides. Each platform's CI job compiles the **test target** as well as the
+crate: `cargo test --release --no-run` on the Linux CPU job (implicitly), `cargo test --release
+--features cuda --no-run` on the CUDA job and `cargo test --release --no-run` on `build-macos`
+([#303](https://github.com/yusiwen/minfer/issues/303)) — `cargo build` does not compile
+`#[cfg(test)]`, and a macOS-only test module was invisible for eleven days because of it. Since the KV storage format became **per engine**
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
 longer makes one gate size another gate's KV regions. The current counts live in
 `AGENTS.md` (each with its date, device and command). Four fixes now make the

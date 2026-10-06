@@ -110,7 +110,11 @@ and the struct is `unsafe impl Send/Sync` on that basis.
 
 - **Zero-copy parts.** `MpsState::register_part` wraps an mmap'd GGUF part with
   `newBufferWithBytesNoCopy` (`StorageModeShared`). The base must be page-aligned (16 KiB on Apple
-  Silicon); mmap guarantees it, and the code `debug_assert!`s it.
+  Silicon); mmap guarantees it, and the code `debug_assert!`s it. [#39](https://github.com/yusiwen/minfer/issues/39)
+  audited the remaining `debug_assert!`s and kept this one deliberately: it is an **OS contract on a
+  stdlib call** (`mmap`'s guarantee), not a shape or kernel invariant, and `register_part` returns
+  `()` so there is no `Result` for the value to travel in — the one asymmetry the release-build rule
+  allows.
 - **Per-weight offsets.** `register_weight(name, data)` records `(part buffer, byte offset)`; the
   executor resolves any weight through `state.weight_buf(name) -> Option<(MetalBuffer, u64)>` and
   passes the offset to the kernel. `MINFER_WEIGHT_COPY=1` forces a copy per weight for A/B.
@@ -317,7 +321,12 @@ the reporting test, `graph::op_matrix::matrix_cases_match_their_reference`, only
 when some earlier test in the process had already initialized `MpsState`; its Metal arm now calls
 `MpsState::init()` explicitly, exactly as its CUDA arm calls `CudaState::init()`, so the column no
 longer depends on test order. That silent-wrong-kernel fallback is the registration-gate failure the
-f16 paragraph above describes, and `docs/SUPPORT-MATRIX.md`'s footnote 2 is updated to match.
+f16 paragraph above describes, and `docs/SUPPORT-MATRIX.md`'s footnote 2 is updated to match. Two
+scope notes: **no model in the gate set carries a 2-D f32 weight**, so this path is covered by the
+synthetic `metal_matmul_f32_matches_cpu` gate and the op-matrix case only; and the catch-all `_` arm
+is **still there**, so the next unregistered dtype would repeat #317's silent zero — making it refuse
+loudly is [#329](https://github.com/yusiwen/minfer/issues/329) (PR #320's body assigned it to #208,
+which closed without it).
 
 **bf16 weights run on the device too (#208, landed on a Mac 2026-10-06).** The second 2 B/element
 dtype — the Metal half of the ticket whose CUDA half is PR [#321](https://github.com/yusiwen/minfer/pull/321).
@@ -379,7 +388,11 @@ parallel-prefill / classic) are **byte-untouched**: the windowed kernel is a sep
 only for an explicit window, so a single-sequence causal forward keeps its previous numbers. The
 `kv_map` layout stays refused (`Device::gathers_attn_map` is false) and a **packed `q8_0`** region
 stays refused (`READS_PACKED_KV` false) until [#310](https://github.com/yusiwen/minfer/issues/310);
-both are deliberate asymmetries, not silent gaps.
+both are deliberate asymmetries, not silent gaps. The windowed kernel is a **correctness** path,
+not a performance one: keeping it separate is what leaves the causal instruction streams (and
+their measured numbers) byte-identical, and nobody has measured what a batched multi-sequence
+prefill — which runs it — costs against the causal flash prefill. That comparison is
+[#315](https://github.com/yusiwen/minfer/issues/315).
 
 #### 4.4.2 KV write/move side (issue #44 part (b), landed on a Mac 2026-10-06)
 
@@ -427,6 +440,13 @@ window — the `reused_cache_across_prompts_matches_a_fresh_cache` failure fixed
 (CUDA instead derives the bound on device so nothing host-side enters a captured graph; Metal has no
 replay to protect, so the host read is free.)
 
+**One measured order-dependence.** `a_compaction_between_steps_keeps_the_continuation` compares two
+paths (a prefill whose KV is compacted mid-session against one that is not); the two take different
+kernels, and under the **full-suite** Metal state the drift is ~0.0058 while it is **0** when the
+gate runs alone — the same class as `matrix_cases_match_their_reference`. The gate therefore keeps
+its behavioural assertion (the greedy token) rather than a tight numeric one, and the number is
+recorded here so a future full-suite run does not read it as new.
+
 #### 4.4.3 Prefill flash tail-pad overlap (issue #314, landed on a Mac 2026-10-06)
 
 The flash prefill kernel (`kernel_flash_attn_blk_f32/_f16`, incl. the `hd=128` variants) tiles KV into
@@ -441,7 +461,14 @@ as a wrong answer for **any** >64-token prefill. The fix: the partial block read
 rows past `nkv` are zero+masked (`kpos0 <= qpos`) instead of the leading rows being double-counted.
 CPU is bitwise across chunk shapes; after the fix Metal's residual drift is the ordinary cross-shape
 accumulation class (named **0.1**, measured **0.0087** on the 0.5B and **0.0078** on Qwen3-0.6B),
-which the `a_chunked_prefill_answers_like_an_unchunked_one` gate now carries alongside CUDA. Gates:
+which the `a_chunked_prefill_answers_like_an_unchunked_one` gate now carries alongside CUDA. **Why
+no gate caught it for so long**: the only cross-shape Metal gate was
+`graph_metal_matches_cpu_logits`, whose prompt is 33 tokens — below `C = 64`, so it never reached a
+partial block, and the drift was invisible by construction. The isolating experiment named the
+kernel rather than an accumulation-order effect: `MINFER_NO_PREFILL_FLASH=1` (the 3-pass parallel
+attention) drops the drift from 1.445 to **0.007**, and a chunk sweep (1.71 / 1.61 / 1.68 / 1.45 for
+different chunk counts) is **not** proportional to the number of chunks, which rules out
+accumulation order and leaves the flash-prefill kernel as the entry. Gates:
 `flash_prefill_matches_the_cpu_reference_at_every_kv_tail` (nkv 72/96/98 red before at 0.164, all
 ≤ 2e-4 after) and the real-model chunked gate.
 
@@ -557,7 +584,11 @@ One `MpsCommandBuffer` per split, submitted at boundaries, is the whole executio
      through it; a kernel-side range check would be a *silent* no-write, which this rule forbids. The
       gate `metal_kvcache_store_refuses_a_cell_past_the_arena` drives the real `KvcacheStore` dispatch
       with an out-of-range cell written through the generic f32 `fill_input` (bypassing the
-      allocator's i32-only check), so it fails if the arm stops guarding.
+      allocator's i32-only check), so it fails if the arm stops guarding. Two scope notes: the check
+      compares against the layer region's `n_ctx`, which is **not** the same number the allocator uses
+      when a per-layer `n_ctx` is smaller than the arena's `max` — that path stays the allocator's; and
+      the `FusedQKV`/`FusedQkvNorm` arms share the helper but have **no dispatch gate of their own**, so
+      their guard is covered only by the shared helper's mutation.
    - **Decode-fusion shape guards (#39, gap-table G2).** The three decode-only fused arms —
      `FusedFFN`, `FusedQKV`, `FusedQkvNorm` — refuse a non-decode shape (`nt != 1`) with an `Err`
      naming the node and the observed `nt`, and the check runs **before** the weight lookup (shape
@@ -580,7 +611,12 @@ One `MpsCommandBuffer` per split, submitted at boundaries, is the whole executio
      guard must catch. The gates `metal_rms_norm_refuses_a_weight_not_on_gpu`,
      `metal_rms_norm_refuses_a_weightless_node` and `metal_qk_norm_refuses_a_weight_not_on_gpu` drive
      the arms through the real `BackendScheduler::execute`
-     (`src/graph/metal_backend/tests/norm_weight.rs`).
+     (`src/graph/metal_backend/tests/norm_weight.rs`). Two scope notes: the CPU arm keeps its
+     `None => rms_norm_f32` fall-through (`src/graph/cpu_backend.rs`), untouched because #40 is a Metal
+     ticket — CPU is exposed to the same weightless computation; and the harness that reported it
+     (`src/graph/op_matrix.rs`) registered weights on `CudaState` but not on `MpsState`, so its Metal
+     norm cells had always run weightless — it now registers per device, which is what makes the gate
+     exercise the real kernel.
    - **KV-store row count (#305).** `Op::KvcacheStore` derives `nt` from the K input's **logical**
      length (`BufRef::len`), not `self.pool[id].length()`: the pool allocates at the E4 S2 size
      class, so the physical length over-counts `nt` whenever `nkt * nt` is not itself a class size
@@ -591,7 +627,10 @@ One `MpsCommandBuffer` per split, submitted at boundaries, is the whole executio
      their input fill was moved onto the production entry point (they had first panicked in the CPU
      `decode_window` reference on a zero `attn_span`); the same root cause is why
      `graph_metal_layer0_isolation` (#301) and `fused_qkv_matches_unfused_decode` (#302) were red,
-     and both pass with it.
+     and both pass with it. The other `self.pool[..].length()` uses were audited with it and are
+     harmless: `Silu`/`Add`/`Mul`/`QkNorm` over-process their own output padding (writing the class's
+     tail, which nothing reads), and `FusedQKV`/`FusedQkvNorm` slice to the rounded length but read only
+     `p[0]` for the concat — only a *store* writes the over-counted rows into an arena other nodes read.
 6. **`gpu_abort` for configurations the GPU path cannot run** — dimension misalignment, device-limit
    overruns, kernel-array overflow: print the actual values and exit.
 7. **Recurrence playbook** — reproduce with one app and a bounded `-n`; bisect with `MINFER_GEMM=0`
@@ -758,10 +797,15 @@ and `models::qwen2::graph::tail_tests::cuda_conversation_multiturn_reuse` (passe
 alone 3/3 but failed in the full run) — both green in the full run at `6b95763`
 after [#317]'s Metal engine isolation work; they are recorded here as the
 historical class-(c) entries rather than left to reappear. [#298] is the ticket
-that asked for this enumeration.
+that asked for this enumeration. One more entry belongs here because it explains the round's
+*finding* window: an earlier CI blind spot hid the macOS test target for **eleven days** — `cargo
+build` does not compile `#[cfg(test)]`, so the pre-F4 `Tag::Metal` spelling (`cdf41b2`, 2026-09-24)
+left the macOS test binary uncompilable until `4add59f` (2026-10-05) with no CI signal
+([#303], fixed by making `build-macos` run `cargo test --release --no-run`).
 
 [#54]: https://github.com/yusiwen/minfer/issues/54
 [#298]: https://github.com/yusiwen/minfer/issues/298
+[#303]: https://github.com/yusiwen/minfer/issues/303
 [#305]: https://github.com/yusiwen/minfer/issues/305
 [#310]: https://github.com/yusiwen/minfer/issues/310
 [#312]: https://github.com/yusiwen/minfer/pull/312

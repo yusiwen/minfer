@@ -546,7 +546,7 @@ drain covers an entry nothing reads. Two things follow, both measured on the
   with several staged inputs holds several transfers at once (**2** where the F5
   enqueue-then-wait order cannot exceed **1**).
 
-**Still not claimed:** true *cross-split* overlap (a later split's transfer
+**Still not claimed:** true *cross-split* overlap (a later split's transfer — [#300](https://github.com/yusiwen/minfer/issues/300) owns the measured overlap or the recorded negative result; the boundary blit riding the producer's command buffer is why this stays serial)
 running beside an earlier split's kernels) — the split loop remains strictly
 sequential, and a host-side consumer must wait by definition. What the deferral
 buys is that the wait happens where the data is needed, not where it was

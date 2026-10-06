@@ -60,9 +60,11 @@ width on the device — no registration-time f32 copy — and, like CUDA, an f16
 prefill runs the f32-activation kernel, not a simdgroup GEMM. Both loaders admit
 the type, so `weights_on_gpu`'s all-or-nothing check passes and the model is a
 Metal model; 1-D norms/biases stay f32 (the file contract above), so an f16 norm
-can never reach a `d*2` kernel buffer. Measured on a Mac (2026-10-06, Apple M4
-Pro) against the same file's CPU logits: max |Δlogit| 2.4e-3 on the 0.5B and
-7.9e-3 on Qwen3-0.6B (bar 0.05), with an identical greedy continuation.
+can never reach a `d*2` kernel buffer. Measured on `macbook (macOS 27.0.1, Apple
+M4 Pro)` (2026-10-06) against the same file's CPU logits: max |Δlogit| 2.4e-3 on
+the 0.5B and 7.9e-3 on Qwen3-0.6B (bar 0.05), with an identical greedy
+continuation (`[12095, 11, 323, 432]` for Qwen2, `[12095, 13, 576, 6722]` for
+Qwen3).
 ⁶ BF16 weights ([#142](https://github.com/yusiwen/minfer/issues/142)): the CPU
 decodes one row at a time (`vec_ops::mat_mul_bf16`, exact
 `f32::from_bits(bits << 16)`, then the same `vec_dot_f32` the f16 row path uses)
@@ -242,6 +244,13 @@ differs by platform:
   variance on `macbook (macOS 27.0.1, Apple M4 Pro)` (2026-10-06, five interleaved
   `bench -p 0 -n 128 -r 4` pairs: 48.06 vs 46.49 t/s means, individual pairs crossing
   zero), so a second kernel path and its bitwise gate are not earned by a ~1% ceiling.
+  **Provenance and the rejected alternative, stated so the numbers are not misread.** The ~0.2 ms
+  host-encode figure is `MINFER_OP_PROFILE=1` on that 7B — per-op host-encode **totals**, not
+  per-label counts — and the 10 → 4 / 84-per-token dispatch counts are the CUDA D3-8 ledger applied
+  to Metal's dispatch table; Metal has no per-op profiler, so they were not re-counted on the
+  device. And the port is *cheap*: Metal already has the class-1 `attn_bias_rope_store` kernel, so
+  the refused work is mainly a three-pointer binding — the decision rests on the measured ceiling,
+  not on the size of the change.
 - **Interleaved RoPE is CPU-only.** Both loaders hard-code `NonInterleaved`
   today, so no shipped model hits this; a family that needs interleaved RoPE
   needs a loader change plus a CUDA kernel.
