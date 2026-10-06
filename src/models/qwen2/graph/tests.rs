@@ -51,6 +51,19 @@ fn cross_shape_tolerance() -> f32 {
     if crate::cuda::CudaState::get().is_some() {
         return 1.0;
     }
+    #[cfg(target_os = "macos")]
+    if crate::metal::MpsState::get().is_some() {
+        // Metal is a device too, so its cross-shape comparison uses a named
+        // class for the same reason CUDA does: a batched forward runs the
+        // windowed attention kernel (`kernel_gqa_attn_window_*`, E1/G5a) while a
+        // single-sequence forward runs the causal flash/prefill kernel, and the
+        // GEMMs tile by `nt`, so two shapes cannot agree bitwise. Named before
+        // measuring: **0.1** (the observed max|Δ| across these qwen2 gates on
+        // the 0.5B is <= 0.0153). The same-shape gate
+        // `batch_order_does_not_change_a_sequences_logits` stays bitwise and is
+        // what pins the window assignment.
+        return 0.1;
+    }
     0.0
 }
 /// Assert two forwards that differ in shape agree: bitwise on CPU, within

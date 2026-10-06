@@ -148,7 +148,7 @@ three implementations — keep it in step with them.
 | `GetRows` (embedding, tail rows) | ✅ | ✅ | ✅ |
 | `View` with `offset != 0` or a partial window (D1) | ✅ | ❌ | ✅ — Metal's kernels take a buffer and a length with no element offset, so it can express exact views only (G5); the allocator backstops the partial case, which `supports_op` cannot see |
 | `Attn` | ✅ | ✅ | ✅ |
-| `Attn` with `explicit_span` (a window that starts at a non-zero cell, or several sequences in one batch) | ✅ | ❌ | ✅ — Metal still derives the bound from `positions` (G5); CUDA's windowed instantiation (E1b) is **device-verified** on GB10 (sm_121), including a bitwise batch-order-invariance gate |
+| `Attn` with `explicit_span` (a window that starts at a non-zero cell, or several sequences in one batch) | ✅ | ✅ | ✅ — the one-range `attn_span` window is read on all three backends (Metal's `kernel_gqa_attn_window_f32/_f16` landed in #44 part (a), G5a; CUDA's E1b instantiation is **device-verified** on GB10, including a bitwise batch-order-invariance gate). The set-valued `kv_map` window is CPU + CUDA only (`Device::gathers_attn_map`), and a packed `q8_0` KV cache is refused on Metal |
 | `KvcacheStore` | ✅ | ✅ | ✅ |
 | `SwiGLU` (fused) | ✅ | ✅ | ✅ |
 | `RoPE` non-interleaved | ✅ | ✅ | ✅ |

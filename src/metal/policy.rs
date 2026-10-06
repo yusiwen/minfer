@@ -13,8 +13,44 @@
 /// see §0 decided-not #8 / §2.5).
 static KV_F16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+/// Test-only override of [`kv_cache_is_f16`] (issue #44's `attn_span` gate): the
+/// production answer is a process-wide `OnceLock` — the first `set_kv_cache_type`
+/// wins — so one test cannot exercise both KV widths in a single process by
+/// calling the production setter twice. `0` = defer to `KV_F16`, `1` = force f32,
+/// `2` = force f16. The real machine has a Mac, and the production reader is
+/// unchanged (the override is `#[cfg(test)]`-only); the override exists exactly
+/// because a per-engine `kv_format` on Metal is part (b) [#306]/G5's write side,
+/// not this read-side PR.
+#[cfg(test)]
+static KV_F16_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 pub fn kv_cache_is_f16() -> bool {
+    #[cfg(test)]
+    {
+        match KV_F16_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
     *KV_F16.get_or_init(|| false)
+}
+
+/// Test-only: force [`kv_cache_is_f16`] to `f16`/`f32` for the current test.
+/// Paired with [`clear_kv_f16_for_test`] (or a drop guard) so the override does
+/// not leak into another test sharing the process.
+#[cfg(test)]
+pub fn set_kv_f16_for_test(f16: bool) {
+    KV_F16_TEST.store(
+        if f16 { 2 } else { 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Test-only: restore the production `OnceLock` answer.
+#[cfg(test)]
+pub fn clear_kv_f16_for_test() {
+    KV_F16_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Called once at model load with the model dims, BEFORE the first forward:

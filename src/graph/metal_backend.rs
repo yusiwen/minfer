@@ -576,12 +576,17 @@ pub fn supports_fused(fused: &FusedOp) -> bool {
     matches!(fused, FusedOp::SwiGLU)
 }
 
-/// C8b S5: Metal has no cell-store read path yet (G5), so it refuses **both**
-/// explicit window layouts the KV store can hand a node — `attn_span`'s single
-/// `[lo, hi)` pair per query and `kv_map`'s `(cell, len)` runs. The trait
-/// default is already `false`; this constant is where a reader looks, and
-/// `execute_node`'s Attn arm backstops it.
-pub const SUPPORTS_ATTN_SPAN: bool = false;
+/// E1 `attn_span` read path (issue #44 part (a), G5a): Metal reads an explicit
+/// one-range window — one `[lo, hi)` pair per query — with
+/// `kernel_gqa_attn_window_f32/_f16` (`src/metal/kernels/attn_window.metal`),
+/// covering `nt == 1`, `nt > 1`, both KV widths and a non-zero start.
+///
+/// The **other** explicit layout, `kv_map`'s `(cell, len)` runs (C8b S4), is
+/// still refused: `Device::gathers_attn_map` stays false for Metal, so the model
+/// builder never asks for a map and the `Op::Attn` arm backstops a map-sized
+/// input with a loud `Err` rather than parsing it as spans. The write/move side
+/// (C3 compaction, C2 shift, C5 sessions) is part (b).
+pub const SUPPORTS_ATTN_SPAN: bool = true;
 
 /// C4: Metal addresses f32/f16 KV rows, so it does not read a packed `q8_0`
 /// region; [#87] is the work that adds the kernel and flips this.
@@ -1016,22 +1021,6 @@ impl Backend for MetalBackend {
             }
             Op::KvcacheLoad { .. } => Ok(()), // view of the K region
             Op::Attn { explicit_span, .. } => {
-                // C8b S5: Metal derives every query's window from `positions` (the
-                // pre-E1 form) and has no cell-store read path, so **both** explicit
-                // window layouts — `attn_span`'s one `[lo, hi)` pair per query and
-                // `kv_map`'s `(cell, len)` runs (C8b S4) — are refused here rather
-                // than computed as if they were causal. Assignment already keeps them
-                // off this backend (`Backend::supports_attn_span` is false), so this
-                // is the backstop that makes a slip loud instead of wrong; G5 is
-                // where Metal learns the cell store and this goes away.
-                if *explicit_span {
-                    return Err(
-                        "Metal attention: this node carries an explicit window (attn_span or \
-                         kv_map), which Metal does not read yet (G5) — backend assignment \
-                         should have kept it on a backend with a cell-store read path"
-                            .to_string(),
-                    );
-                }
                 let meta = match &node.meta {
                     NodeMeta::Attn(m) => m,
                     other => return Err(format!("attn node missing AttnMeta: {other:?}")),
@@ -1052,14 +1041,65 @@ impl Backend for MetalBackend {
                 let (k_id, v_id) = kv_pair
                     .ok_or_else(|| format!("KV regions for layer {} not allocated", meta.layer))?;
                 let nt = node.out_shape[1];
-                // G1: dispatch the fast attention kernels (flash / split /
-                // parallel) exactly like the legacy layer_gpu path. The fast
-                // paths are gated to the isolation-tested shapes (hd 64/128);
-                // anything else falls back to the classic kernel.
                 let k = self.buf(k_id);
                 let v = self.buf(v_id);
                 let q = self.buf(in_bufs[0].id);
                 let o = self.buf(out_buf.id);
+                // E1 (G5a): an explicit window is selected by the **size** of the
+                // window input (topology, fixed at build time), mirroring CUDA's
+                // arm. `attn_span` is one `[lo, hi)` pair per query (its `lo` at
+                // `window[t]`, `hi` at `window[nt + t]`) and runs the windowed
+                // kernel; a `kv_map`-sized input names `KV_MAP_MAX_SPANS` runs per
+                // query and would be resolved to the wrong rows if read as spans
+                // (risk 1), so it stays a loud refusal while `gathers_attn_map`
+                // is false — never a guess, and never parsed as spans.
+                if *explicit_span {
+                    let win = in_bufs.get(3).ok_or_else(|| {
+                        format!(
+                            "Metal attention: {} is explicit-span but carries no window input",
+                            node.name
+                        )
+                    })?;
+                    if win.len == 2 * nt {
+                        cb.gqa_attn_window(
+                            q,
+                            k,
+                            v,
+                            o,
+                            self.buf(win.id),
+                            meta.n_head,
+                            meta.n_head_kv,
+                            meta.hd,
+                            meta.scale,
+                            nt,
+                        );
+                        return Ok(());
+                    }
+                    let kmax = crate::graph::kvcache::KV_MAP_MAX_SPANS;
+                    if win.len == nt * kmax * 2 {
+                        return Err(format!(
+                            "Metal attention: {} carries a kv_map window (C8b S4), which Metal's \
+                             kernel cannot gather (`Device::gathers_attn_map` is false) — backend \
+                             assignment should have kept it on CPU or CUDA",
+                            node.name
+                        ));
+                    }
+                    return Err(format!(
+                        "Metal attention: {}'s window input has {} values; one query needs either a \
+                         single (lo, hi) pair ({}) or {} (cell, len) runs ({})",
+                        node.name,
+                        win.len,
+                        2 * nt,
+                        kmax,
+                        nt * kmax * 2
+                    ));
+                }
+                // G1: dispatch the fast attention kernels (flash / split /
+                // parallel) exactly like the legacy layer_gpu path. The fast
+                // paths are gated to the isolation-tested shapes (hd 64/128);
+                // anything else falls back to the classic kernel. Every causal
+                // path below is byte-untouched by the E1 window (G5a): only the
+                // `explicit_span` branch above is new.
                 let positions = self.buf(in_bufs[2].id);
                 if nt == 1 {
                     if crate::metal::flash_attn_enabled(meta.hd) {
