@@ -413,3 +413,145 @@ fn cuda_real_model_registers_q4dsc_planes_only_for_q4k() {
         "the W_dsc plane set must be exactly the model's admissible q4_K weights"
     );
 }
+/// #208 (the CUDA half): the bf16 weight matmul reproduces the **exact**
+/// `f32::from_bits(bits << 16)` reference, bitwise.
+///
+/// The weights and activations are small exact integers (representable in bf16
+/// and f32), so every partial product is an integer and the dot is far below
+/// 2^24 — the result is independent of accumulation order, so the kernel must
+/// match the reference bitwise rather than within a tolerance. The reference
+/// decodes each stored bf16 word with the CPU's own exact decode
+/// (`crate::block::bf16_to_f32` == `f32::from_bits(bits << 16)`), so a wrong
+/// decode (reading the words as `__half`, a byte-order slip, a row/index error)
+/// moves the values far outside that and the gate is red.
+///
+/// Both launcher arms are covered: `id % 8 == 0` selects `bf16_f32_matmul_vec`,
+/// and `id % 8 != 0` selects `bf16_f32_matmul_scalar`. The shapes stay inside
+/// the kernel's `NR0 = 4` row grouping and below the 256-element `CHK` chunk, so
+/// the vec arm really runs its in-chunk loop.
+#[test]
+fn cuda_bf16_matmul_matches_the_exact_shift_reference() {
+    let Some(mut cb) = pool() else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    // (od, id, nt): one vec shape (id % 8 == 0) and one scalar shape, both with
+    // od not a multiple of NR0*NSG = 8 so the tail-row guard runs too.
+    for (od, id_, nt) in [(10usize, 64usize, 3usize), (5usize, 60usize, 2usize)] {
+        // Small exact integers in [-4, 4] / [-3, 3].
+        let wv: Vec<f32> = (0..od * id_)
+            .map(|k| ((k * 7 + 3) % 9) as f32 - 4.0)
+            .collect();
+        let xv: Vec<f32> = (0..nt * id_)
+            .map(|k| ((k * 5 + 2) % 7) as f32 - 3.0)
+            .collect();
+        // bf16 store: RNE into the top 16 bits (the writer's rule, #142).
+        let wbytes: Vec<u8> = wv
+            .iter()
+            .flat_map(|&v| {
+                let bits = (v.to_bits() >> 16) as u16;
+                bits.to_le_bytes()
+            })
+            .collect();
+
+        let name = format!("f208_bf16_matmul_{od}x{id_}_{nt}");
+        cb.state.register_weight(&name, &wbytes);
+        assert!(
+            cb.state.has_weight_of_size(&name, wbytes.len()),
+            "the bf16 weight must be registered at its raw 2 B/element length"
+        );
+        let wptr = cb
+            .state
+            .get_weight_ptr(&name)
+            .expect("registered weight ptr");
+
+        let xb = cb.alloc_buffer(id_ * nt);
+        cb.write_host(xb, &xv).unwrap();
+        let ob = cb.alloc_buffer(od * nt);
+        // The production dispatch path: pointer + TensorType, no graph node.
+        let xp = cb.ptr_of(xb).expect("activation buffer pointer");
+        let op = cb.ptr_of(ob).expect("output buffer pointer");
+        cb.state
+            .matmul_f32_ptr_layout(wptr, TensorType::BF16, xp, op, od, id_, nt, false)
+            .expect("the bf16 matmul kernel must launch");
+        let got = cb.copy_to_host(ob).unwrap();
+
+        for t in 0..nt {
+            for r in 0..od {
+                // Exact reference: decode the stored word, dot in the kernel's
+                // own accumulation class (integer sums are order-independent).
+                let mut acc = 0f32;
+                for i in 0..id_ {
+                    let bits = u16::from_le_bytes([
+                        wbytes[2 * (r * id_ + i)],
+                        wbytes[2 * (r * id_ + i) + 1],
+                    ]);
+                    acc += crate::block::bf16_to_f32(bits) * xv[t * id_ + i];
+                }
+                assert_eq!(
+                    got[t * od + r].to_bits(),
+                    acc.to_bits(),
+                    "bf16 matmul [{t},{r}] (od={od} id={id_} nt={nt}): got {} want {}",
+                    got[t * od + r],
+                    acc
+                );
+            }
+        }
+    }
+}
+
+/// #208 (the CUDA half): the bf16 embedding gather decodes the requested rows
+/// **exactly** (`f32::from_bits(bits << 16)`), and the ids cross a non-trivial
+/// row boundary so a stride/index error cannot pass by symmetry.
+///
+/// The words are hand-built bit patterns, not values round-tripped through an
+/// f32 cast: the reference is the same exact shift the CPU's `Op::GetRows` bf16
+/// arm performs, so equality is bitwise. A `__half` misread, a 1-element
+/// off-by-one row stride, or an id read as a plain f32 all move values outside
+/// that.
+#[test]
+fn cuda_bf16_embed_gather_matches_the_exact_shift_reference() {
+    let Some(mut cb) = pool() else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    let (n_vocab, n_embd, nt) = (7usize, 40usize, 4usize);
+    let ids = [3u32, 6, 0, 5];
+    // Hand-built integer bf16 words: bits = value << 7 gives exactly `value`
+    // after the `<< 16` decode (value * 2^16 / 2^7 ... see the reference below),
+    // so the expected f32 is computable on the host without a float cast.
+    let words: Vec<u16> = (0..n_vocab * n_embd)
+        .map(|k| (((k * 11 + 5) % 13) as u16) << 7)
+        .collect();
+    let wbytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let name = "f208_bf16_embed";
+    cb.state.register_weight(name, &wbytes);
+    let wptr = cb
+        .state
+        .get_weight_ptr(name)
+        .expect("registered weight ptr");
+
+    // ids as I32-as-f32 bit patterns (graph rule §4).
+    let id_bits: Vec<f32> = ids.iter().map(|&i| f32::from_bits(i)).collect();
+    let ib = cb.alloc_buffer(nt);
+    cb.write_host(ib, &id_bits).unwrap();
+    let ob = cb.alloc_buffer(n_embd * nt);
+    let ip = cb.ptr_of(ib).expect("ids buffer pointer");
+    let op = cb.ptr_of(ob).expect("output buffer pointer");
+    cb.state
+        .embed_rows_on_gpu(TensorType::BF16, wptr, ip, op, n_embd, nt, false)
+        .expect("the bf16 embed gather must launch");
+    let got = cb.copy_to_host(ob).unwrap();
+
+    for (t, &id) in ids.iter().enumerate() {
+        for i in 0..n_embd {
+            let want = crate::block::bf16_to_f32(words[id as usize * n_embd + i]);
+            assert_eq!(
+                got[t * n_embd + i].to_bits(),
+                want.to_bits(),
+                "bf16 embed [{t},{i}] (id={id}): got {} want {want}",
+                got[t * n_embd + i]
+            );
+        }
+    }
+}
