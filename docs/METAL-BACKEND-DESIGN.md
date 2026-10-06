@@ -361,7 +361,9 @@ both are deliberate asymmetries, not silent gaps.
   read is ordered after the split's submission (`copy_kv_to_cpu` takes `&mut self` and calls
   `sync_backend` first — `MetalBackend::read_host` takes `&self` and does not submit, so a
   pending buffer would be read stale, the [#301](https://github.com/yusiwen/minfer/issues/301)
-  shape). The C2 re-rope stays **f32-only**: an f16 region has no host map (the raw halves
+  shape). Gate `metal_copy_kv_to_cpu_reads_after_the_pending_split` leaves a real store dispatch
+  un-submitted and reads through `copy_kv_to_cpu`: without the flush the read is the region's zeros.
+  The C2 re-rope stays **f32-only**: an f16 region has no host map (the raw halves
   would be rotated as f32), so `kv_rm` refuses it loudly, naming
   [#306](https://github.com/yusiwen/minfer/issues/306); CUDA is exposed too and is not fixed
   here.

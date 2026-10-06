@@ -12,6 +12,7 @@
 //! `Backend::copy_cells` arm on a real Metal pool.
 
 use super::*;
+use crate::graph::backend::KvProvider;
 use crate::graph::kvformat::KvFormat;
 
 /// The pool a gate drives. `enable_metal` builds the real `MetalBackend`; a
@@ -187,4 +188,82 @@ fn metal_kv_format_is_per_engine() {
     assert_eq!(late.metal().unwrap().kv_format(), KvFormat::F16);
     late.set_kv_format(KvFormat::F32);
     assert_eq!(late.metal().unwrap().kv_format(), KvFormat::F32);
+}
+
+/// C2/C5 (issue #44 part (b)): `GraphAllocator::copy_kv_to_cpu` must **flush
+/// the pending split** before it reads. `MetalBackend::read_host` takes `&self`
+/// and does not submit, so a read issued while a compute command buffer is still
+/// pending would return the region's untouched bytes — the
+/// [#301](https://github.com/yusiwen/minfer/issues/301) shape. This gate leaves a
+/// real `KvcacheStore` dispatch **un-submitted** (it drives the production
+/// `execute_node` but skips the scheduler's boundary sync), then reads through
+/// the production `copy_kv_to_cpu`. Without the flush the read is the region's
+/// zeros; with it, the stored rows. Bar: the read equals the stored bytes exactly.
+#[test]
+fn metal_copy_kv_to_cpu_reads_after_the_pending_split() {
+    let _g = crate::metal::metal_test_lock();
+    crate::metal::MpsState::init();
+    let Some(mut alloc) = metal_alloc(KvFormat::F32) else {
+        eprintln!("MPS unavailable; skipping");
+        return;
+    };
+    const NKT: usize = 8;
+    const N_CTX: usize = 32;
+    let nt = 1usize;
+
+    let mut gb = GraphBuilder::new();
+    let _pos = gb.input("positions", [nt, 1, 1, 1], DType::I32);
+    let k_in = gb.input("k", [NKT, nt, 1, 1], DType::F32);
+    let v_in = gb.input("v", [NKT, nt, 1, 1], DType::F32);
+    let store = gb.kvcache_store(0, k_in, v_in, N_CTX);
+    gb.output(store);
+    // The manual `execute_node` below bypasses assignment, but `alloc_graph`
+    // still needs to know which pool owns the region, so stamp Metal.
+    let mut g = gb.build();
+    for n in &mut g.nodes {
+        n.backend = Some(Tag::METAL);
+    }
+    alloc.kv_set_capacity(N_CTX);
+    alloc.alloc_graph(&g).unwrap();
+    let kv = alloc.kv_pair(0).unwrap();
+
+    let kdata: Vec<f32> = (0..NKT * nt).map(|i| i as f32 + 1.0).collect();
+    let vdata: Vec<f32> = (0..NKT * nt).map(|i| i as f32 + 100.0).collect();
+    alloc.fill_input(&g, "k", &kdata).unwrap();
+    alloc.fill_input(&g, "v", &vdata).unwrap();
+    let cells: Vec<u32> = (0..nt as u32).collect();
+    alloc.fill_input_i32(&g, "cells", &cells).unwrap();
+
+    let cells_node = g
+        .inputs
+        .iter()
+        .copied()
+        .find(|&id| g.node(id).name == "cells")
+        .expect("the store created a cells input");
+    let in_bufs = [
+        alloc.node_buffer(k_in).unwrap(),
+        alloc.node_buffer(v_in).unwrap(),
+        alloc.node_buffer(cells_node).unwrap(),
+    ];
+    let out_buf = alloc.node_buffer(store).unwrap();
+    // Enqueue the store on the device and deliberately **do not submit**: the
+    // command buffer is now pending, exactly the state #301 is about.
+    alloc
+        .metal_mut()
+        .unwrap()
+        .execute_node(g.node(store), &in_bufs, out_buf, Some(kv))
+        .expect("enqueue the store");
+
+    // Production read: it must submit the pending buffer first.
+    let (kout, vout) = alloc.copy_kv_to_cpu(0).expect("kv read");
+    assert_eq!(
+        &kout[..NKT * nt],
+        &kdata[..NKT * nt],
+        "copy_kv_to_cpu read the KV region before flushing the pending store (stale/zero bytes)"
+    );
+    assert_eq!(
+        &vout[..NKT * nt],
+        &vdata[..NKT * nt],
+        "copy_kv_to_cpu read the V region before flushing the pending store (stale/zero bytes)"
+    );
 }
