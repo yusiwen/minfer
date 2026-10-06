@@ -8980,7 +8980,7 @@ worktree:
 |---|---|
 | `cargo build --release` | exit 0, warning-free (`deny(warnings)` off-test) |
 | `cargo test --release` | **531 / 0 / 43** unit + **21 / 0 / 6** integration (was **529 / 0 / 42** unit; the +2 passed are the kernel-exactness gates, the +1 ignored is the real-model gate) |
-| `PARALLEL=0 scripts/real_model_gates.sh` | **41 / 1** (was 40 / 1; the +1 pass is `f208_bf16_weights_run_on_the_metal_device`; the single residual is the #310 `kv_sharing` gate, not this change) |
+| `PARALLEL=0 scripts/real_model_gates.sh` | **42 / 1** (the +1 pass over the pre-change set is `f208_bf16_weights_run_on_the_metal_device`; the single residual is the #310 `kv_sharing` gate, not this change) |
 | `f208_bf16_weights_run_on_the_metal_device` | **1 / 0** — 169 bf16 matmul + 1 embed nodes on `Backend::METAL`, 942.4 MiB, max |Δlogit| **1.889e-3** / **1.025e-4** relative (bar 0.05 / 5e-3), greedy `[12095, 13, 1084, 374]` identical |
 | `bf16_matmul_matches_the_exact_shift_reference` / `bf16_embed_gather_matches_the_reference` | **2 / 0**, bitwise against `crate::block::bf16_to_f32` |
 | `cargo fmt --all --check` + the six `check_*.py` gates | clean / exit 0 each |
