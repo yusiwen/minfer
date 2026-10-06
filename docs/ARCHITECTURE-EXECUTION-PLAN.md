@@ -8918,7 +8918,7 @@ loudly; that half is the ticket's second PR.
 | `cargo build --release --features cuda` | exit 0, warning-free (`deny(warnings)` off-test) |
 | `cargo build --release` | exit 0, warning-free |
 | `scripts/cuda_test.sh` | **570 / 0 / 45** (was 567 / 0 / 42) |
-| `cargo test --release` | **482 / 0 / 39** unit + **10 / 0 / 6** integration (was 481 / 0 / 36) |
+| `cargo test --release` | **482 / 0 / 39** unit + **10 / 0 / 6** integration (was 481 / 0 / 36); the x86_64 CI runner reports **480 / 0 / 39** — the live `check_status.py --check-live` gate is what corrected the CI row from a derived 41 ignored to the measured 39 |
 | `FEATURES=cuda scripts/real_model_gates.sh` (0.5B) | **45 / 0** (was 42 / 0) |
 | `FEATURES=cuda MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf scripts/real_model_gates.sh` | **45 / 0** (was 42 / 0) |
 | `PARALLEL=0 scripts/real_model_gates.sh` (CPU) | **39 / 0** (was 36 / 0) |
