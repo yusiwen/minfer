@@ -25,7 +25,14 @@
 #                       (#254) — the maximal configuration, since `src/cuda.rs`
 #                       and `src/graph/cuda_backend.rs` exist only under the
 #                       feature — which is why the image installs `python3`.
-# 3. build-macos      : unchanged macOS/Metal compile check (Apple Silicon).
+# 3. build-macos      : the macOS/Metal compile check (Apple Silicon). It compiles the
+#                       crate **and the test target** (`cargo test --no-run`). The
+#                       crate build alone does not compile `#[cfg(test)]`, so from
+#                       `cdf41b2` (2026-09-24, F4 made `Backend` a registry handle)
+#                       to `4add59f` (2026-10-05) a broken macOS test target — 16
+#                       pre-F4 `Tag::Metal` uses — was invisible here for eleven days
+#                       (#303). Link-only: a GitHub runner has no Metal device, so the
+#                       macOS-only assertions still need a Mac; the *compile* does not.
 # 4. check-docs       : the documentation gate (#63, #94). `mdbook build` proves the
 #                       book renders (a chapter missing from SUMMARY.md is a hard
 #                       error there, and the toolchain matches the one Docs deploys
@@ -204,6 +211,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build (release)
         run: cargo build --release
+      # #303: `cargo build` never compiles `#[cfg(test)]`, so a broken macOS test
+      # target stayed green here while no macOS test could run at all (see the job
+      # comment above). `--no-run` links the test binaries without executing them.
+      - name: Compile tests (release, link only)
+        run: cargo test --release --no-run
 
   # The documentation gate (#63, #94). Checked first because it is the cheap half and
   # the half that catches rot: a renamed file leaves a dead link that `mdbook build`
