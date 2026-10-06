@@ -210,6 +210,17 @@ fn run_on(tag: Backend, case: &Case) -> Result<Vec<f32>, String> {
                 state.register_weight(&w.name, w.data());
             }
         }
+        // Same reason as the CUDA block above: Metal's kernels read weights from
+        // `MpsState`, which the product loader fills (`models/*/loader.rs`). A
+        // norm/matmul cell has no device weight without this, and since #40 the
+        // norm arms refuse that loudly instead of running weightless — so the
+        // harness must register here to exercise the real kernel.
+        #[cfg(target_os = "macos")]
+        if tag == Backend::METAL {
+            if let Some(state) = crate::metal::MpsState::get() {
+                state.register_weight(&w.name, w.data());
+            }
+        }
     }
     for (name, data) in &inputs {
         let id = graph_input_id(&g, name).ok_or_else(|| format!("no input '{name}'"))?;
