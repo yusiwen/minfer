@@ -27,6 +27,16 @@ same GGUF file, and *why* — measured on the M4 Pro dev machine, 2026-08.
 | **CPU decode** (tok/s, -t 8) | **1.1 → ~52–58** | 63–68 | **~60× → ~80–90 %** |
 | **CPU prefill** (tok/s) | ~1.1 → **~75** | ~211 | ~190× → ~2.8× |
 
+> **Re-measured by [#54] (2026-10-06, `6b95763`, `macbook (macOS 27.0.1, Apple M4
+> Pro)`)**: `minfer bench -p 241 -n 128 -r 3 Qwen3-4B-Q4_K_M.gguf` gives Metal
+> **decode 74.11 ± 0.19 tok/s** and **prefill pp241 729.83 ± 0.20 tok/s** (~330 ms)
+> — decode is within the run-to-run range above and prefill is at the table's
+> steady-state band. llama.cpp was **not** re-run for #54, so the ratio columns
+> remain the 2026-08 record. Full re-measured rows: `docs/METAL_OPTIMIZATIONS.md`
+> §0.1.
+
+[#54]: https://github.com/yusiwen/minfer/issues/54
+
 Post-fix notes: the first-request gap was a KV-sizing policy issue (§2), now
 fixed — the 241-token first request drops from 552 ms to ~370 ms
 (241×1.15 + ~106 ms instead of + ~289 ms). The CPU gap (§3) was

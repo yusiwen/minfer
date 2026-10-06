@@ -185,7 +185,7 @@ fn main() {
     // other target no metallib is built and the env vars are left unset; the
     // Metal module itself is cfg-gated out there, so nothing reads them.
     //
-    // Compile src/metal.metal → $OUT_DIR/minfer.metallib at build time so the
+    // Compile the concatenated src/metal/kernels/*.metal → $OUT_DIR/minfer.metallib at build time so the
     // binary can load it with newLibraryWithData (llama embeds default.metallib
     // the same way; minfer previously compiled from source at every process
     // start — ~0.3-1 s, and even the first-ever run). Flags mirror llama's
@@ -294,7 +294,7 @@ fn main() {
         }
         let _ = std::fs::remove_file(&air);
         // Content hash in the env fingerprint: cargo does not track OUT_DIR
-        // files for include_bytes!, so a changed metallib (metal.metal edit)
+        // files for include_bytes!, so a changed metallib (a shader-part edit)
         // would otherwise leave a stale binary. The hash forces a recompile.
         let bytes = std::fs::read(&metallib).unwrap_or_default();
         let hash: String = bytes.iter().map(|b| format!("{b:02x}")).take(16).collect();

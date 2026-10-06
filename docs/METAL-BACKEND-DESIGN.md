@@ -45,7 +45,7 @@ never a silent mid-run fallback.
 | Attention dispatch matches the old path | G1 wires nt==1 and nt>1 to the flash/split/parallel/classic kernels with the same gates and env vars | §4.4, §4.6 |
 | Decode fusions on Metal | G4 `FusedQKV`, G5 `FusedFFN`, G6 `FusedQkvNorm` (Qwen3) are built as single nodes | §4.4, §4.6 |
 | Same correctness gates as CPU | Per-op parity tests, cross-backend copy tests, model-level CPU-vs-Metal logits / greedy equality, kernel isolation tests | §7 |
-| Performance | Graph path at or above the old imperative path: 0.5B decode ~299–331 tok/s (KV440, G4+G5) and prefill pp440 ~3900–4000 tok/s; 7B decode ≈ parity; Qwen3-4B decode ~75.9 tok/s ≈ llama-Metal 79.7 | `METAL_OPTIMIZATIONS.md` §0.1 |
+| Performance | Graph path at or above the old imperative path, **re-measured 2026-10-06** at `6b95763` on `macbook (macOS 27.0.1, Apple M4 Pro)` (`minfer bench -p <P> -n 128 -r 3`): 0.5B Q4_0 decode **306.19 ± 1.00 tok/s** / prefill pp440 **6249.60 ± 10.52 tok/s**; 7B Q4_K_M decode **48.52 ± 0.18 tok/s** / prefill pp206 **406.51 ± 0.83 tok/s**; Qwen3-4B Q4_K_M decode **74.11 ± 0.19 tok/s** (llama-Metal 79.7). Metal correctness: the external oracle `graph_metal_matches_llama_reference` reproduces the pinned greedy prefix, and the per-op `metal_*_matches_cpu` gates are green (the model-level `graph_metal_matches_cpu_logits` is degenerate in the graph era — [#324](https://github.com/yusiwen/minfer/issues/324)) | `METAL_OPTIMIZATIONS.md` §0.1 |
 
 ### 1.3 Non-goals
 
@@ -719,13 +719,60 @@ single-threaded and parallel runs (e.g. 152 passed / 3 ignored single-threaded m
 integration binaries green on device). Run `cargo test --release` on macOS for the device suites;
 on Linux the Metal-only tests self-skip and the isolation binaries are empty.
 
+### 7.4 The macOS suite baseline (#298, recorded by [#54] at the round's end)
+
+The macOS suite was **red for the whole Metal round**; this is the dated,
+enumerated baseline a later Mac gate run **diffs against — anything new is a
+regression**. Taken at `6b95763` (the round's final master), 2026-10-06, on
+`macbook (macOS 27.0.1, Apple M4 Pro)`.
+
+- **unit** `cargo test --release --no-fail-fast`: **531 passed / 0 failed / 43
+  ignored** — green.
+- **integration**: **21 passed / 0 failed / 6 ignored**.
+- **real-model** (`PARALLEL=0 scripts/real_model_gates.sh`, serial), both cached
+  models (0.5B f32 KV and Qwen3-0.6B f16 KV): **42 passed / 1 failed** each. The
+  single residual is
+  `server::batch::tests::kv_sharing::a_store_inside_a_shared_prefix_takes_a_private_row`
+  — a **deliberate Metal capability gap, not a regression**: it needs the
+  set-valued `kv_map` gather Metal does not implement (`Device::gathers_attn_map`
+  is false, [#310]). What fails is the *setup* assertion ("slot 1 must read 0 rows
+  in place for the gate to mean anything"): the harness cannot make Metal read a
+  shared prefix in place, so the gate is a class-(b) known-refusal owned by
+  [#310], not a class-(a) defect.
+
+**History (so the green is legible).** At the round's start (`97823e4`, after
+[#137]) the same unit suite was **21 failures**. Three root causes explained them:
+**twelve were one production bug** — `Op::KvcacheStore` derived `nt` from the
+class-rounded pool length instead of the logical node length ([#305], PR [#312]);
+the other two were [#317] (an f32 weight silently ran the Q4_0 matmul kernel on
+Metal, PR [#320]) and [#314] (the flash-prefill partial KV block overlapped the
+previous one, so any >64-token prefill drifted, PR [#322]). Two further failures
+were **order-dependent flakes** — `graph::op_matrix::matrix_cases_match_their_reference`
+(Metal's op-matrix column depended on another test having initialized `MpsState`)
+and `models::qwen2::graph::tail_tests::cuda_conversation_multiturn_reuse` (passed
+alone 3/3 but failed in the full run) — both green in the full run at `6b95763`
+after [#317]'s Metal engine isolation work; they are recorded here as the
+historical class-(c) entries rather than left to reappear. [#298] is the ticket
+that asked for this enumeration.
+
+[#54]: https://github.com/yusiwen/minfer/issues/54
+[#298]: https://github.com/yusiwen/minfer/issues/298
+[#305]: https://github.com/yusiwen/minfer/issues/305
+[#310]: https://github.com/yusiwen/minfer/issues/310
+[#312]: https://github.com/yusiwen/minfer/pull/312
+[#314]: https://github.com/yusiwen/minfer/issues/314
+[#317]: https://github.com/yusiwen/minfer/issues/317
+[#320]: https://github.com/yusiwen/minfer/pull/320
+[#322]: https://github.com/yusiwen/minfer/pull/322
+
 ---
 
 ## 8. Out of Scope / Future
 
-- **Not planned**: MPSGraph / higher-level MPS APIs, multi-GPU, f16 activations (f16 **weights** are a
-  CPU/CUDA feature and are refused on Metal until [#164](https://github.com/yusiwen/minfer/issues/164) —
-  see §4.4), training.
+- **Not planned**: MPSGraph / higher-level MPS APIs, multi-GPU, f16 activations, training.
+  (f16 **weights** landed on Metal in [#164](https://github.com/yusiwen/minfer/issues/164) and bf16 in
+  [#208](https://github.com/yusiwen/minfer/issues/208) — see §4.4 and `docs/SUPPORT-MATRIX.md`; it is
+  the *activation* dtype that stays f32.)
 - **Closed by measurement** (`METAL_OPTIMIZATIONS.md` §3.6/§4): the prefill GEMM gap (params match
   llama's; decided not to change), and the flash/split/parallel attention lineup.
 - **Remaining research** (`METAL_OPTIMIZATIONS.md` §4.1/§4.2): cold-start items and the residual

@@ -40,6 +40,19 @@
 # architecture reports it as a removal (informational). `--target
 # x86_64-unknown-linux-gnu` reproduces the CI set locally; the authoritative run
 # is the CI job itself, which passes no `--target`.
+#
+# Re-stated 2026-10-06 (#54). The value stays `unjudged`: the Linux oracle still
+# cannot compile a macOS-only module, and `build-macos` still only type-checks.
+# The round *did* judge the two `src/metal.rs` annotations that were this
+# marker's concrete cases — [#255] (PR #294) turned `matmul_on_gpu_buf` into
+# `#[cfg(test)]` and deleted the container-level `impl MpsState` blanket — and it
+# re-verified the two `forward_graph` rows below: the macOS **test** build emits no
+# `dead_code` for them, so `src/models/mod.rs`'s
+# `#[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]` applies
+# no allow where its caller lives
+# (`models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits`).
+#
+# [#255]: https://github.com/yusiwen/minfer/issues/255
 macos = "unjudged"
 
 # ---- cpu: 46 dead item(s), union of aarch64 + x86_64 ----

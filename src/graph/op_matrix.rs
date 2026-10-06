@@ -850,6 +850,7 @@ fn matrix_cases_match_their_reference() {
 fn support_table_matches_support_matrix_doc() {
     // (op, CPU, Metal, CUDA)
     let table: &[(&str, Op, bool, bool, bool)] = &[
+        ("Input", Op::Input, true, true, true),
         ("Add", Op::Add, true, true, true),
         ("Mul", Op::Mul, true, true, true),
         ("Silu", Op::Silu, true, true, true),
@@ -921,6 +922,22 @@ fn support_table_matches_support_matrix_doc() {
             },
             true,
             true,
+            true,
+        ),
+        // The doc's `View` row is two rows: an exact view (offset 0, above) and
+        // a partial window at a non-zero offset. Metal's kernels take a buffer
+        // and a length with no element offset, so it refuses the latter (G5);
+        // CPU and CUDA express it. Checking the offset spelling here is the
+        // whole row `supports_op` can see — a *partial* window at offset 0 is
+        // backstopped by the allocator, not by `supports_op`.
+        (
+            "View offset",
+            Op::View {
+                offset: 2,
+                shape: [1, 1, 1, 1],
+            },
+            true,
+            false,
             true,
         ),
         (
