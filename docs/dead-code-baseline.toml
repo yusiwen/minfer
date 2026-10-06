@@ -236,12 +236,6 @@ file = "src/tokenizer.rs"
 reason = "Read by `tokenizer::tests`; production reaches the token through the merged special-token index."
 
 [[cpu]]
-name = "kv_format"
-kind = "fn"
-file = "src/graph/alloc.rs"
-reason = "The only non-test reader is the CUDA registry entry's `kv_format` hook, compiled out of a CPU-only build — `not(feature = \"cuda\")` names that configuration."
-
-[[cpu]]
 name = "llama_key"
 kind = "fn"
 file = "src/device_tier.rs"

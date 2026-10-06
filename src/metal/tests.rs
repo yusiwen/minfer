@@ -441,7 +441,7 @@ fn non_matmul_bandwidth_profile() {
         ),
         (
             "store_kv (nkt=128, 1t)",
-            Box::new(|cb| cb.store_kv(&bk, &kv, nkt, 1, &pos, 0)),
+            Box::new(|cb| cb.store_kv(&bk, &kv, nkt, 1, &pos, 0, false)),
             400,
         ),
         (
@@ -464,6 +464,7 @@ fn non_matmul_bandwidth_profile() {
                     1.0,
                     (nkv - 1) as i32,
                     0,
+                    false,
                 )
             }),
             400,
@@ -472,7 +473,7 @@ fn non_matmul_bandwidth_profile() {
         (
             "attn split p+c (c=16)",
             Box::new(|cb| {
-                cb.gqa_attn_split_f32(&bqkv, &kv, &kv, &o, &pos, nh, nk, hd, 0.125, 1, 16)
+                cb.gqa_attn_split_f32(&bqkv, &kv, &kv, &o, &pos, nh, nk, hd, 0.125, 1, 16, false)
             }),
             100,
         ),
@@ -521,7 +522,7 @@ fn non_matmul_bandwidth_profile() {
     // Classic single-pass attention (baseline for the split pair):
     let cases2: Vec<(&str, Box<dyn Fn(&MpsCommandBuffer)>, usize)> = vec![(
         "attn classic (nkv=430)",
-        Box::new(|cb| cb.gqa_attn_f32(&bqkv, &kv, &kv, &o, &pos, nh, nk, hd, 0.125, 1)),
+        Box::new(|cb| cb.gqa_attn_f32(&bqkv, &kv, &kv, &o, &pos, nh, nk, hd, 0.125, 1, false)),
         100,
     )];
     for (i, (label, dispatch, n)) in cases2.iter().enumerate() {

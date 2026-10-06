@@ -61,6 +61,90 @@ impl MpsCommandBuffer<'_> {
         Ok(())
     }
 
+    /// C3 (issue #44 part (b)): encode the overlap-safe row move
+    /// [`Backend::copy_cells`](crate::graph::backend::Backend::copy_cells) needs —
+    /// one `MTLBlitCommandEncoder` copy per row, in the order the overlap
+    /// requires (ascending when the run slides down, descending when it slides
+    /// up), into **this** command buffer, so the move rides the split's single
+    /// submission.
+    ///
+    /// Apple documents a same-buffer copy whose source and destination ranges
+    /// overlap as undefined, so a bulk blit is not an option; a per-row blit
+    /// satisfies the `size <= distance` rule for every `src_row != dst_row` (a
+    /// same-row move is a no-op and returns early). This mirrors CUDA's
+    /// `kv_move_rows` (`cuda/kernels/kv_store.cu`), which branches on
+    /// `dst_row <= src_row` the same way.
+    ///
+    /// `row_bytes` is one cell's storage stride (`elems_per_cell * 4`, already
+    /// halved for an f16 region by the caller), and `src_base`/`dst_base` are the
+    /// two views' byte offsets (`BufRef::offset * 4`).
+    pub fn encode_move_rows(
+        &mut self,
+        src: &MetalBuffer,
+        dst: &MetalBuffer,
+        src_base: usize,
+        dst_base: usize,
+        src_row: usize,
+        dst_row: usize,
+        rows: usize,
+        row_bytes: usize,
+    ) -> Result<(), String> {
+        if rows == 0 || src_row == dst_row {
+            return Ok(());
+        }
+        let src_end = src_base
+            .checked_add(
+                (src_row + rows)
+                    .checked_mul(row_bytes)
+                    .ok_or("row move overflow")?,
+            )
+            .ok_or("row move source offset overflow")?;
+        if src_end > src.length() {
+            return Err(format!(
+                "Metal copy_cells: source rows {src_row}..{} at byte {src_base} run past the \
+                 {} -byte buffer",
+                src_row + rows,
+                src.length()
+            ));
+        }
+        let dst_end = dst_base
+            .checked_add(
+                (dst_row + rows)
+                    .checked_mul(row_bytes)
+                    .ok_or("row move overflow")?,
+            )
+            .ok_or("row move destination offset overflow")?;
+        if dst_end > dst.length() {
+            return Err(format!(
+                "Metal copy_cells: destination rows {dst_row}..{} at byte {dst_base} run past the \
+                 {} -byte buffer",
+                dst_row + rows,
+                dst.length()
+            ));
+        }
+        // Close the compute pass first (Metal allows one active encoder).
+        self.end_compute();
+        let blit = self
+            .cmd_buf
+            .blitCommandEncoder()
+            .ok_or("MTLCommandBuffer.blitCommandEncoder returned nil")?;
+        let down = dst_row <= src_row;
+        for k in 0..rows {
+            // Moving down: copy the lowest row first. Moving up: the highest
+            // first. Either way a row is never overwritten before it is read.
+            let r = if down { k } else { rows - 1 - k };
+            let so = src_base + (src_row + r) * row_bytes;
+            let d_off = dst_base + (dst_row + r) * row_bytes;
+            unsafe {
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    src, so, dst, d_off, row_bytes,
+                );
+            }
+        }
+        blit.endEncoding();
+        Ok(())
+    }
+
     pub fn submit(self) -> Result<(), String> {
         if self.enc_open {
             self.enc.endEncoding();

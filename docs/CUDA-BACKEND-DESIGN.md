@@ -624,11 +624,12 @@ Two layers of checks are deliberately *not* in `supports_op`:
   `enable_metal()`. On a CUDA-only host the practical effect is CUDA first.
 - **KV compaction (C3) is not a node op** — it is the `Backend::copy_cells` trait method, called by
   `GraphAllocator::kv_defrag` between forwards. CUDA implements it with `kv_move_rows`: one block,
-  rows walked **ascending** with a `__syncthreads()` between them, because the contract is
-  `dst_row <= src_row` with **overlapping** ranges (a compaction slides a run into the gap just below
-  it) and device-to-device `cudaMemcpyAsync` is documented undefined for overlap. No staging buffer,
-  no second pass. The launcher returns non-zero on a contract violation and the Rust side turns that
-  into an `Err`, so the allocator fails the compaction **before** it renumbers any run. It runs on the
+  rows walked **ascending when `dst_row <= src_row` and descending otherwise** (C7b — a compaction
+  slides a run down into the gap below it, and growing a run can move one up), with a
+  `__syncthreads()` between rows, because the ranges may **overlap** in either direction and
+  device-to-device `cudaMemcpyAsync` is documented undefined for overlap. No staging buffer, no second
+  pass. The launcher returns non-zero on a contract violation and the Rust side turns that into an
+  `Err`, so the allocator fails the compaction **before** it renumbers any run. It runs on the
   backend's own stream, so it is ordered after the previous forward's kernels.
 - KV regions are created by `ensure_kv` on the layer's assigned backend, so with CUDA assignment the
   per-layer K/V regions live in the CUDA pool and `KvProvider::kv_pair` returns pool ids that
@@ -728,9 +729,11 @@ tag as an argument; what was process-wide was the value. Two engines in one proc
 their own layouts, and the captured-graph key carries the tag (below), so an exec instantiated for
 one layout cannot replay for another. `models::load_model_configured` no longer restates anything.
 
-**Metal is the remaining device-static.** `metal::kv_cache_is_f16` is still a process-wide
-`OnceLock` its kernels read (no Mac here to re-plumb it; Metal is G5 for packed anyway), so the
-*Metal* device run keeps the documented discipline.
+**Metal is no longer a device-static (since #44 part (b), 2026-10-06).** Its `kv_format` is a field
+on `MetalBackend`, stamped from `GraphAllocator::set_kv_format`, and every store/attention dispatch
+takes it as an explicit `f16` argument — the old `metal::KV_F16` `OnceLock` and
+`kv_cache_is_f16`/`set_kv_cache_type` are gone, so all three backends now keep the format per engine.
+(The packed `q8_0` read is still [#310](https://github.com/yusiwen/minfer/issues/310).)
 
 **Host transfers.**
 

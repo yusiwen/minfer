@@ -117,13 +117,16 @@ and the struct is `unsafe impl Send/Sync` on that basis.
 - **Load-time warm-up.** The first GPU access to file-backed (mmap) pages costs a one-time
   page/TLB setup (~44 ms measured); a dummy full-buffer read at model load moves that cost out of
   the first prefill (`METAL_OPTIMIZATIONS.md` §0 Done #39).
-- **KV element type.** `set_kv_cache_type(n_layers, n_kv_embd)` runs once at load: f16 when
-  `n_layers × n_kv_embd >= 8192` (the 7B class; measured ~−1 ms/token at 2K context) or f32 for
-  small models (f16 measured ~3% slower there, dispatch-latency-bound); `MINFER_CACHE_TYPE=f16|f32`
-  overrides (a third value, `q8_0`, is the packed cache the CPU and CUDA kernels read since C4,
-  and is **refused** here — Metal's kernels address f32/f16 rows and its half is G5,
-  [#44](https://github.com/yusiwen/minfer/issues/44)). `kv_cache_is_f16()` is the query the
-  store/attention/fused kernels use.
+- **KV element type (per engine, #44 part (b)).** `models::load_model_configured` resolves
+  `MINFER_CACHE_TYPE` once (`kvformat::auto_device_format` picks f16 when
+  `n_layers × n_kv_embd >= 8192` — the 7B class, measured ~−1 ms/token at 2K context — and f32
+  otherwise; f16 measured ~3% slower on the 0.5B, dispatch-latency-bound). The answer is stored on
+  `MetalBackend` as `kv_format`, stamped through `GraphAllocator::set_kv_format`, and passed as an
+  explicit `f16` argument to every store/attention/fused decode. There is **no** process-wide
+  Metal tag any more: the old `metal::KV_F16` `OnceLock`, `kv_cache_is_f16` and `set_kv_cache_type`
+  were deleted in #44 part (b), so two engines with different dims can hold different layouts in
+  one process. A third value, `q8_0`, is the packed cache the CPU and CUDA kernels read since C4;
+  Metal's kernels address f32/f16 rows and **refuse** it ([#310](https://github.com/yusiwen/minfer/issues/310)).
 
 ### 2.4 Command buffers and submission
 
@@ -167,7 +170,7 @@ what it deliberately does not do:
 | `FLASH_ATTN_EXT` variant selection (DK/DV, f16 KV) | `gqa_attn_flash` (nt==1) and `attn_flash_prefill` (nt>1) with `hd ∈ {64,128}` guards | Borrowed in spirit, own port |
 | Fusion rules in the Metal backend | minfer fuses at the graph level: `FusionPass` SwiGLU + build-time `FusedQKV`/`FusedFFN`/`FusedQkvNorm` | Diverged (graph-level fusion) |
 | Unified-memory weight buffers (mmap or copies) | `newBufferWithBytesNoCopy` over mmap'd GGUF parts, per-weight (buffer, offset) | Borrowed |
-| KV cache element-type policy | `set_kv_cache_type` auto f16 for the 7B class | Borrowed |
+| KV cache element-type policy | `ModelDef::kv_format` auto f16 for the 7B class, per engine | Borrowed |
 | MPS `MPSGraph` / higher-level MPS APIs | — | Not used (all kernels are hand-written MSL) |
 | Multi-GPU / device selection, command-buffer concurrency tuning | — | Out of scope |
 
@@ -267,7 +270,7 @@ CUDA's `supports_op` gates RoPE to `NonInterleaved` only. All supported models a
 | `GetRows` + no meta | `get_rows_f32` (the G3 tail-row selection) |
 | `RoPE` | `copy_in` if not aliased, then `rope_f32` with the node's `rope_style` |
 | `SwiGLU` | `swiglu_f32` |
-| `KvcacheStore` | `kv_pair` required; two `store_kv` calls (K then V); f32 or f16 by `kv_cache_is_f16()` |
+| `KvcacheStore` | `kv_pair` required; two `store_kv` calls (K then V); f32 or f16 by the engine's per-instance `kv_format` |
 | `KvcacheLoad` | no-op — the output buffer *is* the persistent K region |
 | `Attn` | §4.4.1 |
 | `View` / `Reshape` / `Permute` | `copy_in` when the output differs, else no-op |
@@ -335,15 +338,53 @@ time), mirroring CUDA's arm:
 `supports_attn_span()` is now `true` (`SUPPORTS_ATTN_SPAN`). The causal paths (flash / split /
 parallel-prefill / classic) are **byte-untouched**: the windowed kernel is a separate family used
 only for an explicit window, so a single-sequence causal forward keeps its previous numbers. The
-write/move side of G5 is still owed (part (b)): `copy_cells` (C3 compaction), the `copy_kv_to_cpu`
-Metal arm (C2 shift / C5 sessions), the packed `q8_0` read (`READS_PACKED_KV` stays false) and the
-per-engine `kv_format`.
+`kv_map` layout stays refused (`Device::gathers_attn_map` is false) and a **packed `q8_0`** region
+stays refused (`READS_PACKED_KV` false) until [#310](https://github.com/yusiwen/minfer/issues/310);
+both are deliberate asymmetries, not silent gaps.
+
+#### 4.4.2 KV write/move side (issue #44 part (b), landed on a Mac 2026-10-06)
+
+- **C3 row move — `Backend::copy_cells`.** CUDA-rejecting on **both** directions
+  (`dst_row` above *or* below `src_row`, overlapping): the arm opens **one**
+  `MTLBlitCommandEncoder` in the current command buffer and copies row by row in the
+  overlap-safe order — ascending when the run slides down, descending when it slides up
+  (`dst_row <= src_row`), the mirror of CUDA's `kv_move_rows`. A bulk blit is not an option:
+  Apple documents an overlapping same-buffer copy as undefined, and a separate submission
+  would overlap the producer split ([#137](https://github.com/yusiwen/minfer/issues/137)).
+  **f16** halves `elems_per_cell` (`half[cell * nkt]` is `nkt / 2` f32 words apart); a packed
+  Q8_0 cell is whole words and needs no division, but Metal refuses Q8_0 so only the f16
+  branch is live. Gates: `metal_copy_cells_moves_overlapping_rows_in_both_directions`,
+  `metal_f16_kv_cell_move_strides_by_row_bytes`.
+- **C2 shift / C5 sessions — `GraphAllocator::copy_kv_to_cpu`.** The `CPU || CUDA` hardcode is
+  gone; the read goes through the registry `host_read` hook for every backend, so a Metal
+  session **shifts** (`kv_rm`/`kv_shift`) and saves (`kv_save*`) instead of re-rendering. The
+  read is ordered after the split's submission (`copy_kv_to_cpu` takes `&mut self` and calls
+  `sync_backend` first — `MetalBackend::read_host` takes `&self` and does not submit, so a
+  pending buffer would be read stale, the [#301](https://github.com/yusiwen/minfer/issues/301)
+  shape). The C2 re-rope stays **f32-only**: an f16 region has no host map (the raw halves
+  would be rotated as f32), so `kv_rm` refuses it loudly, naming
+  [#306](https://github.com/yusiwen/minfer/issues/306); CUDA is exposed too and is not fixed
+  here.
+- **Per-engine `kv_format`.** `MetalBackend` now carries its own `KvFormat`, stamped from
+  `GraphAllocator::set_kv_format` (and read from the allocator stamp on `enable_metal`), and
+  every attention/store dispatch takes it as an explicit `f16` argument instead of reading a
+  process-wide tag. The old `metal::KV_F16` `OnceLock`, `kv_cache_is_f16`, `set_kv_cache_type`
+  and the `#[cfg(test)]` override are deleted: two engines in one process now hold their own
+  layouts and a C5 session header is described under the width its region really uses (the
+  registry `kv_format` hook reads the allocator's stamp so it answers before the pool is
+  enabled — the CUDA hook's shape). Gate `metal_kv_format_is_per_engine`.
+- **Packed `q8_0`** stays refused; [#310](https://github.com/yusiwen/minfer/issues/310) is the
+  follow-up and `docs/SUPPORT-MATRIX.md` carries the asymmetry.
 
 The decode chunk count is `MINFER_ATTN_CHUNKS` or `((max_pos + 1 + 31) / 32).clamp(1, 16)` — one
 chunk per 32 KV rows, capped at 16. `nkv` for the prefill kernels and the chunk count come from a
 host read of the positions buffer; that is safe because positions are host-written input data, never
-GPU-computed. (CUDA instead derives the bound on device so nothing host-side enters a captured
-graph; Metal has no replay to protect, so the host read is free.)
+GPU-computed. The read is bounded by the node's **logical** length (`positions_max(positions, nt)`,
+`BufRef::len`), not the class-rounded pool buffer: a recycled positions buffer keeps a prior graph's
+tail, and scanning it derived a stale `max_pos` that made a causal prefill attend past its own
+window — the `reused_cache_across_prompts_matches_a_fresh_cache` failure fixed in #44 part (b).
+(CUDA instead derives the bound on device so nothing host-side enters a captured graph; Metal has no
+replay to protect, so the host read is free.)
 
 ### 4.5 Allocator and scheduler integration
 
@@ -397,9 +438,10 @@ CParams.gpu = metal_on || cuda_on
 - **Weights are zero-copy** over the mmap'd GGUF parts, with the ~44 ms first-touch page cost paid
   at load by a dummy warm-up read (`METAL_OPTIMIZATIONS.md` §0 Done #39). `MINFER_WEIGHT_COPY=1` forces
   per-weight copies.
-- **KV element type.** The persistent regions stay f32-shaped in the IR, but `set_kv_cache_type`
-  picks f16 for the 7B class (KV-bandwidth-bound; measured ~−1 ms/token at 2K) and f32 for small
-  models (f16 measured ~3% slower there); `MINFER_CACHE_TYPE` overrides.
+- **KV element type.** The persistent regions stay f32-shaped in the IR, but the engine's per-instance
+  `kv_format` picks f16 for the 7B class (KV-bandwidth-bound; measured ~−1 ms/token at 2K) and f32
+  for small models (f16 measured ~3% slower there); `MINFER_CACHE_TYPE` overrides. The arm is
+  `GraphAllocator::set_kv_format` (per engine, #44 part (b)).
 - **Capture staging** exists only while trace/live capture is armed; per-split blits write node
   outputs into host-readable staging at the end of the command buffer, read back after submit, then
   released.

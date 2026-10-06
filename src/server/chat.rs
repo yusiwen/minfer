@@ -650,19 +650,23 @@ pub(crate) enum BatchMode {
 ///
 /// Pure on purpose: CI has no GPU, so the matrix (unset / "1" / "0" / invalid x
 /// cpu / metal / cuda) is unit-tested here instead of being discovered in
-/// production. `Device::Metal` still follows CPU: the batched path needs the
-/// write/move side of G5 — a slot's run can be compacted or shifted mid-session
-/// (`copy_cells` / `copy_kv_to_cpu`), which Metal does not implement yet (issue
-/// #44 part (b)) — so the default waits for those gates (see the caller). The
-/// read side (`supports_attn_span()`, #44 part (a)) landed 2026-10-06.
+/// production. **Metal joined CUDA** in #44 part (b) once the write/move side of
+/// G5 landed (`copy_cells`, `copy_kv_to_cpu`): a batched slot's run can be
+/// compacted or shifted mid-session, and the Metal arms now serve that, so the
+/// default follows the device. The read side (`supports_attn_span()`) was part
+/// (a); the batching gates (`a_two_sequence_batch_…`,
+/// `batch_order_does_not_change_a_sequences_logits`,
+/// `offset_sensitivity_is_narrowed_to_multi_query_attention`) and the server's
+/// `a_long_prefill_keeps_another_slot_decoding` are green on the Mac, which is
+/// the D8 condition the approval comment set.
 pub(crate) fn batch_mode(requested: Option<&str>, device: crate::models::Device) -> BatchMode {
     match requested {
         Some("1") => BatchMode::Batched,
         Some("0") => BatchMode::Serial,
         // Unset, or a value the caller already warned about: follow the device —
-        // batching is the measured win on CUDA only.
+        // batching is the measured win on the device (CUDA, and now Metal).
         _ => match device {
-            crate::models::Device::Cuda => BatchMode::Batched,
+            crate::models::Device::Cuda | crate::models::Device::Metal => BatchMode::Batched,
             _ => BatchMode::Serial,
         },
     }
@@ -687,15 +691,16 @@ pub fn worker_loop(
     // B2's cross-request prefix reuse), versus **1.9x on the GB10**, where decode
     // is weight-bandwidth bound. So the default follows the device (E6):
     //
-    //   MINFER_BATCH unset -> batched iff the model's forwards run on **CUDA**
+    //   MINFER_BATCH unset -> batched iff the model's forwards run on a device
+    //                         (CUDA, or Metal since #44 part (b))
     //   MINFER_BATCH=1     -> batched (forced; also the way to batch on CPU)
     //   MINFER_BATCH=0     -> serial (forced)
     //
-    // Metal is deliberately not included even where a Metal device participates:
+    // Metal joined CUDA when the write/move half of G5 landed (#44 part (b)):
     // a batched slot's run can be compacted or shifted mid-session, and the
-    // write/move half of G5 (`copy_cells` / `copy_kv_to_cpu`) is not ported yet
-    // (issue #44 part (b)), so batching would fail on the first move rather than
-    // serve. The read half (`supports_attn_span()`) landed 2026-10-06.
+    // Metal `copy_cells` / `copy_kv_to_cpu` arms now serve that instead of
+    // failing on the first move. The read half (`supports_attn_span()`) was
+    // part (a).
     //
     // A session with a speculative draft keeps the per-slot caches and the
     // run-to-completion loop below too, because doc 94/97's identity contract is

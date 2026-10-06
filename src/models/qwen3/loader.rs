@@ -403,8 +403,8 @@ pub fn load(
     }
 
     // Qwen3 KV dim = n_head_kv * n_embd_head = 8*128 = 1024 (override from the
-    // K weight's actual output dim). Resolve BEFORE the KV cache type pick
-    // (`kvformat::auto_device_format` keys the 7B-class f16 policy off
+    // K weight's actual output dim). Resolve BEFORE the KV cache format is
+    // resolved (`kvformat::auto_device_format` keys the 7B-class f16 policy off
     // n_layers * n_kv_embd).
     if let Some((_, ti)) = tensor_map.get(&tn::attn_k(0)) {
         hparams.n_kv_embd = ti.ne[1];
@@ -419,11 +419,9 @@ pub fn load(
             hparams.n_embd_head,
         );
     }
-    // #153: the CUDA side no longer needs a tag here — the engine's resolved format
-    // (auto policy + `MINFER_CACHE_TYPE`) reaches its kernels through the allocator.
-    // Metal still keeps its own process-wide tag.
-    #[cfg(target_os = "macos")]
-    crate::metal::set_kv_cache_type(hparams.n_layer as usize, hparams.n_kv_embd as usize);
+    // #153/#44(b): neither device needs a tag here — the engine's resolved format
+    // (auto policy + `MINFER_CACHE_TYPE`) reaches its kernels per engine through
+    // `GraphAllocator::set_kv_format`.
 
     // Zero-copy weight registration: tell the Metal backend about each mmap'd
     // part (page-aligned base) BEFORE any weight is registered, so weights are

@@ -95,7 +95,7 @@ never silently mapped to f32.
 |---|---|:---:|:---:|:---:|
 | `f32` (default) | 4 B/element, f32 | ✅ | ✅ | ✅ |
 | `f16` | 2 B/element in the f32-shaped region | → f32 | ✅ | ✅ |
-| `q8_0` | packed Q8_0 blocks, 34 B per 32 elements, cell padded to whole f32 words | ✅ (C4 S1+S2) | ✅ (C4 S2b) | ❌ — G5, [#44](https://github.com/yusiwen/minfer/issues/44) |
+| `q8_0` | packed Q8_0 blocks, 34 B per 32 elements, cell padded to whole f32 words | ✅ (C4 S1+S2) | ✅ (C4 S2b) | ❌ — Metal's kernels address f32/f16 rows; the packed read is [#310](https://github.com/yusiwen/minfer/issues/310) |
 
 Notes:
 
@@ -121,6 +121,15 @@ Notes:
 - **A Q8_0 cell width must be a whole number of 32-element blocks** (so `n_kv_embd
   % 32 == 0`, which every supported architecture satisfies); `ensure_kv` refuses
   anything else.
+- **The KV *write/move* side** (`Backend::copy_cells` for C3 compaction / C8a
+  prefix copy / C8b S3 copy-on-write, and `GraphAllocator::copy_kv_to_cpu` for the
+  C2 shift and C5 sessions) is implemented on all three backends since #44 part
+  (b): Metal moves rows one at a time with `MTLBlitCommandEncoder` in the
+  overlap-safe order and reads its regions back through the registry `host_read`
+  hook. A **physical shift of an f16 region** refuses loudly
+  ([#306](https://github.com/yusiwen/minfer/issues/306): the host round trip has
+  no dequantize → re-rope → requantize map); the per-engine `kv_format` is what
+  makes a Metal session describe the width its region really uses.
 
 ### Not Yet Supported
 
@@ -148,7 +157,7 @@ three implementations — keep it in step with them.
 | `GetRows` (embedding, tail rows) | ✅ | ✅ | ✅ |
 | `View` with `offset != 0` or a partial window (D1) | ✅ | ❌ | ✅ — Metal's kernels take a buffer and a length with no element offset, so it can express exact views only (G5); the allocator backstops the partial case, which `supports_op` cannot see |
 | `Attn` | ✅ | ✅ | ✅ |
-| `Attn` with `explicit_span` (a window that starts at a non-zero cell, or several sequences in one batch) | ✅ | ✅ | ✅ — the one-range `attn_span` window is read on all three backends (Metal's `kernel_gqa_attn_window_f32/_f16` landed in #44 part (a), G5a; CUDA's E1b instantiation is **device-verified** on GB10, including a bitwise batch-order-invariance gate). The set-valued `kv_map` window is CPU + CUDA only (`Device::gathers_attn_map`), and a packed `q8_0` KV cache is refused on Metal |
+| `Attn` with `explicit_span` (a window that starts at a non-zero cell, or several sequences in one batch) | ✅ | ✅ | ✅ — the one-range `attn_span` window is read on all three backends (Metal's `kernel_gqa_attn_window_f32/_f16` landed in #44 part (a), and #44 part (b) gave Metal the matching write/move side so a batched and compacted multi-sequence run serves; CUDA's E1b instantiation is **device-verified** on GB10, including a bitwise batch-order-invariance gate). The set-valued `kv_map` window is CPU + CUDA only (`Device::gathers_attn_map`), and a packed `q8_0` KV cache is refused on Metal ([#310](https://github.com/yusiwen/minfer/issues/310)) |
 | `KvcacheStore` | ✅ | ✅ | ✅ |
 | `SwiGLU` (fused) | ✅ | ✅ | ✅ |
 | `RoPE` non-interleaved | ✅ | ✅ | ✅ |

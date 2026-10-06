@@ -9,6 +9,7 @@ use crate::graph::scheduler::BackendScheduler;
 use crate::graph::{Backend as Tag, ComputeGraph, DType};
 
 mod attn_span;
+mod copy_cells;
 mod fusion_shape;
 mod norm_weight;
 mod staging;

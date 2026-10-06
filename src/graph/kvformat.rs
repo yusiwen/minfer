@@ -3,8 +3,8 @@
 //! Three formats can reach a KV region:
 //!
 //! - **F32** — the CPU default and the reference every tolerance is stated against;
-//! - **F16** — the GPU bandwidth policy ([`auto_device_format`] /
-//!   `metal::set_kv_cache_type`, auto-selected for the 7B class). It keeps the region
+//! - **F16** — the GPU bandwidth policy ([`auto_device_format`], auto-selected
+//!   for the 7B class). It keeps the region
 //!   *f32-shaped* and stores halves in the first half of those words, so
 //!   [`KvFormat::row_elems`] is the same as F32's: the win is bandwidth, not footprint;
 //! - **Q8_0** — the first **packed** format. A cell occupies
@@ -41,7 +41,9 @@
 //! reaches its `CudaBackend` through the same `GraphAllocator::set_kv_format` stamp the
 //! CPU kernels get, the graph builder's `CParams::kv_format` still sizes the regions, and
 //! the captured-graph identity records the layout, so an exec instantiated for one layout
-//! never replays for another. Metal's `kv_cache_is_f16` is the one device-static left.
+//! never replays for another. Metal joined them in #44 part (b): `MetalBackend` carries its own
+//! `kv_format` and its kernels take it as an explicit `f16` argument — there is no device-static
+//! left.
 //!
 //! Design record: `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 (C4) and its #99 / #153
 //! records.

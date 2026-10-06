@@ -102,6 +102,14 @@ pub struct MetalBackend {
     /// it (it publishes its own staging bytes instead). See
     /// `docs/BACKEND-REGISTRY-DESIGN.md` §11.3.
     sync_readbacks: std::sync::atomic::AtomicU64,
+    /// C4 per-engine (issue #44 part (b); the Metal half of #99/#153): the KV
+    /// element type this pool's regions store. Stamped from
+    /// [`GraphAllocator::set_kv_format`](super::alloc::GraphAllocator::set_kv_format)
+    /// — the loaded engine's resolved format — and read by every attention/store
+    /// dispatch and the registry's `kv_format` hook, so two engines in one
+    /// process hold their own layouts and a C5 session header describes the width
+    /// its region really uses. `F32` until stamped (the pre-enable default).
+    kv_format: super::kvformat::KvFormat,
 }
 
 /// F5 (#137): one in-flight Metal cross-backend staging copy (see
@@ -347,7 +355,33 @@ impl MetalBackend {
             cb_ptr: std::ptr::null_mut(),
             cross: std::collections::HashMap::new(),
             sync_readbacks: std::sync::atomic::AtomicU64::new(0),
+            kv_format: super::kvformat::KvFormat::F32,
         })
+    }
+
+    /// C4 per-engine: stamp the loaded engine's resolved KV format onto this
+    /// pool (see the `kv_format` field). Idempotent.
+    pub(crate) fn set_kv_format(&mut self, format: super::kvformat::KvFormat) {
+        self.kv_format = format;
+    }
+
+    /// C4 per-engine: the KV element type this pool's regions store.
+    ///
+    /// The registry's `kv_format` hook reads the allocator's stamp, not this,
+    /// because it must answer before the pool is enabled (C5's `load_slots`);
+    /// this is the instance answer the dispatch reads through `kv_f16`.
+    /// Test-only: driven by `graph::metal_backend::tests::copy_cells::metal_kv_format_is_per_engine`,
+    /// which asserts the pool holds its own layout; `#[cfg(test)]` keeps it out
+    /// of production builds.
+    #[cfg(test)]
+    pub(crate) fn kv_format(&self) -> super::kvformat::KvFormat {
+        self.kv_format
+    }
+
+    /// Whether the KV kernels must read half-width rows. Metal refuses `Q8_0`
+    /// (`READS_PACKED_KV = false`), so the only other answer is f32.
+    fn kv_f16(&self) -> bool {
+        self.kv_format == super::kvformat::KvFormat::F16
     }
 
     fn buf(&self, id: usize) -> &crate::metal::MetalBuffer {
@@ -399,8 +433,8 @@ impl MetalBackend {
     /// KV-parallel attention chunk count (decode), mirroring layer_gpu's
     /// adaptive rule: one chunk per 32 KV rows, capped at 16, with a
     /// MINFER_ATTN_CHUNKS override.
-    fn attention_chunks(&self, positions: &crate::metal::MetalBuffer) -> usize {
-        let max_pos = Self::positions_max(positions);
+    fn attention_chunks(&self, positions: &crate::metal::MetalBuffer, count: usize) -> usize {
+        let max_pos = Self::positions_max(positions, count);
         std::env::var("MINFER_ATTN_CHUNKS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -408,11 +442,17 @@ impl MetalBackend {
             .unwrap_or_else(|| ((max_pos + 1 + 31) / 32).clamp(1, 16))
     }
 
-    /// max(positions) + host-side read of the (host-written) I32 positions
-    /// buffer — the positions are input data, never GPU-computed, so a host
-    /// read is safe here.
-    fn positions_max(positions: &crate::metal::MetalBuffer) -> usize {
-        let n = (positions.length() as usize) / 4;
+    /// `max(positions[..count])`, read on the host: the positions are input
+    /// data, never GPU-computed, so a host read is safe here.
+    ///
+    /// `count` is the node's **logical** length (`BufRef::len`, i.e. `nt`), not
+    /// the pool buffer's class-rounded length (E4 S2): a recycled positions
+    /// buffer keeps an earlier graph's tail, so scanning the whole pool buffer
+    /// would derive a stale `max_pos` and make a causal prefill attend to rows
+    /// past its own window (the `reused_cache_across_prompts_matches_a_fresh_cache`
+    /// failure). The pool is always at least `count` long; bound the scan.
+    fn positions_max(positions: &crate::metal::MetalBuffer, count: usize) -> usize {
+        let n = ((positions.length() as usize) / 4).min(count);
         let p =
             unsafe { std::slice::from_raw_parts(positions.contents().as_ptr() as *const u32, n) };
         p.iter().map(|&x| x as usize).max().unwrap_or(0)
@@ -585,7 +625,8 @@ pub fn supports_fused(fused: &FusedOp) -> bool {
 /// still refused: `Device::gathers_attn_map` stays false for Metal, so the model
 /// builder never asks for a map and the `Op::Attn` arm backstops a map-sized
 /// input with a loud `Err` rather than parsing it as spans. The write/move side
-/// (C3 compaction, C2 shift, C5 sessions) is part (b).
+/// landed in part (b): `copy_cells` (C3 compaction), the `copy_kv_to_cpu` arm
+/// (C2 shift / C5 sessions, f32-only) and the per-engine `kv_format`.
 pub const SUPPORTS_ATTN_SPAN: bool = true;
 
 /// C4: Metal addresses f32/f16 KV rows, so it does not read a packed `q8_0`
@@ -710,15 +751,15 @@ pub fn entry() -> super::registry::BackendEntry {
         // declined directions.
         copy_cross,
         await_cross,
-        // The MPS device layer holds the process-wide f16 policy (C5 records it
-        // so a session written under one width cannot be resumed under another).
-        kv_format: |_| {
-            if crate::metal::kv_cache_is_f16() {
-                super::kvformat::KvFormat::F16
-            } else {
-                super::kvformat::KvFormat::F32
-            }
-        },
+        // C4 per-engine (issue #44 part (b)): the engine's stamped format, not a
+        // process global — C5 records it as the session's KV element type, so a
+        // session is described under the width its region really uses. Reading
+        // the allocator's stamp rather than `metal().kv_format()` matters because
+        // `kv_load` / `load_slots` run **before** the first forward, when the
+        // Metal pool has not been enabled yet (`enable_metal` builds its format
+        // from this same stamp, so the two cannot disagree). This is the CUDA
+        // hook's shape (`cuda_backend::entry`).
+        kv_format: |a| a.kv_format(),
         enable: |a| a.enable_metal(),
         unavailable: || {
             if metal_available() {
@@ -1008,6 +1049,7 @@ impl Backend for MetalBackend {
                     nt,
                     self.buf(in_bufs[2].id),
                     0,
+                    self.kv_f16(),
                 );
                 cb.store_kv(
                     self.buf(in_bufs[1].id),
@@ -1016,6 +1058,7 @@ impl Backend for MetalBackend {
                     nt,
                     self.buf(in_bufs[2].id),
                     0,
+                    self.kv_f16(),
                 );
                 Ok(())
             }
@@ -1072,6 +1115,7 @@ impl Backend for MetalBackend {
                             meta.hd,
                             meta.scale,
                             nt,
+                            self.kv_f16(),
                         );
                         return Ok(());
                     }
@@ -1103,7 +1147,7 @@ impl Backend for MetalBackend {
                 let positions = self.buf(in_bufs[2].id);
                 if nt == 1 {
                     if crate::metal::flash_attn_enabled(meta.hd) {
-                        let chunks = self.attention_chunks(positions);
+                        let chunks = self.attention_chunks(positions, nt);
                         cb.gqa_attn_flash(
                             q,
                             k,
@@ -1116,11 +1160,12 @@ impl Backend for MetalBackend {
                             meta.scale,
                             1,
                             chunks,
+                            self.kv_f16(),
                         );
                     } else if (meta.hd == 64 || meta.hd == 128)
                         && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1")
                     {
-                        let chunks = self.attention_chunks(positions);
+                        let chunks = self.attention_chunks(positions, nt);
                         cb.gqa_attn_split_f32(
                             q,
                             k,
@@ -1133,6 +1178,7 @@ impl Backend for MetalBackend {
                             meta.scale,
                             1,
                             chunks,
+                            self.kv_f16(),
                         );
                     } else {
                         cb.gqa_attn_f32(
@@ -1146,10 +1192,11 @@ impl Backend for MetalBackend {
                             meta.hd,
                             meta.scale,
                             1,
+                            self.kv_f16(),
                         );
                     }
                 } else if meta.hd == 64 || meta.hd == 128 {
-                    let max_pos = Self::positions_max(positions);
+                    let max_pos = Self::positions_max(positions, nt);
                     let nkv = max_pos + 1;
                     if crate::metal::prefill_flash_enabled(meta.hd) {
                         cb.attn_flash_prefill(
@@ -1165,6 +1212,7 @@ impl Backend for MetalBackend {
                             meta.n_head_kv,
                             meta.hd,
                             meta.scale,
+                            self.kv_f16(),
                         );
                     } else if crate::metal::matmul_attn_enabled() {
                         cb.attn_parallel_prefill(
@@ -1194,6 +1242,7 @@ impl Backend for MetalBackend {
                             meta.hd,
                             meta.scale,
                             nt,
+                            self.kv_f16(),
                         );
                     }
                 } else {
@@ -1208,6 +1257,7 @@ impl Backend for MetalBackend {
                         meta.hd,
                         meta.scale,
                         nt,
+                        self.kv_f16(),
                     );
                 }
                 Ok(())
@@ -1370,6 +1420,7 @@ impl Backend for MetalBackend {
                     meta.freq_scale,
                     pos,
                     meta.rope_style as i32,
+                    self.kv_f16(),
                 );
                 Ok(())
             }
@@ -1507,6 +1558,7 @@ impl Backend for MetalBackend {
                     meta.freq_scale,
                     pos,
                     meta.rope_style as i32,
+                    self.kv_f16(),
                 );
                 Ok(())
             }
@@ -1522,19 +1574,60 @@ impl Backend for MetalBackend {
         }
     }
 
-    /// C3: the compaction primitive is not ported to Metal, and saying so is the
-    /// point — a backend that cannot move cells must fail the compaction rather
-    /// than let the allocator renumber runs whose data it did not move (Phase G).
+    /// C3 (issue #44 part (b)): move KV rows inside one arena on the device.
+    ///
+    /// One `MTLBlitCommandEncoder` copy per row, in the overlap-safe order
+    /// (ascending when the run slides down, descending when it slides up — the
+    /// same `dst_row <= src_row` branch CUDA's `kv_move_rows` takes), encoded
+    /// into the **current** command buffer and submitted once. A separate
+    /// submission would overlap the producer split (#137); `self.cb()` reuses the
+    /// open one when there is one, otherwise opens exactly one.
     fn copy_cells(
         &mut self,
-        _dst: BufRef,
-        _src: BufRef,
-        _dst_row: usize,
-        _src_row: usize,
-        _rows: usize,
-        _elems_per_cell: usize,
+        dst: BufRef,
+        src: BufRef,
+        dst_row: usize,
+        src_row: usize,
+        rows: usize,
+        elems_per_cell: usize,
     ) -> Result<(), String> {
-        Err("copy_cells: Metal does not move KV cells yet (Phase G, G5)".to_string())
+        if dst.id != src.id {
+            return Err(format!(
+                "metal: copy_cells moves cells within one arena ({} -> {})",
+                src.id, dst.id
+            ));
+        }
+        if rows == 0 || dst_row == src_row {
+            // A zero-row plan entry or a same-row move: nothing to copy (the
+            // overlapping blit would also be undefined for a same-row move).
+            return Ok(());
+        }
+        // An f16 region addresses `half[cell * nkt]` while `elems_per_cell` is
+        // counted in f32 words (the unit the caller passes): a cell is `nkt / 2`
+        // f32 words apart. CUDA's `copy_cells` halves the same stride; a Q8_0
+        // cell is already whole words including padding and is passed through
+        // unchanged (the caller passes `region.elems / n_ctx`), but Metal refuses
+        // Q8_0 (`READS_PACKED_KV = false`) so only the f16 branch is live here.
+        let elems_per_cell = if self.kv_f16() {
+            (elems_per_cell / 2).max(1)
+        } else {
+            elems_per_cell
+        };
+        let row_bytes = elems_per_cell * 4;
+        let src_buf = self.buf(src.id).clone();
+        let dst_buf = self.buf(dst.id).clone();
+        self.cb().encode_move_rows(
+            &src_buf,
+            &dst_buf,
+            src.offset * 4,
+            dst.offset * 4,
+            src_row,
+            dst_row,
+            rows,
+            row_bytes,
+        )?;
+        self.submit_pending();
+        Ok(())
     }
 
     fn read_host(&self, id: usize) -> Option<&[f32]> {
