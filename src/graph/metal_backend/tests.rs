@@ -1097,3 +1097,10 @@ fn metal_kvcache_store_refuses_a_cell_past_the_arena() {
         "the refusal must name the actual cell and the arena size, got: {err}"
     );
 }
+
+// SCRATCH MUTATION for #303 — the pre-F4 spelling that broke the macOS test
+// target for eleven days. Must fail at `cargo test --no-run`, never at `cargo build`.
+#[test]
+fn scratch_pre_f4_spelling_must_not_compile() {
+    let _ = crate::graph::Tag::Metal;
+}
