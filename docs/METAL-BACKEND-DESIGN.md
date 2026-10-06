@@ -452,6 +452,17 @@ One `MpsCommandBuffer` per split, submitted at boundaries, is the whole executio
      `metal_rms_norm_refuses_a_weightless_node` and `metal_qk_norm_refuses_a_weight_not_on_gpu` drive
      the arms through the real `BackendScheduler::execute`
      (`src/graph/metal_backend/tests/norm_weight.rs`).
+   - **KV-store row count (#305).** `Op::KvcacheStore` derives `nt` from the K input's **logical**
+     length (`BufRef::len`), not `self.pool[id].length()`: the pool allocates at the E4 S2 size
+     class, so the physical length over-counts `nt` whenever `nkt * nt` is not itself a class size
+     and the store reads `cells` past the filled prefix into the class's uninitialised tail, writing
+     those garbage rows into the arena. On a Mac this corrupted the KV region at `nt = 12` and
+     `nt = 30` (nt = 8, 16 are class sizes and were unaffected). The five
+     `metal_attn_*`/`metal_store_*` fixtures in `src/graph/metal_backend/tests.rs` exposed it once
+     their input fill was moved onto the production entry point (they had first panicked in the CPU
+     `decode_window` reference on a zero `attn_span`); the same root cause is why
+     `graph_metal_layer0_isolation` (#301) and `fused_qkv_matches_unfused_decode` (#302) were red,
+     and both pass with it.
 6. **`gpu_abort` for configurations the GPU path cannot run** — dimension misalignment, device-limit
    overruns, kernel-array overflow: print the actual values and exit.
 7. **Recurrence playbook** — reproduce with one app and a bounded `-n`; bisect with `MINFER_GEMM=0`
