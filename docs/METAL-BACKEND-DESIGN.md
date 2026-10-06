@@ -291,7 +291,7 @@ init. `MINFER_GEMM=0` disables the GEMM tier for A/B.
 **f16 weights run on the device (#164, landed on a Mac 2026-10-06).** The tiers above exist for
 the quantized types; f16 and f32 have their own single-token arms. The loader registers
 `TensorType::F16` raw (2
-B/element — no registration-time f32 copy) via the Metal branch's `matches!(ttype, F32 | F16)`, and
+B/element — no registration-time f32 copy) via the Metal branch's `matches!(ttype, F32 | F16 | BF16)`, and
 `quant_matmul_f32_on_gpu_buf`'s `TensorType::F16` arm dispatches `kernel_f16_f32_matmul`
 (`src/metal/kernels/f16.metal`), a f32-activation matmul that promotes each `half` weight in-register
 over NR0*NSG = 8 output rows per 64-thread threadgroup (grid `(ceil(od/8), 1)`, the token loop
@@ -304,10 +304,10 @@ norms/biases stay f32 (the file contract), so an f16 norm can never reach a kern
 type was refused here — registering a weight type a kernel cannot consume would make the device
 claim true while the op silently ran the wrong (or no) kernel, exactly what the registration gate
 exists to prevent. A second 2 B/element dtype (bf16, [#208](https://github.com/yusiwen/minfer/issues/208))
-slots in the same way. Per `docs/SUPPORT-MATRIX.md`, `f16` is now on both device columns.
+is the subject of the paragraph after the f32 one. Per `docs/SUPPORT-MATRIX.md`, `f16` is on both device columns.
 
 **f32 weights run on the device too (#317, landed on a Mac 2026-10-06).** The loader's
-`matches!(ttype, F32 | F16)` branch registers an f32 2-D weight raw (4 B/element), and
+`matches!(ttype, F32 | F16 | BF16)` branch registers an f32 2-D weight raw (4 B/element), and
 `quant_matmul_f32_on_gpu_buf`'s `TensorType::F32` arm dispatches `kernel_f32_f32_matmul`
 (`src/metal/kernels/f32.metal`, the `pl_f32_f32` pipeline) — the f32 twin of the f16 kernel and the
 peer of CUDA's `launch_f32_f32_matmul`. Before #317 an f32 weight had no arm and hit the catch-all
@@ -318,6 +318,25 @@ when some earlier test in the process had already initialized `MpsState`; its Me
 `MpsState::init()` explicitly, exactly as its CUDA arm calls `CudaState::init()`, so the column no
 longer depends on test order. That silent-wrong-kernel fallback is the registration-gate failure the
 f16 paragraph above describes, and `docs/SUPPORT-MATRIX.md`'s footnote 2 is updated to match.
+
+**bf16 weights run on the device too (#208, landed on a Mac 2026-10-06).** The second 2 B/element
+dtype — the Metal half of the ticket whose CUDA half is PR [#321](https://github.com/yusiwen/minfer/pull/321).
+`kernel_bf16_f32_matmul` + `kernel_get_rows_bf16` (`src/metal/kernels/bf16.metal`, the `pl_bf16_f32`
+/ `pl_get_rows_bf16` pipelines built in `try_new` and listed in `build.rs`'s `SHADER_SOURCES`) are
+dispatched by the `TensorType::BF16` arms of `quant_matmul_f32_on_gpu_buf` / `embed_tokens_gpu` — the
+f16 pair's geometry with an in-register `as_type<float>(bits << 16)` promotion (the device twin of
+`crate::block::bf16_to_f32`, exact for every value including NaNs). **Its own kernel, not a dtype flag
+on the f16 one** — the same decision #208's CUDA half made: bf16 and f16 are different 2 B/element
+layouts, so a shared kernel would branch per element in the hottest device kernel. Both loaders'
+Metal arm (`matches!(ttype, F32 | F16 | BF16)`) registers it raw (2 B/element, no f32 copy), so
+`weights_on_gpu` passes and both architectures are Metal models; 1-D norms/biases stay f32. The
+kernel-exactness gates `bf16_matmul_matches_the_exact_shift_reference` /
+`bf16_embed_gather_matches_the_reference` assert bitwise against `crate::block::bf16_to_f32` (a wrong
+kernel — the f16 or f32 one — is red), and the ignored real-model gate
+`f208_bf16_weights_run_on_the_metal_device` measures 169 bf16 matmul + 1 embed nodes all on
+`Backend::METAL`, 942.4 MiB of device weights, max |Δlogit| **1.889e-3** absolute / **1.025e-4**
+relative (bar 0.05 / 5e-3) with an identical greedy continuation. Per `docs/SUPPORT-MATRIX.md`, bf16
+is now on both device columns.
 
 **Aliasing.** Only `Silu`, `RoPE` and the view ops call `copy_in(dst, src)`, and only when the
 allocator did *not* alias them; an aliased node runs its in-place kernel directly on `out_buf`.
