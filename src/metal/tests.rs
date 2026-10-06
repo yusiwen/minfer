@@ -1412,3 +1412,150 @@ fn f16_embed_gather_matches_the_reference() {
         }
     }
 }
+
+/// #208: the bf16 weight matmul kernel reproduces an **exact** integer
+/// reference — the f16 gate's twin over the second 2 B/element dtype.
+///
+/// The construction is `f16_matmul_matches_the_exact_integer_reference`'s:
+/// weights and activations are small exact integers, so every partial product is
+/// an integer and the dot is below 2^24 — the result is independent of
+/// accumulation order, so the kernel must match the reference **bitwise**. The
+/// weights are stored as bf16 words and the reference promotes each with the
+/// CPU's own `crate::block::bf16_to_f32` (`f32::from_bits(bits << 16)`), so the
+/// kernel's in-register shift is pinned to the same decode. A misread (the f16
+/// kernel, a byte/f32 error, or a row/index slip) moves the values far outside.
+#[test]
+fn bf16_matmul_matches_the_exact_shift_reference() {
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the bf16 matmul gate");
+        return;
+    };
+    let dev = &mps.inner.device;
+    let (od, id, nt) = (64usize, 96usize, 3usize);
+    // Small exact integers in [-4, 4] / [-3, 3]. `to_bits() >> 16` truncates to
+    // bf16, but these values have at most 3 significant bits, so it is exact and
+    // `bf16_to_f32` recovers them bit-for-bit.
+    let wf: Vec<f32> = (0..od * id)
+        .map(|k| ((k * 7 + 3) % 9) as f32 - 4.0)
+        .collect();
+    let xv: Vec<f32> = (0..nt * id)
+        .map(|k| ((k * 5 + 2) % 7) as f32 - 3.0)
+        .collect();
+    let wbits: Vec<u16> = wf.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+
+    let wb = dev
+        .newBufferWithLength_options(
+            ((od * id * 2) as u64) as usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap();
+    unsafe {
+        let p = wb.contents().as_ptr() as *mut u16;
+        for (i, &b) in wbits.iter().enumerate() {
+            *p.add(i) = b;
+        }
+    }
+    let acts = dev
+        .newBufferWithLength_options(
+            ((nt * id * 4) as u64) as usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap();
+    unsafe {
+        std::slice::from_raw_parts_mut(acts.contents().as_ptr() as *mut f32, nt * id)
+            .copy_from_slice(&xv);
+    }
+    let out = dev
+        .newBufferWithLength_options(
+            ((nt * od * 4) as u64) as usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap();
+
+    let cb = mps.cmd_buffer();
+    cb.matmul_on_gpu_buf(&wb, 0, TensorType::BF16, &acts, &acts, 0, &out, od, id, nt);
+    cb.submit().expect("submit");
+
+    let got = unsafe { std::slice::from_raw_parts(out.contents().as_ptr() as *const f32, nt * od) };
+    for t in 0..nt {
+        for r in 0..od {
+            let mut acc = 0f32;
+            for i in 0..id {
+                acc += crate::block::bf16_to_f32(wbits[r * id + i]) * xv[t * id + i];
+            }
+            assert_eq!(
+                got[t * od + r],
+                acc,
+                "bf16 matmul [{t},{r}] (od={od} id={id} nt={nt})"
+            );
+        }
+    }
+}
+
+/// #208: the bf16 embedding gather promotes the requested rows exactly.
+///
+/// One thread per output element shifts each 2 B word (`f32::from_bits(bits <<
+/// 16)`); the reference is `crate::block::bf16_to_f32` of the same word, so
+/// equality is bitwise. A row-index error or an f16/half misread of the layout is
+/// red.
+#[test]
+fn bf16_embed_gather_matches_the_reference() {
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the bf16 embed gate");
+        return;
+    };
+    let dev = &mps.inner.device;
+    let (n_vocab, ne, nt) = (50usize, 96usize, 4usize);
+    let ids = [3usize, 17usize, 49usize, 0usize];
+    let wf: Vec<f32> = (0..n_vocab * ne)
+        .map(|k| ((k * 11 + 5) % 13) as f32 - 6.0)
+        .collect();
+    let wbits: Vec<u16> = wf.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+
+    let wb = dev
+        .newBufferWithLength_options(
+            ((n_vocab * ne * 2) as u64) as usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap();
+    unsafe {
+        let p = wb.contents().as_ptr() as *mut u16;
+        for (i, &b) in wbits.iter().enumerate() {
+            *p.add(i) = b;
+        }
+    }
+    let idb = dev
+        .newBufferWithLength_options(
+            ((nt * 4) as u64) as usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap();
+    unsafe {
+        let p = idb.contents().as_ptr() as *mut i32;
+        for (i, &v) in ids.iter().enumerate() {
+            *p.add(i) = v as i32;
+        }
+    }
+    let dst = dev
+        .newBufferWithLength_options(
+            ((nt * ne * 4) as u64) as usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap();
+
+    let cb = mps.cmd_buffer();
+    cb.embed_tokens_gpu(&wb, 0, &idb, &dst, ne, nt, TensorType::BF16);
+    cb.submit().expect("submit");
+
+    let got = unsafe { std::slice::from_raw_parts(dst.contents().as_ptr() as *const f32, nt * ne) };
+    for t in 0..nt {
+        for i in 0..ne {
+            let want = crate::block::bf16_to_f32(wbits[ids[t] * ne + i]);
+            assert_eq!(got[t * ne + i], want, "bf16 embed [{t},{i}]");
+        }
+    }
+}

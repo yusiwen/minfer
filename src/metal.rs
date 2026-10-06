@@ -183,6 +183,9 @@ struct MpsStateInner {
     pl_f16_f32: MetalComputePipelineState,
     // #317: f32-weight matmul (parity with CUDA's `launch_f32_f32_matmul`).
     pl_f32_f32: MetalComputePipelineState,
+    // #208: bf16 weights stay 2 B/element too (its own kernel, the exact shift
+    // decode — the Metal twin of CUDA's #208 pair).
+    pl_bf16_f32: MetalComputePipelineState,
     pl_get_rows_q4_0: MetalComputePipelineState,
     pl_get_rows_f32: MetalComputePipelineState,
     pl_get_rows_q4_k: MetalComputePipelineState,
@@ -193,6 +196,7 @@ struct MpsStateInner {
     pl_get_rows_q6_k: MetalComputePipelineState,
     pl_get_rows_q5_k: MetalComputePipelineState,
     pl_get_rows_f16: MetalComputePipelineState,
+    pl_get_rows_bf16: MetalComputePipelineState,
     pl_rms_norm: MetalComputePipelineState,
     pl_rms_norm_256: MetalComputePipelineState,
     pl_add: MetalComputePipelineState,

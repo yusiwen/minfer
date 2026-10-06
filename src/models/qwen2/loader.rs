@@ -239,17 +239,21 @@ fn load_tensor(
             ) {
                 mps.register_weight(&reg_name, tensor.data());
                 device_bytes.set(device_bytes.get() + tensor.data().len());
-            } else if matches!(ttype, TensorType::F32 | TensorType::F16) {
+            } else if matches!(ttype, TensorType::F32 | TensorType::F16 | TensorType::BF16) {
                 // #164: f16 weights register raw (2 B/element) — the Metal
                 // matmul/embed kernels promote in-register, so an f16 norm can
                 // never reach a `d*2` buffer (1-D tensors stay f32 per the file
                 // contract). The F32 arm is the norms/biases.
                 //
-                // #208 deliberately does **not** add `TensorType::BF16` here: the
-                // Metal half of the bf16 ticket is a separate, later delegation
-                // (it needs `kernel_bf16_f32_matmul` + `kernel_get_rows_bf16`),
-                // so until that lands a bf16 GGUF on a Metal build still drops to
-                // the CPU loudly through the all-or-nothing gate.
+                // #208: bf16 registers raw the same way, and its kernel pair
+                // (`kernel_bf16_f32_matmul` + `kernel_get_rows_bf16`, selected by
+                // the `TensorType::BF16` arms of `quant_matmul_f32_on_gpu_buf` /
+                // `embed_tokens_gpu`) is what makes registering it safe: the
+                // dispatch ladder's `_` fallback would otherwise read the 2 B
+                // words as Q4_0 blocks. The type is admitted here only because
+                // that kernel exists — the kernel-exactness gate
+                // `metal::tests::bf16_matmul_matches_the_exact_shift_reference`
+                // is the proof.
                 mps.register_weight(&reg_name, tensor.data());
                 device_bytes.set(device_bytes.get() + tensor.data().len());
             }
@@ -262,8 +266,9 @@ fn load_tensor(
             // for the dispatch and for why the q4_K `W_dsc` plane (r59/#165) and the
             // f16 arm (#141) live there instead of in a per-loader copy. The failure
             // mode this closes is real: the two copies had already drifted twice.
-            // #208 adds `TensorType::BF16` to that same shared rule (the CUDA half
-            // only; the Metal arm above stays `F32 | F16` until its own ticket).
+            // #208 adds `TensorType::BF16` to that same shared rule (the CUDA half;
+            // the Metal arm above admits it in the same change, now that its kernel
+            // pair exists).
             crate::models::weight_reg::register_cuda_weight(
                 cuda,
                 &reg_name,
