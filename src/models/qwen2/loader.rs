@@ -239,7 +239,11 @@ fn load_tensor(
             ) {
                 mps.register_weight(&reg_name, tensor.data());
                 device_bytes.set(device_bytes.get() + tensor.data().len());
-            } else if ttype == TensorType::F32 {
+            } else if matches!(ttype, TensorType::F32 | TensorType::F16) {
+                // #164: f16 weights register raw (2 B/element) — the Metal
+                // matmul/embed kernels promote in-register, so an f16 norm can
+                // never reach a `d*2` buffer (1-D tensors stay f32 per the file
+                // contract). The F32 arm is the norms/biases.
                 mps.register_weight(&reg_name, tensor.data());
                 device_bytes.set(device_bytes.get() + tensor.data().len());
             }

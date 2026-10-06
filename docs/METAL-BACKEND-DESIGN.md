@@ -288,16 +288,22 @@ supported quant type has the tiers that matter. Guards: K-quant `id % 256 != 0` 
 `gpu_abort`; the GEMM checks the threadgroup-memory request against the device limit queried at
 init. `MINFER_GEMM=0` disables the GEMM tier for A/B.
 
-**f16 weights are refused, not half-supported (#141).** The tiers above exist for f32 and the
-quantized types; Metal has no f16-weight kernel, so the loader does **not** register
-`TensorType::F16` on Metal and `Qwen2Graph::weights_on_gpu` fails its all-or-nothing check: an f16
-GGUF prints the loader's *"weights are not usable there — running on CPU"* line and runs the CPU
-path (which is now vectorized and pooled). This is deliberate. Registering a weight type a kernel
-cannot consume would make the device claim true while the op silently ran the wrong (or no) kernel
-— exactly what the registration gate exists to prevent — and a Metal f16 matmul/embed kernel cannot
-be verified from dgxspark (no Mac; CI's `build-macos` job compiles the crate, nothing runs it). The
-follow-up is [#164](https://github.com/yusiwen/minfer/issues/164); until it lands, `f16` is on the
-CUDA side of the weight matrix and off Metal's, per `docs/SUPPORT-MATRIX.md`.
+**f16 weights run on the device (#164, landed on a Mac 2026-10-06).** The tiers above exist for f32
+and the quantized types; f16 now has its own arm. The loader registers `TensorType::F16` raw (2
+B/element — no registration-time f32 copy) via the Metal branch's `matches!(ttype, F32 | F16)`, and
+`quant_matmul_f32_on_gpu_buf`'s `TensorType::F16` arm dispatches `kernel_f16_f32_matmul`
+(`src/metal/kernels/f16.metal`), a f32-activation matmul that promotes each `half` weight in-register
+over NR0*NSG = 8 output rows per 64-thread threadgroup (grid `(ceil(od/8), 1)`, the token loop
+inside so a prefill re-streams a weight row once per threadgroup). The embedding gather is the
+sibling `kernel_get_rows_f16`, selected by `embed_tokens_gpu`'s F16 arm (one element per thread,
+`nb = ne`). Both are listed in `build.rs`'s `SHADER_SOURCES` and their pipelines (`pl_f16_f32`,
+`pl_get_rows_f16`) are built in `try_new`, so `Qwen2Graph::weights_on_gpu` passes and an f16 GGUF is
+a Metal model. Like CUDA, an f16 prefill runs this f32-activation kernel, not a simdgroup GEMM; 1-D
+norms/biases stay f32 (the file contract), so an f16 norm can never reach a kernel. Before #164 the
+type was refused here — registering a weight type a kernel cannot consume would make the device
+claim true while the op silently ran the wrong (or no) kernel, exactly what the registration gate
+exists to prevent. A second 2 B/element dtype (bf16, [#208](https://github.com/yusiwen/minfer/issues/208))
+slots in the same way. Per `docs/SUPPORT-MATRIX.md`, `f16` is now on both device columns.
 
 **Aliasing.** Only `Silu`, `RoPE` and the view ops call `copy_in(dst, src)`, and only when the
 allocator did *not* alias them; an aliased node runs its in-place kernel directly on `out_buf`.

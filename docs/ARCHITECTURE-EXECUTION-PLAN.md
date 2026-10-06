@@ -8512,6 +8512,8 @@ concat registration was already fine but the type gate was not.
   exactly what that gate exists to prevent; a Metal f16 matmul/embed kernel
   cannot be verified from dgxspark (no Mac; CI's `build-macos` compiles the crate
   and nothing runs it). Filed as [#164](https://github.com/yusiwen/minfer/issues/164).
+  **(#164 landed on a Mac 2026-10-06 — `kernel_f16_f32_matmul` + `kernel_get_rows_f16`
+  exist, both loaders register f16, and an f16 GGUF runs on Metal; see the G8 row.)**
 - **CPU**: `vec_ops::dot_f16_f32` (AVX2 `F16C` `_mm256_cvtph_ps` / aarch64
   baseline NEON `FCVTL` `vcvt_f32_f16`, f64 scalar oracle) and
   `vec_ops::decode_f16_row`, with `mat_mul_f16` decoding each weight row once for
@@ -8592,9 +8594,11 @@ on something the code under test clears".
    than a last-bit one. No gate compares across the two files, so nothing is
    red; a future gate that does must not assume they are the same weights.
 
-**Honest scope.** (a) **Metal has no f16 weight kernels**, so f16 is refused
-there and falls to the CPU loudly ([#164](https://github.com/yusiwen/minfer/issues/164));
-that is a stated policy, not an untested implementation. (b) The device gate's
+**Honest scope.** (a) **Metal had no f16 weight kernels** at the time of this
+record, so f16 was refused there and fell to the CPU loudly
+([#164](https://github.com/yusiwen/minfer/issues/164)) — that was a stated policy,
+not an untested implementation. **(#164 landed on a Mac 2026-10-06: the kernels
+exist and f16 runs on Metal; see the G8 row.)** (b) The device gate's
 tolerance is a **backend** tolerance: both paths compute f32 activations against
 f16 weights (an f16 weight has no integer form, so the CPU does *not* quantize
 its activations the way it does for the quantized types), so what remains is
@@ -8716,9 +8720,11 @@ plan puts on the device, so the type coverage has one authority and cannot diver
 carries: the quantized set, the F16 raw branch, F32 (1-D norms/biases vs 2-D matmul weights), the
 Q6_K padded repack, the q8_0 p32 split plane, the q4_K `W_dsc` plane under
 `q4k_dsc_plane_admitted`, and the `clear_mmq_nb_bt_only` rule. The **Metal** per-tensor blocks were
-deliberately *not* folded in: Metal's admitted set is different and an f16 weight must stay refused
-there ([#164](https://github.com/yusiwen/minfer/issues/164)), so the extraction is CUDA-only and
-Metal's per-loader blocks are untouched (CPU/Metal behaviour unchanged is part of the acceptance).
+deliberately *not* folded in: Metal's admitted set is different (and, at that time, an f16 weight
+had to stay refused there — [#164](https://github.com/yusiwen/minfer/issues/164)), so the extraction
+is CUDA-only and Metal's per-loader blocks are untouched (CPU/Metal behaviour unchanged was part of
+the acceptance). **(#164 later added `F16` to Metal's own per-loader arm, 2026-10-06; the CUDA
+extraction is still CUDA-only.)**
 `Qwen3Graph::weights_on_cuda` gained `TensorType::F16` in `matmul_t_ok` and `embed_t_ok`, matching
 qwen2's list; `CudaState::q4dsc_plane_for` was added so a gate can read the same pointer-keyed map
 `mmq_raw_nb_bt` reads.
@@ -8911,6 +8917,7 @@ split is backend-agnostic and Metal's pool already ran through it.
 | G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` · [#52](https://github.com/yusiwen/minfer/issues/52) | **landed** on a Mac (2026-10-06): the decision is **keep the refusal** — the mixed-quant epilogue port would save 6 dispatches per mixed layer (10 → 4), **84/token** on Qwen2.5-7B-Q4_K_M (14/28 layers carry `attn_v` as Q6_K against Q4_K q/k), with no numerical difference and a sub-1% time ceiling, so the asymmetry is recorded instead of closed; record in `docs/SUPPORT-MATRIX.md` (PR [#318](https://github.com/yusiwen/minfer/pull/318)) |
 | G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool · [#53](https://github.com/yusiwen/minfer/issues/53) | **landed** on a Mac (2026-10-05): the allocator split was already backend-agnostic (E4 S3), so the delta is Metal's `DeviceMemory` answer (`recommendedMaxWorkingSetSize`) — record under the E4 record |
 | G7 | METAL-OBJ | Re-run the Metal gap/parity measurements after G2–G3 (and again after G5), since each changes a kernel path · [#54](https://github.com/yusiwen/minfer/issues/54) | last |
+| G8 | F6/#49 | f16 weight matmul + embedding kernels on Metal (an f16 GGUF runs on the device instead of falling to the CPU) · [#164](https://github.com/yusiwen/minfer/issues/164) | **landed** on a Mac (2026-10-06): `kernel_f16_f32_matmul` + `kernel_get_rows_f16` (`src/metal/kernels/f16.metal`, listed in `build.rs`'s `SHADER_SOURCES`) are the f32-activation matmul and the embedding gather, selected by the `TensorType::F16` arms of `quant_matmul_f32_on_gpu_buf` / `embed_tokens_gpu` through the new `pl_f16_f32` / `pl_get_rows_f16` pipelines; both loaders' Metal branch registers raw 2 B/element f16 (`matches!(ttype, F32 | F16)`), so `weights_on_gpu` passes and `Qwen2Model::device()`/`Qwen3Model::device()` answer `Device::Metal` — no registration-time f32 copy, and (like CUDA) an f16 prefill runs the f32-activation kernel, not a simdgroup GEMM. Record under `docs/SUPPORT-MATRIX.md` (the F16 row is ✅ on Metal) and `AGENTS.md`'s f16 bullet; gates `f16_matmul_matches_the_exact_integer_reference` / `f16_embed_gather_matches_the_reference` (kernel-exact, non-ignored) and the ignored real-model gates `f164_f16_weights_run_on_the_metal_device` / `..._qwen3` (169+1 / 197+1 f16 nodes all assigned `Backend::METAL`, greedy identical, max |Δlogit| 2.4e-3 / 7.9e-3 against the bar 0.05; PR [#NNN](https://github.com/yusiwen/minfer/pull/NNN)) |
 
 **G5 acceptance** (on a Mac; the CPU/CUDA equivalents are the gates already in the
 suite): two sequences do not cross-attend, bitwise; a mid-session compaction is

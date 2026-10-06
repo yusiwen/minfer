@@ -5,6 +5,7 @@ use crate::gguf::GgmlType;
 
 mod bf16;
 mod f141_device;
+mod f164_metal;
 mod f167_qwen3;
 mod f16_encode;
 mod f6_roundtrip;

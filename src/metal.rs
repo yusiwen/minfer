@@ -179,6 +179,8 @@ struct MpsStateInner {
     pl_q5_k_f32: MetalComputePipelineState,
     pl_q5_k_f32_multi: MetalComputePipelineState,
     pl_q5_k_mm_f32: MetalComputePipelineState,
+    // #164: f16 weights stay 2 B/element on the device (matmul + embed).
+    pl_f16_f32: MetalComputePipelineState,
     pl_get_rows_q4_0: MetalComputePipelineState,
     pl_get_rows_f32: MetalComputePipelineState,
     pl_get_rows_q4_k: MetalComputePipelineState,
@@ -188,6 +190,7 @@ struct MpsStateInner {
     pl_get_rows_q8_0: MetalComputePipelineState,
     pl_get_rows_q6_k: MetalComputePipelineState,
     pl_get_rows_q5_k: MetalComputePipelineState,
+    pl_get_rows_f16: MetalComputePipelineState,
     pl_rms_norm: MetalComputePipelineState,
     pl_rms_norm_256: MetalComputePipelineState,
     pl_add: MetalComputePipelineState,

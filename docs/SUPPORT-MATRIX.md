@@ -18,7 +18,7 @@ minfer supports GGUF v3 files with the following quantized weight types. The CPU
 | **Q5_K** | 5 | 176 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q6_K** | 6 | 210 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q8_0** | 8 | 34 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
-| **F16** | 16 | 2 B / 1 val | ✅³ | ✅³ | ✅⁴ | ❌⁵ |
+| **F16** | 16 | 2 B / 1 val | ✅³ | ✅³ | ✅⁴ | ✅⁵ |
 | **BF16** | 16 | 2 B / 1 val | ✅⁶ | — | ❌⁷ | ❌⁷ |
 | **F32** | 32 | 4 B / 1 val | ✅ | — | ✅² | ✅² |
 
@@ -48,11 +48,18 @@ loaders now share one registration rule (`models::weight_reg`). The engine's f16
 **file** contract is 2-D tensors f16 and 1-D norms/biases f32 (llama.cpp's rule;
 `mat_mul_f16`/the f16 embed decode have no f16-norm sibling) — what `minfer
 convert --outtype f16` writes.
-⁵ **Metal refuses f16 weights**, so an f16 GGUF runs the CPU path there
-(loudly, through the loader's all-or-nothing registration check). A registered
-weight with no kernel would be a silent wrong path, which is exactly what that
-check exists to prevent; the Metal f16 matmul/embed kernels are
-[#162](https://github.com/yusiwen/minfer/issues/162).
+⁵ Metal registers the raw 2 B/element f16 weights and promotes in-register:
+`kernel_f16_f32_matmul` (`src/metal/kernels/f16.metal`) is the f32-activation
+matmul and `kernel_get_rows_f16` the embedding gather, both selected by the
+`TensorType::F16` arms of `quant_matmul_f32_on_gpu_buf` / `embed_tokens_gpu`
+([#164](https://github.com/yusiwen/minfer/issues/164)). The weights stay half
+width on the device — no registration-time f32 copy — and, like CUDA, an f16
+prefill runs the f32-activation kernel, not a simdgroup GEMM. Both loaders admit
+the type, so `weights_on_gpu`'s all-or-nothing check passes and the model is a
+Metal model; 1-D norms/biases stay f32 (the file contract above), so an f16 norm
+can never reach a `d*2` kernel buffer. Measured on a Mac (2026-10-06, Apple M4
+Pro) against the same file's CPU logits: max |Δlogit| 2.4e-3 on the 0.5B and
+7.9e-3 on Qwen3-0.6B (bar 0.05), with an identical greedy continuation.
 ⁶ BF16 weights ([#142](https://github.com/yusiwen/minfer/issues/142)): the CPU
 decodes one row at a time (`vec_ops::mat_mul_bf16`, exact
 `f32::from_bits(bits << 16)`, then the same `vec_dot_f32` the f16 row path uses)
