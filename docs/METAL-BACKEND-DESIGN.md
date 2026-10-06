@@ -408,6 +408,24 @@ window — the `reused_cache_across_prompts_matches_a_fresh_cache` failure fixed
 (CUDA instead derives the bound on device so nothing host-side enters a captured graph; Metal has no
 replay to protect, so the host read is free.)
 
+#### 4.4.3 Prefill flash tail-pad overlap (issue #314, landed on a Mac 2026-10-06)
+
+The flash prefill kernel (`kernel_flash_attn_blk_f32/_f16`, incl. the `hd=128` variants) tiles KV into
+`C = 64` blocks. For a partial last block (`nkv % C != 0`) it read the **last `C` rows**
+(`pos0 = nkv - C`) from the `[2][64][nkt]` tail pad. That window overlaps the previous full block
+whenever `nkv % C != 0 && nkv > C` (e.g. `nkv = 72`: block 0 covers rows 0–63, the "partial" block
+covers 8–71), so the online softmax counted the overlapped rows twice — a real attention error
+(measured 0.05–0.16 on a synthetic reference), which surfaced as a **1.445** (Qwen2.5-0.5B) /
+**0.382** (Qwen3-0.6B) chunked-vs-unchunked logit drift because every chunk > 64 tokens hit it, and
+as a wrong answer for **any** >64-token prefill. The fix: the partial block reads its own
+`[ic, ic + C)` window (`pos0 = ic`) and `kernel_kv_tail_pad` pads from `ic = (nkv / 64) * 64`, so the
+rows past `nkv` are zero+masked (`kpos0 <= qpos`) instead of the leading rows being double-counted.
+CPU is bitwise across chunk shapes; after the fix Metal's residual drift is the ordinary cross-shape
+accumulation class (named **0.1**, measured **0.0087** on the 0.5B and **0.0078** on Qwen3-0.6B),
+which the `a_chunked_prefill_answers_like_an_unchunked_one` gate now carries alongside CUDA. Gates:
+`flash_prefill_matches_the_cpu_reference_at_every_kv_tail` (nkv 72/96/98 red before at 0.164, all
+≤ 2e-4 after) and the real-model chunked gate.
+
 ### 4.5 Allocator and scheduler integration
 
 - Assignment priority is **Metal → CUDA → CPU**; `enable_metal()` mirrors `enable_cuda()`.
