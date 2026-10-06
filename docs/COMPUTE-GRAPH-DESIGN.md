@@ -55,10 +55,10 @@ scratch buffers per step. That shape had four structural costs:
 
 - **Multi-sequence batching on CPU.** The IR, the allocator and the attention kernels are
   sequence-aware (E1/E1b/E2: `seq_ids`, `attn_span`, per-sequence KV reservations, `Batch`), and the
-  server composes a batch — but the default follows the **device** (E6: batches iff the model runs on
-  CUDA, off on CPU/Metal; `MINFER_BATCH=0/1` forces either way), because batching measures **0.49x**
-  the serial path on CPU while it is **1.9x** on the GB10 (E2's acceptance is device-dependent; see
-  `ARCHITECTURE-EXECUTION-PLAN.md` §7 and the E6 record).
+  server composes a batch — but the default follows the **device** (E6: batches on CUDA and Metal,
+  since #44 part (b); off on CPU — `MINFER_BATCH=0/1` forces either way), because batching
+  measures **0.49x** the serial path on CPU while it is **1.9x** on the GB10 (E2's acceptance is
+  device-dependent; see `ARCHITECTURE-EXECUTION-PLAN.md` §7 and the E6 record).
 - **A generic ggml operator set.** `Scale`, `Softmax`, `View`, `Reshape`, `Permute`, `AttnMode::Mha`
   and `FusedOp::BatchMatMul` are present in the vocabulary but no supported architecture emits
   them; they are kept for parity and future use. `Op::FusedBiasRope` and its fusion rule were

@@ -33,8 +33,10 @@ The remaining work is at the **system layer**, and three items dominate it:
    (Key/Value) allocator and the server are all single-sequence. E1/E1b made the
    *attention* side sequence-aware and E2 landed sequence-addressable batches
    and a batching server worker; the CPU payoff measured negative while the GPU
-   payoff was 1.9x, so the default now follows the device (**E6**: batches iff the
-   model runs on CUDA, off on CPU/Metal).
+   payoff was 1.9x, so the default follows the device (**E6**: batches on CUDA and,
+   since [#44](https://github.com/yusiwen/minfer/issues/44) part (b) landed the
+   one-range `attn_span` read and the matching write/move side on a Mac
+   (2026-10-06), on Metal too; off on CPU).
 2. **KV cache is a fixed per-layer buffer**, not a sequence-addressable cell
    store: no sequence ids, no eviction/context shift, no defragmentation, no
    state save/restore, no quantized KV. (Phase C has since closed every one of
@@ -208,16 +210,21 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    where the pre-F5 code did `copy_to_cpu` (a full stream sync + a blocking
    `cudaMemcpy`) — and phase B (`await_cross`) waits on the recorded event at the
    documented synchronization point, once per staged input. The CPU's hooks are a
-   synchronous host round trip and a no-op (it has no device memory); **Metal
-   declines and keeps the synchronous path** until its blit/event port is written
-   and verified on a Mac. Counters (`graph/copystats.rs`), the per-backend table,
+   synchronous host round trip and a no-op (it has no device memory); **Metal runs
+   the same two phases** — a `MTLBlitCommandEncoder` copy into a shared staging
+   buffer plus `encodeSignalEvent` on a `MTLSharedEvent`, waited once by a bounded
+   `waitUntilSignaledValue` — ported by
+   [#137](https://github.com/yusiwen/minfer/issues/137) and verified on a Mac
+   (2026-10-05: `blocking_host_copies` 21 → 0, `copies == waits`, bitwise
+   identical). Counters (`graph/copystats.rs`), the per-backend table,
    the enumeration of the synchronization points and the measured before/after are
    in `docs/BACKEND-REGISTRY-DESIGN.md` §11 and the plan's F5 record.
    **What remains:** true *overlap* — the split loop is still strictly sequential
    (enqueue, then immediately wait), so there is no independent work for a copy to
    overlap with; exploiting the substrate needs the scheduler to defer a wait to
-   the consumer's first use, and the Metal port. Both are filed follow-ups (see
-   the plan's F5 record), and multi-device execution still needs both.
+   the consumer's first use — the one filed follow-up
+   ([#300](https://github.com/yusiwen/minfer/issues/300); see the plan's F5
+   record), and multi-device execution still needs it.
 
 **Also:** ~~the cross-boundary staging map is keyed by node id alone
 (`alloc.rs:34`), so a node consumed by two different foreign backends can only
@@ -305,17 +312,17 @@ it stops at the single-sequence append-only case. What is missing:
 |---|---|
 | Sequence ids / per-sequence views of one cache | ✔ **C1** per-cell `owner` (`SeqId`); **E1/E2** made several views of one cache real (reservations + explicit `attn_span`, device-aware batching default via E6); **C7 increment 1** made the partition elastic. One cell still belongs to exactly one sequence — **C8** ([#41](https://github.com/yusiwen/minfer/issues/41), **closed 2026-09-22**) turns `owner` into a set/refcount so a prefix can be shared, and C8b's span list + `kv_map` ([#41](https://github.com/yusiwen/minfer/issues/41)) delivers it on CPU and CUDA |
 | Partial removal / keep / copy between sequences | ◐ **C2**: physical removal of a row range; **compaction inside one arena is C3 (done)**; *sharing* one cell range across sequences no longer needs `owner[cell]` to become a set — **C8b S2 landed 2026-09-21** derives occupancy from per-sequence span lists and **S3 landed 2026-09-22** adds the copy-on-write store rule, both gated on byte-equality; CUDA's gather (S4) is next |
-| Defragmentation | ✔ **C3 (2026-09-19)**: pure planner + `KvArenaStats` counters + `Backend::copy_cells` (CPU `copy_within`; CUDA `kv_move_rows`, one block walking rows ascending with a barrier, because overlapping device-to-device copies are undefined; Metal refuses it, G5) + host K re-rope while `positions` are cells + a mid-session compaction gate. The re-rope is **gone** (C6 landed): compaction moves rows verbatim and is bit-identical. **C7** is the scheduled consumer — the server's dynamic-run trigger uses the planner to make a slot's reservation elastic |
+| Defragmentation | ✔ **C3 (2026-09-19)**: pure planner + `KvArenaStats` counters + `Backend::copy_cells` (CPU `copy_within`; CUDA `kv_move_rows`, one block walking rows ascending with a barrier, because overlapping device-to-device copies are undefined; Metal moves rows through `MTLBlitCommandEncoder` in the same order since [#44](https://github.com/yusiwen/minfer/issues/44) part (b), 2026-10-06) + host K re-rope while `positions` are cells + a mid-session compaction gate. The re-rope is **gone** (C6 landed): compaction moves rows verbatim and is bit-identical. **C7** is the scheduled consumer — the server's dynamic-run trigger uses the planner to make a slot's reservation elastic |
 | Sliding-window eviction | ◐ **C2**: physical shift + re-rope (exact mechanism; the retained rows keep the context they were written in, see below) |
 | Recurrent / hybrid memory (state-space models) | ✗ |
 | Context shift (keep KV, shift positions) | ✔ **C2**: `kv_rm`/`kv_shift` plus the conversation's overflow shift — 185 → 14 prefilled tokens per overflowing turn on the 0.5B probe; `MINFER_NO_CONTEXT_SHIFT=1` restores the exact re-render |
 | State save/restore (session persistence) | ✔ **C5 (2026-09-22)**: a versioned, checksummed container (`graph/kvsession.rs`) holds the shape, the backend, the KV element type, one K/V blob per layer and the arena's bookkeeping (owner table + run table + span lists); `GraphAllocator::kv_save`/`kv_load` stream it through the backends' host I/O. A load **verifies the whole file before it applies anything**, so a truncated/corrupted/foreign file is a no-op, and the real-model gate resumes a session that continues **bitwise** (max \|Δlogit\| = 0, CPU and CUDA). The element type rides in the header flags (`FLAG_PACKED` Q8_0 / `FLAG_F16` f16 / `0` f32; the two bits are mutually exclusive and an unknown bit is refused), so **C5 S3 ([#130](https://github.com/yusiwen/minfer/issues/130), 2026-09-25)** closed the last gap — a CUDA f16 auto-policy session (`--session` or `--slots-file`) now restores instead of refusing its own snapshot, and the Qwen3-0.6B configuration's real-model set is 31/0. Resuming the CLI's `--session` and an E2 slot snapshot: [#89](https://github.com/yusiwen/minfer/issues/89) · [#43](https://github.com/yusiwen/minfer/issues/43) |
 | Prefix reuse across requests | ✔ **B2/B3** — ≈11× TTFT on the second turn |
-| Quantized KV | ◐ **C4 S1 + S2a + S2b (2026-09-24, CPU and CUDA)**: `MINFER_CACHE_TYPE=q8_0` stores packed Q8_0 cells — 3.76× smaller regions, measured on both cached models. S2a reads the packed blocks directly on the CPU (Q8_0 × Q8_0 K dot, V out of the cell: 1.16×/1.31× over S1's dequantizing read at ctx 512/2048) and makes a physical `kv_rm`/`kv_shift` work on a packed region; S2b adds the CUDA kernels (a `KV_LAYOUT_F32/F16/Q8_0` tag with a byte-addressed `kv4<LAYOUT>` load, a packed store that uses the CPU's quantizer byte for byte) and flips the registry's `reads_packed_kv`. **The win is memory**: decode against f16 is 1.13× slower on Qwen3-0.6B and 1.48× on the 0.5B (1.25× of it the packed load, the rest the stated no-fused-epilogue cut); at hd 128 the packed **prefill is 15× slower** because the f16-typed FA path is not offered for a packed cell. Metal stays G5 ([#44](https://github.com/yusiwen/minfer/issues/44)); the remaining CUDA tuning is [#87](https://github.com/yusiwen/minfer/issues/87) · [#42](https://github.com/yusiwen/minfer/issues/42). **Format ownership is per engine since [#99](https://github.com/yusiwen/minfer/issues/99) (2026-09-25)**: the resolved format lives on the loaded model and reaches the graph through `CParams::kv_format` and the CPU kernels through `GraphAllocator::set_kv_format`; the CUDA *device* layout tag is still process-wide ([#153](https://github.com/yusiwen/minfer/issues/153)) |
+| Quantized KV | ◐ **C4 S1 + S2a + S2b (2026-09-24, CPU and CUDA)**: `MINFER_CACHE_TYPE=q8_0` stores packed Q8_0 cells — 3.76× smaller regions, measured on both cached models. S2a reads the packed blocks directly on the CPU (Q8_0 × Q8_0 K dot, V out of the cell: 1.16×/1.31× over S1's dequantizing read at ctx 512/2048) and makes a physical `kv_rm`/`kv_shift` work on a packed region; S2b adds the CUDA kernels (a `KV_LAYOUT_F32/F16/Q8_0` tag with a byte-addressed `kv4<LAYOUT>` load, a packed store that uses the CPU's quantizer byte for byte) and flips the registry's `reads_packed_kv`. **The win is memory**: decode against f16 is 1.13× slower on Qwen3-0.6B and 1.48× on the 0.5B (1.25× of it the packed load, the rest the stated no-fused-epilogue cut); at hd 128 the packed **prefill is 15× slower** because the f16-typed FA path is not offered for a packed cell. Metal refuses the packed cell ([#310](https://github.com/yusiwen/minfer/issues/310), `reads_packed_kv` is false there), so a `q8_0` cache stays a CPU/CUDA feature; the remaining CUDA tuning is [#87](https://github.com/yusiwen/minfer/issues/87) · [#42](https://github.com/yusiwen/minfer/issues/42). **Format ownership is per engine since [#99](https://github.com/yusiwen/minfer/issues/99) (2026-09-25)**: the resolved format lives on the loaded model and reaches the graph through `CParams::kv_format` and the CPU kernels through `GraphAllocator::set_kv_format`; the CUDA *device* layout tag is still process-wide ([#153](https://github.com/yusiwen/minfer/issues/153)) |
 | KV memory growth | fixed at first allocation, **never resized** |
-| Position vs cell | ✔ **C6 (landed 2026-09-20, `001b8cc`)**: sequence-relative `positions` + an allocator-resolved `cells` input, so a cell move changes no rotation and compaction is bit-identical. The CUDA fused decode QKV family (`Op::FusedQKV`, `Op::QkvBiasRopeStore`) takes `cells` too, so the build-time gate that kept it on the unfused chain under `explicit_span` is now `(cuda_on \|\| !explicit_span)` — Metal keeps it (no explicit-span attention, G5). A request placed in a non-zero-start slot exposed and fixed a server position bug (`submit_on` still added the run start). The two user-visible limits this design leaves open are **C7** (one request may use the whole arena) and **C8** (cross-sequence sharing), both now scheduled |
+| Position vs cell | ✔ **C6 (landed 2026-09-20, `001b8cc`)**: sequence-relative `positions` + an allocator-resolved `cells` input, so a cell move changes no rotation and compaction is bit-identical. The CUDA fused decode QKV family (`Op::FusedQKV`, `Op::QkvBiasRopeStore`) takes `cells` too, so the build-time gate that kept it on the unfused chain under `explicit_span` is now `(cuda_on \|\| !explicit_span)` — Metal keeps the fused node (a CUDA-side gate, not a Metal limitation). A request placed in a non-zero-start slot exposed and fixed a server position bug (`submit_on` still added the run start). The two user-visible limits this design leaves open are **C7** (one request may use the whole arena) and **C8** (cross-sequence sharing), both now scheduled |
 | Elastic per-slot KV partition (a long request vs `n_slots`) | ✔ **C7 + C7b (2026-09-20)**: the engine sizes a slot from the request (`prompt + max_tokens + 1`, clamped to the arena); when that exceeds its share it reclaims **idle** runs for capacity and `KvCache::set_cap` returns a plan that moves whatever is in the way — **in either direction**, so a *busy* neighbour above the slot is no longer a wall (`order_moves`: upward top-down, downward bottom-up, upward first, with the owner table travelling in the same order). The HTTP bound moved from a slot's share to the whole arena, and CPU + CUDA `copy_cells` pin an overlapping upward move byte-for-byte. GB10: `--n-slots 4 --n-ctx 8192` serves a 2054-token prompt (2048 → 2071 cells, three idle slots released) with a continuation byte-identical to `--n-slots 1` |
-| Multi-sequence attention masks | (Metal's port is **G5**, [#44](https://github.com/yusiwen/minfer/issues/44)) ✔ **E1 + E1b + E2** (device-aware default: see the batching row below): the allowed window is an explicit `attn_span` input resolved from the sequence's span list (C8b S1a/S1b, derived from cell ownership; multi-span layouts are refused until S2's `kv_map`), read by the CPU kernel and by CUDA's windowed kernel instantiations — **device-verified on GB10 since 2026-09-18**, and since 2026-09-19 swept over **both** KV dtypes (f16 and f32), which is what caught the f16 prefill mask fault (`ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0). Metal still derives from `positions` and refuses a multi-sequence node — **G5 is scheduled** (after C8; CI's `build-macos` compile-checks it) |
+| Multi-sequence attention masks | ✔ **E1 + E1b + E2** (device-aware default: see the batching row below): the allowed window is an explicit `attn_span` input resolved from the sequence's span list (C8b S1a/S1b, derived from cell ownership; multi-span layouts are refused until S2's `kv_map`), read by the CPU kernel and by CUDA's windowed kernel instantiations — **device-verified on GB10 since 2026-09-18**, and since 2026-09-19 swept over **both** KV dtypes (f16 and f32), which is what caught the f16 prefill mask fault (`ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0). Metal reads the one-range `attn_span` too ([#44](https://github.com/yusiwen/minfer/issues/44) part (a), 2026-10-06 — `kernel_gqa_attn_window_f32/_f16`), so a batched multi-sequence run serves there; only the set-valued `kv_map` window stays CPU + CUDA ([#310](https://github.com/yusiwen/minfer/issues/310)) |
 
 **Gap.** 🔴 This is the single largest structural gap, because it blocks four
 separate user-visible capabilities at once: multi-slot serving throughput,
@@ -479,9 +486,10 @@ all read, `--gpu-layers N` / `MINFER_GPU_LAYERS=N`, the startup report, and a
 verified mixed CPU+CUDA run on the 0.5B — then **S2**'s `auto`: per-block weight
 bytes from the GGUF index, the pure `fit_blocks` prefix search against a weight
 budget (`MINFER_GPU_MEM`, else three quarters of the device's free bytes) with a
-quarter held back for the KV arenas and the activation pool. What remains on this
-axis is a free-bytes query for Metal (so `auto` works there too); the registry/`BackendId`
-half is **done** (F4).
+quarter held back for the KV arenas and the activation pool. The registry/`BackendId`
+half is **done** (F4), and the free-bytes query for Metal landed as
+[#53](https://github.com/yusiwen/minfer/issues/53)'s `DeviceMemory` answer
+(`recommendedMaxWorkingSetSize`), so `auto` and `headroom_bytes()` work on macOS too.
 
 **Recommendation.** (a) ~~Introduce a `BackendRegistry` with
 `register(Box<dyn Backend>)`, `supports(op, dtype) -> Option<BackendId>` and
@@ -506,11 +514,14 @@ decision, its prerequisites and its cost live in `MODEL-SUPPORT-ROADMAP.md`; the
 caveat that matters here is §2.1 — its Tier 1 estimate holds only while a family
 needs no new IR structure. 🟠
 
-**Quantization coverage.** Eight types; no Q2_K/Q3_K/Q8_K, no I-quants, no
-BF16/MXFP4/NVFP4 (`SUPPORT-MATRIX.md §Not Yet Supported`;
-`CUDA_OPTIMIZATION.md §1.4` marks IQ/Q2/Q3 "not planned"). The notable ones for
-reach are Q2_K/Q3_K (running large models on small machines) and BF16 (serving
-unconverted checkpoints). 🟠 but legitimately deprioritized.
+**Quantization coverage.** Eight quant types; no Q2_K/Q3_K/Q8_K, no I-quants, no
+MXFP4/NVFP4 (`SUPPORT-MATRIX.md §Not Yet Supported`;
+`CUDA_OPTIMIZATION.md §1.4` marks IQ/Q2/Q3 "not planned"). BF16 landed as a
+*weight type*: the writer and the CPU path in
+[#142](https://github.com/yusiwen/minfer/issues/142), the device halves (CUDA and
+Metal) in [#208](https://github.com/yusiwen/minfer/issues/208), 2026-10-06. The
+notable one still for reach is Q2_K/Q3_K (running large models on small machines).
+🟠 but legitimately deprioritized.
 
 **Quantizer tooling — closed by F6 ([#49](https://github.com/yusiwen/minfer/issues/49), 2026-09-24), and
 its f16-weight gap closed by [#141](https://github.com/yusiwen/minfer/issues/141) (2026-09-25).**
@@ -709,10 +720,12 @@ work predates the tracker has no issue, and the plan is its record.
 Ordered by severity. Items 1–6 are behavioural; 7–12 are hygiene; 13–14 are
 behavioural defects found while executing the plan, already fixed.
 
-1. **GPU KV store has no bounds check.** CPU returns `Err` for `pos >= n_ctx`
-   (`cpu_backend.rs:170-172`); CUDA (`cuda_backend.rs:1028-1061`) and Metal do
-   not. A contract violation becomes an out-of-bounds device write. *Fix: one
-   guard, mirrored from the CPU path.*
+1. **GPU KV store bounds check — closed.** A3 moved the check to the
+   backend-agnostic `GraphAllocator::fill_input_i32` (`check_positions_bound`), so
+   CPU, CUDA and Metal all refuse an out-of-range row before execution, and
+   [#38](https://github.com/yusiwen/minfer/issues/38) added the arm-level Metal
+   guard (`MetalBackend::check_kv_store_rows`) for the fill paths that bypass it —
+   §2.4 states the same closure in the gap list.
 2. **`ensure_kv` ignores a changed size** (`alloc.rs:384-392`). The KV region is
    frozen at first allocation while `CParams.n_ctx` remains part of the reuse
    identity, so a size change is neither honoured nor detected.

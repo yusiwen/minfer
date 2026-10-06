@@ -473,7 +473,9 @@ CParams.gpu = metal_on || cuda_on
   missing name and the model runs entirely on CPU. Unlike CUDA's `weights_on_cuda` there is **no
   type whitelist here and no diagnostic print** — a Metal gate failure is silent.
 - **Type support is enforced at loader registration**: `load_ti` registers a tensor only when its
-  type is Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0, or F32. An unsupported type is simply never
+  type is Q4_0/Q4_1/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0, or F32/F16/BF16 (the last two since
+  [#164](https://github.com/yusiwen/minfer/issues/164) and
+  [#208](https://github.com/yusiwen/minfer/issues/208)). An unsupported type is simply never
   registered, so the gate fails and the model falls back to CPU. Names are namespaced (`mps.register_part`
   per mmap'd part; `{ns}{tensor}` for the registry) so a second model cannot collide with the first.
 - **Concat weights** are built once at load with `metal::concat_rows` and registered: Qwen2 and
@@ -707,9 +709,12 @@ none needs an external dump:
 
 - **Bit-exactness where the math is identical**: elementwise and KV/attention round trips are
   checked bit-for-bit; matmul and norm are checked within float tolerance.
-- **CPU-vs-Metal logits** are compared with tolerance plus `greedy_ref == greedy_gpu`, because the
-  Metal path uses f32 activations while the CPU reference quantizes to Q8_0 (the ~18-magnitude
-  difference is expected and documented in the test).
+- **CPU-vs-Metal logits**: the model-level `graph_metal_matches_cpu_logits` **cannot carry this row
+  in the graph era** — both `ModelDef::forward` and `forward_graph` route through
+  `Qwen2Graph::forward`, so its `max |Δ| = 0` compares the Metal graph with itself
+  ([#324](https://github.com/yusiwen/minfer/issues/324)). The row rests on the per-op
+  `metal_*_matches_cpu` gates (float tolerance; the Metal path uses f32 activations while the CPU
+  reference quantizes to Q8_0) and on the external oracle `graph_metal_matches_llama_reference`.
 - **Fused-vs-unfused decode** must be bit-identical, with the unfused side running the FusionPass.
 - **llama-reference oracle**: Qwen3's first 9 greedy tokens are pinned against llama-Metal.
 - **Determinism**: `metal_prefill_determinism` and the isolation suites' repeat-run checks.

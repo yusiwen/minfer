@@ -31,8 +31,9 @@
 #     `#[cfg(target_os = "macos")]` test block *looks* dead here while it is live
 #     there — `ModelDef::forward_graph` was exactly that case, which is why it is
 #     listed below with the test named in its reason.
-# `build-macos` only type-checks, so the manifest records the blind spot instead
-# of pretending coverage: hence the marker below.
+# `build-macos` compiles the test target since #303 (`cargo test --release --no-run`),
+# but it cannot run the Linux oracle on a macOS module, so the manifest records
+# the blind spot instead of pretending coverage: hence the marker below.
 #
 # Architecture. The dead set can differ by `cfg(target_arch)` (NEON vs AVX2-gated
 # code). This manifest is the **union** of the host and the x86_64 CI runner: an
@@ -42,7 +43,9 @@
 # is the CI job itself, which passes no `--target`.
 #
 # Re-stated 2026-10-06 (#54). The value stays `unjudged`: the Linux oracle still
-# cannot compile a macOS-only module, and `build-macos` still only type-checks.
+# cannot compile a macOS-only module. `build-macos` does compile the test target
+# since #303, so a macOS-only reference is *seen* there; what is missing is the
+# oracle run, not the compile.
 # The round *did* judge the two `src/metal.rs` annotations that were this
 # marker's concrete cases — [#255] (PR #294) turned `matmul_on_gpu_buf` into
 # `#[cfg(test)]` and deleted the container-level `impl MpsState` blanket — and it

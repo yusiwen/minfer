@@ -24,8 +24,10 @@ schema = 1
 
 # The commit the plan's status block was first baselined against, and the master
 # commit this status was last refreshed against. Both must be ancestors of HEAD.
+# The second is bumped when a phase or round closes, not on every PR — which is
+# what the plan's prose promised while the value sat at f663750 for 190 commits.
 baseline_commit = "f32daa7"
-refreshed_against = "f663750"
+refreshed_against = "53b3ace"
 
 # The one honest `next:` sentence. It replaced a stale one that still called
 # E4/E5 upcoming years after they landed (issue #94).
@@ -47,7 +49,8 @@ regex = 'Next: (?P<value>[^\n]+?)\.\*\*'
 
 # --- phase counters ---------------------------------------------------------
 # `done`/`total` are the preamble's `(done/total)`; `state` is its completion
-# word. Phase G is scheduled with none of its seven tickets started.
+# word. Phase G is **complete** (7/7, 2026-10-06); the rows past G7 are the gaps
+# the round found while executing it.
 
 [[phase]]
 id = "A"

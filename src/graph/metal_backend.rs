@@ -597,7 +597,7 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         // window would read the wrong bytes, so it is refused here rather
         // than silently mis-computed — the allocator backstops the partial
         // case, which `supports_op` cannot see (the parent's length is not
-        // in the op). G5 is where Metal would learn offsets.
+        // in the op). A standing design limit, not a pending port (G5 did not add it).
         Op::View { offset, .. } => *offset == 0,
         Op::Reshape { .. } | Op::Permute { .. } => true,
         Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => false,
