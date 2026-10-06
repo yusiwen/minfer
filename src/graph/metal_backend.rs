@@ -452,6 +452,38 @@ impl MetalBackend {
         Ok(())
     }
 
+    /// #40: resolve a norm node's weight `(buffer, offset)` or refuse loudly.
+    ///
+    /// Both `None` meanings are a missing weight, not a licence to run
+    /// weightless: (a) `NormMeta::weight_name` is `None`, and (b) the name is
+    /// set but `MpsState::weight_buf` has no registration for it on this device.
+    /// The old arms fell through to the weightless `rms_norm` kernel in either
+    /// case, turning a kernel-invariant violation into plausible-looking output
+    /// from a wrong computation — the exact failure mode `docs/GPU_SAFETY.md`
+    /// forbids. Both supported producers (`models/qwen2`, `models/qwen3`) always
+    /// pass a weight, so no legitimate weightless path exists to preserve; this
+    /// mirrors CUDA's `CudaBackend::norm_weight` (same two refusals).
+    fn norm_weight(&self, node: &CNode) -> Result<(crate::metal::MetalBuffer, u64), String> {
+        let name = match &node.meta {
+            NodeMeta::Norm(m) => m.weight_name.as_deref(),
+            other => {
+                return Err(format!(
+                    "metal: {} norm node missing NormMeta: {other:?}",
+                    node.name
+                ))
+            }
+        };
+        let Some(name) = name else {
+            return Err(format!(
+                "metal: {} has no norm weight (the Metal rms_norm kernel requires one)",
+                node.name
+            ));
+        };
+        self.state
+            .weight_buf(name)
+            .ok_or_else(|| format!("metal: norm weight '{name}' not on GPU ({})", node.name))
+    }
+
     fn copy_in(&self, dst: usize, src: usize) {
         // in-place-ish ops (silu/rope) may alias; snapshot to dst first
         let src_buf = self.buf(src);
@@ -784,110 +816,71 @@ impl Backend for MetalBackend {
                 Ok(())
             }
             Op::RmsNorm { eps } => {
-                let w = match &node.meta {
-                    NodeMeta::Norm(m) => m
-                        .weight_name
-                        .as_ref()
-                        .and_then(|n| self.state.weight_buf(n)),
-                    _ => None,
-                };
+                // #40: a missing norm weight is a loud refusal, never a
+                // weightless fallthrough (see `MetalBackend::norm_weight`).
+                let (wb, w_off) = self.norm_weight(node)?;
                 let d = node.out_shape[0];
                 let n = node.out_shape[1];
-                // G2: 256-thread kernel when enabled (METAL_OPTIMIZATIONS #16)
-                match w {
-                    Some((wb, w_off)) => {
-                        if crate::metal::rms_norm_256_enabled() {
-                            cb.rms_norm_256(
-                                self.buf(in_bufs[0].id),
-                                Some(&wb),
-                                w_off,
-                                self.buf(out_buf.id),
-                                d,
-                                n,
-                                *eps,
-                                0,
-                                0,
-                            );
-                        } else {
-                            cb.rms_norm(
-                                self.buf(in_bufs[0].id),
-                                Some(&wb),
-                                w_off,
-                                self.buf(out_buf.id),
-                                d,
-                                n,
-                                *eps,
-                                0,
-                                0,
-                            );
-                        }
-                    }
-                    None => cb.rms_norm(
+                // 256-thread kernel when enabled (METAL_OPTIMIZATIONS #16)
+                if crate::metal::rms_norm_256_enabled() {
+                    cb.rms_norm_256(
                         self.buf(in_bufs[0].id),
-                        None,
-                        0,
+                        Some(&wb),
+                        w_off,
                         self.buf(out_buf.id),
                         d,
                         n,
                         *eps,
                         0,
                         0,
-                    ),
+                    );
+                } else {
+                    cb.rms_norm(
+                        self.buf(in_bufs[0].id),
+                        Some(&wb),
+                        w_off,
+                        self.buf(out_buf.id),
+                        d,
+                        n,
+                        *eps,
+                        0,
+                        0,
+                    );
                 }
                 Ok(())
             }
             Op::QkNorm { hd, nh, eps } => {
                 // Per-head norm: contiguous [nt*nh, hd] rows — same kernel as
                 // RmsNorm with d = hd and n = nt*nh (weight length hd).
-                let w = match &node.meta {
-                    NodeMeta::Norm(m) => m
-                        .weight_name
-                        .as_ref()
-                        .and_then(|n| self.state.weight_buf(n)),
-                    _ => None,
-                };
+                // #40: loud refusal on a missing weight, as in the RmsNorm arm.
+                let (wb, w_off) = self.norm_weight(node)?;
                 let d = *hd;
                 let n = (self.pool[out_buf.id].length() as usize / 4) / d;
                 let _ = nh;
-                match w {
-                    Some((wb, w_off)) => {
-                        if crate::metal::rms_norm_256_enabled() {
-                            cb.rms_norm_256(
-                                self.buf(in_bufs[0].id),
-                                Some(&wb),
-                                w_off,
-                                self.buf(out_buf.id),
-                                d,
-                                n,
-                                *eps,
-                                0,
-                                0,
-                            );
-                        } else {
-                            cb.rms_norm(
-                                self.buf(in_bufs[0].id),
-                                Some(&wb),
-                                w_off,
-                                self.buf(out_buf.id),
-                                d,
-                                n,
-                                *eps,
-                                0,
-                                0,
-                            );
-                        }
-                    }
-                    None => cb.rms_norm(
+                if crate::metal::rms_norm_256_enabled() {
+                    cb.rms_norm_256(
                         self.buf(in_bufs[0].id),
-                        None,
-                        0,
+                        Some(&wb),
+                        w_off,
                         self.buf(out_buf.id),
                         d,
                         n,
                         *eps,
                         0,
                         0,
-                    ),
+                    );
+                } else {
+                    cb.rms_norm(
+                        self.buf(in_bufs[0].id),
+                        Some(&wb),
+                        w_off,
+                        self.buf(out_buf.id),
+                        d,
+                        n,
+                        *eps,
+                        0,
+                        0,
+                    );
                 }
                 Ok(())
             }

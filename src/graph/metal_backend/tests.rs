@@ -8,6 +8,7 @@ use crate::graph::scheduler::BackendScheduler;
 use crate::graph::{Backend as Tag, DType};
 
 mod fusion_shape;
+mod norm_weight;
 mod staging;
 
 fn f32t(name: &str, shape: [i64; 4], data: Vec<f32>) -> crate::tensor::Tensor {

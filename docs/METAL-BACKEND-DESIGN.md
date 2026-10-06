@@ -260,7 +260,7 @@ CUDA's `supports_op` gates RoPE to `NonInterleaved` only. All supported models a
 | `Input` | no-op (host-filled) |
 | `Silu` | `copy_in` if not aliased, then `silu_f32` in place |
 | `Add` / `Mul` | `add_f32` / `mul_f32` |
-| `RmsNorm` | weight from `NormMeta`; `rms_norm_256` when `rms_norm_256_enabled()`, else `rms_norm` (a `None` weight selects the weightless kernel) |
+| `RmsNorm` | weight from `NormMeta`; `rms_norm_256` when `rms_norm_256_enabled()`, else `rms_norm`. A missing gain (no `NormMeta`, no `weight_name`, or a name the device never registered) is a loud `Err` — never the weightless kernel (#40) |
 | `QkNorm` | same kernels with `d = hd`, `n = len/hd` over the flat `[nt*nh, hd]` rows |
 | `MatMul` | `quant_matmul_f32_on_gpu_buf` (tier below) + optional `add_bias_f32` |
 | `GetRows` + `Embed` meta | `embed_tokens_gpu` (per-weight-type row gather + dequant) |
@@ -436,10 +436,22 @@ One `MpsCommandBuffer` per split, submitted at boundaries, is the whole executio
      shape, not the missing weight; this matches CUDA's `FusedQKV`/`QkvBiasRopeStore` order). Before
      #39 the arms asserted this with `debug_assert!`, which a **release** build compiles out and then
      dispatches a shape the kernel does not handle — exactly the asymmetry CUDA never had. The gates
-     `metal_fused_ffn_refuses_nt_other_than_one`, `metal_fused_qkv_refuses_nt_other_than_one` and
-     `metal_fused_qkv_norm_refuses_nt_other_than_one` drive each arm through the real
-     `BackendScheduler::execute` with `nt == 2` and assert the message names the node and the `nt`
-     (`src/graph/metal_backend/tests/fusion_shape.rs`).
+      `metal_fused_ffn_refuses_nt_other_than_one`, `metal_fused_qkv_refuses_nt_other_than_one` and
+      `metal_fused_qkv_norm_refuses_nt_other_than_one` drive each arm through the real
+      `BackendScheduler::execute` with `nt == 2` and assert the message names the node and the `nt`
+      (`src/graph/metal_backend/tests/fusion_shape.rs`).
+   - **Norm-weight guards (#40, gap-table G3).** `Op::RmsNorm` / `Op::QkNorm` no longer fall through
+     to the weightless `rms_norm` kernel when the gain cannot be resolved. Both `None` meanings —
+     `NormMeta::weight_name` absent, or a set name the device never registered — are a *missing
+     gain*, and the old path produced plausible-looking output from a wrong computation, the failure
+     mode this section forbids. Both arms now call `MetalBackend::norm_weight`, which returns `Err`
+     naming the node and the missing tensor (the CUDA twin is `CudaBackend::norm_weight`). No
+     supported producer (`models/qwen2`, `models/qwen3`) builds a weightless norm, so there is no
+     legitimate path to preserve and the unregistered-name case is exactly the assignment mistake the
+     guard must catch. The gates `metal_rms_norm_refuses_a_weight_not_on_gpu`,
+     `metal_rms_norm_refuses_a_weightless_node` and `metal_qk_norm_refuses_a_weight_not_on_gpu` drive
+     the arms through the real `BackendScheduler::execute`
+     (`src/graph/metal_backend/tests/norm_weight.rs`).
 6. **`gpu_abort` for configurations the GPU path cannot run** — dimension misalignment, device-limit
    overruns, kernel-array overflow: print the actual values and exit.
 7. **Recurrence playbook** — reproduce with one app and a bounded `-n`; bisect with `MINFER_GEMM=0`
