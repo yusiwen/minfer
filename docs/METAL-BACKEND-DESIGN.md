@@ -271,9 +271,9 @@ CUDA's `supports_op` gates RoPE to `NonInterleaved` only. All supported models a
 | `KvcacheLoad` | no-op — the output buffer *is* the persistent K region |
 | `Attn` | §4.4.1 |
 | `View` / `Reshape` / `Permute` | `copy_in` when the output differs, else no-op |
-| `FusedQKV` | concat matmul (`blk.{i}.attn_qkv`) + `attn_bias_rope_store`; `debug_assert!(nt == 1)` |
-| `FusedFFN` | concat matmul (`blk.{i}.ffn_gu`, `od = 2*nf`) + in-place `swiglu_f32_off`; `debug_assert!(nt == 1)` |
-| `FusedQkvNorm` | concat matmul + two in-place per-head `rms_norm[_256]` (q at offset 0, k at byte offset `nqt*4`) + `attn_rope_store`; `debug_assert!(nt == 1)` |
+| `FusedQKV` | concat matmul (`blk.{i}.attn_qkv`) + `attn_bias_rope_store`; refuses `nt != 1` with `Err` |
+| `FusedFFN` | concat matmul (`blk.{i}.ffn_gu`, `od = 2*nf`) + in-place `swiglu_f32_off`; refuses `nt != 1` with `Err` |
+| `FusedQkvNorm` | concat matmul + two in-place per-head `rms_norm[_256]` (q at offset 0, k at byte offset `nqt*4`) + `attn_rope_store`; refuses `nt != 1` with `Err` |
 | `Scale` / `Softmax` / `BatchMatMul` | `Err("op ... unsupported on Metal (Phase 3)")` |
 | `QkvBiasRopeStore` | `Err("op ... unsupported on Metal (CUDA-only)")` — reaching it is a scheduling invariant violation |
 
@@ -426,9 +426,20 @@ One `MpsCommandBuffer` per split, submitted at boundaries, is the whole executio
      already bounds the same input on the `fill_input_i32` path
      (`GraphAllocator::check_positions_bound`), so the arm guard closes the fill paths that do not go
      through it; a kernel-side range check would be a *silent* no-write, which this rule forbids. The
-     gate `metal_kvcache_store_refuses_a_cell_past_the_arena` drives the real `KvcacheStore` dispatch
-     with an out-of-range cell written through the generic f32 `fill_input` (bypassing the
-     allocator's i32-only check), so it fails if the arm stops guarding.
+      gate `metal_kvcache_store_refuses_a_cell_past_the_arena` drives the real `KvcacheStore` dispatch
+      with an out-of-range cell written through the generic f32 `fill_input` (bypassing the
+      allocator's i32-only check), so it fails if the arm stops guarding.
+   - **Decode-fusion shape guards (#39, gap-table G2).** The three decode-only fused arms —
+     `FusedFFN`, `FusedQKV`, `FusedQkvNorm` — refuse a non-decode shape (`nt != 1`) with an `Err`
+     naming the node and the observed `nt`, and the check runs **before** the weight lookup (shape
+     validation is weight-independent and cheaper, so a bad shape on a weightless node reports the
+     shape, not the missing weight; this matches CUDA's `FusedQKV`/`QkvBiasRopeStore` order). Before
+     #39 the arms asserted this with `debug_assert!`, which a **release** build compiles out and then
+     dispatches a shape the kernel does not handle — exactly the asymmetry CUDA never had. The gates
+     `metal_fused_ffn_refuses_nt_other_than_one`, `metal_fused_qkv_refuses_nt_other_than_one` and
+     `metal_fused_qkv_norm_refuses_nt_other_than_one` drive each arm through the real
+     `BackendScheduler::execute` with `nt == 2` and assert the message names the node and the `nt`
+     (`src/graph/metal_backend/tests/fusion_shape.rs`).
 6. **`gpu_abort` for configurations the GPU path cannot run** — dimension misalignment, device-limit
    overruns, kernel-array overflow: print the actual values and exit.
 7. **Recurrence playbook** — reproduce with one app and a bounded `-n`; bisect with `MINFER_GEMM=0`

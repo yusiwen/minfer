@@ -16,7 +16,7 @@ Phase D **complete** (3/3) (**D1 done**: views, multi-output via `split_parts`, 
 F8 done; F1 needs x86); Phase G
 **scheduled** (0/7) — after the CUDA
 KV path, not before it (device claims need a Mac; CI's `build-macos` is the compile
-check). **Next: the Metal round G2–G3/G5 (on a Mac) and F1 (needs x86).** The order is
+check). **Next: the Metal round G3/G5 (on a Mac) and F1 (needs x86).** The order is
 deliberate: the Metal KV port (G5) comes **after** the CUDA arena stops changing shape
 (C7, C7b, C8), so those semantics are written into Metal once. Per-ticket evidence is in
 each phase's record and in the §14 open-risks table.
@@ -8904,7 +8904,7 @@ split is backend-agnostic and Metal's pool already ran through it.
 | ID | Origin | Work | Position |
 |---|---|---|---|
 | G1 | A3 | `pos < n_ctx` guard in Metal's `KvcacheStore` · [#38](https://github.com/yusiwen/minfer/issues/38) | **landed** on a Mac (2026-10-06): the allocator already bounds `cells`/`positions` on the `fill_input_i32` path (`docs/ARCHITECTURE-EXECUTION-PLAN.md` §A3), so the delta is the arm that indexes the region — `MetalBackend::check_kv_store_rows` now bounds every Metal KV-write arm (`KvcacheStore` on `cells`; `FusedQKV`/`FusedQkvNorm` on `positions`) against the layer region's `n_ctx` and returns `Err` naming the cell and the arena before any dispatch — record in `docs/METAL-BACKEND-DESIGN.md` §4.9; gate `metal_kvcache_store_refuses_a_cell_past_the_arena` (PR [#304](https://github.com/yusiwen/minfer/pull/304)) |
-| G2 | A8 | `debug_assert!` → `Err` for `FusedFFN`/`FusedQKV`/`FusedQkvNorm` `nt == 1` · [#39](https://github.com/yusiwen/minfer/issues/39) | now |
+| G2 | A8 | `debug_assert!` → `Err` for `FusedFFN`/`FusedQKV`/`FusedQkvNorm` `nt == 1` · [#39](https://github.com/yusiwen/minfer/issues/39) | **landed** on a Mac (2026-10-06): each decode-only arm now refuses `nt != 1` with an `Err` naming the node and the observed `nt` *before* the weight lookup, so a release build no longer dispatches a shape the kernel does not handle — record in `docs/METAL-BACKEND-DESIGN.md` §4.9; gates `metal_fused_ffn_refuses_nt_other_than_one` / `..._qkv_...` / `..._qkv_norm_...` drive each arm through the real `BackendScheduler::execute` |
 | G3 | A8 | Remove the silent weightless-RMSNorm fallback (`metal_backend.rs:403-414`, `:457-468`) · [#40](https://github.com/yusiwen/minfer/issues/40) | now |
 | G5 | C1/C2/E1 | Port the cell store, the KV removal/shift and the explicit attention span to Metal (`supports_attn_span()` becomes true; today `copy_kv_to_cpu` has no Metal arm, so a Metal session re-renders instead of shifting, and a multi-sequence batch is refused outright) · [#44](https://github.com/yusiwen/minfer/issues/44) | after C8 |
 | G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` · [#52](https://github.com/yusiwen/minfer/issues/52) | after G5 |

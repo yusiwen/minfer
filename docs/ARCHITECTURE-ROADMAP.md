@@ -611,14 +611,16 @@ path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
 **Fixed in A8**: `SUPPORT-MATRIX.md` now carries an "Operator Coverage by
 Backend" table with the four asymmetric rows and their consequences.
 
-**Guard asymmetry.** Metal uses `debug_assert!` where CUDA returns `Err` for the
-same invariants (`metal_backend.rs:749`, `:800`, `:891`), so release builds pass
-through invalid shapes; and Metal silently substitutes a weightless RMSNorm when
-a weight name is missing (`:403-414`, `:457-468`) where CUDA errors
-(`cuda_backend.rs:1246-1269`). Both violate the project's own stated rule that
-"kernel-invariant violations return `Err`, never a silent fallback"
-(`AGENTS.md §GPU Safety`). 🟠 — silent numerical degradation is the worst failure
-class for an inference engine.
+**Guard asymmetry.** The decode-fusion `debug_assert!`s are **closed**
+([#39](https://github.com/yusiwen/minfer/issues/39), gap-table G2, 2026-10-06):
+`FusedFFN` / `FusedQKV` / `FusedQkvNorm` each return `Err` naming the node and the
+observed `nt` before the weight lookup, so a release build no longer passes an
+invalid shape through. The remaining half is Metal silently substituting a
+weightless RMSNorm when a weight name is missing (`:403-414`, `:457-468`) where
+CUDA errors (`cuda_backend.rs:1246-1269`), which still violates the project's own
+stated rule that "kernel-invariant violations return `Err`, never a silent
+fallback" (`AGENTS.md §GPU Safety`). 🟠 — silent numerical degradation is the
+worst failure class for an inference engine.
 
 **Testing.** Five integration files, four of them `#![cfg(target_os = "macos")]`
 Metal kernel isolation tests; CPU/CUDA correctness rests on inline unit tests
@@ -671,7 +673,7 @@ work predates the tracker has no issue, and the plan is its record.
 | 10 | **Chunked prefill**: make `n_batch` real; cap activation memory and allow decode/prefill interleaving. — **landed in E3 (2026-09-22)**: `prefill_chunks` + `MINFER_N_BATCH` (default 2048, a no-op for prompts that fit), remainder-last so the final forward carries the tail row, and the other slots take their decode step *between* chunks. Measured: 5 forwards / max `nt` 24 vs 1 / 98 for a 98-token prompt; logits bitwise on CPU and ≤ 0.218 (class 1.0) on CUDA; the interleaving A/B is 3 decode steps vs 0; the split costs one forward's fixed overhead per chunk (514 tokens in 4 forwards: CUDA 1.11x, CPU 1.005x; 98 tokens in 5: CUDA 2.0x). Not mixed prefill+decode batches yet · [#45](https://github.com/yusiwen/minfer/issues/45) | §2.5 | M |
 | 11 | **CPU AVX2 (and AVX-512/VNNI where available) for the K-quant dots**; then weight repacking. | §2.7 | L |
 | 12 | **Backend registry** decoupling the enum from the nine match sites. — **landed in F4 (2026-09-24)**: [#57](https://github.com/yusiwen/minfer/issues/57); the handle + the name-keyed table live in `graph/registry.rs`, the priority order is a pinned number, and the name surface (`--backend` / `MINFER_BACKENDS`) has three distinct loud startup refusals (`docs/BACKEND-REGISTRY-DESIGN.md`). The registered set itself stays compile-time (no `dlopen`) | §2.6 | M |
-| 13 | **Guard symmetry**: Metal `Err` instead of `debug_assert!`/weightless fallback; CUDA gains `FusedQkvNorm` or `SUPPORT-MATRIX.md` gains a per-backend op column. — **docs route done in A8**; the Metal half defers to Phase G | §2.8 | S |
+| 13 | **Guard symmetry**: Metal `Err` instead of `debug_assert!`/weightless fallback; CUDA gains `FusedQkvNorm` or `SUPPORT-MATRIX.md` gains a per-backend op column. — **docs route done in A8**; the `debug_assert!` half **closed** ([#39](https://github.com/yusiwen/minfer/issues/39)); the weightless-RMSNorm half is [#40](https://github.com/yusiwen/minfer/issues/40) | §2.8 | S |
 | 14 | **Async cross-backend copy + events** (needed for any heterogeneous split and for multi-device execution). — **landed in F5 (2026-09-24)**: [#58](https://github.com/yusiwen/minfer/issues/58); the boundary's two registered phases (`BackendEntry::copy_cross`/`await_cross`), CUDA's `cudaMemcpyAsync` D2H + event + one `cudaEventSynchronize` at the documented point, the CPU's documented no-op, counter-gated (`graph/copystats.rs`: zero blocking boundary copies, one wait per copy) and bitwise-identical to the `MINFER_SYNC_COPIES` reference on a real split model. **The deferred wait landed in [#138](https://github.com/yusiwen/minfer/issues/138) (2026-10-04)**: the boundary only enqueues, each staged input's single wait is issued at the consumer's first read (and drained after the last split), and the boundary's redundant `sync_backend` is gone for a backend that can order its close on its own stream (`Backend::retire`) — measured 21 → 0 full stream syncs over the 0.5B gate's 7 forwards and 2 copies in flight where the enqueue-then-wait order holds 1, still bitwise. **Still open: Metal declines (unported, no Mac to verify) and true *cross-split* overlap** (a later split's transfer beside an earlier split's kernels) | §2.2 | M |
 
 ### P2 — coverage
@@ -712,10 +714,12 @@ behavioural defects found while executing the plan, already fixed.
 2. **`ensure_kv` ignores a changed size** (`alloc.rs:384-392`). The KV region is
    frozen at first allocation while `CParams.n_ctx` remains part of the reuse
    identity, so a size change is neither honoured nor detected.
-3. **Metal weakens kernel guards.** `debug_assert!` where CUDA returns `Err`
-   (`metal_backend.rs:749`, `:800`, `:891`) and a silent weightless RMSNorm when
-   a weight is missing (`:403-414`, `:457-468`) — both contradict
-   `docs/GPU_SAFETY.md` and `AGENTS.md`'s no-silent-fallback rule.
+3. **Metal weakens kernel guards.** The decode-fusion `debug_assert!`s are
+   **closed** ([#39](https://github.com/yusiwen/minfer/issues/39)): each arm
+   returns `Err` naming the node and the observed `nt`. The silent weightless
+   RMSNorm when a weight is missing (`metal_backend.rs:403-414`, `:457-468`)
+   remains and contradicts `docs/GPU_SAFETY.md` and `AGENTS.md`'s
+   no-silent-fallback rule ([#40](https://github.com/yusiwen/minfer/issues/40)).
 4. ~~**Server worker had no panic isolation outside the forward call**
    (`chat.rs:454-518`): a panic anywhere else unwound the worker, permanently
    degrading the server (503 for new jobs, empty 200/SSE for queued ones) with

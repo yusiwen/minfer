@@ -1186,6 +1186,17 @@ impl Backend for MetalBackend {
                 Ok(())
             }
             Op::FusedFFN => {
+                // #39: the fused FFN kernel is decode-only, and `debug_assert!`
+                // is compiled out in release. Shape validation is cheap and does
+                // not depend on the weights, so it is the first thing checked
+                // (kernel-invariant violations return Err, never assume).
+                let nt = node.out_shape[1];
+                if nt != 1 {
+                    return Err(format!(
+                        "metal: {}: FusedFFN is decode (nt==1) only, got nt={nt}",
+                        node.name
+                    ));
+                }
                 let meta = match &node.meta {
                     NodeMeta::FusedFfn(m) => m,
                     other => return Err(format!("fused_ffn node missing FusedFfnMeta: {other:?}")),
@@ -1194,8 +1205,6 @@ impl Backend for MetalBackend {
                     .state
                     .weight_buf(&meta.gu_weight)
                     .ok_or_else(|| format!("gate+up weight '{}' not on GPU", meta.gu_weight))?;
-                let nt = node.out_shape[1];
-                debug_assert!(nt == 1, "FusedFFN is decode (nt==1) only, got nt={nt}");
                 let od_total = 2 * meta.nf;
                 // 1) concat matmul: x × [ffn_gate|ffn_up] → gate|up concat buffer
                 cb.quant_matmul_f32_on_gpu_buf(
@@ -1238,6 +1247,14 @@ impl Backend for MetalBackend {
                 Ok(())
             }
             Op::FusedQKV { layer } => {
+                // #39: decode-only shape guard first — see the FusedFFN arm.
+                let nt = node.out_shape[1];
+                if nt != 1 {
+                    return Err(format!(
+                        "metal: {}: FusedQKV is decode (nt==1) only, got nt={nt}",
+                        node.name
+                    ));
+                }
                 let meta = match &node.meta {
                     NodeMeta::FusedQkv(m) => m,
                     other => return Err(format!("fused_qkv node missing FusedQkvMeta: {other:?}")),
@@ -1246,8 +1263,6 @@ impl Backend for MetalBackend {
                     .state
                     .weight_buf(&meta.qkv_weight)
                     .ok_or_else(|| format!("qkv weight '{}' not on GPU", meta.qkv_weight))?;
-                let nt = node.out_shape[1];
-                debug_assert!(nt == 1, "FusedQKV is decode (nt==1) only, got nt={nt}");
                 let od_total = meta.nqt + 2 * meta.nkt;
                 // 1) concat matmul: x × [wq|wk|wv] → q|k|v concat buffer
                 cb.quant_matmul_f32_on_gpu_buf(
@@ -1321,6 +1336,14 @@ impl Backend for MetalBackend {
                 Ok(())
             }
             Op::FusedQkvNorm { layer } => {
+                // #39: decode-only shape guard first — see the FusedFFN arm.
+                let nt = node.out_shape[1];
+                if nt != 1 {
+                    return Err(format!(
+                        "metal: {}: FusedQkvNorm is decode (nt==1) only, got nt={nt}",
+                        node.name
+                    ));
+                }
                 let meta = match &node.meta {
                     NodeMeta::FusedQkvNorm(m) => m,
                     other => {
@@ -1346,8 +1369,6 @@ impl Backend for MetalBackend {
                     };
                 let (qn_b, qn_o) = norm_off(&meta.q_norm_name)?;
                 let (kn_b, kn_o) = norm_off(&meta.k_norm_name)?;
-                let nt = node.out_shape[1];
-                debug_assert!(nt == 1, "FusedQkvNorm is decode (nt==1) only, got nt={nt}");
                 let od_total = meta.nqt + 2 * meta.nkt;
                 // 1) concat matmul: x × [wq|wk|wv] → q|k|v concat buffer
                 cb.quant_matmul_f32_on_gpu_buf(
