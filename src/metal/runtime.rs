@@ -150,6 +150,8 @@ impl MpsState {
             let pl_q5_k_f32 = get_pl("kernel_q5_k_f32_matmul")?;
             let pl_q5_k_mm_f32 = get_pl("kernel_q5_k_mm_f32")?;
             let pl_q5_k_f32_multi = get_pl("kernel_q5_k_f32_matmul_multi")?;
+            // #164: f16 weight matmul + embedding gather (Metal twin of #141).
+            let pl_f16_f32 = get_pl("kernel_f16_f32_matmul")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_get_rows_f32 = get_pl("kernel_get_rows_f32")?;
             let pl_get_rows_q4_k = get_pl("kernel_get_rows_q4_k")?;
@@ -159,6 +161,7 @@ impl MpsState {
             let pl_get_rows_q8_0 = get_pl("kernel_get_rows_q8_0")?;
             let pl_get_rows_q6_k = get_pl("kernel_get_rows_q6_k")?;
             let pl_get_rows_q5_k = get_pl("kernel_get_rows_q5_k")?;
+            let pl_get_rows_f16 = get_pl("kernel_get_rows_f16")?;
             let pl_rms_norm = get_pl("kernel_rms_norm_f32")?;
             let pl_rms_norm_256 = get_pl("kernel_rms_norm_f32_256")?;
             let pl_add = get_pl("kernel_add_f32")?;
@@ -223,6 +226,7 @@ impl MpsState {
                 pl_q5_k_f32,
                 pl_q5_k_f32_multi,
                 pl_q5_k_mm_f32,
+                pl_f16_f32,
                 pl_get_rows_q4_0,
                 pl_get_rows_f32,
                 pl_get_rows_q4_k,
@@ -232,6 +236,7 @@ impl MpsState {
                 pl_get_rows_q8_0,
                 pl_get_rows_q6_k,
                 pl_get_rows_q5_k,
+                pl_get_rows_f16,
                 pl_rms_norm,
                 pl_rms_norm_256,
                 pl_add,

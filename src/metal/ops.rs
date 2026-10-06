@@ -446,6 +446,35 @@ impl MpsCommandBuffer<'_> {
                     self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
                 }
             }
+            TensorType::F16 => {
+                // #164: f16 weight rows × f32 activations; the weights stay 2
+                // B/element on the device (no registration-time f32 copy). A
+                // second 2 B/element dtype (bf16, #208) adds its own arm here.
+                self.enc.setComputePipelineState(&*self.state.pl_f16_f32);
+                unsafe {
+                    self.enc
+                        .setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize)
+                };
+                unsafe {
+                    self.enc
+                        .setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize)
+                };
+                unsafe {
+                    self.enc
+                        .setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize)
+                };
+                let mm_p = [od as i32, id as i32, nt as i32];
+                unsafe {
+                    self.enc.setBytes_length_atIndex(
+                        NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void)
+                            .unwrap(),
+                        (12) as usize,
+                        (3) as usize,
+                    )
+                };
+                // NR0*NSG = 8 rows per threadgroup, one 64-thread threadgroup.
+                self.dispatch_2d(((od + 7) / 8) as u64, 1, 32, 2);
+            }
             _ => {
                 self.enc.setComputePipelineState(
                     &**(if nt > 1 {
@@ -503,6 +532,8 @@ impl MpsCommandBuffer<'_> {
             TensorType::Q4_K => (&self.state.pl_get_rows_q4_k, (ne / 256) * 16),
             TensorType::Q6_K => (&self.state.pl_get_rows_q6_k, (ne / 256) * 16),
             TensorType::Q5_K => (&self.state.pl_get_rows_q5_k, (ne / 256) * 16),
+            // #164: f16 embedding rows decode one element per thread (nb = ne).
+            TensorType::F16 => (&self.state.pl_get_rows_f16, ne),
             _ => unreachable!("embed_tokens_gpu called with unsupported type {ttype:?}"),
         };
         self.enc.setComputePipelineState(&**(pl));
