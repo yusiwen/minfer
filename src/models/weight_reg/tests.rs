@@ -27,6 +27,36 @@ fn f16_weights_are_registered_raw_and_clear_the_nb_bt_flag() {
     );
 }
 
+/// #208 (the CUDA half): a bf16 weight takes the **same** raw registration path the
+/// f16 one does — F16 and BF16 are the crate's two 2 B/element dtypes and both must
+/// clear the NB-BT-only flag, because neither GEMM consumes an NB-BT producer's
+/// quantized stream. The pair with the f16 gate above is what keeps a future edit
+/// from admitting one 2 B/element dtype and forgetting the other.
+///
+/// The Metal half is *not* covered here: it lives in each loader's inline
+/// `matches!(ttype, F32 | F16)` arm and is a separate, later ticket, so a bf16 GGUF
+/// on a Metal build still falls to the CPU loudly.
+#[test]
+fn bf16_weights_are_registered_raw_and_clear_the_nb_bt_flag() {
+    // A Qwen3-0.6B bf16 `ffn_gate` is [in=1024, out=3072] → id=ne[0]=1024, od=ne[1]=3072.
+    let (id, od) = (1024usize, 3072usize);
+    assert_eq!(
+        cuda_weight_reg(TensorType::BF16, 2, od * id * 2, od, id, true),
+        CudaWeightReg::Raw {
+            q80_p32: false,
+            clear_nb_bt_only: true,
+            q4k_dsc: false,
+        },
+        "a bf16 weight must register raw and clear the NB-BT-only flag"
+    );
+    // Positive control: the same call for a type no kernel reads answers None, so the
+    // assertion above is not `Raw` for every input.
+    assert_eq!(
+        cuda_weight_reg(TensorType::I8, 2, 0, od, id, true),
+        CudaWeightReg::None
+    );
+}
+
 /// #167: the q4_K dsc plane is decided by the shared
 /// [`crate::q4k_dsc::q4k_dsc_plane_admitted`] rule **and** the two r59 gates — each
 /// half independently refused, so the plane gate cannot pass for the wrong reason.

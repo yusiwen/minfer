@@ -255,6 +255,10 @@ fn load_tensor(
             } else if matches!(ttype, TensorType::F32 | TensorType::F16) {
                 // #164: f16 weights register raw (2 B/element) — see qwen2's
                 // loader twin for the reason. 1-D norms/biases stay f32.
+                //
+                // #208 deliberately does not add `TensorType::BF16` here; the
+                // Metal half of the ticket is a separate delegation (qwen2's
+                // twin comment names the kernels it needs).
                 mps.register_weight(&reg_name, tensor.data());
                 device_bytes.set(device_bytes.get() + tensor.data().len());
             }
@@ -267,6 +271,8 @@ fn load_tensor(
             // for the dispatch and for why the q4_K `W_dsc` plane (r59/#165) and the
             // f16 arm (#141) live there instead of in a per-loader copy. The failure
             // mode this closes is real: the two copies had already drifted twice.
+            // #208 adds `TensorType::BF16` to that same shared rule (the CUDA half
+            // only; the Metal arm above stays `F32 | F16` until its own ticket).
             crate::models::weight_reg::register_cuda_weight(
                 cuda,
                 &reg_name,

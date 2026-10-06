@@ -91,6 +91,17 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
+    // #208: bf16 weights × f32 activations (raw 2 B/element words, `bits << 16`
+    // in-register). Same checked-return contract as the f16 launcher above.
+    pub(crate) fn launch_bf16_f32_matmul(
+        w: *const u8,
+        x: *const f32,
+        out: *mut f32,
+        od: i32,
+        id: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
     pub(crate) fn launch_q5_1_f32_matmul(
         weights: *const u8,
         acts: *const f32,
@@ -428,6 +439,38 @@ impl CudaState {
                     return Err(format!(
                         "cuda: f16 matmul launch failed for [{od}x{id}] x nt={nt} \
                          (site launch:f16_f32_matmul_*)"
+                    ));
+                }
+                Ok(())
+            }
+            // #208: a bf16 weight matmul — the f16 arm's exact sibling. Raw
+            // 2 B/element words stay on the device; `bf16_f32_matmul_vec` /
+            // `_scalar` promote in-register with `bits << 16`, which is exact.
+            // Deliberately its own arm over its own kernel rather than a flag on
+            // the f16 one: the two decodes differ (`__half22float2` vs a shift)
+            // and folding them would put a per-element branch in the inner loop
+            // of the hottest device kernel. Like f16 it never enters the int8
+            // MMQ prefill GEMM: MMQ streams *quantized* bytes and bf16 is not one
+            // of its formats.
+            TensorType::BF16 => {
+                let rc = unsafe {
+                    launch_bf16_f32_matmul(
+                        wptr as *const u8,
+                        x as *const f32,
+                        out as *mut f32,
+                        od as i32,
+                        id as i32,
+                        nt as i32,
+                        stream,
+                    )
+                };
+                if rc != 0 {
+                    // #147 rule: the launch named itself at the site (see the
+                    // `minfer/cuda: kernel launch …` line on stderr); refuse
+                    // here instead of running on into a checked error.
+                    return Err(format!(
+                        "cuda: bf16 matmul launch failed for [{od}x{id}] x nt={nt} \
+                         (site launch:bf16_f32_matmul_*)"
                     ));
                 }
                 Ok(())

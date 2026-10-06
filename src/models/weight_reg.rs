@@ -123,6 +123,29 @@ pub(crate) fn cuda_weight_reg(
             q4k_dsc: false,
         };
     }
+    if ttype == TensorType::BF16 {
+        // #208 (the CUDA half): bf16 registers raw, exactly like f16 above — the
+        // 2 B/element words stay on the device and `bf16_f32_matmul_vec` /
+        // `_scalar` / `embed_rows_bf16` promote in-register with the exact
+        // `f32::from_bits(bits << 16)` decode. No f32 copy at registration, so the
+        // memory a bf16 file exists to save is actually saved. Like f16 it is
+        // deliberately outside the quantized `matches!` above (that arm's dsc-plane
+        // gate has no type check and would expand bf16 bytes into a plane no kernel
+        // reads) and it clears the NB-BT-only flag (its GEMM reads the f32
+        // activations, so a mode-2 skip-write producer upstream would feed it a dead
+        // buffer).
+        //
+        // **Metal is the other half and is deliberately NOT here.** The Metal
+        // registration arm lives inline in each loader (`matches!(ttype, F32 | F16)`)
+        // and #208's Metal half is a separate, later delegation, so a bf16 GGUF on a
+        // Metal build still drops to the CPU loudly. Flipping it needs
+        // `kernel_bf16_f32_matmul` + `kernel_get_rows_bf16` on that side.
+        return CudaWeightReg::Raw {
+            q80_p32: false,
+            clear_nb_bt_only: true,
+            q4k_dsc: false,
+        };
+    }
     CudaWeightReg::None
 }
 

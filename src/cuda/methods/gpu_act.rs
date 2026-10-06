@@ -21,6 +21,16 @@ extern "C" {
         nt: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
+    // #208: bf16 token-embedding gather (raw 2 B/element words, `bits << 16`
+    // in-register). Same checked-return contract as the f16 gather above.
+    pub(crate) fn launch_embed_rows_bf16(
+        w: *const u8,
+        ids: *const f32,
+        out: *mut f32,
+        n_embd: i32,
+        nt: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
     pub(crate) fn launch_swiglu_f32_off(
         buf: *mut f32,
         n: i32,
@@ -206,6 +216,29 @@ impl CudaState {
                     return Err(format!(
                         "cuda: f16 embed gather launch failed for n_embd={n_embd} nt={nt} \
                          (site launch:embed_rows_f16)"
+                    ));
+                }
+                return Ok(());
+            }
+            // #208: bf16 tok_embd rows gather + convert in one kernel — the f16
+            // arm's exact sibling. Without it a converted bf16 GGUF would fail
+            // the all-or-nothing `weights_on_cuda` embed check over
+            // `token_embd` alone and run the whole model on the CPU.
+            TensorType::BF16 => {
+                let rc = unsafe {
+                    launch_embed_rows_bf16(
+                        wptr as *const u8,
+                        ids as *const f32,
+                        out as *mut f32,
+                        n_embd as i32,
+                        nt as i32,
+                        stream,
+                    )
+                };
+                if rc != 0 {
+                    return Err(format!(
+                        "cuda: bf16 embed gather launch failed for n_embd={n_embd} nt={nt} \
+                         (site launch:embed_rows_bf16)"
                     ));
                 }
                 return Ok(());

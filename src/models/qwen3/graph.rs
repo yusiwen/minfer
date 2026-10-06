@@ -751,8 +751,9 @@ impl Qwen3Graph {
     /// embedding a device gather+dequant kernel). Matmul weights additionally
     /// require a type with an f32-activation kernel (Q5_0/Q5_1/Q5_K/F32 have
     /// none — the loader registers them for the legacy path, so the type
-    /// check is required here); tok_embd requires an embed-kernel type
-    /// (F32/Q4_0/Q8_0/Q4_K/Q6_K). Norm/bias weights are f32 and only need
+    /// check is required here; the 2 B/element f16/bf16 weights each have one);
+    /// tok_embd requires an embed-kernel type (F32/Q4_0/Q8_0/Q4_K/Q6_K, plus the
+    /// f16/bf16 gathers). Norm/bias weights are f32 and only need
     /// registration; q_norm/k_norm feed Op::QkNorm on CUDA.
     #[cfg(feature = "cuda")]
     fn weights_on_cuda(model: &Qwen3Model) -> bool {
@@ -770,6 +771,11 @@ impl Qwen3Graph {
                 // after the loader had registered it — qwen2's twin list has had
                 // F16 since #141.
                 | TensorType::F16
+                // #208 (CUDA half): the loader registers bf16 raw and
+                // `bf16_f32_matmul_vec` / `_scalar` are its device kernels —
+                // qwen2's twin list gained the same arm in the same PR, because
+                // the shared registration rule admits the type for both.
+                | TensorType::BF16
                 | TensorType::Q5_1
                 | TensorType::Q5_K)
                 && cuda.has_weight_of_size(&t.name, t.data().len())
@@ -789,6 +795,8 @@ impl Qwen3Graph {
                 // #167: `embed_rows_f16` is the device gather (#141); see
                 // `matmul_t_ok` for the gate this completes.
                 | TensorType::F16
+                // #208 (CUDA half): `embed_rows_bf16` is the device gather.
+                | TensorType::BF16
                 | TensorType::Q5_1
                 | TensorType::Q5_K)
                 && cuda.has_weight_of_size(&t.name, t.data().len())
