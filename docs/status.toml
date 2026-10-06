@@ -125,7 +125,7 @@ command = "cargo test --release"
 date = "2026-10-06"
 passed = 482
 failed = 0
-ignored = 39
+ignored = 40
 integration_passed = 10
 integration_failed = 0
 integration_ignored = 6
@@ -142,7 +142,7 @@ command = "cargo test --release"
 date = "2026-10-06"
 passed = 480
 failed = 0
-ignored = 39
+ignored = 40
 integration_passed = 10
 integration_failed = 0
 integration_ignored = 6
@@ -157,7 +157,7 @@ box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "real-model"
 command = "PARALLEL=0 scripts/real_model_gates.sh and the parallel form"
 date = "2026-10-06"
-passed = 39
+passed = 40
 failed = 0
 live_check = false
 note = "recorded measurement; needs the cached models, not run in CI"
@@ -172,7 +172,7 @@ command = "scripts/cuda_test.sh"
 date = "2026-10-06"
 passed = 570
 failed = 0
-ignored = 45
+ignored = 46
 # #207: this row is a recorded measurement (CI has no GPU) refreshed only on a
 # device run, but it counts the same test binary plus the device-gated tests, so a
 # feature-independent test added by a CPU-only ticket moves it too.
@@ -195,11 +195,11 @@ box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "real-model"
 command = "FEATURES=cuda scripts/real_model_gates.sh"
 date = "2026-10-06"
-passed = 45
+passed = 46
 failed = 0
 projection_key = "cpu-real-model"
 projection_box = "dgxspark (aarch64, GB10 sm_121)"
-projection_base_passed = 39
+projection_base_passed = 40
 live_check = false
 note = "recorded measurement; CI has no GPU"
 file = "AGENTS.md"
@@ -211,11 +211,11 @@ box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "real-model"
 command = "FEATURES=cuda scripts/real_model_gates.sh"
 date = "2026-10-06"
-passed = 45
+passed = 46
 failed = 0
 projection_key = "cpu-real-model"
 projection_box = "dgxspark (aarch64, GB10 sm_121)"
-projection_base_passed = 39
+projection_base_passed = 40
 live_check = false
 note = "recorded measurement; CI has no GPU"
 file = "AGENTS.md"
