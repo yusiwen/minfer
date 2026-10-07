@@ -331,12 +331,12 @@ and they span 18 docs — 21 in `13-decode-loop-graph-reuse.md`, 12 in
 revision their lines were verified against (`lines verified at commit e7fa0da`), where
 re-pointing the anchor would falsify the record — the same reason the `FROZEN` set
 exists. And two of the three anchors [#339] was filed for are *invisible* to the rule:
-`:256` cited `metal_backend.rs:316-1020` for `execute_node`, a range that **does**
+`:256` cited `metal_backend.rs:316-1051` for `execute_node`, a range that **does**
 contain the definition at 843 (containment cannot see a range that starts 527 lines
 early), and `:586`'s `synchronize` anchor carries no adjacent symbol at all
 (`` `self.submit_pending()` `` is not an identifier), so no adjacency rule can reach
 it. Both were re-pointed by hand in the [#339] PR, as was the `()`
-(`:526` cites `metal_backend.rs:1770-1772` now). The 80 that remain are the sweep
+(`:526` cites `metal_backend.rs:1832-1834` now). The 80 that remain are the sweep
 [#336] and [#356] carry alongside the bare ranges; until it lands they are visible as
 `range misses` in every `check-docs` run, and `--strict-symbols` fails on each.
 
