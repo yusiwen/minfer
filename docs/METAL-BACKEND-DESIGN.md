@@ -376,12 +376,21 @@ Pre-dispatch guards return `Err`: `nkt == n_head_kv * hd` (the classic kernel st
 at cell 0 — the arm selects the mode from the **size** of the window input (topology, fixed at build
 time), mirroring CUDA's arm:
 
-- `in_bufs[3].len == 2 * nt` → the **`attn_span`** layout (one `[lo, hi)` pair per query):
-  `gqa_attn_window_f32` / `_f16` (`src/metal/kernels/attn_window.metal`) reads K/V at the run's cells
-  `[lo, hi)` instead of `[0, positions[t] + 1)`, with the same `Bc = 32` tiling, online softmax and
-  reduction order as the classic `gqa_attn_f32` (the CPU gather `cpu_gqa_attn_runs` is the structural
-  reference). `nt == 1` and `nt > 1` both use it, so a decode and a batched prefill share one launch;
-  f32/f16 is selected from the engine's KV format.
+- `in_bufs[3].len == 2 * nt` → the **`attn_span`** layout (one `[lo, hi)` pair per query). A
+  **prefill** (`nt > 1`) at `hd ∈ {64,128}` with `MINFER_NO_WINDOW_FLASH` unset takes the fast
+  windowed family `kernel_flash_attn_window_blk_{f32,f16}` / `_hd128_{f32,f16}`
+  (`src/metal/kernels/fa_window.metal`, issue [#359](https://github.com/yusiwen/minfer/issues/359)):
+  a copy of the causal `kernel_flash_attn_blk_*` tile structure (Q=8 × C=64 simdgroup GEMM, inline
+  online softmax, the `kernel_kv_tail_pad` tail) whose mask reads each query's explicit
+  `[window[t], window[nt+t])` instead of the causal `[0, positions[t] + 1)`. The threadgroup
+  processes the launch's global `[lo_min, hi_max)` union; the host advances K/V by `lo_min` for the
+  tail pad and passes `lo_min` for the mask, so a windowed prefill does the causal tile work with
+  extra blocks masked out. Every other shape — `nt == 1` decode, any `hd` outside {64,128}, the
+  opt-out — keeps the **correctness** kernel `gqa_attn_window_f32` / `_f16`
+  (`src/metal/kernels/attn_window.metal`), which reads K/V at the run's cells `[lo, hi)` with the
+  classic kernel's `Bc = 32` tiling (the CPU gather `cpu_gqa_attn_runs` is the structural
+  reference). f32/f16 is selected from the engine's KV format for both families; the fast family is
+  the one measured below, the correctness family stays its reference.
 - `in_bufs[3].len == nt * KV_MAP_MAX_SPANS * 2` → the **`kv_map`** layout (a list of `(cell, len)`
   runs per query, C8b S2/S4): the sibling kernels `gqa_attn_map_f32` / `_f16` (also in
   `src/metal/kernels/attn_window.metal`, issue [#362](https://github.com/yusiwen/minfer/issues/362))
@@ -394,15 +403,17 @@ time), mirroring CUDA's arm:
 
 `supports_attn_span()` is now `true` (`SUPPORTS_ATTN_SPAN`) and `Device::gathers_attn_map` is now
 true for Metal, so both explicit layouts are read on the device. The causal paths (flash / split /
-parallel-prefill / classic) are **byte-untouched**: the windowed family is used only for an explicit
-window, so a single-sequence causal forward keeps its previous numbers. The one asymmetry that
-remains is a **packed `q8_0`** region, refused (`READS_PACKED_KV` false) until
+parallel-prefill / classic) are **byte-untouched**: the windowed families are used only for an
+explicit window, so a single-sequence causal forward keeps its previous numbers. The one asymmetry
+that remains is a **packed `q8_0`** region, refused (`READS_PACKED_KV` false) until
 [#310](https://github.com/yusiwen/minfer/issues/310) adds its store and reads; that is a deliberate
-asymmetry, not a silent gap. The windowed kernel is a **correctness** path, not a performance one:
-keeping it separate is what leaves the causal instruction streams (and their measured numbers)
-byte-identical. Issue [#315](https://github.com/yusiwen/minfer/issues/315) measured what a batched
-multi-sequence prefill — which runs it — costs against the causal flash prefill; the answer is
-**materially slower**, and the follow-up it earns (a windowed fast path) is its own ticket.
+asymmetry, not a silent gap. The `attn_span` layout has two families — the **fast** prefill family
+above and the #44 **correctness** family, still the reference and still serving every other
+explicit-span shape. Keeping them separate is what leaves the causal instruction streams (and their
+measured numbers) byte-identical. Issue [#315](https://github.com/yusiwen/minfer/issues/315)
+measured the correctness family as **materially slower** than the causal flash prefill; issue
+[#359](https://github.com/yusiwen/minfer/issues/359) added the fast family and re-measured — both
+records follow.
 
 **Measured (issue [#315], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
 2026-10-07).** Bar named before the run (`docs/GATE-CONTRACT.md` rules 3 and 5): the windowed
@@ -439,9 +450,42 @@ The causal kernel and code path are untouched (the round adds only the harness);
 simple windowed kernel's serial per-(query, KV-head) walk over the run, which the tuned
 `attn_flash_prefill` tiles. A windowed **fast** path — tiling the run list the way
 `fa_prefill.metal` tiles a contiguous window, without disturbing the causal kernels (the
-[#137](https://github.com/yusiwen/minfer/issues/137) lesson) — is therefore warranted and is
-filed as [#359](https://github.com/yusiwen/minfer/issues/359); the correctness kernel stays the
-reference.
+[#137](https://github.com/yusiwen/minfer/issues/137) lesson) — was therefore warranted and is filed
+as [#359](https://github.com/yusiwen/minfer/issues/359); the correctness kernel stays the reference.
+
+**Measured (issue [#359], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
+2026-10-07).** Same harness, bar and `n_ctx`/`n_total` as the #315 run above (median of 5
+interleaved rounds, three runs each). The fast family is now selected for every windowed prefill
+arm; the causal arm and its kernel are unchanged, and both windowed arms print
+`kernel_gqa_attn_window_*` because the harness's kernel label is hard-coded to the correctness
+family (the harness is the yardstick and was re-run unchanged).
+
+| Pair (median of the 3 runs) | 0.5B (before → after) | Qwen3-0.6B (before → after) |
+|---|---|---|
+| **primary** — one 512-token causal sequence vs a two-sequence batch of the same 512 tokens | **0.540x → 0.968x** | **0.158x → 0.918x** |
+| **shape-matched** — one causal sequence vs the same sequence behind a 128-cell holder, same `nt`/`n_out`/tokens, only the kernel differs | **0.379x → 0.996x** | **0.093x → 0.995x** |
+
+Both arms clear the **>= 0.8x** bar on both models (0.5B primary 0.968 / 0.968 / 0.971, shape
+0.995 / 0.996 / 0.997; Qwen3-0.6B primary 0.918 / 0.917 / 0.920, shape 0.995 / 0.997 / 0.995). The
+residual gap in each primary pair is the two-sequence batch's own per-forward overhead, not the
+attention kernel: the windowed-global launch runs the same tile count the causal prefill does. With
+`MINFER_NO_WINDOW_FLASH=1` both pairs fall back to the #315 numbers above, which is the A/B control
+for the fast family.
+
+The `kv_map` explicit-span layout (#362) still reads through its correctness kernels
+`kernel_gqa_attn_map_*`; a fast sibling for it — the same tile structure with a run-membership mask
+over the global `[lo_min, hi_max)` range — is the **remaining increment** of [#359].
+
+Gate: `metal::tests::window_flash_matches_the_cpu_reference` drives the fast kernel directly at
+`hd 64` (f32 and f16) and `hd 128` (f32 and f16), with `lo_min ∈ {0, 64, 96}`, `nt = 197` (a
+non-multiple of 8, so the Q-tile tail padding runs) and `nkv = 197` (a partial 64-row tail, so
+`kernel_kv_tail_pad` runs). Its bars were named before measuring: a one-cell window returns the
+named cell's V row **bitwise** (max|Δ| = 0 on every case), the growing window matches the CPU
+reference to **<= 0.01** (f32) / **<= 0.05** (f16) — measured 1.5e-4 / 2.7e-4 — and a window shifted
+one cell changes the output (the rule-2 control). The #44 correctness gates
+(`metal_attn_span_matches_cpu`, `metal_attn_span_multi_key_matches_cpu`,
+`metal_attn_span_nonzero_start`, `metal_map_single_cell_matches_the_v_row`,
+`metal_map_matches_the_span_and_a_wrong_base_differs`) are unchanged and green.
 
 #### 4.4.2 KV write/move side (issue #44 part (b), landed on a Mac 2026-10-06)
 

@@ -194,6 +194,12 @@ impl MpsState {
             let pl_flash_attn_blk_f16 = get_pl("kernel_flash_attn_blk_f16")?;
             let pl_flash_attn_blk_hd128 = get_pl("kernel_flash_attn_blk_hd128_f32")?;
             let pl_flash_attn_blk_hd128_f16 = get_pl("kernel_flash_attn_blk_hd128_f16")?;
+            // #359: fast explicit-span prefill (windowed sibling of the causal blk family).
+            let pl_flash_attn_window_blk = get_pl("kernel_flash_attn_window_blk_f32")?;
+            let pl_flash_attn_window_blk_f16 = get_pl("kernel_flash_attn_window_blk_f16")?;
+            let pl_flash_attn_window_blk_hd128 = get_pl("kernel_flash_attn_window_blk_hd128_f32")?;
+            let pl_flash_attn_window_blk_hd128_f16 =
+                get_pl("kernel_flash_attn_window_blk_hd128_f16")?;
             let pl_kv_tail_pad = get_pl("kernel_kv_tail_pad")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
@@ -273,6 +279,10 @@ impl MpsState {
                 pl_flash_attn_blk_f16,
                 pl_flash_attn_blk_hd128,
                 pl_flash_attn_blk_hd128_f16,
+                pl_flash_attn_window_blk,
+                pl_flash_attn_window_blk_f16,
+                pl_flash_attn_window_blk_hd128,
+                pl_flash_attn_window_blk_hd128_f16,
                 pl_kv_tail_pad,
                 pl_store_kv,
                 pl_store_kv_f16,
