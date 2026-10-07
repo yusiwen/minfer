@@ -246,6 +246,45 @@ and the prose in the same commit. A box whose name has no manifest row fails
 `--check-live` loudly, which is deliberate: a fabricated box must not pass
 vacuously.
 
+## Prose anchors: name the section, not the line range
+
+This is a **documentation convention**, not a sixth gate rule — it belongs here
+because `check_doc_line_anchors.py` is the gate it supports, and because the
+reason it exists is the gate's own boundary.
+
+A `path:NNN` anchor in the docs is checked for two things only: that the file and
+the line exist, and — when a backticked *symbol* sits next to the anchor — that
+the symbol still lives within ±25 lines of it ([#266]). Neither test can see a
+range that still *resolves* but no longer holds the text the citing sentence
+describes. That is not a bug to fix with a third rule: measured for [#327],
+**173** anchors carry an adjacent backticked **non-symbol** token, and **99** of
+the 144 live ones do not contain that token inside their own range — 69 % of the
+population, and the tokens are mostly code expressions (`ins[1][t].to_bits() as
+usize`, `nt >= 9`) or fragments of a *neighbouring* quoted sentence, never the
+claim. Even the narrowest useful spelling ("≥2 pure-lowercase words") leaves one
+hit — an anchor citing `build.rs` for `` `ar rcs` `` that no longer held it — and
+that one *was* a real drift, which is the point: the detectable subset is a
+coincidence, not a rule.
+
+So the convention is:
+
+- **A prose anchor points at a section heading.** Cite the heading by name and
+  number (`docs/COMPUTE-GRAPH-DESIGN.md` §7.3 "In-place execution and the
+  aliasing rule") next to the range, so a reader who lands on the wrong text has
+  a stable second locator. A heading rename is a visible edit; a 200-line insert
+  is not.
+- **Prefer a symbol anchor where one exists.** `check_doc_line_anchors.py` rule C
+  is the one content-aware test that is mechanical: put the backticked symbol
+  next to the anchor and the checker follows it through a move. A bare range is
+  the fallback, not the default.
+- **A range that quotes prose is the weakest form.** Do not backtick the quoted
+  words to "make them checkable": the adjacency rule was written for identifiers,
+  and applying it to prose judges the neighbouring sentence (measured above).
+
+The remaining bare ranges are a tracked sweep, not a silent one: **878** of the
+955 resolved anchors are bare ranges across 33 docs (`docs/cuda_tutorial/**` alone
+carries 276), and converting them is its own ticket.
+
 ## Writing the next gate — checklist
 
 1. What **value** does it assert, and how is that value computed independently
@@ -306,3 +345,5 @@ questions a reviewer must be able to answer from the PR, not as property tests.
 [#188]: https://github.com/yusiwen/minfer/issues/188
 [#218]: https://github.com/yusiwen/minfer/issues/218
 [#223]: https://github.com/yusiwen/minfer/issues/223
+[#266]: https://github.com/yusiwen/minfer/issues/266
+[#327]: https://github.com/yusiwen/minfer/issues/327
