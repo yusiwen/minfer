@@ -81,7 +81,7 @@ is against the old path, not against the pre-round figure):
 > oracle that compares Metal against an **external** reference. The per-op
 > Metal-vs-CPU gates (`metal_*_matches_cpu` in `src/graph/metal_backend/tests.rs`)
 > and the four kernel isolation suites are green in the full macOS run
-> (**531 / 0 / 43** unit, **21 / 0 / 6** integration). **The Metal-vs-CPU
+> (**532 / 0 / 43** unit, **21 / 0 / 6** integration; the +1 is #329's dispatch-refusal gate). **The Metal-vs-CPU
 > *logits* row cannot be taken from `graph_metal_matches_cpu_logits`**: in the
 > graph era both `ModelDef::forward` and `forward_graph` route through
 > `Qwen2Graph::forward` (`src/models/qwen2/mod.rs:56`/`:96`), so its

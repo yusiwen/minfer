@@ -776,7 +776,9 @@ regression**. Taken at `6b95763` (the round's final master), 2026-10-06, on
 `macbook (macOS 27.0.1, Apple M4 Pro)`.
 
 - **unit** `cargo test --release --no-fail-fast`: **531 passed / 0 failed / 43
-  ignored** — green.
+  ignored** — green. (The live count is **532 / 0 / 43** since [#329] added the
+  Metal dispatch-refusal gate on 2026-10-07; the enumeration below is this
+  round's record at `6b95763`.)
 - **integration**: **21 passed / 0 failed / 6 ignored**.
 - **real-model** (`PARALLEL=0 scripts/real_model_gates.sh`, serial), both cached
   models (0.5B f32 KV and Qwen3-0.6B f16 KV): **42 passed / 1 failed** each. The
@@ -812,6 +814,7 @@ left the macOS test binary uncompilable until `4add59f` (2026-10-05) with no CI 
 [#298]: https://github.com/yusiwen/minfer/issues/298
 [#303]: https://github.com/yusiwen/minfer/issues/303
 [#305]: https://github.com/yusiwen/minfer/issues/305
+[#329]: https://github.com/yusiwen/minfer/issues/329
 [#310]: https://github.com/yusiwen/minfer/issues/310
 [#312]: https://github.com/yusiwen/minfer/pull/312
 [#314]: https://github.com/yusiwen/minfer/issues/314
