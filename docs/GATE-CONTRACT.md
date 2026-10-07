@@ -285,6 +285,46 @@ The remaining bare ranges are a tracked sweep, not a silent one: **878** of the
 955 resolved anchors are bare ranges across 33 docs (`docs/cuda_tutorial/**` alone
 carries 276), and converting them is its own ticket.
 
+### The drift rule: re-point by the map, in the same PR
+
+Rule C follows a symbol through a move, but a bare range has nothing to follow: a
+commit that inserts a line in an anchored file leaves every anchor below it
+*resolving* and *wrong*. That is the gap
+[`scripts/check_anchor_drift.py`](../scripts/check_anchor_drift.py) ([#344]) closes,
+and it runs in `check-docs` on `pull_request` events. It diffs `HEAD` against the
+PR's **merge base** — `git diff -U0 origin/<base_ref>...HEAD`, which is why that
+job's `fetch-depth: 0` is load-bearing twice — reduces each file to its hunks, and
+compares the base revision's anchors with the head tree's. Anchors are paired on
+the doc line with its numbers normalised (so a re-pointed line still pairs), which
+is [PR #343]'s own proof (`":NNN" -> ":N"` multisets identical) applied per line:
+
+- the pair does **not** carry the mapped numbers → **stale**, printed as
+  `doc:line → target:old (now new)`, exit 1;
+- a cited *endpoint* was deleted by the range, so the map has no image for it →
+  **ambiguous**: reported with the reason, never guessed, and promoted to a
+  failure by `--strict`;
+- the range never touched the target, or the doc already carries the mapped
+  numbers → silent.
+
+The rule for a PR author is therefore: **moving a line in an anchored file obliges
+you to re-point every anchor into it, by the mapped delta, in the same PR** — and
+the cheapest way to need that less often is rule C above, a symbol anchor the map
+cannot strand. The gate exists because the rule was missed twice in one round:
+[#329]'s dispatch change moved **7** anchors off by one (docs 07 and 14), and
+[#299]'s weight accounting moved **69** across eight docs by 1–3. Both were caught
+by a hand-written old→new line map, which is exactly what the gate replaces — and
+which it beats: re-run over [#299]'s range it named **73**, the 69 the re-point
+commit fixed plus **4 it missed** (`docs/ARCHITECTURE-ROADMAP.md:98` and `:452`,
+`docs/SOURCE-LAYOUT-PLAN.md:56`,
+`docs/inference_e2e_walkthrough/03-model-dispatch-weights.md:705`).
+
+Two boundaries are deliberate. A **bare `:NNN` continuation** is not an anchor
+either checker can see, so those numbers remain [#336]'s sweep. And a base anchor
+whose doc line was rewritten *beyond* its numbers is not compared — the author
+touched that line, and pairing it would be a guess; `--list` prints it as
+`not compared`, so "why did this pass?" has an answer. The `FROZEN` set above is
+the *same* set in both modes: a record frozen against a past revision is not drift.
+
 ## Writing the next gate — checklist
 
 1. What **value** does it assert, and how is that value computed independently
@@ -347,3 +387,8 @@ questions a reviewer must be able to answer from the PR, not as property tests.
 [#223]: https://github.com/yusiwen/minfer/issues/223
 [#266]: https://github.com/yusiwen/minfer/issues/266
 [#327]: https://github.com/yusiwen/minfer/issues/327
+[#299]: https://github.com/yusiwen/minfer/issues/299
+[#329]: https://github.com/yusiwen/minfer/issues/329
+[#336]: https://github.com/yusiwen/minfer/issues/336
+[#344]: https://github.com/yusiwen/minfer/issues/344
+[PR #343]: https://github.com/yusiwen/minfer/pull/343
