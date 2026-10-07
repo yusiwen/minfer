@@ -395,9 +395,45 @@ only for an explicit window, so a single-sequence causal forward keeps its previ
 stays refused (`READS_PACKED_KV` false) until [#310](https://github.com/yusiwen/minfer/issues/310);
 both are deliberate asymmetries, not silent gaps. The windowed kernel is a **correctness** path,
 not a performance one: keeping it separate is what leaves the causal instruction streams (and
-their measured numbers) byte-identical, and nobody has measured what a batched multi-sequence
-prefill — which runs it — costs against the causal flash prefill. That comparison is
-[#315](https://github.com/yusiwen/minfer/issues/315).
+their measured numbers) byte-identical. Issue [#315](https://github.com/yusiwen/minfer/issues/315)
+measured what a batched multi-sequence prefill — which runs it — costs against the causal flash
+prefill; the answer is **materially slower**, and the follow-up it earns (a windowed fast path)
+is its own ticket.
+
+**Measured (issue [#315], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
+2026-10-07).** Bar named before the run (`docs/GATE-CONTRACT.md` rules 3 and 5): the windowed
+arm's tokens/s must reach **>= 0.8x** the causal prefill's at the same total token count, on the
+**median of interleaved matched rounds** (rule 4). It was **not met**. Qwen2.5-0.5B-Instruct Q4_0
+(`hd = 64`, f32 KV, `n_ctx = 1024`, `n_total = 512`), three runs of
+
+```
+cargo test --release --bin minfer -- --ignored --nocapture a_windowed_prefill_is_not_materially_slower
+```
+
+(a 5-round interleaved harness, `#[cfg(target_os = "macos")] #[ignore]`d, in
+`src/models/qwen2/graph/tests/batching.rs`; it prints the model, `n_ctx`, the node/attention-node
+counts and the kernel each arm took):
+
+| Arm | tokens/s (mean ± stddev over the 3 runs) |
+|---|---|
+| causal single sequence (`attn_flash_prefill`) | 6387 ± 10 |
+| windowed two-sequence batch (`kernel_gqa_attn_window_f32`) | 3439 ± 5 |
+| windowed single sequence @ cell 128 (`kernel_gqa_attn_window_f32`) | 2410 ± 3 |
+
+- **primary** (one 512-token causal sequence vs a two-sequence batch of the same 512 tokens):
+  **0.539x** median (the three runs' medians 0.537 / 0.541 / 0.539, mean 0.539 ± 0.002) — the
+  batch is ~1.9x slower;
+- **shape-matched** (one 512-token causal sequence vs the same sequence behind a 128-cell holder,
+  so `nt`, `n_out` and the token count are identical and only the attention kernel differs):
+  **0.376x** median (0.375 / 0.377 / 0.376, mean 0.376 ± 0.001) — the windowed kernel is
+  **~2.7x** slower.
+
+The causal kernel and code path are untouched (the round adds only the harness); the gap is the
+simple windowed kernel's serial per-(query, KV-head) walk over the run, which the tuned
+`attn_flash_prefill` tiles. A windowed **fast** path — tiling the run list the way
+`fa_prefill.metal` tiles a contiguous window, without disturbing the causal kernels (the
+[#137](https://github.com/yusiwen/minfer/issues/137) lesson) — is therefore warranted and is
+filed as its own ticket; the correctness kernel stays the reference.
 
 #### 4.4.2 KV write/move side (issue #44 part (b), landed on a Mac 2026-10-06)
 

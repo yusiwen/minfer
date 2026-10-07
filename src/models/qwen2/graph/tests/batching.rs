@@ -808,3 +808,316 @@ fn forward_cached_isolates_kv_between_caches() {
     }));
     assert!(oob.is_err(), "position >= n_ctx must be rejected");
 }
+
+/// #315: the explicit `attn_span` window on Metal is a **correctness** path
+/// (`kernel_gqa_attn_window_f32/_f16`, [issue #44] part (a)), deliberately kept
+/// separate from the tuned causal prefill — a single-sequence
+/// `attn_flash_prefill` — so the causal kernels' instruction streams stay
+/// byte-identical. The only production caller of the windowed kernel is a
+/// **batched multi-sequence prefill**, so this measures what running it costs
+/// against the causal prefill of the same total token count.
+///
+/// **Bar named before measuring** (docs/GATE-CONTRACT.md rules 3 and 5): the
+/// windowed arm's tokens/s must reach **>= 0.8x** the causal arm's at the same
+/// total token count, on the **median of interleaved matched rounds** (rule 4,
+/// so up to `ROUNDS / 2` rounds a loaded box disturbed cannot move the verdict).
+/// The **primary** pair is the ticket's shape — one sequence (causal) vs a
+/// two-sequence batch (windowed), both `N_TOTAL` tokens — and a **shape-matched**
+/// pair (one sequence at cell 0 vs the same single sequence behind a holder, so
+/// `nt`, `n_out` and the token count are identical and the graphs differ *only*
+/// in the attention kernel) isolates the kernel from the batch's half-length
+/// windows. The primary pair's windowed side does half the attention work of the
+/// causal side (two `N_TOTAL/2` windows vs one causal `N_TOTAL` window), so the
+/// shape-matched ratio is the conservative one; both are printed.
+///
+/// Run: `cargo test --release --bin minfer -- --ignored \
+///   a_windowed_prefill_is_not_materially_slower --nocapture`.
+///
+/// [issue #44]: https://github.com/yusiwen/minfer/issues/44
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires the cached 0.5B model and a Metal device"]
+fn a_windowed_prefill_is_not_materially_slower_than_the_causal_one() {
+    use crate::graph::batch::Batch;
+    use crate::graph::cache::GraphCache;
+    use crate::graph::kvformat::KvFormat;
+    use crate::models::{Device, ModelDef};
+    use std::time::Instant;
+
+    const N_CTX: usize = 1024;
+    const N_TOTAL: usize = 512;
+    const START: usize = 128;
+    const ROUNDS: usize = 5;
+    const BAR: f64 = 0.8;
+
+    struct Arm {
+        label: &'static str,
+        n_out: usize,
+        cache: GraphCache,
+        batch: Batch,
+    }
+    impl Arm {
+        /// One production forward (`ModelDef::forward_batch`) on the Metal
+        /// device, timed by wall clock. `MetalCommandBuffer::submit` waits on a
+        /// completion semaphore, so the elapsed time includes the GPU work.
+        fn run(&mut self, model: &dyn ModelDef) -> f64 {
+            let t0 = Instant::now();
+            let logits = model.forward_batch(&self.batch, self.n_out, N_CTX, &mut self.cache);
+            let dt = t0.elapsed().as_secs_f64();
+            assert!(
+                !logits.is_empty() && logits.iter().all(|x| x.is_finite()),
+                "{}: the forward returned no finite logits; the measurement is vacuous",
+                self.label
+            );
+            dt
+        }
+    }
+
+    /// `(total nodes, attention nodes, any attention on the explicit-span path)`
+    /// of the graph the cache last built — the legibility half of the report.
+    fn describe(cache: &mut GraphCache) -> (usize, usize, bool) {
+        match cache.current() {
+            Some((g, _)) => {
+                let total = g.nodes.len();
+                let attn = g
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.op, crate::graph::ops::Op::Attn { .. }))
+                    .count();
+                let explicit = g.nodes.iter().any(|n| {
+                    matches!(
+                        n.op,
+                        crate::graph::ops::Op::Attn {
+                            explicit_span: true,
+                            ..
+                        }
+                    )
+                });
+                (total, attn, explicit)
+            }
+            None => (0, 0, false),
+        }
+    }
+
+    /// Upper median of an odd-length sample (the location estimate issue #154
+    /// gave the server timing verdict; #315 reuses it so a loaded run is auditable).
+    fn median(v: &[f64]) -> f64 {
+        assert!(!v.is_empty(), "median of an empty sample");
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s[s.len() / 2]
+    }
+    /// Mean and population standard deviation of a sample.
+    fn mean_stddev(v: &[f64]) -> (f64, f64) {
+        let n = v.len() as f64;
+        let mean = v.iter().sum::<f64>() / n;
+        let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        (mean, var.sqrt())
+    }
+
+    let Some(path) = cached_model_path() else {
+        eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the #315 measurement");
+        return;
+    };
+    // The Metal device must be up **before** the load, or the loader decides the
+    // weights are not usable there and answers `Device::Cpu` (the sibling
+    // `real_model` gate states the same ordering).
+    let _lock = crate::metal::metal_test_lock();
+    crate::metal::MpsState::init();
+    if crate::metal::MpsState::get().is_none() {
+        eprintln!("#315: no Metal device; skipping the measurement");
+        return;
+    }
+    let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+    let model = crate::models::load_model(&gguf).expect("load model");
+    if model.device() != Device::Metal {
+        eprintln!(
+            "#315: Metal is not the active device ({:?}); skipping the measurement",
+            model.device()
+        );
+        return;
+    }
+    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+
+    // A deterministic prompt of exactly `N_TOTAL` tokens, taken from a repeated
+    // sentence (the same fixture discipline as the sibling batch gates).
+    let sentence = "The quick brown fox jumps over the lazy dog. ";
+    let mut text = String::from(sentence);
+    while tok.encode(&text).len() < N_TOTAL {
+        text.push_str(sentence);
+    }
+    let all = tok.encode(&text);
+    let prompt: Vec<u32> = all[..N_TOTAL].to_vec();
+    let half = N_TOTAL / 2;
+    let (a, b) = (prompt[..half].to_vec(), prompt[half..].to_vec());
+
+    let hd = model.n_embd_head();
+    let width = if matches!(model.kv_format(), KvFormat::F16) {
+        "f16"
+    } else {
+        "f32"
+    };
+    let window_kernel = format!("kernel_gqa_attn_window_{width}");
+    let causal_kernel = if crate::metal::prefill_flash_enabled(hd) {
+        format!("attn_flash_prefill ({width})")
+    } else if crate::metal::matmul_attn_enabled() {
+        "attn_parallel_prefill".to_string()
+    } else {
+        format!("gqa_attn_f32 ({width})")
+    };
+
+    // ---- primary pair: one sequence (causal) vs two sequences (windowed) ----
+    let mut causal = {
+        let mut cache = GraphCache::new();
+        cache.alloc().kv_set_capacity(N_CTX);
+        cache
+            .alloc()
+            .kv_reserve_seq(1, N_TOTAL + 8)
+            .expect("reserve causal");
+        Arm {
+            label: "causal single-seq",
+            n_out: 1,
+            cache,
+            batch: Batch::new(prompt.clone(), (0..N_TOTAL).collect(), vec![1u32; N_TOTAL]),
+        }
+    };
+    let mut win_batch = {
+        let mut cache = GraphCache::new();
+        cache.alloc().kv_set_capacity(N_CTX);
+        cache
+            .alloc()
+            .kv_reserve_seq(1, half + 8)
+            .expect("reserve a");
+        cache
+            .alloc()
+            .kv_reserve_seq(2, half + 8)
+            .expect("reserve b");
+        let mut tokens = a.clone();
+        tokens.extend_from_slice(&b);
+        let mut positions: Vec<usize> = (0..half).collect();
+        positions.extend(0..half);
+        let mut seq_ids = vec![1u32; half];
+        seq_ids.extend(std::iter::repeat(2u32).take(half));
+        Arm {
+            label: "windowed two-seq batch",
+            n_out: 2,
+            cache,
+            batch: Batch::new(tokens, positions, seq_ids),
+        }
+    };
+    // ---- shape-matched pair: same shape, only the attention kernel differs ----
+    let mut win_shape = {
+        let mut cache = GraphCache::new();
+        cache.alloc().kv_set_capacity(N_CTX);
+        cache.alloc().kv_reserve_seq(1, START).expect("holder");
+        cache
+            .alloc()
+            .kv_reserve_seq(2, N_TOTAL + 8)
+            .expect("subject");
+        Arm {
+            label: "windowed single-seq @ offset",
+            n_out: 1,
+            cache,
+            batch: Batch::new(prompt.clone(), (0..N_TOTAL).collect(), vec![2u32; N_TOTAL]),
+        }
+    };
+
+    // Warm-up builds and allocates each graph.
+    causal.run(&*model);
+    win_batch.run(&*model);
+    win_shape.run(&*model);
+
+    let (tc_nodes, tc_attn, tc_exp) = describe(&mut causal.cache);
+    let (wb_nodes, wb_attn, wb_exp) = describe(&mut win_batch.cache);
+    let (ws_nodes, ws_attn, ws_exp) = describe(&mut win_shape.cache);
+    eprintln!(
+        "[315] model={} hd={hd} n_ctx={N_CTX} n_total={N_TOTAL} rounds={ROUNDS} bar={BAR:.2}x",
+        path.display()
+    );
+    eprintln!(
+        "[315] causal:          {tc_nodes} nodes, {tc_attn} attn (explicit_span={tc_exp}) -> {causal_kernel}"
+    );
+    eprintln!(
+        "[315] windowed-batch:  {wb_nodes} nodes, {wb_attn} attn (explicit_span={wb_exp}) -> {window_kernel}"
+    );
+    eprintln!(
+        "[315] windowed-shape:  {ws_nodes} nodes, {ws_attn} attn (explicit_span={ws_exp}) -> {window_kernel}"
+    );
+    // Control (rule 2): the causal arm must not be explicit-span and both
+    // windowed arms must be, or the comparison is not the two kernels.
+    assert!(!tc_exp, "the causal arm is not on the causal path");
+    assert!(
+        wb_exp && ws_exp,
+        "a windowed arm is not on the explicit-span path"
+    );
+
+    let mut causal_ts = Vec::new();
+    let mut win_batch_ts = Vec::new();
+    let mut win_shape_ts = Vec::new();
+    for r in 0..ROUNDS {
+        let tc = causal.run(&*model);
+        let twb = win_batch.run(&*model);
+        let tws = win_shape.run(&*model);
+        eprintln!(
+            "[315] round {r}: causal {tc:.4}s ({:.1} tok/s) | windowed-batch {twb:.4}s ({:.1} tok/s) \
+             {:.3}x | windowed-shape {tws:.4}s ({:.1} tok/s) {:.3}x",
+            N_TOTAL as f64 / tc,
+            N_TOTAL as f64 / twb,
+            tc / twb,
+            N_TOTAL as f64 / tws,
+            tc / tws,
+        );
+        causal_ts.push(tc);
+        win_batch_ts.push(twb);
+        win_shape_ts.push(tws);
+    }
+
+    let primary: Vec<f64> = causal_ts
+        .iter()
+        .zip(&win_batch_ts)
+        .map(|(c, w)| c / w)
+        .collect();
+    let shape: Vec<f64> = causal_ts
+        .iter()
+        .zip(&win_shape_ts)
+        .map(|(c, w)| c / w)
+        .collect();
+    let (cm, cs) = mean_stddev(&causal_ts);
+    let (bm, bs) = mean_stddev(&win_batch_ts);
+    let (wm, ws) = mean_stddev(&win_shape_ts);
+    let (pm, ps) = mean_stddev(&primary);
+    let (sm, ss) = mean_stddev(&shape);
+    eprintln!(
+        "[315] causal        {cm:.4}s ± {cs:.4}s  ({:.1} tok/s)",
+        N_TOTAL as f64 / cm
+    );
+    eprintln!(
+        "[315] windowed-batch {bm:.4}s ± {bs:.4}s  ({:.1} tok/s)",
+        N_TOTAL as f64 / bm
+    );
+    eprintln!(
+        "[315] windowed-shape {wm:.4}s ± {ws:.4}s  ({:.1} tok/s)",
+        N_TOTAL as f64 / wm
+    );
+    let primary_med = median(&primary);
+    let shape_med = median(&shape);
+    let verdict = |r: f64| if r >= BAR { "MET" } else { "NOT MET" };
+    eprintln!(
+        "[315] PRIMARY one-seq causal vs two-seq windowed batch, same {N_TOTAL} tokens: \
+         median {primary_med:.3}x, mean {pm:.3} ± {ps:.3}  --> bar {BAR:.2}x {}",
+        verdict(primary_med)
+    );
+    eprintln!(
+        "[315] SHAPE   one-seq causal vs one-seq windowed @offset, same nt/n_out/{N_TOTAL} tokens: \
+         median {shape_med:.3}x, mean {sm:.3} ± {ss:.3}  --> bar {BAR:.2}x {}",
+        verdict(shape_med)
+    );
+    // This is the **measurement harness** the ticket asks for, not a pass/fail
+    // suite gate: the measured ratio is the ticket's finding, and the follow-up
+    // it earns (a windowed fast path that tiles the run list the way
+    // `fa_prefill.metal` tiles a contiguous window) belongs to its own ticket —
+    // a `#[ignore]`d assert on a bar the engine does not yet meet would turn the
+    // real-model set red. The structural control above is what keeps the
+    // comparison honest; the bar is printed with its verdict so a later run's
+    // record is auditable.
+}
