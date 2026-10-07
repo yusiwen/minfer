@@ -121,8 +121,8 @@ named before the run) it reaches **0.539x** the causal prefill's tokens/s for a 
 batch on the 0.5B Q4_0 (f32, `hd` 64) and **0.159x** on Qwen3-0.6B Q8_0 (f16, `hd` 128); at the
 same shape it is **0.376x** (`~2.7x` slower) and **0.096x** (`~10.4x` slower) respectively.
 Protocol, node/kernel counts and the bar are in
-[`METAL-BACKEND-DESIGN.md`](./METAL-BACKEND-DESIGN.md) §4.4.1; the fast-path follow-up is its
-own ticket.
+[`METAL-BACKEND-DESIGN.md`](./METAL-BACKEND-DESIGN.md) §4.4.1; the fast-path follow-up is
+[#359](https://github.com/yusiwen/minfer/issues/359).
 
 **Graph-path TODO (wire into `MetalBackend`)**: ① ✅ G1 attention dispatch;
 ② ✅ G2 `rms_norm_256`; ③ ✅ G3 n_out tail-row `GetRows`; ④ ✅ G4 fused decode

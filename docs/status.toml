@@ -251,11 +251,11 @@ key = "macos-real-model"
 box = "macbook (macOS 27.0.1, Apple M4 Pro)"
 suite = "real-model"
 command = "PARALLEL=0 scripts/real_model_gates.sh (serial)"
-date = "2026-10-06"
-passed = 42
+date = "2026-10-07"
+passed = 43
 failed = 1
 live_check = false
-note = "recorded measurement; the one residual is the deliberate #310 kv_map capability gap, not a regression"
+note = "recorded measurement; the one residual is the deliberate #310 kv_map capability gap, not a regression; the +1 over 42 is #315's macOS-only #[ignore]d windowed-prefill gate joining the --ignored set"
 file = "AGENTS.md"
 regex = 'macOS real-model set, box `(?P<box>[^`]+)`, `PARALLEL=0 scripts/real_model_gates\.sh` \(serial\), (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) / (?P<failed>[0-9]+)\*\*'
 

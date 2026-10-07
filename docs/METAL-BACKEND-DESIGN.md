@@ -436,7 +436,8 @@ simple windowed kernel's serial per-(query, KV-head) walk over the run, which th
 `attn_flash_prefill` tiles. A windowed **fast** path — tiling the run list the way
 `fa_prefill.metal` tiles a contiguous window, without disturbing the causal kernels (the
 [#137](https://github.com/yusiwen/minfer/issues/137) lesson) — is therefore warranted and is
-filed as its own ticket; the correctness kernel stays the reference.
+filed as [#359](https://github.com/yusiwen/minfer/issues/359); the correctness kernel stays the
+reference.
 
 #### 4.4.2 KV write/move side (issue #44 part (b), landed on a Mac 2026-10-06)
 
