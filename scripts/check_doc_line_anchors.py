@@ -31,6 +31,9 @@ A path that resolves to nothing is judged by one rule, and only one:
 spelled out here because it is one. When the anchor's own span is adjacent to a
 backticked identifier (nothing between them but `` ` `` `(` `)` `,` `;` `:` `.`
 whitespace, at most 6 characters), that identifier is the anchor's *named symbol*.
+A trailing ``()`` is part of the token, not a disqualifier: `` `metal_available()` ``
+names the symbol `` `metal_available` `` (issue #339), because the docs write a
+function with its call parentheses whenever the sentence is about calling it.
 The pass condition is the symbol appearing within ``SYMBOL_WINDOW`` lines either side
 of the anchor line. A miss is classified by where the symbol actually is, which is
 what keeps the heuristic honest rather than loud:
@@ -48,7 +51,8 @@ what keeps the heuristic honest rather than loud:
     cannot tell an FFI name from a renamed Rust item must not fail on absence.
 
 Both non-failing classes are listed by `--list`, printed in the summary, and promoted
-to failures by `--strict-symbols` — so "why did this pass?" always has an answer.
+to failures by `--strict-symbols` — so "why did this pass?" always has an answer. Rule
+E's range miss joins them on the same terms.
 
 ``D`` **the continuation is range-checked too.** A backticked span whose whole content
 is `:NNN` or `:NNN-MMM` — a second range in the file the line already cited — attaches
@@ -58,6 +62,30 @@ with no preceding anchor, or a continuation that precedes every anchor on its li
 stays silent; a continuation whose path anchor is itself external, ambiguous or frozen
 is classified the same way. This closes issue #355: the bare form was invisible, so a
 re-point that fixed the visible `path:NNN` left its continuation behind.
+
+``E`` **the range holds the symbol too** — a *note*, counted and listed, not a failure
+(issue #339). Rule C's window is deliberately loose (±25 lines), so an anchor like
+`` `metal_available()` (`metal_backend.rs:1054-1056`) `` passes while the definition is
+700 lines away. Rule E therefore asks the narrower question the citation actually
+claims — does the identifier occur **inside** `start-end` (for a bare `path:NNN`, on
+that one line)? It is a *note* and not a failure because of what that rule costs
+today: measured on `7991218`, **79** non-frozen anchors carry an adjacent backticked
+symbol whose identifier is not inside their own range (**84** once a trailing `()` is
+stripped; 46 of the 84 cite a `NNN-MMM` range, 38 a single line, and 81 of the 84 hold
+the identifier in the target file at all, which is what makes them range misses). A
+rule that failed on that population would have to re-point every one of them in the
+PR that adds it — and 26 of the 84 live in walkthrough docs that state the revision
+their lines were verified against (`lines verified at commit e7fa0da`), where a
+re-point would falsify the record. Two of the three anchors that motivated the rule
+show why the in-range test is not the whole answer anyway: `:256`'s `execute_node`
+anchor cites `316-1020`, which **does** contain the definition at 843 — containment
+cannot see a range that starts 527 lines early — and `:586`'s `synchronize` anchor has
+no adjacent symbol at all, so no adjacency rule can see it. Those two were re-pointed
+by hand.
+A *call-site* citation is not a miss: if the range names the symbol at a call, the
+identifier is inside the range and the anchor passes. The convention this note
+enforces is written in ``docs/GATE-CONTRACT.md`` §"Prose anchors"; the sweep of the
+80 is tracked by [#336] and [#356] alongside the bare ranges.
 
 **Frozen records.** A frozen-file set (the ``GRANDFATHERED_BARE`` pattern of
 `scripts/check_dead_code_annotations.py`) exempts the historical records whose anchors
@@ -170,9 +198,20 @@ CONTINUATION = re.compile(r"^:(\d+)(?:-(\d+))?$")
 #: from being read as symbols and failed for "moving".
 SYMBOL = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:::[A-Za-z][A-Za-z0-9_]*)*$")
 
+#: The call parentheses of a function citation: `` `metal_available()` `` names the
+#: symbol `metal_available` (issue #339), and the identifier — not the call — is what
+#: the checker greps for.
+CALL_SUFFIX = re.compile(r"\(\)$")
+
+
+def symbol_base(token: str) -> str:
+    """The identifier a backticked token names: `f()`, `Type::f`, `f` → `f`."""
+    return CALL_SUFFIX.sub("", token.strip()).split("::")[-1]
+
 
 def looks_like_symbol(token: str) -> bool:
     """Whether a backticked token is a code symbol rather than a prose word."""
+    token = CALL_SUFFIX.sub("", token.strip())
     if not SYMBOL.match(token) or "." in token:
         return False
     base = token.split("::")[-1]
@@ -260,6 +299,12 @@ class Anchor:
     continuation: bool = False
     verdict: str = "ok"
     detail: str = ""
+    #: Rule E (#339): the first line of the target file that holds the named symbol,
+    #: when that identifier is **not** inside the cited range. ``None`` when the
+    #: anchor carries no symbol, when the symbol is inside the range, or when it is
+    #: not in the file at all (that case is ``symbol-moved`` / ``symbol-foreign``
+    #: already). Excluded from ``compare`` so equality is unchanged by judging.
+    range_miss: int | None = field(default=None, compare=False)
 
     def where(self) -> str:
         return f"{self.doc}:{self.line}"
@@ -271,7 +316,9 @@ class Anchor:
     def is_violation(self, strict_symbols: bool = False) -> bool:
         if self.verdict in ("missing", "out-of-range", "range-order", "symbol-moved"):
             return True
-        return strict_symbols and self.verdict in ("symbol-far", "symbol-foreign")
+        return strict_symbols and (
+            self.verdict in ("symbol-far", "symbol-foreign") or self.range_miss is not None
+        )
 
 
 @dataclass
@@ -481,6 +528,9 @@ class Checker:
                 for anchor in here:
                     anchor.verdict = "frozen"
                     anchor.detail = reason
+                    # The exemption covers the whole anchor: a record frozen against a
+                    # past revision is not a rule-E miss either.
+                    anchor.range_miss = None
             report.anchors.extend(here)
         report.unattached = self._unattached
         # The ratchet. An entry whose files no longer carry a single anchor names a
@@ -526,11 +576,20 @@ class Checker:
         if not anchor.symbol:
             anchor.verdict = "ok"
             return
+        base = symbol_base(anchor.symbol)
+        pattern = r"\b" + re.escape(base) + r"\b"
+        # Rule E (#339): the citation claims the range holds the symbol, so ask that
+        # question first — the window below is looser (±SYMBOL_WINDOW lines from the
+        # *start*) and is a note rather than the claim.
+        end = anchor.end if anchor.end is not None else anchor.start
+        if not re.search(pattern, "\n".join(lines[anchor.start - 1 : end])):
+            for number, text in enumerate(lines, start=1):
+                if re.search(pattern, text):
+                    anchor.range_miss = number
+                    break
         lo = max(0, anchor.start - 1 - SYMBOL_WINDOW)
         hi = min(len(lines), anchor.start + SYMBOL_WINDOW)
         window = "\n".join(lines[lo:hi])
-        base = anchor.symbol.split("::")[-1]
-        pattern = r"\b" + re.escape(base) + r"\b"
         if re.search(pattern, window):
             anchor.verdict = "ok"
             anchor.detail = f"`{anchor.symbol}` within ±{SYMBOL_WINDOW} lines"
@@ -554,7 +613,13 @@ def print_list(report: Report) -> None:
         rng = f"{anchor.start}-{anchor.end}" if anchor.end is not None else str(anchor.start)
         symbol = f" `{anchor.symbol}`" if anchor.symbol else ""
         bare = " (bare continuation)" if anchor.continuation else ""
-        print(f"{anchor.where()} → {target}:{rng} [{anchor.verdict}]{symbol}{bare}")
+        miss = (
+            f" [range-miss: `{anchor.symbol}` is not inside {anchor.shown()}, "
+            f"it is at {target}:{anchor.range_miss}]"
+            if anchor.range_miss is not None
+            else ""
+        )
+        print(f"{anchor.where()} → {target}:{rng} [{anchor.verdict}]{symbol}{bare}{miss}")
 
 
 def summarize(report: Report, strict_symbols: bool) -> None:
@@ -564,11 +629,13 @@ def summarize(report: Report, strict_symbols: bool) -> None:
     ambiguous = report.count("ambiguous")
     checked = total - frozen - external - ambiguous
     notes = report.count("symbol-far") + report.count("symbol-foreign")
+    misses = sum(1 for a in report.anchors if a.range_miss is not None)
     continuations = sum(1 for a in report.anchors if a.continuation)
     print(
         f"check_doc_line_anchors: {total} anchors ({continuations} bare continuations, "
         f"{report.unattached} unattached) · {frozen} frozen · {external} external · "
-        f"{ambiguous} ambiguous · {checked} checked · {notes} symbol notes"
+        f"{ambiguous} ambiguous · {checked} checked · {notes} symbol notes · "
+        f"{misses} range misses"
     )
     for pattern, reason in report.stale_frozen:
         print(
@@ -595,7 +662,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--strict-symbols",
         action="store_true",
-        help="promote symbol-far / symbol-foreign notes to failures",
+        help=(
+            "promote symbol-far / symbol-foreign notes, and a rule-E range miss "
+            "(the cited range does not hold the named symbol), to failures"
+        ),
     )
     parser.add_argument("--selftest", action="store_true", help="run the checker's own cases")
     args = parser.parse_args(argv[1:])
@@ -615,9 +685,19 @@ def main(argv: list[str]) -> int:
 
     violations = report.violations(args.strict_symbols)
     for anchor in violations:
+        # A bare rule-E miss has no verdict of its own (the anchor resolves and the
+        # window passes), so it is labelled by what it is; an anchor that already
+        # violates something keeps its verdict and gains the range-miss detail.
+        label = anchor.verdict if anchor.verdict != "ok" else "range-miss"
+        miss = (
+            f" — `{anchor.symbol}` is not inside {anchor.shown()}; it is at "
+            f"{anchor.target}:{anchor.range_miss}"
+            if anchor.range_miss is not None
+            else ""
+        )
         print(
-            f"{anchor.verdict.upper():13s} {anchor.where()}: {anchor.shown()} "
-            f"→ {anchor.target or '?'} — {anchor.detail}",
+            f"{label.upper():13s} {anchor.where()}: {anchor.shown()} "
+            f"→ {anchor.target or '?'} — {anchor.detail}{miss}",
             file=sys.stderr,
         )
     if violations or report.stale_frozen:
@@ -652,6 +732,16 @@ FIXTURE_FILES = {
     "src/other.rs": "pub fn moved_symbol() {}\n",
     "src/nested/tests.rs": "fn alpha() {}\n",
     "src/elsewhere/tests.rs": "fn beta() {}\n",
+    # Rule E (#339): the definition sits on line 1 and is *called* on line 33, so
+    # the two citations below are 32 lines apart — outside ``SYMBOL_WINDOW`` from
+    # each other, which is what separates "the range holds the symbol" (the call
+    # site, line 33) from "the window saw it nearby" (the definition, line 1).
+    "src/caller.rs": "\n".join(
+        ["pub fn target_symbol() -> u32 { 0 }"]
+        + [f"// filler {i}" for i in range(1, 31)]
+        + ["pub fn caller() -> u32 {", "    target_symbol()", "}"]
+    )
+    + "\n",
     "docs/ok.md": "The function `target_symbol` (`src/thing.rs:21`) is here.\n",
     "docs/external.md": "See `ggml-cuda.cu:12` and `mmq.cuh:9`.\n",
     "docs/ambiguous.md": "Both are named `tests.rs:1`.\n",
@@ -673,7 +763,10 @@ def _run_case(extra: dict[str, str], frozen: dict[str, str] | None = None) -> Re
         return Checker(root, frozen or {}).run()
 
 
-def _exit_code(extra: dict[str, str], *flags: str, frozen: dict[str, str] | None = None) -> int:
+def _run_main(
+    extra: dict[str, str], *flags: str, frozen: dict[str, str] | None = None
+) -> tuple[int, str]:
+    """Run ``main`` over a fresh fixture tree; return its exit code and stderr."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         for rel, text in {**FIXTURE_FILES, **extra}.items():
@@ -682,18 +775,32 @@ def _exit_code(extra: dict[str, str], *flags: str, frozen: dict[str, str] | None
             path.write_text(text, encoding="utf-8")
         saved = globals()["FROZEN"]
         globals()["FROZEN"] = frozen or {}
+        err = io.StringIO()
         try:
-            # The cases assert exit codes, not chatter: swallow the run's summary.
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
-                io.StringIO()
-            ):
-                return main(["check_doc_line_anchors.py", "--root", str(root), *flags])
+            # The cases assert exit codes and messages, not chatter.
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = main(["check_doc_line_anchors.py", "--root", str(root), *flags])
         finally:
             globals()["FROZEN"] = saved
+        return code, err.getvalue()
+
+
+def _exit_code(extra: dict[str, str], *flags: str, frozen: dict[str, str] | None = None) -> int:
+    return _run_main(extra, *flags, frozen=frozen)[0]
+
+
+def _stderr_of(extra: dict[str, str], *flags: str, frozen: dict[str, str] | None = None) -> str:
+    return _run_main(extra, *flags, frozen=frozen)[1]
 
 
 def _verdicts(report: Report, doc: str) -> list[str]:
     return [a.verdict for a in report.anchors if a.doc == doc]
+
+
+def _range_miss(report: Report, doc: str) -> int | None:
+    """The single anchor's rule-E finding on ``doc``, if it carries one."""
+    rows = [a for a in report.anchors if a.doc == doc]
+    return rows[0].range_miss if rows else None
 
 
 def selftest() -> int:
@@ -854,7 +961,72 @@ def selftest() -> int:
         "the real frozen pattern makes a bad continuation pass",
     )
 
-    # 8. The exit codes, end to end.
+    # 8. Rule E (#339): the cited range must hold the symbol the sentence names.
+    #    The window test is ±25 lines around the *start*, so an anchor can pass it
+    #    and still cite a range 660 lines away from the definition — which is what
+    #    the three walkthrough anchors did. The call-site case is the control: a
+    #    citation of a *call* is legitimate and must not be reported.
+    call_site = {"docs/range.md": "`target_symbol` (`src/caller.rs:33`).\n"}
+    report = _run_case(call_site)
+    expect(
+        _verdicts(report, "docs/range.md") == ["ok"],
+        "a range that holds a *call* of the symbol passes (rule E control case)",
+    )
+    expect(
+        _range_miss(report, "docs/range.md") is None,
+        "the call-site control case must not be reported as a range miss",
+    )
+    offence = {"docs/range.md": "`target_symbol` (`src/caller.rs:20`).\n"}
+    report = _run_case(offence)
+    expect(
+        _verdicts(report, "docs/range.md") == ["ok"],
+        "the window test alone still calls a symbol 19 lines away `ok`...",
+    )
+    expect(
+        _range_miss(report, "docs/range.md") == 1,
+        "... but rule E reports that line 20 does not hold it (the definition is line 1)",
+    )
+    expect(not report.violations(False), "a range miss is a note, not a default failure")
+    expect(bool(report.violations(True)), "--strict-symbols promotes a range miss to a failure")
+    expect(
+        _exit_code(offence) == 0,
+        "the plain run stays green over a range miss (the population is 79 on master)",
+    )
+    expect(
+        _exit_code(offence, "--strict-symbols") == 1,
+        "a range miss fails the run under --strict-symbols",
+    )
+    stderr = _stderr_of(offence, "--strict-symbols")
+    expect("docs/range.md:1" in stderr, "the failure names the doc line")
+    expect(
+        "src/caller.rs:1" in stderr,
+        "the failure names the target file and where the symbol actually is",
+    )
+    # The `()` half: `metal_available()` is a symbol, so the anchor is checked at
+    # all — without the strip it is `ok` with no symbol note (the #339 row :526).
+    report = _run_case({"docs/range.md": "`target_symbol()` (`src/caller.rs:20`).\n"})
+    expect(
+        _range_miss(report, "docs/range.md") == 1,
+        "a trailing `()` is stripped before the symbol test, so the token is checked",
+    )
+    expect(
+        not [
+            a
+            for a in _run_case(
+                {"docs/range.md": "`target_symbol()` (`src/caller.rs:33`).\n"}
+            ).anchors
+            if a.doc == "docs/range.md" and a.is_violation(True)
+        ],
+        "the `()` form passes when its range holds the call",
+    )
+    # A single-line anchor is a range of one: the identifier must be on that line.
+    report = _run_case({"docs/range.md": "`target_symbol` (`src/thing.rs:23`).\n"})
+    expect(
+        _range_miss(report, "docs/range.md") == 21,
+        "a one-line anchor whose line does not hold the symbol is a range miss",
+    )
+
+    # 9. The exit codes, end to end.
     expect(
         _exit_code({"docs/bad.md": "See `src/thing.rs:999`.\n"}) == 1,
         "exit 1 when an anchor is bad",
