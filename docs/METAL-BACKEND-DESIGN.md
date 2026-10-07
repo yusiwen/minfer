@@ -45,7 +45,7 @@ never a silent mid-run fallback.
 | Attention dispatch matches the old path | G1 wires nt==1 and nt>1 to the flash/split/parallel/classic kernels with the same gates and env vars | §4.4, §4.6 |
 | Decode fusions on Metal | G4 `FusedQKV`, G5 `FusedFFN`, G6 `FusedQkvNorm` (Qwen3) are built as single nodes | §4.4, §4.6 |
 | Same correctness gates as CPU | Per-op parity tests, cross-backend copy tests, model-level CPU-vs-Metal logits / greedy equality, kernel isolation tests | §7 |
-| Performance | Graph path at or above the old imperative path, **re-measured 2026-10-06** at `6b95763` on `macbook (macOS 27.0.1, Apple M4 Pro)` (`minfer bench -p <P> -n 128 -r 3`): 0.5B Q4_0 decode **306.19 ± 1.00 tok/s** / prefill pp440 **6249.60 ± 10.52 tok/s**; 7B Q4_K_M decode **48.52 ± 0.18 tok/s** / prefill pp206 **406.51 ± 0.83 tok/s**; Qwen3-4B Q4_K_M decode **74.11 ± 0.19 tok/s** (llama-Metal 79.7). Metal correctness: the external oracle `graph_metal_matches_llama_reference` reproduces the pinned greedy prefix, and the per-op `metal_*_matches_cpu` gates are green (the model-level `graph_metal_matches_cpu_logits` is degenerate in the graph era — [#324](https://github.com/yusiwen/minfer/issues/324)) | `METAL_OPTIMIZATIONS.md` §0.1 |
+| Performance | Graph path at or above the old imperative path, **re-measured 2026-10-06** at `6b95763` on `macbook (macOS 27.0.1, Apple M4 Pro)` (`minfer bench -p <P> -n 128 -r 3`): 0.5B Q4_0 decode **306.19 ± 1.00 tok/s** / prefill pp440 **6249.60 ± 10.52 tok/s**; 7B Q4_K_M decode **48.52 ± 0.18 tok/s** / prefill pp206 **406.51 ± 0.83 tok/s**; Qwen3-4B Q4_K_M decode **74.11 ± 0.19 tok/s** (llama-Metal 79.7). Metal correctness: the external oracle `graph_metal_matches_llama_reference` reproduces the pinned greedy prefix, the model-level `graph_metal_matches_cpu_logits` compares a `Layers(0)` CPU engine against the full-plan Metal engine (restored by [#324](https://github.com/yusiwen/minfer/issues/324)), and the per-op `metal_*_matches_cpu` gates are green | `METAL_OPTIMIZATIONS.md` §0.1 |
 
 ### 1.3 Non-goals
 
@@ -753,12 +753,22 @@ none needs an external dump:
 
 - **Bit-exactness where the math is identical**: elementwise and KV/attention round trips are
   checked bit-for-bit; matmul and norm are checked within float tolerance.
-- **CPU-vs-Metal logits**: the model-level `graph_metal_matches_cpu_logits` **cannot carry this row
-  in the graph era** — both `ModelDef::forward` and `forward_graph` route through
-  `Qwen2Graph::forward`, so its `max |Δ| = 0` compares the Metal graph with itself
-  ([#324](https://github.com/yusiwen/minfer/issues/324)). The row rests on the per-op
-  `metal_*_matches_cpu` gates (float tolerance; the Metal path uses f32 activations while the CPU
-  reference quantizes to Q8_0) and on the external oracle `graph_metal_matches_llama_reference`.
+- **CPU-vs-Metal logits**: [#324](https://github.com/yusiwen/minfer/issues/324) restored the
+  model-level `graph_metal_matches_cpu_logits`. The pre-#324 body compared `ModelDef::forward` with
+  `ModelDef::forward_graph`, but in the graph era both route through `Qwen2Graph::forward` under the
+  same device decision, so its `max |Δ| = 0` compared the Metal graph with itself — a vacuous gate.
+  It now loads the same cached 0.5B Q4_0 twice — a `Layers(0)` CPU engine and an explicit full-plan
+  Metal engine — drives the same greedy continuation through `forward_graph_cached`, asserts the two
+  built graphs genuinely differ in backend assignment (metal arm 248 `METAL` / 0 CPU nodes; cpu arm
+  0 `METAL` / 440 CPU nodes), pins the greedy continuation to a literal, and compares the final-step
+  logits. Bar named before measuring: **1.0 absolute** (the q8_0 weight-quantisation class of
+  `docs/GGUF-TOOLING.md`, 3× the observed) and **5e-2 relative**. Measured on `macbook (macOS 27.0.1,
+  Apple M4 Pro)`, 2026-10-07, `cargo test --release --bin minfer -- --nocapture
+  graph_metal_matches_cpu_logits`: max |Δlogit| **0.347** absolute / **1.57e-2** relative against
+  max |logit| 22.04, greedy `[12095, 11, 323, 432]` identical. The class is quantization, not
+  accumulation order: the CPU quantizes activations to Q8_0 while Metal reads f32 (rule 9), which is
+  why the bar is looser than the f16 #164 gate's 0.05. The row is still backed more widely by the
+  per-op `metal_*_matches_cpu` gates and the external oracle `graph_metal_matches_llama_reference`.
 - **Fused-vs-unfused decode** must be bit-identical, with the unfused side running the FusionPass.
 - **llama-reference oracle**: Qwen3's first 9 greedy tokens are pinned against llama-Metal.
 - **Determinism**: `metal_prefill_determinism` and the isolation suites' repeat-run checks.
