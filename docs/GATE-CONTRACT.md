@@ -246,6 +246,32 @@ and the prose in the same commit. A box whose name has no manifest row fails
 `--check-live` loudly, which is deliberate: a fabricated box must not pass
 vacuously.
 
+**The PR body's `Mac verification` section is this rule on the one path CI
+cannot run** ([#335]). `build-macos` compiles the crate and — since [#303] — the
+test target, but it has no Metal device, so on the macOS/Metal path the
+**Mac-local run is the evidence**. The template requires the section
+([`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md),
+enforced by the `check-pr-body` job and
+[`scripts/check_pr_body.py`](../scripts/check_pr_body.py)), and its content
+convention is the one stated above: `<box label> / <date> / <command>` with the
+machine's own absolute label, or `N/A — <reason>` when the change touches no
+macOS-only file and no shared layer's macOS arm. It is the place where *what was
+verified on which box, and what was not* becomes part of the record — the record
+a Linux-green PR otherwise lacks. Why it earns a section rather than a sentence
+in someone's memory: the predicate is not confined to `src/metal*` —
+`git grep -F 'cfg(target_os = "macos")' -- src/` finds **111 sites in 36 files**
+today (the issue that introduced the section measured 35 / 108 on 2026-10-07;
+[#299] and [#329] moved the row), and they include shared layers
+(`graph/alloc.rs`, `graph/kvcache.rs`, `graph/kvformat.rs`, `graph/scheduler.rs`,
+`graph/backend.rs`, `graph/registry.rs`, `graph/fusion.rs`,
+`models/weight_reg.rs`, every `models/*/graph*.rs`) — while the macOS-only
+assertions no Linux job executes are the **53** unit tests the current recorded
+rows differ by (macOS `541` − aarch64 `488`, `docs/status.toml` 2026-10-07) and
+**11** integration tests (macOS `21` − aarch64 `10`, the four
+`#![cfg(target_os = "macos")]` binaries in `tests/`), plus the op matrix's Metal column and every performance number. The
+checker enforces that the section is *present and filled*; whether it is *true* is
+the reviewer's job ([#175]).
+
 ## Prose anchors: name the section, not the line range
 
 This is a **documentation convention**, not a sixth gate rule — it belongs here
@@ -347,21 +373,21 @@ the *same* set in both modes: a record frozen against a past revision is not dri
 5. Is the runtime bounded by **work**? If not, are the rounds interleaved and
    the assertion on a median that prints its inputs? (rule 4)
 6. Does every number in the PR body carry its **date, device and command**?
-   (rule 5)
+   (rule 5 — on a macOS/Metal change that is the `Mac verification` line)
 
 ## How the shape is enforced
 
-The two facts rules 3 and 5 ask a PR to state in prose have a mechanical floor.
-The PR body is rendered from
+The facts rules 3 and 5 ask a PR to state in prose have a mechanical floor, and
+so does the Mac record of §5. The PR body is rendered from
 [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md), and
 [`scripts/check_pr_body.py`](../scripts/check_pr_body.py) refuses a body whose
-required headings are missing or whose two gate sections — `Bar named before
-measuring` and `Mutation evidence` — are empty or left at their template
-placeholder (a stated `N/A — <reason>` is filled). The `check-pr-body` job in
-[`ci.yml`](../.github/workflows/ci.yml) runs it on `pull_request` events only,
-after the checker's own `--selftest` cases. It reads the body through `env:`,
-so it needs no token and works on a fork PR ([#175]). This is the shape, not the
-rules: the rules stay stated once, above.
+required headings are missing or whose three checked sections — `Bar named
+before measuring`, `Mutation evidence` and `Mac verification` — are empty or
+left at their template placeholder (a stated `N/A — <reason>` is filled). The
+`check-pr-body` job in [`ci.yml`](../.github/workflows/ci.yml) runs it on
+`pull_request` events only, after the checker's own `--selftest` cases. It reads
+the body through `env:`, so it needs no token and works on a fork PR ([#175],
+[#335]). This is the shape, not the rules: the rules stay stated once, above.
 
 ## Honest scope
 
@@ -370,9 +396,10 @@ This document is a contract, not a linter. Nothing in CI parses this page: rules
 construction. What the repository does enforce is the concrete part — the seam is
 off by default under a CI-covered test, `check_docs_links.py` keeps this page
 reachable, the per-ticket records keep the instances auditable, and the
-`check-pr-body` job requires the two facts to be *present* in the PR body,
-never to be true (§"How the shape is enforced"). Treat the rules as the
-questions a reviewer must be able to answer from the PR, not as property tests.
+`check-pr-body` job requires the checked facts — the two gate sections and the
+Mac record — to be *present* in the PR body, never to be true (§"How the shape
+is enforced"). Treat the rules as the questions a reviewer must be able to
+answer from the PR, not as property tests.
 
 <!-- Issue references, linked once so the text above stays readable. -->
 [#87]: https://github.com/yusiwen/minfer/issues/87
@@ -395,7 +422,9 @@ questions a reviewer must be able to answer from the PR, not as property tests.
 [#266]: https://github.com/yusiwen/minfer/issues/266
 [#327]: https://github.com/yusiwen/minfer/issues/327
 [#299]: https://github.com/yusiwen/minfer/issues/299
+[#303]: https://github.com/yusiwen/minfer/issues/303
 [#329]: https://github.com/yusiwen/minfer/issues/329
+[#335]: https://github.com/yusiwen/minfer/issues/335
 [#336]: https://github.com/yusiwen/minfer/issues/336
 [#344]: https://github.com/yusiwen/minfer/issues/344
 [#355]: https://github.com/yusiwen/minfer/issues/355

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Require a PR body to carry the two gate sections, filled.
+"""Require a PR body to carry the gate sections and the Mac record, filled.
 
 `docs/GATE-CONTRACT.md` states the five rules a gate must satisfy. Two of them
 live in the PR body as prose: the numeric **bar named before measuring** (rules
-3 and 5) and the **mutation evidence** showing the gate can fail (rule 3).
-Prose cannot be checked for truth, but it can be checked for *presence*: this
-script fails a body whose required headings are missing, or whose two gate
-sections are empty or left at the template placeholder.
+3 and 5) and the **mutation evidence** showing the gate can fail (rule 3). The
+third checked section is **Mac verification** (#335): CI's `build-macos` job
+only *compiles* the crate and the test target, so on the Metal path the
+Mac-local run is the evidence, and rule 5's `<box label> / <date> / <command>`
+record belongs in the PR. Prose cannot be checked for truth, but it can be
+checked for *presence*: this script fails a body whose required headings are
+missing, or whose three checked sections are empty or left at the template
+placeholder.
 
 **The honest limit.** This check can force the sentence to exist; it can never
 force it to be true. A body that names a bar and pastes a transcript still has
@@ -16,7 +20,7 @@ otherwise would be exactly the "passed for the wrong reason" failure
 
 Rules, kept simple and documented:
 
-- **Headings.** The seven required headings are matched as ATX headings at
+- **Headings.** The eight required headings are matched as ATX headings at
   level two or three (`##` / `###`), case-insensitively, with surrounding
   whitespace, trailing `#`s and surrounding emphasis/backticks ignored. The
   section body runs to the next heading at the same or a shallower level.
@@ -30,9 +34,9 @@ Rules, kept simple and documented:
   is likewise unfilled. `N/A — <reason>` (also the ASCII hyphen form) is a
   **filled** section: a stated non-applicability is honest, an empty section is
   not.
-- **Non-gate sections.** Only presence is required for What changed / Why /
-  Verification / Honest scope / Follow-ups; only the two gate sections are
-  checked for content.
+- **Non-checked sections.** Only presence is required for What changed / Why /
+  Verification / Honest scope / Follow-ups; the three sections listed in
+  `CONTENT_HEADINGS` are checked for content.
 
 Usage:
 
@@ -56,7 +60,7 @@ import os
 import re
 import sys
 
-# The seven headings, in template order. A missing one is named by its exact
+# The eight headings, in template order. A missing one is named by its exact
 # heading text, so the CI failure points at the line to add.
 REQUIRED_HEADINGS = (
     "What changed",
@@ -66,12 +70,16 @@ REQUIRED_HEADINGS = (
     "Mutation evidence",
     "Honest scope",
     "Follow-ups",
+    "Mac verification",
 )
 
-# Only these two are checked for content (the "gate sections").
-GATE_HEADINGS = (
+# The headings whose *content* is checked: an empty section, or one holding only
+# the template placeholder, fails. Two carry the gate facts (#175); the third
+# carries the Mac run's record (#335). Presence, never truth, for all three.
+CONTENT_HEADINGS = (
     "Bar named before measuring",
     "Mutation evidence",
+    "Mac verification",
 )
 
 # The template's placeholder prefix. A section whose every non-blank line starts
@@ -89,7 +97,7 @@ COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 WHITESPACE_RE = re.compile(r"\s+")
 
 REQUIRED_NORMS = {h.casefold(): h for h in REQUIRED_HEADINGS}
-GATE_NORMS = {h.casefold() for h in GATE_HEADINGS}
+CONTENT_NORMS = {h.casefold() for h in CONTENT_HEADINGS}
 
 
 def normalize_heading(text: str) -> str:
@@ -148,7 +156,7 @@ def sections(body: str) -> dict[str, tuple[int, str]]:
 
 
 def section_state(text: str) -> str:
-    """`"empty"`, `"placeholder"` or `"filled"` for a gate section's body."""
+    """`"empty"`, `"placeholder"` or `"filled"` for a checked section's body."""
     without_comments = COMMENT_RE.sub("", text)
     content = [line.strip() for line in without_comments.splitlines() if line.strip()]
     if not content:
@@ -173,7 +181,7 @@ def check_body(body: str) -> list[str]:
             where += " and must come first"
         problems.append(f'missing required heading "## {heading}" ({where})')
 
-    for heading in GATE_HEADINGS:
+    for heading in CONTENT_HEADINGS:
         entry = found.get(heading.casefold())
         if entry is None:
             continue  # already reported as missing
@@ -220,8 +228,9 @@ def read_body(args: argparse.Namespace) -> str:
 def complete_body(
     bar: str = "the checker exits 0 on a template-shaped body and names the heading on each negative",
     mutation: str = "deleted `## Mutation evidence` -> exit 1, message names it",
+    mac: str = "macbook (macOS 27.0.1, Apple M4 Pro) / 2026-10-07 / `cargo test --release`",
 ) -> str:
-    """A body that passes: every heading present and both gate sections filled."""
+    """A body that passes: every heading present and all checked sections filled."""
     return (
         "## What changed\n"
         "- added the checker\n"
@@ -235,17 +244,24 @@ def complete_body(
         "presence, not truth\n"
         "## Follow-ups\n"
         "N/A — none\n"
+        f"## Mac verification\n{mac}\n"
     )
 
 
 def selftest_cases() -> list[tuple[str, str, bool, str | None]]:
     """`(name, body, should_pass, expected_substring)` for every built-in case."""
     missing = complete_body().replace("## Mutation evidence\n", "")
+    missing_mac = complete_body().replace("## Mac verification\n", "")
     placeholder = complete_body(bar="FILL-ME: the numeric bar, named before measuring")
+    mac_placeholder = complete_body(
+        mac="FILL-ME: `<box label> / <date> / <command>`, or `N/A — <reason>`"
+    )
     empty_gate = complete_body(mutation="<!-- guidance only -->")
+    empty_mac = complete_body(mac="<!-- guidance only -->")
     n_a = complete_body(
         bar="N/A — this change introduces no measured number",
         mutation="N/A - covered by the checker's own selftest",
+        mac="N/A — no macOS-specific file or shared macOS arm is touched",
     )
     heading_variants = (
         "### what changed ###\n"
@@ -262,6 +278,8 @@ def selftest_cases() -> list[tuple[str, str, bool, str | None]]:
         "n/a\n"
         "### Follow-ups\n"
         "N/A — none\n"
+        "### MAC VERIFICATION ###\n"
+        "N/A — docs only\n"
     )
     fenced_gates = (
         "## What changed\n- x\n## Why\ny\n## Verification\nz\n"
@@ -273,6 +291,7 @@ def selftest_cases() -> list[tuple[str, str, bool, str | None]]:
         "the mutation\n"
         "```\n"
         "## Honest scope\nn/a\n## Follow-ups\nN/A — none\n"
+        "## Mac verification\nN/A — docs only\n"
     )
     # The whole template, quoted inside a fence: no real heading exists.
     template = (
@@ -281,6 +300,7 @@ def selftest_cases() -> list[tuple[str, str, bool, str | None]]:
         "## Bar named before measuring\nFILL-ME: the numeric bar\n"
         "## Mutation evidence\nFILL-ME: the mutation\n"
         "## Honest scope\nplaceholder\n## Follow-ups\nplaceholder\n"
+        "## Mac verification\nFILL-ME: box / date / command\n"
         "```\n"
     )
     return [
@@ -292,12 +312,30 @@ def selftest_cases() -> list[tuple[str, str, bool, str | None]]:
             "Mutation evidence",
         ),
         (
+            "missing `## Mac verification` fails and names it",
+            missing_mac,
+            False,
+            "Mac verification",
+        ),
+        (
             "placeholder left in place fails",
             placeholder,
             False,
             "Bar named before measuring",
         ),
+        (
+            "the `Mac verification` placeholder left in place fails",
+            mac_placeholder,
+            False,
+            "Mac verification",
+        ),
         ("empty gate section fails", empty_gate, False, "Mutation evidence"),
+        (
+            "empty `## Mac verification` fails",
+            empty_mac,
+            False,
+            "Mac verification",
+        ),
         ("`N/A — reason` passes", n_a, True, None),
         (
             "gate headings quoted inside a fence fail",
@@ -342,8 +380,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="check_pr_body.py",
         description=(
-            "Require a PR body's headings and its two filled gate sections "
-            "(docs/GATE-CONTRACT.md, issue #175). " + HELP_LIMIT
+            "Require a PR body's headings and its filled checked sections — the two "
+            "gate sections and the Mac verification record "
+            "(docs/GATE-CONTRACT.md, issues #175 and #335). " + HELP_LIMIT
         ),
         epilog=(
             "Check only that the sentences are present — never that they are true. "
@@ -389,8 +428,8 @@ def main(argv: list[str]) -> int:
         )
         return 1
     print(
-        f"check_pr_body: all {len(REQUIRED_HEADINGS)} required headings present and both "
-        f"gate sections filled (presence only, not truth)"
+        f"check_pr_body: all {len(REQUIRED_HEADINGS)} required headings present and the "
+        f"{len(CONTENT_HEADINGS)} checked sections filled (presence only, not truth)"
     )
     return 0
 
