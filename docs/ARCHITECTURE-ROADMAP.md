@@ -753,7 +753,7 @@ behavioural defects found while executing the plan, already fixed.
    Backend" table; the asymmetry is visible rather than silent.
 6. **CUDA RoPE is non-interleaved only** (`cuda_backend.rs:1324`), so any model
    needing the interleaved style splits every layer between CUDA and CPU,
-   producing two host round trips per layer (§2.2). `ARCHITECTURE.md:391-393`
+   producing two host round trips per layer (§2.2). `ARCHITECTURE.md:393-395`
    advertises both styles as available.
 7. **Stale `unreachable!("CUDA pool not implemented")`** in the non-CUDA arms
    (`alloc.rs:333`, `:357`) — misleading text in a live panic path.
