@@ -702,7 +702,7 @@ Excerpt 10 — CPU registration: the cheapest one. (`src/graph/cpu_backend.rs:34
 The comment is the whole lesson: with borrowed bytes, even the *unguarded*
 insert is cheap; the guard exists because one call path produced *owned*
 clones. The graph allocator simply forwards to it
-(`graph/alloc.rs:134-137`: `self.cpu.register_weight(name, t)`), which is
+(`graph/alloc.rs:135-138`: `self.cpu.register_weight(name, t)`), which is
 why the allocator's registration costs nothing on CPU.
 
 Excerpt 11 — the graph's own registration pass, at first build.
