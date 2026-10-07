@@ -1542,6 +1542,120 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d(((nt + 7) / 8) as u64, nh as u64, 32, 4);
     }
 
+    /// Fast explicit-span prefill (issue #359): the windowed sibling of
+    /// [`Self::attn_flash_prefill`]. Same Q=8 × C=64 simdgroup tiling, but the
+    /// inline mask reads each query's `[window[t], window[nt + t])` explicit
+    /// window instead of the causal `[0, positions[t] + 1)`. `lo_min` is the
+    /// first cell of the launch's union window (`[lo_min, lo_min + nkv)`); K/V
+    /// are read at `lo_min + ic` cells (the tail pad is filled with the K/V
+    /// pointer advanced by `lo_min`, so `kernel_kv_tail_pad` itself is unchanged).
+    ///
+    /// The causal kernels in `fa_prefill.metal` are not touched: this is a
+    /// separate kernel family (`fa_window.metal`) selected only by the
+    /// explicit-span prefill arm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_flash_window(
+        &self,
+        q: &MetalBuffer,
+        kv_k: &MetalBuffer,
+        kv_v: &MetalBuffer,
+        out: &MetalBuffer,
+        window: &MetalBuffer,
+        nkv: usize,
+        lo_min: usize,
+        nkt: usize,
+        nt: usize,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        f16: bool,
+    ) {
+        self.trace_op("attn_flash_window");
+        let dev = &self.state.device;
+        let elem = if f16 { 2u64 } else { 4u64 };
+        let pad =
+            MpsState::get_or_grow(&self.state.buf_attn_pad, (2 * 64 * nkt as u64) * elem, dev);
+
+        if nkv % 64 != 0 {
+            // The pad holds the launch's partial last block; advance K/V by
+            // `lo_min` cells so the pad's relative row `t` is absolute
+            // `lo_min + (nkv / 64) * 64 + t`, exactly the windowed block.
+            let off = (lo_min * nkt) as u64 * elem;
+            self.enc
+                .setComputePipelineState(&*self.state.pl_kv_tail_pad);
+            unsafe {
+                self.enc
+                    .setBuffer_offset_atIndex(Some(&**(kv_k)), off as usize, (0) as usize)
+            };
+            unsafe {
+                self.enc
+                    .setBuffer_offset_atIndex(Some(&**(kv_v)), off as usize, (1) as usize)
+            };
+            unsafe {
+                self.enc
+                    .setBuffer_offset_atIndex(Some(&*pad), (0) as usize, (2) as usize)
+            };
+            self.set_params(3, &(nkv as i32));
+            self.set_params(4, &(nkt as i32));
+            self.set_params(5, &(if f16 { 1 } else { 0 }));
+            self.dispatch_2d(nkt as u64, 64, 1, 1);
+        }
+
+        self.enc.setComputePipelineState(
+            &**(if f16 {
+                if hd == 128 {
+                    &self.state.pl_flash_attn_window_blk_hd128_f16
+                } else {
+                    &self.state.pl_flash_attn_window_blk_f16
+                }
+            } else {
+                if hd == 128 {
+                    &self.state.pl_flash_attn_window_blk_hd128
+                } else {
+                    &self.state.pl_flash_attn_window_blk
+                }
+            }),
+        );
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(kv_k)), (0) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(kv_v)), (0) as usize, (2) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&*pad), (0) as usize, (3) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (4) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(window)), (0) as usize, (5) as usize)
+        };
+        self.set_params(6, &(nh as i32));
+        self.set_params(7, &(nk as i32));
+        self.set_params(8, &(hd as i32));
+        self.set_params(9, &(scale.to_bits() as i32));
+        self.set_params(10, &(nt as i32));
+        self.set_params(11, &(nkv as i32));
+        self.set_params(12, &(lo_min as i32));
+        let shmem = if hd == 128 { 10240u64 } else { 7168u64 };
+        unsafe {
+            self.enc
+                .setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize)
+        };
+        self.dispatch_2d(((nt + 7) / 8) as u64, nh as u64, 32, 4);
+    }
+
     /// Fused bias-add + RoPE + KV-store for nt==1 decode: ONE kernel replaces
     /// add_bias×3 + rope×2 + store_kv×2 (7 dispatches). `bqkv` layout is
     /// [q: 0..nqt][k: nqt..nqt+nkt][v: nqt+nkt..nqt+2nkt]; biases are the raw

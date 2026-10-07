@@ -1108,6 +1108,228 @@ fn flash_prefill_matches_the_cpu_reference_at_every_kv_tail() {
     }
 }
 
+/// #359: the fast explicit-span prefill (`kernel_flash_attn_window_blk_*`,
+/// `fa_window.metal`) vs a CPU reference, at the shapes the harness measures
+/// (hd 64 f32, hd 128 f16) plus a non-zero `lo_min`. The causal flash gate above
+/// never names a window, so this is the fast family's own correctness gate.
+///
+/// Two arms:
+///
+/// - **Value (rule 1):** every query names exactly one cell, so a one-key
+///   softmax is exactly 1 and the output is that cell's V row **bitwise** —
+///   whatever q/K are. The expected row is a host array, independent of both
+///   backends, so a kernel that resolved the wrong window or ignored `lo_min`
+///   cannot alias a shared constant.
+/// - **Multi-key (rule 1, real softmax):** a growing window `[lo_min,
+///   lo_min+t+1)` over `nt = 197` queries (a non-multiple of 8, so the Q-tile's
+///   tail padding runs) with `nkv = 197` (a partial 64-row tail, so
+///   `kernel_kv_tail_pad` runs), compared to the CPU reference.
+///
+/// Bars named before measuring: **max|Δ| <= 0.01** for the f32-KV variants (the
+/// class `flash_prefill_matches_the_cpu_reference_at_every_kv_tail` uses) and
+/// **<= 0.05** for the f16-KV variants (K/V f16 rounding plus the Q→f16 staging
+/// the causal kernel shares). The exact bar is `== 0.0` for the one-key arm.
+///
+/// Control (rule 2): a window shifted one cell off its start names different
+/// rows and must change the multi-key output, so the window is observable.
+#[test]
+fn window_flash_matches_the_cpu_reference() {
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let mps = MpsState::get().expect("MPS must be active");
+    let dev = &mps.inner.device;
+
+    const NH: usize = 2;
+    const NK: usize = 2;
+    const NT: usize = 197; // not a multiple of 8 -> the Q-tile tail padding runs
+                           // (hd, f16, lo_min): the 0.5B shape, the Qwen3 shape, and an offset-0 control.
+    let cases: &[(usize, bool, usize)] = &[
+        (64, false, 0),
+        (64, false, 96),
+        (64, true, 96),
+        (128, false, 64),
+        (128, true, 64),
+    ];
+
+    for &(hd, f16, lo_min) in cases {
+        let nkt = NK * hd;
+        let nqt = NH * hd;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let total_cells = lo_min + NT;
+        let one = |bytes: usize| {
+            dev.newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+                .unwrap()
+        };
+        let q = one(NT * nqt * 4);
+        let k = one(total_cells * nkt * if f16 { 2 } else { 4 });
+        let v = one(total_cells * nkt * if f16 { 2 } else { 4 });
+        let out = one(NT * nqt * 4);
+        let win = one(2 * NT * 4);
+
+        let qs: Vec<f32> = (0..NT * nqt)
+            .map(|i| ((i as f32) * 0.37).sin() * 1.5)
+            .collect();
+        let ks: Vec<f32> = (0..total_cells * nkt)
+            .map(|i| ((i as f32) * 0.11).cos() * 1.2)
+            .collect();
+        let vs: Vec<f32> = (0..total_cells * nkt)
+            .map(|i| ((i as f32) * 0.23).sin() * 0.9)
+            .collect();
+        // The values the device actually holds: f16 rounds them, so the CPU
+        // reference must use the same rounded values (a plain f32 would differ
+        // from the cache by the f16 rounding, not by the window).
+        let round = |x: f32| {
+            if f16 {
+                half::f16::from_f32(x).to_f32()
+            } else {
+                x
+            }
+        };
+        let ks_r: Vec<f32> = ks.iter().map(|&x| round(x)).collect();
+        let vs_r: Vec<f32> = vs.iter().map(|&x| round(x)).collect();
+
+        unsafe {
+            let qp = q.contents().as_ptr() as *mut f32;
+            for (i, &x) in qs.iter().enumerate() {
+                *qp.add(i) = x;
+            }
+            if f16 {
+                let kp = k.contents().as_ptr() as *mut u16;
+                let vp = v.contents().as_ptr() as *mut u16;
+                for i in 0..ks_r.len() {
+                    *kp.add(i) = half::f16::from_f32(ks_r[i]).to_bits();
+                    *vp.add(i) = half::f16::from_f32(vs_r[i]).to_bits();
+                }
+            } else {
+                let kp = k.contents().as_ptr() as *mut f32;
+                let vp = v.contents().as_ptr() as *mut f32;
+                for i in 0..ks_r.len() {
+                    *kp.add(i) = ks_r[i];
+                    *vp.add(i) = vs_r[i];
+                }
+            }
+        }
+
+        let read_out = || unsafe {
+            std::slice::from_raw_parts(out.contents().as_ptr() as *const f32, NT * nqt).to_vec()
+        };
+        let run = |window: &[u32], nkv: usize| -> Vec<f32> {
+            unsafe {
+                let wp = win.contents().as_ptr() as *mut u32;
+                for (i, &x) in window.iter().enumerate() {
+                    *wp.add(i) = x;
+                }
+            }
+            let cb = mps.cmd_buffer();
+            cb.attn_flash_window(
+                &q, &k, &v, &out, &win, nkv, lo_min, nkt, NT, NH, NK, hd, scale, f16,
+            );
+            cb.submit().expect("submit");
+            read_out()
+        };
+
+        // ── arm 1: one cell per query -> the cell's V row, bitwise ──
+        // Query t names the single cell `lo_min + t`.
+        let mut single = vec![0u32; 2 * NT];
+        for t in 0..NT {
+            single[t] = (lo_min + t) as u32;
+            single[NT + t] = (lo_min + t + 1) as u32;
+        }
+        let got_single = run(&single, NT);
+        let mut want_single = vec![0.0f32; NT * nqt];
+        for t in 0..NT {
+            for h in 0..NH {
+                for d in 0..hd {
+                    want_single[t * nqt + h * hd + d] = vs_r[(lo_min + t) * nkt + h * hd + d];
+                }
+            }
+        }
+        let d_single = got_single
+            .iter()
+            .zip(&want_single)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "[window_flash] hd={hd} f16={f16} lo_min={lo_min}: one-cell vs V row max|Δ|={d_single}"
+        );
+        assert_eq!(
+            d_single, 0.0,
+            "hd={hd} f16={f16} lo_min={lo_min}: the fast window did not return the named \
+             cell's V row (max|Δ| = {d_single})"
+        );
+
+        // ── arm 2: growing window [lo_min, lo_min+t+1) vs the CPU reference ──
+        let mut grow = vec![0u32; 2 * NT];
+        for t in 0..NT {
+            grow[t] = lo_min as u32;
+            grow[NT + t] = (lo_min + t + 1) as u32;
+        }
+        let got_grow = run(&grow, NT);
+        let mut want = vec![0.0f32; NT * nqt];
+        for h in 0..NH {
+            let hk = h; // gqa = 1 in this fixture
+            for t in 0..NT {
+                let nkeys = t + 1;
+                let mut scores = vec![0.0f32; nkeys];
+                let mut mx = f32::NEG_INFINITY;
+                for (j, s) in scores.iter_mut().enumerate() {
+                    let cell = lo_min + j;
+                    let mut dot = 0.0f32;
+                    for d in 0..hd {
+                        dot += qs[(t * NH + h) * hd + d] * ks_r[cell * nkt + hk * hd + d];
+                    }
+                    *s = dot * scale;
+                    mx = mx.max(*s);
+                }
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for d in 0..hd {
+                    let mut acc = 0.0f32;
+                    for (j, &s) in scores.iter().enumerate() {
+                        acc += (s / sum) * vs_r[(lo_min + j) * nkt + hk * hd + d];
+                    }
+                    want[(t * NH + h) * hd + d] = acc;
+                }
+            }
+        }
+        let d_grow = got_grow
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let bar = if f16 { 0.05 } else { 0.01 };
+        eprintln!(
+            "[window_flash] hd={hd} f16={f16} lo_min={lo_min}: growing window vs CPU max|Δ|={d_grow} \
+             (bar {bar})"
+        );
+        assert!(
+            d_grow <= bar,
+            "hd={hd} f16={f16} lo_min={lo_min}: fast window vs CPU diverges (max|Δ| = {d_grow} > {bar})"
+        );
+
+        // ── control (rule 2): a window shifted one cell off must differ ──
+        let mut shifted = vec![0u32; 2 * NT];
+        for t in 0..NT {
+            shifted[t] = (lo_min + 1) as u32;
+            shifted[NT + t] = (lo_min + t + 2) as u32;
+        }
+        let got_shift = run(&shifted, NT);
+        let d_shift = got_shift
+            .iter()
+            .zip(&got_grow)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            d_shift > 1e-4,
+            "hd={hd} f16={f16} lo_min={lo_min}: a window shifted off its start gave the same \
+             output; the window is not observable (max|Δ| = {d_shift})"
+        );
+    }
+}
+
 /// Prefill GEMM (nt=430) throughput — P1 prefill-gap investigation (2026-08-11):
 /// minfer pp430 ~1860 t/s vs llama-Metal ~6940 t/s (3.7x). GEMM params match
 /// (64x32 tile, 4 sg, both legacy-simdgroup on M4). This measures the GEMM

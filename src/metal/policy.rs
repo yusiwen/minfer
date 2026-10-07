@@ -50,3 +50,15 @@ pub fn prefill_flash_enabled(hd: usize) -> bool {
     *V.get_or_init(|| std::env::var("MINFER_NO_PREFILL_FLASH").map_or(true, |v| v != "1"))
         && (hd == 64 || hd == 128)
 }
+
+/// Use the windowed sibling of `kernel_flash_attn_blk_*`
+/// (`kernel_flash_attn_window_blk_*`, `fa_window.metal`, issue #359) for an
+/// explicit `attn_span` prefill. Fixed-shape like the causal prefill, so it
+/// requires `hd == 64 || hd == 128`; every other shape keeps the #44
+/// correctness kernel `kernel_gqa_attn_window_*`. ON by default;
+/// `MINFER_NO_WINDOW_FLASH=1` reverts to the correctness kernel for A/B.
+pub fn prefill_window_flash_enabled(hd: usize) -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_NO_WINDOW_FLASH").map_or(true, |v| v != "1"))
+        && (hd == 64 || hd == 128)
+}

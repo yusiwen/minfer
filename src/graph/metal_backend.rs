@@ -458,6 +458,24 @@ impl MetalBackend {
         p.iter().map(|&x| x as usize).max().unwrap_or(0)
     }
 
+    /// `(min lo, max hi)` of a one-range explicit `attn_span` window, read on
+    /// the host for the same reason [`Self::positions_max`] reads `positions`:
+    /// the window is input data, never GPU-computed. `count` is the node's
+    /// logical `nt`, so the class-rounded pool buffer's tail cannot widen the
+    /// scan. Returns `(0, 0)` if the buffer is too small (a malformed graph;
+    /// the caller then keeps the correctness kernel).
+    fn window_range(window: &crate::metal::MetalBuffer, count: usize) -> (usize, usize) {
+        let need = 2 * count;
+        if (window.length() as usize) / 4 < need {
+            return (0, 0);
+        }
+        let w =
+            unsafe { std::slice::from_raw_parts(window.contents().as_ptr() as *const u32, need) };
+        let lo_min = w[..count].iter().map(|&x| x as usize).min().unwrap_or(0);
+        let hi_max = w[count..].iter().map(|&x| x as usize).max().unwrap_or(0);
+        (lo_min, hi_max)
+    }
+
     /// #38: refuse a KV-store row that is past the layer's persistent region.
     ///
     /// `rows` is the I32 index buffer the store kernel dereferences — `cells`
@@ -1111,12 +1129,42 @@ impl Backend for MetalBackend {
                         )
                     })?;
                     if win.len == 2 * nt {
+                        // #359: a prefill-shaped one-range window takes the fast
+                        // windowed flash family (the causal blk family's tile
+                        // structure with an explicit `[lo, hi)` mask). The
+                        // #44 correctness kernel stays the fallback for every
+                        // shape it alone covers (small hd, nt == 1, opt-out),
+                        // and is byte-untouched.
+                        let win_buf = self.buf(win.id);
+                        if nt > 1 && crate::metal::prefill_window_flash_enabled(meta.hd) {
+                            let (lo_min, hi_max) = Self::window_range(win_buf, nt);
+                            let nkv = hi_max.saturating_sub(lo_min);
+                            if nkv > 0 {
+                                cb.attn_flash_window(
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    win_buf,
+                                    nkv,
+                                    lo_min,
+                                    meta.nkt,
+                                    nt,
+                                    meta.n_head,
+                                    meta.n_head_kv,
+                                    meta.hd,
+                                    meta.scale,
+                                    self.kv_f16(),
+                                );
+                                return Ok(());
+                            }
+                        }
                         cb.gqa_attn_window(
                             q,
                             k,
                             v,
                             o,
-                            self.buf(win.id),
+                            win_buf,
                             meta.n_head,
                             meta.n_head_kv,
                             meta.hd,

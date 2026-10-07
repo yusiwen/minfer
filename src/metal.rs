@@ -226,6 +226,13 @@ struct MpsStateInner {
     pl_flash_attn_blk_f16: MetalComputePipelineState,
     pl_flash_attn_blk_hd128: MetalComputePipelineState,
     pl_flash_attn_blk_hd128_f16: MetalComputePipelineState,
+    // #359: the fast explicit-span prefill. A *copy* of the causal blk family
+    // (fa_prefill.metal, left byte-untouched) whose inline mask reads each
+    // query's `[lo, hi)` window instead of `[0, pos+1)`.
+    pl_flash_attn_window_blk: MetalComputePipelineState,
+    pl_flash_attn_window_blk_f16: MetalComputePipelineState,
+    pl_flash_attn_window_blk_hd128: MetalComputePipelineState,
+    pl_flash_attn_window_blk_hd128_f16: MetalComputePipelineState,
     pl_kv_tail_pad: MetalComputePipelineState,
     pl_store_kv: MetalComputePipelineState,
     pl_store_kv_f16: MetalComputePipelineState,
@@ -467,7 +474,8 @@ mod policy;
 mod runtime;
 
 pub use policy::{
-    flash_attn_enabled, matmul_attn_enabled, prefill_flash_enabled, rms_norm_256_enabled,
+    flash_attn_enabled, matmul_attn_enabled, prefill_flash_enabled, prefill_window_flash_enabled,
+    rms_norm_256_enabled,
 };
 
 #[cfg(test)]
