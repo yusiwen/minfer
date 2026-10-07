@@ -8547,6 +8547,53 @@ sign in `make_qx_quants` → q6_K `blk.0.ffn_down.weight payload differs (256768
 of 3575040 bytes)`, green again 290/290 after the fix (the round-trip unit tests
 did not see it).
 
+**#349 (2026-10-07) — the K-quant half of that claim is compiler-dependent, and
+the gate's verdict now says which build it is looking at.** [#342](https://github.com/yusiwen/minfer/issues/342)
+had already rebuilt the Mac's `llama-quantize` from `c479922ac` with
+`-DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -ffp-contract=fast"` (the flag confirmed in
+the object) and measured: the five legacy quads pass **290/290**, and every
+K-quant fails as `tensor blk.0.ffn_down.weight payload differs (2285 of 2451456
+bytes) … build unmatched` — `q5_K` 97 of 2996224, `q6_K` 269 of 3575040 — i.e. the
+reference matches neither minfer's `Fast` nor its uncontracted `Off` model. `git
+log 050dde50c..c479922ac -- ggml/src/ggml-quants.c` touches only the q3_K/i-quant
+encoders, so the residual is Apple-clang-vs-GCC codegen of the *search* quantizers
+(§4.2.1), not the flag. Two defects followed: §4.2/§4.2.1 stated the K-quant
+290/290/310/310 without naming the compiler, and `build unmatched` read like an
+encoder defect while being indistinguishable from a corrupted file. The fix
+records the decision in the manifest and in the gate. `docs/f6-fixtures.json` gained
+`authoritative_reference: true` on the one entry per `llama-quantize` path the claim
+is asserted against — for every `ref/…` path the `dgxspark` **gcc 13.3.0**
+`-ffp-contract=fast` content, which §4.2.1 now names next to the number and states
+the claim is conditional on (compiler + `-ffp-contract` + llama.cpp revision).
+`scripts/check_f6_fixtures.py` enforces it as **S6** (exactly one marked entry, on a
+`llama-quantize` record built with the flag; five new selftest cases, 26 total), and
+the Rust reader exposes `reference_record` + a pure `ParityVerdict::classify` that
+turns the three byte comparisons into five outcomes: reproduces; flag mismatch
+(the #334 refusal); **not the recorded content** (the resolver of #205 refuses
+first, by name and digest); **a recorded foreign build** (matches neither model but
+its digest *is* recorded → `[f6 parity] SKIP …` naming the file's build, the
+authoritative build, the §4.2.1 reason and this box's `cc --version`, so the Mac's
+K-quants stop being a permanently red ignored gate — the §14 row 6 failure mode);
+and **the authoritative build, not reproduced**, or an unrecorded file, which still
+fail. Measured on `dgxspark (aarch64, GB10 sm_121)`, 2026-10-07: the eight targets
+stay **290/290** with `build -ffp-contract=fast, recorded reference gcc 13.3.0 …` on
+the pass line; a freshly built `-ffp-contract=off` `llama-quantize` (sha256
+`ea94611e…`, the #334 digest) → the flag-mismatch refusal; one flipped byte in a
+`/tmp` copy → `check_f6_fixtures.py --file` exit 1 naming both recorded digests and
+the actual one, and the same copy under `MINFER_F6_CACHE` → the gate's resolver
+refusal before any compiler verdict; four flipped bytes at the end of the q4_K
+reference (a `/tmp` copy the record does not name) → `tensor blk.23.ffn_up.weight
+payload differs (4 of 2996224 bytes)` with the *unattributable* failure, **not** a
+compiler claim; and a fabricated third record marked non-authoritative plus
+`MINFER_F6_CACHE` → the `SKIP` line with exit 0. Mutations: the classifier's
+`unrecorded` arm returning `RecordedForeignBuild` → the unit test fails
+(`left: RecordedForeignBuild, right: Unattributable`) **and** the `/tmp` gate run
+wrongly skips as "a different compiler"; `reference_record_in` returning the default
+→ the unit test fails on the empty record. Both restored from `cp` backups. Suites:
+**486 / 0 / 40** unit + **10 / 0 / 6** integration and the F6 `#[ignore]`d set
+**6 / 0**, all on `dgxspark`. Still owed: `--regenerate` ([#345](https://github.com/yusiwen/minfer/issues/345)),
+and the bare `:NNN` citation sweep ([#336](https://github.com/yusiwen/minfer/issues/336)).
+
 **#344 (2026-10-07) — the anchor checker can now see a moved target.**
 `check_doc_line_anchors.py` ([#266](https://github.com/yusiwen/minfer/issues/266))
 proves an anchor's file exists, its line is in range and its adjacent symbol is

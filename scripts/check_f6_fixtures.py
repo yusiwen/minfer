@@ -47,8 +47,18 @@ verbatim; a directory must prefix some entry), and every ``.gguf`` path a
 ``producer`` command names is an entry. A gate that grows a new fixture, or a
 recipe that gains a step, cannot silently leave the record behind.
 
+``S6`` every path whose record includes a ``llama-quantize`` entry has **exactly
+one** entry marked ``authoritative_reference``, it is a ``llama-quantize`` entry
+built with ``-ffp-contract=fast``, and the field appears nowhere else. That entry
+is *the reference the byte-parity claim is asserted against* (docs/
+GGUF-TOOLING.md §4.2): a ``ref/…`` path has two recorded contents because the two
+boxes' ``llama-quantize`` builds differ, and the claim was measured against the
+dgxspark GCC one. Without the mark, a mismatch cannot say whether the gate is
+looking at the reference the claim is about or at a different compiler's build of
+the same source — which is the whole of issue #349.
+
 What it checks, ``--verify`` (needs the cache; the developer's and the F6 gate's
-form): ``S1``–``S5``, then per entry ``bytes`` + ``sha256`` against the file,
+form): ``S1``–``S6``, then per entry ``bytes`` + ``sha256`` against the file,
 and every file under the cache root that no entry names is reported as
 ``extra``. A full-digest mismatch is a **failure** naming the file, the expected
 digest(s) and the actual one; a prefix-only entry accepts a matching prefix with
@@ -115,7 +125,7 @@ ENTRY_KEYS = {
     "path", "bytes", "sha256", "sha256_prefix", "producer", "producer_kind",
     "producer_note", "digest_note", "date", "box", "also_on",
     "minfer_commit", "llamacpp_commit", "llamacpp_binary", "compiler",
-    "ffp_contract", "cflags", "source",
+    "ffp_contract", "cflags", "source", "authoritative_reference",
 }
 
 #: A `box` label is absolute or it is a lie the next agent cannot read (gate
@@ -223,6 +233,17 @@ def check_entry(path: Path, i: int, e: dict, problems: list[str]) -> None:
             f"{where}: ffp_contract must be one of {list(FFP_CONTRACTS)}, got "
             f"{e.get('ffp_contract')!r} (the flag this whole record turns on)"
         )
+    if "authoritative_reference" in e:
+        if not isinstance(e["authoritative_reference"], bool):
+            problems.append(
+                f"{where}: authoritative_reference must be true or false, got "
+                f"{e['authoritative_reference']!r}"
+            )
+        elif kind != "llama-quantize":
+            problems.append(
+                f"{where}: authoritative_reference is only meaningful on a llama-quantize "
+                f"entry (the byte-parity claim is about that build), not {kind!r}"
+            )
     if not DATE.match(str(e.get("date", ""))):
         problems.append(f"{where}: date must be YYYY-MM-DD, got {e.get('date')!r}")
     box = str(e.get("box", ""))
@@ -291,6 +312,36 @@ def check_manifest(path: Path, doc: dict) -> list[str]:
                 f"{path}: {p} has {len(es)} recorded contents but no divergence_notes entry — "
                 "an unexplained divergence is the failure this manifest exists to prevent"
             )
+    # S6: exactly one authoritative reference per path a llama-quantize record
+    # describes (issue #349). The byte-parity claim is asserted against the build
+    # that one entry names; without it, a mismatch cannot be read.
+    for p, es in sorted(by_path.items()):
+        marks = [e for e in es if e.get("authoritative_reference") is True]
+        if not marks:
+            if any(e.get("producer_kind") == "llama-quantize" for e in es):
+                problems.append(
+                    f"{path}: {p} has a llama-quantize record but no entry marked "
+                    "authoritative_reference — the byte-parity claim does not record which "
+                    "compiler's build it is asserted against (issue #349)"
+                )
+            continue
+        if len(marks) > 1:
+            problems.append(
+                f"{path}: {p} marks {len(marks)} entries authoritative_reference; exactly one "
+                "content is the reference the byte-parity claim is about"
+            )
+        for e in marks:
+            if e.get("producer_kind") != "llama-quantize":
+                problems.append(
+                    f"{path}: {p}: the authoritative_reference entry is "
+                    f"{e.get('producer_kind')!r}, not a llama-quantize build"
+                )
+            if e.get("ffp_contract") != "fast":
+                problems.append(
+                    f"{path}: {p}: the authoritative_reference entry is a "
+                    f"-ffp-contract={e.get('ffp_contract')!r} build; the byte-parity claim is "
+                    "asserted against the contracting build (docs/GGUF-TOOLING.md §4.2)"
+                )
     return problems
 
 
@@ -489,6 +540,7 @@ def _tiny_manifest(root: Path, sha: str, **over) -> dict:
         "compiler": "gcc 13.3.0",
         "ffp_contract": "fast",
         "cflags": "-O3 -DNDEBUG",
+        "authoritative_reference": True,
         "date": "2026-10-07",
         "box": "dgxspark (aarch64, GB10 sm_121)",
     }
@@ -580,13 +632,16 @@ def selftest() -> int:
                bool(check_manifest(manifest_path, bad)))
         bad = _tiny_manifest(root, good, minfer_commit="unrecorded")
         bad["entries"][0]["producer_kind"] = "minfer"
+        # `authoritative_reference` is a llama-quantize field (S2): a minfer
+        # producer has no compiler, so the mark goes with the kind.
+        bad["entries"][0].pop("authoritative_reference")
         record("an unrecorded producer without a note is a structural problem",
                bool(check_manifest(manifest_path, bad)))
         bad["entries"][0]["producer_note"] = "not recorded at the time"
         record("... and is accepted once the note explains it",
                not check_manifest(manifest_path, bad))
         bad = _tiny_manifest(root, good)
-        soft = dict(bad["entries"][0])
+        soft = dict(bad["entries"][0], authoritative_reference=False)
         del soft["sha256"]
         soft["sha256_prefix"] = good[:8]
         soft["digest_note"] = "recorded as a prefix only"
@@ -594,7 +649,9 @@ def selftest() -> int:
         record("a prefix that is a prefix of the full digest for the same path is rejected",
                any("not a divergence" in p for p in check_manifest(manifest_path, bad)))
         bad = _tiny_manifest(root, good)
-        bad["entries"].append(dict(bad["entries"][0], sha256="f" * 64))
+        bad["entries"].append(
+            dict(bad["entries"][0], sha256="f" * 64, authoritative_reference=False)
+        )
         record("two contents for one path need a divergence note",
                any("divergence_notes" in p for p in check_manifest(manifest_path, bad)))
         bad["divergence_notes"] = [
@@ -605,6 +662,31 @@ def selftest() -> int:
         bad["divergence_notes"][0]["paths"] = ["ref/ghost.gguf"]
         record("a note naming an unknown path is rejected",
                any("no entry has" in p for p in check_manifest(manifest_path, bad)))
+        # S6 (#349): the manifest must record which content the byte-parity claim
+        # is asserted against, and it must be the contracting build.
+        bad = _tiny_manifest(root, good)
+        del bad["entries"][0]["authoritative_reference"]
+        record("a llama-quantize path with no authoritative reference is rejected",
+               any("no entry marked" in p for p in check_manifest(manifest_path, bad)))
+        bad = _tiny_manifest(root, good, ffp_contract="off")
+        record("... and a non-contracting authoritative build is rejected",
+               any("asserted against the contracting build" in p
+                   for p in check_manifest(manifest_path, bad)))
+        bad = _tiny_manifest(root, good)
+        bad["entries"].append(dict(bad["entries"][0], sha256="f" * 64))
+        bad["divergence_notes"] = [
+            {"cause": "two builds", "paths": ["ref/tiny.gguf"], "explanation": "why"}
+        ]
+        record("two authoritative entries for one path are rejected",
+               any("marks 2 entries" in p for p in check_manifest(manifest_path, bad)))
+        bad = _tiny_manifest(root, good, producer_kind="minfer", minfer_commit="abc")
+        bad["entries"][0].pop("compiler")
+        record("an authoritative_reference on a non-llama entry is rejected",
+               any("only meaningful on a llama-quantize" in p
+                   for p in check_manifest(manifest_path, bad)))
+        bad = _tiny_manifest(root, good, authoritative_reference="yes")
+        record("a non-boolean authoritative_reference is rejected",
+               any("must be true or false" in p for p in check_manifest(manifest_path, bad)))
         bad = _tiny_manifest(root, good)
         bad["entries"][0]["minfercommit"] = "typo"
         record("an unknown field is rejected", bool(check_manifest(manifest_path, bad)))

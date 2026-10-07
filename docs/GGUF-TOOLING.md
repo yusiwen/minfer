@@ -425,16 +425,23 @@ strongest available reference, and the missing direct converter reference is
 
 `llama-quantize ref-f16.gguf ref-<type>.gguf <type>` on the same f16 source.
 For **each** of q4_0, q4_1, q5_0, q5_1, q8_0, all **290/290 tensors are
-byte-identical** — against a reference **built with `-ffp-contract=fast`**
-(measured 2026-09-27, `dgxspark (aarch64, GB10 sm_121)`,
+byte-identical — against the recorded `dgxspark` build: `gcc 13.3.0`,
+`-ffp-contract=fast`, llama.cpp revision unrecorded (`docs/f6-fixtures.json`
+records it per content, §4.2.2)** (measured 2026-09-27,
+`dgxspark (aarch64, GB10 sm_121)`,
 `MINFER_F6_F16_GGUF=… cargo test --release --bin minfer
 f6_quantize_encoder_is_byte_identical_to_llamacpp -- --ignored`; the `env_path`
-convention and the per-type command are below). That qualifier is not decoration,
-and this section records it because the number is otherwise a statement about
-**one build** of `llama-quantize`: measured 2026-10-07, **the same llama.cpp
-source built with the one flag changed does not match**, and a differently-built
-reference made the same gate red on a platform this project ships on
-([#334](https://github.com/yusiwen/minfer/issues/334)).
+convention and the per-type command are below). **The claim is conditional on all
+three of those** — the compiler, the effective `-ffp-contract`, and the llama.cpp
+revision — because a `llama-quantize` binary *is* a (compiler, flags, revision)
+triple and the reference is that binary's output.
+That qualifier is not decoration, and this section records it because the number
+is otherwise a statement about **one build** of `llama-quantize`: measured
+2026-10-07, **the same llama.cpp source built with the one flag changed does not
+match**, and a differently-built reference made the same gate red on a platform
+this project ships on ([#334](https://github.com/yusiwen/minfer/issues/334)). The
+K-quant half of the claim is compiler-sensitive as well as flag-sensitive, which
+§4.2.1 records ([#349](https://github.com/yusiwen/minfer/issues/349)).
 
 **Which build, and how it was identified.** The `dgxspark` producer is a GCC
 13.3.0 `-O3 -DNDEBUG` build with no explicit `-ffp-contract` (so GCC's default
@@ -470,18 +477,29 @@ tensor, the same count — which is what makes "the reference's build" the whole
 content of the claim. Q8_0 uses a single multiply and matched without it.
 
 **What the gate does about it.** `f6_quantize_encoder_is_byte_identical_to_llamacpp`
-prints the reference's path, size and the build it established it matched
-(`build -ffp-contract=fast` on a pass). On a mismatch it does **not** report an
-encoder defect first: it re-encodes the whole source with the uncontracted
-arithmetic — `quantize::FmaContract::Off` through `quantize_row_with`, which is
-**exact** for the legacy quants and a *model* of the K-quants' per-expression
-fusion (§4.2.1) — and when the reference matches *that*, fails with the build
-named ("the reference is NOT the `-ffp-contract=fast` build this encoder
-reproduces … rebuild `llama-quantize` with `-ffp-contract=fast`") instead of
-"tensor X payload differs". A reference that matches **neither** variant still
-fails as a payload difference, which is what an encoder defect looks like. The
-`#[ignore]` reason names the same prerequisite. The identity is a whole-file,
-per-tensor byte comparison in all three outcomes. The fixture it resolves is
+prints the reference's path, size and the recorded build it established it matched
+(`build -ffp-contract=fast, recorded reference gcc 13.3.0 …` on a pass). On a
+mismatch it does **not** report an encoder defect first: it re-encodes the whole
+source with the uncontracted arithmetic — `quantize::FmaContract::Off` through
+`quantize_row_with`, which is **exact** for the legacy quants and a *model* of the
+K-quants' per-expression fusion (§4.2.1) — and then it asks the manifest which
+recorded content the file is, because re-encoding alone cannot tell a different
+compiler from a corrupted file: both match neither model. The three byte
+comparisons — `Fast` against the reference, the uncontracted model against it, and
+the file's digest against `docs/f6-fixtures.json` (§4.2.2) — plus the entry the
+digest matched give five named outcomes, and the classifier that decides them is
+pure and unit-tested (`the_f6_parity_verdict_names_the_recorded_build`):
+
+| outcome | when | what the gate does |
+|---|---|---|
+| **reproduces** | the `Fast` model matches | pass, and the pass line names the recorded compiler and flag |
+| **flag mismatch** | only the uncontracted model matches | fails with the build named: "the reference is NOT the `-ffp-contract=fast` build this encoder reproduces … rebuild `llama-quantize` with `-ffp-contract=fast`" (#334) |
+| **not the recorded content** | the digest matches no recorded content for the path | the resolver of §4.2.2 has already refused the file by name and digest; a path outside the cache is not a fixture at all |
+| **a recorded foreign build** | the digest *is* recorded, but the entry is not the path's `authoritative_reference`, and neither model matches | **skips loudly** (a passing run with a `[f6 parity] SKIP` line) naming the build the file is, the authoritative build the claim was measured against, the reason (§4.2.1's compiler sensitivity), and this box's own `cc --version` |
+| **the authoritative build, not reproduced** | the digest *is* the `authoritative_reference` and neither model matches | fails: the encoder no longer reproduces the reference the claim is asserted against — a defect, not a compiler difference |
+
+The `#[ignore]` reason names the same prerequisite. The identity is a whole-file,
+per-tensor byte comparison in every outcome. The fixture it resolves is
 additionally verified against the manifest of §4.2.2 first, so *which file* is
 being compared against is checked too — a stale or replaced reference in the
 cache refuses the run instead of silently becoming the reference.
@@ -543,13 +561,41 @@ the persistent cache `~/.cache/minfer/f6-src/` (never `/tmp`):
 `MINFER_F6_QUANT_TYPE=q4_K|q5_K|q6_K` with `MINFER_F6_F16_GGUF` /
 `MINFER_F6_LLAMACPP_QUANT` set to the pair above: **290/290 tensors byte-identical
 on the 0.5B** (`encoded-as q5_0: 145, f32: 121, q4_K: 24`) and **310/310 on the
-0.6B** (`encoded-as f32: 113, q4_K: 197`), for each of the three types. The gate
-prints that breakdown, so "byte-identical" always carries how many tensors the
-new encoder actually saw. Legacy regression on the same 0.5B source:
-q4_0/q4_1/q5_0/q5_1/q8_0 all still 290/290 against the `-ffp-contract=fast`
-reference of §4.2 (the K-quant rows above are against that same build, and their
-per-expression fusion is *not* reproducible by the `Off` variant — that variant
-is the gate's provenance probe, not a second encoder).
+0.6B** (`encoded-as f32: 113, q4_K: 197`), for each of the three types — against
+the same recorded `dgxspark` build as §4.2: **`gcc 13.3.0`,
+`-ffp-contract=fast`**. The gate prints that breakdown, so "byte-identical" always
+carries how many tensors the new encoder actually saw; since
+[#349](https://github.com/yusiwen/minfer/issues/349) it names the recorded
+compiler too. Legacy regression on the same 0.5B source:
+q4_0/q4_1/q5_0/q5_1/q8_0 all still 290/290 against the reference of §4.2 (the
+K-quant rows above are against that same build, and their per-expression fusion is
+*not* reproducible by the `Off` variant — that variant is the gate's provenance
+probe, not a second encoder).
+
+**The K-quant claim is compiler-sensitive, and the record says which compiler.**
+Measured 2026-10-07 on `macbook (macOS 27.0.1, Apple M4 Pro)`: after rebuilding
+`llama-quantize` from `c479922ac` with
+`-DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -ffp-contract=fast"` (the flag confirmed by
+disassembly — `fmul` + `fadd` → `fmadd`/`fmla`, Apple clang 21.0.0), the five
+legacy quads pass **290/290** and **every K-quant fails**: `tensor
+blk.0.ffn_down.weight payload differs (2285 of 2451456 bytes) … build unmatched`
+for `q4_K`, `97 of 2996224` for `q5_K`, `269 of 3575040` for `q6_K` — the
+reference matches neither minfer's `FmaContract::Fast` nor its uncontracted `Off`
+model. `git log 050dde50c..c479922ac -- ggml/src/ggml-quants.c` touches only the
+q3_K/i-quant encoders, so the residual is **Apple-clang-vs-GCC codegen of the
+search quantizers above**, not `-ffp-contract`.
+
+**The decision this forces, recorded.** The byte-parity claim is asserted against
+**the content `docs/f6-fixtures.json` marks `authoritative_reference`** (§4.2.2) —
+for every `ref/…` path exactly one, the `dgxspark` `gcc 13.3.0`
+`-ffp-contract=fast` build. A reference whose digest *is* recorded but is not that
+entry is a different compiler's build of the same source: the gate names the file's
+build, the authoritative one and the reason and **skips loudly**, because a
+permanently red gate on a supported platform is the failure mode the project has
+already filed once (`docs/ARCHITECTURE-EXECUTION-PLAN.md` §14 row 6). A mismatch
+against the authoritative entry, or against a file no entry records, still
+**fails**: the skip is never available to the claim's own reference, and a
+corrupted or unrecorded file cannot be excused as a compiler difference.
 
 Reproduce the sources and references:
 
@@ -592,7 +638,19 @@ explaining it: the f16 source and its bf16 cast differ by **minfer producer
 version** (`dgxspark`, 2026-09-27, commit unrecorded — a Mac regeneration at
 master `ab34a72` produced other bytes, and `bf16-from-f32`, whose input *is*
 identical on both boxes, is identical too), while the `ref/qwen2.5-0.5b-*`
-references differ by the reference build's `-ffp-contract` (§4.2).
+references differ by the reference **build** (§4.2: the two boxes'
+`llama-quantize`s — `dgxspark` `gcc 13.3.0` and the Mac's Apple clang 21.0.0).
+
+Exactly one of a `ref/…` path's entries carries `authoritative_reference: true`
+([#349](https://github.com/yusiwen/minfer/issues/349)): **the content the
+byte-parity claim is asserted against**, which for every path today is the
+`dgxspark` `gcc 13.3.0` `-ffp-contract=fast` build. The mark is what lets the
+parity gate's verdict say *which* recorded build it is looking at, and therefore
+whether a mismatch against both encoder models may be excused as a different
+compiler (§4.2.1) or must be reported as an encoder defect. `--check` enforces it
+as **S6**: a path with a `llama-quantize` record has exactly one marked entry, the
+mark is on a `llama-quantize` entry built with `-ffp-contract=fast`, and it
+appears nowhere else.
 
 ```bash
 python3 scripts/check_f6_fixtures.py --check     # CI: the manifest's shape + the tree cross-check
@@ -614,11 +672,13 @@ an experiment — which is how the refusal is demonstrated without touching
 cache root, where a path the manifest does not name is not a fixture at all.
 
 **What it does not cover.** The manifest checks content, not truth: nothing else
-recorded those bytes, so a wrong digest in the record is accepted. Eleven Mac
-references carry a **truncated** digest (the 2026-10-07 table kept 8 hex
-characters), so a matching prefix is accepted with a `WEAK` line and the full
-digest must be re-captured on the Mac ([#342](https://github.com/yusiwen/minfer/issues/342)).
-The `hf/` checkpoint's `main` revision is not pinned by the download recipe (only
+recorded those bytes, so a wrong digest in the record is accepted. Every entry
+carries a full `sha256` since [PR
+#350](https://github.com/yusiwen/minfer/pull/350) re-captured the eleven Mac
+references (the 2026-10-07 table had kept 8 hex characters), so
+`--strict-digests` passes with no `WEAK` line; the reader still accepts a
+`sha256_prefix` entry weakly, for a digest that has to be re-captured again. The
+`hf/` checkpoint's `main` revision is not pinned by the download recipe (only
 its bytes are recorded), and `f164/minfer-f16.gguf` has a pinned digest but no
 recorded producer at all (it is #164's fixture). Regenerating the chain from the
 manifest is still the manual recipe above, not a command.
