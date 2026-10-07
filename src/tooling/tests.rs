@@ -98,10 +98,16 @@ fn logits_greedy_on(
     (logits, toks)
 }
 /// Compare every tensor payload of two GGUFs by name (offset-independent).
-/// Returns the number of tensors compared.
-fn assert_tensor_payloads_equal(a_path: &Path, b_path: &Path) -> usize {
-    let ma = crate::gguf::load_gguf_model(a_path).expect("a parses");
-    let mb = crate::gguf::load_gguf_model(b_path).expect("b parses");
+/// `Ok(n)` is the number of tensors compared; `Err` names the first difference
+/// and counts the differing bytes of that tensor (`Ok`/`Err` rather than an
+/// assertion because the F6 parity gate asks the same question of a *second*,
+/// deliberately differently-encoded file before it reports a failure — see
+/// `tests/quantize_bounds.rs`).
+fn tensor_payloads_equal(a_path: &Path, b_path: &Path) -> Result<usize, String> {
+    let ma = crate::gguf::load_gguf_model(a_path)
+        .ok_or_else(|| format!("{} does not parse", a_path.display()))?;
+    let mb = crate::gguf::load_gguf_model(b_path)
+        .ok_or_else(|| format!("{} does not parse", b_path.display()))?;
     let mut index = std::collections::HashMap::new();
     for (pi, part) in ma.parts.iter().enumerate() {
         for ti in &part.ctx.info {
@@ -115,20 +121,36 @@ fn assert_tensor_payloads_equal(a_path: &Path, b_path: &Path) -> usize {
             let off = part.ctx.offset + ti.offset as usize;
             let (pa, oa, na) = index
                 .get(&ti.name)
-                .unwrap_or_else(|| panic!("tensor '{}' only in the second file", ti.name));
-            assert_eq!(*na, ti.nbytes(), "tensor {} size", ti.name);
-            assert_eq!(
+                .ok_or_else(|| format!("tensor '{}' only in the second file", ti.name))?;
+            if *na != ti.nbytes() {
+                return Err(format!("tensor {} size {} != {}", ti.name, na, ti.nbytes()));
+            }
+            let (xa, xb) = (
                 &ma.parts[*pa].data[*oa..*oa + *na],
                 &mb.parts[pi].data[off..off + ti.nbytes()],
-                "tensor {} payload differs",
-                ti.name
             );
+            if xa != xb {
+                let diff = xa.iter().zip(xb).filter(|(p, q)| p != q).count();
+                return Err(format!(
+                    "tensor {} payload differs ({diff} of {} bytes)",
+                    ti.name,
+                    xa.len()
+                ));
+            }
             n += 1;
         }
     }
-    assert_eq!(n, index.len(), "tensor set differs");
+    if n != index.len() {
+        return Err("tensor set differs".to_string());
+    }
     assert!(n > 0);
-    n
+    Ok(n)
+}
+
+/// [`tensor_payloads_equal`] as an assertion, for the gates that have nothing
+/// else to ask. Returns the number of tensors compared.
+fn assert_tensor_payloads_equal(a_path: &Path, b_path: &Path) -> usize {
+    tensor_payloads_equal(a_path, b_path).unwrap_or_else(|e| panic!("{e}"))
 }
 /// The Qwen3 twin of [`logits_greedy_on`] (that one is pinned to `Qwen2Model`).
 /// Same forward code on both arms, so the only difference is the backend the

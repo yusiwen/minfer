@@ -305,12 +305,62 @@ fn put_f16_bits(out: &mut Vec<u8>, bits: u16) {
 
 // === Encoders (llama.cpp refs, verbatim arithmetic) ===
 
+/// Which `-ffp-contract` semantics an encoder run reproduces.
+///
+/// This is the one input the byte-parity claim of this module is *conditional*
+/// on. llama.cpp's `quantize_row_q4_0_ref` computes `x*id + c`; a compiler that
+/// contracts that expression across statements (`-ffp-contract=fast`, GCC's
+/// default and what every recorded reference was built with) emits one FMA,
+/// while one that does not (Apple clang without the flag, or GCC/clang with
+/// `-ffp-contract=off`) emits `fmul` + `fadd` and picks a different quant at an
+/// exact rounding boundary. Production always asks for [`FmaContract::Fast`];
+/// the F6 byte-parity gate's provenance probe asks for [`FmaContract::Off`] to
+/// identify which build produced the `llama-quantize` reference it is comparing
+/// against (`docs/GGUF-TOOLING.md` §4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmaContract {
+    /// `-ffp-contract=fast`: every `a*b + c` is one fused multiply-add.
+    Fast,
+    /// Every fused operation split back into a multiply and an add — what a
+    /// compiler that does not contract across statements emits. **Exact** for
+    /// the legacy `q4_0`/`q4_1`/`q5_0`/`q5_1` encoders, whose reference has one
+    /// contractable shape per element, and a *model* of the K-quants, whose
+    /// reference additionally depends on the compiler's per-expression fusion
+    /// and vectorization choices (§4.2.1). Only the F6 parity gate's provenance
+    /// probe constructs it (`src/tooling/tests/quantize_bounds.rs`), so it is
+    /// scoped to the test build rather than annotated with an `allow`.
+    #[cfg(test)]
+    Off,
+}
+
+/// `a*b + c` under an explicit [`FmaContract`]. The `Fast` arm is the
+/// production arithmetic (`f32::mul_add`); the `Off` arm exists only in the
+/// test build, so a non-test build has exactly one arm and no choice to make.
+#[inline]
+fn fma(contract: FmaContract, a: f32, b: f32, c: f32) -> f32 {
+    match contract {
+        FmaContract::Fast => a.mul_add(b, c),
+        #[cfg(test)]
+        FmaContract::Off => a * b + c,
+    }
+}
+
 /// Quantize a flat run of f32 (a whole row, or a whole tensor whose rows are
 /// contiguous and block-aligned) to `target`'s byte layout.
 ///
 /// For f16/f32 this is an element cast; for the quants it is the llama.cpp
-/// reference encoder block by block.
+/// reference encoder block by block. This is the `-ffp-contract=fast`
+/// arithmetic — the documented reference build; see [`quantize_row_with`].
 pub fn quantize_row(target: QuantTarget, x: &[f32]) -> Vec<u8> {
+    quantize_row_with(target, x, FmaContract::Fast)
+}
+
+/// [`quantize_row`] with an explicit FMA-contract variant.
+///
+/// The variant is a no-op for `f16`/`f32` (an element cast) and for `q8_0` (a
+/// single multiply and no add, so there is nothing to contract); it is the
+/// whole difference for the legacy quants and part of it for the K-quants.
+pub fn quantize_row_with(target: QuantTarget, x: &[f32], contract: FmaContract) -> Vec<u8> {
     match target {
         QuantTarget::F32 => x.iter().flat_map(|v| v.to_le_bytes()).collect(),
         QuantTarget::F16 => {
@@ -321,13 +371,13 @@ pub fn quantize_row(target: QuantTarget, x: &[f32]) -> Vec<u8> {
             out
         }
         QuantTarget::Q8_0 => quantize_q8_0(x),
-        QuantTarget::Q4_0 => quantize_q4_0(x),
-        QuantTarget::Q4_1 => quantize_q4_1(x),
-        QuantTarget::Q5_0 => quantize_q5_0(x),
-        QuantTarget::Q5_1 => quantize_q5_1(x),
-        QuantTarget::Q4_K => quantize_q4_k(x),
-        QuantTarget::Q5_K => quantize_q5_k(x),
-        QuantTarget::Q6_K => quantize_q6_k(x),
+        QuantTarget::Q4_0 => quantize_q4_0(x, contract),
+        QuantTarget::Q4_1 => quantize_q4_1(x, contract),
+        QuantTarget::Q5_0 => quantize_q5_0(x, contract),
+        QuantTarget::Q5_1 => quantize_q5_1(x, contract),
+        QuantTarget::Q4_K => quantize_q4_k(x, contract),
+        QuantTarget::Q5_K => quantize_q5_k(x, contract),
+        QuantTarget::Q6_K => quantize_q6_k(x, contract),
     }
 }
 
@@ -348,7 +398,7 @@ fn quantize_q8_0(x: &[f32]) -> Vec<u8> {
     out
 }
 
-fn quantize_q4_0(x: &[f32]) -> Vec<u8> {
+fn quantize_q4_0(x: &[f32], contract: FmaContract) -> Vec<u8> {
     let mut out = Vec::with_capacity(x.len() / 32 * 18);
     for blk in x.chunks_exact(32) {
         let (mut amax, mut max) = (0.0f32, 0.0f32);
@@ -367,8 +417,8 @@ fn quantize_q4_0(x: &[f32]) -> Vec<u8> {
             // `x*id + 8.5f` is contracted to an FMA on aarch64/x86. Without the
             // FMA the encoder differs from `llama-quantize` in a handful of
             // nibbles (12 of 64512 on one 0.5B tensor) — byte parity needs it.
-            let xi0 = trunc_i8(blk[j].mul_add(id, 8.5)).min(15) as u8;
-            let xi1 = trunc_i8(blk[j + 16].mul_add(id, 8.5)).min(15) as u8;
+            let xi0 = trunc_i8(fma(contract, blk[j], id, 8.5)).min(15) as u8;
+            let xi1 = trunc_i8(fma(contract, blk[j + 16], id, 8.5)).min(15) as u8;
             qs[j] = xi0 | (xi1 << 4);
         }
         out.extend_from_slice(&qs);
@@ -376,7 +426,7 @@ fn quantize_q4_0(x: &[f32]) -> Vec<u8> {
     out
 }
 
-fn quantize_q4_1(x: &[f32]) -> Vec<u8> {
+fn quantize_q4_1(x: &[f32], contract: FmaContract) -> Vec<u8> {
     let mut out = Vec::with_capacity(x.len() / 32 * 20);
     for blk in x.chunks_exact(32) {
         let mut min = f32::MAX;
@@ -395,8 +445,8 @@ fn quantize_q4_1(x: &[f32]) -> Vec<u8> {
         put_f16(&mut out, min);
         let mut qs = [0u8; 16];
         for j in 0..16 {
-            let xi0 = trunc_i8((blk[j] - min).mul_add(id, 0.5)).min(15) as u8;
-            let xi1 = trunc_i8((blk[j + 16] - min).mul_add(id, 0.5)).min(15) as u8;
+            let xi0 = trunc_i8(fma(contract, blk[j] - min, id, 0.5)).min(15) as u8;
+            let xi1 = trunc_i8(fma(contract, blk[j + 16] - min, id, 0.5)).min(15) as u8;
             qs[j] = xi0 | (xi1 << 4);
         }
         out.extend_from_slice(&qs);
@@ -404,7 +454,7 @@ fn quantize_q4_1(x: &[f32]) -> Vec<u8> {
     out
 }
 
-fn quantize_q5_0(x: &[f32]) -> Vec<u8> {
+fn quantize_q5_0(x: &[f32], contract: FmaContract) -> Vec<u8> {
     let mut out = Vec::with_capacity(x.len() / 32 * 22);
     for blk in x.chunks_exact(32) {
         let (mut amax, mut max) = (0.0f32, 0.0f32);
@@ -420,8 +470,8 @@ fn quantize_q5_0(x: &[f32]) -> Vec<u8> {
         let mut qh = 0u32;
         let mut qs = [0u8; 16];
         for j in 0..16 {
-            let xi0 = trunc_i8(blk[j].mul_add(id, 16.5)).min(31) as u8;
-            let xi1 = trunc_i8(blk[j + 16].mul_add(id, 16.5)).min(31) as u8;
+            let xi0 = trunc_i8(fma(contract, blk[j], id, 16.5)).min(31) as u8;
+            let xi1 = trunc_i8(fma(contract, blk[j + 16], id, 16.5)).min(31) as u8;
             qs[j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
             // The 5th bit goes to a separate plane, element j for the low half
             // and element j+16 for the high half.
@@ -434,7 +484,7 @@ fn quantize_q5_0(x: &[f32]) -> Vec<u8> {
     out
 }
 
-fn quantize_q5_1(x: &[f32]) -> Vec<u8> {
+fn quantize_q5_1(x: &[f32], contract: FmaContract) -> Vec<u8> {
     let mut out = Vec::with_capacity(x.len() / 32 * 24);
     for blk in x.chunks_exact(32) {
         let mut min = f32::MAX;
@@ -454,8 +504,8 @@ fn quantize_q5_1(x: &[f32]) -> Vec<u8> {
         let mut qh = 0u32;
         let mut qs = [0u8; 16];
         for j in 0..16 {
-            let xi0 = trunc_i8((blk[j] - min).mul_add(id, 0.5)) as u8;
-            let xi1 = trunc_i8((blk[j + 16] - min).mul_add(id, 0.5)) as u8;
+            let xi0 = trunc_i8(fma(contract, blk[j] - min, id, 0.5)) as u8;
+            let xi1 = trunc_i8(fma(contract, blk[j + 16] - min, id, 0.5)) as u8;
             qs[j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
             qh |= (((xi0 & 0x10u8) >> 4) as u32) << j;
             qh |= (((xi1 & 0x10u8) >> 4) as u32) << (j + 16);
@@ -500,8 +550,8 @@ fn nearest_int(fval: f32) -> i32 {
 /// **not** rounded before the add. Writing `nearest_int(a * b)` rounds twice and
 /// picks a different integer at a boundary.
 #[inline]
-fn nearest_int_mul(a: f32, b: f32) -> i32 {
-    let val = a.mul_add(b, 12_582_912.0f32);
+fn nearest_int_mul(a: f32, b: f32, contract: FmaContract) -> i32 {
+    let val = fma(contract, a, b, 12_582_912.0f32);
     let i = val.to_bits() as i32;
     (i & 0x007f_ffff) - 0x0040_0000
 }
@@ -530,6 +580,7 @@ fn make_qx_quants(
     l: &mut [i8],
     rmse_type: i32,
     qw: Option<&[f32]>,
+    contract: FmaContract,
 ) -> f32 {
     let (mut max, mut amax) = (0.0f32, 0.0f32);
     for i in 0..n {
@@ -549,7 +600,7 @@ fn make_qx_quants(
     let mut iscale = -(nmax as f32) / max;
     if rmse_type == 0 {
         for i in 0..n {
-            let li = nearest_int_mul(iscale, x[i]);
+            let li = nearest_int_mul(iscale, x[i], contract);
             l[i] = (nmax + li.clamp(-nmax, nmax - 1)) as i8;
         }
         return 1.0 / iscale;
@@ -563,11 +614,11 @@ fn make_qx_quants(
     let mut sumlx = 0.0f32;
     let mut suml2 = 0.0f32;
     for i in 0..n {
-        let li = nearest_int_mul(iscale, x[i]).clamp(-nmax, nmax - 1);
+        let li = nearest_int_mul(iscale, x[i], contract).clamp(-nmax, nmax - 1);
         l[i] = (li + nmax) as i8;
         let w = qw.map_or_else(|| rmse_weight(rmse_type, x[i]), |q| q[i]);
-        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
-        suml2 = (w * li as f32).mul_add(li as f32, suml2);
+        sumlx = fma(contract, w * x[i], li as f32, sumlx);
+        suml2 = fma(contract, w * li as f32, li as f32, suml2);
     }
     let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
     if return_early {
@@ -582,7 +633,11 @@ fn make_qx_quants(
         if is == 0 {
             continue;
         }
-        iscale = -0.1f32.mul_add(is as f32, nmax as f32) / max;
+        // The original spelling is `-0.1f32.mul_add(is, nmax)`, and the method
+        // call binds first: the fused expression is `0.1*is + nmax` and only
+        // *then* negated (llama.cpp computes `-(nmax + 0.1f*is)`), which is not
+        // `fma(-0.1, is, nmax)` — the sign of `nmax` would move.
+        iscale = -fma(contract, 0.1f32, is as f32, nmax as f32) / max;
         // The search loop is *vectorized* by GCC (4-wide), and the reduction is
         // a plain `fmul` product per element plus an in-order `fadd` sum — it
         // does NOT contract the `+=` into an FMA, unlike the scalar initial loop
@@ -591,7 +646,7 @@ fn make_qx_quants(
         sumlx = 0.0;
         suml2 = 0.0;
         for i in 0..n {
-            let li = nearest_int_mul(iscale, x[i]).clamp(-nmax, nmax - 1);
+            let li = nearest_int_mul(iscale, x[i], contract).clamp(-nmax, nmax - 1);
             let w = qw.map_or_else(|| rmse_weight(rmse_type, x[i]), |q| q[i]);
             let lf = li as f32;
             sumlx += (w * x[i]) * lf;
@@ -599,7 +654,7 @@ fn make_qx_quants(
         }
         if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
             for i in 0..n {
-                let li = nearest_int_mul(iscale, x[i]).clamp(-nmax, nmax - 1);
+                let li = nearest_int_mul(iscale, x[i], contract).clamp(-nmax, nmax - 1);
                 l[i] = (li + nmax) as i8;
             }
             scale = sumlx / suml2;
@@ -625,6 +680,7 @@ fn make_qkx2_quants(
     rmin: f32,
     rdelta: f32,
     nstep: i32,
+    contract: FmaContract,
 ) -> f32 {
     let mut min = x[0];
     let mut max = x[0];
@@ -639,7 +695,7 @@ fn make_qkx2_quants(
         }
         let w = weights[i];
         sum_w += w;
-        sum_x = w.mul_add(x[i], sum_x);
+        sum_x = fma(contract, w, x[i], sum_x);
     }
     if min > 0.0 {
         min = 0.0;
@@ -655,46 +711,46 @@ fn make_qkx2_quants(
     let mut scale = 1.0 / iscale;
     let mut best_error = 0.0f32;
     for i in 0..n {
-        let li = nearest_int_mul(iscale, x[i] - min);
+        let li = nearest_int_mul(iscale, x[i] - min, contract);
         l[i] = li.clamp(0, nmax) as u8;
-        let diff = scale.mul_add(l[i] as f32, min) - x[i];
+        let diff = fma(contract, scale, l[i] as f32, min) - x[i];
         let diff = diff * diff;
-        best_error = weights[i].mul_add(diff, best_error);
+        best_error = fma(contract, weights[i], diff, best_error);
     }
     if nstep < 1 {
         *the_min = -min;
         return scale;
     }
     for is in 0..=nstep {
-        iscale = (rdelta.mul_add(is as f32, rmin) + nmax as f32) / (max - min);
+        iscale = (fma(contract, rdelta, is as f32, rmin) + nmax as f32) / (max - min);
         let (mut sum_l, mut sum_l2, mut sum_xl) = (0.0f32, 0.0f32, 0.0f32);
         for i in 0..n {
-            let li = nearest_int_mul(iscale, x[i] - min).clamp(0, nmax);
+            let li = nearest_int_mul(iscale, x[i] - min, contract).clamp(0, nmax);
             laux[i] = li as u8;
             let w = weights[i];
             let lf = li as f32;
             let wl = w * lf;
             sum_l += wl;
-            sum_l2 = wl.mul_add(lf, sum_l2);
-            sum_xl = wl.mul_add(x[i], sum_xl);
+            sum_l2 = fma(contract, wl, lf, sum_l2);
+            sum_xl = fma(contract, wl, x[i], sum_xl);
         }
         // `a*b - c*d` contracts as `fma(a, b, -(c*d))` — the *left* product
         // is the fused one (the production object computes this with
         // `fmul` + `fnmsub`). All three of these are rounding boundaries the
         // search ranks candidates by, so the contraction is load-bearing.
-        let d = sum_w.mul_add(sum_l2, -(sum_l * sum_l));
+        let d = fma(contract, sum_w, sum_l2, -(sum_l * sum_l));
         if d > 0.0 {
-            let mut this_scale = sum_x.mul_add(-sum_l, sum_w * sum_xl) / d;
-            let mut this_min = sum_l2.mul_add(sum_x, -(sum_l * sum_xl)) / d;
+            let mut this_scale = fma(contract, sum_x, -sum_l, sum_w * sum_xl) / d;
+            let mut this_min = fma(contract, sum_l2, sum_x, -(sum_l * sum_xl)) / d;
             if this_min > 0.0 {
                 this_min = 0.0;
                 this_scale = sum_xl / sum_l2;
             }
             let mut cur_error = 0.0f32;
             for i in 0..n {
-                let diff = this_scale.mul_add(laux[i] as f32, this_min) - x[i];
+                let diff = fma(contract, this_scale, laux[i] as f32, this_min) - x[i];
                 let diff = diff * diff;
-                cur_error = weights[i].mul_add(diff, cur_error);
+                cur_error = fma(contract, weights[i], diff, cur_error);
             }
             if cur_error < best_error {
                 l[..n].copy_from_slice(&laux[..n]);
@@ -728,7 +784,13 @@ fn get_scale_min_k4(j: usize, q: &[u8; 12]) -> (u8, u8) {
 ///
 /// `nmax` is 15 for q4_K and 31 for q5_K; `rmin`/`nstep` are the reference's
 /// per-type search parameters.
-fn q4k_q5k_common(x: &[f32], nmax: i32, rmin: f32, nstep: i32) -> ([u8; 12], u16, u16, [u8; 256]) {
+fn q4k_q5k_common(
+    x: &[f32],
+    nmax: i32,
+    rmin: f32,
+    nstep: i32,
+    contract: FmaContract,
+) -> ([u8; 12], u16, u16, [u8; 256]) {
     let mut weights = [0.0f32; 32];
     let mut mins = [0.0f32; 8];
     let mut scales = [0.0f32; 8];
@@ -745,7 +807,7 @@ fn q4k_q5k_common(x: &[f32], nmax: i32, rmin: f32, nstep: i32) -> ([u8; 12], u16
         // so the contraction is part of the encoder.
         let mut sum_x2 = 0.0f32;
         for l in 0..32 {
-            sum_x2 = xb[l].mul_add(xb[l], sum_x2);
+            sum_x2 = fma(contract, xb[l], xb[l], sum_x2);
         }
         let av_x = (sum_x2 / 32.0).sqrt();
         for l in 0..32 {
@@ -762,6 +824,7 @@ fn q4k_q5k_common(x: &[f32], nmax: i32, rmin: f32, nstep: i32) -> ([u8; 12], u16
             rmin,
             0.1,
             nstep,
+            contract,
         );
         if scales[j] > max_scale {
             max_scale = scales[j];
@@ -778,8 +841,8 @@ fn q4k_q5k_common(x: &[f32], nmax: i32, rmin: f32, nstep: i32) -> ([u8; 12], u16
     let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
     let mut sc_packed = [0u8; 12];
     for j in 0..8 {
-        let ls = (nearest_int_mul(inv_scale, scales[j]) as u8).min(63);
-        let lm = (nearest_int_mul(inv_min, mins[j]) as u8).min(63);
+        let ls = (nearest_int_mul(inv_scale, scales[j], contract) as u8).min(63);
+        let lm = (nearest_int_mul(inv_min, mins[j], contract) as u8).min(63);
         if j < 4 {
             sc_packed[j] = ls;
             sc_packed[j + 4] = lm;
@@ -810,10 +873,10 @@ fn q4k_q5k_common(x: &[f32], nmax: i32, rmin: f32, nstep: i32) -> ([u8; 12], u16
     (sc_packed, d.to_bits(), dmin.to_bits(), l_all)
 }
 
-fn quantize_q4_k(x: &[f32]) -> Vec<u8> {
+fn quantize_q4_k(x: &[f32], contract: FmaContract) -> Vec<u8> {
     let mut out = Vec::with_capacity(x.len() / K_QUANT_BLOCK * 144);
     for xb in x.chunks_exact(K_QUANT_BLOCK) {
-        let (scales, d, dmin, l) = q4k_q5k_common(xb, 15, -1.0, 20);
+        let (scales, d, dmin, l) = q4k_q5k_common(xb, 15, -1.0, 20, contract);
         put_f16_bits(&mut out, d);
         put_f16_bits(&mut out, dmin);
         out.extend_from_slice(&scales);
@@ -828,10 +891,10 @@ fn quantize_q4_k(x: &[f32]) -> Vec<u8> {
     out
 }
 
-fn quantize_q5_k(x: &[f32]) -> Vec<u8> {
+fn quantize_q5_k(x: &[f32], contract: FmaContract) -> Vec<u8> {
     let mut out = Vec::with_capacity(x.len() / K_QUANT_BLOCK * 176);
     for xb in x.chunks_exact(K_QUANT_BLOCK) {
-        let (scales, d, dmin, l) = q4k_q5k_common(xb, 31, -0.5, 15);
+        let (scales, d, dmin, l) = q4k_q5k_common(xb, 31, -0.5, 15, contract);
         put_f16_bits(&mut out, d);
         put_f16_bits(&mut out, dmin);
         out.extend_from_slice(&scales);
@@ -865,7 +928,7 @@ fn quantize_q5_k(x: &[f32]) -> Vec<u8> {
     out
 }
 
-fn quantize_q6_k(x: &[f32]) -> Vec<u8> {
+fn quantize_q6_k(x: &[f32], contract: FmaContract) -> Vec<u8> {
     let mut out = Vec::with_capacity(x.len() / K_QUANT_BLOCK * 210);
     for xb in x.chunks_exact(K_QUANT_BLOCK) {
         // 16 sub-blocks of 16 elements, each with its own `make_qx_quants`
@@ -881,6 +944,7 @@ fn quantize_q6_k(x: &[f32]) -> Vec<u8> {
                 &mut l_all[16 * ib..16 * ib + 16],
                 1,
                 None,
+                contract,
             );
             scales[ib] = scale;
             let abs_scale = scale.abs();
@@ -898,7 +962,7 @@ fn quantize_q6_k(x: &[f32]) -> Vec<u8> {
         let d = half::f16::from_f32(1.0 / iscale);
         let mut sc = [0i8; 16];
         for ib in 0..16 {
-            sc[ib] = nearest_int_mul(iscale, scales[ib]).min(127) as i8;
+            sc[ib] = nearest_int_mul(iscale, scales[ib], contract).min(127) as i8;
         }
         let d_f32 = d.to_f32();
         for j in 0..16 {

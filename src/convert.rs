@@ -1208,6 +1208,7 @@ impl QuantizePlan {
         model: &crate::gguf::GgufModel,
         i: usize,
         w: &mut dyn Write,
+        contract: crate::quantize::FmaContract,
     ) -> io::Result<()> {
         let s = &self.sources[i];
         let src = &model.parts[s.part].data[s.offset..s.offset + s.src_nbytes];
@@ -1222,13 +1223,42 @@ impl QuantizePlan {
                     s.src_type.type_name()
                 ))
             })?;
-        let bytes = crate::quantize::quantize_row(s.retarget.unwrap_or(self.target), &f32s);
+        let tgt = s.retarget.unwrap_or(self.target);
+        let bytes = match contract {
+            // Production is `quantize_row` itself, so the documented reference
+            // build and the writer's pass path are one call, not two spellings
+            // of the same arithmetic.
+            crate::quantize::FmaContract::Fast => crate::quantize::quantize_row(tgt, &f32s),
+            #[cfg(test)]
+            crate::quantize::FmaContract::Off => {
+                crate::quantize::quantize_row_with(tgt, &f32s, contract)
+            }
+        };
         w.write_all(&bytes)
     }
 
     pub fn write_single(&self, model: &crate::gguf::GgufModel, path: &Path) -> Result<(), String> {
         gguf_write::write_single(path, &self.kv, self.specs.clone(), 32, |i, w| {
-            self.encode_into(model, i, w)
+            self.encode_into(model, i, w, crate::quantize::FmaContract::Fast)
+        })
+    }
+
+    /// [`write_single`] with an explicit `-ffp-contract` variant: the same
+    /// file, encoded by the uncontracted arithmetic a `llama-quantize` built
+    /// without `-ffp-contract=fast` produces. Only the F6 byte-parity gate's
+    /// provenance probe calls it (`src/tooling/tests/quantize_bounds.rs`), to
+    /// identify which build the reference it is comparing against came from —
+    /// so it is scoped to the test build rather than annotated with an `allow`
+    /// (see `docs/GGUF-TOOLING.md` §4.2).
+    #[cfg(test)]
+    pub fn write_single_with_contract(
+        &self,
+        model: &crate::gguf::GgufModel,
+        path: &Path,
+        contract: crate::quantize::FmaContract,
+    ) -> Result<(), String> {
+        gguf_write::write_single(path, &self.kv, self.specs.clone(), 32, |i, w| {
+            self.encode_into(model, i, w, contract)
         })
     }
 
@@ -1246,7 +1276,7 @@ impl QuantizePlan {
             self.specs.clone(),
             32,
             max_part_bytes,
-            |i, w| self.encode_into(model, i, w),
+            |i, w| self.encode_into(model, i, w, crate::quantize::FmaContract::Fast),
         )
     }
 }
