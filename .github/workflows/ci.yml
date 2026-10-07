@@ -72,6 +72,15 @@
 #                       frozen in the script with a reason apiece, and an
 #                       exemption that no longer covers a failure is itself a
 #                       failure (the dead-code ratchet's shape).
+#                       And `scripts/check_anchor_drift.py` (#344): resolving is
+#                       not pointing, so a PR that adds or removes lines in an
+#                       anchored file is diffed against its merge base
+#                       (`origin/<base_ref>...HEAD`, hence `fetch-depth: 0` here)
+#                       and every live anchor compared with the old->new line map
+#                       — `#329`'s 7 and `#299`'s 69 anchors were caught by a
+#                       hand-written map, not by CI. Anchors whose cited line was
+#                       removed are reported for a human; the same FROZEN set
+#                       exempts the same records.
 # 5. check-viz        : the shape-flow gate. `scripts/check_viz_e2e.mjs` replays the
 #                       stage template against every exported sample and requires the
 #                       computed shapes to equal the ones the engine actually
@@ -291,6 +300,22 @@ jobs:
         run: python3 scripts/check_doc_line_anchors.py
       - name: The doc-line-anchor checker's own pass/fail cases
         run: python3 scripts/check_doc_line_anchors.py --selftest
+      # #344: resolving is not pointing. A PR that adds or removes lines in a file
+      # the docs anchor into shifts every anchor below the edit, and the checker
+      # above stays green because the numbers still resolve. This diffs `HEAD`
+      # against the *merge base* of the target branch — `origin/<base_ref>...HEAD`
+      # is exactly that, and it is why this job's checkout needs `fetch-depth: 0`
+      # (the docstring above says why that is required for `check_status.py`; the
+      # merge base is the second reason). `origin/<base_ref>` is fetched by
+      # actions/checkout at depth 0, so the base is always present in this job;
+      # `pull_request` only, because a push to the default branch has no base.
+      - name: An anchor whose target moved must have been re-pointed
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: python3 scripts/check_anchor_drift.py "origin/$BASE_REF"
+      - name: The anchor-drift checker's own pass/fail cases
+        run: python3 scripts/check_anchor_drift.py --selftest
       # #205: the F6 gates compare against fixtures under ~/.cache/minfer/f6-src/
       # that CI does not have, so this job carries the half that needs no bytes —
       # the manifest's shape, the tree cross-check, and the checker's own tamper

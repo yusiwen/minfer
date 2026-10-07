@@ -187,6 +187,15 @@ FROZEN = {
         "criteria and panic transcripts verbatim from the revision they were "
         "written against (SOURCE-LAYOUT-PLAN §6.2)"
     ),
+    "docs/METAL-OBJC2-MIGRATION-PLAN.md": (
+        "completed objc 0.2 → objc2 migration record (its Status line reads "
+        "Implemented, 2026-08-25): the two `Cargo.toml:38-43` anchors name the "
+        "`[lints.rust] unexpected_cfgs` block that commit 6a382a3 deleted, so they "
+        "cite the pre-execution file and cannot be re-pointed — the block is gone, "
+        "and no revision of Cargo.toml ever held it at 38-43 — and the five "
+        "`metal_backend.rs:NNN` anchors name that file's 2026-08-25 revision, which "
+        "~20 commits have moved since (issue #344)"
+    ),
 }
 
 #: Directories that exist at the repository root today. Rule A only judges a

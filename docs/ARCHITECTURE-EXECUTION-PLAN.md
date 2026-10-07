@@ -8547,6 +8547,46 @@ sign in `make_qx_quants` → q6_K `blk.0.ffn_down.weight payload differs (256768
 of 3575040 bytes)`, green again 290/290 after the fix (the round-trip unit tests
 did not see it).
 
+**#344 (2026-10-07) — the anchor checker can now see a moved target.**
+`check_doc_line_anchors.py` ([#266](https://github.com/yusiwen/minfer/issues/266))
+proves an anchor's file exists, its line is in range and its adjacent symbol is
+still in that file; a commit that inserts a line in an anchored file leaves every
+anchor below it resolving and wrong, and the checker stays green. That happened
+twice in one round —
+[#329](https://github.com/yusiwen/minfer/issues/329)'s dispatch change moved **7**
+anchors off by one (walkthrough docs 07 and 14),
+[#299](https://github.com/yusiwen/minfer/issues/299)'s weight accounting moved
+**69** across eight docs by 1–3 — and both were caught by a hand-written old→new
+line map. `scripts/check_anchor_drift.py` is that map as a gate: it diffs `HEAD`
+against the merge base (`git diff -U0 <rev>...HEAD`), reads the anchors of *both*
+revisions through the same `Checker` / `ANCHOR` / `FROZEN` objects (it imports the
+#266 script rather than restating them), pairs them on the doc line with its
+numbers normalised — [PR #343](https://github.com/yusiwen/minfer/pull/343)'s own
+`":NNN" -> ":N"` proof, applied per line — and fails a pair that does not carry the
+mapped numbers, naming it `doc:line → target:old (now new)`. A cited *endpoint* the
+range deleted has no image in the map, so it is reported as `ambiguous` for a human
+(`--strict` promotes it); an untouched target, an already re-pointed pair and an
+empty range are silent. It runs in `check-docs` on `pull_request` against
+`origin/<base_ref>` (hence the `fetch-depth: 0` that `check_status.py` already
+required) plus its own `--selftest` (stale, re-pointed, rewritten, frozen and
+unchanged cases, each a real two-commit repository). Re-measured on
+`dgxspark (aarch64, GB10 sm_121)`, 2026-10-07, with the recorded commands: over
+`#299`'s range (`--head eef052b 252932a`) it named **73** anchors — the 69
+[PR #343](https://github.com/yusiwen/minfer/pull/343) fixed and **4 it missed**
+(`docs/ARCHITECTURE-ROADMAP.md:98` and `:452`, `docs/SOURCE-LAYOUT-PLAN.md:56`,
+`docs/inference_e2e_walkthrough/03-model-dispatch-weights.md:705`, each verified by
+content) — and over `#329`'s (`--head 3bc896c 3bc896c^`) the 7, with both ranges
+green at their re-pointed heads; the third live case, `Cargo.toml:38-43` × 2 in
+`docs/METAL-OBJC2-MIGRATION-PLAN.md` (`--head 506b26c 387fe91` → `(now 47-52)`), is
+resolved by adding that completed-migration record to `FROZEN`: the anchors cite the
+`[lints.rust] unexpected_cfgs` block commit `6a382a3` deleted, so they cannot be
+re-pointed (re-pointing is not even defined — no revision of `Cargo.toml` ever held
+that block at 38-43). The existing checker's verdicts are untouched: 1537 anchors,
+297→**304** frozen and 1014→**1007** checked is the whole delta, and the new entry is
+reported `UNUSED FREEZE` (the ratchet's informational arm, not `STALE FREEZE`).
+Still owed: the bare `:NNN` continuations on those same lines are invisible to both
+checkers and belong to [#336](https://github.com/yusiwen/minfer/issues/336)'s sweep.
+
 ### F6b — f16 weights on the device backends + a vectorized CPU f16 dot (#141) — **DONE 2026-09-25**
 
 **What landed.** The third item F6 left open, plus the discovery that the fused
