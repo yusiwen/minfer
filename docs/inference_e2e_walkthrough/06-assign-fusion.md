@@ -371,7 +371,7 @@ makes the assignment *total*: every node leaves with a backend even if `supports
 `Err` arm for ops it has no kernel for (§3.4) — it just guarantees the *abort names the right
 node* instead of crashing on an `Option` unwrap.
 
-**Where the priority actually lives** — `src/graph/alloc.rs:139-157`:
+**Where the priority actually lives** — `src/graph/alloc.rs:140-158`:
 
 ```rust
 /// Which backend supports this op/dtype (highest priority first).
