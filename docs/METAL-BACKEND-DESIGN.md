@@ -403,30 +403,33 @@ is its own ticket.
 **Measured (issue [#315], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
 2026-10-07).** Bar named before the run (`docs/GATE-CONTRACT.md` rules 3 and 5): the windowed
 arm's tokens/s must reach **>= 0.8x** the causal prefill's at the same total token count, on the
-**median of interleaved matched rounds** (rule 4). It was **not met**. Qwen2.5-0.5B-Instruct Q4_0
-(`hd = 64`, f32 KV, `n_ctx = 1024`, `n_total = 512`), three runs of
+**median of interleaved matched rounds** (rule 4). It was **not met on either model**. Three runs
+each of
 
 ```
 cargo test --release --bin minfer -- --ignored --nocapture a_windowed_prefill_is_not_materially_slower
+MINFER_315_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf \
+  cargo test --release --bin minfer -- --ignored --nocapture a_windowed_prefill_is_not_materially_slower
 ```
 
 (a 5-round interleaved harness, `#[cfg(target_os = "macos")] #[ignore]`d, in
 `src/models/qwen2/graph/tests/batching.rs`; it prints the model, `n_ctx`, the node/attention-node
-counts and the kernel each arm took):
+counts and the kernel each arm took). Both models use `n_ctx = 1024`, `n_total = 512`; the second
+exercises the **f16** windowed kernel and `hd = 128`, the first the f32 kernel at `hd = 64`.
 
-| Arm | tokens/s (mean ± stddev over the 3 runs) |
-|---|---|
-| causal single sequence (`attn_flash_prefill`) | 6387 ± 10 |
-| windowed two-sequence batch (`kernel_gqa_attn_window_f32`) | 3439 ± 5 |
-| windowed single sequence @ cell 128 (`kernel_gqa_attn_window_f32`) | 2410 ± 3 |
+| Model (KV, `hd`) | causal single seq (`attn_flash_prefill`) | windowed two-seq batch | windowed one-seq @ cell 128 |
+|---|---|---|---|
+| Qwen2.5-0.5B Q4_0 (f32, 64) | 6387 ± 10 tok/s | 3439 ± 5 | 2410 ± 3 |
+| Qwen3-0.6B Q8_0 (f16, 128) | 5258 ± 17 tok/s | 838 ± 1 | 505 ± 1 |
 
-- **primary** (one 512-token causal sequence vs a two-sequence batch of the same 512 tokens):
-  **0.539x** median (the three runs' medians 0.537 / 0.541 / 0.539, mean 0.539 ± 0.002) — the
-  batch is ~1.9x slower;
-- **shape-matched** (one 512-token causal sequence vs the same sequence behind a 128-cell holder,
-  so `nt`, `n_out` and the token count are identical and only the attention kernel differs):
-  **0.376x** median (0.375 / 0.377 / 0.376, mean 0.376 ± 0.001) — the windowed kernel is
-  **~2.7x** slower.
+| Pair (median of the 3 runs) | 0.5B | Qwen3-0.6B |
+|---|---|---|
+| **primary** — one 512-token causal sequence vs a two-sequence batch of the same 512 tokens | **0.539x** (0.537 / 0.541 / 0.539) | **0.159x** (0.159 / 0.160 / 0.159) |
+| **shape-matched** — one causal sequence vs the same sequence behind a 128-cell holder, same `nt`/`n_out`/tokens, only the kernel differs | **0.376x** (0.375 / 0.377 / 0.376) | **0.096x** (0.096 / 0.097 / 0.095) |
+
+So the windowed kernel runs at ~0.54x / ~0.16x the causal prefill's tokens/s for the two-sequence
+batch (**~1.9x / ~6.3x** slower) and ~0.38x / ~0.10x at the same shape (**~2.7x / ~10.4x** slower);
+the f16/`hd = 128` instantiation is the worse of the two.
 
 The causal kernel and code path are untouched (the round adds only the harness); the gap is the
 simple windowed kernel's serial per-(query, KV-head) walk over the run, which the tuned
