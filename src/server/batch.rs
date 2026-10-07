@@ -784,9 +784,10 @@ impl BatchEngine {
         gathers: bool,
     ) -> usize {
         let (src_seq, dst_seq) = (self.slots[src].seq, self.slots[idx].seq);
-        // C8b S2: a device whose kernel gathers a `kv_map` (CPU) **shares** the
+        // C8b S2: a device whose kernel gathers a `kv_map` **shares** the
         // donor's rows instead of copying them — one copy of the bytes read by both
-        // sequences. Other devices keep C8a's copy (CUDA is C8b S4, Metal is G5).
+        // sequences. All three backends gather it (CPU, CUDA and, since #362,
+        // Metal); `MINFER_NO_KV_SHARE` or a non-gathering device keeps C8a's copy.
         let (verb, fail) = if gathers {
             ("shared", "sharing")
         } else {

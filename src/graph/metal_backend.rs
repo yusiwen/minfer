@@ -621,18 +621,23 @@ pub fn supports_fused(fused: &FusedOp) -> bool {
 /// `kernel_gqa_attn_window_f32/_f16` (`src/metal/kernels/attn_window.metal`),
 /// covering `nt == 1`, `nt > 1`, both KV widths and a non-zero start.
 ///
-/// The **other** explicit layout, `kv_map`'s `(cell, len)` runs (C8b S4), is
-/// still refused: `Device::gathers_attn_map` stays false for Metal, so the model
-/// builder never asks for a map and the `Op::Attn` arm backstops a map-sized
-/// input with a loud `Err` rather than parsing it as spans. The write/move side
-/// landed in part (b): `copy_cells` (C3 compaction), the `copy_kv_to_cpu` arm
-/// (C2 shift / C5 sessions, f32-only) and the per-engine `kv_format`.
+/// The **other** explicit layout, `kv_map`'s `(cell, len)` runs (C8b S4), reads
+/// through its own sibling kernels `kernel_gqa_attn_map_f32/_f16` (also in
+/// `attn_window.metal`, issue #362): `Device::gathers_attn_map` is now true for
+/// Metal, so the model builder asks for a map whenever a sequence shares a
+/// prefix in place, and the `Op::Attn` arm dispatches the map kernels for a
+/// map-sized window. The one-range window kernels are deliberately untouched
+/// (their measured instruction stream is a contract, [#315]); the write/move
+/// side landed in part (b): `copy_cells` (C3 compaction), the `copy_kv_to_cpu`
+/// arm (C2 shift / C5 sessions, f32-only) and the per-engine `kv_format`.
+///
+/// [#315]: https://github.com/yusiwen/minfer/issues/315
 pub const SUPPORTS_ATTN_SPAN: bool = true;
 
 /// C4: Metal addresses f32/f16 KV rows, so it does not read a packed `q8_0`
-/// region; [#87] is the work that adds the kernel and flips this.
+/// region; [#310] owns the kernel that adds the packed half and flips this.
 ///
-/// [#87]: https://github.com/yusiwen/minfer/issues/87
+/// [#310]: https://github.com/yusiwen/minfer/issues/310
 pub const READS_PACKED_KV: bool = false;
 
 /// F5 ([#58], ported by [#137]): registry hook **phase A** of a cross-backend
@@ -1089,14 +1094,15 @@ impl Backend for MetalBackend {
                 let v = self.buf(v_id);
                 let q = self.buf(in_bufs[0].id);
                 let o = self.buf(out_buf.id);
-                // E1 (G5a): an explicit window is selected by the **size** of the
-                // window input (topology, fixed at build time), mirroring CUDA's
-                // arm. `attn_span` is one `[lo, hi)` pair per query (its `lo` at
-                // `window[t]`, `hi` at `window[nt + t]`) and runs the windowed
-                // kernel; a `kv_map`-sized input names `KV_MAP_MAX_SPANS` runs per
-                // query and would be resolved to the wrong rows if read as spans
-                // (risk 1), so it stays a loud refusal while `gathers_attn_map`
-                // is false — never a guess, and never parsed as spans.
+                // E1 (G5a) / C8b S4: an explicit window is selected by the
+                // **size** of the window input (topology, fixed at build time),
+                // mirroring CUDA's arm. `attn_span` is one `[lo, hi)` pair per
+                // query (its `lo` at `window[t]`, `hi` at `window[nt + t]`) and
+                // runs the one-range window kernel; a `kv_map`-sized input names
+                // `KV_MAP_MAX_SPANS` `(cell, len)` runs per query (a sharing
+                // sequence's shared prefix plus its own run) and runs the sibling
+                // map kernel — the two layouts are never parsed as each other,
+                // because that would attend to the wrong rows silently (risk 1).
                 if *explicit_span {
                     let win = in_bufs.get(3).ok_or_else(|| {
                         format!(
@@ -1122,12 +1128,20 @@ impl Backend for MetalBackend {
                     }
                     let kmax = crate::graph::kvcache::KV_MAP_MAX_SPANS;
                     if win.len == nt * kmax * 2 {
-                        return Err(format!(
-                            "Metal attention: {} carries a kv_map window (C8b S4), which Metal's \
-                             kernel cannot gather (`Device::gathers_attn_map` is false) — backend \
-                             assignment should have kept it on CPU or CUDA",
-                            node.name
-                        ));
+                        cb.gqa_attn_map(
+                            q,
+                            k,
+                            v,
+                            o,
+                            self.buf(win.id),
+                            meta.n_head,
+                            meta.n_head_kv,
+                            meta.hd,
+                            meta.scale,
+                            nt,
+                            self.kv_f16(),
+                        );
+                        return Ok(());
                     }
                     return Err(format!(
                         "Metal attention: {}'s window input has {} values; one query needs either a \

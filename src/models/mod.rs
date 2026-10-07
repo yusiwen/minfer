@@ -132,8 +132,13 @@ impl Device {
     /// ever disagreed, the graph would be built with a one-range window and the
     /// share would make attention resolve a *set* of cells — the S2 refusal
     /// catches that loudly, but the point is that they cannot disagree.
+    ///
+    /// All three backends gather it now: the CPU's `cpu_gqa_attn_runs` and
+    /// CUDA's `ATTN_WIN_MAP` instantiation, and Metal's sibling
+    /// `kernel_gqa_attn_map_f32/_f16` (issue #362), which reads the same runs in
+    /// the windowed attention family.
     pub fn gathers_attn_map(self) -> bool {
-        matches!(self, Device::Cpu | Device::Cuda)
+        matches!(self, Device::Cpu | Device::Metal | Device::Cuda)
     }
 
     pub fn name(self) -> &'static str {

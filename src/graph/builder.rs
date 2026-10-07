@@ -31,8 +31,8 @@ pub struct GraphBuilder {
     /// C8b S2: build the window as the `kv_map` input — a list of cell runs per
     /// query (a shared prefix plus a private run) — instead of `attn_span`, one
     /// `[lo, hi)` range. Same op, and the window input's layout *is* the
-    /// difference: a backend that cannot gather a map validates the input's size
-    /// and refuses the node (CPU can; CUDA is C8b S4; Metal is G5).
+    /// difference: every backend gathers a map now (CPU, CUDA since C8b S4 and
+    /// Metal since #362), so the input's size picks the read kernel.
     kv_map: bool,
     /// C4 per-engine (issue #99): the storage format of this graph's persistent KV
     /// regions. It is a **parameter** (`params.cparams.kv_format`), not a process

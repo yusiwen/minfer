@@ -215,8 +215,8 @@ pub fn resolve(
     if !format.supports(device) {
         return Err(format!(
             "MINFER_CACHE_TYPE={} is not supported on {} yet: the {} attention kernel has no \
-             packed Q8_0 read (the CPU's and CUDA's do, since C4 S2a / S2b; Metal is G5 on \
-             issue #44); refusing rather than silently falling back to f32",
+             packed Q8_0 read (the CPU's and CUDA's do, since C4 S2a / S2b; Metal's packed \
+             read is issue #310); refusing rather than silently falling back to f32",
             format.name(),
             device.name(),
             device.name()

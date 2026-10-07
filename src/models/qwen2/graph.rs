@@ -521,7 +521,7 @@ impl Qwen2Graph {
         let cuda_on = device == crate::models::Device::Cuda;
         // C8b S2/S4: a sequence that reads part of its prefix in place needs the
         // window as a list of cell runs rather than one range. Only a device whose
-        // kernel can gather a map is asked (CPU and CUDA; Metal is G5), and
+        // kernel can gather a map is asked (CPU, CUDA and, since #362, Metal), and
         // *whether* to share is the caller's decision — this only reflects it,
         // read from the reservations the cache already holds.
         let kv_map = device.gathers_attn_map()

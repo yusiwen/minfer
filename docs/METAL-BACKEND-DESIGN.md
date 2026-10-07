@@ -383,22 +383,26 @@ time), mirroring CUDA's arm:
   reference). `nt == 1` and `nt > 1` both use it, so a decode and a batched prefill share one launch;
   f32/f16 is selected from the engine's KV format.
 - `in_bufs[3].len == nt * KV_MAP_MAX_SPANS * 2` → the **`kv_map`** layout (a list of `(cell, len)`
-  runs per query, C8b S2/S4). Metal has no gather for it (`Device::gathers_attn_map` is false), so
-  the arm returns a loud `Err` rather than parsing the runs as `(lo, hi)` and attending to the wrong
-  rows (risk 1 of the issue's plan).
+  runs per query, C8b S2/S4): the sibling kernels `gqa_attn_map_f32` / `_f16` (also in
+  `src/metal/kernels/attn_window.metal`, issue [#362](https://github.com/yusiwen/minfer/issues/362))
+  read the same rows, but resolve each flat window row to a cell by walking the ≤ 4 runs — the flat
+  index arithmetic CUDA does in `attn_map_nkv` / `kv_cell` — instead of the window's `lo + ki`. They
+  are a **separate family** on purpose: the one-range `attn_span` kernels' instruction stream is a
+  measured contract (`#315`), so their code path is byte-untouched. A sharing sequence's window (a
+  shared prefix plus a private run) is exactly this shape; the input's **size** selects the layout.
 - anything else → a loud `Err` naming the accepted sizes.
 
-`supports_attn_span()` is now `true` (`SUPPORTS_ATTN_SPAN`). The causal paths (flash / split /
-parallel-prefill / classic) are **byte-untouched**: the windowed kernel is a separate family used
-only for an explicit window, so a single-sequence causal forward keeps its previous numbers. The
-`kv_map` layout stays refused (`Device::gathers_attn_map` is false) and a **packed `q8_0`** region
-stays refused (`READS_PACKED_KV` false) until [#310](https://github.com/yusiwen/minfer/issues/310);
-both are deliberate asymmetries, not silent gaps. The windowed kernel is a **correctness** path,
-not a performance one: keeping it separate is what leaves the causal instruction streams (and
-their measured numbers) byte-identical. Issue [#315](https://github.com/yusiwen/minfer/issues/315)
-measured what a batched multi-sequence prefill — which runs it — costs against the causal flash
-prefill; the answer is **materially slower**, and the follow-up it earns (a windowed fast path)
-is its own ticket.
+`supports_attn_span()` is now `true` (`SUPPORTS_ATTN_SPAN`) and `Device::gathers_attn_map` is now
+true for Metal, so both explicit layouts are read on the device. The causal paths (flash / split /
+parallel-prefill / classic) are **byte-untouched**: the windowed family is used only for an explicit
+window, so a single-sequence causal forward keeps its previous numbers. The one asymmetry that
+remains is a **packed `q8_0`** region, refused (`READS_PACKED_KV` false) until
+[#310](https://github.com/yusiwen/minfer/issues/310) adds its store and reads; that is a deliberate
+asymmetry, not a silent gap. The windowed kernel is a **correctness** path, not a performance one:
+keeping it separate is what leaves the causal instruction streams (and their measured numbers)
+byte-identical. Issue [#315](https://github.com/yusiwen/minfer/issues/315) measured what a batched
+multi-sequence prefill — which runs it — costs against the causal flash prefill; the answer is
+**materially slower**, and the follow-up it earns (a windowed fast path) is its own ticket.
 
 **Measured (issue [#315], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
 2026-10-07).** Bar named before the run (`docs/GATE-CONTRACT.md` rules 3 and 5): the windowed
@@ -844,20 +848,21 @@ regression**. Taken at `6b95763` (the round's final master), 2026-10-06, on
 `macbook (macOS 27.0.1, Apple M4 Pro)`.
 
 - **unit** `cargo test --release --no-fail-fast`: **531 passed / 0 failed / 43
-  ignored** — green. (The live count is **533 / 0 / 43** since [#329] added the
-  Metal dispatch-refusal gate and [#299] the weights-charged E4 gate on 2026-10-07;
-  the enumeration below is this round's record at `6b95763`.)
+  ignored** — green. (The live count is **541 / 0 / 44** as of [#362] on
+  2026-10-07: [#329] added the Metal dispatch-refusal gate, [#299] the
+  weights-charged E4 gate, and [#362] the two Metal `kv_map` window gates plus the
+  pure `every_device_gathers_the_attn_map`; the enumeration below is this round's
+  record at `6b95763`.)
 - **integration**: **21 passed / 0 failed / 6 ignored**.
 - **real-model** (`PARALLEL=0 scripts/real_model_gates.sh`, serial), both cached
-  models (0.5B f32 KV and Qwen3-0.6B f16 KV): **42 passed / 1 failed** each. The
-  single residual is
-  `server::batch::tests::kv_sharing::a_store_inside_a_shared_prefix_takes_a_private_row`
-  — a **deliberate Metal capability gap, not a regression**: it needs the
-  set-valued `kv_map` gather Metal does not implement (`Device::gathers_attn_map`
-  is false, [#310]). What fails is the *setup* assertion ("slot 1 must read 0 rows
-  in place for the gate to mean anything"): the harness cannot make Metal read a
-  shared prefix in place, so the gate is a class-(b) known-refusal owned by
-  [#310], not a class-(a) defect.
+  models (0.5B f32 KV and Qwen3-0.6B f16 KV): **44 passed / 0 failed** each —
+  **no residual**. The set is 44 because [#315]'s macOS-only `#[ignore]`d
+  windowed-prefill harness joined it (42 → 43). The failure this section used to
+  record,
+  `server::batch::tests::kv_sharing::a_store_inside_a_shared_prefix_takes_a_private_row`,
+  now passes: [#362] gave Metal the set-valued `kv_map` gather
+  (`Device::gathers_attn_map`, the sibling `kernel_gqa_attn_map_f32/_f16`), so a
+  shared-prefix slot reads the donor's rows in place instead of copying them.
 
 **History (so the green is legible).** At the round's start (`97823e4`, after
 [#137]) the same unit suite was **21 failures**. Three root causes explained them:
@@ -890,6 +895,7 @@ left the macOS test binary uncompilable until `4add59f` (2026-10-05) with no CI 
 [#317]: https://github.com/yusiwen/minfer/issues/317
 [#320]: https://github.com/yusiwen/minfer/pull/320
 [#322]: https://github.com/yusiwen/minfer/pull/322
+[#362]: https://github.com/yusiwen/minfer/issues/362
 
 ---
 
