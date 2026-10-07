@@ -95,7 +95,7 @@ and mostly *enabled* by fixing (1) and (2) first.
 Compute graph (build → assign → fuse → alloc → execute) with params-only reuse
 (`graph/cache.rs:47`, `graph/params.rs:51`); per-op backend assignment
 (`graph/scheduler.rs:60`); liveness allocator with persistent per-layer KV
-regions (`graph/alloc.rs:164`, `:384`); eight quantized weight types
+regions (`graph/alloc.rs:165`, `:384`); eight quantized weight types
 (`Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K`) on CPU + Metal + CUDA; two model
 families (`qwen2`, `qwen3` dense); GGUF v3 with split parts and Metal zero-copy
 mmap; self-contained BPE tokenizer; chat templates via minijinja;
@@ -449,7 +449,7 @@ Two smaller but immediate items sit in this layer:
 ### 2.6 L6 — Backend abstraction and device reach
 
 **Today.** `Backend` is a `Copy`/`Hash`/`Eq`/`Ord` **handle** over a fixed id space
-(`graph/registry.rs`, F4) and a trait (`graph/backend.rs:21-95`). The ids are a
+(`graph/registry.rs`, F4) and a trait (`graph/backend.rs:21-98`). The ids are a
 KV-session file-format contract, and the name-keyed registry carries each backend's
 priority, capability matrix and pool hooks; consumers read it instead of matching.
 Before F4 the enum was matched in `GraphAllocator::supports`
