@@ -362,10 +362,10 @@ unsafe fn quantize_row_q8_k_buf_neon(row: &[f32], out: &mut [u8]) {
 
 Three details carry weight: ② uses **saturating** narrowing (clamping to [−128, 127] exactly like the scalar `.clamp()`), ③ computes the `bsums` from the *saturated* values so the integer group sums are exact — the K-quant dot kernels use them for their correction term and any drift there would break parity — and ④ keeps the reserved field zeroed so the region reads deterministically. The AVX2/scalar paths write byte-identical layouts, which is what lets one kernel consume activations from any build.
 
-**The payoff: a K-quant dot kernel, walked.** All of §2.4's structure (super-scales, 6-bit sub-scales, mins, `bsums`) exists to serve this loop — `dot_q4_k_q8_k_scalar` (`src/quants/kquant.rs:19-58`), the reference every K-quant fast path must match:
+**The payoff: a K-quant dot kernel, walked.** All of §2.4's structure (super-scales, 6-bit sub-scales, mins, `bsums`) exists to serve this loop — `dot_q4_k_q8_k_scalar` (`src/quants/kquant.rs:30-69`), the reference every K-quant fast path must match:
 
 ```rust
-// src/quants/kquant.rs:19-58 (scalar, abridged but complete in structure)
+// src/quants/kquant.rs:30-69 (scalar, abridged but complete in structure)
 fn dot_q4_k_q8_k_scalar(q4: &[u8], q8k: &[u8]) -> f32 {
     for i in 0..n_super {
         let d    = w_scale(i) * a_scale(i);          // super-scale × activation scale
