@@ -67,6 +67,9 @@ fn f208_metal_fixture() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MINFER_F208_BF16_GGUF") {
         let p = std::path::PathBuf::from(p);
         if p.exists() {
+            // #205: this early return bypasses the shared resolver, so it verifies
+            // the fixture itself rather than handing an unrecorded file to the gate.
+            super::f6_fixtures::check(&p);
             return Some(p);
         }
         eprintln!(

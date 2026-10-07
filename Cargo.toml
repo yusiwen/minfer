@@ -28,8 +28,17 @@ futures-util = "0.3"
 # Test-only. `AsyncReadExt`/`AsyncWriteExt` are what F8's `/metrics` test drives a
 # real HTTP/1.1 request with; the production `tokio` dependency stays without
 # `io-util`, and cargo unifies the feature for the test build only.
+#
+# `sha2` is test-only for the same reason, and is #205's whole point: the F6
+# fixture manifest (`docs/f6-fixtures.json`) records each cached reference's
+# content hash, and the gate that consumes a reference verifies it before
+# comparing (`src/tooling/tests/f6_fixtures.rs`). Hashing is not something to
+# hand-write in a test module, and the production dependency graph — which
+# `cargo build --release` and the `deny(warnings)` gate both cover — does not
+# grow by it.
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util"] }
+sha2 = "0.10"
 
 [features]
 cuda = []

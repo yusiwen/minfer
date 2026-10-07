@@ -53,6 +53,15 @@
 #                       carries a reason) plus that checker's own cases. A source
 #                       audit needs no build; the liveness half is the oracle that
 #                       the two build/test jobs run last.
+#                       It also runs `scripts/check_f6_fixtures.py` (#205): the
+#                       F6 fixture manifest (`docs/f6-fixtures.json`) must be
+#                       complete and explain every cross-box divergence, every
+#                       `~/.cache/minfer/f6-src/…` fixture the source tree names
+#                       must be an entry, and the checker's own cases prove a
+#                       tampered copy is refused by name and digest. That is the
+#                       shape half — CI has no fixture cache — and the byte half
+#                       runs inside the F6 gates, which verify the file they
+#                       resolve before comparing against it.
 #                       It also runs `scripts/check_doc_line_anchors.py` (#266):
 #                       `check_docs_links.py` sees link *targets*, not the
 #                       `path:NNN` line anchors the docs cite code by, so a moved
@@ -282,6 +291,14 @@ jobs:
         run: python3 scripts/check_doc_line_anchors.py
       - name: The doc-line-anchor checker's own pass/fail cases
         run: python3 scripts/check_doc_line_anchors.py --selftest
+      # #205: the F6 gates compare against fixtures under ~/.cache/minfer/f6-src/
+      # that CI does not have, so this job carries the half that needs no bytes —
+      # the manifest's shape, the tree cross-check, and the checker's own tamper
+      # cases. The byte half is the F6 gates' own fixture verification.
+      - name: The F6 fixture manifest must be well formed
+        run: python3 scripts/check_f6_fixtures.py --check
+      - name: The F6 fixture verifier's own pass/fail cases
+        run: python3 scripts/check_f6_fixtures.py --selftest
       # Same toolchain as Docs (`.github/workflows/docs.yml`), so the gate builds the
       # book the site actually ships: mdBook 0.4.37 because 0.5 changed the
       # preprocessor protocol, and mdbook-mermaid 0.13.0 because it only understands

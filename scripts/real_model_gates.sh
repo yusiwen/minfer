@@ -61,6 +61,13 @@ cd "$(dirname "$0")/.."
 export PATH="/usr/local/cuda-13.0/bin:$PATH"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 
+# #205: the F6 gates compare against fixtures under `~/.cache/minfer/f6-src/` that
+# they do not produce. Verify the cache against the checked-in manifest
+# (`docs/f6-fixtures.json`) *before* the set runs, so a stale or replaced reference
+# aborts the run instead of being compared against. A cache that is not there is
+# fine: `--verify` says so and exits 0, and the F6 gates skip themselves.
+python3 scripts/check_f6_fixtures.py --verify
+
 cargo_args=(--release --bin minfer)
 [ -n "${FEATURES:-}" ] && cargo_args+=(--features "$FEATURES")
 cargo_args+=(-- --ignored)
