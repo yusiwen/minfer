@@ -506,7 +506,7 @@ CUDA backend runs, and what the layout buys the kernels of §3.1–3.2.
 
 **Ownership and lifetime.** Each layer owns exactly two persistent regions,
 created on first use on the layer's assigned backend
-(`src/graph/alloc.rs:384-392`):
+(`src/graph/alloc.rs:385-393`):
 
 ```rust
 fn ensure_kv(&mut self, layer: usize, backend: Backend, size: usize) -> [BufRef; 2] {
@@ -520,7 +520,7 @@ fn ensure_kv(&mut self, layer: usize, backend: Backend, size: usize) -> [BufRef;
 }
 ```
 
-`alloc_persistent` (`alloc.rs:395-403`) routes through the same pool allocator
+`alloc_persistent` (`alloc.rs:396-404`) routes through the same pool allocator
 as everything else — on CUDA that is a `cudaMalloc` held in the backend's
 buffer pool (§3.4) — and registers the buffer as *never freed*. Because the
 allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:79`), the regions
@@ -581,7 +581,7 @@ arithmetic). The correctness story for the f16 round trip is test
 `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1011`).
 
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
-copy — its output buffer *is* the K region (`alloc.rs:226-230` maps the node to
+copy — its output buffer *is* the K region (`alloc.rs:227-231` maps the node to
 `pair[0]`; the CUDA arm comments "out_buf IS the region — no kernel" at
 `cuda_backend.rs:428-430`). So the whole path — matmul, fused tail, cache,
 attention, next layer — touches pool device memory and crosses no host

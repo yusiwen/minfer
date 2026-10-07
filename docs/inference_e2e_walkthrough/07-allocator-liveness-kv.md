@@ -89,7 +89,7 @@ keeps its size; nothing ever moves. That stability is what lets a GPU record
 raw pointers into a captured kernel launch (CUDA Graph replay, doc 15) and
 replay them later — the backend trait says it outright: "Implementations must
 keep captured pointers stable (pool ids never move memory)"
-(`backend.rs:79-80`).
+(`backend.rs:82-83`).
 
 ### 2.2 Liveness: when a buffer's contents are precious
 
@@ -131,31 +131,31 @@ execution-order realities rather than graph theory:
    *before* execution starts, so a buffer that liveness would normally recycle
    for another input would get clobbered by the later fill. Inputs get the
    same "live to the end" treatment as outputs
-   (`alloc.rs:204-210`).
+   (`alloc.rs:205-211`).
 
 ### 2.3 The alloc_graph walk: intervals, sweep, free list
 
 `alloc_graph` runs once per graph (re)build, after doc 06's assign + fusion
 passes. The walk is a single forward pass with a running clock:
 
-1. **Tear down the previous graph's liveness buffers** (`alloc.rs:164-177`):
+1. **Tear down the previous graph's liveness buffers** (`alloc.rs:165-178`):
    every id tracked in `buf_alive` goes back to its pool's free list; the
    `node_to_buf` map is cleared. Persistent regions (§2.5) are *not* in
    `buf_alive`, so they sail through untouched.
 2. **Order check**: call `topo_order()` — but only to *validate* that the
    graph is acyclic. The order actually used is plain **build order**,
-   `0..n_nodes` (`alloc.rs:179-186`). §3.4 explains why this one line is the
+   `0..n_nodes` (`alloc.rs:180-187`). §3.4 explains why this one line is the
    tombstone of the G3 bug.
 3. **Compute windows**: `exec[id] = i` gives each node its execution position;
    then one pass over all nodes raises `last_use[src]` to the latest consumer
    position. Finally outputs and inputs are pinned to `order.len()`
-   (`alloc.rs:189-210`).
-4. **Count consumers** per node (`alloc.rs:214-219`) — the safety input for
+   (`alloc.rs:190-211`).
+4. **Count consumers** per node (`alloc.rs:215-220`) — the safety input for
    in-place aliasing (§2.4).
-5. **Walk nodes in order** (`alloc.rs:221-310`). For each node, first
+5. **Walk nodes in order** (`alloc.rs:222-311`). For each node, first
    **sweep**: free every tracked buffer whose `last_use < i` — its readers
    have all been positioned earlier, so its contents are officially dead
-   (`alloc.rs:410-422`). Then decide where this node's output lives:
+   (`alloc.rs:411-423`). Then decide where this node's output lives:
    - KV store/load nodes → the layer's persistent K region (§2.5);
    - fused QKV nodes → their persistent regions *plus* an ordinary output
      buffer for the concatenated `q|k|v` result;
@@ -237,7 +237,7 @@ the allocator maps the rope node's output to the *input's* buffer:
 q_buf ──▶ rope kernel reads and overwrites q_buf in place   [1 buffer]
 ```
 
-`alloc.rs:263-299` implements this, guarded by exactly two conditions — the
+`alloc.rs:264-300` implements this, guarded by exactly two conditions — the
 input's **sole consumer** is this op (`n_consumers[src] == 1`, from step 4
 above) and the input lives **on the same backend**. Both guards are load
 bearing. If another node also reads the input, overwriting it destroys data
@@ -247,7 +247,7 @@ device's pool* — and the cross-backend case gets its own treatment (§2.7),
 which is precisely where the Phase-3 bug lived (§3.4).
 
 When aliasing applies, the aliased input's live range is extended to cover the
-aliasing op's consumers (`alloc.rs:292`) — the buffer now carries *two*
+aliasing op's consumers (`alloc.rs:293`) — the buffer now carries *two*
 logical tensors' worth of deadlines, and liveness must respect the later one.
 
 Why bother? Three reasons, in decreasing order of "wow":
@@ -268,7 +268,7 @@ Why bother? Three reasons, in decreasing order of "wow":
    path, but there the whole `Silu` node is folded into `SwiGLU`, so it is
    fusion's win, not aliasing's.)
 3. **Parity with llama.cpp**, which executes rope and silu in place for the
-   same reasons (`alloc.rs:273-274`).
+   same reasons (`alloc.rs:274-275`).
 
 The model-side code cooperates with the rule. In the mixed-quant QKV decode
 path, the builder deliberately wires attention to the epilogue node *so that*
@@ -290,7 +290,7 @@ phrase) means deciding *how big* that notepad is before anything is written.
 minfer's allocator owns it as **persistent regions**: each layer gets two
 buffers, K and V, each sized `n_kv_embd × n_ctx` f32 elements, allocated the
 first time any node of that layer mentions the layer and then **never freed
-and never recycled** (`alloc.rs:382-403`). `n_kv_embd` is the KV width —
+and never recycled** (`alloc.rs:383-404`). `n_kv_embd` is the KV width —
 128 for Qwen2.5-0.5B (2 KV heads × head-dim 64), 1024 for Qwen3-4B — and
 `n_ctx` is the context budget from the CLI (`--n-ctx`, default 4096). The
 store/load node shapes carry the size (`builder.rs:376-388` builds the store
@@ -327,7 +327,7 @@ than one graph execution:
    living in the memory context rather than the graph's buffer set.
 
 Mechanically, the K region does double duty as the store node's *output
-buffer* (`alloc.rs:226-229`: "the node's buffer = the K region"), and the CPU
+buffer* (`alloc.rs:227-230`: "the node's buffer = the K region"), and the CPU
 executor enforces that contract (`cpu_backend.rs:146-148`: "KV store out
 buffer must be the K region"). The V region is a sibling the kernel reaches
 through the `kv_pair` handle (§3.2, excerpt 8). The load node executes as a
@@ -339,7 +339,7 @@ The graph declares three inputs for a prefill (`models/qwen2/graph.rs:53-67`):
 `token_ids` `[nt,1,1,1]`, `positions` `[nt,1,1,1]`, and (when the tail-row
 optimization is active) `tail_ids` — all typed `DType::I32` in the IR. Yet
 every pool buffer is f32 (§2.1). The bridge is `fill_input_i32`
-(`alloc.rs:436-446`): each u32 is packaged as `f32::from_bits(v)` — a pure
+(`alloc.rs:437-447`): each u32 is packaged as `f32::from_bits(v)` — a pure
 bit reinterpretation, *not* a numeric conversion — and written into the input
 node's buffer via the backend's `write_host`. On the consumer side the
 kernels run the inverse, `x.to_bits()`, recovering the exact integer:
@@ -358,7 +358,7 @@ double the copy paths, and a special-case `alloc_buffer(size, dtype)` in
 every backend) or converting integers to their float *values* (which is exact
 only for small integers and lossy in surprising ways). Riding the bits keeps
 one pool and is lossless. The safety envelope recorded in the code — "exact
-for |v| < 2^24" (`alloc.rs:437`, `cpu_backend.rs:2-4`) — is generous
+for |v| < 2^24" (`alloc.rs:438`, `cpu_backend.rs:2-4`) — is generous
 headroom: 2²⁴ = 16,777,216, and real data sits far inside it — the largest
 vocabulary here is 151,936 token ids, and contexts top out in the tens of
 thousands (the biggest `n_ctx` in the perf tables, 65,536, is clamped to the
@@ -387,11 +387,11 @@ the consumer's inputs across (`scheduler.rs:176-188`). The copy lands in the
 allocator's `copy_across`, which routes through `copy_to_cpu` (a host round
 trip — Metal/CUDA buffers here are CPU-visible, so this is a plain memcpy)
 and then `write_host` into a buffer on the *destination* pool
-(`alloc.rs:575-636`).
+(`alloc.rs:576-637`).
 
 That destination staging buffer must be **fresh** — `alloc_fresh_in`
-(`alloc.rs:336-358`) — never drawn from the recycle free list. The trait
-comment is the design record (`backend.rs:36-42`):
+(`alloc.rs:337-359`) — never drawn from the recycle free list. The trait
+comment is the design record (`backend.rs:36-45`):
 
 ```rust
 /// Allocate a buffer that bypasses the recycle free list. Split-boundary
@@ -416,7 +416,7 @@ by never consulting the list.
 Staging buffers are one-per-(node, destination backend) per graph: the first
 execute allocates, every later execute of the reused graph just rewrites the
 same buffer ("no per-step allocation", `alloc.rs:28-34`). They are freed at
-the next rebuild (`alloc.rs:171-177`) — the "at graph rebuild" moment the
+the next rebuild (`alloc.rs:172-178`) — the "at graph rebuild" moment the
 trait comment mentions, where returning them to the normal free list *is*
 safe because the next build's monotonic sweep re-establishes the invariant
 from scratch.
@@ -452,7 +452,7 @@ planted persistent region (`cache/tests.rs:159`).
   region (§2.5).
 - Registered weights, already inside the backends' registries (doc 03) — the
   allocator's CPU pool is the same object weight registration went through
-  (`alloc.rs:135-137` delegates to `self.cpu.register_weight`).
+  (`alloc.rs:136-138` delegates to `self.cpu.register_weight`).
 - Host data for inputs: `&[u32]` token ids, positions, tail ids
   (`models/qwen2/graph.rs:522-536`).
 
@@ -464,7 +464,7 @@ planted persistent region (`cache/tests.rs:159`).
 - `kv: HashMap<layer, [BufRef; 2]>` + `persistent: Vec<PersistentBuf>` — the
   KV regions with stable names like `"kv.7.k"` / `"kv.7.v"`, exposed to
   backends through the `KvProvider` trait (`backend.rs:12-19`,
-  `alloc.rs:646-650`).
+  `alloc.rs:647-651`).
 - `cross: HashMap<NodeId, BufRef>` — split-boundary staging copies, filled
   lazily during the first execute and rewritten on later ones.
 - Filled input buffers, ready before the scheduler's first node.
@@ -509,7 +509,7 @@ consuming backend — which would break execute #2 of a reused graph, when the
 producing split needs its buffer back where it was.
 
 **Excerpt 2 — liveness in build order, with inputs and outputs pinned**
-(`alloc.rs:179-210`). This is the code that bug G3 rewrote; the comment is
+(`alloc.rs:180-211`). This is the code that bug G3 rewrote; the comment is
 the tombstone.
 
 ```rust
@@ -552,7 +552,7 @@ for &i in &graph.inputs {
 by many consumers ends at the latest reader.
 
 **Excerpt 3 — the main walk: sweep, then per-node decision**
-(`alloc.rs:221-239`, KV arm; the generic arm at 301-309 is three lines of
+(`alloc.rs:222-240`, KV arm; the generic arm at 301-309 is three lines of
 "alloc if alive").
 
 ```rust
@@ -579,13 +579,13 @@ for (i, &id) in order.iter().enumerate() {
         }
 ```
 
-`sweep(i)` (`alloc.rs:410-422`) collects every `buf_alive` entry whose deadline
+`sweep(i)` (`alloc.rs:411-423`) collects every `buf_alive` entry whose deadline
 passed (`al < i`), removes it, and hands the id to `free_in_pool` — which
 pushes it onto the backend's free list. Nothing is *deallocated*; "free" here
 means "return to the recycling pool", which is why the next `alloc_in_pool`
 of the same size is a zero-cost reuse (plus one zero-fill on CPU).
 
-**Excerpt 4 — the in-place alias arm** (`alloc.rs:273-299`). The two guards
+**Excerpt 4 — the in-place alias arm** (`alloc.rs:274-300`). The two guards
 and the live-range extension, exactly as argued in §2.4.
 
 ```rust
@@ -622,7 +622,7 @@ The `else` branch matters as much as the `if`: a cross-backend or
 multi-consumer input silently falls back to a normal buffer. Aliasing is an
 optimization with strict preconditions, never an assumption.
 
-**Excerpt 5 — persistent region creation** (`alloc.rs:382-403`).
+**Excerpt 5 — persistent region creation** (`alloc.rs:383-404`).
 
 ```rust
 /// Per-layer KV persistent regions (K and V), created on first use on the
@@ -656,8 +656,8 @@ The region is also sized on **first use only**: if a later graph asked for a
 different size, it would silently get the old buffer — one reason `n_ctx`
 must stay consistent across a run (§3.3, question 3).
 
-**Excerpt 6 — I32 input filling** (`alloc.rs:436-446` plus the routing tail
-of `fill_input_impl`, `alloc.rs:454-465`).
+**Excerpt 6 — I32 input filling** (`alloc.rs:437-447` plus the routing tail
+of `fill_input_impl`, `alloc.rs:455-466`).
 
 ```rust
 /// Fill an I32 input (token ids / positions). Stored as `f32::from_bits`
@@ -688,7 +688,7 @@ Inputs are found **by name**, not position — the graph is rebuilt between
 prefill and decode, so node ids may shift, but the names `"token_ids"` /
 `"positions"` / `"tail_ids"` are stable API.
 
-**Excerpt 7 — the copy that must be fresh** (`alloc.rs:608-635`, the tail of
+**Excerpt 7 — the copy that must be fresh** (`alloc.rs:609-636`, the tail of
 `copy_across`).
 
 ```rust
@@ -737,7 +737,7 @@ let kv_pair = match &node.op {
 ```
 
 `execute_node` takes `kv_pair: Option<(usize, usize)>` alongside the ordinary
-input ids (`backend.rs:49-55`) — the K/V regions are *not* the node's `src`
+input ids (`backend.rs:52-58`) — the K/V regions are *not* the node's `src`
 inputs; they are process-lifetime siblings only KV-aware ops know about. The
 CPU store kernel shows the split-brain clearly (`cpu_backend.rs:143-175`):
 K is written through `out_buf` (which the allocator guaranteed is the K
@@ -910,7 +910,7 @@ logits off by **21.79** (`COMPUTE-GRAPH-DESIGN.md` deviation 22). The fix is
 excerpt 2: call `topo_order()?` purely to reject cycles, then compute
 liveness over `0..n_nodes` — the order the scheduler actually runs. (Small
 forensics note: the doc comment on `topo_order` still says "used by the
-allocator" (`graph/mod.rs:151-153`) — a stale leftover; `alloc.rs:179-185` is
+allocator" (`graph/mod.rs:151-153`) — a stale leftover; `alloc.rs:180-186` is
 authoritative.)
 
 **Bug 2b — input buffers are never freed.** Same fix series, complementary
@@ -941,7 +941,7 @@ longer matters.
 
 ## 4. Observe & verify
 
-- **`cargo test` — the allocator's own unit tests** (`src/graph/alloc.rs:652-778`):
+- **`cargo test` — the allocator's own unit tests** (`src/graph/alloc.rs:653-779`):
   `liveness_reuses_buffers_along_chain` and `parallel_chains_do_not_share`
   assert the two liveness behaviors of §2.2; `kv_regions_two_per_layer`
   asserts store and load share the K region, V is a sibling, and exactly two

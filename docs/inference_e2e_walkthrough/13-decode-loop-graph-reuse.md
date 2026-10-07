@@ -10,8 +10,8 @@
 > `src/models/qwen2/graph.rs::forward_cached` (`graph.rs:403-626`), the reuse
 > decision `src/graph/cache.rs::try_reuse` (`cache.rs:47-64`), the params
 > `src/graph/params.rs` (`GraphParams` `params.rs:52-63`), the allocator's
-> persistent KV regions `src/graph/alloc.rs` (`alloc_graph` `alloc.rs:164`,
-> `ensure_kv` `alloc.rs:384`), the per-step execution
+> persistent KV regions `src/graph/alloc.rs` (`alloc_graph` `alloc.rs:165`,
+> `ensure_kv` `alloc.rs:385`), the per-step execution
 > `src/graph/scheduler.rs::execute` (`scheduler.rs:123-354`), and the
 > multi-turn session `src/conversation.rs` (`user_turn` `conversation.rs:259`,
 > `generate_assistant_with_logits` `conversation.rs:490`) — lines verified at
@@ -327,10 +327,10 @@ the graph*; on the "survives" side, everything that *holds data*:
 | Survives the rebuild | Recomputed on rebuild |
 |---|---|
 | The `GraphAllocator` itself (it lives inside `GraphCache`, `cache.rs:24-28`) | The node list (`Self::build`, `graph.rs:473`) |
-| Registered weights (registered once by name; `register_weight`, `alloc.rs:135`) | Backend assignment (`assign_backends`, `graph.rs:486`) |
-| **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:384-392`; `alloc_graph` explicitly frees only liveness buffers, `alloc.rs:161-177`) | The fusion pass (`FusionPass::run`, `graph.rs:509-514`) |
-| Backend buffer *pools* (freed liveness buffers return to their pool; the memory is recycled, not released) | The node→buffer mapping (`alloc_graph` clears `node_to_buf`, `alloc.rs:170`) |
-| The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `cache.rs:69-73` + §3.4) | Cross-backend staging buffers (freed and re-materialized on first execute, `alloc.rs:171-177`) |
+| Registered weights (registered once by name; `register_weight`, `alloc.rs:136`) | Backend assignment (`assign_backends`, `graph.rs:486`) |
+| **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:385-393`; `alloc_graph` explicitly frees only liveness buffers, `alloc.rs:162-178`) | The fusion pass (`FusionPass::run`, `graph.rs:509-514`) |
+| Backend buffer *pools* (freed liveness buffers return to their pool; the memory is recycled, not released) | The node→buffer mapping (`alloc_graph` clears `node_to_buf`, `alloc.rs:171`) |
+| The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `cache.rs:69-73` + §3.4) | Cross-backend staging buffers (freed and re-materialized on first execute, `alloc.rs:172-178`) |
 
 The first row is the one that matters most: the allocator is a field of the
 cache, not a local of the forward function, so a rebuild cannot take the KV
@@ -419,7 +419,7 @@ and is only read:
 |---|---|---|---|
 | `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`graph.rs:524`) |
 | `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` — starts at `input_ids.len()` (`main.rs:840`), incremented once per step (`main.rs:940`) | same, `graph.rs:526`; the KV store uses it as the write slot, attention as the last readable slot |
-| K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:384-392`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
+| K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:385-393`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
 | logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `graph.rs:618-625`) | moved into the loop's `logits` variable (`main.rs:932-933`) for the next sample |
 | `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens (`main.rs:847, 903-907`) | the sampler's repeat/frequency/presence penalties (doc 12) |
 | `generated` | `Vec<u32>` | pushed per step (`main.rs:903`) | stop checks, final stats; decode_bytes streams it to stdout |
@@ -430,7 +430,7 @@ Two details of this table deserve unpacking.
 every node reads and writes `f32` slices, whatever its logical type. Token
 ids and positions are integers. Rather than special-case integer buffers,
 `fill_input_i32` stores each `u32` *bit pattern* reinterpreted as an `f32`
-value (`alloc.rs:438-446`), and the kernels that consume these inputs
+value (`alloc.rs:439-447`), and the kernels that consume these inputs
 (attention, KV store) convert back with `f32::to_bits() as usize`
 (`cpu_backend.rs:152-155, 410-415`). This is exact for values below 2²⁴ —
 vocabulary ids and positions never come close — and it keeps one uniform
@@ -860,7 +860,7 @@ or a truncated copy — never a full-`nt` logits matrix (doc 09 covered the
 prefill-side benefit; in decode `n_out == nt == 1`, so the buffer is one
 row regardless).
 
-#### Why the KV survives: the allocator's two kinds of memory (`src/graph/alloc.rs:161-177, 382-403`)
+#### Why the KV survives: the allocator's two kinds of memory (`src/graph/alloc.rs:162-178, 382-403`)
 
 The claim everywhere above is that a rebuild "keeps the KV". The mechanism
 is that the allocator distinguishes two kinds of buffers, and only one kind
@@ -925,8 +925,8 @@ graph that touches layer ℓ's KV creates both regions at the *full*
 `n_ctx`-sized extent (`size = nkt × n_ctx` f32 — 2 MiB per region for
 0.5B at `--n-ctx 4096`), and every later graph — including the decode
 graph of every subsequent step — just gets the same `BufRef`s back
-(`alloc.rs:385-387`). The allocation happens during `alloc_graph` when it
-walks the `KvcacheStore`/`KvcacheLoad` nodes (`alloc.rs:226-230`: the
+(`alloc.rs:386-388`). The allocation happens during `alloc_graph` when it
+walks the `KvcacheStore`/`KvcacheLoad` nodes (`alloc.rs:227-231`: the
 store node's buffer *is* the K region; V is its sibling). The `size`
 argument comes from the node metadata (`kv_elems: nkt * n_ctx`,
 `graph.rs:125`), which is why `n_ctx` is a `CParams` field: it fixes a
@@ -1220,8 +1220,8 @@ steps touches buffers out-of-band.
 buffer lifetimes in node-id (build) order, not topological order, because
 `topo_order()` may reorder src-less nodes (like KV loads) ahead of nodes
 the scheduler reads first — the G3 tail regression
-(`alloc.rs:179-185`). Related decode-side rule: input buffers are treated
-as live for the whole step (`alloc.rs:204-210`) so that a liveness reuse
+(`alloc.rs:180-186`). Related decode-side rule: input buffers are treated
+as live for the whole step (`alloc.rs:205-211`) so that a liveness reuse
 can never clobber `token_ids` after it was filled but before its consumer
 ran. On a rebuild, `node_to_buf` is cleared and re-derived — the input
 *fill* in `forward_cached` happens *after* `alloc_graph` has produced the

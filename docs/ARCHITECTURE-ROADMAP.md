@@ -161,7 +161,7 @@ overlapping regions as compositions of primitive ops — which is why minfer
 carries four hand-written decode-specific fused ops instead: `FusedQKV`,
 `QkvBiasRopeStore`, `FusedFFN`, `FusedQkvNorm` (`ops.rs:125-154`). Each one
 costs changes in *five* places: the builder constructor (`builder.rs:193-281`),
-the allocator's special cases (`alloc.rs:231-272`), the scheduler's `kv_pair`
+the allocator's special cases (`alloc.rs:232-273`), the scheduler's `kv_pair`
 resolution (`scheduler.rs:261-271`), every backend's `supports_op` +
 `execute_node`, and both models' `build_graph`. `BatchMatMul` is deferred for
 the same reason (`COMPUTE-GRAPH-DESIGN.md §5.4`).
@@ -245,11 +245,11 @@ are prerequisites for multi-device execution and for any heterogeneous split.
 
 ### 2.3 L3 — Allocator and memory
 
-**Today.** `GraphAllocator::alloc_graph` (`alloc.rs:164`) rebuilds the whole
+**Today.** `GraphAllocator::alloc_graph` (`alloc.rs:165`) rebuilds the whole
 node→buffer mapping on every graph rebuild: it frees every previously live
 buffer back to the backend pool (`:165-177`), recomputes `last_use` over build
 order, and re-allocates. Buffer pools are per backend, not unified
-(`alloc.rs:314-334`), and allocation is by **exact element count** — both the
+(`alloc.rs:315-335`), and allocation is by **exact element count** — both the
 Metal (`metal_backend.rs:293-303`) and CUDA (`cuda_backend.rs:1333-1353`) pools
 scan a free list for an exact byte-length match and otherwise allocate fresh.
 `free_buffer` never returns memory to the device (`cuda_backend.rs:1355-1362`).
@@ -298,7 +298,7 @@ backend assignment).
 ### 2.4 L4 — KV cache and sequence state 🔴
 
 **Today.** Each layer owns two persistent contiguous regions, K and V, created
-on first use by `ensure_kv(layer, backend, size)` (`alloc.rs:384-392`), sized
+on first use by `ensure_kv(layer, backend, size)` (`alloc.rs:385-393`), sized
 `n_kv_embd × n_ctx` f32 (or f16 when the type flag is set). They live in the
 allocator inside `GraphCache` and survive graph rebuilds (`graph/cache.rs:69`).
 Positions are *data*, injected per step through the `positions` input node, so
@@ -332,7 +332,7 @@ re-prefill, and any state-space/hybrid model family.
 Two concrete defects live here as well:
 
 - **`ensure_kv` ignores the requested size after the first call**
-  (`alloc.rs:384-392`: the early `if let Some(&pair) = self.kv.get(&layer)`
+  (`alloc.rs:385-393`: the early `if let Some(&pair) = self.kv.get(&layer)`
   returns without comparing `size`). `CParams.n_ctx` is part of the reuse
   identity, so a session that changes `n_ctx` on the same `GraphCache` silently
   keeps the old region. The CPU backend then errors on out-of-range positions
@@ -453,7 +453,7 @@ Two smaller but immediate items sit in this layer:
 KV-session file-format contract, and the name-keyed registry carries each backend's
 priority, capability matrix and pool hooks; consumers read it instead of matching.
 Before F4 the enum was matched in `GraphAllocator::supports`
-(`alloc.rs:140-157`), `alloc_in_pool`/`alloc_fresh_in`/`free_in_pool`
+(`alloc.rs:141-158`), `alloc_in_pool`/`alloc_fresh_in`/`free_in_pool`
 (`:314-380`), `sync_backend` (`:559-579`), `copy_across` (`:592-653`), and the
 scheduler's execute match (`scheduler.rs:274-292`) — nine `#[cfg]`-laden match
 sites, each of which had to be taught about a new backend.
@@ -726,7 +726,7 @@ behavioural defects found while executing the plan, already fixed.
    [#38](https://github.com/yusiwen/minfer/issues/38) added the arm-level Metal
    guard (`MetalBackend::check_kv_store_rows`) for the fill paths that bypass it —
    §2.4 states the same closure in the gap list.
-2. **`ensure_kv` ignores a changed size** (`alloc.rs:384-392`). The KV region is
+2. **`ensure_kv` ignores a changed size** (`alloc.rs:385-393`). The KV region is
    frozen at first allocation while `CParams.n_ctx` remains part of the reuse
    identity, so a size change is neither honoured nor detected.
 3. **Metal weakens kernel guards.** Both halves are **closed**: the decode-fusion
@@ -752,7 +752,7 @@ behavioural defects found while executing the plan, already fixed.
    producing two host round trips per layer (§2.2). `ARCHITECTURE.md:391-393`
    advertises both styles as available.
 7. **Stale `unreachable!("CUDA pool not implemented")`** in the non-CUDA arms
-   (`alloc.rs:332`, `:356`) — misleading text in a live panic path.
+   (`alloc.rs:333`, `:356`) — misleading text in a live panic path.
 8. ~~**Dead fields in the reuse identity**: `CParams.n_batch` and
    `GraphParams.n_seqs` are compared by `params_match` (`cache.rs:57-64`) but no
    builder reads them; every construction site hard-codes 1 / `n_tokens`.~~
@@ -766,7 +766,7 @@ behavioural defects found while executing the plan, already fixed.
    by `(node, dst_backend)`; two foreign consumers can now be served.
 10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:1403-1408`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
-    with `copy_to_host` (`alloc.rs:509`).
+    with `copy_to_host` (`alloc.rs:510`).
 11. **CUDA pool never releases device memory** (`cuda_backend.rs:1355-1362`),
     documented as accepted debt but reasoned about for fixed-shape CLI runs; a
     varying-`n_tokens` workload accumulates one buffer set per distinct shape.
