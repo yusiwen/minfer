@@ -676,52 +676,52 @@ nvcc from your shell; `build.rs` (the Cargo build script that runs before
 compilation) does the whole pipeline:
 
 1. **Opt-in, and required once opted in.** The CUDA section returns early
-   unless `CARGO_FEATURE_CUDA` is set (`build.rs:177-179`) — plain builds
+   unless `CARGO_FEATURE_CUDA` is set (`build.rs:178-180`) — plain builds
    never touch nvcc. But once the feature is requested, CUDA is *required*:
    `src/cuda.rs` declares the `launch_*` symbols that only the kernels
    archive provides, so every failure below `panic!`s with an actionable
-   message (`build.rs:181-187`).
-2. **Find nvcc and the toolkit root.** `find_nvcc()` (`build.rs:378-401`)
+   message (`build.rs:182-188`).
+2. **Find nvcc and the toolkit root.** `find_nvcc()` (`build.rs:379-402`)
    probes `CUDA_HOME`/`CUDA_PATH`, then `which nvcc`, resolving to an
-   absolute path either way; `find_cuda_home()` (`build.rs:403-422`) derives
+   absolute path either way; `find_cuda_home()` (`build.rs:404-423`) derives
    the root for `-I{home}/include`.
 3. **Pin the host compiler (ccbin).** nvcc uses the first `cc`/`g++` on PATH
    as its host compiler and *hard-fails* when that GCC is newer than the
    toolkit supports (CUDA 13 rejects GCC 15 — the error surfaces confusingly
-   inside `<cmath>`). `detect_host_compiler()` (`build.rs:480-519`) probes
+   inside `<cmath>`). `detect_host_compiler()` (`build.rs:481-520`) probes
    nvcc's default first, then `g++-15 … g++-11, g++, clang++`; the winner is
-   passed as `-ccbin` (`build.rs:201-220`, `:255-258`), and
+   passed as `-ccbin` (`build.rs:202-221`, `:256-259`), and
    `MINFER_CUDA_CCBIN` overrides the probe.
-4. **Probe the architectures.** `detect_archs()` (`build.rs:532-561`)
+4. **Probe the architectures.** `detect_archs()` (`build.rs:533-562`)
    compiles a one-line dummy kernel for every candidate from `sm_70` to
-   `sm_121` (`build.rs:537-539`) and keeps the ones this nvcc accepts —
+   `sm_121` (`build.rs:538-540`) and keeps the ones this nvcc accepts —
    candidates newer than the toolkit simply fail their probe and are skipped,
    so one list works on every CUDA version. (The floor is sm_70, not Pascal:
    the prefill GEMM uses WMMA tensor-core intrinsics that require Volta+,
-   `build.rs:525-531`.)
+   `build.rs:526-532`.)
 5. **Compile once, embed many targets.** The single `nvcc` invocation
-   (`build.rs:242-286`) carries `-O3 -fPIC` plus one
+   (`build.rs:243-287`) carries `-O3 -fPIC` plus one
    `-gencode arch=compute_NN,code=sm_NN` per detected arch — SASS for every
-   GPU class — *plus* two kinds of PTX (`build.rs:263-278`): a backward
+   GPU class — *plus* two kinds of PTX (`build.rs:264-279`): a backward
    `compute_70/72` (so an older card like a V100 can JIT forward) and a
    forward `compute_{highest}` (so a GPU newer than the newest SASS can JIT).
    The result is the portable fat binary: every probed arch as native SASS,
    plus PTX from Volta up that any future GPU can JIT.
 
 6. **Archive and link into the Rust binary.** The object is packed into
-   `libcuda_kernels.a` with `ar rcs` (`build.rs:485-494`), and two cargo
-   directives hand it to the linker (`build.rs:496-497`):
+   `libcuda_kernels.a` with `ar rcs` (`build.rs:486-495`), and two cargo
+   directives hand it to the linker (`build.rs:497-498`):
    `cargo:rustc-link-search=native={out_dir}` +
    `cargo:rustc-link-lib=static=cuda_kernels`. The `launch_*` symbols the
    `extern "C"` block of §2.3 declares are resolved against this archive —
    the whole seam between the two languages.
 7. **cudart: static or shared.** The CUDA runtime is linked according to the
-   `cuda_static` feature (`build.rs:327-360`): `cuda_static` links
+   `cuda_static` feature (`build.rs:328-361`): `cuda_static` links
    `libcudart_static.a` (plus `dl`/`pthread`) so the binary needs only the
    NVIDIA driver at run time; the default links `libcudart.so` and bakes an
    rpath — *only* when the toolkit dir is not a system dir, to avoid
-   shadowing a nix-provided glibc (`build.rs:340-359`). The lib directory is
-   probed rather than assumed (`build.rs:433-446`), because distro packages
+   shadowing a nix-provided glibc (`build.rs:341-360`). The lib directory is
+   probed rather than assumed (`build.rs:434-447`), because distro packages
    install cudart into the multiarch dir. What is *never* linked is the
    driver library `libcuda.so.1` — it is dlopen'd lazily at run time
    (`preload_driver`, `src/cuda/methods/init.rs:34`), the same lazy-loading trick as the
