@@ -152,12 +152,17 @@ impl TimingSink {
     /// A CAS loop rather than `fetch_add`, so an absurd duration saturates
     /// instead of wrapping to a small number that reads as "instant".
     /// Contention is nil: one worker thread does the timing.
+    ///
+    /// `try_update` is the current spelling of the same method — `fetch_update`
+    /// was renamed for consistency and is deprecated from Rust 1.99, where
+    /// `src/main.rs`'s `deny(warnings)` turns the two calls below into errors.
+    /// Both names resolve on the 1.97.1 pin, so this is a pure rename.
     pub fn record(&self, index: usize, elapsed: Duration) {
         let nanos = nanos_of(elapsed);
-        let _ = self.calls[index].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        let _ = self.calls[index].try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             Some(cur.saturating_add(1))
         });
-        let _ = self.nanos[index].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        let _ = self.nanos[index].try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             Some(cur.saturating_add(nanos))
         });
     }
