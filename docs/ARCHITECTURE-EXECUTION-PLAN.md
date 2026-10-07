@@ -8494,6 +8494,29 @@ f16-vs-f16 byte comparison against llama.cpp's converter is the stronger claim.
 the cached 0.5B); CI covers the writer/encoder/converter/download unit and
 local-HTTP gates.
 
+**#334 (2026-10-07) — the byte-parity claim is build-dependent.** Re-running the
+gate on `macbook (macOS 27.0.1, Apple M4 Pro)` made it red (`blk.0.attn_k.weight
+payload differs`; 168 of 290 q4_0 tensors, every difference a single data nibble,
+zero scale bytes) against a `llama-quantize` built by Apple clang without
+`-ffp-contract=fast`, while `dgxspark`'s GCC-built reference still reproduced
+290/290. The flag is the whole difference, measured on `dgxspark (aarch64, GB10
+sm_121)`, 2026-10-07, one variable at a time from llama.cpp HEAD `050dde50c`:
+`-O3 -DNDEBUG` reproduces the cached `ref/qwen2.5-0.5b-q4_0.gguf` (`04634958…`)
+and adding `-ffp-contract=off` yields `ea94611e…`. The gate now detects which of
+the two builds produced the reference it compares against — `quantize::FmaContract`
+threads the contract through every encoder, and `quantize_row_with(…, Off)`
+reproduces that uncontracted reference **290/290** — so it refuses loudly naming
+the build instead of reporting a payload difference; a reference that matches
+neither variant still fails as a payload difference. `docs/GGUF-TOOLING.md` §4.2
+carries the qualifier next to the 290/290 number, the two-box hash table and what
+[#205](https://github.com/yusiwen/minfer/issues/205) still owes. Mutation evidence
+on `dgxspark`: the `-ffp-contract=off` reference → the named-build refusal; one
+flipped payload byte → `tensor blk.3.attn_output.weight payload differs (1 of
+451584 bytes)` with *build unmatched*; and a refactor slip that moved `nmax`'s
+sign in `make_qx_quants` → q6_K `blk.0.ffn_down.weight payload differs (2567682
+of 3575040 bytes)`, green again 290/290 after the fix (the round-trip unit tests
+did not see it).
+
 ### F6b — f16 weights on the device backends + a vectorized CPU f16 dot (#141) — **DONE 2026-09-25**
 
 **What landed.** The third item F6 left open, plus the discovery that the fused

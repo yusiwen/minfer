@@ -425,17 +425,63 @@ strongest available reference, and the missing direct converter reference is
 
 `llama-quantize ref-f16.gguf ref-<type>.gguf <type>` on the same f16 source.
 For **each** of q4_0, q4_1, q5_0, q5_1, q8_0, all **290/290 tensors are
-byte-identical** (measured 2026-09-27, aarch64, `MINFER_F6_F16_GGUF=… cargo test
---release --bin minfer f6_quantize_encoder_is_byte_identical_to_llamacpp --
---ignored`; the `env_path` convention and the per-type command are below).
+byte-identical** — against a reference **built with `-ffp-contract=fast`**
+(measured 2026-09-27, `dgxspark (aarch64, GB10 sm_121)`,
+`MINFER_F6_F16_GGUF=… cargo test --release --bin minfer
+f6_quantize_encoder_is_byte_identical_to_llamacpp -- --ignored`; the `env_path`
+convention and the per-type command are below). That qualifier is not decoration,
+and this section records it because the number is otherwise a statement about
+**one build** of `llama-quantize`: measured 2026-10-07, **the same llama.cpp
+source built with the one flag changed does not match**, and a differently-built
+reference made the same gate red on a platform this project ships on
+([#334](https://github.com/yusiwen/minfer/issues/334)).
 
-One subtlety is worth recording because it is not obvious from the reference
-source: llama.cpp computes `x*id + c` and is compiled with
-`-ffp-contract=fast`, so the CPU reference contracts that expression to an FMA.
-Without `f32::mul_add` the q4_0 encoder differed from `llama-quantize` in
-**12 of 64512 bytes** on one tensor — each a single nibble off by one, at an
-exact rounding boundary. With the FMA the difference is zero. Q8_0 uses a single
-multiply and matched without it.
+**Which build, and how it was identified.** The `dgxspark` producer is a GCC
+13.3.0 `-O3 -DNDEBUG` build with no explicit `-ffp-contract` (so GCC's default
+`fast`). It is identified by reproduction rather than by a recorded version
+string — nothing recorded the binary's own source revision, which is part of what
+[#205](https://github.com/yusiwen/minfer/issues/205) still owes. Measured
+2026-10-07 on `dgxspark`, one variable at a time, from `~/git/reading/llama.cpp`
+HEAD `050dde50c` and the cached f16 source:
+
+| `llama-quantize` build | `ref/qwen2.5-0.5b-q4_0.gguf` sha256 |
+|---|---|
+| the cached `build/bin/llama-quantize` (GCC 13.3.0, `-O3 -DNDEBUG`) | `04634958ae0289b8c557c4d50491d225b23728326fd6d5bbfabedd299a89b3b9` |
+| fresh build of HEAD `050dde50c`, same flags | `04634958…` — **identical**, so the flag is the only variable |
+| that same build **+ `-ffp-contract=off`** | `ea94611ef461e5a65c1af0b6c7189d731735a31e310b54b48ad9b94fa2521930` |
+
+The Mac's reference (`macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-07; the
+binary built 2026-09-01 from `458681e1d`, `CMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG`,
+no `-ffp-contract=fast`) is sha256 `51c2b000…` and **disagrees with minfer in 168
+of 290 q4_0 tensors** — every difference a single data nibble, zero scale bytes
+(`blk.0.attn_k.weight`: exactly **12 of 64512** bytes).
+
+**Why.** llama.cpp computes `x*id + c` in `quantize_row_q4_0_ref`, and whether
+the compiler contracts that across statements is a *rounding decision*: under
+`-ffp-contract=fast` the expression is one FMA, otherwise `fmul` + `fadd`, and
+the two pick a different quant at an exact rounding boundary. The Mac's
+`quantize_row_q4_0_ref` disassembles to `fmul.4s` + `fadd.4s` with no `fmla`.
+GCC contracts by default and Apple clang does not without the flag, so **both
+sides are right about their own build**; minfer's encoder uses `f32::mul_add`
+unconditionally, i.e. it reproduces the contracting one. This is the mirror of
+the experiment this section used to record alone — minfer *without* `mul_add`
+against the `dgxspark` reference differs in **12 of 64512** bytes on the same
+tensor, the same count — which is what makes "the reference's build" the whole
+content of the claim. Q8_0 uses a single multiply and matched without it.
+
+**What the gate does about it.** `f6_quantize_encoder_is_byte_identical_to_llamacpp`
+prints the reference's path, size and the build it established it matched
+(`build -ffp-contract=fast` on a pass). On a mismatch it does **not** report an
+encoder defect first: it re-encodes the whole source with the uncontracted
+arithmetic — `quantize::FmaContract::Off` through `quantize_row_with`, which is
+**exact** for the legacy quants and a *model* of the K-quants' per-expression
+fusion (§4.2.1) — and when the reference matches *that*, fails with the build
+named ("the reference is NOT the `-ffp-contract=fast` build this encoder
+reproduces … rebuild `llama-quantize` with `-ffp-contract=fast`") instead of
+"tensor X payload differs". A reference that matches **neither** variant still
+fails as a payload difference, which is what an encoder defect looks like. The
+`#[ignore]` reason names the same prerequisite. The identity is a whole-file,
+per-tensor byte comparison in all three outcomes.
 
 The pure encoder gate (`quantize::tests`) additionally pins the block layout
 against hand-checked reference numbers: the scale, the `j` / `j+16` nibble
@@ -497,7 +543,10 @@ on the 0.5B** (`encoded-as q5_0: 145, f32: 121, q4_K: 24`) and **310/310 on the
 0.6B** (`encoded-as f32: 113, q4_K: 197`), for each of the three types. The gate
 prints that breakdown, so "byte-identical" always carries how many tensors the
 new encoder actually saw. Legacy regression on the same 0.5B source:
-q4_0/q4_1/q5_0/q5_1/q8_0 all still 290/290.
+q4_0/q4_1/q5_0/q5_1/q8_0 all still 290/290 against the `-ffp-contract=fast`
+reference of §4.2 (the K-quant rows above are against that same build, and their
+per-expression fusion is *not* reproducible by the `Off` variant — that variant
+is the gate's provenance probe, not a second encoder).
 
 Reproduce the sources and references:
 
@@ -593,7 +642,25 @@ network is used.
   `llama-quantize` references live in `~/.cache/minfer/f6-src/` and are
   regenerated by the recipe in §4.2.1; nothing checks that they are the ones the
   record describes, and a stale cache entry would silently be compared against.
-  Filed as [#205](https://github.com/yusiwen/minfer/issues/205).
+  Filed as [#205](https://github.com/yusiwen/minfer/issues/205), whose manifest
+  must record per artifact the producer command, the **minfer commit** and the
+  **llama.cpp commit + build flags**. §4.2 supplies the acceptance test for those
+  last two fields and this PR does not build the manifest: the *reference*'s build
+  is now detected by the gate and named in its verdict, but the reference
+  **file** itself is still unverified — a swapped or stale
+  `~/.cache/minfer/f6-src/ref/*.gguf` is compared against silently, and the
+  cross-box f16 divergence below is still unexplained by anything but a
+  not-recorded producer commit.
+- **`qwen2.5-0.5b-instruct-f16.gguf` is not byte-identical across boxes.**
+  `dgxspark`'s copy is `aef12ad44a60d2dd…` (2026-09-27) and the Mac's is
+  `a26884ee1286c1d3…` (2026-10-07, master `ab34a72`), while their f32
+  conversions (`6894f9ea3eb79e29…`) and the bf16-from-f32 reference
+  (`688109f4c9a4a8ca…`) **are** identical — so the cause is a *producer version*
+  difference, not a platform one, and it is only readable at all if the record
+  names the minfer commit that produced each fixture. That is [#205]'s field, not
+  this one's; the two boxes' full tables are on
+  [#333](https://github.com/yusiwen/minfer/issues/333) and
+  [#205](https://github.com/yusiwen/minfer/issues/205).
 - **f16 weights run on CPU, CUDA and Metal for both architectures (Qwen2/Qwen2.5
   and Qwen3).**
   `Op::MatMul`/`Op::GetRows` dispatch f16 on the CPU (one weight row at a time,
