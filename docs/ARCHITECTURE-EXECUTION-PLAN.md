@@ -8494,6 +8494,36 @@ f16-vs-f16 byte comparison against llama.cpp's converter is the stronger claim.
 the cached 0.5B); CI covers the writer/encoder/converter/download unit and
 local-HTTP gates.
 
+**#205 (2026-10-07) — the fixture chain has a record, and the gates check it.**
+The F6 gates compare against files under `~/.cache/minfer/f6-src/` that they do
+not produce, so a stale or replaced reference used to be compared against
+silently. `docs/f6-fixtures.json` now records one entry per artifact content
+identity — path, bytes, sha256 (or a `sha256_prefix` where the 2026-10-07 table
+truncated it), the exact producer command, the producer's identity (minfer commit,
+or llama.cpp commit + compiler + effective `-ffp-contract` + cflags), date and an
+absolute box label — and every path with two recorded contents carries a
+`divergence_notes` entry, which is how the two 2026-10-07 divergences became
+readable: the f16 source and its bf16 cast differ by **minfer producer version**
+(the dgxspark copy is the 2026-09-27 producer whose commit was never recorded;
+the Mac's is `ab34a72`, and `bf16-from-f32` — whose f32 input *is* identical on
+both boxes — is byte-identical), while the `ref/qwen2.5-0.5b-*` references differ
+by the reference build's `-ffp-contract` (§4.2, #334). `scripts/check_f6_fixtures.py`
+audits the manifest's shape and the tree cross-check in CI (`--check`), verifies
+the whole cache where it exists (`--verify`), and carries its own tamper cases
+(`--selftest`); the F6 gates verify the fixture they resolve
+(`src/tooling/tests/f6_fixtures.rs`), so `cargo test … --ignored` refuses a
+tampered cache by name and digest. Measured on `dgxspark (aarch64, GB10 sm_121)`,
+2026-10-07: `--verify` → 36 recorded contents, the 21 present files all matching,
+the Mac's two `f164/` entries reported absent; one flipped byte in a
+`/tmp` copy (`qwen2.5-0.5b-q4_0.gguf`, `a7`→`a6`) → exit 1 naming the file, the
+actual `9fe6b5e0…` and both recorded digests (`04634958…` and the Mac's `51c2b000…`);
+the same tamper under `MINFER_F6_CACHE` → the gate panics with the same message;
+an unrecorded `.gguf` inside the cache root → refused as unknown. Three new
+unit tests (485/0/40 on dgxspark) and a `sha2` **dev**-dependency, so the
+production graph is unchanged. Still owed: the 11 truncated Mac digests (#342),
+the `hf/` `main` revision pin, `f164/minfer-f16.gguf`'s producer, and a
+regeneration command.
+
 **#334 (2026-10-07) — the byte-parity claim is build-dependent.** Re-running the
 gate on `macbook (macOS 27.0.1, Apple M4 Pro)` made it red (`blk.0.attn_k.weight
 payload differs`; 168 of 290 q4_0 tensors, every difference a single data nibble,

@@ -226,7 +226,11 @@ fn verify_in(path: &Path, m: &Manifest, root: &Path) -> Result<Option<String>, S
 /// match once. A test's failure is the point — the alternative is a silently
 /// wrong comparison.
 pub fn check(path: &Path) {
-    match verify(path) {
+    check_in(path, manifest(), &cache_root(manifest()));
+}
+
+fn check_in(path: &Path, m: &Manifest, root: &Path) {
+    match verify_in(path, m, root) {
         Ok(None) => {}
         Ok(Some(note)) => eprintln!("[f6 fixtures] WEAK {note}"),
         Err(msg) => panic!("{msg}"),
@@ -315,6 +319,17 @@ fn f6_fixture_a_tampered_cached_reference_is_refused_by_name_and_digest() {
     assert!(matches!(verify_in(&target, &m, &root), Ok(None)));
     // ... and one flipped byte is refused by name, actual digest and record.
     std::fs::write(&target, b"tinv").unwrap();
+    // The resolver the gates actually reach (`env_path` -> `check`) must refuse
+    // too, not just the inner function: a `check` that returned quietly would
+    // leave every F6 gate comparing against a tampered file.
+    let panicked = std::panic::catch_unwind(|| {
+        check_in(&target, &m, &root);
+    })
+    .is_err();
+    assert!(
+        panicked,
+        "the fixture resolver must panic on a tampered file"
+    );
     let err = verify_in(&target, &m, &root).expect_err("a tampered cache fixture must be refused");
     assert!(err.contains(&target.display().to_string()), "{err}");
     assert!(err.contains("actual sha256"), "{err}");
