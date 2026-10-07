@@ -164,11 +164,46 @@ fn graph_logits_match_forward_real_model() {
     compare("prefill", &lf, &lg);
     compare("decode", &lf2, &lg2);
 }
-/// Phase 3 verification: the graph path on the Metal backend must produce
-/// logits close to the CPU forward (kernel math differs in reduction order,
-/// so a loose tolerance + greedy-token equality is the criterion).
+/// Phase 3 / [#324]: the model-level CPU-vs-Metal logits gate, restored.
+///
+/// The pre-#324 body called `model.forward` and `model.forward_graph`, but in
+/// the graph era both dispatch to `Qwen2Graph::forward` under the same
+/// `Qwen2Graph::device` decision, so it compared the Metal graph with itself
+/// (measured max |Δ| = 0 — a vacuous gate). This version loads the **same
+/// cached 0.5B Q4_0** into two engines — a `Layers(0)` CPU engine and an
+/// explicit full-plan Metal engine (`OffloadRequest::Layers(usize::MAX)`) —
+/// drives the same greedy continuation through the production
+/// `ModelDef::forward_graph_cached`, asserts the two graphs genuinely differ in
+/// backend assignment (the CPU graph has no `METAL` node; the Metal graph
+/// assigns `METAL` nodes), and compares the final-step logits plus the greedy
+/// continuation. This is the shape of the CUDA #141 gate and the Metal #164
+/// f16 gate.
+///
+/// Bar named before measuring (gate-contract rules 3/5): unlike the f16 gate,
+/// this compares the **quantized** Q4_0 path, where the CPU quantizes
+/// activations to Q8_0 on the fly while Metal reads f32 (AGENTS rule 9), so
+/// the class is quantization, not accumulation order. The bar is `MAX_ABS`
+/// absolute / `MAX_REL` relative (taken from the q8_0 weight-quantisation
+/// class of `docs/GGUF-TOOLING.md`: 1.0 absolute, 3x the observed), with the
+/// load-bearing arm the greedy continuation pinned to the literal the CPU arm
+/// produces. Measured on `macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-07,
+/// `cargo test --release --bin minfer -- --nocapture
+/// graph_metal_matches_cpu_logits`: max |Δlogit| **0.347** absolute /
+/// **1.57e-2** relative against max |logit| 22.04, greedy
+/// `[12095, 11, 323, 432]` on both engines, metal-arm 248 METAL / 0 CPU nodes
+/// and cpu-arm 0 METAL / 440 CPU nodes. The record lives in
+/// `docs/METAL-BACKEND-DESIGN.md` §7.3.
 #[test]
 fn graph_metal_matches_cpu_logits() {
+    /// Absolute logits bar (gross-error detector).
+    const MAX_ABS: f32 = 1.0;
+    /// Relative logits bar against the run's max |logit|.
+    const MAX_REL: f32 = 5e-2;
+    /// Greedy continuation the CPU arm must reproduce — the value arm
+    /// (rule 1), independent of the Metal path. Pinned for the cached 0.5B
+    /// Q4_0 on "The capital of France is".
+    const PINNED_GREEDY: [u32; 4] = [12095, 11, 323, 432];
+
     #[cfg(target_os = "macos")]
     let _g = crate::metal::metal_test_lock();
     #[cfg(not(target_os = "macos"))]
@@ -178,13 +213,23 @@ fn graph_metal_matches_cpu_logits() {
     }
     #[cfg(target_os = "macos")]
     {
+        use crate::graph::cache::GraphCache;
+        use crate::graph::offload::OffloadRequest;
+        use crate::graph::Backend;
+        use crate::models::{Device, ModelDef};
+
         let Some(path) = cached_model_path() else {
             eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping");
             return;
         };
+        // The Metal device must be up **before** the load, or the loader decides
+        // the weights are not usable there and answers `Device::Cpu`.
         crate::metal::MpsState::init();
+        if crate::metal::MpsState::get().is_none() {
+            eprintln!("no Metal device; skipping");
+            return;
+        }
         let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
-        let model = crate::models::load_model(&gguf).expect("load model");
         // Keep the weight registry stable for this whole test: a parallel
         // test loading a different architecture swaps same-named entries,
         // which would flip the CUDA gate mid-test (persistent KV regions
@@ -193,25 +238,103 @@ fn graph_metal_matches_cpu_logits() {
         let _model_load_guard = crate::cuda::CudaState::model_load_guard();
         let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let ids = tok.encode("The capital of France is");
-        let positions: Vec<usize> = (0..ids.len()).collect();
+        assert!(!ids.is_empty());
+        let n_ctx = 512usize;
+        let steps = PINNED_GREEDY.len();
 
-        // CPU reference (forward, not forward_graph — separate KV state)
-        let ref_l = model.forward(&ids, &positions, 1, 4096);
+        // Metal arm: the full plan, explicit (no environment involvement). Its
+        // weights are registered under the primary (empty) namespace.
+        let dev = crate::models::load_model_with(&gguf, "", OffloadRequest::Layers(usize::MAX))
+            .expect("Metal load");
+        assert_eq!(
+            dev.device(),
+            Device::Metal,
+            "the 0.5B Q4_0 must be a Metal model on this box"
+        );
+        // CPU arm: `Layers(0)` — the same engine, fenced to no device block, so
+        // `Qwen2Graph::device` answers Cpu. A distinct namespace keeps the
+        // name-keyed Metal registry from making this engine look registered.
+        let cpu = crate::models::load_model_with(&gguf, "cpu324.", OffloadRequest::Layers(0))
+            .expect("CPU load");
+        assert_eq!(
+            cpu.device(),
+            Device::Cpu,
+            "the CPU arm must not be a device model"
+        );
 
-        // GPU graph (forward_graph picks Metal when MPS + weights on GPU)
-        let gpu_l = model.forward_graph(&ids, &positions, 1, 4096);
+        // Greedy continuation + the built graph's assignment, per engine.
+        let run = |model: &dyn ModelDef| -> (Vec<f32>, Vec<u32>, usize, usize) {
+            let mut cache = GraphCache::new();
+            let n = ids.len();
+            let mut positions: Vec<usize> = (0..n).collect();
+            let mut logits = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
+            let mut toks = Vec::with_capacity(steps);
+            for step in 0..steps {
+                let next = argmax(&logits);
+                toks.push(next);
+                positions = vec![n + step];
+                logits = model.forward_graph_cached(&[next], &positions, 1, n_ctx, &mut cache);
+            }
+            let (graph, _alloc) = cache.current().expect("a built graph");
+            let n_metal = graph
+                .nodes
+                .iter()
+                .filter(|nd| nd.backend == Some(Backend::METAL))
+                .count();
+            let n_cpu = graph
+                .nodes
+                .iter()
+                .filter(|nd| nd.backend == Some(Backend::CPU))
+                .count();
+            (logits, toks, n_metal, n_cpu)
+        };
 
-        let mut maxd = 0.0f32;
-        for i in 0..ref_l.len() {
-            maxd = maxd.max((ref_l[i] - gpu_l[i]).abs());
-        }
-        eprintln!("[metal graph] logits max abs diff: {maxd:.3e} (expected ~18: the graph-Metal path uses f32 activations while the CPU reference quantizes activations to Q8_0)");
-        let greedy_ref = argmax(&ref_l);
-        let greedy_gpu = argmax(&gpu_l);
-        eprintln!("[metal graph] greedy token: CPU={greedy_ref} GPU={greedy_gpu}");
-        // functional criterion: the greedy token should agree OR the GPU
-        // path should still be self-consistent (verified separately)
-        assert_eq!(greedy_ref, greedy_gpu, "greedy token differs");
+        let (logits_metal, toks_metal, n_metal, n_metal_cpu) = run(dev.as_ref());
+        let (logits_cpu, toks_cpu, n_cpu_metal, n_cpu_cpu) = run(cpu.as_ref());
+
+        // Control arm (rule 2): the two sides must differ in the property under
+        // test — backend assignment. A CPU engine cannot run a Metal graph, and
+        // the Metal engine must actually place nodes on the device.
+        eprintln!(
+            "[metal graph] graph nodes: metal-arm {n_metal} METAL / {n_metal_cpu} CPU; cpu-arm {n_cpu_metal} METAL / {n_cpu_cpu} CPU"
+        );
+        assert!(
+            n_metal > 0,
+            "the Metal arm built no METAL node (vacuous gate)"
+        );
+        assert_eq!(n_cpu_metal, 0, "the CPU arm must not place a node on Metal");
+
+        // Value arm (rule 1): the CPU engine's continuation is pinned.
+        assert_eq!(
+            toks_cpu.as_slice(),
+            &PINNED_GREEDY,
+            "CPU greedy continuation moved"
+        );
+        // The load-bearing parity claim.
+        assert_eq!(
+            toks_metal, toks_cpu,
+            "greedy continuation differs CPU vs Metal"
+        );
+
+        assert_eq!(logits_metal.len(), logits_cpu.len());
+        let max_abs = logits_metal
+            .iter()
+            .zip(logits_cpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_logit = logits_metal.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let max_rel = max_abs / max_logit.max(1.0);
+        eprintln!(
+            "[metal graph] final-step logits: max |Δ| = {max_abs:.3e} (bar {MAX_ABS}), relative {max_rel:.3e} (bar {MAX_REL}), max |logit| = {max_logit:.3e}; greedy CPU={toks_cpu:?} Metal={toks_metal:?}"
+        );
+        assert!(
+            max_abs <= MAX_ABS,
+            "CPU vs Metal max |Δlogit| = {max_abs:.3e} exceeds bar {MAX_ABS}"
+        );
+        assert!(
+            max_rel <= MAX_REL,
+            "CPU vs Metal relative Δlogit = {max_rel:.3e} exceeds bar {MAX_REL}"
+        );
     }
 }
 /// Phase 3: full layer-0 path on Metal vs CPU (embed/rms/matmul/rope/kv/attn).
