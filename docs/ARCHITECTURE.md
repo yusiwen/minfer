@@ -349,7 +349,9 @@ scheduler orchestrates assignment, cross-backend copies, and sync.
   mirrors the old per-layer check). `MINFER_DISABLE_MPS=1` forces CPU.
 - **CPU**: always available; AVX2 dispatch via
   `is_x86_feature_detected!("avx2")` on x86, NEON+SDOT on aarch64, scalar
-  fallback elsewhere (`MINFER_NO_NEON=1` forces scalar).
+  fallback elsewhere (`MINFER_NO_NEON=1` forces scalar; the K-quant dots also have
+  an AVX-512/VNNI path since [#56](https://github.com/yusiwen/minfer/issues/56),
+  gated by `MINFER_NO_AVX512=1` and `MINFER_NO_AVX2=1`).
 
 ### 5.3 GPU safety
 
@@ -533,7 +535,8 @@ Selection rules (then):
 - **CUDA** (`--features cuda`): requires every layer's 7 matrices to be all
   Q4_0/Q4_1 or all Q4_K/Q6_K. Decode replays a captured CUDA Graph.
 - **CPU**: always available; AVX2 dispatch via
-  `is_x86_feature_detected!("avx2")`, scalar fallback elsewhere.
+  `is_x86_feature_detected!("avx2")`, scalar fallback elsewhere (plus the
+  AVX-512/VNNI K-quant dots, [#56](https://github.com/yusiwen/minfer/issues/56)).
 
 The GPU path skipped the per-token CPU→GPU KV drain (no `sync_kv_to_cpu`)
 because GPU-layer failure is deterministic by weight type — the sync only

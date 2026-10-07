@@ -3,7 +3,7 @@
 This document analyzes minfer's CPU inference performance, compares with
 llama.cpp, and documents optimization attempts and their outcomes.
 
-> **Status and scope (updated 2026-09-15).** This file is a layered record.
+> **Status and scope (updated 2026-10-08).** This file is a layered record.
 > The sections from the top down to **§Conclusion** are a **2026-07-01
 > snapshot taken before the compute-graph rewrite**: their
 > `src/models/qwen2/forward.rs:NNN` line references point at a file that was
@@ -11,14 +11,15 @@ llama.cpp, and documents optimization attempts and their outcomes.
 > longer holds. The current numbers are in **§"NEON + Threading Overhaul"
 > (2026-08)** below and in `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §3.
 >
-> Three of the four "Remaining Optimization Opportunities" from that snapshot
+> Four of the four "Remaining Optimization Opportunities" from that snapshot
 > have since shipped: **P4 multi-threading** (persistent CPU thread pool,
 > `src/kernel.rs`), **P2 f16 KV cache** (`MINFER_CACHE_TYPE`, auto-selected for
-> 7B-class models), and **flash attention** (on both GPU backends; the CPU path
-> keeps the multi-pass form). **P1 — AVX2 dot products for the K-quant types —
-> is still open** and remains the largest CPU gap: only Q4_0 and Q8_0 have AVX2
-> kernels today (`src/quants.rs`). That gap is tracked in
-> `docs/ARCHITECTURE-ROADMAP.md` §2.7 and `docs/SUPPORT-MATRIX.md`.
+> 7B-class models), **flash attention** (on both GPU backends; the CPU path
+> keeps the multi-pass form), and **P1 — the AVX2/AVX-512 dot products for the
+> K-quant types** ([#56](https://github.com/yusiwen/minfer/issues/56), landed
+> 2026-10-08; see §P1 below). The remaining piece of that lane is **weight
+> repacking**, tracked in `docs/ARCHITECTURE-ROADMAP.md` §2.7 and
+> `docs/SUPPORT-MATRIX.md`.
 
 ## Current State
 
@@ -358,22 +359,35 @@ minfer and llama.cpp is due to:
 
 ## Remaining Optimization Opportunities
 
-> **Superseded in part (2026-09-15).** P2, P3 and P4 below have shipped since
-> this section was written; **P1 (Q4_K AVX2) is still open**. See the status
-> banner at the top of this document.
+> **Superseded in part (2026-10-08).** P2, P3 and P4 below have shipped since
+> this section was written, and **P1 — the K-quant AVX2/AVX-512 dots — landed
+> 2026-10-08** ([#56](https://github.com/yusiwen/minfer/issues/56)); only its
+> weight-repacking half remains. See the status banner at the top of this
+> document.
 
-### P1: Q4_K AVX2 Dot Product
+### P1: K-quant AVX2 / AVX-512 Dot Products — **DONE 2026-10-08** (#56)
 
-**Impact:** Huge for Q4_K models (all matmul operations).
+**Impact:** Huge for Q4_K/Q5_K/Q6_K models (all matmul operations).
 **Difficulty:** High (requires SIMD bit manipulation).
 
-**Current state:** `src/quants.rs:201` uses scalar `dot_q4_k_q8_0_scalar`.
+**Current state (closed):** `Q4_K`/`Q5_K`/`Q6_K × Q8_K` have AVX2+FMA kernels in
+`src/quants/avx2.rs` and AVX-512/VNNI variants in `src/quants/avx512.rs`,
+dispatched **AVX-512 → AVX2 → scalar** at runtime (`MINFER_NO_AVX512=1` drops to
+AVX2, `MINFER_NO_AVX2=1` to scalar — the x86 counterparts of `MINFER_NO_NEON`).
+`quants::avx2_correctness` gates each kernel **bitwise** against its `*_scalar`
+reference, and its `#[ignore]`d `kquant_simd_dot_speedup` harness records the dot
+ratios on a 4096-element row: AVX2 `3.39× / 2.80× / 1.79×`, AVX-512
+`3.97× / 3.23× / 2.51×` scalar for `Q4_K / Q5_K / Q6_K` (Intel `i7-11700B`,
+2026-10-08). `minfer bench` on the cached Qwen2.5-0.5B Q4_K_M (16 threads, median
+of nine `-r 3` samples, `--n-ctx 656`) moves prefill `pp512` 28.59 → 32.13 tok/s
+and decode `tg128` 11.20 → 12.54 tok/s; the modest end-to-end delta is the
+weight-row re-read per token, which the remaining **weight-repacking** increment
+addresses.
 
-**llama.cpp approach:** `ggml/src/ggml-cpu/arch/x86/quants.c:1900-2076`
-implements AVX2 with `denibble()` trick for fast nibble unpacking.
-
-**Recommendation:** Implement AVX2 Q4_K dot product following llama.cpp's
-approach. This is the highest-impact optimization for Q4_K models.
+**llama.cpp approach:** `ggml/src/ggml-cpu/arch/x86/quants.c` uses the
+`denibble()`/`maddubs` AVX2 shape and the VNNI `dpbusd` AVX-512 shape; minfer's
+kernels follow the same structure and keep the scalar float order so the result is
+bitwise, not merely close.
 
 ### P2: f16 KV Cache
 
@@ -715,7 +729,9 @@ The CPU path went from **1.1 tok/s decode (single-threaded scalar) to
    instruction (16 MACs/instr) via stable inline asm (`vdotq_s32` is unstable
    in std::arch). **Bit-exact with the scalar kernels** (exact int32
    accumulation, per-block float ops in identical order); `MINFER_NO_NEON=1`
-   reverts.
+   reverts. The x86 counterpart since #56 is `MINFER_NO_AVX2=1` (the whole quants
+   AVX2 layer) with `MINFER_NO_AVX512=1` dropping just its AVX-512/VNNI layer to
+   AVX2.
 2. **Q8_K activations for K-quant matmuls** (`src/block.rs` Q8KB,
    `src/quants.rs` quantize + dots, `src/kernel.rs` dispatch) — llama.cpp's
    activation format: 256-element blocks with precomputed int16 per-subblock

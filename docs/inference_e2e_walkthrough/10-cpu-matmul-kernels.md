@@ -180,15 +180,14 @@ The other arms only change the stride constants and the kernel name: `Q8_0` has 
 pub fn dot_q4_0_q8_0(q4: &[u8], q8: &[u8]) -> f32 {
     let nb = q8.len() / Q8B;                       // 32-value blocks
     #[cfg(target_arch = "x86_64")]
-    { if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-          return unsafe { dot_q4_0_q8_0_avx2(q4, q8, nb) }; } }
+    { if avx2_enabled() { return unsafe { dot_q4_0_q8_0_avx2(q4, q8, nb) }; } }
     #[cfg(target_arch = "aarch64")]
     { if neon_enabled() { return unsafe { dot_q4_0_q8_0_neon(q4, q8, nb) }; } }
     dot_q4_0_q8_0_scalar(q4, q8, nb)               // portable fallback
 }
 ```
 
-Runtime detection (`is_x86_feature_detected!`) is why one binary ships everywhere and picks AVX2 only where it exists; doc 06's `supports_op` story is about *ops*, this one is about *instructions*, and both follow the same capability-query philosophy.
+Runtime detection (`is_x86_feature_detected!`, wrapped in `avx2_enabled()`) is why one binary ships everywhere and picks AVX2 only where it exists; `MINFER_NO_AVX2=1` forces the portable fallback for A/B (`MINFER_NO_NEON=1` on aarch64). The K-quant dots (`dot_q4_k_q8_k`/`dot_q5_k_q8_k`/`dot_q6_k_q8_k`) follow the same shape with a third arm — an AVX-512/VNNI variant selected first, then AVX2, then scalar ([#56](https://github.com/yusiwen/minfer/issues/56)) — so the same wrapper text applies to all ten `dot_*` entry points; doc 06's `supports_op` story is about *ops*, this one is about *instructions*, and both follow the same capability-query philosophy.
 
 The AVX2 kernel processes one 32-value block per iteration with two 256-bit registers:
 
@@ -300,7 +299,7 @@ pub(super) unsafe fn sdot_vec(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int
 }
 ```
 
-Each `sdot` takes two 16-byte int8 vectors and adds **sixteen** multiply-accumulates into four i32 lanes. The NEON `dot_q4_0_q8_0` (`src/quants/neon.rs:58`) unpacks nibbles with NEON shuffles and drives `sdot_vec` per 16 bytes — the aarch64 answer to `maddubs`. `MINFER_NO_NEON=1` disables the whole NEON layer (`neon_enabled()`) and drops to scalar, which is how the optimization campaign A/Bs the SIMD paths.
+Each `sdot` takes two 16-byte int8 vectors and adds **sixteen** multiply-accumulates into four i32 lanes. The NEON `dot_q4_0_q8_0` (`src/quants/neon.rs:58`) unpacks nibbles with NEON shuffles and drives `sdot_vec` per 16 bytes — the aarch64 answer to `maddubs`. `MINFER_NO_NEON=1` disables the whole NEON layer (`neon_enabled()`) and drops to scalar, which is how the optimization campaign A/Bs the SIMD paths; on x86 the counterparts are `MINFER_NO_AVX2=1` (whole quants AVX2 layer) and `MINFER_NO_AVX512=1` (only the AVX-512/VNNI K-quant dots, falling back to AVX2).
 
 **The activation quantizers.** The Q8_0 one, entry first:
 
@@ -478,6 +477,7 @@ This is the `GetRows` node of doc 05 made concrete — "the embedding table is a
 - `MINFER_TIMING=1 ./target/release/minfer <model> "hi"` — splits per-token wall time into sampling vs forward (doc 09 §4); on CPU, forward *is* these kernels.
 - `--threads N` — the pool's worker count; output must be identical for any N (that property is itself tested).
 - `MINFER_NO_NEON=1` (aarch64) — forces scalar, the A/B lever for the NEON layer.
+- `MINFER_NO_AVX2=1` (x86) — forces the whole quants AVX2 layer scalar; `MINFER_NO_AVX512=1` drops only the AVX-512/VNNI K-quant dots to AVX2.
 
 ## 5. Cross-references
 

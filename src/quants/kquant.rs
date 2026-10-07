@@ -7,6 +7,17 @@ use super::*;
 pub fn dot_q4_k_q8_k(q4: &[u8], q8k: &[u8]) -> f32 {
     debug_assert!(q4.len() % Q4KB == 0);
     debug_assert!(q8k.len() % crate::block::Q8KB == 0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Dispatch order: AVX-512/VNNI → AVX2+FMA → scalar. Both x86 gates are
+        // runtime and honour MINFER_NO_AVX512 / MINFER_NO_AVX2.
+        if avx512_enabled() {
+            return unsafe { dot_q4_k_q8_k_avx512(q4, q8k) };
+        }
+        if avx2_enabled() {
+            return unsafe { dot_q4_k_q8_k_avx2(q4, q8k) };
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     {
         if neon_enabled() {
@@ -62,6 +73,15 @@ pub(super) fn dot_q4_k_q8_k_scalar(q4: &[u8], q8k: &[u8]) -> f32 {
 pub fn dot_q6_k_q8_k(q6: &[u8], q8k: &[u8]) -> f32 {
     debug_assert!(q6.len() % Q6KB == 0);
     debug_assert!(q8k.len() % crate::block::Q8KB == 0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            return unsafe { dot_q6_k_q8_k_avx512(q6, q8k) };
+        }
+        if avx2_enabled() {
+            return unsafe { dot_q6_k_q8_k_avx2(q6, q8k) };
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     {
         if neon_enabled() {
@@ -121,6 +141,15 @@ pub(super) fn dot_q6_k_q8_k_scalar(q6: &[u8], q8k: &[u8]) -> f32 {
 pub fn dot_q5_k_q8_k(q5: &[u8], q8k: &[u8]) -> f32 {
     debug_assert!(q5.len() % 176 == 0);
     debug_assert!(q8k.len() % crate::block::Q8KB == 0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx512_enabled() {
+            return unsafe { dot_q5_k_q8_k_avx512(q5, q8k) };
+        }
+        if avx2_enabled() {
+            return unsafe { dot_q5_k_q8_k_avx2(q5, q8k) };
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     {
         if neon_enabled() {
@@ -130,7 +159,7 @@ pub fn dot_q5_k_q8_k(q5: &[u8], q8k: &[u8]) -> f32 {
     dot_q5_k_q8_k_scalar(q5, q8k)
 }
 
-fn dot_q5_k_q8_k_scalar(q5: &[u8], q8k: &[u8]) -> f32 {
+pub(super) fn dot_q5_k_q8_k_scalar(q5: &[u8], q8k: &[u8]) -> f32 {
     let n_super = q5.len() / 176;
     let mut sumf = 0.0f32;
     for i in 0..n_super {

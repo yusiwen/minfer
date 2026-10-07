@@ -36,9 +36,11 @@ refreshed_against = "53b3ace"
 # cannot host interactive work (#335). It now names a lane that can start on
 # each box; F1's hardware wait is recorded in the plan's §9 table, its §11
 # sequencing diagram and its §14 hardware row, where a reader of the plan sees
-# it. The value is compared *literally* against the plan's `Next: ….**`
-# sentence, so the two must be edited together.
-next = "the macOS round-2 tickets tracked in #333, on macbook (macOS 27.0.1, Apple M4 Pro), and the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121); F1 (AVX2 K-quant dots) still waits for an x86 host"
+# it. #56 landed F1's AVX2/AVX-512 K-quant dots on an x86 host (2026-10-08), so
+# the `next:` clause now names only the remaining weight-repacking increment. The
+# value is compared *literally* against the plan's `Next: ….**` sentence, so the
+# two must be edited together.
+next = "the macOS round-2 tickets tracked in #333, on macbook (macOS 27.0.1, Apple M4 Pro), and the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121); F1's weight-repacking increment still wants an x86 host"
 
 # --- prose locations for the three scalars ----------------------------------
 
@@ -122,15 +124,19 @@ regex = 'Phase G\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]
 #   `dgxspark (aarch64, GB10 sm_121)` — the maintainer's DGX Spark; one physical
 #       machine, so the CPU and the CUDA rows share the label.
 #   `x86_64 (CI runner)` — GitHub's runner; CPU-only, no GPU and no aarch64.
-# The box is part of the identity: `quants::neon_correctness` is
-# `cfg(all(test, target_arch = "aarch64"))`, so the aarch64 box reports two more
-# unit tests than the x86_64 CI runner. Only `x86_64 (CI runner)` is compared
-# live, by `test-linux-cpu`; every other row is a recorded measurement. A row's
-# `ignored` count is also a **derivation**, not a measurement, whenever a change adds
-# a platform-gated test: #208's Metal half added one `#[ignore]`d macOS-only gate
-# (`f208_bf16_weights_run_on_the_metal_device`, a no-op off macOS), which raises the
-# ignored count on every box without re-running it there. `projection_*` carries only
-# `passed`, so an ignored-count move is derived — say so when recording it.
+# The box is part of the identity. `quants::neon_correctness` is
+# `cfg(all(test, target_arch = "aarch64"))` (two tests the x86_64 box lacks), and
+# since #56 the x86_64 box carries `quants::avx2_correctness` (three gates plus one
+# `#[ignore]`d timing harness) that aarch64 lacks, so the x86_64 box now reports
+# **one more** unit test than aarch64 (491 vs 490) and one more ignored (41 vs 40) —
+# the old "x86_64 = aarch64 - 2" relation is gone. Only `x86_64 (CI runner)` is
+# compared live, by `test-linux-cpu`; every other row is a recorded measurement. A
+# row's `ignored` count is also a **derivation**, not a measurement, whenever a
+# change adds a platform-gated test: #208's Metal half added one `#[ignore]`d
+# macOS-only gate (`f208_bf16_weights_run_on_the_metal_device`, a no-op off macOS),
+# and #56's x86_64 harness is the second, which raises the ignored count on that box
+# without re-running it there. `projection_*` carries only `passed`, so an
+# ignored-count move is derived — say so when recording it.
 
 [[counts]]
 key = "cpu-unit"
@@ -154,15 +160,15 @@ key = "cpu-unit"
 box = "x86_64 (CI runner)"
 suite = "unit"
 command = "cargo test --release"
-date = "2026-10-07"
-passed = 488
+date = "2026-10-08"
+passed = 491
 failed = 0
-ignored = 40
+ignored = 41
 integration_passed = 10
 integration_failed = 0
 integration_ignored = 6
 live_check = true
-note = "compared live by the test-linux-cpu job; 488 = the aarch64 measurement (490) minus the two `quants::neon_correctness` tests, which are cfg(target_arch = \"aarch64\"); #354's two platform-neutral manifest-override tests move it with the aarch64 row"
+note = "compared live by the test-linux-cpu job; the first direct measurement of the x86_64 suite (#56): 491 = aarch64 (490) - the two cfg(aarch64) `quants::neon_correctness` tests + the three new cfg(x86_64) `quants::avx2_correctness` gates, and ignored 41 = aarch64 40 + that module's `#[ignore]`d `kquant_simd_dot_speedup` harness"
 file = "AGENTS.md"
 regex = 'CPU unit, box `(?P<box>[^`]+)`, `cargo test --release`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
 

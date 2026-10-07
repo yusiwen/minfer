@@ -394,7 +394,9 @@ Every lever is env-gated so the same binary runs both sides of an A/B
 | `MINFER_Q6K_PF=0` | revert v2_pf padded-form dispatch |
 | `MINFER_PDL` | (closed NO-GO, D4-4) programmatic dependent launch |
 | `MINFER_NO_MPS=1` | Metal: force CPU (macOS paths) |
-| `MINFER_NO_NEON=1` | CPU: force scalar |
+| `MINFER_NO_NEON=1` | CPU (aarch64): force scalar |
+| `MINFER_NO_AVX2=1` | CPU (x86): force the whole quants AVX2 layer scalar |
+| `MINFER_NO_AVX512=1` | CPU (x86): drop just the AVX-512/VNNI K-quant dots to AVX2 |
 | `MINFER_GRAPH_DUMP` / `MINFER_TRACE` / `MINFER_DUMP_DIR` | verification instruments (§9) |
 
 **PDL** (programmatic dependent launch — letting the next kernel launch before
