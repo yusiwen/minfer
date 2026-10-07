@@ -476,6 +476,37 @@ impl MetalBackend {
         (lo_min, hi_max)
     }
 
+    /// `(min cell, max cell + len)` over a set-valued `kv_map` window's runs (C8b
+    /// S2/#369), read on the host for the same reason [`Self::window_range`] reads
+    /// the one-range window: it is input data. Padding runs (`len == 0`) are
+    /// skipped, and `(0, 0)` means no live run (the caller keeps the correctness
+    /// kernel). The union can be wider than the runs' total, so a map whose runs
+    /// are far apart pays the gap; a first-fit shared prefix (donor `[0, r)` then
+    /// the subject's run at `r`) is adjacent and pays nothing.
+    fn window_map_range(map: &crate::metal::MetalBuffer, count: usize) -> (usize, usize) {
+        let kmax = crate::graph::kvcache::KV_MAP_MAX_SPANS;
+        let need = count * kmax * 2;
+        if (map.length() as usize) / 4 < need {
+            return (0, 0);
+        }
+        let w = unsafe { std::slice::from_raw_parts(map.contents().as_ptr() as *const u32, need) };
+        let mut lo_min = usize::MAX;
+        let mut hi_max = 0usize;
+        for pair in w.chunks_exact(2) {
+            let (cell, len) = (pair[0] as usize, pair[1] as usize);
+            if len == 0 {
+                continue;
+            }
+            lo_min = lo_min.min(cell);
+            hi_max = hi_max.max(cell + len);
+        }
+        if lo_min == usize::MAX {
+            (0, 0)
+        } else {
+            (lo_min, hi_max)
+        }
+    }
+
     /// #38: refuse a KV-store row that is past the layer's persistent region.
     ///
     /// `rows` is the I32 index buffer the store kernel dereferences — `cells`
@@ -1155,6 +1186,7 @@ impl Backend for MetalBackend {
                                     meta.hd,
                                     meta.scale,
                                     self.kv_f16(),
+                                    false,
                                 );
                                 return Ok(());
                             }
@@ -1176,12 +1208,42 @@ impl Backend for MetalBackend {
                     }
                     let kmax = crate::graph::kvcache::KV_MAP_MAX_SPANS;
                     if win.len == nt * kmax * 2 {
+                        // #369: a prefill-shaped set-valued `kv_map` window takes
+                        // the fast map family — the same tile with a
+                        // run-membership mask over the launch's global union. The
+                        // #362 correctness kernel stays the fallback for the
+                        // shapes it alone covers (small hd, nt == 1, opt-out).
+                        let map_buf = self.buf(win.id);
+                        if nt > 1 && crate::metal::prefill_window_flash_enabled(meta.hd) {
+                            let (lo_min, hi_max) = Self::window_map_range(map_buf, nt);
+                            let nkv = hi_max.saturating_sub(lo_min);
+                            if nkv > 0 {
+                                cb.attn_flash_window(
+                                    q,
+                                    k,
+                                    v,
+                                    o,
+                                    map_buf,
+                                    nkv,
+                                    lo_min,
+                                    meta.nkt,
+                                    nt,
+                                    meta.n_head,
+                                    meta.n_head_kv,
+                                    meta.hd,
+                                    meta.scale,
+                                    self.kv_f16(),
+                                    true,
+                                );
+                                return Ok(());
+                            }
+                        }
                         cb.gqa_attn_map(
                             q,
                             k,
                             v,
                             o,
-                            self.buf(win.id),
+                            map_buf,
                             meta.n_head,
                             meta.n_head_kv,
                             meta.hd,

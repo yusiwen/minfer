@@ -113,21 +113,25 @@ outputs are byte-identical to the pre-G1 graph path (flash/split/parallel and
 tail-reduced paths all verified).
 
 **Windowed prefill ([#315](https://github.com/yusiwen/minfer/issues/315) /
-[#359](https://github.com/yusiwen/minfer/issues/359)).** The explicit `attn_span` prefill — the
-batched multi-sequence path — first ran the correctness kernel family
-`kernel_gqa_attn_window_f32/_f16` where a single-sequence prefill keeps the tuned
-`attn_flash_prefill` (`src/metal/kernels/attn_window.metal`). Measured on this Mac (2026-10-07,
-`macbook (macOS 27.0.1, Apple M4 Pro)`, 512 tokens, bar 0.8x named before the run) it reached only
-**0.539x** the causal prefill's tokens/s for a two-sequence batch on the 0.5B Q4_0 (f32, `hd` 64)
-and **0.159x** on Qwen3-0.6B Q8_0 (f16, `hd` 128); at the same shape **0.376x** (`~2.7x` slower)
-and **0.096x** (`~10.4x` slower). [#359] added the fast family
+[#359](https://github.com/yusiwen/minfer/issues/359) /
+[#369](https://github.com/yusiwen/minfer/issues/369)).** The explicit prefill — the batched
+multi-sequence path — first ran the correctness kernel families `kernel_gqa_attn_window_f32/_f16`
+(one-range `attn_span`) and `kernel_gqa_attn_map_f32/_f16` (set-valued `kv_map`) where a
+single-sequence prefill keeps the tuned `attn_flash_prefill` (`src/metal/kernels/attn_window.metal`).
+Measured on this Mac (2026-10-07, `macbook (macOS 27.0.1, Apple M4 Pro)`, 512 tokens, bar 0.8x
+named before the run) the one-range path reached only **0.539x** the causal prefill's tokens/s for a
+two-sequence batch on the 0.5B Q4_0 (f32, `hd` 64) and **0.159x** on Qwen3-0.6B Q8_0 (f16, `hd`
+128); at the same shape **0.376x** (`~2.7x` slower) and **0.096x** (`~10.4x` slower), and the map
+path (a shared prefix read in place) **0.229x** / **0.046x**. [#359] added the fast one-range family
 `kernel_flash_attn_window_blk_*` (`src/metal/kernels/fa_window.metal`, a copy of the causal
 `attn_flash_prefill` tile with an explicit `[lo, hi)` mask, selected for `nt > 1` at `hd ∈ {64,128}`)
-and re-measured: **0.968x / 0.918x** primary and **0.996x / 0.995x** shape-matched — both above the
-0.8x bar, with `MINFER_NO_WINDOW_FLASH=1` restoring the #315 numbers as the A/B control. The
-`kv_map` layout (#362) still reads through its correctness kernels; a fast sibling for it is the
-remaining increment. Protocol, node/kernel counts and the bar are in
-[`METAL-BACKEND-DESIGN.md`](./METAL-BACKEND-DESIGN.md) §4.4.1.
+and re-measured **0.968x / 0.918x** primary and **0.996x / 0.995x** shape-matched; [#369] added the
+fast **map** family `kernel_flash_attn_window_map_*` (the same tile with a run-membership mask,
+`fwin_map_has`) and measured the map arm at **0.943x / 0.914x** — all above the 0.8x bar, with
+`MINFER_NO_WINDOW_FLASH=1` restoring the before numbers on **both** layouts as the A/B control. A
+map whose runs are far apart pays the gap between them (the kernel tiles the global union); the
+first-fit shared prefix the server emits is adjacent and does not. Protocol, node/kernel counts and
+the bar are in [`METAL-BACKEND-DESIGN.md`](./METAL-BACKEND-DESIGN.md) §4.4.1.
 
 **Graph-path TODO (wire into `MetalBackend`)**: ① ✅ G1 attention dispatch;
 ② ✅ G2 `rms_norm_256`; ③ ✅ G3 n_out tail-row `GetRows`; ④ ✅ G4 fused decode
