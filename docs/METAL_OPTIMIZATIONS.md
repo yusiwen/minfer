@@ -113,12 +113,13 @@ outputs are byte-identical to the pre-G1 graph path (flash/split/parallel and
 tail-reduced paths all verified).
 
 **Windowed prefill ([#315](https://github.com/yusiwen/minfer/issues/315)).** The explicit
-`attn_span` prefill — the batched multi-sequence path, which runs the correctness kernel
-`kernel_gqa_attn_window_f32` where a single-sequence prefill keeps the tuned
+`attn_span` prefill — the batched multi-sequence path, which runs the correctness kernel family
+`kernel_gqa_attn_window_f32/_f16` where a single-sequence prefill keeps the tuned
 `attn_flash_prefill` (`src/metal/kernels/attn_window.metal`) — is **not yet optimized**:
-measured on this Mac (2026-10-07, `macbook (macOS 27.0.1, Apple M4 Pro)`) it reaches
-**0.539x** the causal prefill's tokens/s for a two-sequence batch of the same 512 tokens and
-**0.376x** at the same shape (`~2.7x` slower), against a bar of **0.8x** named before the run.
+measured on this Mac (2026-10-07, `macbook (macOS 27.0.1, Apple M4 Pro)`, 512 tokens, bar 0.8x
+named before the run) it reaches **0.539x** the causal prefill's tokens/s for a two-sequence
+batch on the 0.5B Q4_0 (f32, `hd` 64) and **0.159x** on Qwen3-0.6B Q8_0 (f16, `hd` 128); at the
+same shape it is **0.376x** (`~2.7x` slower) and **0.096x** (`~10.4x` slower) respectively.
 Protocol, node/kernel counts and the bar are in
 [`METAL-BACKEND-DESIGN.md`](./METAL-BACKEND-DESIGN.md) §4.4.1; the fast-path follow-up is its
 own ticket.

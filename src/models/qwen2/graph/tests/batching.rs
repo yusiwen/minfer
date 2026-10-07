@@ -915,7 +915,10 @@ fn a_windowed_prefill_is_not_materially_slower_than_the_causal_one() {
         (mean, var.sqrt())
     }
 
-    let Some(path) = cached_model_path() else {
+    let Some(path) = std::env::var_os("MINFER_315_MODEL")
+        .map(std::path::PathBuf::from)
+        .or_else(cached_model_path)
+    else {
         eprintln!("Qwen2.5-0.5B q4_0 not cached; skipping the #315 measurement");
         return;
     };
