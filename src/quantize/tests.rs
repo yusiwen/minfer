@@ -487,7 +487,12 @@ fn nearest_int_mul_fuses_the_magic_constant_into_the_product() {
         1516,
         "the fixture must distinguish the fused form from the plain one"
     );
-    assert_eq!(nearest_int_mul(a, b), 1517);
+    assert_eq!(nearest_int_mul(a, b, FmaContract::Fast), 1517);
+    // ... and the two-op variant is that same double rounding: this is the
+    // assertion that makes `FmaContract::Off` mean "a compiler that does not
+    // contract", not just "some other number" (docs/GGUF-TOOLING.md §4.2).
+    assert_eq!(nearest_int_mul(a, b, FmaContract::Off), 1516);
+    assert_eq!(nearest_int_mul(a, b, FmaContract::Off), nearest_int(a * b));
 }
 
 /// A zero super-block is representable exactly: all-zero quants, zero
