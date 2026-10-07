@@ -830,6 +830,13 @@ fn forward_cached_isolates_kv_between_caches() {
 /// causal side (two `N_TOTAL/2` windows vs one causal `N_TOTAL` window), so the
 /// shape-matched ratio is the conservative one; both are printed.
 ///
+/// The ratio is **printed, not asserted**, deliberately:
+/// [#315](https://github.com/yusiwen/minfer/issues/315) does not ask for an
+/// assertion, and a timing floor on a loaded box is exactly the flaky-gate class
+/// filed as [#195](https://github.com/yusiwen/minfer/issues/195). The control arms
+/// are asserted, which is what keeps the comparison honest; the fast-path fix is
+/// [#359](https://github.com/yusiwen/minfer/issues/359).
+///
 /// Run: `cargo test --release --bin minfer -- --ignored \
 ///   a_windowed_prefill_is_not_materially_slower --nocapture`.
 ///
