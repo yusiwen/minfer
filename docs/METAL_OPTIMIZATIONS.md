@@ -145,10 +145,12 @@ MINFER_CACHE_TYPE=f16 ./target/release/minfer bench -p 430 -n 128 -r 3 <Q8_0 mod
 ```
 
 llama.cpp (the 2026-08-17 pair used `minfer --greedy` vs `llama-bench -b 512 -t 8`;
-kept here — `minfer bench` is the current harness and its `pp` is prefill-only and
-its `tg` is prefill + greedy decode, the direct analogue of the old `Generated:`
-pure-decode caliber; both harnesses do a warmup pass before the measured reps and
-report a mean over `-r 3`):
+kept here — `minfer bench` is the current harness: `pp` times the prefill alone, and
+`tg` runs `P` prefill tokens and then times **only** the `n_gen` decode steps (the
+prefill happens before the timer in `src/bench.rs`'s `decode_once`), which is
+`llama-bench`'s `tg` caliber — the direct analogue of the old `Generated:`
+pure-decode number, not a prefill-inclusive average; both harnesses do a warmup pass
+before the measured reps and report a mean over `-r 3`):
 
 ```
 ~/git/reading/llama.cpp/build-fpc/bin/llama-bench -m <model> -p P -n 128 -r 3 -b 512 -t 8
