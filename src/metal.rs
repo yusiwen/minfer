@@ -230,12 +230,14 @@ struct MpsStateInner {
     pl_attn_output: MetalComputePipelineState,
     pl_softmax_attn: MetalComputePipelineState,
     pl_warmup: MetalComputePipelineState,
-    // (buffer, byte-offset): weights live either in a per-weight copied buffer
-    // (offset 0) or — since the 2026-08-21 mmap loader — as offsets into a
-    // page-aligned NoCopy buffer over the mmap'd GGUF part (llama-style,
-    // ggml-metal-device.m:1668; newBufferWithBytesNoCopy requires a page-aligned
-    // base, so per-tensor offsets are passed via setBuffer:offset:).
-    weights: std::sync::Mutex<std::collections::HashMap<String, (MetalBuffer, u64)>>,
+    // (buffer, byte-offset, logical byte length): weights live either in a
+    // per-weight copied buffer (offset 0) or — since the 2026-08-21 mmap loader —
+    // as offsets into a page-aligned NoCopy buffer over the mmap'd GGUF part
+    // (llama-style, ggml-metal-device.m:1668; newBufferWithBytesNoCopy requires a
+    // page-aligned base, so per-tensor offsets are passed via setBuffer:offset:).
+    // The byte length is the registered weight's own extent — the E4 gate's
+    // "weights" term (issue #299), the analogue of CUDA's per-entry `size`.
+    weights: std::sync::Mutex<std::collections::HashMap<String, (MetalBuffer, u64, usize)>>,
     // Registered mmap'd GGUF parts: (base_ptr, len, Metal buffer). register_weight
     // resolves a weight slice to (buffer, offset) by pointer-range containment.
     mmap_parts: std::sync::Mutex<Vec<(usize, usize, MetalBuffer)>>,

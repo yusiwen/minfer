@@ -37,7 +37,10 @@ pub trait Backend: Send + Sync {
 
     /// Bytes this backend's registered weights occupy (E4's feasibility gate counts
     /// them against the budget). Defaults to 0: a backend that does not track its
-    /// weights is not charged for them.
+    /// weights is not charged for them. Every backend that has weights overrides it —
+    /// CPU (its tensor map), CUDA (`CudaState`'s registry) and, since
+    /// [#299](https://github.com/yusiwen/minfer/issues/299), Metal (`MpsState`'s
+    /// registry, mmap-backed `NoCopy` slices included).
     fn weights_bytes(&self) -> usize {
         0
     }

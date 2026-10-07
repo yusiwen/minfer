@@ -434,10 +434,15 @@ fn metal_memory_report_carries_the_device_budget() {
     let budget = report.budget.expect("Metal must now answer a budget");
     assert!(budget > 0, "{report:?}");
     assert!(report.budget_is_bounded(), "{report:?}");
+    // Since [#299] the headroom subtracts the resident registered weights, so "all
+    // headroom" is only true of an allocator whose `MpsState` holds no weights — a
+    // fresh pool is empty, but the process-wide registry may already carry model
+    // weights from another test. Read the term rather than assume it is zero.
+    assert_eq!(report.pool_bytes, 0, "an empty pool holds nothing");
     assert_eq!(
         report.headroom_bytes(),
-        Some(budget),
-        "an empty pool is all headroom"
+        Some(budget - report.weights_bytes),
+        "headroom is the budget minus the resident weights"
     );
     // The budget is the device's own three-quarter default, not a literal: the oracle
     // is the API answer the report is built from.
@@ -465,6 +470,86 @@ fn metal_memory_report_carries_the_device_budget() {
     assert!(err.contains("budget") && err.contains("MiB"), "{err}");
     assert_eq!(alloc.memory_report(Backend::METAL).pool_bytes, 0);
 }
+
+/// [#299]: E4's feasibility gate charges Metal's **registered weights** — the "weights"
+/// term that used to be the trait default `0` on the one platform that has them.
+///
+/// The mutation this pins is `MetalBackend::weights_bytes` returning `0` again (or its
+/// `MpsState` reader reporting a zero sum). The budget here is
+/// `registered_len + one activation class - 1`, a number written down from the
+/// **known** registered extent rather than from the getter under test, so it is only
+/// exceeded because the weights are charged: with `weights = 0` the activation alone
+/// fits, the graph allocates, and the `unwrap_err` below fails. The changed term is
+/// therefore observable through the gate's own refusal, not merely asserted about a
+/// getter.
+///
+/// macOS-only: enabling the Metal pool needs a live MPS device, and CI has none.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_registered_weights_are_charged_in_the_budget_gate() {
+    let _g = crate::metal::metal_test_lock();
+    crate::metal::MpsState::init();
+    let Some(mps) = crate::metal::MpsState::get() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    // A real registered weight of known size (4 MiB), named so it cannot collide with a
+    // model's registry entry.
+    let registered_len = 4 * 1024 * 1024;
+    let bytes = vec![0u8; registered_len];
+    mps.register_weight("#299-gate-weight", &bytes);
+
+    let mut alloc = GraphAllocator::new();
+    assert!(alloc.enable_metal(), "the Metal pool must enable on a Mac");
+
+    let mut b = GraphBuilder::new();
+    let x = b.input("x", [1024, 1, 1, 1], crate::graph::DType::F32);
+    let y = b.silu(x);
+    b.output(y);
+    let mut g = b.build();
+    for n in g.nodes.iter_mut() {
+        n.backend = Some(Backend::METAL);
+    }
+    let activation_class = allocplan::class_bytes(allocplan::class_size(1024));
+
+    // One byte short of `registered_len + activation`: only the charged weights push it
+    // over. This `unwrap_err` is the observable — with the weights term at `0` the
+    // activation alone fits and this line panics instead of refusing.
+    alloc.set_memory_budget(Backend::METAL, Some(registered_len + activation_class - 1));
+    let err = alloc.alloc_graph(&g).unwrap_err();
+    assert!(err.contains("out of Metal memory"), "{err}");
+    assert!(err.contains("budget") && err.contains("MiB"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "{} MiB of weights",
+            registered_len / (1024 * 1024)
+        )),
+        "the refusal must name the weights figure: {err}"
+    );
+    assert_eq!(
+        alloc.memory_report(Backend::METAL).pool_bytes,
+        0,
+        "the gate runs before the pool is touched"
+    );
+
+    // The charged term is the getter's sum, at least the weight just registered.
+    let weights = alloc.memory_report(Backend::METAL).weights_bytes;
+    assert!(
+        weights >= registered_len,
+        "the registered weight must be charged: {weights} < {registered_len}"
+    );
+
+    // One byte more and it fits, with the same weights still charged.
+    alloc.set_memory_budget(Backend::METAL, Some(registered_len + activation_class));
+    alloc.alloc_graph(&g).unwrap();
+    let fitted = alloc.memory_report(Backend::METAL);
+    assert!(fitted.pool_bytes > 0, "{fitted:?}");
+    assert!(
+        fitted.weights_bytes >= weights,
+        "the charged weights term stays resident across the two attempts: {fitted:?}"
+    );
+}
+
 /// The tiny f32 tensor the accounting tests register (`Tensor` carries raw bytes).
 fn tensor_f32(name: &str, shape: [i64; 4], data: Vec<f32>) -> crate::tensor::Tensor {
     let mut bytes = Vec::with_capacity(data.len() * 4);

@@ -83,9 +83,10 @@ fn unaccounted_budget_note(note: &str) {
 /// > budget` under-charged the budget by every resident weight. Recovering the value and
 /// saying so keeps the accounting honest.
 ///
-/// The CUDA weight registry is its only production caller (`cuda.rs`); the CPU
-/// tests pin the poisoned-lock path, so the item must also exist under `test`.
-#[cfg(any(feature = "cuda", test))]
+/// The CUDA **and Metal** weight registries are its production callers (`cuda.rs`,
+/// `metal/runtime.rs`); the CPU tests pin the poisoned-lock path, so the item must
+/// also exist under `test`.
+#[cfg(any(feature = "cuda", target_os = "macos", test))]
 pub fn weights_from_lock<T, F>(lock: std::sync::LockResult<T>, what: &str, sum: F) -> usize
 where
     F: FnOnce(&T) -> usize,
