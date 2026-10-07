@@ -10,6 +10,7 @@ mod f167_qwen3;
 mod f16_encode;
 mod f208_device;
 mod f208_metal;
+mod f6_fixtures;
 mod f6_roundtrip;
 mod parse;
 mod quantize_bounds;
@@ -18,11 +19,21 @@ mod quantize_bounds;
 /// The prompt every F6 logit gate uses. Short enough to prefill quickly on
 /// the 0.5B, long enough that a position/weight error moves a logit.
 const PROMPT: &str = "The capital of France is";
+/// Resolve one `#[ignore]`d gate's fixture path: the environment override, else
+/// the default.
+///
+/// A path that is **present** is verified against the F6 fixture manifest before
+/// it is handed back (`f6_fixtures::check`, issue #205): a cached reference the
+/// record does not describe refuses the run by name and digest instead of being
+/// compared against. A path that is absent still skips the gate with a printed
+/// line, and a path outside the fixture cache (a `/tmp` scratch file, a cached
+/// model, a directory) is not a manifest fixture and is left alone.
 fn env_path(key: &str, default: &str) -> Option<PathBuf> {
     let p = std::env::var_os(key)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(default.replace('~', &std::env::var("HOME").unwrap())));
     if p.exists() {
+        f6_fixtures::check(&p);
         Some(p)
     } else {
         eprintln!("{key} not found at {}; skipping this F6 gate", p.display());
