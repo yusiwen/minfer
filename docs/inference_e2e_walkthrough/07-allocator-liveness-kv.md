@@ -879,7 +879,7 @@ sometimes needed a copy: the original allocator materialized cross-backend and
 in-place inputs through a host `copy_in`. On Metal, though, one split's
 kernels are *encoded* into an `MpsCommandBuffer` as they execute — and only
 *submitted* at the split boundary (`metal_backend.rs:146-157`,
-`metal_backend.rs:1029-1031`). A host copy enqueued mid-split therefore read
+`metal_backend.rs:1047-1049`). A host copy enqueued mid-split therefore read
 the buffer's *old* contents: freshly allocated Metal memory, i.e. **zeros**.
 The copy captured zeros, RoPE dutifully rotated them, `KvcacheStore` wrote
 them into the layer's persistent region — and the whole KV region was zeros,

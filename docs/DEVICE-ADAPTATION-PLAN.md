@@ -276,7 +276,7 @@ A 2080 Ti is available to the project owner. This is the first foreign-device
 measurement opportunity and doubles as the T1 field-validation run.
 
 **What runs on it today (zero new code needed — sm_75 is already a build
-target, build.rs:534):** MMVQ family (dp4a works on Turing), f16 GEMM prefill
+target, build.rs:535):** MMVQ family (dp4a works on Turing), f16 GEMM prefill
 (`gemm_f16_nt` compiles for sm_75), f32 fallbacks. The BT kernel family is
 **compile-time excluded** on sm_75 (`#if __CUDA_ARCH__ >= 800` guards in
 cuda/kernels/*.cu) on top of the runtime `cc ≥ 800` gate — so a Turing run
@@ -316,7 +316,7 @@ the shape-dimension gates in ways GB10 never could.
 
 **Build prerequisites (blocking — today's CUDA-13 binary cannot run there):**
 
-1. The target list (build.rs:534) has no `87`, and the only embedded PTX is
+1. The target list (build.rs:535) has no `87`, and the only embedded PTX is
    compute_121, which forward-JITs upward only — sm_87 cannot load it. Either
    add `87` to the targets (preferred) or rebuild on the Jetson with its
    JetPack CUDA 12.x (which also embeds the compute_70/72 backward-JIT PTX).
