@@ -21,7 +21,7 @@ impl MpsCommandBuffer<'_> {
         od: usize,
         id: usize,
         nt: usize,
-    ) {
+    ) -> Result<(), String> {
         self.trace_op("matmul");
         // GPU safety (M1): the K-quant (super-block) kernels index weights by
         // K/256 super-blocks (floor). A non-256-aligned id silently drops the
@@ -539,38 +539,24 @@ impl MpsCommandBuffer<'_> {
                 self.dispatch_2d(((od + 7) / 8) as u64, 1, 32, 2);
             }
             _ => {
-                self.enc.setComputePipelineState(
-                    &**(if nt > 1 {
-                        &self.state.pl_q4_0_f32_multi
+                // #329: this arm is a guard, not a fallback. Every dtype a
+                // loader can register has its own arm above; an unregistered
+                // one reaching here used to dispatch the Q4_0 kernel, which
+                // reads the bytes as Q4_0 blocks (the #317 silent zero). Refuse
+                // loudly, naming the dtype and the kernel that *would* have run;
+                // the caller prepends the node.
+                return Err(format!(
+                    "no Metal f32-activation matmul kernel for weight dtype {ttype:?}; \
+                     would have run {} (the Q4_0 kernel) instead of computing zeros",
+                    if nt > 1 {
+                        "pl_q4_0_f32_multi"
                     } else {
-                        &self.state.pl_q4_0_f32
-                    }),
-                );
-                unsafe {
-                    self.enc
-                        .setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize)
-                };
-                unsafe {
-                    self.enc
-                        .setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize)
-                };
-                unsafe {
-                    self.enc
-                        .setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize)
-                };
-                let mm_p = [od as i32, id as i32, nt as i32];
-                unsafe {
-                    self.enc.setBytes_length_atIndex(
-                        NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void)
-                            .unwrap(),
-                        (12) as usize,
-                        (3) as usize,
-                    )
-                };
-                let grid_y = if nt > 1 { 1 } else { nt as u64 };
-                self.dispatch_2d(((od + 7) / 8) as u64, grid_y, 64, 1);
+                        "pl_q4_0_f32"
+                    }
+                ));
             }
         }
+        Ok(())
     }
 
     /// GPU embedding lookup: dequantize Q4_0 embedding rows for nt token ids.

@@ -951,7 +951,8 @@ impl Backend for MetalBackend {
                     meta.out_dim,
                     meta.in_dim,
                     nt,
-                );
+                )
+                .map_err(|e| format!("metal: {}: {e}", node.name))?;
                 if let Some(bname) = &meta.bias_name {
                     let (bb, b_off) = self
                         .state
@@ -1305,7 +1306,8 @@ impl Backend for MetalBackend {
                     od_total,
                     meta.in_dim,
                     nt,
-                );
+                )
+                .map_err(|e| format!("metal: {}: {e}", node.name))?;
                 // 2) swiglu in place: silu(gate rows 0..nf) * up rows nf..2*nf
                 //    (llama ggml_swiglu_split); result written back to gate rows
                 let n = nt * meta.nf;
@@ -1363,7 +1365,8 @@ impl Backend for MetalBackend {
                     od_total,
                     meta.in_dim,
                     nt,
-                );
+                )
+                .map_err(|e| format!("metal: {}: {e}", node.name))?;
                 // 2) fused bias + rope + KV store in one kernel pass
                 let (k_id, v_id) =
                     kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
@@ -1470,7 +1473,8 @@ impl Backend for MetalBackend {
                     od_total,
                     meta.in_dim,
                     nt,
-                );
+                )
+                .map_err(|e| format!("metal: {}: {e}", node.name))?;
                 let (k_id, v_id) =
                     kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
                 // #38: same store bound as the plain/fused QKV arms — the

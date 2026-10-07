@@ -396,6 +396,100 @@ fn metal_matmul_f32_matches_cpu() {
     );
 }
 
+/// #329: a weight dtype with no Metal f32-activation matmul arm must be refused
+/// **loudly** — naming the node, the dtype and the kernel that would have run —
+/// not dispatched through the Q4_0 fallback the pre-#329 `_` arm was. That arm
+/// ran `pl_q4_0_f32`(_multi), which reads the weight bytes as Q4_0 blocks (the
+/// first two bytes of `1.0f32` are `0x0000`, an f16 scale of 0) and writes zeros.
+///
+/// Rule 2 (control arm): the second half builds the **same** graph with a
+/// kerneled dtype (`F32`) — the only difference is the property under test — and
+/// asserts it executes and is non-zero, so the refusal above is caused by the
+/// dtype, not by the graph plumbing.
+#[test]
+fn metal_matmul_refuses_an_unkerneled_weight_dtype() {
+    let _g = crate::metal::metal_test_lock();
+    crate::metal::MpsState::init();
+    let Some(_b) = MetalBackend::new() else {
+        eprintln!("MPS unavailable; skipping");
+        return;
+    };
+    let od = 64usize;
+    let inn = 128usize;
+    let nt = 4usize;
+    let xd: Vec<f32> = (0..inn * nt)
+        .map(|i| ((i * 1103515245) % 997) as f32 / 500.0 - 1.0)
+        .collect();
+
+    // Refusal arm: I32 is a real TensorType with a byte width, but
+    // `quant_matmul_f32_on_gpu_buf` has no arm for it.
+    let mut bad = crate::tensor::Tensor::from_data(
+        crate::tensor::TensorType::I32,
+        &[inn as i64, od as i64, 1, 1],
+        vec![0u8; od * inn * 4],
+    );
+    bad.name = "wbad329".to_string();
+    crate::metal::MpsState::get()
+        .unwrap()
+        .register_weight("wbad329", bad.data());
+
+    let mut gb = GraphBuilder::new();
+    let x = gb.input("x", [inn, nt, 1, 1], DType::F32);
+    let m = gb.matmul(x, &bad, None);
+    gb.output(m);
+    let g = gb.build();
+
+    let mut g2 = g.clone();
+    for n in &mut g2.nodes {
+        n.backend = Some(Tag::METAL);
+    }
+    let mut alloc = GraphAllocator::new();
+    alloc.enable_metal();
+    alloc.alloc_graph(&g2).unwrap();
+    alloc.fill_input(&g2, "x", &xd).unwrap();
+    let err = BackendScheduler::new()
+        .execute(&g2, &mut alloc)
+        .expect_err("an unkerneled weight dtype must be refused, not run the Q4_0 kernel");
+    eprintln!("[#329] refusal: {err}");
+    assert!(err.contains("matmul_wbad329"), "node name missing: {err}");
+    assert!(err.contains("I32"), "dtype missing in message: {err}");
+    assert!(
+        err.contains("pl_q4_0_f32"),
+        "the kernel that would have run is missing: {err}"
+    );
+
+    // Control arm: same graph, kerneled dtype — still computes.
+    let wf: Vec<f32> = (0..od * inn)
+        .map(|i| ((i * 2654435761) % 1000) as f32 / 500.0 - 1.0)
+        .collect();
+    let wt = f32t("wctl329", [inn as i64, od as i64, 1, 1], wf);
+    crate::metal::MpsState::get()
+        .unwrap()
+        .register_weight("wctl329", wt.data());
+
+    let mut gb = GraphBuilder::new();
+    let x = gb.input("x", [inn, nt, 1, 1], DType::F32);
+    let m = gb.matmul(x, &wt, None);
+    gb.output(m);
+    let g = gb.build();
+    let mut g2 = g.clone();
+    for n in &mut g2.nodes {
+        n.backend = Some(Tag::METAL);
+    }
+    let mut alloc = GraphAllocator::new();
+    alloc.enable_metal();
+    alloc.alloc_graph(&g2).unwrap();
+    alloc.fill_input(&g2, "x", &xd).unwrap();
+    BackendScheduler::new()
+        .execute(&g2, &mut alloc)
+        .expect("a registered weight dtype must still compute");
+    let got = alloc.copy_to_cpu(m).unwrap();
+    assert!(
+        got.iter().any(|v| *v != 0.0),
+        "control arm produced all zeros — the refusal is not dtype-specific"
+    );
+}
+
 /// rms_norm at REAL scale (d=896, nt=8, like attn_norm) Metal vs CPU.
 #[test]
 fn metal_rmsnorm_real_scale() {
