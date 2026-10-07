@@ -709,8 +709,8 @@ compilation) does the whole pipeline:
    plus PTX from Volta up that any future GPU can JIT.
 
 6. **Archive and link into the Rust binary.** The object is packed into
-   `libcuda_kernels.a` with `ar rcs` (`build.rs:288-295`), and two cargo
-   directives hand it to the linker (`build.rs:297-298`):
+   `libcuda_kernels.a` with `ar rcs` (`build.rs:485-494`), and two cargo
+   directives hand it to the linker (`build.rs:496-497`):
    `cargo:rustc-link-search=native={out_dir}` +
    `cargo:rustc-link-lib=static=cuda_kernels`. The `launch_*` symbols the
    `extern "C"` block of §2.3 declares are resolved against this archive —

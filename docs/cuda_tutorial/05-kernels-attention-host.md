@@ -724,7 +724,8 @@ The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — i
 AGENTS rule 5 (`AGENTS.md:82`), written in the blood of Phase 3. In three
 sentences: a per-node host readback inside a split whose command buffer was
 still open read *stale* (not-yet-written) data, which surfaced as an all-zero
-KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:905-907`). The fix
+KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:977-979`, the §7.3
+"In-place execution and the aliasing rule" hard rule). The fix
 was not "sync more" but structural — the in-place aliasing rule plus a single
 sanctioned copy point at split boundaries — so the bug class has nowhere to
 reappear. The GPU_SAFETY audit generalizes the lesson: any change to shared
@@ -854,7 +855,8 @@ silent CPU fallback; backend assignment is decided at build time"
 (`AGENTS.md:72`); TECH-PRIMER §7 repeats it
 (`docs/CUDA-TECH-PRIMER.md:312-314`); the design record explains why — silent
 fallbacks make performance and correctness bugs indistinguishable
-(`docs/COMPUTE-GRAPH-DESIGN.md:909-916`).
+(`docs/COMPUTE-GRAPH-DESIGN.md:1105-1107`, the §9.2 "Eligibility" no-silent-fallback
+clause).
 
 ## 4. Performance intuition
 
