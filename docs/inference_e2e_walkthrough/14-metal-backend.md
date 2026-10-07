@@ -1,7 +1,7 @@
 # 14 · The Metal backend
 
 > **Stage**: decode loop running (docs 09–13) → **this stage: the same graph, executed on the Apple GPU instead of the CPU kernels of docs 10/11** → the CUDA backend (doc 15).
-> **Code**: `src/graph/metal_backend.rs` (`MetalBackend`, the `Backend` trait implementation — `supports_op` at :265, `execute_node` at :316, `synchronize` at :1023), `src/metal/` (`MpsState` device layer, `MpsCommandBuffer`, `submit` at :1935), `src/metal/kernels/` (the Metal Shading Language kernels).
+> **Code**: `src/graph/metal_backend.rs` (`MetalBackend`, the `Backend` trait implementation — `supports_op` at :265, `execute_node` at :843, `synchronize` at :1750), `src/metal/` (`MpsState` device layer, `MpsCommandBuffer`, `submit` at :1935), `src/metal/kernels/` (the Metal Shading Language kernels).
 
 ## 1. Background — where this stage sits
 
@@ -253,7 +253,7 @@ The recycle logic is an exact-size free-list search: reuse any dead buffer whose
 
 #### 3.2.4 `execute_node`: the dispatch arms
 
-`execute_node` (`metal_backend.rs:316-1020`) is a 680-line `match &node.op`, and every arm follows the same rhythm: resolve metadata → look up weights by name → **encode** one or two kernel launches into `cb` → `Ok(())`. Nothing waits; the submit happens at the split boundary. The `MatMul` arm is the cleanest example:
+`execute_node` (`metal_backend.rs:843-1641`) is a 782-line `match &node.op` (the `match` opens at `:859`), and every arm follows the same rhythm: resolve metadata → look up weights by name → **encode** one or two kernel launches into `cb` → `Ok(())`. Nothing waits; the submit happens at the split boundary. The `MatMul` arm is the cleanest example:
 
 ```rust
 // src/graph/metal_backend.rs:486-515
@@ -523,7 +523,7 @@ At forward time, before the graph is built or reused, the model asks a yes/no qu
         let cuda_on = false;
 ```
 
-`metal_available()` (`metal_backend.rs:1054-1056`) is just `MpsState::get().is_some()` — device present, not disabled. `weights_on_gpu` (`:646-695`) is the gate itself: it enumerates *every* tensor name the graph will read (embedding, output norm, lm_head, output bias, then per layer the norm, `wq/bq/wk/bk/wv/bv/wo`, the FFN norm, `ffn_gate/ffn_up/ffn_down`) and requires all of them in the Metal registry:
+`metal_available()` (`metal_backend.rs:1770-1772`) is just `MpsState::get().is_some()` — device present, not disabled. `weights_on_gpu` (`:646-695`) is the gate itself: it enumerates *every* tensor name the graph will read (embedding, output norm, lm_head, output bias, then per layer the norm, `wq/bq/wk/bk/wv/bv/wo`, the FFN norm, `ffn_gate/ffn_up/ffn_down`) and requires all of them in the Metal registry:
 
 ```rust
 // src/models/qwen2/graph.rs:665-671 (tail of weights_on_gpu)
@@ -583,7 +583,7 @@ Now assemble §2.4's rhythm from both sides. The scheduler's `execute` (`schedul
             }
 ```
 
-Step 1 is the command buffer's submit: `sync_backend` (`alloc.rs:543-563`) routes to `MetalBackend::synchronize`, which is one line — `self.submit_pending()` (`metal_backend.rs:1047-1049`). Step 2 is the cross-backend copy of §2.2 (host round trip through the shared buffers, into a fresh staging buffer so the producer's own buffer is untouched for the graph's re-executability). On a fully-Metal graph there is one split, so this `if` never fires mid-graph — but the *final* sync after the loop (`:348-352`) always does, which is where the decode forward's single submit lands. If any node's buffer turned out to live on a different backend than the split executing it, the scheduler returns a hard `Err` ("assignment/alloc mismatch", `:234-241`) — the same no-silent-fallback posture, one level up.
+Step 1 is the command buffer's submit: `sync_backend` (`alloc.rs:543-563`) routes to `MetalBackend::synchronize`, which is one line — `self.submit_pending()` (`metal_backend.rs:1750-1752`). Step 2 is the cross-backend copy of §2.2 (host round trip through the shared buffers, into a fresh staging buffer so the producer's own buffer is untouched for the graph's re-executability). On a fully-Metal graph there is one split, so this `if` never fires mid-graph — but the *final* sync after the loop (`:348-352`) always does, which is where the decode forward's single submit lands. If any node's buffer turned out to live on a different backend than the split executing it, the scheduler returns a hard `Err` ("assignment/alloc mismatch", `:234-241`) — the same no-silent-fallback posture, one level up.
 
 The submit itself (`metal_backend.rs:160-186`) takes the leaked box back, calls `cb.submit()`, and — under `MINFER_OP_PROFILE=1` — accumulates the GPU wait time that §4's profile table prints. The `Drop` impl does the same flush best-effort (`let _ = cb.submit()`) so a backend dropped mid-split cannot leak an unterminated encoder.
 

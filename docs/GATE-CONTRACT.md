@@ -278,19 +278,25 @@ This is a **documentation convention**, not a sixth gate rule — it belongs her
 because `check_doc_line_anchors.py` is the gate it supports, and because the
 reason it exists is the gate's own boundary.
 
-A `path:NNN` anchor in the docs is checked for two things only: that the file and
-the line exist, and — when a backticked *symbol* sits next to the anchor — that
-the symbol still lives within ±25 lines of it ([#266]). Neither test can see a
-range that still *resolves* but no longer holds the text the citing sentence
-describes. That is not a bug to fix with a third rule: measured for [#327],
-**173** anchors carry an adjacent backticked **non-symbol** token, and **99** of
-the 144 live ones do not contain that token inside their own range — 69 % of the
-population, and the tokens are mostly code expressions (`ins[1][t].to_bits() as
+A `path:NNN` anchor in the docs is checked for two things that **fail**: that the file
+and the line exist, and — when a backticked *symbol* sits next to the anchor — that the
+symbol still lives within ±25 lines of it ([#266]). The window is loose on purpose (a
+symbol 20 lines away is a neighbour, not a move), so a symbol that is *in the file but
+not in the cited range* is a **note**, not a failure — rule E of
+`check_doc_line_anchors.py` ([#339]), counted in its summary and listed by `--list`
+with `[range-miss: …]`. A call-site citation is not a miss: if the range names the
+symbol where it is *called*, the identifier is inside the range and the anchor passes.
+Neither test can see a range that still *resolves* but no longer holds the **text** the
+citing sentence describes, and that is not a bug to fix with a further rule: measured
+for [#327], **173** anchors carry an adjacent backticked **non-symbol** token, and
+**99** of the 144 live ones do not contain that token inside their own range — 69 % of
+the population, and the tokens are mostly code expressions (`ins[1][t].to_bits() as
 usize`, `nt >= 9`) or fragments of a *neighbouring* quoted sentence, never the
 claim. Even the narrowest useful spelling ("≥2 pure-lowercase words") leaves one
 hit — an anchor citing `build.rs` for `` `ar rcs` `` that no longer held it — and
 that one *was* a real drift, which is the point: the detectable subset is a
-coincidence, not a rule.
+coincidence, not a rule. Rule E is the *symbol* half of that question, where the
+adjacent token is mechanical; the non-symbol half stays a convention.
 
 So the convention is:
 
@@ -303,9 +309,36 @@ So the convention is:
   is the one content-aware test that is mechanical: put the backticked symbol
   next to the anchor and the checker follows it through a move. A bare range is
   the fallback, not the default.
+- **A symbol anchor's range must hold that symbol** (rule E). Write the symbol
+  *and* cite the lines that contain it — a definition citation starts **at** the
+  definition, and a `NNN-MMM` range must not start hundreds of lines early. A
+  trailing `()` is part of the token, so `` `metal_available()` `` is checked
+  like `` `metal_available` ``. If the sentence is about a *call*, cite the call
+  site; the identifier is there too. When neither is possible, cite a section
+  heading (the bullet above) rather than a range that holds something else.
 - **A range that quotes prose is the weakest form.** Do not backtick the quoted
   words to "make them checkable": the adjacency rule was written for identifiers,
   and applying it to prose judges the neighbouring sentence (measured above).
+
+Rule E ships as a note rather than a failure because of what a failure would cost
+*and* because it does not catch the whole class. Measured on `7991218`, **79**
+non-frozen anchors carry an adjacent backticked symbol whose identifier is not inside
+their own range (**84** with the trailing `()` stripped; 46 cite a `NNN-MMM` range and
+38 a single line, and 81 of the 84 hold the identifier in the target file at all),
+and they span 18 docs — 21 in `13-decode-loop-graph-reuse.md`, 12 in
+`cuda_tutorial/02-minimal-cuda.md`, 11 in `14-metal-backend.md`, 7 in
+`ARCHITECTURE-ROADMAP.md`. **26** of the 84 live in walkthrough docs that state the
+revision their lines were verified against (`lines verified at commit e7fa0da`), where
+re-pointing the anchor would falsify the record — the same reason the `FROZEN` set
+exists. And two of the three anchors [#339] was filed for are *invisible* to the rule:
+`:256` cited `metal_backend.rs:316-1020` for `execute_node`, a range that **does**
+contain the definition at 843 (containment cannot see a range that starts 527 lines
+early), and `:586`'s `synchronize` anchor carries no adjacent symbol at all
+(`` `self.submit_pending()` `` is not an identifier), so no adjacency rule can reach
+it. Both were re-pointed by hand in the [#339] PR, as was the `()`
+(`:526` cites `metal_backend.rs:1770-1772` now). The 80 that remain are the sweep
+[#336] and [#356] carry alongside the bare ranges; until it lands they are visible as
+`range misses` in every `check-docs` run, and `--strict-symbols` fails on each.
 
 The remaining bare ranges are a tracked sweep, not a silent one: **878** of the
 955 resolved anchors are bare ranges across 33 docs (`docs/cuda_tutorial/**` alone
@@ -485,4 +518,6 @@ answer from the PR, not as property tests.
 [#344]: https://github.com/yusiwen/minfer/issues/344
 [#347]: https://github.com/yusiwen/minfer/issues/347
 [#355]: https://github.com/yusiwen/minfer/issues/355
+[#339]: https://github.com/yusiwen/minfer/issues/339
+[#356]: https://github.com/yusiwen/minfer/issues/356
 [PR #343]: https://github.com/yusiwen/minfer/pull/343
