@@ -1016,14 +1016,14 @@ impl GraphAllocator {
             // pre-F4 `backend != Backend::CPU` hardcode and the C4 format gate
             // can no longer disagree. C4 S2a gave the CPU the fused read and S2b
             // the CUDA kernels, so today the registry says yes for CPU and CUDA
-            // and no for Metal ([#44], G5).
+            // and no for Metal (its packed read is [#310]).
             //
-            // [#44]: https://github.com/yusiwen/minfer/issues/44
+            // [#310]: https://github.com/yusiwen/minfer/issues/310
             if !super::registry::reads_packed_kv(backend) {
                 return Err(format!(
                     "KV region for layer {layer} would live on {backend:?}, which has no kernel \
                      that reads a packed {} region (the CPU and CUDA attention kernels do; Metal \
-                     is G5 on issue #44); refusing rather than sizing a region its kernels would \
+                     is issue #310); refusing rather than sizing a region its kernels would \
                      address as f32 rows",
                     format.name()
                 ));

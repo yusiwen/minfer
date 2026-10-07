@@ -24,3 +24,14 @@ fn ffn_composition_is_opt_in_and_refuses_where_it_cannot_work() {
         }
     }
 }
+
+/// C8b S4 / #362: `gathers_attn_map` is the single authority for the set-valued
+/// window, and every backend now answers yes — the CPU and CUDA kernels always
+/// did, and Metal's sibling `kernel_gqa_attn_map_f32/_f16` closed the gap this
+/// ticket is about. Pure, so CI (no GPU) covers it.
+#[test]
+fn every_device_gathers_the_attn_map() {
+    for d in [Device::Cpu, Device::Metal, Device::Cuda] {
+        assert!(d.gathers_attn_map(), "{d:?} must gather a kv_map window");
+    }
+}

@@ -210,6 +210,11 @@ struct MpsStateInner {
     // E1 `attn_span` read path (issue #44, G5a): the windowed kernel family.
     pl_gqa_attn_window: MetalComputePipelineState,
     pl_gqa_attn_window_f16: MetalComputePipelineState,
+    // C8b S4 `kv_map` read path (issue #362): the set-valued window's sibling
+    // kernels. Deliberately separate from the one-range window family above,
+    // whose instruction stream is a measured contract (#315).
+    pl_gqa_attn_map: MetalComputePipelineState,
+    pl_gqa_attn_map_f16: MetalComputePipelineState,
     pl_gqa_attn_partial: MetalComputePipelineState,
     pl_gqa_attn_partial_f16: MetalComputePipelineState,
     pl_gqa_attn_combine: MetalComputePipelineState,
