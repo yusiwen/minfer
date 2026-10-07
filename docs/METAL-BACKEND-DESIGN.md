@@ -421,9 +421,15 @@ prefill — which runs it — costs against the causal flash prefill. That compa
   shape). Gate `metal_copy_kv_to_cpu_reads_after_the_pending_split` leaves a real store dispatch
   un-submitted and reads through `copy_kv_to_cpu`: without the flush the read is the region's zeros.
   The C2 re-rope stays **f32-only**: an f16 region has no host map (the raw halves
-  would be rotated as f32), so `kv_rm` refuses it loudly, naming
-  [#306](https://github.com/yusiwen/minfer/issues/306); CUDA is exposed too and is not fixed
-  here.
+  would be rotated as f32), so `kv_rm` — and its `start == 0` spelling `kv_shift` —
+  refuses it loudly, naming [#306](https://github.com/yusiwen/minfer/issues/306); CUDA is
+  exposed too and is not fixed here. That refusal is the recorded end state, pinned by
+  `graph::alloc::tests::kv_shift::an_f16_region_refuses_the_physical_shift_and_the_other_formats_take_it`
+  (a genuine `set_kv_format(F16)` region, with f32 and packed q8_0 controls that do shift on
+  the same fixture), and the caller re-renders the retained window instead — measured on
+  `dgxspark (aarch64, GB10 sm_121)`, 2026-10-07, 7B Q4_K_M `--cnv` overflow at `--n-ctx 512`:
+  499–505 tokens / 0.30–0.35 s re-prefilled per overflow, against the shift's 22-token /
+  0.26 s delta.
 - **Per-engine `kv_format`.** `MetalBackend` now carries its own `KvFormat`, stamped from
   `GraphAllocator::set_kv_format` (and read from the allocator stamp on `enable_metal`), and
   every attention/store dispatch takes it as an explicit `f16` argument instead of reading a

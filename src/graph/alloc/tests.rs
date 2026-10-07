@@ -8,6 +8,7 @@ use crate::graph::DType;
 mod backend_fence;
 mod budget;
 mod kv_arena;
+mod kv_shift;
 mod liveness;
 mod staging;
 mod views;
