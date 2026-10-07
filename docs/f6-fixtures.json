@@ -139,7 +139,7 @@
       "producer": "minfer convert ~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct ~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f32.gguf --outtype f32",
       "producer_kind": "minfer",
       "minfer_commit": "unrecorded (2026-09-27 producer)",
-      "date": "2026-09-27",
+      "date": "2026-10-07",
       "box": "dgxspark (aarch64, GB10 sm_121)",
       "producer_note": "byte-identical to the Mac's 2026-10-07 conversion at master ab34a72, so the producer version does not move this one",
       "also_on": [
