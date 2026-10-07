@@ -33,7 +33,7 @@ surface:
 | Method | Meaning |
 |---|---|
 | `supports_op(op, dtype)` | capability query, asked **per node at build time** |
-| `supports_fused(fused)` | gates the fusion pass — fused IR nodes are only produced where a kernel exists (`fusion.rs:68`, `:112`) |
+| `supports_fused(fused)` | gates the fusion pass — fused IR nodes are only produced where a kernel exists (`fusion.rs:72`) |
 | `alloc_buffer` / `free_buffer` | the backend's own buffer pool, sized in `f32` elements |
 | `alloc_fresh` | same, but bypasses the recycle free list — split-boundary staging needs ids whose physical contents are still referenced later in the same execute (`backend.rs:36-45`) |
 | `execute_node(node, in_bufs, out_buf, kv_pair)` | run one node; `kv_pair` carries the layer's persistent (K, V) region ids for KV ops; the output may alias an input (in-place ops) |

@@ -349,14 +349,66 @@ ones — line 98 and line 452 of `docs/ARCHITECTURE-ROADMAP.md`, line 56 of
 `graph/alloc.rs` range moved from `134-137` to `135-138`. Read that line at
 `506b26c` to see the defect; read it today to see the fix.
 
-Two boundaries are deliberate. A **bare `:NNN` continuation** is not an anchor
-either checker can see, so neither one re-points it — those numbers remain
-[#336]'s sweep, and making the form itself checkable is [#355]'s own ticket.
-And a base anchor whose doc line was rewritten *beyond* its numbers is not
-compared — the author touched that line, and pairing it would be a guess;
-`--list` prints it as
-`not compared`, so "why did this pass?" has an answer. The `FROZEN` set above is
-the *same* set in both modes: a record frozen against a past revision is not drift.
+Two boundaries are deliberate. A base anchor whose doc line was rewritten *beyond*
+its numbers is not compared — the author touched that line, and pairing it would be a
+guess; `--list` prints it as `not compared`, so "why did this pass?" has an answer.
+The `FROZEN` set above is the *same* set in both modes: a record frozen against a past
+revision is not drift. The other boundary — a bare `:NNN` continuation — is no longer a
+blind spot: it is rule D below.
+
+### A bare `:NNN` continuation attaches to the anchor before it
+
+A citation often names a file once and then a second range beside it:
+
+```
+`docs/ARCHITECTURE-ROADMAP.md:NNN` … `graph/alloc.rs:NNN`, `:MMM`
+```
+
+The `:MMM` is a **bare continuation** — a backticked span whose whole content is `:NNN`
+or `:NNN-MMM`. `ANCHOR` requires a `path.ext`, so before [#355] **neither**
+`check_doc_line_anchors.py` nor `check_anchor_drift.py` could see it: a re-point that
+fixed the visible `graph/alloc.rs:NNN` left `:MMM` behind, silently. That is not
+hypothetical — it is how [#347]'s seven rows survived `387fe91` and `da7a35a`, and
+`check_anchor_drift.py` reported green over each. (The numbers are placeholders: this
+page states the rule, it does not cite a revision, so it carries no live anchor for the
+gates to keep re-pointing.)
+
+The convention, stated once here and implemented as rule D:
+
+- **A bare continuation attaches to the nearest *preceding* `path.ext:NNN` match on the
+  same doc line.** "Nearest preceding" is exact: the window is **one doc line**, the
+  direction is **backwards only**, and the nearest earlier anchor wins — so a line
+  carrying two path anchors and two continuations attaches each number to the anchor
+  immediately before it, not to the first one on the line. The continuation is then
+  resolved and range-checked against **that** file, exactly like a written `path:NNN`,
+  and the drift gate maps it through that file's hunks in the same way — a stranded
+  continuation is `doc:line (bare continuation) → path:old (now new)`, exit 1.
+- **A continuation that follows no anchor on its line stays silent.** So does one that
+  comes *before* every anchor on its line, and one whose path anchor is itself
+  external, ambiguous or frozen. The rule is syntactic, so the silent class is not a
+  guess about intent: nothing on the line names the file, and attaching to the nearest
+  anchor in *either* direction is wrong where it is not empty. Measured on `f754ee3`,
+  the two standalone `:1289-1321` spans in `docs/ARCHITECTURE-ROADMAP.md` (its line 204
+  and its line 619) each continue a file named on the *previous* line, while the anchor
+  that follows on their own line names `metal_backend.rs` — so a forward window would
+  fail both, naming the wrong file, and the backward one has nothing to attach to.
+- **The window is the line, not the paragraph or the table cell.** Measured on
+  `f754ee3` with the issue's criterion, the docs carry **58** bare continuations on
+  anchor-carrying lines: **38** resolve, **11** were out of range (the visible path
+  anchor had been re-pointed by the [#261]/[#263] split and the continuation left at
+  its pre-split absolute number — fixed in the [#355] PR), **2** are in the frozen
+  `docs/ARCHITECTURE-EXECUTION-PLAN.md`, and **7** are silent by the two rules above.
+  The `FROZEN` exemption covers bare continuations exactly as it covers path anchors.
+- **Prefer the explicit form when the two citations are in *different* files.** The
+  rule attaches the number to the nearest anchor, not to the file the sentence meant:
+  `03-kernels-elementwise.md`'s ``(`src/cuda/methods.rs:NNN`, launch at `:MMM`)`` meant
+  the launcher that the [#262] split moved to
+  `src/cuda/methods/prefill_f16.rs`, so the fix names that file. Widening the window to
+  the paragraph is the follow-up the silent class leaves open — [#367] carries the seven
+  measured spans and both options, and [#336] is the same sweep for bare ranges generally.
+
+The convention for the *content* of a range is unchanged from §"Prose anchors" above: a
+heading or a symbol is still the stable locator, and a bare range is still the fallback.
 
 ## Writing the next gate — checklist
 
@@ -419,6 +471,9 @@ answer from the PR, not as property tests.
 [#188]: https://github.com/yusiwen/minfer/issues/188
 [#218]: https://github.com/yusiwen/minfer/issues/218
 [#223]: https://github.com/yusiwen/minfer/issues/223
+[#261]: https://github.com/yusiwen/minfer/issues/261
+[#262]: https://github.com/yusiwen/minfer/issues/262
+[#263]: https://github.com/yusiwen/minfer/issues/263
 [#266]: https://github.com/yusiwen/minfer/issues/266
 [#327]: https://github.com/yusiwen/minfer/issues/327
 [#299]: https://github.com/yusiwen/minfer/issues/299
@@ -426,6 +481,8 @@ answer from the PR, not as property tests.
 [#329]: https://github.com/yusiwen/minfer/issues/329
 [#335]: https://github.com/yusiwen/minfer/issues/335
 [#336]: https://github.com/yusiwen/minfer/issues/336
+[#367]: https://github.com/yusiwen/minfer/issues/367
 [#344]: https://github.com/yusiwen/minfer/issues/344
+[#347]: https://github.com/yusiwen/minfer/issues/347
 [#355]: https://github.com/yusiwen/minfer/issues/355
 [PR #343]: https://github.com/yusiwen/minfer/pull/343

@@ -218,13 +218,17 @@ line and both values — edit *that* file, not a counter. The same job runs `scr
 (pinned mdBook + a sha384-checked Mermaid download) and `scripts/check_docs_links.py`, which fails on
 a relative link whose target does not exist, and `scripts/check_doc_line_anchors.py` (#266), which
 fails on a `path:NNN` anchor whose file or line is gone — and, when the anchor names a backticked
-symbol, on a symbol that has left the file it points at; the historical records whose anchors cite a
+symbol, on a symbol that has left the file it points at; a bare `:NNN` continuation attaches to the
+nearest *preceding* `path:NNN` on its own doc line and is resolved and range-checked against that
+file the same way, while one that follows no anchor on its line stays silent (#355); the historical
+records whose anchors cite a
 pre-split revision are frozen inside it, one reason apiece, and an exemption that no longer covers a
 failure fails too. Resolving is not pointing, so the same job runs
 `scripts/check_anchor_drift.py` (#344) on `pull_request`: it diffs `HEAD` against the PR's merge base
 (`origin/<base_ref>...HEAD`, the second reason the checkout is `fetch-depth: 0`), maps every anchored
 file's old→new lines, and fails an anchor the range moved without re-pointing — naming it
-`doc:line → target:old (now new)`. A cited line the range *deleted* has no image in the map, so it is
+`doc:line → target:old (now new)`, and for a bare continuation
+`doc:line (bare continuation) → target:old (now new)`. A cited line the range *deleted* has no image in the map, so it is
 reported for a human instead of guessed, and the same `FROZEN` set exempts the same records. It named
 **73** anchors over #299's range, the 69 its re-point commit fixed plus 4 it missed. It also runs
 `scripts/check_f6_fixtures.py` (#205), which checks the shape of the F6 fixture manifest `docs/f6-fixtures.json`,

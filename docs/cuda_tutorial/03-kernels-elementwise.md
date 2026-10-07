@@ -316,7 +316,7 @@ them:
 
 #### The kernel
 
-`src/cuda/kernels/gemm_wmma.cu:38` (family header + type-id table at `:4421`):
+`src/cuda/kernels/gemm_wmma.cu:38` (family header + type-id table at `:10-21`):
 
 ```c
 __global__ void dequant_q4_0_f16(
@@ -413,7 +413,7 @@ kernels in a profile:
   **no** dequant at load today.
 - Otherwise `launch_dequant_f16` runs **per call** into a scratch buffer,
   from the f16 prefill GEMM path `prefill_gemm_f16`
-  (`src/cuda/methods.rs:224`, launch at `:3848`).
+  (`src/cuda/methods.rs:224`, launch at `src/cuda/methods/prefill_f16.rs:159`).
 - Why a cache at all: the two-pass prefill GEMM used to dequantize W on
   *every* call — "288 ms per 7B @2K forward" — because weights are immutable
   after registration, the dequant result is cached per weight pointer
@@ -552,9 +552,9 @@ that carries the idea.
 
 | Kernel (file:line) | Purpose | The one interesting line |
 |---|---|---|
-| `convert_f32_f16_kernel` (`gemm_wmma.cu:203`) | f32 activations → f16, feeding the wmma prefill GEMM | `:4619` — `base = (…blockIdx.x * blockDim.x + threadIdx.x) * 8`: the thread index is **multiplied by 8**; each thread `float4`-loads 8 f32 and stores 4 `__half2` (`:4624`), 8× fewer transactions for the same traffic (the P1 comment at `:4617`). Launcher `launch_convert_f16` `:5067` sizes the grid over `n/8`. |
-| `f32_bits_to_i32` (`ops_elementwise.cu:249`) | positions/token ids arrive as I32-as-f32 bit patterns; rope/store/attention kernels want raw `int*` | `:2496` — `dst[tid] = __float_as_int(src[tid]);` the whole kernel *is* that line: one device-side bit reinterpretation pass, so the per-layer path never syncs with the host (comment `:2483`). Rust entry `bits_to_i32` `src/cuda/methods/kvstore.rs:146`, called from `positions_i32` (`cuda_backend.rs:1210`, launch `:1238`). |
-| `gather_rows_f32` (`ops_misc.cu:145`) | the quant-free `GetRows`: `out[t*n+i] = x[ids[t]*n+i]` | `:2058` — `out[idx] = src[(long long)id * n + i];` the classic gather: one flat index decoded into `(t, i)`, the id looked up per thread. Same `(1, 18)`-style dispatch you saw in §3.3 is what routes F32 embeddings and the tail-row selects here. |
+| `convert_f32_f16_kernel` (`gemm_wmma.cu:203`) | f32 activations → f16, feeding the wmma prefill GEMM | `:208` — `base = (…blockIdx.x * blockDim.x + threadIdx.x) * 8`: the thread index is **multiplied by 8**; each thread `float4`-loads 8 f32 and stores 4 `__half2` (`:213`), 8× fewer transactions for the same traffic (the P1 comment at `:206`). Launcher `launch_convert_f16` `:833` sizes the grid over `n/8`. |
+| `f32_bits_to_i32` (`ops_elementwise.cu:249`) | positions/token ids arrive as I32-as-f32 bit patterns; rope/store/attention kernels want raw `int*` | `:256` — `dst[tid] = __float_as_int(src[tid]);` the whole kernel *is* that line: one device-side bit reinterpretation pass, so the per-layer path never syncs with the host (comment `:243`). Rust entry `bits_to_i32` `src/cuda/methods/kvstore.rs:146`, called from `positions_i32` (`cuda_backend.rs:1210`, launch `:1238`). |
+| `gather_rows_f32` (`ops_misc.cu:145`) | the quant-free `GetRows`: `out[t*n+i] = x[ids[t]*n+i]` | `:157` — `out[idx] = src[(long long)id * n + i];` the classic gather: one flat index decoded into `(t, i)`, the id looked up per thread. Same `(1, 18)`-style dispatch you saw in §3.3 is what routes F32 embeddings and the tail-row selects here. |
 
 All three are one-thread-per-element kernels with the usual ceil-div launcher;
 if §3.1 made sense, these read themselves.

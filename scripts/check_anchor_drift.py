@@ -66,6 +66,23 @@ Boundary (what this does not catch).
     against the committed diff.  Run it on a clean tree (CI does), or pass ``--head
     <rev>`` and nothing local is read at all.
 
+**Bare `:NNN` continuations (#355).** The sibling checker now emits a bare
+continuation as a first-class anchor attached to the nearest preceding `path.ext:NNN`
+on its doc line (its rule D), so the drift mode judges it with no second grammar: the
+pairing key is the doc line, and the map is applied to that path anchor's file — the
+file the continuation continues.  Two consequences are worth stating, because they are
+what the rule buys and where it stops:
+
+  - a continuation the author *left behind* maps forward to different numbers than it
+    carries, so the row is ``stale`` and names the file, the old number, the new one and
+    the fact that it is a continuation: `doc:line (bare continuation) →
+    path:old (now new)`.  That is [PR #343]'s exact failure mode one level down — the
+    visible `path:NNN` was re-pointed and the `:NNN` beside it was not;
+  - a continuation the author *did* re-point edits the digits, so the normalised doc
+    line no longer pairs and the base anchor is ``not compared`` — a pass, because the
+    line was touched.  The asymmetry is deliberate: a stale continuation is decidable
+    and must fail, a re-pointed one is an author edit and needs no arithmetic.
+
 Usage::
 
     python3 scripts/check_anchor_drift.py [--root DIR] [--list] [--strict] <rev>
@@ -243,7 +260,11 @@ ALREADY_FAILED = ("missing", "out-of-range", "range-order", "symbol-moved")
 
 @dataclass
 class Verdict:
-    """One paired anchor and what the line map says about it."""
+    """One paired anchor and what the line map says about it.
+
+    ``continuation`` marks a bare `:NNN` span (issue #355): the row is then about a
+    number whose file is named by the path anchor before it on the same doc line.
+    """
 
     doc: str
     line: int
@@ -252,17 +273,19 @@ class Verdict:
     new: str | None
     kind: str
     detail: str = ""
+    continuation: bool = False
 
     def where(self) -> str:
         return f"{self.doc}:{self.line}"
 
     def sentence(self) -> str:
         """The one-line form the ticket fixes: `doc:line -> target:old (now new)`."""
+        where = f"{self.where()} (bare continuation)" if self.continuation else self.where()
         if self.kind == STALE:
-            return f"{self.where()} → {self.target}:{self.old} (now {self.new})"
+            return f"{where} → {self.target}:{self.old} (now {self.new})"
         if self.kind == AMBIGUOUS:
-            return f"{self.where()} → {self.target}:{self.old} — {self.detail}"
-        return f"{self.where()} → {self.target}:{self.old} [{self.kind}] {self.detail}".rstrip()
+            return f"{where} → {self.target}:{self.old} — {self.detail}"
+        return f"{where} → {self.target}:{self.old} [{self.kind}] {self.detail}".rstrip()
 
 
 @dataclass
@@ -460,6 +483,7 @@ def check(
                         new=None,
                         kind=NOT_COMPARED,
                         detail="the doc line changed beyond the anchor numbers",
+                        continuation=b.continuation,
                     )
                 )
         report.verdicts.sort(key=lambda v: (v.doc, v.line))
@@ -480,6 +504,7 @@ def _judge(diff: DiffMap, b: anchors.Anchor, h: anchors.Anchor) -> Verdict:
         old=_shown(b),
         new=None,
         kind=CORRECT,
+        continuation=h.continuation,
     )
     if h.target != b.target:
         verdict.kind = NOT_COMPARED
@@ -607,6 +632,9 @@ BASE_FILES = {
     "docs/repointed.md": "See (`src/thing.rs:20-22`) for the re-pointed case.\n",
     "docs/ambiguous.md": "See (`src/rewritten.rs:20-22`) for the rewritten block.\n",
     "docs/unchanged.md": "See (`src/other.rs:3`) for the untouched file.\n",
+    "docs/continuation.md": "The pair `src/thing.rs:20`, `:22` moved together.\n",
+    "docs/cont_repointed.md": "See `src/thing.rs:20-22` and the tail `:24`.\n",
+    "docs/detached.md": "A bare `:99` with no anchor on its line stays silent.\n",
     "docs/frozen/old.md": "See (`src/thing.rs:20-22`) in a record of a past revision.\n",
 }
 
@@ -626,6 +654,7 @@ def _head_files() -> dict[str, str]:
         "src/thing.rs": thing,
         "src/rewritten.rs": rewritten,
         "docs/repointed.md": "See (`src/thing.rs:23-25`) for the re-pointed case.\n",
+        "docs/cont_repointed.md": "See `src/thing.rs:23-25` and the tail `:27`.\n",
     }
 
 
@@ -716,7 +745,7 @@ def selftest() -> int:
         # 1. The stale case: the number did not move with the text, so it must fail —
         #    and the row must name the mapped numbers.
         expect(kinds("docs/stale.md") == [STALE], "a shifted anchor must be stale")
-        stale = report.stale[0] if report.stale else None
+        stale = next((v for v in report.stale if v.doc == "docs/stale.md"), None)
         expect(stale is not None and stale.target == "src/thing.rs", "the stale row names the file")
         expect(stale is not None and stale.old == "20-22", "the stale row names the written range")
         expect(stale is not None and stale.new == "23-25", "the stale row names the mapped range")
@@ -757,8 +786,14 @@ def selftest() -> int:
         expect(err.getvalue() == "", "an empty range must print nothing")
 
         # 7. The policy is the lever: freeze the moving target's citation and the same
-        #    range goes green, with the ambiguous bucket still only a report.
-        frozen = {**SELFTEST_FROZEN, "docs/stale.md": "a record of a past revision"}
+        #    range goes green, with the ambiguous bucket still only a report.  The
+        #    freeze covers a bare continuation exactly as it covers a path anchor
+        #    (#355) — a record of a past revision is not re-pointed in either form.
+        frozen = {
+            **SELFTEST_FROZEN,
+            "docs/stale.md": "a record of a past revision",
+            "docs/continuation.md": "a record of a past revision, bare `:NNN` included",
+        }
         quiet = check(root, base, frozen=frozen)
         expect(not quiet.stale, "freezing the doc must clear its stale anchor")
         expect(quiet.worst(False) == 0, "the frozen run must be green")
@@ -771,6 +806,37 @@ def selftest() -> int:
                 main(["check_anchor_drift.py", "--root", str(root), "no-such-rev"]) == 2,
                 "an unknown revision must exit 2",
             )
+
+        # 9. The bare `:NNN` continuation (#355).  `docs/continuation.md` cites
+        #    ``src/thing.rs:20`` and the continuation ``:22``; thing.rs grows by three
+        #    lines and neither number moves, so both anchors are stale — the pair
+        #    [#343] missed one level down.  The continuation row must say what it is
+        #    and carry the mapped number.
+        expect(
+            kinds("docs/continuation.md") == [STALE, STALE],
+            "a stranded continuation must be stale beside its path anchor",
+        )
+        cont = [v for v in report.verdicts if v.doc == "docs/continuation.md" and v.continuation]
+        expect(len(cont) == 1, "the line's two anchors are one path anchor and one continuation")
+        expect(cont and cont[0].target == "src/thing.rs", "the continuation row names the file it continues")
+        expect(cont and cont[0].old == "22", "the continuation row names the written number")
+        expect(cont and cont[0].new == "25", "the continuation row names the mapped number")
+        expect(
+            cont and cont[0].sentence().startswith("docs/continuation.md:1 (bare continuation)"),
+            "the continuation row says it is a bare continuation",
+        )
+
+        # 10. The same continuation re-pointed in the same doc line pairs through the
+        #     fallback signature and is `correct`, and one that follows no anchor on
+        #     its line is not an anchor at all — silence, not a guess.
+        expect(
+            kinds("docs/cont_repointed.md") == [CORRECT, CORRECT],
+            "a re-pointed continuation must be correct",
+        )
+        expect(
+            not [v for v in report.verdicts if v.doc == "docs/detached.md"],
+            "an unattached `:NNN` stays silent",
+        )
 
     if failures:
         for failure in failures:

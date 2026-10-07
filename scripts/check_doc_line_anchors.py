@@ -50,6 +50,15 @@ what keeps the heuristic honest rather than loud:
 Both non-failing classes are listed by `--list`, printed in the summary, and promoted
 to failures by `--strict-symbols` — so "why did this pass?" always has an answer.
 
+``D`` **the continuation is range-checked too.** A backticked span whose whole content
+is `:NNN` or `:NNN-MMM` — a second range in the file the line already cited — attaches
+to the nearest *preceding* `path.ext:NNN` match on the same line and is judged against
+**that** file: the same resolution (rule A) and the same range test (rule B). A line
+with no preceding anchor, or a continuation that precedes every anchor on its line,
+stays silent; a continuation whose path anchor is itself external, ambiguous or frozen
+is classified the same way. This closes issue #355: the bare form was invisible, so a
+re-point that fixed the visible `path:NNN` left its continuation behind.
+
 **Frozen records.** A frozen-file set (the ``GRANDFATHERED_BARE`` pattern of
 `scripts/check_dead_code_annotations.py`) exempts the historical records whose anchors
 were written against a revision that has since moved: rewriting them would falsify a
@@ -58,7 +67,9 @@ a one-line reason, and the set is a ratchet *downwards*: an entry that no longer
 a file carrying a single anchor fails (``STALE FREEZE``), like a grandfather key that no
 longer covers a bare `allow`. An entry whose files all resolve today is printed as
 ``UNUSED FREEZE`` but does not fail — the exemption is a policy for a record of a past
-revision, not a claim that the record is broken today.
+revision, not a claim that the record is broken today. The exemption covers
+continuations exactly as it covers path anchors: a frozen record's bare `:NNN` is
+`frozen`, never a violation.
 
 **Boundary (what this does not catch).** A bare basename that names nothing in this
 tree is treated as an external citation, so now that the campaign's Step 2 has retired
@@ -75,6 +86,23 @@ sentence, not the claim. The convention that replaces the missing rule — a pro
 anchor names a **section heading** next to its range, and a symbol anchor is
 preferred where one exists — is written down in ``docs/GATE-CONTRACT.md``
 §"Prose anchors: name the section, not the line range".
+
+Rule D's **window is the doc line, and it is one-directional**. Measured on `f754ee3`
+with the issue's criterion (a backticked span whose content is exactly `:NNN` /
+`:NNN-MMM`, on a doc line that carries a `path.ext:NNN` match), the docs carry **58**
+such spans: **38** resolve, **13** are out of range (2 of them in a frozen record) and
+**6** follow no anchor on their line (`:1752`, `:1849` in
+`docs/ARCHITECTURE-EXECUTION-PLAN.md`; `:1289-1321` twice in
+`docs/ARCHITECTURE-ROADMAP.md`; `:2045-2052`, `:2054-2063` in
+`docs/inference_e2e_walkthrough/14-metal-backend.md`), while one
+(`docs/inference_e2e_walkthrough/14-metal-backend.md:499`) inherits its path anchor's
+`ambiguous` verdict. Those seven stay silent deliberately: in each, the file is named
+in the *sentence before* the number, or the path anchor is on the same line but *after*
+it, and attaching the number to the nearest anchor in either direction would be a
+guess with a wrong answer available (the roadmap pair belongs to a file named on the
+previous line, not to the `metal_backend.rs` anchor that follows it). The window is
+stated once in ``docs/GATE-CONTRACT.md`` §"A bare `:NNN` continuation attaches to the
+anchor before it"; widening it is the follow-up the boundary names.
 
 Usage::
 
@@ -124,6 +152,16 @@ ANCHOR = re.compile(
 
 #: One backticked span.
 CODE_SPAN = re.compile(r"`([^`]+)`")
+
+#: A **bare continuation**: a backticked span whose whole content is `:NNN` or
+#: `:NNN-MMM`, i.e. a second range in the file the line already cited. The attachment
+#: rule is stated once in `docs/GATE-CONTRACT.md` §"A bare `:NNN` continuation attaches
+#: to the anchor before it": the continuation attaches to the **nearest preceding**
+#: `path.ext:NNN` match on the **same doc line**, and a line with no such match — or a
+#: continuation that comes before every anchor on its line — stays silent, because
+#: there is no file to attribute the number to. The `ANCHOR` grammar requires the
+#: path, which is why the continuation was invisible before issue #355.
+CONTINUATION = re.compile(r"^:(\d+)(?:-(\d+))?$")
 
 #: A symbol-shaped token: a bare identifier or a `Type::item` path, starting with a
 #: letter (never `_foo`) and looking like code rather than prose — it must carry an
@@ -205,7 +243,12 @@ ROOT_DIRS = ("src", "docs", "scripts", "tests", "viz", "benches", "experiments")
 
 @dataclass
 class Anchor:
-    """One `path:NNN` token, its resolution and the verdict on it."""
+    """One `path:NNN` token, its resolution and the verdict on it.
+
+    ``continuation`` marks a bare `:NNN` span: ``path`` is then the *written* path of
+    the anchor it attached to, ``start``/``end`` are its own numbers, and the verdict
+    is judged against that anchor's resolved target (rule D).
+    """
 
     doc: str
     line: int
@@ -214,6 +257,7 @@ class Anchor:
     end: int | None
     target: str | None = None
     symbol: str | None = None
+    continuation: bool = False
     verdict: str = "ok"
     detail: str = ""
 
@@ -222,7 +266,7 @@ class Anchor:
 
     def shown(self) -> str:
         rng = f"{self.start}-{self.end}" if self.end is not None else f"{self.start}"
-        return f"{self.path}:{rng}"
+        return f":{rng}" if self.continuation else f"{self.path}:{rng}"
 
     def is_violation(self, strict_symbols: bool = False) -> bool:
         if self.verdict in ("missing", "out-of-range", "range-order", "symbol-moved"):
@@ -235,6 +279,9 @@ class Report:
     anchors: list[Anchor] = field(default_factory=list)
     stale_frozen: list[tuple[str, str]] = field(default_factory=list)
     unused_frozen: list[tuple[str, str]] = field(default_factory=list)
+    #: Bare continuations that attach to no preceding anchor on their line: the
+    #: documented silent class (rule D), counted so "why did this pass?" has an answer.
+    unattached: int = 0
 
     def violations(self, strict_symbols: bool = False) -> list[Anchor]:
         return [a for a in self.anchors if a.is_violation(strict_symbols)]
@@ -327,6 +374,7 @@ class Checker:
         self.frozen = dict(FROZEN if frozen is None else frozen)
         self._lines: dict[str, list[str]] = {}
         self._src_text: str | None = None
+        self._unattached = 0
 
     # -- helpers ---------------------------------------------------------------
 
@@ -355,10 +403,62 @@ class Checker:
                 return reason
         return None
 
+    def anchors_on_line(self, rel: str, number: int, text: str) -> list[tuple[Anchor, tuple[int, int] | None]]:
+        """The anchors one doc line carries, in written order, with a symbol span.
+
+        A `path.ext:NNN` match is an anchor with its own span (rule C reads the
+        backticked token next to it). A backticked span whose whole content is
+        `:NNN` / `:NNN-MMM` is a bare continuation (rule D): it attaches to the
+        nearest *preceding* path anchor on this line and is judged against that
+        anchor's written path. A continuation with no such anchor is dropped — the
+        documented silent class — and counted on the report.
+        """
+        matches = list(ANCHOR.finditer(text))
+        entries: list[tuple[int, Anchor, tuple[int, int] | None]] = []
+        for match in matches:
+            entries.append(
+                (
+                    match.start(),
+                    Anchor(
+                        doc=rel,
+                        line=number,
+                        path=match.group("path"),
+                        start=int(match.group("start")),
+                        end=int(match.group("end")) if match.group("end") else None,
+                    ),
+                    match.span(),
+                )
+            )
+        for span in CODE_SPAN.finditer(text):
+            bare = CONTINUATION.match(span.group(1).strip())
+            if bare is None:
+                continue
+            preceding = [m for m in matches if m.start() < span.start()]
+            if not preceding:
+                self._unattached += 1
+                continue
+            entries.append(
+                (
+                    span.start(),
+                    Anchor(
+                        doc=rel,
+                        line=number,
+                        path=preceding[-1].group("path"),
+                        start=int(bare.group(1)),
+                        end=int(bare.group(2)) if bare.group(2) else None,
+                        continuation=True,
+                    ),
+                    None,
+                )
+            )
+        entries.sort(key=lambda entry: entry[0])
+        return [(anchor, span) for _, anchor, span in entries]
+
     # -- the check -------------------------------------------------------------
 
     def run(self, files: list[Path] | None = None) -> Report:
         report = Report()
+        self._unattached = 0
         # pattern → [has an anchor, has a violation], aggregated over every file it covers.
         ratchet: dict[str, list[bool]] = {pattern: [False, False] for pattern in self.frozen}
         for path in files if files is not None else doc_files(self.root):
@@ -367,15 +467,9 @@ class Checker:
             lines = path.read_text(encoding="utf-8").splitlines()
             here: list[Anchor] = []
             for number, text in enumerate(lines, start=1):
-                for match in ANCHOR.finditer(text):
-                    anchor = Anchor(
-                        doc=rel,
-                        line=number,
-                        path=match.group("path"),
-                        start=int(match.group("start")),
-                        end=int(match.group("end")) if match.group("end") else None,
-                    )
-                    anchor.symbol = symbol_of(text, match.span())
+                for anchor, span in self.anchors_on_line(rel, number, text):
+                    if span is not None:
+                        anchor.symbol = symbol_of(text, span)
                     self._judge(anchor)
                     here.append(anchor)
             if reason is not None:
@@ -388,6 +482,7 @@ class Checker:
                     anchor.verdict = "frozen"
                     anchor.detail = reason
             report.anchors.extend(here)
+        report.unattached = self._unattached
         # The ratchet. An entry whose files no longer carry a single anchor names a
         # record that is gone or emptied, so the exemption must go with it. An entry
         # whose anchors all happen to resolve today is *reported* (``unused_frozen``)
@@ -458,7 +553,8 @@ def print_list(report: Report) -> None:
         target = anchor.target or anchor.path
         rng = f"{anchor.start}-{anchor.end}" if anchor.end is not None else str(anchor.start)
         symbol = f" `{anchor.symbol}`" if anchor.symbol else ""
-        print(f"{anchor.where()} → {target}:{rng} [{anchor.verdict}]{symbol}")
+        bare = " (bare continuation)" if anchor.continuation else ""
+        print(f"{anchor.where()} → {target}:{rng} [{anchor.verdict}]{symbol}{bare}")
 
 
 def summarize(report: Report, strict_symbols: bool) -> None:
@@ -468,8 +564,10 @@ def summarize(report: Report, strict_symbols: bool) -> None:
     ambiguous = report.count("ambiguous")
     checked = total - frozen - external - ambiguous
     notes = report.count("symbol-far") + report.count("symbol-foreign")
+    continuations = sum(1 for a in report.anchors if a.continuation)
     print(
-        f"check_doc_line_anchors: {total} anchors · {frozen} frozen · {external} external · "
+        f"check_doc_line_anchors: {total} anchors ({continuations} bare continuations, "
+        f"{report.unattached} unattached) · {frozen} frozen · {external} external · "
         f"{ambiguous} ambiguous · {checked} checked · {notes} symbol notes"
     )
     for pattern, reason in report.stale_frozen:
@@ -677,7 +775,86 @@ def selftest() -> int:
         "a stale frozen entry must fail the run",
     )
 
-    # 7. The exit codes, end to end.
+    # 7. The bare `:NNN` continuation (#355). It attaches to the nearest preceding
+    #    `path.ext:NNN` on the same line and is range-checked against that file.
+    report = _run_case({"docs/cont.md": f"See {GOOD_ANCHOR}, tail `:30`.\n"})
+    expect(
+        _verdicts(report, "docs/cont.md") == ["ok", "ok"],
+        "a continuation in range passes against the file its anchor names",
+    )
+    report = _run_case({"docs/cont.md": f"See {GOOD_ANCHOR}, tail `:999`.\n"})
+    expect(
+        _verdicts(report, "docs/cont.md") == ["ok", "out-of-range"],
+        "an out-of-range continuation must fail",
+    )
+    cont = [a for a in report.anchors if a.doc == "docs/cont.md" and a.continuation]
+    expect(len(cont) == 1, "the bare span is reported as one continuation")
+    expect(cont and cont[0].shown() == ":999", "the continuation reports its bare written form")
+    expect(
+        cont and cont[0].target == "src/thing.rs",
+        "the continuation is judged against the preceding anchor's resolved file",
+    )
+    expect(
+        _exit_code({"docs/cont.md": f"See {GOOD_ANCHOR}, tail `:999`.\n"}) == 1,
+        "a bad continuation fails the run",
+    )
+
+    # 7b. The window is the doc line, and it is one-directional: the nearest anchor
+    #     *before* the span on the same line, never one on the next line and never one
+    #     after it (that anchor names another file).
+    report = _run_case(
+        {"docs/edge.md": f"{GOOD_ANCHOR} on one line.\n\nA bare `:999` on the next line.\n"}
+    )
+    expect(
+        _verdicts(report, "docs/edge.md") == ["ok"],
+        "a continuation on the next line is outside the window and stays silent",
+    )
+    expect(report.unattached == 1, "the silent span is counted, so the boundary is visible")
+    report = _run_case({"docs/edge.md": f"A bare `:999` precedes {GOOD_ANCHOR} on its line.\n"})
+    expect(
+        _verdicts(report, "docs/edge.md") == ["ok"],
+        "a continuation before every anchor on its line stays silent",
+    )
+    expect(report.unattached == 1, "the preceding-only count is reported")
+    report = _run_case({"docs/edge.md": "A bare `:999` stands alone.\n"})
+    expect(_verdicts(report, "docs/edge.md") == [], "a line with no anchor carries no anchor")
+    expect(report.unattached == 1, "a line with no anchor still counts its silent span")
+
+    # 7c. Two path candidates on one line: each continuation follows the *nearest*
+    #     preceding anchor, so the second one is judged against two-line `other.rs`
+    #     (out of range) and not against the 61-line `thing.rs` (which would pass).
+    report = _run_case(
+        {"docs/two.md": "`src/thing.rs:21` then `:30`; `src/other.rs:1` then `:2`.\n"}
+    )
+    expect(
+        _verdicts(report, "docs/two.md") == ["ok", "ok", "ok", "out-of-range"],
+        "each continuation attaches to its own nearest preceding anchor",
+    )
+
+    # 7d. The frozen-plan case: a per-ticket record keeps its text, so its bare
+    #     continuations are exempt by the same lookup as its path anchors — and they
+    #     count as violations for the ratchet, so the exemption is not reported unused.
+    plan = {"docs/ARCHITECTURE-EXECUTION-PLAN.md": "per-ticket history of a past revision"}
+    report = _run_case(
+        {"docs/ARCHITECTURE-EXECUTION-PLAN.md": f"See {GOOD_ANCHOR}, `:999`.\n"}, plan
+    )
+    expect(
+        _verdicts(report, "docs/ARCHITECTURE-EXECUTION-PLAN.md") == ["frozen", "frozen"],
+        "a continuation in a frozen record is exempt like its path anchor",
+    )
+    expect(not report.violations(False), "a frozen continuation must not fail the run")
+    expect(not report.stale_frozen, "the entry still covers anchors, so it is not stale")
+    expect(not report.unused_frozen, "the frozen entry covers a real continuation violation")
+    expect(
+        _exit_code(
+            {"docs/ARCHITECTURE-EXECUTION-PLAN.md": f"See {GOOD_ANCHOR}, `:999`.\n"},
+            frozen=plan,
+        )
+        == 0,
+        "the real frozen pattern makes a bad continuation pass",
+    )
+
+    # 8. The exit codes, end to end.
     expect(
         _exit_code({"docs/bad.md": "See `src/thing.rs:999`.\n"}) == 1,
         "exit 1 when an anchor is bad",
