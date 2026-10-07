@@ -53,7 +53,7 @@ Each step appends its dated record here when it lands (gates run, counts, box la
    **Step 5 pre-analysis (2026-10-05, on `4900298`) — no `common` module yet, and the Linux half owes
    none.** The candidate's three halves: the **type** (`allocplan::DeviceMemory`,
    `src/graph/allocplan.rs:67`) and the pure **policy** (`budget_decision`/`weight_budget`,
-   `allocplan.rs:124` + `graph/offload.rs:310`, with callers in `graph/alloc.rs:889/907` and both
+   `allocplan.rs:124` + `graph/offload.rs:310`, with callers in `graph/alloc.rs:889/908` and both
    loaders) are **already device-agnostic and CI-tested**; the **device answer** has exactly **one**
    implementation (`CudaState::device_memory()`, `src/cuda/methods/accounting.rs:31`, reached through
    the CUDA-only resolver `models::device_memory()` at `src/models/mod.rs:74`, 3 call sites), and no

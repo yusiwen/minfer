@@ -95,7 +95,7 @@ and mostly *enabled* by fixing (1) and (2) first.
 Compute graph (build → assign → fuse → alloc → execute) with params-only reuse
 (`graph/cache.rs:47`, `graph/params.rs:51`); per-op backend assignment
 (`graph/scheduler.rs:60`); liveness allocator with persistent per-layer KV
-regions (`graph/alloc.rs:165`, `:384`); eight quantized weight types
+regions (`graph/alloc.rs:165`, `:385`); eight quantized weight types
 (`Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K`) on CPU + Metal + CUDA; two model
 families (`qwen2`, `qwen3` dense); GGUF v3 with split parts and Metal zero-copy
 mmap; self-contained BPE tokenizer; chat templates via minijinja;
@@ -454,7 +454,7 @@ KV-session file-format contract, and the name-keyed registry carries each backen
 priority, capability matrix and pool hooks; consumers read it instead of matching.
 Before F4 the enum was matched in `GraphAllocator::supports`
 (`alloc.rs:141-158`), `alloc_in_pool`/`alloc_fresh_in`/`free_in_pool`
-(`:314-380`), `sync_backend` (`:559-579`), `copy_across` (`:592-653`), and the
+(`:315-381`), `sync_backend` (`:560-580`), `copy_across` (`:593-654`), and the
 scheduler's execute match (`scheduler.rs:274-292`) — nine `#[cfg]`-laden match
 sites, each of which had to be taught about a new backend.
 
@@ -752,7 +752,7 @@ behavioural defects found while executing the plan, already fixed.
    producing two host round trips per layer (§2.2). `ARCHITECTURE.md:391-393`
    advertises both styles as available.
 7. **Stale `unreachable!("CUDA pool not implemented")`** in the non-CUDA arms
-   (`alloc.rs:333`, `:356`) — misleading text in a live panic path.
+   (`alloc.rs:333`, `:357`) — misleading text in a live panic path.
 8. ~~**Dead fields in the reuse identity**: `CParams.n_batch` and
    `GraphParams.n_seqs` are compared by `params_match` (`cache.rs:57-64`) but no
    builder reads them; every construction site hard-codes 1 / `n_tokens`.~~
@@ -761,7 +761,7 @@ behavioural defects found while executing the plan, already fixed.
    decision lives in `CParams.explicit_span`), with
    `sequence_count_is_data_not_topology` pinning that a sequence-count change no
    longer rebuilds an otherwise identical graph.
-9. ~~**Single-entry cross-backend staging** (`alloc.rs:34`, `:645`), mitigated by
+9. ~~**Single-entry cross-backend staging** (`alloc.rs:34`, `:646`), mitigated by
    the consumer-side filter at `scheduler.rs:252-255`.~~ **Fixed in A5** — keyed
    by `(node, dst_backend)`; two foreign consumers can now be served.
 10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:1403-1408`), so the
