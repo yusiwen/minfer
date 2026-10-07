@@ -111,7 +111,7 @@ Three rules decide whether any node runs on Metal, all resolved **before the gra
 2. **Metal is enabled only if the whole model made it to the GPU.** The gate (`models/qwen2/graph.rs:630`, §3.2.6) requires *every* weight the graph reads — embeddings, all 28+ layer weights and biases, norms, lm_head — to be registered in the Metal registry (`has_weight`). One missing tensor ⇒ `metal_on = false` ⇒ the entire graph runs on CPU. This is the **all-weights-registered gate**: all-or-nothing participation, never a partial run where some layers are on the GPU and some on the CPU (which would be correct-but-mysterious; a split boundary per layer would also hammer the sync path).
 3. **Participation is part of graph identity.** The gate's outcome is recorded in `CParams.gpu` (`graph/params.rs:27`), and `GraphParams` is the *only* thing graph reuse compares (doc 13). So "was the GPU on" is baked into the cached graph: a change (MPS unavailable, weights not registered) changes `CParams.gpu`, fails `try_reuse`, and forces a rebuild with the new assignment — rather than silently reusing a graph whose backend assignments no longer hold.
 
-And the failure posture, which the repo treats as a hard rule: **kernel-invariant violations return `Err` from `execute_node` — never a silent CPU fallback.** If a weight is somehow not registered when a matmul executes, the arm returns `Err("weight '...' not on GPU")` and the run aborts with that message; if an op reaches the Metal arm that `supports_op` rejected, the arm returns `Err` too (`metal_backend.rs:986-994`). The reasoning (`GPU_SAFETY.md` §2.3): a silent fallback *masks* a broken invariant — the model would keep producing text while the user has no idea half the graph silently ran somewhere else, or that a shape assumption was violated. Loud failure at the offending node is debuggable; quiet degradation is not. (Frontier guards that sit *below* the graph layer — dispatch-time checks like `gpu_abort` for device-limit overruns — print the actual values and exit, for the same reason.)
+And the failure posture, which the repo treats as a hard rule: **kernel-invariant violations return `Err` from `execute_node` — never a silent CPU fallback.** If a weight is somehow not registered when a matmul executes, the arm returns `Err("weight '...' not on GPU")` and the run aborts with that message; if an op reaches the Metal arm that `supports_op` rejected, the arm returns `Err` too (`metal_backend.rs:987-995`). The reasoning (`GPU_SAFETY.md` §2.3): a silent fallback *masks* a broken invariant — the model would keep producing text while the user has no idea half the graph silently ran somewhere else, or that a shape assumption was violated. Loud failure at the offending node is debuggable; quiet degradation is not. (Frontier guards that sit *below* the graph layer — dispatch-time checks like `gpu_abort` for device-limit overruns — print the actual values and exit, for the same reason.)
 
 ## 3. Implementation
 
@@ -253,7 +253,7 @@ The recycle logic is an exact-size free-list search: reuse any dead buffer whose
 
 #### 3.2.4 `execute_node`: the dispatch arms
 
-`execute_node` (`metal_backend.rs:316-996`) is a 680-line `match &node.op`, and every arm follows the same rhythm: resolve metadata → look up weights by name → **encode** one or two kernel launches into `cb` → `Ok(())`. Nothing waits; the submit happens at the split boundary. The `MatMul` arm is the cleanest example:
+`execute_node` (`metal_backend.rs:316-997`) is a 680-line `match &node.op`, and every arm follows the same rhythm: resolve metadata → look up weights by name → **encode** one or two kernel launches into `cb` → `Ok(())`. Nothing waits; the submit happens at the split boundary. The `MatMul` arm is the cleanest example:
 
 ```rust
 // src/graph/metal_backend.rs:468-497
@@ -523,7 +523,7 @@ At forward time, before the graph is built or reused, the model asks a yes/no qu
         let cuda_on = false;
 ```
 
-`metal_available()` (`metal_backend.rs:1030-1032`) is just `MpsState::get().is_some()` — device present, not disabled. `weights_on_gpu` (`:628-677`) is the gate itself: it enumerates *every* tensor name the graph will read (embedding, output norm, lm_head, output bias, then per layer the norm, `wq/bq/wk/bk/wv/bv/wo`, the FFN norm, `ffn_gate/ffn_up/ffn_down`) and requires all of them in the Metal registry:
+`metal_available()` (`metal_backend.rs:1031-1033`) is just `MpsState::get().is_some()` — device present, not disabled. `weights_on_gpu` (`:628-677`) is the gate itself: it enumerates *every* tensor name the graph will read (embedding, output norm, lm_head, output bias, then per layer the norm, `wq/bq/wk/bk/wv/bv/wo`, the FFN norm, `ffn_gate/ffn_up/ffn_down`) and requires all of them in the Metal registry:
 
 ```rust
 // src/models/qwen2/graph.rs:665-671 (tail of weights_on_gpu)
@@ -583,7 +583,7 @@ Now assemble §2.4's rhythm from both sides. The scheduler's `execute` (`schedul
             }
 ```
 
-Step 1 is the command buffer's submit: `sync_backend` (`alloc.rs:542-562`) routes to `MetalBackend::synchronize`, which is one line — `self.submit_pending()` (`metal_backend.rs:1023-1025`). Step 2 is the cross-backend copy of §2.2 (host round trip through the shared buffers, into a fresh staging buffer so the producer's own buffer is untouched for the graph's re-executability). On a fully-Metal graph there is one split, so this `if` never fires mid-graph — but the *final* sync after the loop (`:348-352`) always does, which is where the decode forward's single submit lands. If any node's buffer turned out to live on a different backend than the split executing it, the scheduler returns a hard `Err` ("assignment/alloc mismatch", `:234-241`) — the same no-silent-fallback posture, one level up.
+Step 1 is the command buffer's submit: `sync_backend` (`alloc.rs:542-562`) routes to `MetalBackend::synchronize`, which is one line — `self.submit_pending()` (`metal_backend.rs:1024-1026`). Step 2 is the cross-backend copy of §2.2 (host round trip through the shared buffers, into a fresh staging buffer so the producer's own buffer is untouched for the graph's re-executability). On a fully-Metal graph there is one split, so this `if` never fires mid-graph — but the *final* sync after the loop (`:348-352`) always does, which is where the decode forward's single submit lands. If any node's buffer turned out to live on a different backend than the split executing it, the scheduler returns a hard `Err` ("assignment/alloc mismatch", `:234-241`) — the same no-silent-fallback posture, one level up.
 
 The submit itself (`metal_backend.rs:160-186`) takes the leaked box back, calls `cb.submit()`, and — under `MINFER_OP_PROFILE=1` — accumulates the GPU wait time that §4's profile table prints. The `Drop` impl does the same flush best-effort (`let _ = cb.submit()`) so a backend dropped mid-split cannot leak an unterminated encoder.
 
@@ -639,7 +639,7 @@ Walk it as three defenses. **(1) A completion handler on a semaphore**: `addComp
 #### 3.2.11 Host read/write: views, plus the readback that feeds the sampler
 
 ```rust
-// src/graph/metal_backend.rs:998-1021
+// src/graph/metal_backend.rs:999-1022
     fn read_host(&self, id: usize) -> Option<&[f32]> {
         let buf = self.pool.get(id)?;
         let len = (buf.length() as usize) / 4;
@@ -804,7 +804,7 @@ With 256 threads (8 simdgroups), one `simd_sum` is no longer enough: each simdgr
 
 - **Quant-shape assumptions get refused, not absorbed.** The K-quant `id % 256` guard (§3.2.4, audit M1) exists because the failure mode is *wrong numbers, no crash* — the worst kind. The same audit table accepts genuinely low-risk gaps with reasoning (L1: matmul pointers computed past the buffer for out-of-range rows but reads guarded; L2: `store_kv` trusts the host to keep positions < capacity, which doc 07's region sizing guarantees). Every accepted risk is written down with its mitigation — the audit doc is the invariant ledger.
 
-- **The registry and the graph must agree on shapes.** `FusedQkvNorm`'s per-head norms assume the concat layout (`q` at byte 0, `k` at `nqt*4` — `metal_backend.rs:906-911`); `attn_bias_rope_store` assumes the same packing; the f16 KV kernels assume the region's first half is theirs (§3.1). These cross-file layout contracts are exactly where doc 10's lesson applies: they are tested with real-scale isolation tests (`metal_attn_kv_real_scale`, `metal_store_real_dims`, … — the `#[cfg(test)]` module at `metal_backend.rs:1035`), not just small shapes, because the transposed-output bug of doc 10 hid from `nt == 1` tests.
+- **The registry and the graph must agree on shapes.** `FusedQkvNorm`'s per-head norms assume the concat layout (`q` at byte 0, `k` at `nqt*4` — `metal_backend.rs:906-911`); `attn_bias_rope_store` assumes the same packing; the f16 KV kernels assume the region's first half is theirs (§3.1). These cross-file layout contracts are exactly where doc 10's lesson applies: they are tested with real-scale isolation tests (`metal_attn_kv_real_scale`, `metal_store_real_dims`, … — the `#[cfg(test)]` module at `metal_backend.rs:1036`), not just small shapes, because the transposed-output bug of doc 10 hid from `nt == 1` tests.
 
 - **A shader typo must fail at startup, not at token 500.** §3.2.6's pipeline table makes every kernel name a startup-checked fact; the `metal_pipelines_compile` test pins it in CI. The Q5_0 incident (2026-08-06) — a duplicate symbol that silently downgraded the process to CPU and "looked like GPU throttling" — is the reason this is treated as an invariant rather than an annoyance.
 
