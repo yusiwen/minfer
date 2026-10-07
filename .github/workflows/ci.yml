@@ -324,6 +324,14 @@ jobs:
         run: python3 scripts/check_f6_fixtures.py --check
       - name: The F6 fixture verifier's own pass/fail cases
         run: python3 scripts/check_f6_fixtures.py --selftest
+      # #345: a recorded producer command that cannot be re-run is a dead record,
+      # so the manifest has to keep one runnable command per entry (S7 of
+      # `--check`). This job has no fixture cache, no built `minfer` and no
+      # `llama-quantize`, so the dry run only classifies — RUN, or REFUSED with
+      # the reason — and writes nothing; the refusals it prints here are the
+      # honest per-box answer, not a failure.
+      - name: The F6 producers must stay re-runnable (dry run)
+        run: python3 scripts/check_f6_fixtures.py --regenerate --dry-run
       # Same toolchain as Docs (`.github/workflows/docs.yml`), so the gate builds the
       # book the site actually ships: mdBook 0.4.37 because 0.5 changed the
       # preprocessor protocol, and mdbook-mermaid 0.13.0 because it only understands

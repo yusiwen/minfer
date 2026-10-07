@@ -47,6 +47,14 @@ verbatim; a directory must prefix some entry), and every ``.gguf`` path a
 ``producer`` command names is an entry. A gate that grows a new fixture, or a
 recipe that gains a step, cannot silently leave the record behind.
 
+``S7`` every ``producer`` that *is* a command runs the program its
+``producer_kind`` names and **writes the entry's own path**: a ``minfer``
+producer whose argv is a ``llama-quantize`` invocation, or one that writes
+somewhere else under the cache root, is a record that cannot be re-run. A
+``producer`` that is not a command (a bare ``unrecorded …`` note) must carry a
+``producer_note``. That is the shape ``--regenerate`` relies on, and unlike the
+rest of the manifest it needs no bytes — so CI pins it.
+
 ``S6`` every path whose record includes a ``llama-quantize`` entry has **exactly
 one** entry marked ``authoritative_reference``, it is a ``llama-quantize`` entry
 built with ``-ffp-contract=fast``, and the field appears nowhere else. That entry
@@ -69,11 +77,53 @@ the form the issue's tamper check uses.
 **Honest limits.** This checks *content*, not truth: a manifest entry whose
 recorded digest is wrong is accepted, because nothing else recorded those bytes.
 The ``--verify`` half needs the cache, so CI (which has none) covers only
-``--check`` and ``--selftest``; the F6 gates verify the fixtures they resolve
-through ``src/tooling/tests/f6_fixtures.rs``, which is where a tampered cache
-stops a run that CI cannot reach. A prefix-only entry can be defeated by a
-1-in-2**32 collision — re-capturing the full digest is the fix, and the 11
-entries that need it say so.
+``--check``, ``--selftest`` and ``--regenerate --dry-run``; the F6 gates verify
+the fixtures they resolve through ``src/tooling/tests/f6_fixtures.rs``, which is
+where a tampered cache stops a run that CI cannot reach. A prefix-only entry can
+be defeated by a 1-in-2**32 collision — re-capturing the full digest is the fix,
+and the 11 entries that need it say so.
+
+``--regenerate`` (issue #345) makes the recipe runnable instead of hand-run:
+rather than ``--verify`` merely *checking* the cached bytes against the record, it
+re-runs the recorded ``producer`` command for the selected entries and re-records
+the content identity (``sha256``, ``bytes``, ``date``) from what the run wrote.
+The mode is a **verification gate first**:
+
+* the producer program must be present here — the recorded command's program
+  (``minfer``, resolved from ``PATH`` and then ``./target/release/minfer``;
+  ``curl`` for an ``hf-download`` entry) is looked up before anything runs, and a
+  command that cannot run is **refused by name**, never silently replaced by
+  another producer and never run with a substituted binary;
+* **regenerating a ``llama-quantize`` reference is out of scope** — the
+  byte-parity claim is about one specific compiler's build (§4.2.1), and this mode
+  refuses such an entry naming the ``llamacpp_binary`` it records (and whether
+  that binary exists here). It must be re-run on the box that records it, with
+  that build;
+* the run's content must **match the record**: a produced digest that equals an
+  entry's full ``sha256`` re-records that entry (the date of the reproducing run;
+  nothing else changes) and is idempotent — a second run the same day writes
+  nothing. A produced digest that matches **no** recorded content for the path is
+  a **finding**, not an update (exit 1): the record's producer no longer
+  reproduces the record. When the entry names a producer identity (``minfer_commit``)
+  that differs from what runs here the run is **refused** naming both commits and
+  both digests, because the run is not the producer the entry names — that is the
+  cross-box/cross-commit case, and recording it needs the identity field moved by
+  hand first;
+* it writes **only** ``sha256``/``bytes``/``date``: the ``authoritative_reference``
+  mark, the producer command and every identity field are left exactly as they
+  were, so the mode can neither invent provenance nor move the content the
+  byte-parity claim is asserted against. Every write is printed, and the manifest
+  is re-validated (``S1``-``S7``) after the write;
+* the existing cache file is moved aside (``<path>.regen-before``, a rename, so no
+  second copy is made) before the producer runs; a finding, a refusal after a run
+  or a producer failure restores it and keeps the rejected content at
+  ``<path>.regen-rejected``, so a rejected run cannot destroy a fixture the gates
+  need.
+
+``--dry-run`` classifies every selected entry without running anything — ``RUN``
+with the ``~``-expanded command, or ``REFUSED`` with the reason — which is what CI
+runs: a manifest whose command has the wrong shape, or whose producer is a
+program this mode does not know, fails it.
 
 Usage::
 
@@ -83,17 +133,29 @@ Usage::
     python3 scripts/check_f6_fixtures.py --file /tmp/x.gguf         # one file
     python3 scripts/check_f6_fixtures.py --selftest                 # the checker's own cases
 
-Exit codes: 0 clean, 1 violations, 2 usage or I/O error.
+    # #345: re-run a recorded producer and re-record the content identity
+    python3 scripts/check_f6_fixtures.py --regenerate --dry-run     # CI: classify, run nothing
+    python3 scripts/check_f6_fixtures.py --regenerate --only qwen2.5-0.5b-instruct-f32.gguf
+    python3 scripts/check_f6_fixtures.py --regenerate --box 'dgxspark (aarch64, GB10 sm_121)'
+
+Exit codes: 0 clean, 1 violations (a --regenerate finding, or a producer failure),
+2 usage or I/O error, 3 refused (a --regenerate target whose producer cannot run
+here, or a --strict-runnable dry run that has one).
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import datetime
 import hashlib
+import io
 import json
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -118,6 +180,20 @@ REQUIRED_BY_KIND = {
 #: Fields a `llama-quantize` entry may claim for `-ffp-contract`. Only these two
 #: are meaningful: the flag is either on (GCC's default) or off.
 FFP_CONTRACTS = ("fast", "off")
+
+#: The program each `producer_kind`'s recorded command must run (S7). The
+#: basename is compared, so `minfer` and `./target/release/minfer` are the same
+#: producer while a `minfer`-kind entry that records a `llama-quantize` command is
+#: rejected. `--regenerate` resolves the same three programs.
+PRODUCER_PROGRAM = {
+    "minfer": ("minfer",),
+    "llama-quantize": ("llama-quantize",),
+    "hf-download": ("curl",),
+}
+
+#: The subcommands a recorded `minfer` producer may name (`--regenerate` runs the
+#: command verbatim; this list only lets the argument parser find the output path).
+MINFER_SUBCOMMANDS = ("convert", "quantize", "split")
 
 #: Keys an entry may carry — an allowlist, so a typo (`minfercommit`) is a
 #: failure instead of a silently absent identity.
@@ -264,6 +340,110 @@ def check_entry(path: Path, i: int, e: dict, problems: list[str]) -> None:
                 problems.append(f"{where}: also_on[{j}] box {a['box']!r} is a relative label")
 
 
+def split_command(text: str) -> list[str] | None:
+    """The argv of a recorded producer, or ``None`` when the text is not a command.
+
+    ``None`` is the honest answer for ``unrecorded (byte-identical to …)``: an
+    absent command is a gap the record has to admit, not one to guess at.
+    """
+    try:
+        argv = shlex.split(text)
+    except ValueError:
+        return None
+    return argv or None
+
+
+def output_path(argv: list[str]) -> str | None:
+    """The path a recorded producer command writes, or ``None`` if unreadable.
+
+    The rules are per program, because the recorded shapes are
+    ``minfer convert|quantize|split IN OUT [--flag VALUE]`` (the subcommand is not
+    a filename), ``llama-quantize [--pure] IN OUT TYPE`` and ``curl [-sL] -o OUT
+    URL``. A shape the rules do not cover returns ``None`` — never a guess.
+    """
+    prog = os.path.basename(argv[0])
+    args = argv[1:]
+    if prog == "curl":
+        for i, a in enumerate(args):
+            if a == "-o" and i + 1 < len(args):
+                return args[i + 1]
+        return None
+    if prog == "minfer":
+        if not args or args[0] not in MINFER_SUBCOMMANDS:
+            return None
+        positional: list[str] = []
+        skip_value = False
+        for a in args[1:]:
+            if skip_value:
+                skip_value = False
+                continue
+            if a.startswith("--"):
+                # `--flag=value` carries its own value; `--flag value` does not.
+                skip_value = "=" not in a
+                continue
+            if a.startswith("-"):
+                continue
+            positional.append(a)
+        return positional[1] if len(positional) > 1 else None
+    if prog == "llama-quantize":
+        positional = [a for a in args if not a.startswith("-")]
+        return positional[1] if len(positional) > 1 else None
+    return None
+
+
+def expand_path_token(token: str, old_root: Path | None, new_root: Path | None) -> str:
+    """``~``-expand a recorded path, relocating the cache root when asked.
+
+    ``MINFER_F6_CACHE``/``--root`` relocate the cache for an experiment (the
+    docstring of the checker says so), so a command that names the recorded cache
+    root has to follow it — and only that prefix, never a bare path rewrite.
+    """
+    p = os.path.expanduser(token)
+    if old_root is not None and new_root is not None and old_root != new_root:
+        op, np_ = str(old_root), str(new_root)
+        if p == op:
+            return np_
+        if p.startswith(op + os.sep):
+            return np_ + p[len(op):]
+    return p
+
+
+def check_command_shape(
+    manifest: Path, i: int, e: dict, cache_root: str | None, problems: list[str]
+) -> None:
+    """``S7``: the producer command runs the kind's program and writes the entry."""
+    where = f"{manifest}: entries[{i}]"
+    p = e.get("path")
+    if not isinstance(p, str) or not p:
+        return
+    where = f"{manifest}: {p}"
+    argv = split_command(str(e.get("producer", "")))
+    out = output_path(argv) if argv else None
+    if out is None:
+        if not e.get("producer_note"):
+            problems.append(
+                f"{where}: the producer is not a runnable command and carries no producer_note "
+                "— a record that cannot be re-run has to say why"
+            )
+        return
+    prog = os.path.basename(argv[0])
+    allowed = PRODUCER_PROGRAM.get(e.get("producer_kind"), ())
+    if prog not in allowed:
+        problems.append(
+            f"{where}: producer_kind {e.get('producer_kind')!r} runs {prog!r}; the recorded "
+            f"command must run {' or '.join(allowed)} (S7)"
+        )
+    if not isinstance(cache_root, str) or not cache_root:
+        return
+    expected = os.path.normpath(os.path.join(os.path.expanduser(cache_root), p))
+    actual = os.path.normpath(os.path.expanduser(out))
+    if actual != expected:
+        problems.append(
+            f"{where}: the recorded command writes {out!r}, not the entry's own path — the "
+            "record and the producer disagree about the output (S7)"
+        )
+
+
 def check_manifest(path: Path, doc: dict) -> list[str]:
     """``S2``-``S5``: every invariant the manifest alone can carry."""
     problems: list[str] = []
@@ -272,6 +452,8 @@ def check_manifest(path: Path, doc: dict) -> list[str]:
         return [f"{path}: entries must be a list"]
     for i, e in enumerate(entries):
         check_entry(path, i, e, problems)
+        if isinstance(e, dict):
+            check_command_shape(path, i, e, doc.get("cache_root"), problems)
     # S3 + duplicate identities.
     by_path: dict[str, list[dict]] = {}
     for e in entries:
@@ -526,6 +708,302 @@ def verify_cache(
 
 
 # --------------------------------------------------------------------------- #
+# --regenerate: re-run a recorded producer and re-record the content identity
+# --------------------------------------------------------------------------- #
+
+def resolve_program(program: str, repo_root: Path) -> str | None:
+    """The executable a recorded command names, or ``None`` when it is not here.
+
+    A program with a path separator is resolved against the repository root (that
+    is where ``./target/release/minfer`` lives), a bare one against ``PATH``, and
+    ``minfer`` falls back to the repo's own release binary. There is deliberately
+    **no fallback between producers**: a missing ``llama-quantize`` is a refusal,
+    never a reason to run ``minfer`` instead.
+    """
+    raw = os.path.expanduser(program)
+    if os.sep in raw:
+        cand = Path(raw) if os.path.isabs(raw) else repo_root / raw
+        return str(cand) if cand.is_file() and os.access(cand, os.X_OK) else None
+    found = shutil.which(raw)
+    if found:
+        return found
+    if raw == "minfer":
+        cand = repo_root / "target" / "release" / "minfer"
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
+def program_candidates(program: str, repo_root: Path) -> str:
+    """Where :func:`resolve_program` looked — the refusal names the missing binary."""
+    raw = os.path.expanduser(program)
+    if os.sep in raw:
+        cand = Path(raw) if os.path.isabs(raw) else repo_root / raw
+        return f"looked for {cand}"
+    if raw == "minfer":
+        return f"looked for `minfer` on PATH and at {repo_root / 'target' / 'release' / 'minfer'}"
+    return f"looked for `{raw}` on PATH"
+
+
+def running_minfer_commit(repo_root: Path, env: dict) -> str | None:
+    """The minfer commit that runs here: ``MINFER_F6_COMMIT``, else the tree's HEAD."""
+    override = env.get("MINFER_F6_COMMIT")
+    if override:
+        return override.strip() or None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = proc.stdout.strip()
+    return out if proc.returncode == 0 and out else None
+
+
+def recorded_commit(entry: dict) -> tuple[str | None, str]:
+    """``(sha or None, the raw field)`` for an entry's recorded minfer commit.
+
+    ``None`` means the entry admits the gap (``unrecorded (2026-09-27 producer)``):
+    there is no identity to check the run against, which is why a differing
+    content is then an unexcused finding rather than a producer-version one.
+    """
+    raw = str(entry.get("minfer_commit", ""))
+    if not raw or UNRECORDED.search(raw):
+        return None, raw
+    m = re.search(r"[0-9a-f]{7,40}", raw)
+    return (m.group(0) if m else None), raw
+
+
+def commits_agree(a: str, b: str) -> bool:
+    return a.startswith(b) or b.startswith(a)
+
+
+def restore_fixture(out_path: Path, backup: Path, rejected: Path) -> None:
+    """Put the pre-run content back, keeping the rejected bytes beside it."""
+    if out_path.exists():
+        if rejected.exists():
+            rejected.unlink()
+        os.replace(out_path, rejected)
+    if backup.exists():
+        os.replace(backup, out_path)
+
+
+def regenerate(
+    doc: dict,
+    manifest_path: Path,
+    cache_root: Path,
+    repo_root: Path,
+    only: str | None = None,
+    box: str | None = None,
+    dry_run: bool = False,
+    strict_runnable: bool = False,
+    running_commit: str | None = None,
+    today: str | None = None,
+) -> int:
+    """``--regenerate``: re-run the recorded producers and re-record what they wrote.
+
+    Returns the process exit code (0 clean, 1 a finding or a producer failure,
+    2 usage/I/O, 3 refused). Every write is printed; ``authoritative_reference``,
+    the producer command and every identity field are never touched.
+    """
+    entries = [e for e in doc.get("entries", []) if isinstance(e, dict)]
+    if running_commit is None:
+        running_commit = running_minfer_commit(repo_root, os.environ)
+    if today is None:
+        today = datetime.date.today().isoformat()
+    record_root = Path(os.path.expanduser(doc.get("cache_root") or str(cache_root)))
+
+    selected: list[int] = []
+    for i, e in enumerate(entries):
+        if only is not None:
+            want_path, _, want_box = only.partition("@")
+            if e.get("path") != want_path:
+                continue
+            if want_box and e.get("box") != want_box:
+                continue
+        if box is not None:
+            boxes = [e.get("box")] + [a.get("box") for a in e.get("also_on", [])
+                                      if isinstance(a, dict)]
+            if box not in boxes:
+                continue
+        selected.append(i)
+    if not selected:
+        wanted = f"--only {only}" if only else f"--box {box}"
+        print(f"check_f6_fixtures.py: {wanted} matches no manifest entry", file=sys.stderr)
+        return 2
+
+    # One producer command per path: the entries of a recorded divergence share
+    # the command and can only be told apart by the content the run produced.
+    groups: dict[str, list[int]] = {}
+    for i in selected:
+        groups.setdefault(entries[i]["path"], []).append(i)
+
+    runs = refusals = findings = changes = 0
+    for path, idxs in groups.items():
+        first = entries[idxs[0]]
+        argv = split_command(str(first.get("producer", "")))
+        if not argv or output_path(argv) is None:
+            refusals += 1
+            print(f"REFUSED  {path}: the producer is not a recorded command "
+                  f"({first.get('producer')!r}) — there is nothing to run here")
+            continue
+        prog = os.path.basename(argv[0])
+        kind = first.get("producer_kind")
+        if prog not in PRODUCER_PROGRAM.get(kind, ()):
+            refusals += 1
+            print(f"REFUSED  {path}: producer_kind {kind!r} records a {prog!r} command "
+                  "(S7: the record and the producer disagree)")
+            continue
+        if any(not entries[i].get("sha256") for i in idxs):
+            refusals += 1
+            print(f"REFUSED  {path}: an entry records only a truncated digest "
+                  "(sha256_prefix), so the run cannot be verified against it — re-capture the "
+                  "full digest first")
+            continue
+        if kind == "minfer":
+            blocked = False
+            for i in idxs:
+                sha, raw = recorded_commit(entries[i])
+                if sha and running_commit and not commits_agree(sha, running_commit):
+                    refusals += 1
+                    blocked = True
+                    print(
+                        f"REFUSED  {path} [{entries[i].get('box')}]: the entry names minfer "
+                        f"commit {raw!r} but {running_commit} is what runs here — this run is not "
+                        "the producer the entry names, so its bytes cannot be recorded against "
+                        f"it; re-record the identity by hand first, or select the content you can "
+                        f"verify with --only '{path}@{entries[i].get('box')}'"
+                    )
+            if blocked:
+                continue
+        if kind == "llama-quantize":
+            binary = os.path.expanduser(str(first.get("llamacpp_binary") or prog))
+            refusals += 1
+            here = "is present here" if resolve_program(binary, repo_root) else "is not present here"
+            print(f"REFUSED  {path}: the producer is a llama.cpp build ({binary}), which {here} — "
+                  f"recorded on {first.get('box')}; regenerating a llama.cpp reference is out of "
+                  "scope (docs/GGUF-TOOLING.md §4.2.2), because the byte-parity claim is about that "
+                  "one compiler's build: re-run it on that box and record the digest by hand")
+            continue
+
+        resolved = resolve_program(argv[0], repo_root)
+        if resolved is None:
+            refusals += 1
+            print(f"REFUSED  {path}: the producer program {argv[0]!r} is not present here "
+                  f"({program_candidates(argv[0], repo_root)}) — it cannot run on this box; build "
+                  f"it (`cargo build --release`) or run the producer on {first.get('box')}")
+            continue
+
+        run_argv = [resolved] + [expand_path_token(a, record_root, cache_root) for a in argv[1:]]
+        out_path = Path(expand_path_token(output_path(argv), record_root, cache_root))
+        backup = out_path.with_name(out_path.name + ".regen-before")
+        rejected = out_path.with_name(out_path.name + ".regen-rejected")
+        if dry_run:
+            runs += 1
+            print(f"RUN      {path} [{first.get('box')}]\n         "
+                  f"{' '.join(shlex.quote(a) for a in run_argv)}")
+            continue
+
+        had_file = out_path.is_file()
+        runs += 1
+        if had_file:
+            try:
+                if backup.exists():
+                    backup.unlink()
+                os.replace(out_path, backup)
+            except OSError as exc:
+                print(f"check_f6_fixtures.py: {out_path}: cannot move the fixture aside: {exc}",
+                      file=sys.stderr)
+                return 2
+        print(f"RUN      {path} [{first.get('box')}]\n         "
+              f"{' '.join(shlex.quote(a) for a in run_argv)}")
+        try:
+            proc = subprocess.run(run_argv, cwd=str(repo_root), env=os.environ.copy(),
+                                  capture_output=True, text=True)
+        except OSError as exc:
+            proc = None
+            tail = [str(exc)]
+        if proc is None or proc.returncode != 0:
+            code = "?" if proc is None else str(proc.returncode)
+            tail = tail if proc is None else \
+                ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-3:]
+            findings += 1
+            print(f"FAIL     {path}: the recorded producer exited {code}: "
+                  f"{' | '.join(tail) if tail else '(no output)'}")
+            restore_fixture(out_path, backup, rejected)
+            continue
+
+        if not out_path.is_file():
+            findings += 1
+            print(f"FAIL     {path}: the producer exited 0 but wrote no {out_path}")
+            restore_fixture(out_path, backup, rejected)
+            continue
+        actual = sha256_file(out_path)
+        size = out_path.stat().st_size
+        matched = [i for i in idxs if entries[i].get("sha256") == actual]
+        if not matched:
+            elsewhere = [e for e in entries
+                         if e.get("path") == path and e.get("sha256") == actual]
+            findings += 1
+            print(f"FINDING  {path} [{first.get('box')}]: the producer named by the record "
+                  f"produced different content — {actual} ({size} B), against the record's "
+                  f"{expected([entries[i] for i in idxs])}")
+            if elsewhere:
+                print(f"         the run reproduced the content recorded for "
+                      f"{elsewhere[0].get('box')} ({elsewhere[0].get('date')}) instead — a "
+                      "recorded divergence, so its identity, not this entry's, is what ran")
+            at = running_commit or "a commit the record does not name"
+            print(f"         the run was at minfer {at}; the digest is NOT recorded — record the "
+                  "identity and the digest together by hand")
+            restore_fixture(out_path, backup, rejected)
+            continue
+        for i in matched:
+            e = entries[i]
+            new = [("sha256", actual), ("bytes", size), ("date", today)]
+            diffs = [(k, e.get(k), v) for k, v in new if e.get(k) != v]
+            if not diffs:
+                print(f"OK       {path} [{e.get('box')}]: {actual} ({size} B) — the record already "
+                      "holds this content; nothing written")
+                continue
+            for k, _old, v in diffs:
+                e[k] = v
+            changes += 1
+            print(f"RECORD   {path} [{e.get('box')}]: " +
+                  ", ".join(f"{k} {old!r} -> {new_v!r}" for k, old, new_v in diffs))
+        if backup.exists():
+            backup.unlink()
+            print(f"         removed {backup} (byte-identical to the regenerated file)")
+
+    if dry_run:
+        print(f"check_f6_fixtures.py --regenerate --dry-run: {runs} runnable, {refusals} refused "
+              "— nothing was run and nothing was written")
+        return 1 if (strict_runnable and refusals) else 0
+
+    if changes:
+        manifest_path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n",
+                                 encoding="utf-8")
+        reloaded, probs = load_manifest(manifest_path)
+        if reloaded is not None:
+            probs += check_manifest(manifest_path, reloaded)
+        if probs:
+            for p in probs:
+                print(p, file=sys.stderr)
+            print(f"check_f6_fixtures.py: the re-recorded {manifest_path} is not well formed",
+                  file=sys.stderr)
+            return 1
+        print(f"check_f6_fixtures.py --regenerate: wrote {manifest_path} "
+              f"({changes} content identity/identities re-recorded, S1-S7 still clean)")
+    print(f"check_f6_fixtures.py --regenerate: {runs} producer(s) run, {changes} re-recorded, "
+          f"{findings} finding(s), {refusals} refused")
+    if findings:
+        return 1
+    if refusals:
+        return 3
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # --selftest
 # --------------------------------------------------------------------------- #
 
@@ -534,7 +1012,10 @@ def _tiny_manifest(root: Path, sha: str, **over) -> dict:
         "path": "ref/tiny.gguf",
         "bytes": 4,
         "sha256": sha,
-        "producer": "llama-quantize src.gguf ref/tiny.gguf q4_0",
+        # The recorded output path has to be the entry's own (S7), and the input
+        # is outside the cache root so it is not a fixture S5 would ask about.
+        "producer": "llama-quantize /tmp/f6-selftest-src.gguf "
+                    "~/.cache/minfer/f6-src/ref/tiny.gguf q4_0",
         "producer_kind": "llama-quantize",
         "llamacpp_commit": "deadbeef",
         "compiler": "gcc 13.3.0",
@@ -548,6 +1029,27 @@ def _tiny_manifest(root: Path, sha: str, **over) -> dict:
     return {
         "schema": 1,
         "cache_root": "~/.cache/minfer/f6-src",
+        "divergence_notes": [],
+        "entries": [e],
+    }
+
+
+def _regen_manifest(root: Path, fake: Path, content: bytes, **over) -> dict:
+    """A one-entry manifest whose producer is a fake `minfer` in the temp tree."""
+    e = {
+        "path": "ref/tiny.gguf",
+        "bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "producer": f"{fake} convert {root}/in.gguf {root}/ref/tiny.gguf --outtype f32",
+        "producer_kind": "minfer",
+        "minfer_commit": "abc1234",
+        "date": "2026-09-27",
+        "box": "dgxspark (aarch64, GB10 sm_121)",
+    }
+    e.update(over)
+    return {
+        "schema": 1,
+        "cache_root": str(root),
         "divergence_notes": [],
         "entries": [e],
     }
@@ -632,9 +1134,15 @@ def selftest() -> int:
                bool(check_manifest(manifest_path, bad)))
         bad = _tiny_manifest(root, good, minfer_commit="unrecorded")
         bad["entries"][0]["producer_kind"] = "minfer"
+        bad["entries"][0]["producer"] = "minfer convert /tmp/in.gguf " \
+                                        "~/.cache/minfer/f6-src/ref/tiny.gguf --outtype f16"
         # `authoritative_reference` is a llama-quantize field (S2): a minfer
         # producer has no compiler, so the mark goes with the kind.
         bad["entries"][0].pop("authoritative_reference")
+        bad["entries"][0].pop("llamacpp_commit")
+        bad["entries"][0].pop("compiler")
+        bad["entries"][0].pop("ffp_contract")
+        bad["entries"][0].pop("cflags")
         record("an unrecorded producer without a note is a structural problem",
                bool(check_manifest(manifest_path, bad)))
         bad["entries"][0]["producer_note"] = "not recorded at the time"
@@ -692,6 +1200,136 @@ def selftest() -> int:
         record("an unknown field is rejected", bool(check_manifest(manifest_path, bad)))
         record("a missing manifest is a problem",
                bool(load_manifest(tmp / "nope.json")[1]))
+
+        # S7 (#345): the recorded command runs the kind's program and writes the
+        # entry. Without this, --regenerate would run a command that cannot
+        # re-record the entry it is recorded on.
+        bad = _tiny_manifest(root, good, producer_kind="minfer", minfer_commit="abc1234")
+        bad["entries"][0].pop("compiler")
+        bad["entries"][0].pop("ffp_contract")
+        bad["entries"][0].pop("cflags")
+        bad["entries"][0].pop("llamacpp_commit")
+        bad["entries"][0].pop("authoritative_reference")
+        record("a command that runs another producer than its kind names is rejected",
+               any("runs 'llama-quantize'" in p for p in check_manifest(manifest_path, bad)),
+               str(check_manifest(manifest_path, bad)))
+        bad = _tiny_manifest(root, good)
+        bad["entries"][0]["producer"] = bad["entries"][0]["producer"].replace(
+            "ref/tiny.gguf", "ref/other.gguf")
+        record("a command that writes another path than the entry is rejected",
+               any("writes" in p and "other.gguf" in p
+                   for p in check_manifest(manifest_path, bad)))
+        bad = _tiny_manifest(root, good, producer="unrecorded (the producer was never written down)")
+        record("a producer that is not a command needs a producer_note",
+               any("not a runnable command" in p for p in check_manifest(manifest_path, bad)))
+        bad["entries"][0]["producer_note"] = "the command was never recorded"
+        record("... and is accepted once the note explains it",
+               not check_manifest(manifest_path, bad))
+
+        # --regenerate (#345): the producer runs, the content is verified against
+        # the record, and only sha256/bytes/date are written.
+        fake = tmp / "bin" / "minfer"
+        fake.parent.mkdir()
+        fake.write_text('#!/bin/sh\nprintf "%s" "$F6_SELFTEST_CONTENT" > "$3"\n',
+                        encoding="utf-8")
+        fake.chmod(0o755)
+        content = b"tiny-regenerated"
+        payload = b"a different producer version"
+        fake_cache = tmp / "regen-cache"
+        (fake_cache / "ref").mkdir(parents=True)
+        (fake_cache / "ref" / "tiny.gguf").write_bytes(content)
+        old_environ = os.environ.get("F6_SELFTEST_CONTENT")
+        # The fake producer writes whatever the environment names, so the two
+        # cases below differ only in what the record claims was produced.
+        os.environ["F6_SELFTEST_CONTENT"] = content.decode()
+
+        def _regen(doc: dict, **kw) -> tuple[int, str]:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = regenerate(doc, manifest_path, fake_cache, tmp, today="2026-10-07", **kw)
+            return code, buf.getvalue()
+
+        # A run that reproduces the record: the content fields stay, the date moves.
+        doc = _regen_manifest(fake_cache, fake, content)
+        manifest_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        before = json.loads(manifest_path.read_text())
+        code, out = _regen(doc, running_commit="abc1234")
+        after = manifest_path.read_text()
+        record("a reproducing run exits 0", code == 0, out)
+        record("a reproducing run records the date of the run",
+               json.loads(after)["entries"][0]["date"] == "2026-10-07", after[:200])
+        record("a reproducing run leaves sha256 and bytes as the record has them",
+               json.loads(after)["entries"][0]["sha256"] == before["entries"][0]["sha256"]
+               and json.loads(after)["entries"][0]["bytes"] == before["entries"][0]["bytes"])
+        record("a reproducing run invents no provenance",
+               {k: v for k, v in json.loads(after)["entries"][0].items()
+                if k not in ("date",)} == {k: v for k, v in before["entries"][0].items()
+                                           if k not in ("date",)})
+        # Idempotent: a second run the same day writes nothing.
+        code, out = _regen(json.loads(manifest_path.read_text()), running_commit="abc1234")
+        record("a second run the same day writes nothing (idempotent)",
+               code == 0 and manifest_path.read_text() == after and "nothing written" in out, out)
+
+        # A run that produces different bytes: a finding, the record untouched
+        # and the fixture restored.
+        (fake_cache / "ref" / "tiny.gguf").write_bytes(payload)
+        doc = _regen_manifest(fake_cache, fake, payload)
+        manifest_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        code, out = _regen(doc, running_commit="abc1234")
+        record("a run that no longer reproduces the record is a finding (exit 1)",
+               code == 1 and "FINDING" in out, out)
+        record("a finding names both digests",
+               hashlib.sha256(content).hexdigest() in out
+               and hashlib.sha256(payload).hexdigest() in out, out)
+        record("a finding does not rewrite the manifest",
+               json.loads(manifest_path.read_text()) == doc, manifest_path.read_text()[:200])
+        record("a finding restores the fixture and keeps the rejected content",
+               (fake_cache / "ref" / "tiny.gguf").read_bytes() == payload
+               and (fake_cache / "ref" / "tiny.gguf.regen-rejected").read_bytes() == content)
+
+        # A producer program that is not here: refused, naming the binary.
+        missing = tmp / "no-such-dir" / "minfer"
+        doc = _regen_manifest(fake_cache, fake, content,
+                              producer=f"{missing} convert {fake_cache}/in.gguf "
+                                       f"{fake_cache}/ref/tiny.gguf --outtype f32")
+        code, out = _regen(doc, running_commit="abc1234")
+        record("a producer program that is not here is refused by name (exit 3)",
+               code == 3 and "REFUSED" in out and str(missing) in out, out)
+
+        # A recorded producer identity that is not what runs here: refused.
+        doc = _regen_manifest(fake_cache, fake, content, minfer_commit="deadbee")
+        code, out = _regen(doc, running_commit="abc1234")
+        record("a run at another producer identity is refused naming both commits",
+               code == 3 and "deadbee" in out and "abc1234" in out, out)
+
+        # A llama-quantize entry: out of scope, refused naming the build, and no
+        # run even when the binary exists.
+        llama = tmp / "bin" / "llama-quantize"
+        llama.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        llama.chmod(0o755)
+        runner = _tiny_manifest(root, good)
+        runner["cache_root"] = str(fake_cache)
+        runner["entries"][0]["path"] = "ref/tiny.gguf"
+        runner["entries"][0]["producer"] = f"{llama} /tmp/in.gguf {fake_cache}/ref/tiny.gguf q4_0"
+        runner["entries"][0]["llamacpp_binary"] = str(llama)
+        code, out = _regen(runner)
+        record("a llama-quantize entry is refused as out of scope, naming the build",
+               code == 3 and "out of scope" in out and str(llama) in out, out)
+
+        # --dry-run: classified, nothing run and nothing written.
+        dry = tmp / "dry-cache"
+        (dry / "ref").mkdir(parents=True)
+        (dry / "ref" / "tiny.gguf").write_bytes(payload)
+        doc = _regen_manifest(dry, fake, payload)
+        manifest_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        code, out = _regen(doc, dry_run=True, running_commit="abc1234")
+        record("--dry-run lists the command and writes nothing",
+               code == 0 and "RUN" in out and manifest_path.read_text() == json.dumps(doc, indent=2),
+               out)
+        if old_environ is None:
+            del os.environ["F6_SELFTEST_CONTENT"]
+        else:
+            os.environ["F6_SELFTEST_CONTENT"] = old_environ
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -718,9 +1356,23 @@ def main() -> int:
                         help="with --verify: an unrecorded file under the root is a failure")
     parser.add_argument("--check", action="store_true", help="manifest structure only (the default)")
     parser.add_argument("--selftest", action="store_true", help="run the checker's own cases")
+    parser.add_argument("--regenerate", action="store_true",
+                        help="re-run the recorded producer(s) and re-record the content identity")
+    parser.add_argument("--only", default=None,
+                        help="with --regenerate: a manifest path, optionally PATH@BOX")
+    parser.add_argument("--box", default=None,
+                        help="with --regenerate: every entry recorded on this box label")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --regenerate: classify and print the commands, run nothing")
+    parser.add_argument("--strict-runnable", action="store_true",
+                        help="with --regenerate --dry-run: a refusal is a failure")
     args = parser.parse_args()
     if args.selftest:
         return selftest()
+    if (args.only or args.box or args.dry_run or args.strict_runnable) and not args.regenerate:
+        print("check_f6_fixtures.py: --only/--box/--dry-run/--strict-runnable need --regenerate",
+              file=sys.stderr)
+        return 2
 
     root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     manifest_path = Path(args.manifest) if args.manifest else root / MANIFEST
@@ -738,6 +1390,9 @@ def main() -> int:
         return 1
 
     cache = Path(os.path.expanduser(args.root or doc.get("cache_root") or DEFAULT_CACHE))
+    if args.regenerate:
+        return regenerate(doc, manifest_path, cache, root, only=args.only, box=args.box,
+                          dry_run=args.dry_run, strict_runnable=args.strict_runnable)
     if args.file:
         args.verify = True
     if args.verify:

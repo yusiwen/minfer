@@ -661,13 +661,14 @@ python3 scripts/check_f6_fixtures.py --file /tmp/copy.gguf   # one file
 
 `--verify` names the file, every recorded digest and the actual one when they
 disagree, and reports a file no entry names; `--check` additionally requires that
-every `~/.cache/minfer/f6-src/…` fixture the source tree spells is an entry, and
-that every `.gguf` a recorded `producer` command names is too. The other half
-runs inside the gates: the shared fixture resolver verifies a path it hands back
-(`env_path` → `src/tooling/tests/f6_fixtures.rs`), so the documented
-`cargo test … --ignored` invocation refuses a tampered cache by name and digest
-rather than comparing against it. `MINFER_F6_CACHE` relocates the cache root for
-an experiment — which is how the refusal is demonstrated without touching
+every `~/.cache/minfer/f6-src/…` fixture the source tree spells is an entry, that
+every `.gguf` a recorded `producer` command names is too, and (**S7**) that the
+command runs the program its `producer_kind` names and writes the entry's own
+path. The other half runs inside the gates: the shared fixture resolver verifies a
+path it hands back (`env_path` → `src/tooling/tests/f6_fixtures.rs`), so the
+documented `cargo test … --ignored` invocation refuses a tampered cache by name and
+digest rather than comparing against it. `MINFER_F6_CACHE` relocates the cache root
+for an experiment — which is how the refusal is demonstrated without touching
 `~/.cache/minfer/f6-src/` — and a *deliberate* reference belongs outside the
 cache root, where a path the manifest does not name is not a fixture at all.
 
@@ -678,10 +679,78 @@ carries a full `sha256` since [PR
 references (the 2026-10-07 table had kept 8 hex characters), so
 `--strict-digests` passes with no `WEAK` line; the reader still accepts a
 `sha256_prefix` entry weakly, for a digest that has to be re-captured again. The
-`hf/` checkpoint's `main` revision is not pinned by the download recipe (only
-its bytes are recorded), and `f164/minfer-f16.gguf` has a pinned digest but no
-recorded producer at all (it is #164's fixture). Regenerating the chain from the
-manifest is still the manual recipe above, not a command.
+`hf/` checkpoint's revision and `f164/minfer-f16.gguf`'s producer are recorded
+(they were the other two gaps that PR closed), but a `llama-quantize` reference
+is still re-recorded **by hand**: `--regenerate` (§4.2.3) refuses one on purpose.
+
+#### 4.2.3 Regenerating from the manifest (#345)
+
+`--verify` checks the cached bytes against the record; it does not *produce* them.
+`--regenerate` closes that gap: it re-runs the recorded `producer` command for the
+selected entries and re-records the content identity from what the run wrote.
+
+```bash
+python3 scripts/check_f6_fixtures.py --regenerate --only qwen2.5-0.5b-instruct-f32.gguf
+python3 scripts/check_f6_fixtures.py --regenerate --box 'dgxspark (aarch64, GB10 sm_121)'
+python3 scripts/check_f6_fixtures.py --regenerate --dry-run     # classify, run nothing (CI)
+```
+
+`--only` takes a manifest `path` or `PATH@BOX` (the form that selects one of a
+recorded divergence's contents); `--box` selects every entry recorded against that
+box label. The mode is a **verification gate first**:
+
+- **It runs the producer the record names, or refuses.** The command's program is
+  resolved *before* anything runs — `minfer` on `PATH` and then
+  `./target/release/minfer`, `curl` for an `hf-download` entry, and the entry's own
+  `llamacpp_binary` for a `llama-quantize` one. There is **no fallback between
+  producers**: a missing `llama-quantize` is a refusal naming the path it looked
+  for, never a reason to run `minfer` instead.
+- **Regenerating a `llama-quantize` reference is out of scope.** The byte-parity
+  claim of §4.2 is about one compiler's build, so the mode refuses such an entry —
+  naming the `llamacpp_binary` it records and whether that binary exists here — and
+  says to re-run it on the box that records it. Even a box that *has* the build
+  takes the refusal: a half-implemented compiler-identity check would be worse than
+  not running it.
+- **The run must reproduce the record.** The content the producer wrote is hashed
+  and compared with the entry's full `sha256`. A match re-records `bytes` and the
+  `date` of the reproducing run (`sha256` is equal by construction) and prints
+  every change; a second run the same day writes nothing, so the mode is
+  idempotent. A digest that matches **no** recorded content for the path is a
+  **finding** (exit 1), not an update — the record's producer no longer reproduces
+  the record — and the message names both digests, the bytes and the commit that
+  ran.
+- **The producer identity is checked before the run.** A `minfer` entry whose
+  `minfer_commit` differs from what runs here (`MINFER_F6_COMMIT`, else the tree's
+  `HEAD`) is **refused** (exit 3) naming both commits: that run is not the producer
+  the entry names, so its bytes cannot be recorded against it. An `unrecorded`
+  identity may run — there is no claim to contradict — but a differing digest is
+  then a finding like any other, never a "producer version" excuse.
+- **It writes only `sha256`/`bytes`/`date`.** `authoritative_reference`, the
+  producer command and every identity field are left exactly as they were, so the
+  mode can neither invent provenance nor move the content the byte-parity claim is
+  asserted against. `--check` (`S1`–`S7`) re-runs on the result before it is kept.
+- **A rejected run cannot destroy a fixture.** The existing cache file is renamed
+  to `<path>.regen-before` before the producer starts (a rename, not a second
+  copy); a finding, a refusal after a run, or a producer failure restores it and
+  keeps the rejected content at `<path>.regen-rejected`; a verified success removes
+  the pre-run copy, which is byte-identical to the new file.
+- **`--dry-run`** classifies every selected entry — `RUN` with the `~`-expanded
+  command, or `REFUSED` with the reason — and writes nothing. CI runs it, so a
+  manifest whose command has the wrong program, the wrong output path or no
+  command at all fails there (S7).
+
+Exit codes: `0` clean, `1` a finding or a producer failure, `3` a refused target,
+`2` a selection that matches nothing. A refusal is the honest per-box answer to
+"this producer cannot run here", not a silent skip; `--strict-runnable` turns it
+into a failure for a box that is expected to hold every producer.
+
+**Measured (`dgxspark (aarch64, GB10 sm_121)`, 2026-10-07).**
+`--regenerate --only qwen2.5-0.5b-instruct-f32.gguf` re-ran `minfer convert … --outtype
+f32` and the file came back **byte-identical** — `6894f9ea3eb79e29…`, 1 982 078 784 B,
+the recorded digest and size — so the only manifest change was the `date`
+(`2026-09-27` → `2026-10-07`); running it again the same day wrote nothing at all.
+The eleven `ref/…` entries refuse by name: the Mac's `build-fpc` binary is not on
+this box, and the `dgxspark` one is refused as out of scope even though it is.
 
 ### 4.3 Tolerances
 
@@ -755,13 +824,13 @@ network is used.
   [#205](https://github.com/yusiwen/minfer/issues/205) closed that: the record
   is `docs/f6-fixtures.json` (§4.2.2), the checker is
   `scripts/check_f6_fixtures.py`, and the gates verify the fixture they resolve.
-  **Still owed:** eleven Mac reference digests were truncated by the 2026-10-07
-  table and are accepted only to 32 bits ([#342](https://github.com/yusiwen/minfer/issues/342));
-  the `hf/` download's `main` revision is not pinned; `f164/minfer-f16.gguf`'s
-  producer is unrecorded; and regenerating the chain from the manifest is a
-  recipe, not a command — which is also why the cross-box f16 divergence below is
-  *explained* (a producer-version difference) but not *settled* (one side's minfer
-  commit is unrecorded).
+  [#345](https://github.com/yusiwen/minfer/issues/345) then made the recipe
+  runnable: `--regenerate` (§4.2.3) re-runs a recorded producer and re-records the
+  content it produces, idempotently, and refuses a target it cannot verify. What
+  remains by hand: a `llama-quantize` reference (deliberately out of scope, §4.2.3)
+  and any digest whose run is at a `minfer` commit the entry does not name — which
+  is also why the cross-box f16 divergence below is *explained* (a producer-version
+  difference) but not *settled* (one side's minfer commit is unrecorded).
 - **`qwen2.5-0.5b-instruct-f16.gguf` is not byte-identical across boxes.**
   `dgxspark`'s copy is `aef12ad44a60d2dd…` (2026-09-27) and the Mac's is
   `a26884ee1286c1d3…` (2026-10-07, master `ab34a72`), while their f32

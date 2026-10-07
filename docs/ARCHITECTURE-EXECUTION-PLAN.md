@@ -8591,8 +8591,8 @@ compiler claim; and a fabricated third record marked non-authoritative plus
 wrongly skips as "a different compiler"; `reference_record_in` returning the default
 → the unit test fails on the empty record. Both restored from `cp` backups. Suites:
 **486 / 0 / 40** unit + **10 / 0 / 6** integration and the F6 `#[ignore]`d set
-**6 / 0**, all on `dgxspark`. Still owed: `--regenerate` ([#345](https://github.com/yusiwen/minfer/issues/345)),
-and the bare `:NNN` citation sweep ([#336](https://github.com/yusiwen/minfer/issues/336)).
+**6 / 0**, all on `dgxspark`. `--regenerate` landed in [#345](https://github.com/yusiwen/minfer/issues/345);
+still owed: the bare `:NNN` citation sweep ([#336](https://github.com/yusiwen/minfer/issues/336)).
 
 **#344 (2026-10-07) — the anchor checker can now see a moved target.**
 `check_doc_line_anchors.py` ([#266](https://github.com/yusiwen/minfer/issues/266))
