@@ -314,14 +314,21 @@ cannot strand. The gate exists because the rule was missed twice in one round:
 [#299]'s weight accounting moved **69** across eight docs by 1–3. Both were caught
 by a hand-written old→new line map, which is exactly what the gate replaces — and
 which it beats: re-run over [#299]'s range it named **73**, the 69 the re-point
-commit fixed plus **4 it missed** (`docs/ARCHITECTURE-ROADMAP.md:98` and `:452`,
-`docs/SOURCE-LAYOUT-PLAN.md:56`,
-`docs/inference_e2e_walkthrough/03-model-dispatch-weights.md:705`).
+commit fixed plus **4 it missed**. Those four are cited here by the revision that
+carried them, not by a live anchor: the PR that added this section re-pointed all
+of them, so the four doc lines that held the stale numbers now hold the corrected
+ones — line 98 and line 452 of `docs/ARCHITECTURE-ROADMAP.md`, line 56 of
+`docs/SOURCE-LAYOUT-PLAN.md` and line 705 of
+`docs/inference_e2e_walkthrough/03-model-dispatch-weights.md`, where the cited
+`graph/alloc.rs` range moved from `134-137` to `135-138`. Read that line at
+`506b26c` to see the defect; read it today to see the fix.
 
 Two boundaries are deliberate. A **bare `:NNN` continuation** is not an anchor
-either checker can see, so those numbers remain [#336]'s sweep. And a base anchor
-whose doc line was rewritten *beyond* its numbers is not compared — the author
-touched that line, and pairing it would be a guess; `--list` prints it as
+either checker can see, so neither one re-points it — those numbers remain
+[#336]'s sweep, and making the form itself checkable is [#355]'s own ticket.
+And a base anchor whose doc line was rewritten *beyond* its numbers is not
+compared — the author touched that line, and pairing it would be a guess;
+`--list` prints it as
 `not compared`, so "why did this pass?" has an answer. The `FROZEN` set above is
 the *same* set in both modes: a record frozen against a past revision is not drift.
 
@@ -391,4 +398,5 @@ questions a reviewer must be able to answer from the PR, not as property tests.
 [#329]: https://github.com/yusiwen/minfer/issues/329
 [#336]: https://github.com/yusiwen/minfer/issues/336
 [#344]: https://github.com/yusiwen/minfer/issues/344
+[#355]: https://github.com/yusiwen/minfer/issues/355
 [PR #343]: https://github.com/yusiwen/minfer/pull/343
