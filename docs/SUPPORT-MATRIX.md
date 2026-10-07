@@ -170,9 +170,10 @@ Notes:
   C2 shift and C5 sessions) is implemented on all three backends since #44 part
   (b): Metal moves rows one at a time with `MTLBlitCommandEncoder` in the
   overlap-safe order and reads its regions back through the registry `host_read`
-  hook. A **physical shift of an f16 region** refuses loudly
+  hook. A **physical shift of an f16 region** refuses loudly and is pinned by a gate
   ([#306](https://github.com/yusiwen/minfer/issues/306): the host round trip has
-  no dequantize → re-rope → requantize map); the per-engine `kv_format` is what
+  no dequantize → re-rope → requantize map, so the CLI re-renders the retained
+  window instead); the per-engine `kv_format` is what
   makes a Metal session describe the width its region really uses.
 
 ### Not Yet Supported
