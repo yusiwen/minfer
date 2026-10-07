@@ -1246,7 +1246,8 @@ fn prefill_gemm_throughput_profile() {
         {
             let cb = mps.cmd_buffer();
             for _ in 0..20 {
-                cb.quant_matmul_f32_on_gpu_buf(&wb, 0, ttype, &acts, 0, &out, od, id, nt);
+                cb.quant_matmul_f32_on_gpu_buf(&wb, 0, ttype, &acts, 0, &out, od, id, nt)
+                    .expect("quant_matmul_f32_on_gpu_buf dispatch");
             }
             cb.submit().expect("warmup");
         }
@@ -1255,7 +1256,8 @@ fn prefill_gemm_throughput_profile() {
         for _ in 0..3 {
             let cb = mps.cmd_buffer();
             for _ in 0..n {
-                cb.quant_matmul_f32_on_gpu_buf(&wb, 0, ttype, &acts, 0, &out, od, id, nt);
+                cb.quant_matmul_f32_on_gpu_buf(&wb, 0, ttype, &acts, 0, &out, od, id, nt)
+                    .expect("quant_matmul_f32_on_gpu_buf dispatch");
             }
             let t0 = std::time::Instant::now();
             cb.submit().expect("submit");

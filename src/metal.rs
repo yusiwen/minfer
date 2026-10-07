@@ -427,7 +427,8 @@ impl MpsCommandBuffer<'_> {
         id: usize,
         nt: usize,
     ) {
-        self.quant_matmul_f32_on_gpu_buf(wb, w_off, ttype, f32_x, x_off, out, od, id, nt);
+        self.quant_matmul_f32_on_gpu_buf(wb, w_off, ttype, f32_x, x_off, out, od, id, nt)
+            .expect("quant_matmul_f32_on_gpu_buf dispatch");
     }
 }
 

@@ -290,7 +290,8 @@ CUDA's `supports_op` gates RoPE to `NonInterleaved` only. All supported models a
 `nt > 1` (one threadgroup per two output rows); otherwise the **single-token** kernel. Every
 supported quant type has the tiers that matter. Guards: K-quant `id % 256 != 0` aborts via
 `gpu_abort`; the GEMM checks the threadgroup-memory request against the device limit queried at
-init. `MINFER_GEMM=0` disables the GEMM tier for A/B.
+init. `MINFER_GEMM=0` disables the GEMM tier for A/B. An **unregistered weight dtype** is refused
+with `Err` (#329) — the catch-all `_` arm is a guard, not a fallback (see the f32 paragraph below).
 
 **f16 weights run on the device (#164, landed on a Mac 2026-10-06).** The tiers above exist for
 the quantized types; f16 and f32 have their own single-token arms. The loader registers
@@ -324,9 +325,13 @@ longer depends on test order. That silent-wrong-kernel fallback is the registrat
 f16 paragraph above describes, and `docs/SUPPORT-MATRIX.md`'s footnote 2 is updated to match. Two
 scope notes: **no model in the gate set carries a 2-D f32 weight**, so this path is covered by the
 synthetic `metal_matmul_f32_matches_cpu` gate and the op-matrix case only; and the catch-all `_` arm
-is **still there**, so the next unregistered dtype would repeat #317's silent zero — making it refuse
-loudly is [#329](https://github.com/yusiwen/minfer/issues/329) (PR #320's body assigned it to #208,
-which closed without it).
+that silently ran the Q4_0 kernel is gone — since
+[#329](https://github.com/yusiwen/minfer/issues/329) it returns `Err` naming the node, the observed
+dtype and the kernel that would have run (`pl_q4_0_f32` / `_multi`), so the next unregistered dtype
+aborts instead of repeating #317's silent zero. That refusal is driven through the **production**
+dispatch by `graph::metal_backend::tests::metal_matmul_refuses_an_unkerneled_weight_dtype`, whose
+control arm builds the same graph with an `F32` weight and asserts it still computes, so the dtype is
+the only difference (rule 2).
 
 **bf16 weights run on the device too (#208, landed on a Mac 2026-10-06).** The second 2 B/element
 dtype — the Metal half of the ticket whose CUDA half is PR [#321](https://github.com/yusiwen/minfer/pull/321).
