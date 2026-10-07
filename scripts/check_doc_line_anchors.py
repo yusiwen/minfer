@@ -67,6 +67,15 @@ tree is treated as an external citation, so now that the campaign's Step 2 has r
 between this tree and llama.cpp's, whose files share the `.cu`/`.cuh` extensions;
 converting the live anchors to symbol anchors (ticket #266 ¶c) is what removes them.
 
+A bare range whose *content* has drifted is invisible here by construction, and no
+rule closes that gap: measured for ticket #327, 99 of the 144 live anchors that
+carry an adjacent backticked **non-symbol** token do not contain that token inside
+their own range — the tokens are code expressions and fragments of a neighbouring
+sentence, not the claim. The convention that replaces the missing rule — a prose
+anchor names a **section heading** next to its range, and a symbol anchor is
+preferred where one exists — is written down in ``docs/GATE-CONTRACT.md``
+§"Prose anchors: name the section, not the line range".
+
 Usage::
 
     python3 scripts/check_doc_line_anchors.py [--root DIR] [--list] [--strict-symbols]
