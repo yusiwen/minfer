@@ -133,6 +133,12 @@ Usage::
     python3 scripts/check_f6_fixtures.py --file /tmp/x.gguf         # one file
     python3 scripts/check_f6_fixtures.py --selftest                 # the checker's own cases
 
+    # #354: audit another record — --manifest, or MINFER_F6_MANIFEST when it is
+    # set (the manifest-side twin of MINFER_F6_CACHE). An empty override is a
+    # usage error, and --regenerate refuses the variable outright.
+    MINFER_F6_MANIFEST=/tmp/f6-fixtures.json python3 scripts/check_f6_fixtures.py --check
+    python3 scripts/check_f6_fixtures.py --check --manifest /tmp/f6-fixtures.json
+
     # #345: re-run a recorded producer and re-record the content identity
     python3 scripts/check_f6_fixtures.py --regenerate --dry-run     # CI: classify, run nothing
     python3 scripts/check_f6_fixtures.py --regenerate --only qwen2.5-0.5b-instruct-f32.gguf
@@ -162,6 +168,15 @@ from pathlib import Path
 
 #: The checked-in manifest, relative to the repository root.
 MANIFEST = "docs/f6-fixtures.json"
+
+#: The manifest's own relocation (issue #354), the manifest-side twin of the
+#: cache override below: it selects which record is audited. ``--manifest`` wins
+#: over it; ``--regenerate`` refuses it, because re-recording into a manifest
+#: chosen by the environment is the accident the override must not create. A
+#: value that is set but empty is refused rather than read as "unset" — auditing
+#: the tracked record while the operator believes another was selected is the
+#: wrong-file failure the override exists to prevent.
+MANIFEST_ENV = "MINFER_F6_MANIFEST"
 
 #: The persistent fixture cache the manifest's `cache_root` names (the recipe in
 #: `docs/GGUF-TOOLING.md` §4.2.1). Overridable for a verification run against a
@@ -225,6 +240,30 @@ UNRECORDED = re.compile(r"unrecord|not recorded|unknown", re.I)
 # --------------------------------------------------------------------------- #
 # S1-S5: the manifest alone
 # --------------------------------------------------------------------------- #
+
+def resolve_manifest(arg: str | None, env: str | None, root: Path) -> tuple[Path, str, list[str]]:
+    """The manifest to audit, and where the choice came from (issue #354).
+
+    ``--manifest`` > ``MINFER_F6_MANIFEST`` > the tracked ``docs/f6-fixtures.json``.
+    Returns ``(path, source, problems)`` with ``source`` one of ``"argv"``,
+    ``"env"``, ``"default"``. An environment value that is set but blank is a
+    usage problem, never a silent fall back to the tracked record: the whole point
+    of the override is that the checker audits the record it was pointed at, or
+    says why it cannot.
+    """
+    if arg:
+        return Path(arg), "argv", []
+    if env is not None:
+        if not env.strip():
+            return root / MANIFEST, "env", [
+                f"{MANIFEST_ENV} is set but empty: an empty override is refused, not read as "
+                f"unset. Auditing {MANIFEST} while the operator believes another record was "
+                f"selected is the wrong-file failure this override exists to prevent (issue "
+                f"#354). Unset {MANIFEST_ENV}, or name a path."
+            ]
+        return Path(env), "env", []
+    return root / MANIFEST, "default", []
+
 
 def load_manifest(path: Path) -> tuple[dict | None, list[str]]:
     """Parse the manifest; ``(manifest, problems)``."""
@@ -1201,6 +1240,22 @@ def selftest() -> int:
         record("a missing manifest is a problem",
                bool(load_manifest(tmp / "nope.json")[1]))
 
+        # The manifest override (#354): --manifest > MINFER_F6_MANIFEST > tracked.
+        # An empty override is refused, never read as "unset".
+        path, source, problems = resolve_manifest("/flag.json", "/env.json", tmp)
+        record("--manifest wins over the environment override",
+               path == Path("/flag.json") and source == "argv" and not problems, str(problems))
+        path, source, problems = resolve_manifest(None, "/env.json", tmp)
+        record("MINFER_F6_MANIFEST selects the record when no flag is given",
+               path == Path("/env.json") and source == "env" and not problems, str(problems))
+        path, source, problems = resolve_manifest(None, None, tmp)
+        record("with no override the tracked manifest is the record",
+               path == tmp / MANIFEST and source == "default" and not problems, str(problems))
+        _, source, problems = resolve_manifest(None, "   ", tmp)
+        record("an empty override is a usage problem, not a silent fall back",
+               source == "env" and len(problems) == 1 and MANIFEST_ENV in problems[0]
+               and "empty" in problems[0], str(problems))
+
         # S7 (#345): the recorded command runs the kind's program and writes the
         # entry. Without this, --regenerate would run a command that cannot
         # re-record the entry it is recorded on.
@@ -1344,7 +1399,8 @@ def selftest() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--manifest", default=None, help=f"the manifest (default {MANIFEST})")
+    parser.add_argument("--manifest", default=None,
+                        help=f"the manifest (default ${MANIFEST_ENV}, else {MANIFEST})")
     parser.add_argument("--root", default=None, help=f"the fixture cache (default {DEFAULT_CACHE})")
     parser.add_argument("--file", default=None, help="verify one file instead of the whole cache")
     parser.add_argument("--verify", action="store_true", help="also check the cached bytes")
@@ -1375,7 +1431,28 @@ def main() -> int:
         return 2
 
     root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    manifest_path = Path(args.manifest) if args.manifest else root / MANIFEST
+    manifest_path, manifest_source, problems = resolve_manifest(
+        args.manifest, os.environ.get(MANIFEST_ENV), root)
+    if problems:
+        for p in problems:
+            print(p, file=sys.stderr)
+        return 2
+    if args.manifest and os.environ.get(MANIFEST_ENV) is not None:
+        # The override is shadowed by the explicit flag. Say so: an override that
+        # is quietly ignored is the same silent wrong-record hazard as one that is
+        # quietly honoured.
+        print(f"check_f6_fixtures.py: {MANIFEST_ENV} is set but --manifest was given; using "
+              f"{manifest_path}", file=sys.stderr)
+    if manifest_source == "env":
+        if args.regenerate:
+            print(f"check_f6_fixtures.py: --regenerate refuses {MANIFEST_ENV}: re-recording into "
+                  f"a manifest chosen by the environment is the accident the override must not "
+                  f"create (issue #354). Unset {MANIFEST_ENV}, or pass --manifest "
+                  f"{manifest_path} explicitly — the flag is the auditable spelling.",
+                  file=sys.stderr)
+            return 2
+        print(f"check_f6_fixtures.py: {MANIFEST_ENV} is set; auditing {manifest_path} instead of "
+              f"{root / MANIFEST}", file=sys.stderr)
     doc, problems = load_manifest(manifest_path)
     if doc is None:
         for p in problems:

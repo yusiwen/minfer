@@ -672,6 +672,31 @@ for an experiment — which is how the refusal is demonstrated without touching
 `~/.cache/minfer/f6-src/` — and a *deliberate* reference belongs outside the
 cache root, where a path the manifest does not name is not a fixture at all.
 
+The **record itself** is relocatable too, with `MINFER_F6_MANIFEST`
+([#354](https://github.com/yusiwen/minfer/issues/354)): the manifest-side twin of
+`MINFER_F6_CACHE`, honoured by both halves — the gate's reader
+(`src/tooling/tests/f6_fixtures.rs`) and the checker (`--manifest` still wins over
+it) — so a test can point the gate at a `/tmp` record instead of editing a tracked
+file:
+
+```bash
+MINFER_F6_MANIFEST=/tmp/f6-fixtures.json cargo test --release --bin minfer -- \
+    the_manifest_override_drives_the_whole_resolver
+MINFER_F6_MANIFEST=/tmp/f6-fixtures.json python3 scripts/check_f6_fixtures.py --check
+```
+
+Both halves honour it **loudly**: a value that is set but empty, or a record that
+is missing, unreadable or malformed, refuses by name and never falls back to
+`docs/f6-fixtures.json` — the empty case is a usage error (exit 2) in the checker.
+The checker's `--regenerate` (§4.2.3) **refuses** the variable outright, because
+re-recording into a manifest chosen by the environment is the accident the
+override must not create; `--manifest <path>` is that mode's auditable spelling.
+The override is what makes the parity gate's fifth verdict testable: with a
+fabricated record that names a reference's content as a non-authoritative build,
+`ParityVerdict::RecordedForeignBuild` — the loud `[f6 parity] SKIP` — is exercised
+end-to-end from a unit test and from a real gate run, instead of by editing the
+tracked manifest under a `cp` backup ([#349](https://github.com/yusiwen/minfer/issues/349)).
+
 **What it does not cover.** The manifest checks content, not truth: nothing else
 recorded those bytes, so a wrong digest in the record is accepted. Every entry
 carries a full `sha256` since [PR
