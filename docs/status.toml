@@ -138,14 +138,14 @@ box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "unit"
 command = "cargo test --release"
 date = "2026-10-07"
-passed = 488
+passed = 490
 failed = 0
 ignored = 40
 integration_passed = 10
 integration_failed = 0
 integration_ignored = 6
 live_check = false
-note = "recorded measurement; CI runs x86_64; the +4 over the 2026-10-06 measurement are #205's three fixture-manifest tests (the manifest reader, the outside-the-cache arm and the tampered-cache refusal) plus #349's parity-verdict classifier, and the +1 on top is #306's format-aware physical-shift gate; the next +1 is #362's platform-neutral `every_device_gathers_the_attn_map`"
+note = "recorded measurement; CI runs x86_64; the +4 over the 2026-10-06 measurement are #205's three fixture-manifest tests (the manifest reader, the outside-the-cache arm and the tampered-cache refusal) plus #349's parity-verdict classifier, and the +1 on top is #306's format-aware physical-shift gate; the next +1 is #362's platform-neutral `every_device_gathers_the_attn_map`; #354 adds two more platform-neutral tests (the manifest-override resolver arm and the broken-override refusal), measured on dgxspark 2026-10-07 — 488 -> 490"
 file = "AGENTS.md"
 regex = 'CPU unit, box `(?P<box>[^`]+)`, `cargo test --release`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
 
@@ -155,14 +155,14 @@ box = "x86_64 (CI runner)"
 suite = "unit"
 command = "cargo test --release"
 date = "2026-10-07"
-passed = 486
+passed = 488
 failed = 0
 ignored = 40
 integration_passed = 10
 integration_failed = 0
 integration_ignored = 6
 live_check = true
-note = "compared live by the test-linux-cpu job; #306's platform-neutral shift gate raises the derived count by one; 486 = 485 + #362's platform-neutral test, measured live by the PR's `--check-live` run"
+note = "compared live by the test-linux-cpu job; 488 = the aarch64 measurement (490) minus the two `quants::neon_correctness` tests, which are cfg(target_arch = \"aarch64\"); #354's two platform-neutral manifest-override tests move it with the aarch64 row"
 file = "AGENTS.md"
 regex = 'CPU unit, box `(?P<box>[^`]+)`, `cargo test --release`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
 
@@ -200,7 +200,7 @@ projection_key = "cpu-unit"
 projection_box = "dgxspark (aarch64, GB10 sm_121)"
 projection_base_passed = 488
 live_check = false
-note = "recorded measurement; CI has no GPU; the refresh over the 2026-10-06 row is #205's three fixture-manifest gates + #349's parity-verdict classifier + #306's format-aware physical-shift gate; #362's platform-neutral test the sixth (575/46 -> 576/46, re-measured on dgxspark 2026-10-07, base moved with it)"
+note = "recorded measurement; CI has no GPU; the refresh over the 2026-10-06 row is #205's three fixture-manifest gates + #349's parity-verdict classifier + #306's format-aware physical-shift gate; #362's platform-neutral test the sixth (575/46 -> 576/46, re-measured on dgxspark 2026-10-07, base moved with it); #354's two platform-neutral manifest-override tests are not re-measured here — the #207 projection prints about 578 passed"
 file = "AGENTS.md"
 regex = 'CUDA unit, box `(?P<box>[^`]+)`, `scripts/cuda_test\.sh`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) / (?P<failed>[0-9]+) / (?P<ignored>[0-9]+)\*\*'
 
@@ -242,14 +242,14 @@ box = "macbook (macOS 27.0.1, Apple M4 Pro)"
 suite = "unit"
 command = "cargo test --release --no-fail-fast"
 date = "2026-10-07"
-passed = 543
+passed = 545
 failed = 0
 ignored = 44
 integration_passed = 21
 integration_failed = 0
 integration_ignored = 6
 live_check = false
-note = "recorded measurement; CI's build-macos compiles the test target but has no Metal device; the +1 over the previous 542 is #369's fast-map gate window_map_flash_matches_the_cpu_reference; the +1 under that is #359's fast-windowed-kernel gate window_flash_matches_the_cpu_reference; the +3 under that are #362's two Metal kv_map window gates plus the pure every_device_gathers_the_attn_map, and the earlier +4 are #205's three fixture-manifest tests plus #349's parity-verdict classifier with the +1 on top being #306's platform-neutral format-aware shift gate; the +2 over the #54 baseline are #329's dispatch-refusal gate and #299's weights-charged E4 gate; the +1 ignored is #315's macOS-only #[ignore]d windowed-prefill measurement harness (passed unchanged)"
+note = "recorded measurement; CI's build-macos compiles the test target but has no Metal device; the +1 over the previous 542 is #369's fast-map gate window_map_flash_matches_the_cpu_reference; the +1 under that is #359's fast-windowed-kernel gate window_flash_matches_the_cpu_reference; the +3 under that are #362's two Metal kv_map window gates plus the pure every_device_gathers_the_attn_map, and the earlier +4 are #205's three fixture-manifest tests plus #349's parity-verdict classifier with the +1 on top being #306's platform-neutral format-aware shift gate; the +2 over the #54 baseline are #329's dispatch-refusal gate and #299's weights-charged E4 gate; the +1 ignored is #315's macOS-only #[ignore]d windowed-prefill measurement harness (passed unchanged); #354's two platform-neutral manifest-override tests are derived here (543 -> 545), not re-measured on a Mac"
 file = "AGENTS.md"
 regex = 'macOS unit, box `(?P<box>[^`]+)`, `cargo test --release --no-fail-fast`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
 

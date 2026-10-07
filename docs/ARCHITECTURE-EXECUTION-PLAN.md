@@ -8612,6 +8612,51 @@ wrongly skips as "a different compiler"; `reference_record_in` returning the def
 **6 / 0**, all on `dgxspark`. `--regenerate` landed in [#345](https://github.com/yusiwen/minfer/issues/345);
 still owed: the bare `:NNN` citation sweep ([#336](https://github.com/yusiwen/minfer/issues/336)).
 
+**#354 (2026-10-07) — the fixture manifest is relocatable, so the skip verdict is
+a test.** The F6 parity gate resolved its record through a compile-time path
+(`concat!(env!("CARGO_MANIFEST_DIR"), …)`), so
+[#349](https://github.com/yusiwen/minfer/issues/349)'s
+`ParityVerdict::RecordedForeignBuild` arm — a reference whose digest *is* recorded
+but is not the path's `authoritative_reference`, which the gate turns into the loud
+`[f6 parity] SKIP` — could only be exercised by editing a tracked file under a `cp`
+backup. `MINFER_F6_MANIFEST` is the record's own override, beside
+`MINFER_F6_CACHE`, honoured by the gate's reader
+(`src/tooling/tests/f6_fixtures.rs`) and by `scripts/check_f6_fixtures.py`
+(`--manifest` still wins over it; `--regenerate` **refuses** the variable outright,
+because re-recording into a manifest chosen by the environment is the accident the
+override must not create). Both halves honour it **loudly**: a value that is set
+but empty, or a record that is missing, unreadable or malformed, refuses by name —
+`manifest_path()` / `load_manifest()` in the reader and `resolve_manifest()` in the
+checker name the variable, the path and the problem — and neither falls back to
+`docs/f6-fixtures.json`. The reader's parse cache is keyed on the path rather than
+a `OnceLock` (a `OnceLock` freezes the first resolution, which is what made the
+verdict untestable in-process), and a reentrant process-wide guard serialises the
+override window against every reader. Two feature-independent tests land:
+`the_manifest_override_drives_the_whole_resolver` drives `verify` →
+`reference_record` → `classify` through a fabricated two-content 4-byte record and
+gets `AuthoritativeNotReproduced`, `RecordedForeignBuild`, `Unattributable` and the
+resolver's tampered-cache refusal, and
+`a_broken_manifest_override_refuses_by_name_instead_of_falling_back` covers the
+empty, missing and malformed override; the checker's `--selftest` gains four cases
+(43 → 47). Measured on `dgxspark (aarch64, GB10 sm_121)`, 2026-10-07: **490 / 0 /
+40** unit + **10 / 0 / 6** integration and the F6 `#[ignore]`d set **6 / 0**; the
+recorded-foreign-build verdict driven end-to-end from a `/tmp` manifest against the
+real cache (the q4_0 reference's last four bytes flipped, its digest recorded as an
+Apple clang non-authoritative content) → `[f6 parity] SKIP q4_0: the reference
+matches neither minfer's `FmaContract::Fast` model nor its uncontracted model
+(tensor blk.23.ffn_up.weight payload differs (4 of 2451456 bytes)) …` with exit 0,
+where #349's evidence needed the tracked-manifest edit; and `MINFER_F6_MANIFEST` at
+a malformed or a missing file → exit 101 naming the path and the problem
+(`… does not parse: key must be a string at line 1 column 3`, `… is unreadable: No
+such file or directory`). Mutations: the reader ignoring the variable (always
+resolving the tracked record) → both new tests fail (`the authoritative content
+must verify against the override: Err("F6 fixture cache: … is not in
+…/docs/f6-fixtures.json …")` and `a missing override must refuse, not fall back`);
+a silent `read_to_string` fallback in `load_manifest` → `a missing override fell
+back: 36 entries`; the checker ignoring the variable → two `--selftest` cases fail.
+All restored from `cp` backups. Docs: `docs/GGUF-TOOLING.md` §4.2.2 names the
+override beside `MINFER_F6_CACHE`.
+
 **#344 (2026-10-07) — the anchor checker can now see a moved target.**
 `check_doc_line_anchors.py` ([#266](https://github.com/yusiwen/minfer/issues/266))
 proves an anchor's file exists, its line is in range and its adjacent symbol is

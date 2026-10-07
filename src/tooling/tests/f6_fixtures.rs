@@ -32,7 +32,15 @@
 //! touching the real cache (copy the root's layout into `/tmp`, tamper one file,
 //! point the variable at it). A deliberate experiment belongs *outside* the cache
 //! root: a file the manifest does not name is only tolerated when it is not a
-//! cache fixture at all.
+//! cache fixture at all. The **record** is overridable too, with
+//! `MINFER_F6_MANIFEST` (issue #354): the manifest-side twin of that cache
+//! override, so the whole resolver — `check` → `reference_record` → the verdict
+//! classifier — can be pointed at a fabricated record in `/tmp` instead of
+//! editing a tracked file. Both overrides are honoured *loudly*: an empty,
+//! missing, unreadable or malformed manifest refuses by name and never falls back
+//! to the checked-in record, because a gate that quietly tests a different record
+//! than the one it was pointed at is worse than one that cannot be pointed
+//! anywhere.
 //!
 //! **Which build the file is** (issue #349). A `ref/…` path holds two recorded
 //! contents because the two boxes' `llama-quantize` builds differ, and the
@@ -47,15 +55,29 @@
 //! record does not name (a `/tmp` experiment, a replaced file) cannot be blamed
 //! on a compiler.
 
+use std::cell::Cell;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// The checked-in record. `CARGO_MANIFEST_DIR` keeps it correct from a worktree.
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/f6-fixtures.json");
+
+/// The record's own relocation (issue #354), the manifest-side twin of
+/// [`CACHE_ENV`]: the path this reader loads instead of [`MANIFEST`], so a test
+/// or an experiment can point the gate at a fabricated record without editing a
+/// tracked file. Honoured **loudly** — a value that is set but empty, or a path
+/// that is missing, unreadable or malformed, refuses by name and never falls back
+/// to [`MANIFEST`]: a gate that quietly reads a different record than the one it
+/// was pointed at is worse than one that cannot be pointed anywhere.
+const MANIFEST_ENV: &str = "MINFER_F6_MANIFEST";
+
+/// The fixture cache root's relocation (issue #205).
+const CACHE_ENV: &str = "MINFER_F6_CACHE";
 
 /// One artifact content identity. Only the fields this module judges are read;
 /// `scripts/check_f6_fixtures.py` is the authority on the rest of the shape.
@@ -196,25 +218,145 @@ struct Manifest {
     entries: Vec<Entry>,
 }
 
-fn manifest() -> &'static Manifest {
-    static MANIFEST_CACHE: OnceLock<Manifest> = OnceLock::new();
-    MANIFEST_CACHE.get_or_init(|| {
-        let text = std::fs::read_to_string(MANIFEST)
-            .unwrap_or_else(|e| panic!("the F6 fixture manifest {MANIFEST} is unreadable: {e}"));
-        let m: Manifest = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("the F6 fixture manifest {MANIFEST} does not parse: {e}"));
-        assert_eq!(
-            m.schema, 1,
-            "the F6 fixture manifest's schema is {} — this reader knows 1",
+/// Serialises the `MINFER_F6_MANIFEST` window against every reader (issue #354).
+///
+/// The environment is process-wide, so a test that points the override at a
+/// fabricated record has a window in which *any* concurrent reader would resolve
+/// the wrong file — and, on the malformed arm, panic. Every reader therefore
+/// resolves through a guard, and the swapping test holds the same guard for its
+/// whole body. It is reentrant on its own thread because that test necessarily
+/// calls the entry points that take it; the repo's preference for an explicit
+/// argument over a mutated environment (#185) cannot reach here, because the
+/// environment variable *is* the feature.
+static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+thread_local! {
+    static OVERRIDE_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct OverrideGuard {
+    _held: Option<MutexGuard<'static, ()>>,
+}
+
+impl OverrideGuard {
+    fn acquire() -> Self {
+        let outermost = OVERRIDE_DEPTH.with(|d| {
+            let was = d.get();
+            d.set(was + 1);
+            was == 0
+        });
+        Self {
+            _held: if outermost {
+                Some(OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+            } else {
+                None
+            },
+        }
+    }
+}
+
+impl Drop for OverrideGuard {
+    fn drop(&mut self) {
+        OVERRIDE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+fn resolve_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = OverrideGuard::acquire();
+    f()
+}
+
+/// The record path this process reads: `MINFER_F6_MANIFEST` when it is set, else
+/// the checked-in [`MANIFEST`]. A value that is set but empty is refused rather
+/// than read as "unset" — the operator who pointed the gate somewhere must never
+/// get the checked-in record back without being told.
+fn manifest_path() -> Result<PathBuf, String> {
+    match std::env::var_os(MANIFEST_ENV) {
+        None => Ok(PathBuf::from(MANIFEST)),
+        Some(v) if v.is_empty() => Err(format!(
+            "{MANIFEST_ENV} is set but empty. An empty override is refused, not read as \
+             \"unset\": falling back to the checked-in {MANIFEST} while the operator believed \
+             the gate was pointed elsewhere is exactly the silent wrong-file failure this \
+             override exists to prevent (issue #354). Unset it, or name a path."
+        )),
+        Some(v) => Ok(PathBuf::from(v)),
+    }
+}
+
+/// Parse one manifest, refusing by name and by reason.
+///
+/// No failure falls back to the checked-in record: the gate compares against the
+/// record it was pointed at, or it does not run (issue #354). The message always
+/// names the file and, when it came from the override, the variable that named it.
+fn load_manifest(path: &Path) -> Result<Manifest, String> {
+    let what = if path == Path::new(MANIFEST) {
+        format!("the checked-in F6 fixture manifest {MANIFEST}")
+    } else {
+        format!(
+            "the F6 fixture manifest {MANIFEST_ENV} names ({})",
+            path.display()
+        )
+    };
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        format!("{what} is unreadable: {e} — refusing rather than reading {MANIFEST} instead")
+    })?;
+    let m: Manifest = serde_json::from_str(&text).map_err(|e| {
+        format!("{what} does not parse: {e} — refusing rather than reading {MANIFEST} instead")
+    })?;
+    if m.schema != 1 {
+        return Err(format!(
+            "{what} has schema {} — this reader knows 1",
             m.schema
-        );
-        m
+        ));
+    }
+    Ok(m)
+}
+
+/// The record at `path`, parsed once per distinct path.
+///
+/// The cache is keyed on the path rather than being a single `OnceLock` because
+/// the override must be *swappable*: a `OnceLock` freezes whichever path the
+/// first caller resolved, which is what made the recorded-foreign-build verdict
+/// untestable in-process (issue #354). A run that never sets the variable holds
+/// exactly one entry, so the ordinary path is unchanged.
+fn manifest_at(path: &Path) -> &'static Manifest {
+    static MANIFEST_CACHE: Mutex<Vec<(PathBuf, &'static Manifest)>> = Mutex::new(Vec::new());
+    let mut cache = MANIFEST_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, m)) = cache.iter().find(|(p, _)| p.as_path() == path) {
+        return *m;
+    }
+    let m: &'static Manifest = Box::leak(Box::new(
+        load_manifest(path).unwrap_or_else(|e| panic!("{e}")),
+    ));
+    cache.push((path.to_path_buf(), m));
+    m
+}
+
+/// The record the resolver is using right now: the path the override names (else
+/// the checked-in one), its parsed entries and the cache root they are judged
+/// against — resolved **together** under the override lock, so a concurrent swap
+/// cannot pair one path with another's entries or root (issue #354).
+struct Record {
+    manifest_path: PathBuf,
+    manifest: &'static Manifest,
+    cache_root: PathBuf,
+}
+
+fn current_record() -> Record {
+    resolve_lock(|| {
+        let manifest_path = manifest_path().unwrap_or_else(|e| panic!("{e}"));
+        let manifest = manifest_at(&manifest_path);
+        let cache_root = cache_root(manifest);
+        Record {
+            manifest_path,
+            manifest,
+            cache_root,
+        }
     })
 }
 
 /// The fixture cache root: `MINFER_F6_CACHE` when set, else the manifest's own.
 fn cache_root(m: &Manifest) -> PathBuf {
-    let raw = std::env::var("MINFER_F6_CACHE").unwrap_or_else(|_| m.cache_root.clone());
+    let raw = std::env::var(CACHE_ENV).unwrap_or_else(|_| m.cache_root.clone());
     expand_home(&raw)
 }
 
@@ -281,7 +423,8 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// (nothing recorded) — the arms the caller turns into "unattributable" and the
 /// resolver turns into a refusal respectively.
 pub fn reference_record(path: &Path) -> ReferenceRecord {
-    reference_record_in(path, manifest(), &cache_root(manifest()))
+    let r = current_record();
+    reference_record_in(path, r.manifest, &r.cache_root)
 }
 
 fn reference_record_in(path: &Path, m: &Manifest, root: &Path) -> ReferenceRecord {
@@ -324,12 +467,19 @@ fn reference_record_in(path: &Path, m: &Manifest, root: &Path) -> ReferenceRecor
 ///
 /// `Ok(None)` — not a fixture this module judges (outside the cache, or a
 /// directory). `Err(message)` — the caller must refuse; the message names the
-/// file, every recorded digest and the actual one.
+/// file, every recorded digest, the actual one and the record it was judged
+/// against.
 pub fn verify(path: &Path) -> Result<Option<String>, String> {
-    verify_in(path, manifest(), &cache_root(manifest()))
+    let r = current_record();
+    verify_in(path, r.manifest, &r.cache_root, &r.manifest_path)
 }
 
-fn verify_in(path: &Path, m: &Manifest, root: &Path) -> Result<Option<String>, String> {
+fn verify_in(
+    path: &Path,
+    m: &Manifest,
+    root: &Path,
+    manifest_path: &Path,
+) -> Result<Option<String>, String> {
     if path.is_dir() {
         return Ok(None);
     }
@@ -340,10 +490,11 @@ fn verify_in(path: &Path, m: &Manifest, root: &Path) -> Result<Option<String>, S
             return Ok(None);
         }
         return Err(format!(
-            "F6 fixture cache: {} is not in {MANIFEST} — nothing records what produced it, so a \
-             gate comparing against it would certify the wrong bytes (issue #205). Move it out of \
-             {} or record it (path, bytes, sha256, producer, date, box).",
+            "F6 fixture cache: {} is not in {} — nothing records what produced it, so a gate \
+             comparing against it would certify the wrong bytes (issue #205). Move it out of {} \
+             or record it (path, bytes, sha256, producer, date, box).",
             path.display(),
+            manifest_path.display(),
             root.display()
         ));
     }
@@ -390,11 +541,12 @@ fn verify_in(path: &Path, m: &Manifest, root: &Path) -> Result<Option<String>, S
         }
     }
     Err(format!(
-        "F6 fixture cache: {} is not the content {MANIFEST} records (actual sha256 {actual}; \
-         recorded: {}). A stale or replaced fixture would otherwise be compared against silently \
-         (issue #205): re-run the recipe in docs/GGUF-TOOLING.md §4.2.1, or keep the experiment \
-         outside the cache root.",
+        "F6 fixture cache: {} is not the content {} records (actual sha256 {actual}; recorded: \
+         {}). A stale or replaced fixture would otherwise be compared against silently (issue \
+         #205): re-run the recipe in docs/GGUF-TOOLING.md §4.2.1, or keep the experiment outside \
+         the cache root.",
         path.display(),
+        manifest_path.display(),
         recorded(&entries)
     ))
 }
@@ -403,11 +555,12 @@ fn verify_in(path: &Path, m: &Manifest, root: &Path) -> Result<Option<String>, S
 /// match once. A test's failure is the point — the alternative is a silently
 /// wrong comparison.
 pub fn check(path: &Path) {
-    check_in(path, manifest(), &cache_root(manifest()));
+    let r = current_record();
+    check_in(path, r.manifest, &r.cache_root, &r.manifest_path);
 }
 
-fn check_in(path: &Path, m: &Manifest, root: &Path) {
-    match verify_in(path, m, root) {
+fn check_in(path: &Path, m: &Manifest, root: &Path, manifest_path: &Path) {
+    match verify_in(path, m, root, manifest_path) {
         Ok(None) => {}
         Ok(Some(note)) => eprintln!("[f6 fixtures] WEAK {note}"),
         Err(msg) => panic!("{msg}"),
@@ -420,7 +573,9 @@ fn check_in(path: &Path, m: &Manifest, root: &Path) {
 /// `scripts/check_f6_fixtures.py` (CI `check-docs`).
 #[test]
 fn f6_fixture_manifest_parses_and_every_entry_has_an_identity() {
-    let m = manifest();
+    // The **checked-in** record, never the override: this audit is about the
+    // tracked file, and `scripts/check_f6_fixtures.py` audits the same one.
+    let m = manifest_at(Path::new(MANIFEST));
     assert!(!m.entries.is_empty());
     for e in &m.entries {
         assert!(!e.path.is_empty() && !e.path.starts_with('/'), "{e:?}");
@@ -537,24 +692,27 @@ fn f6_fixture_a_tampered_cached_reference_is_refused_by_name_and_digest() {
     };
     let root = std::env::temp_dir().join(format!("f6-fixture-refusal-{}", std::process::id()));
     let target = root.join("ref/tiny.gguf");
+    // The fabricated record's own label, for the refusal messages.
+    let record = Path::new("fabricated-f6-fixtures.json");
     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
     // The recorded file verifies...
     std::fs::write(&target, b"tiny").unwrap();
-    assert!(matches!(verify_in(&target, &m, &root), Ok(None)));
+    assert!(matches!(verify_in(&target, &m, &root, record), Ok(None)));
     // ... and one flipped byte is refused by name, actual digest and record.
     std::fs::write(&target, b"tinv").unwrap();
     // The resolver the gates actually reach (`env_path` -> `check`) must refuse
     // too, not just the inner function: a `check` that returned quietly would
     // leave every F6 gate comparing against a tampered file.
     let panicked = std::panic::catch_unwind(|| {
-        check_in(&target, &m, &root);
+        check_in(&target, &m, &root, record);
     })
     .is_err();
     assert!(
         panicked,
         "the fixture resolver must panic on a tampered file"
     );
-    let err = verify_in(&target, &m, &root).expect_err("a tampered cache fixture must be refused");
+    let err = verify_in(&target, &m, &root, record)
+        .expect_err("a tampered cache fixture must be refused");
     assert!(err.contains(&target.display().to_string()), "{err}");
     assert!(err.contains("actual sha256"), "{err}");
     assert!(err.contains("issue #205"), "{err}");
@@ -564,7 +722,8 @@ fn f6_fixture_a_tampered_cached_reference_is_refused_by_name_and_digest() {
     // is refused too: an unrecorded reference is the same hazard as a stale one.
     let stray = root.join("ref/unrecorded.gguf");
     std::fs::write(&stray, b"tiny").unwrap();
-    let err = verify_in(&stray, &m, &root).expect_err("an unrecorded cache file must be refused");
+    let err =
+        verify_in(&stray, &m, &root, record).expect_err("an unrecorded cache file must be refused");
     assert!(err.contains("is not in"), "{err}");
     std::fs::remove_dir_all(&root).ok();
 }
@@ -701,4 +860,244 @@ fn the_f6_parity_verdict_names_the_recorded_build() {
     );
     std::fs::remove_dir_all(&root).ok();
     let _ = std::fs::remove_file(&outside);
+}
+
+/// Set `key` to `value` for the duration of `f`, restoring the previous value on
+/// every exit path — including a panic. The caller holds an [`OverrideGuard`], so
+/// no other reader can observe the half-swapped environment.
+fn with_env_var<R>(key: &str, value: &OsStr, f: impl FnOnce() -> R) -> R {
+    struct Restore {
+        key: String,
+        previous: Option<OsString>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+    let _restore = Restore {
+        key: key.to_string(),
+        previous: std::env::var_os(key),
+    };
+    std::env::set_var(key, value);
+    f()
+}
+
+/// Issue #354: the whole resolver — `check` → `reference_record` → `classify`,
+/// the path an F6 gate reaches through `env_path` — runs against a fabricated
+/// record named by `MINFER_F6_MANIFEST`. The arm this buys back is
+/// `ParityVerdict::RecordedForeignBuild`: a reference whose digest *is* recorded
+/// but is not the path's `authoritative_reference`, which #349 could only
+/// exercise by editing the tracked manifest under a `cp` backup.
+///
+/// The record is the same two-content shape #349's classifier test builds and the
+/// fixture is 4 bytes (a real one is ~350 MB), so the arms under test are the
+/// override, the path resolution and the digest lookup — not the file size. The
+/// real cache is never read or written.
+#[test]
+fn the_manifest_override_drives_the_whole_resolver() {
+    let _override = OverrideGuard::acquire();
+    let tmp = std::env::temp_dir().join(format!("f6-manifest-override-{}", std::process::id()));
+    let root = tmp.join("cache");
+    let manifest = tmp.join("f6-fixtures.json");
+    // sha256("tiny") — the authoritative content, a `gcc` `-ffp-contract=fast`
+    // build; sha256("tinv") — the recorded *foreign* content, an Apple clang build
+    // of the same source. Both computed independently of this module.
+    const AUTHORITATIVE_SHA: &str =
+        "8950abfda7b727630760dd35bcf5c3daa7631aff223a90f7728c0d2521dde10c";
+    const FOREIGN_SHA: &str = "c53fe36c10e45164b7c80362114a9230cc8421eeeddb8fb9547063ad4b2065fd";
+    let doc = serde_json::json!({
+        "schema": 1,
+        "cache_root": root.display().to_string(),
+        "entries": [
+            {
+                "path": "ref/tiny.gguf",
+                "bytes": 4,
+                "sha256": AUTHORITATIVE_SHA,
+                "box": "dgxspark (aarch64, GB10 sm_121)",
+                "date": "2026-10-07",
+                "producer_kind": "llama-quantize",
+                "compiler": "gcc 13.3.0",
+                "ffp_contract": "fast",
+                "llamacpp_commit": "unrecorded",
+                "authoritative_reference": true,
+            },
+            {
+                "path": "ref/tiny.gguf",
+                "bytes": 4,
+                "sha256": FOREIGN_SHA,
+                "box": "macbook (macOS 27.0.1, Apple M4 Pro)",
+                "date": "2026-10-07",
+                "producer_kind": "llama-quantize",
+                "compiler": "Apple clang 21.0.0 (Xcode 27.0)",
+                "ffp_contract": "fast",
+                "llamacpp_commit": "c479922ac",
+                "authoritative_reference": false,
+            },
+        ],
+    });
+    std::fs::create_dir_all(root.join("ref")).unwrap();
+    std::fs::write(&manifest, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    let target = root.join("ref/tiny.gguf");
+
+    with_env_var(MANIFEST_ENV, manifest.as_os_str(), || {
+        with_env_var(CACHE_ENV, root.as_os_str(), || {
+            // 1. The authoritative content: recorded, and marked as such. A
+            //    mismatch against it is an encoder defect, never excused.
+            std::fs::write(&target, b"tiny").unwrap();
+            let verified = verify(&target);
+            assert!(
+                matches!(verified, Ok(None)),
+                "the authoritative content must verify against the override: {verified:?}"
+            );
+            let r = reference_record(&target);
+            assert!(r.content_recorded && r.matched_authoritative, "{r:?}");
+            assert_eq!(r.matched.as_ref().unwrap().compiler, "gcc 13.3.0");
+            assert_eq!(
+                ParityVerdict::classify(false, false, &r),
+                ParityVerdict::AuthoritativeNotReproduced
+            );
+
+            // 2. The recorded *foreign* build — the verdict #349 could only fake
+            //    by editing the tracked manifest. It is recorded, so it is honest;
+            //    it is not authoritative, so it is not a defect: the gate turns
+            //    this into a loud skip and exits 0.
+            std::fs::write(&target, b"tinv").unwrap();
+            let verified = verify(&target);
+            assert!(
+                matches!(verified, Ok(None)),
+                "a recorded content verifies whatever build it is: {verified:?}"
+            );
+            let r = reference_record(&target);
+            assert!(r.content_recorded, "{r:?}");
+            assert!(!r.matched_authoritative, "{r:?}");
+            assert_eq!(
+                r.matched.as_ref().unwrap().compiler,
+                "Apple clang 21.0.0 (Xcode 27.0)"
+            );
+            assert_eq!(r.authoritative.as_ref().unwrap().compiler, "gcc 13.3.0");
+            assert_eq!(
+                ParityVerdict::classify(false, false, &r),
+                ParityVerdict::RecordedForeignBuild
+            );
+            // Both builds are in the record, which is what the skip line names.
+            assert!(r
+                .matched
+                .as_ref()
+                .unwrap()
+                .describe()
+                .contains("Apple clang"));
+            assert!(r
+                .authoritative
+                .as_ref()
+                .unwrap()
+                .describe()
+                .contains("gcc 13.3.0"));
+
+            // 3. A file inside the cache root the record does not name: refused,
+            //    and nothing is attributed to it.
+            let stray = root.join("ref/stray.gguf");
+            std::fs::write(&stray, b"tiny").unwrap();
+            let err = verify(&stray).expect_err("an unrecorded cache file is refused");
+            assert!(err.contains(&stray.display().to_string()), "{err}");
+            assert!(err.contains(&manifest.display().to_string()), "{err}");
+            assert!(err.contains("is not in"), "{err}");
+            assert_eq!(
+                ParityVerdict::classify(false, false, &reference_record(&stray)),
+                ParityVerdict::Unattributable
+            );
+
+            // 4. A tampered copy of a recorded content: refused by name, digest
+            //    and the record it was judged against.
+            std::fs::write(&target, b"tanz").unwrap();
+            let err = verify(&target).expect_err("a tampered cache fixture is refused");
+            assert!(err.contains(&target.display().to_string()), "{err}");
+            assert!(err.contains("actual sha256"), "{err}");
+            assert!(err.contains(&manifest.display().to_string()), "{err}");
+            assert_eq!(
+                ParityVerdict::classify(false, false, &reference_record(&target)),
+                ParityVerdict::Unattributable
+            );
+        });
+    });
+
+    // The default is unaffected: with the override gone the resolver reads the
+    // checked-in record again. The parse cache is keyed on the path, so this is a
+    // fresh read of the tracked file and not a stale hit on the fabricated one.
+    let r = current_record();
+    assert_eq!(r.manifest_path, PathBuf::from(MANIFEST));
+    assert_eq!(r.manifest.schema, 1);
+    assert!(!r.manifest.entries.is_empty());
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// An override is honoured **loudly** (issue #354): a value that is set but
+/// empty, a path that does not exist, and a file that is not JSON each refuse by
+/// name — the reader never falls back to the checked-in record, because a gate
+/// quietly comparing against a different manifest than the operator pointed it
+/// at is worse than one that cannot be pointed anywhere.
+#[test]
+fn a_broken_manifest_override_refuses_by_name_instead_of_falling_back() {
+    let _override = OverrideGuard::acquire();
+    let tmp = std::env::temp_dir().join(format!("f6-manifest-broken-{}", std::process::id()));
+    let missing = tmp.join("missing.json");
+    let malformed = tmp.join("malformed.json");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(&malformed, b"{ not json").unwrap();
+
+    // An empty value is refused before any file is touched: it is not "unset".
+    with_env_var(MANIFEST_ENV, OsStr::new(""), || {
+        let err = manifest_path().expect_err("an empty override is refused");
+        assert!(err.contains(MANIFEST_ENV), "{err}");
+        assert!(err.contains("empty"), "{err}");
+        assert!(err.contains(MANIFEST), "{err}");
+    });
+
+    // A path that does not exist, and a file that does not parse: both name the
+    // override, the path and the problem.
+    let err = match load_manifest(&missing) {
+        Ok(m) => panic!("a missing override fell back: {} entries", m.entries.len()),
+        Err(e) => e,
+    };
+    assert!(err.contains(MANIFEST_ENV), "{err}");
+    assert!(err.contains(&missing.display().to_string()), "{err}");
+    assert!(err.contains("unreadable"), "{err}");
+    let err = match load_manifest(&malformed) {
+        Ok(m) => panic!(
+            "a malformed override fell back: {} entries",
+            m.entries.len()
+        ),
+        Err(e) => e,
+    };
+    assert!(err.contains(MANIFEST_ENV), "{err}");
+    assert!(err.contains(&malformed.display().to_string()), "{err}");
+    assert!(err.contains("does not parse"), "{err}");
+
+    // Through the resolver the gates reach: no silent fall back — the run refuses
+    // instead of comparing against the checked-in record.
+    with_env_var(MANIFEST_ENV, missing.as_os_str(), || {
+        let refused = std::panic::catch_unwind(|| {
+            let _ = verify(Path::new("/tmp/no-such-fixture.gguf"));
+        })
+        .is_err();
+        assert!(refused, "a missing override must refuse, not fall back");
+        let refused = std::panic::catch_unwind(|| {
+            let _ = reference_record(Path::new("/tmp/no-such-fixture.gguf"));
+        })
+        .is_err();
+        assert!(refused, "a missing override must refuse, not fall back");
+        assert_eq!(
+            manifest_path().unwrap(),
+            missing,
+            "the override, not the checked-in record, is what the resolver reads"
+        );
+    });
+
+    // ... and the checked-in record is reachable again once the override is gone.
+    let r = current_record();
+    assert_eq!(r.manifest_path, PathBuf::from(MANIFEST));
+    std::fs::remove_dir_all(&tmp).ok();
 }
