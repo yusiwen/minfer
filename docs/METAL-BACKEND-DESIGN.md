@@ -531,6 +531,18 @@ CParams.gpu = metal_on || cuda_on
 - **Weights are zero-copy** over the mmap'd GGUF parts, with the ~44 ms first-touch page cost paid
   at load by a dummy warm-up read (`METAL_OPTIMIZATIONS.md` §0 Done #39). `MINFER_WEIGHT_COPY=1` forces
   per-weight copies.
+- **E4 charges the registered weights ([#299](https://github.com/yusiwen/minfer/issues/299)).** The
+  registry (`MpsStateInner::weights`) stores each weight's own byte extent, and
+  `MpsState::weights_bytes` sums it (recovering a poisoned lock rather than reporting `0`, the CUDA
+  twin); `MetalBackend::weights_bytes` forwards it, so `weights + pooled + request > budget` is the
+  one comparison on Metal too. Until #299 the trait-default `0` let the E4 gate ignore the resident
+  weights the E5 `auto` fit already charged from the GGUF index — on the measured Mac a 7B Q4_K_M's
+  ~4.4 GiB against a 38 339 MiB `recommendedMaxWorkingSetSize` (the gate could admit the weights
+  more than the pool it protects). The gate is
+  `graph::alloc::tests::budget::metal_registered_weights_are_charged_in_the_budget_gate`; with
+  `weights_bytes` forced back to `0` its budget refusal does not happen and the gate fails at the
+  `unwrap_err`. The per-weight extent is `tensor.data().len()`: 2 B/element for f16/bf16, the block
+  size for a quant — the same bytes CUDA's registry sums.
 - **KV element type.** The persistent regions stay f32-shaped in the IR, but the engine's per-instance
   `kv_format` picks f16 for the 7B class (KV-bandwidth-bound; measured ~−1 ms/token at 2K) and f32
   for small models (f16 measured ~3% slower there); `MINFER_CACHE_TYPE` overrides. The arm is
@@ -786,9 +798,9 @@ regression**. Taken at `6b95763` (the round's final master), 2026-10-06, on
 `macbook (macOS 27.0.1, Apple M4 Pro)`.
 
 - **unit** `cargo test --release --no-fail-fast`: **531 passed / 0 failed / 43
-  ignored** — green. (The live count is **532 / 0 / 43** since [#329] added the
-  Metal dispatch-refusal gate on 2026-10-07; the enumeration below is this
-  round's record at `6b95763`.)
+  ignored** — green. (The live count is **533 / 0 / 43** since [#329] added the
+  Metal dispatch-refusal gate and [#299] the weights-charged E4 gate on 2026-10-07;
+  the enumeration below is this round's record at `6b95763`.)
 - **integration**: **21 passed / 0 failed / 6 ignored**.
 - **real-model** (`PARALLEL=0 scripts/real_model_gates.sh`, serial), both cached
   models (0.5B f32 KV and Qwen3-0.6B f16 KV): **42 passed / 1 failed** each. The
@@ -822,6 +834,7 @@ left the macOS test binary uncompilable until `4add59f` (2026-10-05) with no CI 
 
 [#54]: https://github.com/yusiwen/minfer/issues/54
 [#298]: https://github.com/yusiwen/minfer/issues/298
+[#299]: https://github.com/yusiwen/minfer/issues/299
 [#303]: https://github.com/yusiwen/minfer/issues/303
 [#305]: https://github.com/yusiwen/minfer/issues/305
 [#329]: https://github.com/yusiwen/minfer/issues/329

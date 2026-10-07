@@ -1688,6 +1688,19 @@ impl Backend for MetalBackend {
     fn synchronize(&mut self) {
         self.submit_pending();
     }
+
+    /// Bytes of registered weights (E4: the feasibility gate charges the budget for
+    /// them). Since [#299](https://github.com/yusiwen/minfer/issues/299) this reads the
+    /// bytes `MpsState` actually registered (mmap-backed `NoCopy` slices and per-weight
+    /// copies alike) instead of the trait default `0`, so Metal is charged exactly like
+    /// CPU and CUDA.
+    ///
+    /// Appended at the end of the impl on purpose: the file carries inbound
+    /// `metal_backend.rs:NNN` anchors above line 1036, and a method inserted mid-impl
+    /// would shift every one of them (rule of GATE-CONTRACT §"Prose anchors").
+    fn weights_bytes(&self) -> usize {
+        self.state.weights_bytes()
+    }
 }
 
 /// The Metal backend exists only where the trait sees it; helper for the

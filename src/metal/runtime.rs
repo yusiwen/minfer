@@ -335,7 +335,36 @@ impl MpsState {
         }
         #[cfg(target_os = "macos")]
         {
-            self.inner.weights.lock().unwrap().get(name).cloned()
+            self.inner
+                .weights
+                .lock()
+                .unwrap()
+                .get(name)
+                .map(|(buf, off, _len)| (buf.clone(), *off))
+        }
+    }
+
+    /// Bytes of device-resident weights this state registered (E4: the feasibility
+    /// gate charges the budget for them, so "weights + activations" is one
+    /// comparison — issue #299). Sums the registry; each entry's length is the
+    /// tensor's own registered extent (2 B/element for f16/bf16, the block size for
+    /// a quant), whether it is mmap-backed (`NoCopy`) or a per-weight copy.
+    ///
+    /// A poisoned lock is recovered rather than answered with `0`, the same reason
+    /// as `CudaState::weights_bytes`: reporting 0 would silently under-charge the
+    /// budget by every resident weight (issue #122's fail-open twin).
+    pub fn weights_bytes(&self) -> usize {
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::graph::alloc::weights_from_lock(
+                self.inner.weights.lock(),
+                "Metal weight registry",
+                |w| w.values().map(|(_, _, len)| *len).sum(),
+            )
         }
     }
 
@@ -485,7 +514,7 @@ impl MpsState {
                 .weights
                 .lock()
                 .unwrap()
-                .insert(name.to_string(), (buf, off));
+                .insert(name.to_string(), (buf, off, data.len()));
         }
     }
 
