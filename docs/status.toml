@@ -30,8 +30,15 @@ baseline_commit = "f32daa7"
 refreshed_against = "53b3ace"
 
 # The one honest `next:` sentence. It replaced a stale one that still called
-# E4/E5 upcoming years after they landed (issue #94).
-next = "F1 (needs x86)"
+# E4/E5 upcoming years after they landed (issue #94), and a later one that read
+# "F1 (needs x86)": accurate and useless at once, because the project's two
+# boxes are dgxspark (aarch64) and macbook (macOS) and the x86_64 CI runner
+# cannot host interactive work (#335). It now names a lane that can start on
+# each box; F1's hardware wait is recorded in the plan's §9 table, its §11
+# sequencing diagram and its §14 hardware row, where a reader of the plan sees
+# it. The value is compared *literally* against the plan's `Next: ….**`
+# sentence, so the two must be edited together.
+next = "the macOS round-2 tickets tracked in #333, on macbook (macOS 27.0.1, Apple M4 Pro), and the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121); F1 (AVX2 K-quant dots) still waits for an x86 host"
 
 # --- prose locations for the three scalars ----------------------------------
 

@@ -13,9 +13,10 @@ dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issu
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **complete** (3/3) (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
 **complete** (7/7) (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **in progress** (7/8) (F2, F3, **F4**, **F5**, **F6**, F7,
-F8 done; F1 needs x86); Phase G
+F8 done; **F1 waits for an x86 host**); Phase G
 **complete** (7/7) — G1–G7 all landed on a Mac (the KV port G5 and the
-measurement bookend G7 last; [#54](https://github.com/yusiwen/minfer/issues/54) recorded the round's final baseline). **Next: F1 (needs x86).** The order was
+measurement bookend G7 last; [#54](https://github.com/yusiwen/minfer/issues/54) recorded the round's final baseline).
+**Next: the macOS round-2 tickets tracked in #333, on macbook (macOS 27.0.1, Apple M4 Pro), and the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121); F1 (AVX2 K-quant dots) still waits for an x86 host.** The order was
 deliberate: the Metal KV port (G5) came **after** the CUDA arena stopped changing shape
 (C7, C7b, C8), so those semantics were written into Metal once — it landed on a Mac 2026-10-06. Per-ticket evidence is in
 each phase's record and in the §14 open-risks table.
@@ -7255,6 +7256,23 @@ F1 is the only item in this plan that **cannot be verified on dgxspark**
 single CPU win, so it should be scheduled against hardware availability, not
 against the critical path.
 
+**The hardware lane, stated where the sequencing is read (#335).** F1
+(AVX2/AVX-512 K-quant dots, [#56](https://github.com/yusiwen/minfer/issues/56))
+waits for an **x86 host** — an entirely different machine class from the two
+boxes this project owns, `dgxspark (aarch64, GB10 sm_121)` and `macbook (macOS
+27.0.1, Apple M4 Pro)`; the `x86_64 (CI runner)` is GitHub's ephemeral runner and
+cannot host interactive work. It is therefore **not** the project's `next:`
+sentence, and `docs/status.toml`'s `next:` no longer says so. What can start on
+the two boxes instead, per the §14 hardware row: on **macbook** the macOS round-2
+tickets tracked in [#333](https://github.com/yusiwen/minfer/issues/333) (the
+Metal-only list and the order, with [#310](https://github.com/yusiwen/minfer/issues/310)
+the last capability gap); on **dgxspark** the open Linux-side tickets —
+[#200](https://github.com/yusiwen/minfer/issues/200) (the CUDA
+`Op::FusedQkvNorm` kernel), [#212](https://github.com/yusiwen/minfer/issues/212),
+[#354](https://github.com/yusiwen/minfer/issues/354) and
+[#356](https://github.com/yusiwen/minfer/issues/356). No schedule is attached to
+either lane; this is a statement about which machine each one needs.
+
 ### F3 — Sampler set (#48) — **DONE 2026-09-24**
 
 **What landed.** `src/sampler.rs` gained a `SamplerConfig` (the pre-F3 knobs plus
@@ -9240,7 +9258,7 @@ Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exi
 Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3 ✔ S4 ✔ S5 ✔) ─ C4 ✔ (S1, CPU; S2 = #87) ─ C5 ✔   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ✔ ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
-Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = needs x86
+Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = waits for an x86 host
 Phase G  └─────────────────► G1 ─ G2 ─ G3 ─ G5 ─ G4 ─ G6 ─ G7   (after C8; G1–G3 compile-verified in CI; device claims need a Mac)
 ```
 
@@ -9248,6 +9266,18 @@ Phase G  └─────────────────► G1 ─ G2 ─
 **Deliberate exception to the roadmap's ordering:** A1/A2 run *before* the
 hazard-removal tickets, because they are the instrument that proves those
 tickets and everything after them.
+
+**Hardware lanes (#335).** `F1 = waits for an x86 host` in the diagram is a
+*machine* constraint, not a position in the order: F1 cannot run on either box
+this project owns. The two lanes that can start today are the macOS round-2
+tickets tracked in [#333](https://github.com/yusiwen/minfer/issues/333) on
+`macbook (macOS 27.0.1, Apple M4 Pro)`, and the open Linux-side tickets
+(`cuda` / `tooling` / `docs`) on `dgxspark (aarch64, GB10 sm_121)`. §14 row 8
+carries the same split and §9's F table states it next to F1. The
+`x86_64 (CI runner)` does not count as an x86 host for F1: it is GitHub's
+ephemeral runner, it cannot host an interactive session, and it is a CI job, not
+a box someone develops on — F1 waits for an x86 machine the maintainer can work
+on.
 
 ## 12. What "done" means per phase
 
@@ -9409,7 +9439,7 @@ Earlier text (kept for the record of how the diagnosis narrowed): a focused devi
 | 5 | ~~**Batching is opt-in** even where it is measured faster.~~ **Closed by E6 (2026-09-19)**: the default follows the device, with `=1`/`=0` as the override — **amended 2026-10-06**: [#44](https://github.com/yusiwen/minfer/issues/44) part (b) made Metal batched too, so it is CUDA **and Metal** on, CPU off. | product | done |
 | 6 | **`conversation_real_model_smoke` and `dump_real_q4k/q5k_tensor` are red** (ignored tests). Attribution done: the first fails identically on master + device, the others are pre-existing debug dumps. They are not gates, but a red ignored test is easy to mistake for noise. | pre-existing | Either fix their assertions/artifacts or mark them clearly in their doc comments; not caused by any PR in this campaign. |
 | 7 | **Roadmap item 25 (metrics/observability) had no ticket** — the only orphan from the A-era batch. | planning | **F8**, added with this section. |
-| 8 | **F1 (AVX2 K-quant dots) and all of Phase G need different hardware** (x86 / a Mac). They cannot be started, let alone verified, on dgxspark. | hardware | Sequencing §11; F1 is the largest single CPU win. |
+| 8 | **The hardware lane: F1 (AVX2/AVX-512 K-quant dots, [#56](https://github.com/yusiwen/minfer/issues/56)) needs an x86 host, which neither box this project owns is** — `dgxspark (aarch64, GB10 sm_121)` and `macbook (macOS 27.0.1, Apple M4 Pro)` are the two machines, and the `x86_64 (CI runner)` is ephemeral and cannot host interactive work. Phase G's half of this row is **closed** (complete on a Mac 2026-10-06). | hardware | Sequencing §11 ("Hardware lanes") and §9's F table; **what `next:` points at instead** (#335): the macOS round-2 tickets tracked in [#333](https://github.com/yusiwen/minfer/issues/333) on macbook, and the open Linux-side tickets — [#200](https://github.com/yusiwen/minfer/issues/200) (CUDA `Op::FusedQkvNorm`), [#212](https://github.com/yusiwen/minfer/issues/212), [#354](https://github.com/yusiwen/minfer/issues/354), [#356](https://github.com/yusiwen/minfer/issues/356) — on dgxspark; no schedule is attached to either lane. F1 is the largest single CPU win and stays queued behind the x86 host. |
 | 9 | **A sequence's logits' tail depended on its absolute arena offset — resolved by C6 (2026-09-19)** (found while gating C3). The pre-C6 measurements stand and are what justified the fix: at cell 0 vs cell 8 the max |Δ| over the vocabulary was 2.6% relative with the greedy token unchanged and the run deterministic; the hand-built `q`/`k`/`v` → rope → store → attn graph is exact to ≤ 1.2e-7 at the model's own shape *and* equal for a 1-cell and an 8-cell offset; the arena layout is irrelevant (a split reservation is bit-identical per layer); `positions` had exactly four consumers per layer (96 = 24×4); a layer bisect put the entry at layer 0's attention output; and the **rope-injection intervention** proved the entry is RoPE alone (injecting run A's 48 rope outputs into run B made the logits bitwise identical), while a distributed ~1e-6 rope perturbation already saturates the tail (0.44 vs 0.43) with the greedy token stable from 1e-6 to 1e-2. **C6 removed the coupling** — `positions` are sequence-relative and the allocator resolves `cells` — so a cell move changes no angle: the offset tests now assert bitwise equality, C3's acceptance tightens from the named amplified-rounding class to bit-identical, and a compaction no longer re-ropes. Three method notes earned here: a zero from a perturbation probe means nothing without a loud control; **a control validates the path, not the equivalence of the perturbation** (a single element nudged by 1e-5 is not the offset's distributed 1.5e-5 — the earlier "refutation" was an over-read); and **an intermediate buffer may only be read immediately after its own node runs** (`graph.outputs` does not extend liveness). | measurement | Done by C6; the logical-positions design, its gates and the CUDA fused-op port (S3) are in §5. |
 
 #### Test-infrastructure record (#171, 2026-09-26) — one home for the gate contract, and one failure-injection seam

@@ -1,9 +1,11 @@
 <!--
 Fill every section. The CI `check-pr-body` job (scripts/check_pr_body.py)
-requires all seven headings, and refuses a body whose two gate sections are
-empty or left at their `FILL-ME:` placeholder. The rules these sections serve
-live in docs/GATE-CONTRACT.md; a stated `N/A — <reason>` is a filled section.
-The checker can force the sentence to exist, never to be true.
+requires all eight headings, and refuses a body whose three checked sections
+are empty or left at their `FILL-ME:` placeholder. The rules these sections
+serve live in docs/GATE-CONTRACT.md — the `Mac verification` convention is
+stated in its §5, next to the box-label rule it reuses; a stated
+`N/A — <reason>` is a filled section. The checker can force the sentence to
+exist, never to be true.
 -->
 
 ## What changed
@@ -39,3 +41,13 @@ FILL-ME: the mutation command, its non-zero exit and its message
 <!-- Issues filed for what this leaves open, or `N/A — <reason>`. -->
 
 Closes #
+
+## Mac verification
+
+<!-- The macOS/Metal path this change touches and how it was checked, or why it
+     needs no Mac: `<box label> / <date> / <command>` (the box label is absolute,
+     gate contract rule 5) or `N/A — <reason>`. CI's `build-macos` only compiles
+     the crate and the test target, so this line is the record of what was run
+     on which box — and what was not. -->
+
+FILL-ME: `<box label> / <date> / <command>`, or `N/A — <reason>`
