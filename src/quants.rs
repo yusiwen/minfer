@@ -8,6 +8,8 @@ use crate::block::{self, Q41B, Q4B, Q4KB, Q6KB, Q8B};
 use std::arch::x86_64::*;
 
 mod avx2;
+#[cfg(target_arch = "x86_64")]
+mod avx512;
 mod dot_q4_0;
 mod dot_q4_1;
 mod dot_q5;
@@ -51,11 +53,26 @@ use neon::{
     dot_q6_k_q8_k as dot_q6_k_q8_k_neon,
 };
 
+#[cfg(target_arch = "x86_64")]
+use avx2::{
+    dot_q4_k_q8_k as dot_q4_k_q8_k_avx2, dot_q5_k_q8_k as dot_q5_k_q8_k_avx2,
+    dot_q6_k_q8_k as dot_q6_k_q8_k_avx2, enabled as avx2_enabled,
+};
+#[cfg(target_arch = "x86_64")]
+use avx512::{
+    dot_q4_k_q8_k as dot_q4_k_q8_k_avx512, dot_q5_k_q8_k as dot_q5_k_q8_k_avx512,
+    dot_q6_k_q8_k as dot_q6_k_q8_k_avx512, enabled as avx512_enabled,
+};
+
+#[cfg(all(test, target_arch = "x86_64"))]
+use kquant::{dot_q4_k_q8_k_scalar, dot_q5_k_q8_k_scalar, dot_q6_k_q8_k_scalar};
 #[cfg(all(test, target_arch = "aarch64"))]
 use kquant::{dot_q4_k_q8_k_scalar, dot_q6_k_q8_k_scalar};
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx2_correctness;
 #[cfg(all(test, target_arch = "aarch64"))]
 mod neon_correctness;

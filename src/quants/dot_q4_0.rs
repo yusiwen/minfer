@@ -11,7 +11,7 @@ pub fn dot_q4_0_q8_0(q4: &[u8], q8: &[u8]) -> f32 {
     debug_assert!(q4.len() >= nb * Q4B);
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if avx2_enabled() {
             return unsafe { dot_q4_0_q8_0_avx2(q4, q8, nb) };
         }
     }

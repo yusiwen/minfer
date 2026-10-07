@@ -546,17 +546,21 @@ still refused by name ([#140](https://github.com/yusiwen/minfer/issues/140)) and
 bf16 output is refused ([#142](https://github.com/yusiwen/minfer/issues/142)).
 🟢 for conversion/quantization of the supported set.
 
-**CPU SIMD.** Only `Q4_0` and `Q8_0` have AVX2 (Advanced Vector Extensions 2)
-dot kernels (`src/quants/dot_q4_0.rs:29`, `src/quants/dot_q8_0.rs:28`); `Q4_1`/`Q5_0`/`Q5_1`/`Q4_K`/`Q5_K`/`Q6_K`
-are scalar on x86 and NEON-only on aarch64 (`src/quants/kquant.rs` — the K-quant
-dispatch has no `is_x86_feature_detected` branch at all). Since K-quants are the
-most common GGUF format in circulation, x86 CPU inference is far below what the
-hardware can deliver; the support matrix documents this (`SUPPORT-MATRIX.md`,
-AVX2 column) and `CPU_OPTIMIZATIONS.md §P1` still lists Q4_K AVX2 as open. There
-is also no AVX-512/VNNI/AMX path, no aarch64 `i8mm`, and **no weight
-repacking** — the standard fix for this gap is to repack the quant blocks at
-load time into SIMD-friendly interleaved layouts. 🟠 for anyone on x86; the fix
-is well-understood and self-contained.
+**CPU SIMD.** AVX2 (Advanced Vector Extensions 2) dot kernels exist for
+`Q4_0`/`Q8_0` (`src/quants/dot_q4_0.rs:29`, `src/quants/dot_q8_0.rs:28`), and since
+[#56](https://github.com/yusiwen/minfer/issues/56) (2026-10-08) the K-quants too:
+`Q4_K`/`Q5_K`/`Q6_K × Q8_K` have AVX2+FMA kernels (`src/quants/avx2.rs`) and
+AVX-512/VNNI variants (`src/quants/avx512.rs`), dispatched **AVX-512 → AVX2 →
+scalar** at runtime (`MINFER_NO_AVX512=1` drops to AVX2, `MINFER_NO_AVX2=1` to
+scalar — the x86 counterparts of `MINFER_NO_NEON`) and gated **bitwise** against the
+scalar reference by `quants::avx2_correctness`; `Q4_1`/`Q5_0`/`Q5_1` remain scalar
+on x86 and NEON-only on aarch64. The support matrix is updated
+(`SUPPORT-MATRIX.md`, AVX2 column) and `CPU_OPTIMIZATIONS.md §P1` is closed. What
+remains is **weight repacking** — the standard fix (repack the quant blocks at load
+time into SIMD-friendly interleaved layouts) that would expose the kernel gain
+end-to-end, since the current matmul re-reads each weight row per token; there is
+also still no aarch64 `i8mm` path and no AMX. 🟡 for x86 (the dots landed; the
+end-to-end win awaits repacking).
 
 **Tokenizer.** Byte-level BPE only, loaded from GGUF metadata
 (`tokenizer.rs`). F7 ([#50](https://github.com/yusiwen/minfer/issues/50),

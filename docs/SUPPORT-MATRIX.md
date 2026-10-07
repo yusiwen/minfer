@@ -12,11 +12,11 @@ minfer supports GGUF v3 files with the following quantized weight types. The CPU
 |------|------|-------|:---:|:----:|:--------:|:---------:|
 | **Q4_0** | 4 | 18 B / 32 val | ✅ | ✅ | ✅ | ✅ |
 | **Q4_1** | 4 | 20 B / 32 val | ✅ | ❌ | ✅ | ✅¹ |
-| **Q4_K** | 4 | 144 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
+| **Q4_K** | 4 | 144 B / 256 val | ✅ | ✅⁹ | ✅ | ✅¹ |
 | **Q5_0** | 5 | 22 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
 | **Q5_1** | 5 | 24 B / 32 val | ✅ | ❌ | ✅ | ✅¹ |
-| **Q5_K** | 5 | 176 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
-| **Q6_K** | 6 | 210 B / 256 val | ✅ | ❌ | ✅ | ✅¹ |
+| **Q5_K** | 5 | 176 B / 256 val | ✅ | ✅⁹ | ✅ | ✅¹ |
+| **Q6_K** | 6 | 210 B / 256 val | ✅ | ✅⁹ | ✅ | ✅¹ |
 | **Q8_0** | 8 | 34 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
 | **F16** | 16 | 2 B / 1 val | ✅³ | ✅³ | ✅⁴ | ✅⁵ |
 | **BF16** | 16 | 2 B / 1 val | ✅⁶ | — | ✅⁷ | ✅⁸ |
@@ -111,6 +111,14 @@ M4 Pro)`) against the same file's CPU logits: 169 bf16 matmul + 1 embed nodes
 all on `Backend::METAL`, 942.4 MiB of device weights, max |Δlogit| **1.889e-3**
 absolute / **1.025e-4** relative (bar 0.05 / 5e-3), with an identical greedy
 continuation `[12095, 13, 1084, 374]`.
+
+⁹ The K-quant dots ([#56](https://github.com/yusiwen/minfer/issues/56), 2026-10-08)
+have AVX2+FMA kernels (`src/quants/avx2.rs`) and AVX-512/VNNI variants
+(`src/quants/avx512.rs`), dispatched **AVX-512 → AVX2 → scalar** at runtime
+(`MINFER_NO_AVX512=1` drops to AVX2, `MINFER_NO_AVX2=1` to scalar — the x86
+counterparts of `MINFER_NO_NEON`) and gated **bitwise** against the scalar
+reference (`quants::avx2_correctness`). The AVX2 column marks the hand-written x86
+kernel; NEON is folded into CPU as in every other row.
 
 **CUDA notes**: prefill (`nt ≥ 16`) runs the default int8 tensor-core MMQ path
 for the common quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K via the f16-wmma GEMM,

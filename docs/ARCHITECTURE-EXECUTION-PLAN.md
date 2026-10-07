@@ -16,7 +16,7 @@ Phase D **complete** (3/3) (**D1 done**: views, multi-output via `split_parts`, 
 F8 done; **F1 waits for an x86 host**); Phase G
 **complete** (7/7) — G1–G7 all landed on a Mac (the KV port G5 and the
 measurement bookend G7 last; [#54](https://github.com/yusiwen/minfer/issues/54) recorded the round's final baseline).
-**Next: the macOS round-2 tickets tracked in #333, on macbook (macOS 27.0.1, Apple M4 Pro), and the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121); F1 (AVX2 K-quant dots) still waits for an x86 host.** The order was
+**Next: the macOS round-2 tickets tracked in #333, on macbook (macOS 27.0.1, Apple M4 Pro), and the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121); F1's weight-repacking increment still wants an x86 host.** The order was
 deliberate: the Metal KV port (G5) came **after** the CUDA arena stopped changing shape
 (C7, C7b, C8), so those semantics were written into Metal once — it landed on a Mac 2026-10-06. Per-ticket evidence is in
 each phase's record and in the §14 open-risks table.
@@ -95,7 +95,7 @@ Measured records name it absolutely, never as "this box" (gate contract rule 5).
 | CPU (aarch64 NEON+SDOT) | ✅ | ✅ | Primary correctness net here |
 | CUDA (sm_121) | ✅ | ✅ **device since 2026-09-18** | GB10 (121.6 GiB, driver 580.178.04, CUDA 13.0). Device-gated tests are still **local-only**: CI has no GPU, so its CUDA job only compiles the harness (F-campaign note in §14 row 1) |
 | Metal | ❌ | ❌ | macOS-only code, not compilable here → Phase G |
-| x86 AVX2 / AVX-512 | ❌ | ❌ | Item 11 needs an x86 box or CI |
+| x86 AVX2 / AVX-512 | ❌ | ❌ | dgxspark cannot build/run x86. Item 11's dots were verified on an x86 host 2026-10-08 (F1 landing record in §9); weight repacking is open |
 
 **A0 verdict (2026-09-16) — superseded (2026-09-18).** It read "CUDA is
 compile-only in this environment", and for two days every CUDA ticket's acceptance
@@ -7242,7 +7242,7 @@ Can run in parallel with A–E by a different workstream.
 
 | ID | Item | Title | Effort | Box needed |
 |---|---|---|---|---|
-| F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) | L | **x86** |
+| F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) — **dots landed 2026-10-08 on an x86 host** (bitwise gates; AVX-512/VNNI selected at runtime), **weight repacking is the remaining increment** | L | x86 |
 | F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost) | M | dgxspark |
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | dgxspark |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
@@ -7251,14 +7251,14 @@ Can run in parallel with A–E by a different workstream.
 | F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC + the remaining pre-tokenizer rules) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
-F1 is the only item in this plan that **cannot be verified on dgxspark**
-(aarch64): it needs an x86 box or a new CI runner. It is also the largest
-single CPU win, so it should be scheduled against hardware availability, not
-against the critical path.
+F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
+the remaining increment — weight repacking into SIMD-friendly interleaved
+layouts — still needs that machine class and remains the largest single CPU win.
 
-**The hardware lane, stated where the sequencing is read (#335).** F1
-(AVX2/AVX-512 K-quant dots, [#56](https://github.com/yusiwen/minfer/issues/56))
-waits for an **x86 host** — an entirely different machine class from the two
+**The hardware lane, stated where the sequencing is read (#335).** F1's
+remaining increment (weight repacking, [#56](https://github.com/yusiwen/minfer/issues/56);
+the AVX2/AVX-512 dots themselves landed 2026-10-08) wants an **x86 host** — an
+entirely different machine class from the two
 boxes this project owns, `dgxspark (aarch64, GB10 sm_121)` and `macbook (macOS
 27.0.1, Apple M4 Pro)`; the `x86_64 (CI runner)` is GitHub's ephemeral runner and
 cannot host interactive work. It is therefore **not** the project's `next:`
@@ -7272,6 +7272,25 @@ the last capability gap); on **dgxspark** the open Linux-side tickets —
 [#354](https://github.com/yusiwen/minfer/issues/354) and
 [#356](https://github.com/yusiwen/minfer/issues/356). No schedule is attached to
 either lane; this is a statement about which machine each one needs.
+
+**F1 landing record — AVX2/AVX-512 K-quant dots (#56), 2026-10-08.** On an
+`x86_64` host (Intel `i7-11700B`, `avx2`/`fma`/`avx512f`/`bw`/`dq`/`vl`/`vnni`),
+`src/quants/avx2.rs` gained the `Q4_K`/`Q5_K`/`Q6_K × Q8_K` AVX2+FMA kernels and
+the new `src/quants/avx512.rs` VNNI variants; `kquant.rs` dispatches
+**AVX-512/VNNI → AVX2+FMA → scalar** at runtime (`MINFER_NO_AVX512=1` drops to
+AVX2, `MINFER_NO_AVX2=1` to scalar — the x86 counterpart of `MINFER_NO_NEON`).
+`quants::avx2_correctness` gates every kernel **bitwise** against its `*_scalar`
+reference (the int8×int8 products are exact in i32 and the per-superblock float
+arithmetic keeps the scalar order), and its `#[ignore]`d `kquant_simd_dot_speedup`
+harness records the dot-level ratios on a 4096-element row (median of five):
+AVX2 `3.39× / 2.80× / 1.79×` and AVX-512 `3.97× / 3.23× / 2.51×` scalar for
+`Q4_K / Q5_K / Q6_K`. End-to-end on the cached Qwen2.5-0.5B Q4_K_M (`minfer
+bench`, 16 threads, median of nine `-r 3` samples at `--n-ctx 656`): prefill
+`pp512` 28.59 → 31.82 (AVX2) → 32.13 (AVX-512) tok/s, decode `tg128` 11.20 →
+12.59 → 12.54 tok/s. The end-to-end gain is small because the CPU matmul re-reads
+each weight row per token (bandwidth-bound), which is exactly what the
+weight-repacking increment would fix; the scalar and NEON results are
+byte-unchanged and were **not** re-measured.
 
 ### F3 — Sampler set (#48) — **DONE 2026-09-24**
 
