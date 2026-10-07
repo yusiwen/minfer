@@ -1544,11 +1544,17 @@ impl MpsCommandBuffer<'_> {
 
     /// Fast explicit-span prefill (issue #359): the windowed sibling of
     /// [`Self::attn_flash_prefill`]. Same Q=8 × C=64 simdgroup tiling, but the
-    /// inline mask reads each query's `[window[t], window[nt + t])` explicit
-    /// window instead of the causal `[0, positions[t] + 1)`. `lo_min` is the
-    /// first cell of the launch's union window (`[lo_min, lo_min + nkv)`); K/V
-    /// are read at `lo_min + ic` cells (the tail pad is filled with the K/V
-    /// pointer advanced by `lo_min`, so `kernel_kv_tail_pad` itself is unchanged).
+    /// inline mask reads the query's explicit window instead of the causal
+    /// `[0, positions[t] + 1)`. `lo_min` is the first cell of the launch's union
+    /// window (`[lo_min, lo_min + nkv)`); K/V are read at `lo_min + ic` cells (the
+    /// tail pad is filled with the K/V pointer advanced by `lo_min`, so
+    /// `kernel_kv_tail_pad` itself is unchanged).
+    ///
+    /// `map` selects the window layout (issue #369): false is the one-range
+    /// `attn_span` (`[window[t], window[nt + t])`), true the set-valued `kv_map`
+    /// (`KV_MAP_MAX_SPANS` `(cell, len)` runs per query, masked by run
+    /// membership). Both layouts share this dispatch; only the kernel family and
+    /// the host's `lo_min`/`nkv` differ.
     ///
     /// The causal kernels in `fa_prefill.metal` are not touched: this is a
     /// separate kernel family (`fa_window.metal`) selected only by the
@@ -1570,6 +1576,7 @@ impl MpsCommandBuffer<'_> {
         hd: usize,
         scale: f32,
         f16: bool,
+        map: bool,
     ) {
         self.trace_op("attn_flash_window");
         let dev = &self.state.device;
@@ -1603,17 +1610,33 @@ impl MpsCommandBuffer<'_> {
         }
 
         self.enc.setComputePipelineState(
-            &**(if f16 {
-                if hd == 128 {
-                    &self.state.pl_flash_attn_window_blk_hd128_f16
+            &**(if map {
+                if f16 {
+                    if hd == 128 {
+                        &self.state.pl_flash_attn_window_map_hd128_f16
+                    } else {
+                        &self.state.pl_flash_attn_window_map_f16
+                    }
                 } else {
-                    &self.state.pl_flash_attn_window_blk_f16
+                    if hd == 128 {
+                        &self.state.pl_flash_attn_window_map_hd128
+                    } else {
+                        &self.state.pl_flash_attn_window_map
+                    }
                 }
             } else {
-                if hd == 128 {
-                    &self.state.pl_flash_attn_window_blk_hd128
+                if f16 {
+                    if hd == 128 {
+                        &self.state.pl_flash_attn_window_blk_hd128_f16
+                    } else {
+                        &self.state.pl_flash_attn_window_blk_f16
+                    }
                 } else {
-                    &self.state.pl_flash_attn_window_blk
+                    if hd == 128 {
+                        &self.state.pl_flash_attn_window_blk_hd128
+                    } else {
+                        &self.state.pl_flash_attn_window_blk
+                    }
                 }
             }),
         );

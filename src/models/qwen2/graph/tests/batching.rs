@@ -830,6 +830,18 @@ fn forward_cached_isolates_kv_between_caches() {
 /// causal side (two `N_TOTAL/2` windows vs one causal `N_TOTAL` window), so the
 /// shape-matched ratio is the conservative one; both are printed.
 ///
+/// [#369](https://github.com/yusiwen/minfer/issues/369) adds a **fourth arm** for
+/// the set-valued `kv_map` layout (#362): a donor owns the first `N_TOTAL/2`
+/// positions, and a subject reads them **in place** while prefilling its own
+/// `N_TOTAL` tokens after them, so its window is a shared run plus a private run
+/// — the map the fast one-range kernel cannot name. The donor's cells and the
+/// subject's first-fit run are adjacent, so the map's global union is one
+/// contiguous range and the tile cost is the same one the one-range arm pays;
+/// the arm's own window is set up once, before timing, and the timed forward is
+/// the `N_TOTAL`-token subject prefill (the same token count as the causal arm).
+/// The **before** ratio (the #362 correctness map kernel) is the ticket's
+/// baseline; the fast map path is [#369](https://github.com/yusiwen/minfer/issues/369).
+///
 /// The ratio is **printed, not asserted**, deliberately:
 /// [#315](https://github.com/yusiwen/minfer/issues/315) does not ask for an
 /// assertion, and a timing floor on a loaded box is exactly the flaky-gate class
@@ -904,6 +916,15 @@ fn a_windowed_prefill_is_not_materially_slower_than_the_causal_one() {
             }
             None => (0, 0, false),
         }
+    }
+
+    /// Whether the graph the cache last built carries the `kv_map` input — the
+    /// control that the map arm is actually on the set-valued layout and not the
+    /// one-range `attn_span` one.
+    fn uses_kv_map(cache: &mut GraphCache) -> bool {
+        cache.current().map_or(false, |(g, _)| {
+            g.inputs.iter().any(|&i| g.node(i).name == "kv_map")
+        })
     }
 
     /// Upper median of an odd-length sample (the location estimate issue #154
@@ -1031,15 +1052,58 @@ fn a_windowed_prefill_is_not_materially_slower_than_the_causal_one() {
             batch: Batch::new(prompt.clone(), (0..N_TOTAL).collect(), vec![2u32; N_TOTAL]),
         }
     };
+    // ---- map pair: a prefix read in place (the set-valued `kv_map` layout) ----
+    // A donor owns positions `[0, half)`; the subject shares them in place and
+    // prefills its own `N_TOTAL` tokens at positions `[half, half + N_TOTAL)`, so
+    // its window is two runs (donor cells `[0, half)` + its own `[half, …)`).
+    // First-fit puts the subject's run at cell `half`, adjacent to the donor, so
+    // the map's global union is one contiguous range. The donor prefill is set up
+    // once and is **not** timed; the timed forward is the subject's `N_TOTAL`.
+    let mut win_map = {
+        let mut cache = GraphCache::new();
+        cache.alloc().kv_set_capacity(N_CTX);
+        cache
+            .alloc()
+            .kv_reserve_seq(1, half)
+            .expect("reserve donor");
+        cache
+            .alloc()
+            .kv_reserve_seq(2, N_TOTAL + 8)
+            .expect("reserve subject");
+        model.forward_batch(
+            &Batch::new(
+                prompt[..half].to_vec(),
+                (0..half).collect(),
+                vec![1u32; half],
+            ),
+            1,
+            N_CTX,
+            &mut cache,
+        );
+        cache
+            .alloc()
+            .kv_share_prefix(1, 2, half)
+            .expect("the subject reads the donor's prefix in place");
+        let positions: Vec<usize> = (half..half + N_TOTAL).collect();
+        Arm {
+            label: "windowed shared-prefix map",
+            n_out: 1,
+            cache,
+            batch: Batch::new(prompt.clone(), positions, vec![2u32; N_TOTAL]),
+        }
+    };
 
     // Warm-up builds and allocates each graph.
     causal.run(&*model);
     win_batch.run(&*model);
     win_shape.run(&*model);
+    win_map.run(&*model);
 
     let (tc_nodes, tc_attn, tc_exp) = describe(&mut causal.cache);
     let (wb_nodes, wb_attn, wb_exp) = describe(&mut win_batch.cache);
     let (ws_nodes, ws_attn, ws_exp) = describe(&mut win_shape.cache);
+    let (wm_nodes, wm_attn, wm_exp) = describe(&mut win_map.cache);
+    let wm_is_map = uses_kv_map(&mut win_map.cache);
     eprintln!(
         "[315] model={} hd={hd} n_ctx={N_CTX} n_total={N_TOTAL} rounds={ROUNDS} bar={BAR:.2}x",
         path.display()
@@ -1053,33 +1117,47 @@ fn a_windowed_prefill_is_not_materially_slower_than_the_causal_one() {
     eprintln!(
         "[315] windowed-shape:  {ws_nodes} nodes, {ws_attn} attn (explicit_span={ws_exp}) -> {window_kernel}"
     );
-    // Control (rule 2): the causal arm must not be explicit-span and both
-    // windowed arms must be, or the comparison is not the two kernels.
+    eprintln!(
+        "[315] windowed-map:    {wm_nodes} nodes, {wm_attn} attn (explicit_span={wm_exp}, kv_map={wm_is_map}) \
+         -> kernel_gqa_attn_map_{width}"
+    );
+    // Control (rule 2): the causal arm must not be explicit-span and every
+    // windowed arm must be, or the comparison is not the two kernels; the map
+    // arm must be on the set-valued layout, not the one-range `attn_span` one.
     assert!(!tc_exp, "the causal arm is not on the causal path");
     assert!(
-        wb_exp && ws_exp,
+        wb_exp && ws_exp && wm_exp,
         "a windowed arm is not on the explicit-span path"
+    );
+    assert!(
+        wm_is_map,
+        "the map arm did not build the kv_map window; the measurement is not the map layout"
     );
 
     let mut causal_ts = Vec::new();
     let mut win_batch_ts = Vec::new();
     let mut win_shape_ts = Vec::new();
+    let mut win_map_ts = Vec::new();
     for r in 0..ROUNDS {
         let tc = causal.run(&*model);
         let twb = win_batch.run(&*model);
         let tws = win_shape.run(&*model);
+        let twm = win_map.run(&*model);
         eprintln!(
             "[315] round {r}: causal {tc:.4}s ({:.1} tok/s) | windowed-batch {twb:.4}s ({:.1} tok/s) \
-             {:.3}x | windowed-shape {tws:.4}s ({:.1} tok/s) {:.3}x",
+             {:.3}x | windowed-shape {tws:.4}s ({:.1} tok/s) {:.3}x | windowed-map {twm:.4}s ({:.1} tok/s) {:.3}x",
             N_TOTAL as f64 / tc,
             N_TOTAL as f64 / twb,
             tc / twb,
             N_TOTAL as f64 / tws,
             tc / tws,
+            N_TOTAL as f64 / twm,
+            tc / twm,
         );
         causal_ts.push(tc);
         win_batch_ts.push(twb);
         win_shape_ts.push(tws);
+        win_map_ts.push(twm);
     }
 
     let primary: Vec<f64> = causal_ts
@@ -1092,11 +1170,18 @@ fn a_windowed_prefill_is_not_materially_slower_than_the_causal_one() {
         .zip(&win_shape_ts)
         .map(|(c, w)| c / w)
         .collect();
+    let map: Vec<f64> = causal_ts
+        .iter()
+        .zip(&win_map_ts)
+        .map(|(c, w)| c / w)
+        .collect();
     let (cm, cs) = mean_stddev(&causal_ts);
     let (bm, bs) = mean_stddev(&win_batch_ts);
     let (wm, ws) = mean_stddev(&win_shape_ts);
+    let (mm, ms_) = mean_stddev(&win_map_ts);
     let (pm, ps) = mean_stddev(&primary);
     let (sm, ss) = mean_stddev(&shape);
+    let (mmr, mmrs) = mean_stddev(&map);
     eprintln!(
         "[315] causal        {cm:.4}s ± {cs:.4}s  ({:.1} tok/s)",
         N_TOTAL as f64 / cm
@@ -1109,8 +1194,13 @@ fn a_windowed_prefill_is_not_materially_slower_than_the_causal_one() {
         "[315] windowed-shape {wm:.4}s ± {ws:.4}s  ({:.1} tok/s)",
         N_TOTAL as f64 / wm
     );
+    eprintln!(
+        "[315] windowed-map   {mm:.4}s ± {ms_:.4}s  ({:.1} tok/s)",
+        N_TOTAL as f64 / mm
+    );
     let primary_med = median(&primary);
     let shape_med = median(&shape);
+    let map_med = median(&map);
     let verdict = |r: f64| if r >= BAR { "MET" } else { "NOT MET" };
     eprintln!(
         "[315] PRIMARY one-seq causal vs two-seq windowed batch, same {N_TOTAL} tokens: \
@@ -1121,6 +1211,11 @@ fn a_windowed_prefill_is_not_materially_slower_than_the_causal_one() {
         "[315] SHAPE   one-seq causal vs one-seq windowed @offset, same nt/n_out/{N_TOTAL} tokens: \
          median {shape_med:.3}x, mean {sm:.3} ± {ss:.3}  --> bar {BAR:.2}x {}",
         verdict(shape_med)
+    );
+    eprintln!(
+        "[315] MAP     one-seq causal vs one-seq shared-prefix kv_map, same {N_TOTAL} tokens: \
+         median {map_med:.3}x, mean {mmr:.3} ± {mmrs:.3}  --> bar {BAR:.2}x {}",
+        verdict(map_med)
     );
     // This is the **measurement harness** the ticket asks for, not a pass/fail
     // suite gate: the measured ratio is the ticket's finding, and the follow-up

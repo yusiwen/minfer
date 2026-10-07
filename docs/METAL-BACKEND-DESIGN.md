@@ -392,13 +392,19 @@ time), mirroring CUDA's arm:
   reference). f32/f16 is selected from the engine's KV format for both families; the fast family is
   the one measured below, the correctness family stays its reference.
 - `in_bufs[3].len == nt * KV_MAP_MAX_SPANS * 2` → the **`kv_map`** layout (a list of `(cell, len)`
-  runs per query, C8b S2/S4): the sibling kernels `gqa_attn_map_f32` / `_f16` (also in
-  `src/metal/kernels/attn_window.metal`, issue [#362](https://github.com/yusiwen/minfer/issues/362))
-  read the same rows, but resolve each flat window row to a cell by walking the ≤ 4 runs — the flat
-  index arithmetic CUDA does in `attn_map_nkv` / `kv_cell` — instead of the window's `lo + ki`. They
-  are a **separate family** on purpose: the one-range `attn_span` kernels' instruction stream is a
-  measured contract (`#315`), so their code path is byte-untouched. A sharing sequence's window (a
-  shared prefix plus a private run) is exactly this shape; the input's **size** selects the layout.
+  runs per query, C8b S2/S4). A **prefill** (`nt > 1`) at `hd ∈ {64,128}` with
+  `MINFER_NO_WINDOW_FLASH` unset takes the fast map family
+  `kernel_flash_attn_window_map_{f32,f16}` / `_hd128_{f32,f16}` (also in
+  `src/metal/kernels/fa_window.metal`, issue [#369](https://github.com/yusiwen/minfer/issues/369)):
+  the same Q=8 × C=64 tile over the launch's global `[lo_min, hi_max)` union, with the mask a
+  **run-membership** walk (`fwin_map_has`, ≤ `KV_MAP_MAX_SPANS` runs) instead of `[lo, hi)` — the
+  arithmetic CUDA does in `attn_map_nkv` / `kv_cell`. Every other shape — `nt == 1`, any `hd`
+  outside {64,128}, the opt-out — keeps the #362 **correctness** kernels `gqa_attn_map_f32` / `_f16`
+  (also in `src/metal/kernels/attn_window.metal`), which resolve each flat window row to a cell by
+  walking the ≤ 4 runs instead of the window's `lo + ki`. The correctness one-range and map kernels
+  are a **separate family** on purpose: their instruction streams are the #315 measured contract,
+  so their code path is byte-untouched. A sharing sequence's window (a shared prefix plus a private
+  run) is exactly this shape; the input's **size** selects the layout.
 - anything else → a loud `Err` naming the accepted sizes.
 
 `supports_attn_span()` is now `true` (`SUPPORTS_ATTN_SPAN`) and `Device::gathers_attn_map` is now
@@ -407,13 +413,15 @@ parallel-prefill / classic) are **byte-untouched**: the windowed families are us
 explicit window, so a single-sequence causal forward keeps its previous numbers. The one asymmetry
 that remains is a **packed `q8_0`** region, refused (`READS_PACKED_KV` false) until
 [#310](https://github.com/yusiwen/minfer/issues/310) adds its store and reads; that is a deliberate
-asymmetry, not a silent gap. The `attn_span` layout has two families — the **fast** prefill family
-above and the #44 **correctness** family, still the reference and still serving every other
-explicit-span shape. Keeping them separate is what leaves the causal instruction streams (and their
-measured numbers) byte-identical. Issue [#315](https://github.com/yusiwen/minfer/issues/315)
-measured the correctness family as **materially slower** than the causal flash prefill; issue
-[#359](https://github.com/yusiwen/minfer/issues/359) added the fast family and re-measured — both
-records follow.
+asymmetry, not a silent gap. Each explicit layout now has two families — a **fast** prefill family
+(the one-range `blk` family, [#359](https://github.com/yusiwen/minfer/issues/359); the map family,
+[#369](https://github.com/yusiwen/minfer/issues/369)) and the #44/#362 **correctness** family, still
+the reference and still serving every other explicit-span shape. Keeping them separate is what
+leaves the causal instruction streams (and their measured numbers) byte-identical. Issue
+[#315](https://github.com/yusiwen/minfer/issues/315) measured the correctness families as
+**materially slower** than the causal flash prefill; [#359](https://github.com/yusiwen/minfer/issues/359)
+and [#369](https://github.com/yusiwen/minfer/issues/369) added the fast families and re-measured —
+the records follow.
 
 **Measured (issue [#315], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
 2026-10-07).** Bar named before the run (`docs/GATE-CONTRACT.md` rules 3 and 5): the windowed
@@ -472,9 +480,42 @@ attention kernel: the windowed-global launch runs the same tile count the causal
 `MINFER_NO_WINDOW_FLASH=1` both pairs fall back to the #315 numbers above, which is the A/B control
 for the fast family.
 
-The `kv_map` explicit-span layout (#362) still reads through its correctness kernels
-`kernel_gqa_attn_map_*`; a fast sibling for it — the same tile structure with a run-membership mask
-over the global `[lo_min, hi_max)` range — is the **remaining increment** of [#359].
+**Measured (issue [#369], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
+2026-10-07).** The same harness gained a **fourth arm** for the set-valued `kv_map` layout: a donor
+owns the first `N_TOTAL/2` positions and a subject reads them in place while prefilling its own
+`N_TOTAL` tokens after them, so its window is a shared run plus a private run. First-fit puts the
+subject's run at cell `N_TOTAL/2`, adjacent to the donor, so the map's global union is one
+contiguous range and the fast map kernel pays the same tile cost the one-range fast kernel does
+(the run walk is the only extra work). Bar and protocol are the #315/#359 ones (median of 5
+interleaved rounds, three runs each). Before: the #362 correctness map kernel; after: the #369
+fast map kernel.
+
+| Map arm (median of the 3 runs) | 0.5B (before → after) | Qwen3-0.6B (before → after) |
+|---|---|---|
+| **map** — one 512-token causal sequence vs one shared-prefix `kv_map` subject, same `N_TOTAL` tokens | **0.229x → 0.943x** | **0.046x → 0.914x** |
+
+Both reach the **>= 0.8x** bar (0.5B 0.942 / 0.947 / 0.943; Qwen3-0.6B 0.912 / 0.915 / 0.914).
+`MINFER_NO_WINDOW_FLASH=1` restores the before numbers on **both** layouts (map 0.229x, one-range
+primary 0.539x / shape 0.378x), the A/B control the win is attributed through. The map arm's
+residual gap to the causal prefill is the adjacent shared run (the subject's attention window is
+`N_TOTAL/2` rows wider than a causal query at the same position), not the run walk: the union is
+contiguous, so `fwin_map_has` runs over the same tiles the one-range kernel would.
+
+**Measured: the map's remaining shape limit.** A window whose runs are *far apart* pays the gap
+between them — the fast map kernel tiles the global `[lo_min, hi_max)` union, while the correctness
+kernel walks just the runs; a map whose shared prefix and private run are non-adjacent would
+therefore do the union's tile work, not the runs'. The harness's first-fit layout (the production
+server's) is adjacent and does not pay it; a `kv_defrag`-spread layout could. This is the recorded
+tradeoff, not a silent one.
+
+Gate: `metal::tests::window_map_flash_matches_the_cpu_reference` drives the fast map kernel directly
+at `hd 64` / `hd 128` (f32 and f16), with a shared run plus a growing private run, both adjacent
+(`gap = 0`) and gapped (`gap = 8`, so the run walk is load-bearing), `nt = 197` and a non-zero
+`lo_min`. Bars named before measuring: a one-cell map returns the named cell's V row **bitwise**
+(0 on every case), the two-run map matches the CPU reference to **<= 0.01** (f32) / **<= 0.05**
+(f16) — measured 1.0e-5 to 2.0e-5 — and a wrong shared base changes the output. The #362 map gates
+(`metal_map_single_cell_matches_the_v_row`, `metal_map_matches_the_span_and_a_wrong_base_differs`)
+and the #44/#359 gates are unchanged and green.
 
 Gate: `metal::tests::window_flash_matches_the_cpu_reference` drives the fast kernel directly at
 `hd 64` (f32 and f16) and `hd 128` (f32 and f16), with `lo_min ∈ {0, 64, 96}`, `nt = 197` (a

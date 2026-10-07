@@ -233,6 +233,12 @@ struct MpsStateInner {
     pl_flash_attn_window_blk_f16: MetalComputePipelineState,
     pl_flash_attn_window_blk_hd128: MetalComputePipelineState,
     pl_flash_attn_window_blk_hd128_f16: MetalComputePipelineState,
+    // #369: the set-valued `kv_map` siblings — the same tile with a
+    // run-membership mask instead of `[lo, hi)`.
+    pl_flash_attn_window_map: MetalComputePipelineState,
+    pl_flash_attn_window_map_f16: MetalComputePipelineState,
+    pl_flash_attn_window_map_hd128: MetalComputePipelineState,
+    pl_flash_attn_window_map_hd128_f16: MetalComputePipelineState,
     pl_kv_tail_pad: MetalComputePipelineState,
     pl_store_kv: MetalComputePipelineState,
     pl_store_kv_f16: MetalComputePipelineState,
