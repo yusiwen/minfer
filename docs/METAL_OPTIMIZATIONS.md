@@ -1,15 +1,19 @@
 # Metal Backend Optimizations
 
-> **Goal**: match llama.cpp (commit `88b47a755`, Apple M4 Pro) performance.
-> **Current gap (2026-08-17 same-model, same-parameter A/B)**: decode is 72-88 % of
-> llama (0.5B pure GPU 1.1-1.4×; **7B decode now ≈ llama parity, ~19.3 ms/token
-> GPU vs 50.5 t/s**, after the q4_K decode matmul port, to-do #7), long prefill ~2.6-2.7× (down
-> from 2.8-3.6× via the prefill flash port, `5974eb1`). See [§1 Current state](#1-current-state).
-> **This llama comparison is the 2026-08-17 record and was not re-measured this
-> round** — no llama.cpp binary was run on this box. The re-measured *minfer-only*
-> rows (throughput on the cached models + Metal-vs-CPU parity) live in
+> **Goal**: match llama.cpp (Apple M4 Pro) performance.
+> **Current gap (2026-10-07 same-model, same-parameter A/B against llama.cpp
+> `c479922ac`)**: decode is **~0.88-0.99× llama** (7B Q4_K_M ≈ parity — 48.33 vs
+> 48.59 t/s; 0.5B Q4_K_M 0.88×; Qwen3-0.6B Q8_0 0.89×) and long prefill is
+> **~0.86-0.93×** (0.5B Q4_K_M 0.86×; 7B Q4_K_M 0.93×; Qwen3-0.6B Q8_0 0.86×).
+> The full protocol and every raw number are in
+> [§0.2](#02-refreshed-llamacpp-ab-2026-10-07); measured at minfer `97cc0d7` on
+> `macbook (macOS 27.0.1, Apple M4 Pro)`.
+> **The 2026-08-17 record (llama.cpp `88b47a755`) is superseded** and kept as
+> history in [§1.1](#11-historical-same-model-same-parameter-ab-2026-08-14-record-llamacpp-88b47a755).
+> The re-measured *minfer-only* rows (throughput on the cached models +
+> Metal-vs-CPU parity) live in
 > [§0.1](#01-graph-path-metalbackend-integration-status-2026-08-21), taken
-> 2026-10-06 at `6b95763` on `macbook (macOS 27.0.1, Apple M4 Pro)`.
+> 2026-10-06 at `6b95763`. See [§1 Current state](#1-current-state).
 >
 > ⚠️ **The §0 progress table is the single source of truth for tracking**; §1-§6
 > are the detailed explanations behind it. Update §0 first before changing code.
@@ -121,6 +125,77 @@ fills finished). The FFN fusion is **gated on nf ≤ 16384** — the Q4_K
 concat matmul (od ≈ 37888) is slower than two separate matmuls on the 7B
 decode scalar kernel, so only the 0.5B class fuses FFN.
 
+### §0.2 Refreshed llama.cpp A/B (2026-10-07)
+
+The §1.1 (2026-08-14/08-17) A/B against llama.cpp `88b47a755` was re-measured on
+the Mac against a **HEAD** llama.cpp build, **`c479922ac`** (build 11458,
+AppleClang 21.0.0.21000334, CMake Release `-O3 -DNDEBUG`; `CMAKE_C_FLAGS_RELEASE`
+additionally `-ffp-contract=fast`), at minfer **`97cc0d7`**. Build:
+`cmake --build ~/git/reading/llama.cpp/build-fpc --target llama-bench llama-cli -j`.
+This is outcome 1 of [#331](https://github.com/yusiwen/minfer/issues/331): the pair
+is refreshed, not merely re-worded.
+
+**Protocol (gate-contract rules 3 and 5).** Same GGUF file for both engines, from
+`/Volumes/WD_BLACK/models/hf/Qwen/`; same model, same prompt length and context for
+both. minfer:
+
+```
+./target/release/minfer bench -p P -n 128 -r 3 <model>                       # Metal default
+MINFER_CACHE_TYPE=f16 ./target/release/minfer bench -p 430 -n 128 -r 3 <Q8_0 model>
+```
+
+llama.cpp (the 2026-08-17 pair used `minfer --greedy` vs `llama-bench -b 512 -t 8`;
+kept here — `minfer bench` is the current harness and its `pp` is prefill-only and
+its `tg` is prefill + greedy decode, the direct analogue of the old `Generated:`
+pure-decode caliber; both harnesses do a warmup pass before the measured reps and
+report a mean over `-r 3`):
+
+```
+~/git/reading/llama.cpp/build-fpc/bin/llama-bench -m <model> -p P -n 128 -r 3 -b 512 -t 8
+```
+
+**Ambient state.** `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname
+`macbookpro-ysw`, AC power (battery 80 %, not charging), no recorded thermal or
+performance warning; the box was otherwise loaded (Microsoft Edge + opencode/agent
+active, 15-min load average ≈ 7). Both engines ran back-to-back in one session, so
+the *ratio* is the robust quantity; each engine's absolute t/s carries the shared
+ambient load. Each cell is the harness mean ± stddev over the 3 measured reps.
+
+**Qwen2.5-0.5B-Instruct Q4_K_M** (`qwen2.5-0.5b-instruct-q4_k_m.gguf`):
+
+| Test | llama.cpp `c479922ac` (t/s) | minfer `97cc0d7` (t/s) | minfer / llama |
+|---|---|---|---|
+| pp430 (long) | 6781.16 ± 280.14 | 5827.26 ± 51.13 | **0.86×** |
+| tg128 after pp430 | 298.52 ± 13.44 | 262.68 ± 3.20 | **0.88×** |
+| pp30 (short) | 2844.87 ± 100.80 | 2053.06 ± 8.42 | 0.72× |
+| tg128 after pp30 | 286.04 ± 7.41 | 277.09 ± 1.67 | 0.97× |
+
+**Qwen2.5-7B-Instruct Q4_K_M** (split GGUF, entry part `…-00001-of-00002.gguf`):
+
+| Test | llama.cpp `c479922ac` (t/s) | minfer `97cc0d7` (t/s) | minfer / llama |
+|---|---|---|---|
+| pp495 (long) | 469.79 ± 1.89 | 438.61 ± 1.58 | **0.93×** |
+| tg128 after pp495 | 48.59 ± 1.60 | 48.33 ± 0.31 | **0.99×** |
+| pp30 (short) | 337.77 ± 0.30 | 285.93 ± 0.80 | 0.85× |
+| tg128 after pp30 | 48.76 ± 0.26 | 47.95 ± 0.77 | 0.98× |
+
+**Qwen3-0.6B Q8_0** (f16 KV cache both sides; minfer `MINFER_CACHE_TYPE=f16`,
+llama-bench default `-ctk f16 -ctv f16`):
+
+| Test | llama.cpp `c479922ac` (t/s) | minfer `97cc0d7` (t/s) | minfer / llama |
+|---|---|---|---|
+| pp430 (long) | 5645.83 ± 160.28 | 4881.25 ± 10.44 | 0.86× |
+| tg128 after pp430 | 235.97 ± 5.40 | 210.67 ± 0.83 | 0.89× |
+
+For the Q4_K_M rows minfer's auto KV rule keeps the 0.5B class on f32 and the 7B
+class on f16 while llama-bench is f16 for both; this is stated, not corrected (the
+2026-08-17 record had the same asymmetry).
+
+**Reading.** The 2026-08-17 "long prefill ~2.6-2.7×" no longer holds: long prefill
+is now **0.86-0.93×** (1.07-1.16× slower) and decode is **0.88-0.99×** (7B at
+parity). Short-prompt `pp30` stays dispatch/overhead-bound on both engines and is
+not a clean attention lever (0.72-0.85×).
+
 ### ✅ Done
 
 | # | Item | Measured effect | Commit |
@@ -214,7 +289,11 @@ decode scalar kernel, so only the 0.5B class fuses FFN.
 
 ## 1. Current state
 
-### 1.1 Same-model, same-parameter A/B (2026-08-14, M4 Pro, identical GGUF)
+### 1.1 Historical same-model, same-parameter A/B (2026-08-14 record, llama.cpp `88b47a755`)
+
+> **Historical record — superseded.** These numbers are the *2026-08-14/08-17* A/B
+> against llama.cpp `88b47a755`; they were **re-measured 2026-10-07 against
+> `c479922ac`** in [§0.2](#02-refreshed-llamacpp-ab-2026-10-07). Kept as history.
 
 minfer `--greedy` (pure decode, llama "Generation" caliber); llama.cpp
 `llama-bench -b 512 -t 8` (pure eval). Model Qwen2.5-0.5B-Instruct. Prefill
@@ -319,7 +398,11 @@ dispatches** (f16 cast/cont/reshape are non-no-op nodes).
 
 (Early numbers used the blended caliber; since 2026-08-06 `Generated:` is pure decode.)
 
-### 1.6 Current 7B state (user-facing model, Q4_K_M, 2026-08-21)
+### 1.6 7B state (2026-08-21 record, user-facing model, Q4_K_M)
+
+> **Historical record.** The llama-comparison gaps below are the 2026-08-21
+> standing; the refreshed 2026-10-07 A/B is in
+> [§0.2](#02-refreshed-llamacpp-ab-2026-10-07).
 
 The 7B (`qwen2.5-7b-instruct-q4_k_m`, split GGUF) is the user-facing model; this
 is the current standing after the decode q4_K port (#27), the correctness/unroll/
