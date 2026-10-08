@@ -84,7 +84,7 @@ One more subtlety hides inside the encoder: within a split, kernels run back-to-
 
 ### 2.5 The dispatch matrix: which op runs which kernel
 
-`supports_op` (`metal_backend.rs:265-283`) is the capability table, and it is nearly a yes for everything the Qwen2/Qwen3 builders emit: elementwise ops (`Add`/`Mul`/`Silu`/`SwiGLU`), norms (`RmsNorm`, Qwen3's per-head `QkNorm`), `MatMul` in every supported quant type, `GetRows` (embedding gather and the tail-row gather), `RoPE`, `KvcacheStore`/`KvcacheLoad`, `Attn`, and the decode fusions `FusedQKV`/`FusedFFN`/`FusedQkvNorm`. It refuses `Scale`, `Softmax` and `BatchMatMul` — none of which the model builders emit in the graph path (attention is one fused node that does its own softmax; the attention scale rides in `AttnMeta`; `BatchMatMul` is a deferred vocabulary entry) — and it refuses `QkvBiasRopeStore`, a CUDA-only fusion (doc 15). Refusal here is not an error: it simply makes `assign_backends` (doc 06) hand such a node to the CPU, creating a split boundary.
+`supports_op` (`metal_backend.rs:631-658`) is the capability table, and it is nearly a yes for everything the Qwen2/Qwen3 builders emit: elementwise ops (`Add`/`Mul`/`Silu`/`SwiGLU`), norms (`RmsNorm`, Qwen3's per-head `QkNorm`), `MatMul` in every supported quant type, `GetRows` (embedding gather and the tail-row gather), `RoPE`, `KvcacheStore`/`KvcacheLoad`, `Attn`, and the decode fusions `FusedQKV`/`FusedFFN`/`FusedQkvNorm`. It refuses `Scale`, `Softmax` and `BatchMatMul` — none of which the model builders emit in the graph path (attention is one fused node that does its own softmax; the attention scale rides in `AttnMeta`; `BatchMatMul` is a deferred vocabulary entry) — and it refuses `QkvBiasRopeStore`, a CUDA-only fusion (doc 15). Refusal here is not an error: it simply makes `assign_backends` (doc 06) hand such a node to the CPU, creating a split boundary.
 
 Within the ops Metal *does* run, the dispatch is a decision tree of kernel *families* — this is where `docs/METAL_OPTIMIZATIONS.md`'s campaign lives, so here is the map (the doc has the measurements):
 
@@ -107,7 +107,7 @@ When does Metal *not* win? The doc records the counterexamples as guardrails: th
 
 Three rules decide whether any node runs on Metal, all resolved **before the graph exists**:
 
-1. **Priority order Metal → CUDA → CPU.** `GraphAllocator::supports` (`alloc.rs:141-158`) asks backends in that fixed order and returns the first yes. If Metal is enabled, it wins every op it supports; CUDA (when compiled in) gets the leftovers it can run; CPU mops up the rest. Doc 15's backend joins the same queue.
+1. **Priority order Metal → CUDA → CPU.** `GraphAllocator::supports` (`alloc.rs:384-385`) asks backends in that fixed order and returns the first yes. If Metal is enabled, it wins every op it supports; CUDA (when compiled in) gets the leftovers it can run; CPU mops up the rest. Doc 15's backend joins the same queue.
 2. **Metal is enabled only if the whole model made it to the GPU.** The gate (`models/qwen2/graph.rs:630`, §3.2.6) requires *every* weight the graph reads — embeddings, all 28+ layer weights and biases, norms, lm_head — to be registered in the Metal registry (`has_weight`). One missing tensor ⇒ `metal_on = false` ⇒ the entire graph runs on CPU. This is the **all-weights-registered gate**: all-or-nothing participation, never a partial run where some layers are on the GPU and some on the CPU (which would be correct-but-mysterious; a split boundary per layer would also hammer the sync path).
 3. **Participation is part of graph identity.** The gate's outcome is recorded in `CParams.gpu` (`graph/params.rs:27`), and `GraphParams` is the *only* thing graph reuse compares (doc 13). So "was the GPU on" is baked into the cached graph: a change (MPS unavailable, weights not registered) changes `CParams.gpu`, fails `try_reuse`, and forces a rebuild with the new assignment — rather than silently reusing a graph whose backend assignments no longer hold.
 
@@ -136,7 +136,7 @@ And one negative entry, because it is the headline difference from doc 10: **the
 
 #### 3.2.1 The backend object: pool, command buffer, and the `'static` trick
 
-`MetalBackend` (`metal_backend.rs:56`) is a thin shell over the device singleton plus its own pool:
+`MetalBackend` (`metal_backend.rs:75`) is a thin shell over the device singleton plus its own pool:
 
 ```rust
 // src/graph/metal_backend.rs:56-77
@@ -361,7 +361,7 @@ These are audit findings **H1** (`GPU_SAFETY.md` §3): the attention kernels str
 
 #### 3.2.5 The fused decode ops: fewer dispatches per token
 
-The decode-fusion arms show why the graph's fused nodes exist. `Op::FusedQKV` (`metal_backend.rs:843-915`) is two encodes for what unfused would be ten:
+The decode-fusion arms show why the graph's fused nodes exist. `Op::FusedQKV` (`metal_backend.rs:1463-1552`) is two encodes for what unfused would be ten:
 
 ```rust
 // src/graph/metal_backend.rs:843-866 (head of the FusedQKV arm)
@@ -413,7 +413,7 @@ The weight `blk.{i}.attn_qkv` was built at load time by `concat_rows` (`src/meta
             let device = MTLCreateSystemDefaultDevice()?;
 ```
 
-`MINFER_DISABLE_MPS=1` returns `None` before anything GPU-ish happens — this is the documented force-CPU switch (`AGENTS.md` build table). Then: grab the default Metal device; optionally start an Xcode GPU capture (`MINFER_METAL_CAPTURE=1`, `:2045-2052`); load the shader library — the build precompiles `src/metal/kernels/` into a `metallib` at build time (llama.cpp-style, `:2054-2063`), falling back to a ~0.3-1 s *runtime* source compile when the toolchain was missing, with `MINFER_METALLIB_FILE` as a runtime override for A/B-ing compiler flags. Then comes the part that looks like boilerplate and is actually the capability table made real: ~70 `get_pl("kernel_...")` calls (one `MetalComputePipelineState` per shader entry point — 3 matmul tiers × 7 quant types, 9 `get_rows` variants, 2 rms_norms, elementwise ops, 5 attention families × f32/f16, store_kv × 2, the fused store kernels, warmup) — and any *missing kernel name* makes `try_new` return `None` here, so a shader typo degrades to CPU at startup, loudly printed ("`MPS: no function '...'`"), rather than faulting later. The regression test `metal_pipelines_compile` (`metal/tests.rs:17`) exists because of exactly that failure mode: *"a duplicate/missing kernel or a Metal compile error makes `MpsState::init` fall back to CPU silently, which looks like a 'GPU throttling' slowdown"* — the Q5_0 incident of 2026-08-06.
+`MINFER_DISABLE_MPS=1` returns `None` before anything GPU-ish happens — this is the documented force-CPU switch (`AGENTS.md` build table). Then: grab the default Metal device; optionally start an Xcode GPU capture (`MINFER_METAL_CAPTURE=1`, `:2045-2052`); load the shader library — the build precompiles `src/metal/kernels/` into a `metallib` at build time (llama.cpp-style, `:2054-2063`), falling back to a ~0.3-1 s *runtime* source compile when the toolchain was missing, with `MINFER_METALLIB_FILE` as a runtime override for A/B-ing compiler flags. Then comes the part that looks like boilerplate and is actually the capability table made real: ~70 `get_pl("kernel_...")` calls (one `MetalComputePipelineState` per shader entry point — 3 matmul tiers × 7 quant types, 9 `get_rows` variants, 2 rms_norms, elementwise ops, 5 attention families × f32/f16, store_kv × 2, the fused store kernels, warmup) — and any *missing kernel name* makes `try_new` return `None` here, so a shader typo degrades to CPU at startup, loudly printed ("`MPS: no function '...'`"), rather than faulting later. The regression test `metal_pipelines_compile` (`metal/tests.rs:18`) exists because of exactly that failure mode: *"a duplicate/missing kernel or a Metal compile error makes `MpsState::init` fall back to CPU silently, which looks like a 'GPU throttling' slowdown"* — the Q5_0 incident of 2026-08-06.
 
 Finally the state is built with the device, the **runtime-queried limits**, and the single command queue:
 
@@ -436,7 +436,7 @@ Finally the state is built with the device, the **runtime-queried limits**, and 
 
 #### 3.2.7 Zero-copy weights: wrapping the mmap in a Metal buffer
 
-The registration chain starts in the loader (doc 03). `load_tensor` (`models/qwen2/loader.rs:202-220`) hands every weight tensor's raw bytes to the Metal registry as it is parsed:
+The registration chain starts in the loader (doc 03). `load_tensor` (`models/qwen2/loader.rs:177-184`) hands every weight tensor's raw bytes to the Metal registry as it is parsed:
 
 ```rust
 // src/models/qwen2/loader.rs:202-220
@@ -559,7 +559,7 @@ The result flows into `CParams` (`:447-468`): `gpu: metal_on || cuda_on`, plus `
                 sched.assign_backends(&mut graph, alloc);
 ```
 
-`enable_metal` (`alloc.rs:68-73`) constructs the `MetalBackend` (which succeeds only if MPS is live), and from this moment `assign_backends`'s `alloc.supports(...)` (§2.7's priority order) hands nodes to Metal. When the gate passed, that is *every* node of the Qwen2/Qwen3 graph — the resulting graph is one all-Metal split, and `CParams.gpu=true` means the cached graph keeps that assignment until the params change.
+`enable_metal` (`alloc.rs:260-272`) constructs the `MetalBackend` (which succeeds only if MPS is live), and from this moment `assign_backends`'s `alloc.supports(...)` (§2.7's priority order) hands nodes to Metal. When the gate passed, that is *every* node of the Qwen2/Qwen3 graph — the resulting graph is one all-Metal split, and `CParams.gpu=true` means the cached graph keeps that assignment until the params change.
 
 #### 3.2.9 One command buffer per split, flushed by the scheduler
 
@@ -583,7 +583,7 @@ Now assemble §2.4's rhythm from both sides. The scheduler's `execute` (`schedul
             }
 ```
 
-Step 1 is the command buffer's submit: `sync_backend` (`alloc.rs:543-563`) routes to `MetalBackend::synchronize`, which is one line — `self.submit_pending()` (`metal_backend.rs:1812-1814`). Step 2 is the cross-backend copy of §2.2 (host round trip through the shared buffers, into a fresh staging buffer so the producer's own buffer is untouched for the graph's re-executability). On a fully-Metal graph there is one split, so this `if` never fires mid-graph — but the *final* sync after the loop (`:348-352`) always does, which is where the decode forward's single submit lands. If any node's buffer turned out to live on a different backend than the split executing it, the scheduler returns a hard `Err` ("assignment/alloc mismatch", `:234-241`) — the same no-silent-fallback posture, one level up.
+Step 1 is the command buffer's submit: `sync_backend` (`alloc.rs:2398-2404`) routes to `MetalBackend::synchronize`, which is one line — `self.submit_pending()` (`metal_backend.rs:1812-1814`). Step 2 is the cross-backend copy of §2.2 (host round trip through the shared buffers, into a fresh staging buffer so the producer's own buffer is untouched for the graph's re-executability). On a fully-Metal graph there is one split, so this `if` never fires mid-graph — but the *final* sync after the loop (`:348-352`) always does, which is where the decode forward's single submit lands. If any node's buffer turned out to live on a different backend than the split executing it, the scheduler returns a hard `Err` ("assignment/alloc mismatch", `:234-241`) — the same no-silent-fallback posture, one level up.
 
 The submit itself (`metal_backend.rs:160-186`) takes the leaked box back, calls `cb.submit()`, and — under `MINFER_OP_PROFILE=1` — accumulates the GPU wait time that §4's profile table prints. The `Drop` impl does the same flush best-effort (`let _ = cb.submit()`) so a backend dropped mid-split cannot leak an unterminated encoder.
 
@@ -668,7 +668,7 @@ Walk it as three defenses. **(1) A completion handler on a semaphore**: `addComp
 
 This is §2.2's promise made concrete: `read_host` reinterprets the Metal buffer's `contents()` pointer as a Rust `&[f32]` — no copy, no sync — and `write_host` is `memcpy` with a length check. The two call patterns that matter: **inputs** are written here *before* the split's nodes encode (the scheduler skips `Op::Input` nodes precisely because "data pre-filled by the allocator", `scheduler.rs:225-227`), and **outputs** are read after the split's sync — the logits path ends with `alloc.copy_to_cpu(graph.outputs[0])` (`models/qwen2/graph.rs:618`), which lands here once the final submit's completion handler has fired. Reading a buffer whose producing kernels are still *encoded but not submitted* would be the classic race; the one-command-buffer-per-split discipline plus the bounded submit is what makes these plain views safe.
 
-There is one more readback path, used only by the trace/viz tooling (`MINFER_TRACE`, the viz server): `capture_split` (`metal_backend.rs:83-97`) encodes a *blit* pass — `encode_captures` (`src/metal/encode.rs`), a GPU→GPU copy into per-split staging buffers appended *after* all the split's kernels — so the capture reads this step's data without forcing a per-node flush. The scheduler queues `(node, staging)` pairs during the split (`scheduler.rs:306-344`) and drains them in `flush_metal_captures` right after the boundary sync (`:394-417`). It is a nice illustration of the submit model: even debug tooling has to work *with* the async pipeline, by scheduling its reads into the same command buffer.
+There is one more readback path, used only by the trace/viz tooling (`MINFER_TRACE`, the viz server): `capture_split` (`metal_backend.rs:144-157`) encodes a *blit* pass — `encode_captures` (`src/metal/encode.rs`), a GPU→GPU copy into per-split staging buffers appended *after* all the split's kernels — so the capture reads this step's data without forcing a per-node flush. The scheduler queues `(node, staging)` pairs during the split (`scheduler.rs:306-344`) and drains them in `flush_metal_captures` right after the boundary sync (`:394-417`). It is a nice illustration of the submit model: even debug tooling has to work *with* the async pipeline, by scheduling its reads into the same command buffer.
 
 #### 3.2.12 One shader, walked: `kernel_rms_norm_f32`
 
@@ -816,7 +816,7 @@ With 256 threads (8 simdgroups), one `simd_sum` is no longer enough: each simdgr
 - **`MINFER_TRACE=<dir>`** records per-node real-data traces (doc 08's staged Metal capture path — blits at split end, read after sync); the same env var arms `submit()`'s dispatch-label ring, so a Metal error/timeout message names the last 16 kernels encoded.
 - **A/B levers for every §2.5 decision**: `MINFER_NO_FLASH=1` (decode flash → split), `MINFER_NO_PREFILL_FLASH=1`, `MINFER_NO_MATMUL_ATTN=1` (parallel prefill → classic), `MINFER_NO_SPLIT_ATTN=1`, `MINFER_NO_RMS_256=1`, `MINFER_GEMM=0` (GEMM tier off), `MINFER_CACHE_TYPE=f16|f32` (KV width; `q8_0` is refused here — CPU and CUDA only, C4), `MINFER_ATTN_CHUNKS=N`, `MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1` (fusion off — changes `CParams`, forces a rebuild). Each is a one-env-var kernel-family A/B, the same levers the optimization campaign used.
 - **`MINFER_METAL_CAPTURE=1`** starts an Xcode GPU capture at device init (`src/metal/runtime.rs`) — open the .gpu capture in Xcode to see every encoded dispatch of a run; `MINFER_METALLIB_FILE=<path>` swaps the precompiled shader library at runtime; `MINFER_WEIGHT_COPY=1` forces the copied-weight path to isolate zero-copy registration bugs.
-- **Tests** (macOS, `cargo test`): `metal_pipelines_compile` (`metal/tests.rs:17`) fails if any kernel is missing or the library does not compile — the anti-silent-CPU-fallback guard; the `metal_backend.rs` test module carries per-op correctness gates against host-computed references, e.g. `metal_matmul_q8_matches_cpu` builds a graph, runs it through the real scheduler with every node forced to Metal, and asserts max diff < 1e-3 against a manual Q8×f32 reference (`:1775-1782`), plus cross-backend copy, split alternation, KV attention, decode-step, and real-scale (d=896) variants; the greedy end-to-end gates of doc 12 close the loop (byte-identical greedy output across the optimization campaign is the standard the records claim).
+- **Tests** (macOS, `cargo test`): `metal_pipelines_compile` (`metal/tests.rs:18`) fails if any kernel is missing or the library does not compile — the anti-silent-CPU-fallback guard; the `metal_backend.rs` test module carries per-op correctness gates against host-computed references, e.g. `metal_matmul_q8_matches_cpu` builds a graph, runs it through the real scheduler with every node forced to Metal, and asserts max diff < 1e-3 against a manual Q8×f32 reference (`:1775-1782`), plus cross-backend copy, split alternation, KV attention, decode-step, and real-scale (d=896) variants; the greedy end-to-end gates of doc 12 close the loop (byte-identical greedy output across the optimization campaign is the standard the records claim).
 - **The honest caveat**: on a CPU-only build these tests print `MPS unavailable; skipping` and pass — Metal coverage exists only where Metal does. A no-op GPU test suite is one of the failure modes `docs/GPU_SAFETY.md`'s recurrence playbook is written for.
 
 ## 5. Cross-references

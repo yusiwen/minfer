@@ -335,7 +335,7 @@ softmax treat out-of-range keys uniformly and exclude them with the one
 `gcol < kv_end` test instead of a second control path.
 
 **Which models take this path.** The host wrapper
-`gqa_attn_f16kv` (`src/cuda/methods/prefill_mmq.rs:294`) gates it:
+gqa_attn_f16kv (`src/cuda/methods/prefill_mmq.rs:294`) gates it:
 
 ```rust
 // 8n: prefill (nt >= 64) runs the FA-style tiled attention. ...
@@ -520,7 +520,7 @@ fn ensure_kv(&mut self, layer: usize, backend: Backend, size: usize) -> [BufRef;
 }
 ```
 
-`alloc_persistent` (`alloc.rs:396-404`) routes through the same pool allocator
+`alloc_persistent` (`alloc.rs:1079`) routes through the same pool allocator
 as everything else — on CUDA that is a `cudaMalloc` held in the backend's
 buffer pool (§3.4) — and registers the buffer as *never freed*. Because the
 allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:79`), the regions
@@ -716,7 +716,7 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
 }
 ```
 (`cuda_backend.rs:1403-1408`.) Reading device memory back to the host is
-*always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:320-333`:
+*always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:642`:
 `state.sync()` then a pinned-staging readback); `write_host`
 (`cuda_backend.rs:1410-1426`) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
@@ -767,14 +767,14 @@ that tax without changing the kernels. The scheduler asks the CUDA backend,
 before executing a split, whether it wants to replay a capture
 (`src/graph/scheduler.rs:194-213`; the ask itself is one line,
 `c.graph_replay(graph.uid, split.node_range, …)` at `scheduler.rs:201`). On
-the backend, `graph_replay_step` (`cuda_backend.rs:184-251`) runs a three-run
+the backend, `graph_replay_step` (`cuda_backend.rs:459`) runs a three-run
 protocol: the first two executions of a (graph uid, node range) go through
 normal per-node launches (`graph_runs` counter, `cuda_backend.rs:222-226`); on
 the third, the backend opens a *capture window* (`graph_begin_capture`,
 holding the process-wide stream lock so no other backend's work is recorded
 into the graph, `cuda_backend.rs:237-248`) — from then until `synchronize`,
 every kernel the dispatch enqueues is *recorded*, not executed. At the
-boundary, `close_capture_or_sync` (`cuda_backend.rs:268-306`) instantiates
+boundary, `close_capture_or_sync` (`cuda_backend.rs:573`) instantiates
 the recorded graph, launches it once, and caches the exec; every later step
 replays the whole split as **one** `graph_launch_exec` call
 (`cuda_backend.rs:210-216`). N per-node launches collapse into one.
@@ -916,7 +916,7 @@ traffic (`attention_prefill.cu:394`). The grid at those shapes is small and
 regular: `ceil(2048/64) = 32` query tiles × 28 heads = 896 blocks of 128
 threads, each asking for `((64 + 2·32) · 136 · 2) = 34,816 B ≈ 34.8 KB` of
 dynamic shared memory (`attention_prefill.cu:394`), raised via
-`cudaFuncSetAttribute` (`attention_prefill.cu:394`). What makes it *slow*, by
+`cudaFuncSetAttribute` (`attention_prefill.cu:417`). What makes it *slow*, by
 construction: an `hd ≠ 128` model silently takes the legacy path (0.5B does
 exactly this, §3.1); a device that refuses the shared-memory opt-in falls back
 with one printed warning and a "~50× slower" attention

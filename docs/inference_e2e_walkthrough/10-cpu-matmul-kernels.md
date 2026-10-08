@@ -467,7 +467,7 @@ This is the `GetRows` node of doc 05 made concrete — "the embedding table is a
 - **Row ownership = bit-identical parallelism.** Never "optimize" the pool into splitting a row's reduction; that trades away the determinism the verification gates rely on (§3.3).
 - **The `gate` lock is load-bearing** (`src/kernel/pool.rs:212-218`): removing it works in single-threaded tests and corrupts memory the first time two threads submit concurrently (the server's multi-slot path).
 - **K-quant weights need Q8_K activations, 32-value weights need Q8_0** — crossing the pairing (e.g. feeding Q8_0 blocks to `dot_q4_k_q8_k`) misindexes the super-block scales. The `cpu_quant_matmul_f32` branch exists to make the pairing unstateable from the call site.
-- **The activation-Q8_K layout is kernel-pair-defined** — 306 bytes as written by `quantize_row_q8_k_buf` (`src/quants/quantize_q8_k.rs:8-18` comment), *not* the `BlockQ8_K` struct layout (`block.rs:173`); doc 02 flagged the same nuance on the on-disk side. When touching either side, re-verify the quantizer→kernel byte contract together.
+- **The activation-Q8_K layout is kernel-pair-defined** — 306 bytes as written by `quantize_row_q8_k_buf` (`src/quants/quantize_q8_k.rs:20-25` comment), *not* the `BlockQ8_K` struct layout (`block.rs:173`); doc 02 flagged the same nuance on the on-disk side. When touching either side, re-verify the quantizer→kernel byte contract together.
 - **Scales fold once per block, integers stay exact** — any refactor that converts intermediate integer dots to float mid-block changes the numerics and breaks parity with llama.cpp.
 
 ## 4. Observe & verify

@@ -201,7 +201,7 @@ number consistent for the whole run.
 ### 2.5 Modes: where the same parsed data goes
 
 The parsed state fans out into mode-specific structs, and each mode takes a
-different subset. In `run_conversation` (`src/main.rs:1191-1242`), the
+different subset. In `run_conversation` (`src/main.rs:2008`), the
 conversation gets a `ConversationSpec` (template, special tokens, `seed`,
 `n_ctx`, system prompt) plus a `TurnParams` (all the sampling knobs *plus*
 `stop_strings`) — every field is copied out of `GenParams`, so the
@@ -357,7 +357,7 @@ fallback:
 
 (`src/main.rs:204-419`, condensed.) Three details carry the design:
 
-- **`next_val`** (`src/main.rs:196-203`) is a closure that peeks at
+- **`next_val`** (`src/main.rs:517`) is a closure that peeks at
   `raw_args[i+1]` and records `parse_err = Some("missing value for …")` if
   it is absent — the error is *remembered* and reported after the whole
   parse, so the user sees one clean message, not an early exit mid-list.
@@ -601,7 +601,7 @@ those branches (`src/download/tests.rs:14-89`).
     └── qwen2.5:0.5b → model.gguf (symlink into ~/.ollama/models/blobs)
 ```
 
-`list_local` (`src/download/mod.rs:480-506`) prints this tree with human
+`list_local` (`src/download/mod.rs:524`) prints this tree with human
 sizes ("412.3 MB"), grouped under `Hugging Face:` and `Ollama:` headers —
 and because resolution reads exactly these files, every name it prints is
 directly usable as the model argument. That is the whole point of source

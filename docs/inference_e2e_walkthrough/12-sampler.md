@@ -5,12 +5,12 @@
 > the next step. This is the bridge between math and language: the model's
 > entire output for one step is a list of 151,936 floating-point scores;
 > the sampler turns that list into a single integer — the next piece of text.
-> **Code**: `src/sampler.rs` (`apply_penalties` :47, `recent_window` :95,
-> `match_stop_suffix` :107, `apply_top_k` :128, `apply_top_p` :152,
-> `sample_temperature` :229, `sample_with_penalties` :283) and its call site,
-> the decode loop in `src/main.rs` :832–940 (`GenParams` defaults :50–78,
-> seeded RNG :845, sampling call :885–895, stop gates :900–918,
-> `is_stop_token` :1020) — lines verified at commit `e7fa0da`.
+> **Code**: `src/sampler.rs` (`apply_penalties` :71, `recent_window` :108,
+> `match_stop_suffix` :120, `apply_top_k` :141, `apply_top_p` :165,
+> `sample_temperature` :242, `sample_with_config` :1181) and its call site,
+> the decode loop in `src/main.rs` :1553–1791 (`GenParams` defaults :73–140,
+> seeded RNG :1566, sampling call :1729–1744, stop gates :1749–1768,
+> `is_stop_token` :1868) — lines verified at commit `15fa45c`.
 
 ## 1. Background — where this stage sits
 
@@ -357,12 +357,12 @@ finds every possible match exactly once, in O(len(stop)) time.
 
 ### 3.1 Data in / data out
 
-**In** (all in `main`'s frame, handed to `sampler::sample_with_penalties`):
+**In** (all in `main`'s frame, handed to `sampler::sample_with_config`):
 
 | Value | Type / shape | From |
 |---|---|---|
 | `logits` | `&mut Vec<f32>`, exactly `n_vocab` entries (151,936 for Qwen ≈ 0.6 MB) | the last forward (docs 09–11); prefill for the first step, one-token decode for every later step |
-| `params.temp` | `f32`, default 0.8 (0 = greedy) | `GenParams` (`src/main.rs:67`) |
+| `params.temp` | `f32`, default 0.8 (0 = greedy) | `GenParams` (`src/main.rs:73`) |
 | `params.top_k` | `usize`, default 40 | :68 |
 | `params.top_p` | `f32`, default 0.95 | :69 |
 | `params.repeat_penalty` | `f32`, default 1.1 | :70 |

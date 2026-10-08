@@ -284,7 +284,7 @@ alignment).
 - **Where minfer uses it**: `store_kv_f16` (`float4` load + two `__half2`
   stores, `src/cuda/kernels/kv_store.cu:31`); the q6_K B-expand reads packed data as
   `uint4` groups; the q8_0 p32 decode planes are *designed around* the
-  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda/kernels/mmvq_multi.cu:657`, row
+  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda/kernels/mmvq_multi.cu:655`, row
   pointer :8302, the `__ldg` group loads :8308).
 - **Step records**: [11-p5-gemm-tiles-fa-rewrite.md](../cuda_optimization_steps/11-p5-gemm-tiles-fa-rewrite.md)
   (P5·1, +4%); [44-r41-q6k-bexpand-uint4.md](../cuda_optimization_steps/44-r41-q6k-bexpand-uint4.md)

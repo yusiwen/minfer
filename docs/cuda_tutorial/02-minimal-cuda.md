@@ -236,10 +236,10 @@ elementwise ones are the plainest and are all structured like your toy
 | `add_bias_f32` | 2391-2399 | `y[t*d+i] += b[i]`, 2-D | attention/FFN output bias |
 | `f32_bits_to_i32` | 2489-2497 | bit-reinterpret f32 → int32 | graph I32-input convention |
 
-`add_f32` (`src/cuda/kernels/ops_elementwise.cu:201`) is your toy's skeleton exactly —
+`add_f32` (`src/cuda/kernels/ops_elementwise.cu:163`) is your toy's skeleton exactly —
 index formula, guard, `z[tid] = x[tid] + y[tid]` — with two idiom changes:
 the parameter is named `tid` (thread id) and every pointer is
-`const ... __restrict__`. `silu_f32` (`src/cuda/kernels/ops_elementwise.cu:163`) is the
+`const ... __restrict__`. `silu_f32` (`src/cuda/kernels/ops_elementwise.cu:189`) is the
 toy's kernel verbatim except it is *in-place* — one buffer, read and written
 through the same pointer — legal because each element is touched by exactly
 one thread. In-place-ness is a graph-level decision in minfer (the alias rule:
@@ -624,14 +624,14 @@ step, each a few µs of host time — so minfer's answer was not streams but
 **CUDA Graph capture/replay**: record the whole step's launches once, then
 replay the graph as a single launch. Capture is *per-stream* (only work
 enqueued on the capturing stream is recorded), which is why the capture
-window takes the process-wide `stream_lock` (`src/cuda/methods/weights.rs:121-123`): any
+window takes the process-wide stream lock (`src/cuda/methods/weights.rs:121-123`): any
 other backend's stream work must block rather than be recorded into the graph
 (`src/graph/cuda_backend.rs:237-240`). The state machine lives in
-`graph_replay_step` (`src/graph/cuda_backend.rs:168-251`): executions 1–2 of
+`graph_replay_step` (`src/graph/cuda_backend.rs:459`): executions 1–2 of
 a split run as plain launches (warmup — llama.cpp's protocol), the 3rd opens
 the capture window, `synchronize()` closes it (instantiate + launch once +
 cache, `src/graph/cuda_backend.rs:268-279`), and every later execution is a
-single `graph_launch_exec` (`src/graph/cuda_backend.rs:212-214`). The
+single `graph_launch_exec` (`src/graph/cuda_backend.rs:496`). The
 backend's `synchronize` (`src/graph/cuda_backend.rs:1428-1440`) is the
 split-boundary drain point from §2.2: take the stream guard, clear the
 per-execution memos, then `close_capture_or_sync`. Replay is gated by
@@ -681,20 +681,20 @@ compilation) does the whole pipeline:
    `src/cuda.rs` declares the `launch_*` symbols that only the kernels
    archive provides, so every failure below `panic!`s with an actionable
    message (`build.rs:182-188`).
-2. **Find nvcc and the toolkit root.** `find_nvcc()` (`build.rs:379-402`)
+2. **Find nvcc and the toolkit root.** `find_nvcc()` (`build.rs:578-601`)
    probes `CUDA_HOME`/`CUDA_PATH`, then `which nvcc`, resolving to an
-   absolute path either way; `find_cuda_home()` (`build.rs:404-423`) derives
+   absolute path either way; `find_cuda_home()` (`build.rs:603-622`) derives
    the root for `-I{home}/include`.
 3. **Pin the host compiler (ccbin).** nvcc uses the first `cc`/`g++` on PATH
    as its host compiler and *hard-fails* when that GCC is newer than the
    toolkit supports (CUDA 13 rejects GCC 15 — the error surfaces confusingly
-   inside `<cmath>`). `detect_host_compiler()` (`build.rs:481-520`) probes
+   inside `<cmath>`). `detect_host_compiler()` (`build.rs:680-719`) probes
    nvcc's default first, then `g++-15 … g++-11, g++, clang++`; the winner is
    passed as `-ccbin` (`build.rs:202-221`, `:256-259`), and
    `MINFER_CUDA_CCBIN` overrides the probe.
-4. **Probe the architectures.** `detect_archs()` (`build.rs:533-562`)
+4. **Probe the architectures.** `detect_archs()` (`build.rs:732-763`)
    compiles a one-line dummy kernel for every candidate from `sm_70` to
-   `sm_121` (`build.rs:538-540`) and keeps the ones this nvcc accepts —
+   sm_121 (`build.rs:737-739`) and keeps the ones this nvcc accepts —
    candidates newer than the toolkit simply fail their probe and are skipped,
    so one list works on every CUDA version. (The floor is sm_70, not Pascal:
    the prefill GEMM uses WMMA tensor-core intrinsics that require Volta+,
@@ -844,10 +844,10 @@ are noise in the byte budget. Their cost is therefore not bandwidth but
 **latency**: launch overhead (microseconds per launch, host-side) plus the
 kernel's start-to-finish time. This is why the elementwise family is where
 fusion lives: decode never launches `silu_f32` standalone if it can help it —
-the fused-FFN path runs `swiglu_f32_off` (`src/cuda/kernels/ops_elementwise.cu:189`,
+the fused-FFN path runs `swiglu_f32_off` (`src/cuda/kernels/ops_elementwise.cu:201`,
 silu+mul in one pass over the concatenated gate|up buffer) and the prefill
 path fuses the q8 quantization epilogue into the same kernel
-(`swiglu_quant_pad40`, `src/cuda/kernels/ops_elementwise.cu:189` — its comment block is
+(`swiglu_quant_pad40`, `src/cuda/kernels/ops_elementwise.cu:215` — its comment block is
 worth reading for the "no early return — every thread reaches the barrier"
 discipline).
 

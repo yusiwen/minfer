@@ -93,7 +93,7 @@ pub fn attention_scale(&self) -> f32 {
 }
 ```
 
-and flows into the graph as `attn_scale` (`models/qwen2/graph.rs:76`), landing in every `AttnMeta` (`graph.rs:200-207`). Doc 05 covered the meta's plumbing; here it is the `c.scale` of §3.2.4.
+and flows into the graph as `attn_scale` (`models/qwen2/graph.rs:93`), landing in every `AttnMeta` (`graph.rs:200-207`). Doc 05 covered the meta's plumbing; here it is the `c.scale` of §3.2.4.
 
 ### 2.5 What changes on the GPU (preview)
 

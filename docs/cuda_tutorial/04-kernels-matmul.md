@@ -433,10 +433,10 @@ each with an env opt-out for A/B. **Tier 3 — the F32 fallback**:
 
 The one-line answer to "which kernel does decode's Matmul dispatch to?":
 
-- **decode (`nt == 1`)**: `Op::MatMul` (`cuda_backend.rs:931`) →
-  `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:151`) → per-type MMVQ — for Q4_0 with
+- **decode (`nt == 1`)**: `Op::MatMul` (`cuda_backend.rs:1454`) →
+  `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`) → per-type MMVQ — for Q4_0 with
   `id ≥ 2048`: `q4_0_decode_mmvq` (`src/cuda/methods/mmvq.rs:224`) → `launch_q4_0_q8_mmvq`
-  (`mmvq_multi.cu:605`) → **`q4_0_q8_mmvq`** (`mmvq_multi.cu:605`),
+  (`mmvq_multi.cu:605`) → **`q4_0_q8_mmvq`** (`mmvq_multi.cu:446`),
   after `decode_quantize_native` (`src/cuda/methods.rs:180`) has produced (or memoized,
   the MmqCache) the pad40 q8 activation plane via `quantize_q8_0_pad40`.
 - **prefill (`nt ≥ 9`)**: the same arm → `mmq_active()` → `prefill_mmq`
@@ -464,7 +464,7 @@ this tutorial keeps hammering: **the master table gives the structure; the
 gates give your model's truth.**
 
 One more dispatch consumer: the decode fused path. Chapter 05 documented
-`Op::FusedQKV` (`cuda_backend.rs:843`) as concat-matmul then
+`Op::FusedQKV` (`cuda_backend.rs:1365`) as concat-matmul then
 `attn_bias_rope_store`; the concat matmul inside it is the *same*
 `matmul_f32_ptr_layout` call (`cuda_backend.rs:877`), so the fused node and
 the plain `Op::MatMul` node make identical kernel choices at identical
@@ -557,7 +557,7 @@ per-row on purpose. Line by line:
 - **`acc += d8 * d4 * (dot - 8*sx)`** — both scales fold once per block, in
   f32. The integer accumulation is *exact*; the only rounding in the row is
   the two quantizations, which already happened.
-- **`mmvq_block_reduce`** (`mmvq_multi.cu:484`) — the two-stage reduction
+- **`mmvq_block_reduce`** (`src/cuda/kernels/common.cuh:193`) — the two-stage reduction
   of §2.2's second mapping: 5 warp shuffles, `warp_sums[8]` in shared memory,
   `__syncthreads()`, thread 0 adds and stores `output[t*od + row]`.
 
@@ -603,7 +603,7 @@ but it is the right one to read first — smaller, and every idea transfers.
 per-weight f16 cache — `w16_get`, `src/cuda/methods/prefill_f16.rs:119`, dequantized once by
 chapter 03's `dequant_q*_f16` — or by dequantizing into scratch on this
 call), converts the f32 activations once (`launch_convert_f16`), and
-launches the GEMM (`launch_gemm_f16`, `gemm_wmma.cu:833`).
+launches the GEMM (`launch_gemm_f16`, `gemm_wmma.cu:847`).
 
 **The contract.** `C[nt, od] = A[nt, id] · B[od, id]ᵀ`. The header comment
 is the design in six lines (`gemm_wmma.cu:833`):

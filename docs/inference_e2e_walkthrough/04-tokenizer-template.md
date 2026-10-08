@@ -4,11 +4,11 @@
 > build (05). The weights are registered; nothing has run yet. This stage turns
 > the string you typed into the integer token list that every later document
 > operates on — the raw material of the whole rest of the series.
-> **Code**: `src/tokenizer.rs` (`Tokenizer::load` :82, `encode` :280,
-> `decode_bytes` :322), `src/template.rs` (`render_template` :120,
-> `render_messages` :13), `src/main.rs` (template block :715-735,
-> `get_chat_template` :1495, decode loop :900-918) — lines verified at commit
-> `e7fa0da`.
+> **Code**: `src/tokenizer.rs` (`Tokenizer::load` :353, `encode` :619,
+> `decode_bytes` :661), `src/template.rs` (`render_template` :603,
+> `render_messages` :494), `src/main.rs` (template block :1404-1439,
+> `get_chat_template` :2449, decode loop :1749-1768) — lines verified at commit
+> `15fa45c`.
 
 ## 1. Background — where this stage sits
 

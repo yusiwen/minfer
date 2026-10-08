@@ -51,8 +51,9 @@ what keeps the heuristic honest rather than loud:
     cannot tell an FFI name from a renamed Rust item must not fail on absence.
 
 Both non-failing classes are listed by `--list`, printed in the summary, and promoted
-to failures by `--strict-symbols` — so "why did this pass?" always has an answer. Rule
-E's range miss joins them on the same terms.
+to failures by `--strict-symbols` — so "why did this pass?" always has an answer. A
+rule-E range miss used to join them on the same terms; since [#371] swept that
+population to zero it **fails** the plain run — see ``E`` below.
 
 ``D`` **the continuation is range-checked too.** A backticked span whose whole content
 is `:NNN` or `:NNN-MMM` — a second range in the file the line already cited — attaches
@@ -63,29 +64,35 @@ stays silent; a continuation whose path anchor is itself external, ambiguous or 
 is classified the same way. This closes issue #355: the bare form was invisible, so a
 re-point that fixed the visible `path:NNN` left its continuation behind.
 
-``E`` **the range holds the symbol too** — a *note*, counted and listed, not a failure
-(issue #339). Rule C's window is deliberately loose (±25 lines), so an anchor like
-`` `metal_available()` (`metal_backend.rs:1054-1056`) `` passes while the definition is
-700 lines away. Rule E therefore asks the narrower question the citation actually
-claims — does the identifier occur **inside** `start-end` (for a bare `path:NNN`, on
-that one line)? It is a *note* and not a failure because of what that rule costs
-today: measured on `7991218`, **79** non-frozen anchors carry an adjacent backticked
-symbol whose identifier is not inside their own range (**84** once a trailing `()` is
-stripped; 46 of the 84 cite a `NNN-MMM` range, 38 a single line, and 81 of the 84 hold
-the identifier in the target file at all, which is what makes them range misses). A
-rule that failed on that population would have to re-point every one of them in the
-PR that adds it — and 26 of the 84 live in walkthrough docs that state the revision
-their lines were verified against (`lines verified at commit e7fa0da`), where a
-re-point would falsify the record. Two of the three anchors that motivated the rule
-show why the in-range test is not the whole answer anyway: `:256`'s `execute_node`
-anchor cites `316-1020`, which **does** contain the definition at 843 — containment
-cannot see a range that starts 527 lines early — and `:586`'s `synchronize` anchor has
-no adjacent symbol at all, so no adjacency rule can see it. Those two were re-pointed
-by hand.
+``E`` **the range holds the symbol too** — a *failure* since [#371]; it was a *note*
+from [#339] until that sweep landed. Rule C's window is deliberately loose (±25 lines),
+so an anchor like `` `metal_available()` (`metal_backend.rs:1054-1056`) `` passes while
+the definition is 700 lines away. Rule E therefore asks the narrower question the
+citation actually claims — does the identifier occur **inside** `start-end` (for a bare
+`path:NNN`, on that one line)?
+
+It shipped as a note because of what a failure would have cost at the time: measured on
+`7991218`, **79** non-frozen anchors carried an adjacent backticked symbol whose
+identifier was not inside their own range (**84** once a trailing `()` was stripped; 46
+of the 84 cite a `NNN-MMM` range and 38 a single line, and 81 of the 84 hold the
+identifier in the target file at all, which is what makes them range misses), they span
+18 docs, and **26** of them live in walkthrough docs that state the revision their lines
+were verified against (`lines verified at commit e7fa0da`). [#371] re-pointed every one
+of them — the revision-pinned docs included, whose claim was re-stated at the new base
+rather than frozen — and promoted the rule, so today the plain run fails on a range miss
+and `--strict-symbols` promotes only the two heuristic classes (``symbol-far`` and
+``symbol-foreign``), which stay notes because a distance is a smell and an FFI name is
+not a rename.
+
+Two of the three anchors that motivated the rule show why the in-range test is not the
+whole answer anyway: `:256`'s `execute_node` anchor cites `316-1020`, which **does**
+contain the definition at 843 — containment cannot see a range that starts 527 lines
+early — and `:586`'s `synchronize` anchor has no adjacent symbol at all, so no adjacency
+rule can see it. Those two were re-pointed by hand in [#339].
 A *call-site* citation is not a miss: if the range names the symbol at a call, the
-identifier is inside the range and the anchor passes. The convention this note
-enforces is written in ``docs/GATE-CONTRACT.md`` §"Prose anchors"; the sweep of the
-80 is tracked by [#336] and [#356] alongside the bare ranges.
+identifier is inside the range and the anchor passes. The convention this rule enforces
+is written in ``docs/GATE-CONTRACT.md`` §"Prose anchors"; the bare-range sweep that
+remains (the range holds no symbol at all) is [#336] and [#356].
 
 **Frozen records.** A frozen-file set (the ``GRANDFATHERED_BARE`` pattern of
 `scripts/check_dead_code_annotations.py`) exempts the historical records whose anchors
@@ -316,9 +323,12 @@ class Anchor:
     def is_violation(self, strict_symbols: bool = False) -> bool:
         if self.verdict in ("missing", "out-of-range", "range-order", "symbol-moved"):
             return True
-        return strict_symbols and (
-            self.verdict in ("symbol-far", "symbol-foreign") or self.range_miss is not None
-        )
+        # Rule E is a failure by default since #371 swept its population to zero (it
+        # was a note from #339 to #371, while 80 anchors were still outstanding);
+        # `--strict-symbols` is left to promote the two heuristic classes.
+        if self.range_miss is not None:
+            return True
+        return strict_symbols and self.verdict in ("symbol-far", "symbol-foreign")
 
 
 @dataclass
@@ -663,8 +673,8 @@ def main(argv: list[str]) -> int:
         "--strict-symbols",
         action="store_true",
         help=(
-            "promote symbol-far / symbol-foreign notes, and a rule-E range miss "
-            "(the cited range does not hold the named symbol), to failures"
+            "promote the two heuristic symbol notes (symbol-far / symbol-foreign) to "
+            "failures; a rule-E range miss fails without this flag since #371"
         ),
     )
     parser.add_argument("--selftest", action="store_true", help="run the checker's own cases")
@@ -720,7 +730,9 @@ def main(argv: list[str]) -> int:
 #: The prose of ``src/thing.rs`` is line-numbered by construction: ``target_symbol``
 #: sits on line 21, the ``tail_*`` fillers run from line 23, and ``tail_30`` (line 52)
 #: is deliberately more than ``SYMBOL_WINDOW`` lines away from it — the same anchor
-#: passes with ``target_symbol`` and is only a note with ``tail_30``.
+#: passes with ``target_symbol``, and with ``tail_30`` it is a ``symbol-far`` note only
+#: if the cited range *holds* the symbol (rule E): ``20-52`` contains line 52 and starts
+#: 32 lines early, so it is the rule-C note and not a rule-E miss.
 FIXTURE_FILES = {
     "src/thing.rs": "\n".join(
         ["//! thing"]
@@ -745,7 +757,7 @@ FIXTURE_FILES = {
     "docs/ok.md": "The function `target_symbol` (`src/thing.rs:21`) is here.\n",
     "docs/external.md": "See `ggml-cuda.cu:12` and `mmq.cuh:9`.\n",
     "docs/ambiguous.md": "Both are named `tests.rs:1`.\n",
-    "docs/far.md": "Nothing near `tail_30` (`src/thing.rs:21`).\n",
+    "docs/far.md": "Nothing near `tail_30` (`src/thing.rs:20-52`).\n",
 }
 
 #: The anchor line every case reuses, so only the symbol or the number changes.
@@ -986,17 +998,13 @@ def selftest() -> int:
         _range_miss(report, "docs/range.md") == 1,
         "... but rule E reports that line 20 does not hold it (the definition is line 1)",
     )
-    expect(not report.violations(False), "a range miss is a note, not a default failure")
-    expect(bool(report.violations(True)), "--strict-symbols promotes a range miss to a failure")
+    expect(bool(report.violations(False)), "a range miss fails the plain run since #371")
+    expect(bool(report.violations(True)), "and it still fails under --strict-symbols")
     expect(
-        _exit_code(offence) == 0,
-        "the plain run stays green over a range miss (the population is 79 on master)",
+        _exit_code(offence) == 1,
+        "a range miss fails the plain run (rule E is a failure since the #371 sweep)",
     )
-    expect(
-        _exit_code(offence, "--strict-symbols") == 1,
-        "a range miss fails the run under --strict-symbols",
-    )
-    stderr = _stderr_of(offence, "--strict-symbols")
+    stderr = _stderr_of(offence)
     expect("docs/range.md:1" in stderr, "the failure names the doc line")
     expect(
         "src/caller.rs:1" in stderr,

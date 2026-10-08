@@ -6,11 +6,11 @@
 > ([10 — CPU matmul kernels](10-cpu-matmul-kernels.md),
 > [11 — Attention + vec ops + KV](11-attention-vecops-kv.md)) and the first
 > sample ([12 — Sampler](12-sampler.md)).
-> **Code**: `src/main.rs` prefill block (L737–769, timing prints L763–769 and
-> L1000–1017), the call chain `src/models/mod.rs::forward` (L26) →
-> `src/models/qwen2/mod.rs::forward` (L33) → `src/models/qwen2/graph.rs::forward`
-> (L384) → `forward_cached` (L403), `src/graph/params.rs` (`GraphParams` L52),
-> `src/trace.rs::begin_phase` (L70) — lines verified at commit `e7fa0da`.
+> **Code**: `src/main.rs` prefill block (L1441–1485, timing prints L1480–1485 and
+> L1848–1865), the call chain `src/models/mod.rs::forward` (L222) →
+> `src/models/qwen2/mod.rs::forward` (L55) → `src/models/qwen2/graph.rs::forward`
+> (L432) → `forward_cached` (L450), `src/graph/params.rs` (`GraphParams` L88),
+> `src/trace.rs::begin_phase` (L70) — lines verified at commit `15fa45c`.
 
 ## 1. Background — where this stage sits
 
