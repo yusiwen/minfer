@@ -65,9 +65,9 @@ Three things the table does not show:
 
 1. **The `nt` regimes share one dispatch function.** Rust-side, one place
    decides GEMV-vs-GEMM: `CudaState::matmul_f32_ptr_layout`
-   (`src/cuda/methods/dispatch.rs:151`). Every MatMul-shaped node goes through it — the
-   plain `Op::MatMul` arm (`src/graph/cuda_backend.rs:931`) *and* the
-   decode-fused `Op::FusedQKV` concat matmul (`cuda_backend.rs:877`).
+   `matmul_f32_ptr` (`src/cuda/methods/dispatch.rs:147`)). Every MatMul-shaped node goes through it — the
+   plain `Op::MatMul` arm `execute_node_inner` (`src/graph/cuda_backend.rs:916`)) *and* the
+   decode-fused `Op::FusedQKV` concat matmul (`matmul_f32_ptr_layout`, `cuda_backend.rs:1399`).
 2. **The v2/multi/pf suffixes are variants, not new algorithms.**
    `q4_k_q8_mmvq_v2` (:1447) is the same dp4a structure reorganized for
    16-byte weight loads; `_multi` adds an in-block token loop for `nt` 2–8;
@@ -118,7 +118,7 @@ column") re-reads the same weight bytes once per token: `nt` × the whole
 matrix. The fix is **tiling** — process the output in small rectangles so
 every tile of `B` loaded once serves *all* the tokens in the tile of `A`.
 Count it for the 0.5B down-projection `[od=896, id=4864]` at `nt = 512`
-(dims: `docs/inference_e2e_walkthrough/05-graph-builder-ir.md:162`):
+(dims: `docs/inference_e2e_walkthrough/05-graph-builder-ir.md:162` (§2The main event: one forward pass, node by node")):
 
 - **without reuse**: each weight byte is read `nt` times → 2.45 MB (Q4_0) ×
   512 ≈ 1.25 GB of traffic for one layer, one forward.
@@ -191,7 +191,7 @@ times.
 ### 3.1 `f32_f32_matmul_scalar` — the scalar GEMV
 
 The plainest matmul in the file — the shape every later kernel improves on.
-The kernel, `src/cuda/kernels/ops_misc.cu:350`:
+The kernel, `f32_f32_matmul_vec` (`src/cuda/kernels/ops_misc.cu:314`):
 
 ```c
 // General-case fallback: one thread per (token, output) pair, scalar dot.
@@ -231,7 +231,7 @@ Line by line:
   baseline the rest of the ladder exists to beat. The store address *is*
   `idx`: `od` outputs per token are contiguous, so flat index = address.
 
-The launcher (`src/cuda/kernels/ops_misc.cu:294`) is where the ladder's first fork
+The launcher `embed_rows_q6_k` (`src/cuda/kernels/ops_misc.cu:277`)) is where the ladder's first fork
 lives — `id % 8 == 0` (the vector kernel's float4 alignment requirement)
 routes to `f32_f32_matmul_vec` with `grid = ceil(od/8)`, 64-thread blocks;
 otherwise the scalar kernel launches with the familiar
@@ -244,8 +244,8 @@ so the *shape* of this kernel is the GEMV shape for the whole
 f32-activation family.
 
 **Bytes moved — the number that decides everything.** Qwen2.5-0.5B has
-`n_embd = 896` and FFN width 4864 (`docs/QWEN2-SUPPORT.md:79`;
-`docs/inference_e2e_walkthrough/05-graph-builder-ir.md:162`). Two layers,
+`n_embd = 896` and FFN width 4864 (`docs/QWEN2-SUPPORT.md:79` (§4Verified models");
+`docs/inference_e2e_walkthrough/05-graph-builder-ir.md:162` (§2The main event: one forward pass, node by node")). Two layers,
 f32 weights, one decode token:
 
 - attention `wo` `[896 out, 896 in]`: weights = 896·896·4 B = **3.21 MB**;
@@ -253,7 +253,7 @@ f32 weights, one decode token:
 - `ffn_down` `[896 out, 4864 in]`: weights = 896·4864·4 B = **17.4 MB**;
   FLOPs = 2·896·4864 ≈ 8.72 MFLOP.
 
-At the GB10's documented ~273 GB/s (`docs/GLOSSARY.md:127`), `ffn_down`
+At the GB10's documented ~273 GB/s (`docs/GLOSSARY.md:127` ("L3 — Performance model")), `ffn_down`
 cannot finish faster than 17.4 MB ÷ 273 GB/s ≈ **63.7 µs** — and the math it
 must do (8.7 MFLOP) is ~136 GFLOP/s at that pace, *nothing* for a GPU. That
 asymmetry is the whole story: a GEMV's arithmetic intensity — FLOPs per byte
@@ -274,7 +274,7 @@ bytes are the budget.
 ### 3.2 `f32_f32_matmul_vec` — the vectorized GEMV
 
 Same math, three mechanical changes. The kernel header states the mapping
-(`src/cuda/kernels/ops_misc.cu:294`):
+`embed_rows_q6_k` (`src/cuda/kernels/ops_misc.cu:277`)):
 
 ```c
 // ─── F32 × F32 matmul (7e④) ───────────────────────────────────
@@ -283,7 +283,7 @@ Same math, three mechanical changes. The kernel header states the mapping
 // the aligned float4 loads; the scalar kernel covers the general case.
 ```
 
-First change — **the constants and the mapping** (`ops_misc.cu:294`):
+First change — **the constants and the mapping** `embed_rows_q6_k` (`ops_misc.cu:277`)):
 
 ```c
     const int NR0 = 4;
@@ -311,7 +311,7 @@ warp's 32 threads) will own a `(row, 256-element chunk)` pair. The grid is
 `ceil(od / 8)` blocks — output-parallel only, no `grid.y = nt`.
 
 Second change — **the inner loop is a unit-lane loop with float4 loads**
-(`ops_misc.cu:294`):
+`embed_rows_q6_k` (`ops_misc.cu:277`)):
 
 ```c
         for (int u = lane_id; u < nch * NR0; u += WARP) {
@@ -344,7 +344,7 @@ Second change — **the inner loop is a unit-lane loop with float4 loads**
 - **`acc[rr] += p`** — each lane keeps one partial per row (`float acc[4]`,
   zeroed at :2201); chunk partials accumulate per lane, not globally.
 
-Third change — **the reduction and the token loop** (`ops_misc.cu:294`):
+Third change — **the reduction and the token loop** `embed_rows_q6_k` (`ops_misc.cu:277`)):
 per row, `warp_reduce_sum` — the butterfly shuffle from chapter 02 — folds
 the 32 lane-partials into lane 0, which stores `output[t * od + r0 + rr]`.
 The `for t` loop wraps *everything*, so one launch serves every token; the
@@ -374,7 +374,7 @@ gain class, same ceiling.
 
 Here is the section to bookmark: every MatMul-shaped node reaches the same
 match arm, and the arm hands everything to one function. The backend arm
-(`src/graph/cuda_backend.rs:931`, abridged to the calls that matter):
+`execute_node_inner` (`src/graph/cuda_backend.rs:916`), abridged to the calls that matter):
 
 ```rust
 Op::MatMul { transpose_b } => {
@@ -398,10 +398,10 @@ Op::MatMul { transpose_b } => {
 The name parses as: matmul with **f32 activations** (`_f32`), raw
 **pointers** (`_ptr` — no tensor objects cross the FFI), and a **layout**
 flag (`_layout` — whether a Q6_K weight was registered with the padded
-224-byte stride). The decision tree inside (`src/cuda/methods/weights.rs:458`) has three
+224-byte stride). The decision tree inside `Q4KB` (`src/cuda/methods/weights.rs:426`)) has three
 tiers:
 
-**Tier 1 — prefill GEMM** (`src/cuda/methods/weights.rs:487`): `nt >= 9` **and** `id % 32 == 0`
+**Tier 1 — prefill GEMM** `prewarm_prefill` (`src/cuda/methods/weights.rs:13`)): `nt >= 9` **and** `id % 32 == 0`
 **and** a supported quant type → a tiled GEMM — `prefill_mmq` (int8,
 default) or `prefill_gemm_f16` (the f16 escape, §3.5) depending on
 `mmq_active()` (`src/cuda/methods/policy.rs:39`: compute capability ≥ 8.0 and `MINFER_MMQ`
@@ -409,7 +409,7 @@ not `0`).
 
 **Tier 2 — decode/small-batch per-type kernels**: everything else falls
 through to a `match ttype` with per-type shape gates. The Q4_0 arm
-(`src/cuda/methods/weights.rs:569`):
+`get_weight_ptr` (`src/cuda/methods/weights.rs:197`)):
 
 ```rust
 } else if nt == 1 && id >= 2048 && id % 32 == 0 && !Self::no_q40_mmvq() {
@@ -425,7 +425,7 @@ through to a `match ttype` with per-type shape gates. The Q4_0 arm
 ```
 
 and the K-quant arms have the same skeleton with their own measured gates
-(`src/cuda/methods/weights.rs:619`–2870): Q4_K decode MMVQ at `id >= 2048`, Q5_K at
+`model_load_guard` (`src/cuda/methods/weights.rs:613`)–2870): Q4_K decode MMVQ at `id >= 2048`, Q5_K at
 `od*id >= 24_000_000`, Q6_K at `od*id >= 4_000_000` — each a documented
 crossover where the dp4a structure starts beating the f32-activation kernel,
 each with an env opt-out for A/B. **Tier 3 — the F32 fallback**:
@@ -436,11 +436,11 @@ The one-line answer to "which kernel does decode's Matmul dispatch to?":
 - **decode (`nt == 1`)**: `Op::MatMul` (`cuda_backend.rs:1454`) →
   `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`) → per-type MMVQ — for Q4_0 with
   `id ≥ 2048`: `q4_0_decode_mmvq` (`src/cuda/methods/mmvq.rs:224`) → `launch_q4_0_q8_mmvq`
-  (`mmvq_multi.cu:605`) → **`q4_0_q8_mmvq`** (`mmvq_multi.cu:446`),
+  `q8_0_q8_mmvq_multi` (`mmvq_multi.cu:563`)) → **`q4_0_q8_mmvq`** (`mmvq_multi.cu:446`),
   after `decode_quantize_native` (`src/cuda/methods.rs:180`) has produced (or memoized,
   the MmqCache) the pad40 q8 activation plane via `quantize_q8_0_pad40`.
 - **prefill (`nt ≥ 9`)**: the same arm → `mmq_active()` → `prefill_mmq`
-  (`src/cuda/methods.rs:301`) → for Q4_K: transposed-A prepass
+  `prefill_mmq` (`src/cuda/methods.rs:301`)) → for Q4_K: transposed-A prepass
   `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`) then
   `launch_mmq_raw_nb_bt_nt` (`mmq_nb.cu:601`) →
   **`mmq_raw_nb_bt_kernel`** (`mmq_nb.cu:289`); Q6_K has its own BT
@@ -456,17 +456,17 @@ everything else — QKV projections, `wo`, gate, up, `lm_head` (id 896) —
 misses the gate and runs the **f32-activation kernel** `q4_0_f32_matmul`
 (:124). On Qwen2.5-7B (`id = 3584` everywhere), every decode matmul clears
 the gate and the whole step is MMVQ — plus the v2 variants, since
-`mmvq_v2(id)` (`src/cuda/methods/elementwise.rs:189`) additionally requires `id % 256 == 0`
+`mmvq_v2(id)` `rope_f32` (`src/cuda/methods/elementwise.rs:171`)) additionally requires `id % 256 == 0`
 (3584 = 256·14 ✓). The gate is not an oversight: the arms' comments record
 the measured crossovers (small-`id` MMVQ loses — the uncoalesced nibble
-loads dominate when rows are short, `src/cuda/methods/dispatch.rs:344`). The reading habit
+loads dominate when rows are short, `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:141`)). The reading habit
 this tutorial keeps hammering: **the master table gives the structure; the
 gates give your model's truth.**
 
 One more dispatch consumer: the decode fused path. Chapter 05 documented
 `Op::FusedQKV` (`cuda_backend.rs:1365`) as concat-matmul then
 `attn_bias_rope_store`; the concat matmul inside it is the *same*
-`matmul_f32_ptr_layout` call (`cuda_backend.rs:877`), so the fused node and
+`matmul_f32_ptr_layout` (`cuda_backend.rs:1399`) call, so the fused node and
 the plain `Op::MatMul` node make identical kernel choices at identical
 shapes — the fusion is in the epilogue, not the matvec.
 
@@ -478,13 +478,13 @@ its ingredients, then the code.
 **The activation plane.** `decode_quantize_native` (`src/cuda/methods.rs:180`)
 quantizes the one f32 activation row into the **pad40** layout — 40 bytes per
 32-element block: 2-byte f16 scale, 2 bytes of padding, 32 int8 values at
-offset 4, and a 4-byte int32 sum at offset 36 (`mmvq_aquant.cu:27`
+offset 4, and a 4-byte int32 sum at offset 36 `quantize_q8_0_pad40` (`mmvq_aquant.cu:27`)
 documents the layout; the sum feeds the *MMQ* min-term correction and is
 "invisible" to MMVQ). The writer kernel is `quantize_q8_0_pad40` (:733),
 one thread per block, tree-reduced amax — chapter 03's quantize family,
 already read.
 
-**The kernel** — `src/cuda/kernels/mmvq_aquant.cu:27`:
+**The kernel** — `quantize_q8_0_pad40` (`src/cuda/kernels/mmvq_aquant.cu:27`):
 
 ```c
 __global__ void __launch_bounds__(256) q4_0_q8_mmvq(
@@ -528,7 +528,7 @@ __global__ void __launch_bounds__(256) q4_0_q8_mmvq(
 ```
 
 **What one thread processes: a slice of one weight row — 32-element blocks,
-round-robin.** The launcher (`mmvq_multi.cu:605`) is `grid(od, nt)` × 256
+round-robin.** The launcher `q8_0_q8_mmvq_multi` (`mmvq_multi.cu:563`)) is `grid(od, nt)` × 256
 threads, so block `row` owns output element `out[t][row]` and its 256
 threads split the row's `nb = id/32` quant blocks (`u = threadIdx.x; u +=
 256`). For `ffn_down` 0.5B: `nb = 152`, so each thread handles exactly one
@@ -539,7 +539,7 @@ per-row on purpose. Line by line:
   03's Q4_0 block. One thread's block pointer is `row·2736 + u·18` — a
   stride-18 walk, the row streamed linearly.
 - **`d4`, `d8`** — the two f16 scales: the weight block's and the
-  activation block's (`Q8PB = 40` stride, `common.cuh:122`).
+  activation block's (`Q8PB = 40` stride, `get_scale_min_k4` (`common.cuh:114`)).
 - **the 2-byte-loads-as-u32 trick** — Q4_0's 18-byte stride guarantees only
   2-byte alignment (family comment at :8085-8086), so a direct `uint32_t`
   load would be a misaligned-access fault on some devices; the kernel
@@ -577,7 +577,7 @@ regime. The differences are load widths and loop nesting, never dot algebra.
 §3.1's budget: same `ffn_down` layer, now Q4_0. Weight bytes: 896 rows ×
 152 blocks × 18 B = **2.45 MB** (was 17.4 MB — 7.1× less traffic);
 intensity: 2 FLOP per 0.5625-byte element = **3.56 FLOP/weight-byte** (was
-0.5; `docs/GLOSSARY.md:126` rounds this to "~1 MAC per weight-byte →
+0.5; `docs/GLOSSARY.md:126` ("L3 — Performance model") rounds this to "~1 MAC per weight-byte →
 bandwidth-bound"). The floor drops from 63.7 µs to 2.45 MB ÷ 273 GB/s ≈
 **9.0 µs** — still memory-bound (you never escape that at `nt == 1`), but
 7× lower. And the compute to fill that bandwidth — 8.7 MFLOP in 9 µs — is
@@ -599,14 +599,14 @@ It is also the *escape* path today (the int8 MMQ of §3.6 is the default),
 but it is the right one to read first — smaller, and every idea transfers.
 
 **How to get there.** `MINFER_MMQ=0` routes prefill to `prefill_gemm_f16`
-(`src/cuda/methods.rs:224`), which obtains the weight as f16 (from the persistent
+`prefill_gemm_f16` (`src/cuda/methods.rs:224`)), which obtains the weight as f16 (from the persistent
 per-weight f16 cache — `w16_get`, `src/cuda/methods/prefill_f16.rs:119`, dequantized once by
 chapter 03's `dequant_q*_f16` — or by dequantizing into scratch on this
 call), converts the f32 activations once (`launch_convert_f16`), and
 launches the GEMM (`launch_gemm_f16`, `gemm_wmma.cu:847`).
 
 **The contract.** `C[nt, od] = A[nt, id] · B[od, id]ᵀ`. The header comment
-is the design in six lines (`gemm_wmma.cu:833`):
+is the design in six lines `MINFER_GEMM_OPTIN_SET` (`gemm_wmma.cu:596`)):
 
 ```c
 // C[nt, od] = A[nt, id] · B[od, id]^T. 64 x TM output tiles (TM = 64
@@ -618,7 +618,7 @@ is the design in six lines (`gemm_wmma.cu:833`):
 ```
 
 **Layer 1 — block tiles.** The grid is
-`dim3 grid((nt + 63) / 64, (od + TM_ - 1) / TM_)` (`gemm_wmma.cu:367`,
+`dim3 grid((nt + 63) / 64, (od + TM_ - 1) / TM_)` `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`),
 `TM_ = 128` default per the `MINFER_GEMM_TM` selection at :5079-5086). Block
 `(bx, by)` owns output rows `n0 = bx·64` (tokens) × `m0 = by·TM` (outputs).
 The comment at :4809-4811 records why the *token* axis is `grid.x`:
@@ -627,9 +627,9 @@ the weight stream across blocks — the weight matrix streams from DRAM ~once
 per forward instead of once per token-tile.
 
 **Layer 2 — shared-memory staging, double-buffered.** The setup
-(`gemm_wmma.cu:367`) carves one dynamic shared-memory allocation
+`gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`)) carves one dynamic shared-memory allocation
 into `As` (2 × 64×KS f16 — two buffers), `Bs` (2 × TM×KS f16), and `Cs` (a
-per-warp staging area for the store). The k-loop (`gemm_wmma.cu:367`):
+per-warp staging area for the store). The k-loop `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`)):
 
 ```c
     for (int k = 0; k < id; k += KS, buf ^= 1) {
@@ -658,7 +658,7 @@ double-buffered staging of §2.4, verbatim.
 
 **Layer 3 — register tiles as wmma fragments.** Each warp owns a 32-token ×
 TM-output rectangle (warp `w`: `wm = w >> 1` picks the od chunk, `wn = w & 1`
-the 32-row token half, :4805-4808). The compute step (`gemm_wmma.cu:367`):
+the 32-row token half, :4805-4808). The compute step `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`)):
 
 ```c
 #pragma unroll
@@ -688,7 +688,7 @@ both k-halves must accumulate; fragment indexing bugs do not crash, they
 silently halve your dot products (the parity gates catch them, chapter 06).
 
 **The store.** After the k-loop, each warp spills its fragments through
-`Cs` (shared) and writes out with bounds masks (`gemm_wmma.cu:367`):
+`Cs` (shared) and writes out with bounds masks `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`)):
 `store_matrix_sync` lands the 16×16 fragment in shared memory, then lanes
 copy the 256 values to global `C[n * od + m]` for in-range `(n, m)` — how
 the kernel handles the ragged tail of a 30-token prompt without a second
@@ -706,7 +706,7 @@ trigger is a shared row stride that is an exact multiple of the bank count
 (32 floats = 128 bytes): every row's column 0 lands in bank 0, so a
 column-wise read across rows collapses to one bank. The standard fix is
 padding the stride by one bank's width — exactly what chapter 05's attention
-kernel does with `sstr = hd + 8` (`attention_prefill.cu:117`, its comment
+kernel does with `sstr = hd + 8` `fa_prefill_kv` (`attention_prefill.cu:117`), its comment
 is a worked example worth rereading now that you know the term). This GEMM
 sidesteps the issue differently: its hot shared reads are `wmma::
 load_matrix_sync` calls, and the fragment-load hardware handles the layout.
@@ -723,25 +723,25 @@ diverge.
 
 The default prefill path (`nt ≥ 9`, `mmq_active()`, `MINFER_MMQ` unset) is
 the campaign's flagship: the int8 MMQ GEMM, promoted default-on at r60 after
-measuring **1.080× vs llama.cpp on 7B Q4_K_M** (`src/cuda/methods/buffers.rs:12-17`,
+measuring **1.080× vs llama.cpp on 7B Q4_K_M** `cuda_malloc` (`src/cuda/methods/buffers.rs:10`),
 `docs/CUDA_OPTIMIZATION.md` P6). Its anatomy is a whole reference doc, and
 the tutorial's policy is to link, not re-explain — but you should recognize
 its pieces in a profile:
 
 - **Activation prepass**: `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`)
   quantizes f32 activations to int8 *and writes them pre-transposed and
-  swizzled* into the exact layout the GEMM stages (`src/cuda/methods/dispatch.rs:193`;
+  swizzled* into the exact layout the GEMM stages `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:141`);
   llama.cpp's `quantize_mmq_q8_1` design — "byte-identical … only
   reordered", :782-790).
 - **The GEMM**: `mmq_raw_nb_bt_kernel` (`mmq_nb.cu:289`) — raw
   quantized weight bytes staged per tile, decoded in registers next to the
   `mma.m16n8k32.s8` instruction, per-k-block scale rescale, f32
-  accumulation. The q4_K route enters at `src/cuda/methods/prefill_mmq.rs:53`
+  accumulation. The q4_K route enters at `launch_mmq_raw_nb_bt_nt` (`src/cuda/methods/prefill_mmq.rs:53`)
   (`launch_mmq_raw_nb_bt_nt`, `mmq_nb.cu:601`); Q6_K has its own BT
   kernel (:6976);
   non-BT-consumable shapes fall back to `mmq_nt_kernel` (:5663).
 - **Split-K**: when the grid is M-starved (small `nt`), doc 92's auto
-  ksplit (`src/cuda/methods/dispatch.rs:331-342`) slices the k-range across `grid.z` and
+  ksplit `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:141`)) slices the k-range across `grid.z` and
   `mmq_ksplit_reduce_kernel` (:7316) adds the partials — the same split-K
   family as decode attention (chapter 05 §2.4).
 
@@ -770,24 +770,24 @@ records) for how minfer's grew against it.
 ### 4.1 The arithmetic-intensity table — decode vs prefill
 
 Arithmetic intensity (**AI**) is FLOPs performed per byte of memory traffic
-(`docs/GLOSSARY.md:126`). For a matmul it is decided by the shape, and the
+(`docs/GLOSSARY.md:126` ("L3 — Performance model")). For a matmul it is decided by the shape, and the
 deciding variable is `nt` — how many token rows share each weight byte. The
 numbers below are this chapter's own byte/FLOP arithmetic, for one
 Qwen2.5-0.5B `ffn_down` layer `[od=896, id=4864]` in Q4_0 (dims:
-`docs/QWEN2-SUPPORT.md:79`, walkthrough 05):
+`docs/QWEN2-SUPPORT.md:79` (§4Verified models"), walkthrough 05):
 
 | Path | Kernel | Weight bytes moved | AI (FLOP / byte) | What bounds it |
 |---|---|---|---|---|
 | decode, f32 weights | `f32_f32_matmul_{scalar,vec}` | 17.4 MB | **0.5** | weight bytes, by a landslide |
 | decode, Q4_0 (MMVQ) | `q4_0_q8_mmvq` | **2.45 MB** (+ ~6 KB q8 activations) | **≈ 3.6** | still weight bytes — 7.1× lower wall |
-| decode, any type (`nt == 1`) | — | one weight stream | ~1 MAC/weight-byte (`docs/GLOSSARY.md:126`) | bandwidth, always |
+| decode, any type (`nt == 1`) | — | one weight stream | ~1 MAC/weight-byte (`docs/GLOSSARY.md:126` ("L3 — Performance model")) | bandwidth, always |
 | prefill, `nt = 512` (MMQ) | `mmq_raw_nb_bt_kernel` | 2.45 MB weights + 3.1 MB pad40 activations + 1.8 MB output ≈ **7.4 MB** | **≈ 600** | math (tensor-core) throughput |
 
 The derivation of the last row: FLOPs = 2·512·896·4864 ≈ 4.46 GFLOP; MMQ
 bytes ≈ 512·152·40 B (activations) + 2.45 MB (weights) + 512·896·4 B
 (output) ≈ 7.4 MB; 4.46e9 / 7.4e6 ≈ 600. Between the first and last row the
 intensity swings by three orders of magnitude — and that swing, not any
-kernel's cleverness, is what the dispatch gate `nt >= 9` (`src/cuda/methods/weights.rs:487`)
+kernel's cleverness, is what the dispatch gate `nt >= 9` `prewarm_prefill` (`src/cuda/methods/weights.rs:13`))
 reacts to.
 
 Two consequences worth internalizing:
@@ -796,7 +796,7 @@ Two consequences worth internalizing:
   change can raise AI; the levers are fewer bytes (quantization: 7.1× here)
   or fewer launches around the same bytes (chapter 05's fusion + CUDA
   Graph). Hence decode wins like "MMVQ +74–77% at 7B shapes"
-  (`src/cuda/methods/weights.rs:620-622`, the 8e② record) vs prefill wins like "the whole
+  `has_weight_of_size` (`src/cuda/methods/weights.rs:620-622`), the 8e② record) vs prefill wins like "the whole
   kernel replaced".
 - **Prefill's wall only moves when the math does.** At AI ≈ 600 the traffic
   is amortized; what limits the GEMM is MACs per second — why the MMQ
@@ -806,11 +806,11 @@ Two consequences worth internalizing:
 
 The **roofline model** prices any kernel as
 `time ≥ max(FLOPs / peak-FLOPs, bytes / peak-BW)` — the larger term wins
-(`docs/GLOSSARY.md:125`). On GB10 the bandwidth term uses the documented
-~273 GB/s unified LPDDR5x figure (`docs/GLOSSARY.md:127`; chapter 01's toy
-measured ~225–229 GB/s of it, `01-gpu-mental-model.md:227`), and the
+(`docs/GLOSSARY.md:125` ("L3 — Performance model")). On GB10 the bandwidth term uses the documented
+~273 GB/s unified LPDDR5x figure (`docs/GLOSSARY.md:127` ("L3 — Performance model"); chapter 01's toy
+measured ~225–229 GB/s of it, `01-gpu-mental-model.md:227` (§2The memory hierarchy — where the bytes actually")), and the
 glossary's one-line classification is this chapter's summary: **GB10 decode
-is memory-bound, prefill compute-bound** (`docs/GLOSSARY.md:124`). Check it
+is memory-bound, prefill compute-bound** (`docs/GLOSSARY.md:124` ("L3 — Performance model")). Check it
 against the table: decode Q4_0 at AI ≈ 3.6 tops out near 273 GB/s × 3.6 ≈
 1 TFLOP/s *if every byte were useful* — the compute side is far above that,
 so bytes bind at every quant level. Prefill at AI ≈ 600 would need ~160
@@ -829,10 +829,10 @@ at `nt ≥ 9` you buy MACs.**
   walks only pay off because dp4a turns them into 8 MACs per load; on short
   rows (`id < 2048`, or the 24M/4M-element K-quant floors) the f32 kernels'
   wide coalesced loads win — that is what the per-arm gates *are*
-  (`src/cuda/methods/weights.rs:575`, `2820-2824`, `2855`).
+  `get_weight_ptr` (`src/cuda/methods/weights.rs:197`), `2820-2824`, `2855`).
 - **Prefill GEMM, mis-tiled.** A tile that underfills the machine (TM=64 at
   huge `od`, the `MINFER_GEMM_TM` A/B) or a k-step whose shared appetite
-  halves occupancy (KS=64's −38%, `gemm_wmma.cu:585`) trades the
+  halves occupancy (KS=64's −38%, `gemm_dynamic_smem_bytes` (`gemm_wmma.cu:585`)) trades the
   §2.3 reuse away.
 - **Anywhere: the silent 15/16.** Force the tensor-core GEMM onto `nt == 1`
   and 15 of every 16 mma rows are padding (walkthrough 15 §2.3) — no
@@ -851,7 +851,7 @@ cargo build --release --features cuda
 Run the bench — `-p 512` prefill tokens (MMQ territory), `-n 64` decode
 tokens (MMVQ territory) — flags per [`docs/USAGE.md`](../USAGE.md)
 (`bench [-p N] [-n N] [-r N] [-o md|csv|json]`); any Q4_0/Q4_K_M model
-works, and `minfer` auto-downloads given an HF name (`docs/USAGE.md:16`):
+works, and `minfer` auto-downloads given an HF name (`docs/USAGE.md:16` ("Usage")):
 
 ```bash
 ./target/release/minfer bench -p 512 -n 64 -r 3 hf:Qwen/Qwen2-0.5B-GGUF:qwen2-0.5b-q4_0.gguf
