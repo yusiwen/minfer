@@ -494,7 +494,7 @@ concatenated matmul output (`q = base`, `k = base + nqt`, `v = base + 2·nkt`;
 the Rust arm does this pointer arithmetic at `abort_capture` (`cuda_backend.rs:900`)), and
 the **mixed-quant class** (e.g. a model where `attn_v` is Q6_K and cannot join
 the concat) points them at three separate matmul outputs
-(`Op::QkvBiasRopeStore`, arm at `take_cross` (`cuda_backend.rs:720`)). One device kernel,
+(`Op::QkvBiasRopeStore`, arm at `take_cross` (`cuda_backend.rs:761`)). One device kernel,
 two graph topologies, zero duplicated math.
 
 ### 3.3 KV in device memory — where the cache actually lives

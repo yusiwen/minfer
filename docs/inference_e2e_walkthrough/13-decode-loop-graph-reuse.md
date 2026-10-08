@@ -298,7 +298,7 @@ is worth checking each one `CParams` (`params.rs:52-63`), defined below in §3.2
   the test `fuse_flags_are_part_of_the_reuse_identity` pins this,
   `verify_structural` (`cache.rs:134`)).
 - **`weights_version`** — the future LoRA/reload hook: bumped whenever
-  weights change, invalidating every cached graph `CParams` (`params.rs:8`)).
+  weights change, invalidating every cached graph `CParams` (`params.rs:30`)).
 
 If topology were *not* a pure function of these, a params hit would reuse a
 graph that was subtly wrong for the new inputs — the worst kind of bug,
@@ -330,7 +330,7 @@ the graph*; on the "survives" side, everything that *holds data*:
 | Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `graph.rs:486`) |
 | **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:995-1002`; `alloc_graph` explicitly frees only liveness buffers, `alloc_graph` (`alloc.rs:513-519`)) | The fusion pass (`FusionPass::run`, `graph.rs:509-514`) |
 | Backend buffer *pools* (freed liveness buffers return to their pool; the memory is recycled, not released) | The node→buffer mapping (`alloc_graph` clears `node_to_buf`, `alloc.rs:519`) |
-| The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `replace_graph` (`cache.rs:106-114`) + §3.4) | Cross-backend staging buffers (freed and re-materialized on first execute, `alloc_graph` (`alloc.rs:123`)) |
+| The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `replace_graph` (`cache.rs:106-114`) + §3.4) | Cross-backend staging buffers (freed and re-materialized on first execute, `alloc_graph` (`alloc.rs:513`)) |
 
 The first row is the one that matters most: the allocator is a field of the
 cache, not a local of the forward function, so a rebuild cannot take the KV
@@ -430,7 +430,7 @@ Two details of this table deserve unpacking.
 every node reads and writes `f32` slices, whatever its logical type. Token
 ids and positions are integers. Rather than special-case integer buffers,
 `fill_input_i32` stores each `u32` *bit pattern* reinterpreted as an `f32`
-value `supports_for` (`alloc.rs:174`)), and the kernels that consume these inputs
+value `supports_for` (`alloc.rs:403`)), and the kernels that consume these inputs
 (attention, KV store) convert back with `f32::to_bits() as usize`
 (``supports_op` (cpu_backend.rs:129), 410-415`). This is exact for values below 2²⁴ —
 vocabulary ids and positions never come close — and it keeps one uniform
@@ -762,7 +762,7 @@ pub struct GraphParams {
 and inside `CParams`: `n_ctx`, `flash_attn`, `gpu`,
 `fuse_qkv`, `fuse_ffn` (`src/graph/params.rs`) — each documented there with the
 reason it belongs in the identity. The module's opening comment is the
-invariant in one breath — `GraphParams` (`params.rs:1-7`): these are "the ONLY inputs to
+invariant in one breath — `GraphParams` (`params.rs:88`): these are "the ONLY inputs to
 graph reuse … `n_past` (KV position) is deliberately absent: it is
 execution data."
 
@@ -942,7 +942,7 @@ cached K or V value.
 #### One split walk per token (`src/graph/scheduler.rs:219-285`, the per-split boundary and walk)
 
 Reuse also means the execution machinery runs the same cached plan every
-step. `execute` `split_graph` (`scheduler.rs:5`)) splits the graph into contiguous
+step. `execute` `split_graph` (`scheduler.rs:87`)) splits the graph into contiguous
 same-backend ranges once per call, then walks them. The per-split boundary
 handling is where cross-backend sync and copies happen — and on a CPU-only
 run there is exactly one split, so none of it fires:
@@ -1300,7 +1300,7 @@ the evidence is on stderr of any plain run.
   tens of microseconds and forward in the milliseconds — the loop's own
   overhead is the difference between the two.
 - **`MINFER_GRAPH_TRACE=1`.** The scheduler prints the split layout and a
-  per-op/backend census *once per `execute` call* `split_graph` (`scheduler.rs:5`))
+  per-op/backend census *once per `execute` call* `split_graph` (`scheduler.rs:87`))
   — i.e. once per token on stderr. A CPU-only run shows a single split; a
   Metal run shows the decode graph's split boundary and the fused-op
   census. Watching it repeat N times for N tokens is the loop made
