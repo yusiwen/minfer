@@ -698,17 +698,20 @@ pub fn supports_fused(fused: &FusedOp) -> bool {
 /// [#315]: https://github.com/yusiwen/minfer/issues/315
 pub const SUPPORTS_ATTN_SPAN: bool = true;
 
-/// C4 (#310): Metal reads a packed `q8_0` KV region directly — the packed
-/// `store_kv_q8_0` writes cells and the `kernel_gqa_attn_q8_0` /
-/// `kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0` kernels dequantize
-/// them block-by-block as K/V are staged. The fast causal families (flash /
-/// split / prefill / parallel-prefill) and the fast windowed flash family have
-/// no packed kernel; when the engine's KV format is Q8_0 the dispatch selects
-/// the classic packed kernels instead (see the `Op::Attn` arm) — an explicit
-/// selection, never a silent fallback.
+/// C4 (#310): the packed `q8_0` KV path is **implemented on this branch but not
+/// enabled** — Metal still refuses `MINFER_CACHE_TYPE=q8_0` by default, so this
+/// stays `false`. The store (`kernel_store_kv_q8_0`) and the classic / window /
+/// map reads exist and are exercised through a test-only capability seam
+/// (`registry::set_force_packed_kv`), but the fast causal families (flash /
+/// split / prefill / parallel-prefill) and the fast windowed-flash family have
+/// no packed kernel, so an enabled packed region would fall to the classic
+/// tiled kernel at a measured 4–17× cost. Enabling it requires packing those
+/// families first; the refusal is the shipped decision
+/// (`docs/METAL-BACKEND-DESIGN.md` §4.4, `docs/SUPPORT-MATRIX.md`), and [#310]
+/// tracks the fast-family work.
 ///
 /// [#310]: https://github.com/yusiwen/minfer/issues/310
-pub const READS_PACKED_KV: bool = true;
+pub const READS_PACKED_KV: bool = false;
 
 /// F5 ([#58], ported by [#137]): registry hook **phase A** of a cross-backend
 /// staging copy out of Metal.

@@ -493,7 +493,7 @@ what is new is the *gather* around it:
 
 - **`int id = __float_as_int(ids[t]);`** — the graph convention that integer
   inputs (token ids, positions) ride through f32 buffers as **bit patterns**
-  (`f32::from_bits(v)` at fill time — `fill_input_i32` (`src/graph/alloc.rs:1901`)).
+  (`f32::from_bits(v)` at fill time — `fill_input_i32` (`src/graph/alloc.rs:1903`)).
   `__float_as_int` is a *bit reinterpretation*, not a
   numeric conversion: it hands back the exact i32 that was stored. A reading
   note in the forensics spirit: the family comment above still says "read

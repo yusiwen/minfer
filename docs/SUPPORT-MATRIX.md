@@ -147,7 +147,7 @@ never silently mapped to f32.
 |---|---|:---:|:---:|:---:|
 | `f32` (default) | 4 B/element, f32 | ✅ | ✅ | ✅ |
 | `f16` | 2 B/element in the f32-shaped region | → f32 | ✅ | ✅ |
-| `q8_0` | packed Q8_0 blocks, 34 B per 32 elements, cell padded to whole f32 words | ✅ (C4 S1+S2) | ✅ (C4 S2b) | ✅ ([#310](https://github.com/yusiwen/minfer/issues/310); packed store + classic causal / window / map reads; the fast families stay refused, see the note) |
+| `q8_0` | packed Q8_0 blocks, 34 B per 32 elements, cell padded to whole f32 words | ✅ (C4 S1+S2) | ✅ (C4 S2b) | ❌ — implemented on the #310 draft branch but **not enabled** (the fast families refuse packed and the classic fallback costs 4–17×; see the note) |
 
 Notes:
 
@@ -173,20 +173,21 @@ Notes:
   contract rests on the batched split kernel). See
   `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 C4 #144 and
   `docs/cuda_optimization_steps/107-c4-packed-q8-kv-cuda.md`.
-- **Metal ([#310](https://github.com/yusiwen/minfer/issues/310)).** A Q8_0 cache
-  now runs on Metal: `kernel_store_kv_q8_0` writes the same bytes as the CPU
-  quantizer, and `kernel_gqa_attn_q8_0` (classic causal) plus
-  `kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0` read the packed cells
-  directly. The **fast** causal families (flash decode, split, flow/flash prefill,
-  parallel prefill) and the fast windowed-flash family are f32/f16-only — a
-  packed region is **refused** them by the dispatch (their simdgroup loads cannot
-  transform a packed cell) — so a packed Metal run takes the classic kernel. The
-  memory win is 3.76×; the speed cost is measured and severe
-  (`macbookpro (macOS 27.0.1, Apple M4 Pro)`, 2026-10-08, `minfer bench -p 1024 -n
-  64 -r 3 --n-ctx 2048`, 3 interleaved runs): Qwen3-0.6B `pp1024` 4835 → 291 tok/s
-  and `tg64` 196 → 18 tok/s, Qwen2.5-0.5B `pp1024` 6196 → 1492 and `tg64` 298 → 43.
-  Fast-family packed kernels are the follow-up that would remove it;
-  `docs/METAL-BACKEND-DESIGN.md` §4.4 records the refusal and its gate.
+- **Metal ([#310](https://github.com/yusiwen/minfer/issues/310)) — implemented but NOT enabled.**
+  The `#310` branch carries the whole packed path: `kernel_store_kv_q8_0` writes the same bytes as
+  the CPU quantizer, and `kernel_gqa_attn_q8_0` (classic causal) plus
+  `kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0` read the packed cells directly. But
+  `READS_PACKED_KV` stays **false**: the **fast** causal families (flash decode, split, flash
+  prefill, parallel prefill) and the fast windowed-flash family are f32/f16-only — a packed region
+  is refused them by the dispatch (their simdgroup loads cannot transform a packed cell) — so an
+  enabled packed Metal run would take the classic kernel. The memory win is 3.76×; the speed cost is
+  measured and severe (`macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-08, `minfer bench -p 1024 -n
+  64 -r 3 --n-ctx 2048`, 3 interleaved runs, capability force-enabled for the measurement):
+  Qwen3-0.6B `pp1024` 4835 → 291 tok/s and `tg64` 196.2 → 18.1 tok/s, Qwen2.5-0.5B `pp1024` 6196 →
+  1492 and `tg64` 298.1 → 43.3; region sizes 58 720 256 → 15 597 568 B and 6 291 456 → 1 671 168 B
+  (both 3.76×). **Enabling packed KV on Metal requires packing the fast families first**; until then
+  Metal refuses `MINFER_CACHE_TYPE=q8_0` and `f16` remains the default.
+  `docs/METAL-BACKEND-DESIGN.md` §4.4 records the implementation, the refusal and the gates.
 - **A Q8_0 cell width must be a whole number of 32-element blocks** (so `n_kv_embd
   % 32 == 0`, which every supported architecture satisfies); `ensure_kv` refuses
   anything else.

@@ -1,8 +1,16 @@
 //! C4 S2b Metal packed `q8_0` KV gates (issue #310).
 //!
-//! `reads_packed_kv` was false for Metal, so `MINFER_CACHE_TYPE=q8_0` was refused
-//! at load and `GraphAllocator::ensure_kv` refused a packed region. #310 adds the
-//! packed store (`kernel_store_kv_q8_0`) and the packed reads
+//! The packed path is **implemented on this branch but not enabled**: production
+//! keeps `READS_PACKED_KV = false` (the fast causal/windowed families refuse a
+//! packed region and the classic fallback measures 4–17× slower than f16 — see
+//! `docs/METAL-BACKEND-DESIGN.md` §4.4), so `MINFER_CACHE_TYPE=q8_0` is still
+//! refused at load and `GraphAllocator::ensure_kv` still refuses a packed region
+//! by default. These gates therefore run under a **documented `#[cfg(test)]`
+//! capability seam** ([`PackedKvEnabled`], the registry's thread-local
+//! `set_force_packed_kv`) that lets them drive the real production entry points
+//! without flipping the shipped capability.
+//!
+//! #310 adds the packed store (`kernel_store_kv_q8_0`) and the packed reads
 //! (`kernel_gqa_attn_q8_0` for the causal classic path and
 //! `kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0` for the explicit
 //! window layouts), selected whenever the engine's KV format is Q8_0.
@@ -27,11 +35,36 @@
 //!   Metal arena saves and restores bitwise, and a fresh F32 allocator refuses
 //!   the file (the header really carries Q8_0), which is the store + container
 //!   half.
+//! - [`metal_q8_0_kv_answers_like_f32_on_a_real_model`] (ignored) is the
+//!   real-model end-to-end arm.
 
 use super::*;
 use crate::graph::kvformat::{pack_q8_0_cell, unpack_q8_0_cells, KvFormat};
 use crate::graph::kvsession::KvSessionExpect;
 use crate::graph::ops::{AttnMeta, AttnMode};
+
+/// #310 gate seam: enable packed KV for the calling thread while a test runs.
+///
+/// Production ships `READS_PACKED_KV = false` (the fast families refuse packed,
+/// so the classic fallback is 4–17× slower), but the implementation is real and
+/// must stay exercised. This guard flips the registry's **thread-local**
+/// override, so it drives the production `resolve` / `ensure_kv` / session
+/// entry points without changing the shipped answer and without leaking into a
+/// concurrently-running test. `Drop` restores it, so a panic cannot leave it on.
+struct PackedKvEnabled;
+
+impl PackedKvEnabled {
+    fn on() -> Self {
+        crate::graph::registry::set_force_packed_kv(true);
+        Self
+    }
+}
+
+impl Drop for PackedKvEnabled {
+    fn drop(&mut self) {
+        crate::graph::registry::set_force_packed_kv(false);
+    }
+}
 
 const NH: usize = 2;
 const NK: usize = 2;
@@ -260,6 +293,7 @@ fn span_window(spans: &[(u32, u32)]) -> Vec<u32> {
 #[test]
 fn metal_packed_store_is_byte_identical_to_the_cpu_quantizer() {
     let _g = crate::metal::metal_test_lock();
+    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -329,6 +363,7 @@ fn metal_packed_store_is_byte_identical_to_the_cpu_quantizer() {
 #[test]
 fn metal_packed_decode_matches_the_dequantized_reference() {
     let _g = crate::metal::metal_test_lock();
+    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -368,6 +403,7 @@ fn metal_packed_decode_matches_the_dequantized_reference() {
 #[test]
 fn metal_packed_prefill_matches_the_dequantized_reference() {
     let _g = crate::metal::metal_test_lock();
+    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -440,6 +476,7 @@ fn run_causal(
 #[test]
 fn metal_packed_attn_span_matches_the_v_row() {
     let _g = crate::metal::metal_test_lock();
+    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -516,6 +553,10 @@ fn argmax(x: &[f32]) -> u32 {
 /// at the f32 reference's argmax |Δ| ≤ 1.0, and over the whole logit vector
 /// |Δ| ≤ 4.0 (a gross-error detector — a wrong cell width is off by the spread).
 /// Ignored: needs the cached model and a Metal device.
+///
+/// It enables the packed capability for its own run via [`PackedKvEnabled`] — the
+/// explicit enabling path an ignored arm is allowed, because production keeps
+/// `READS_PACKED_KV = false`.
 #[test]
 #[ignore = "requires the cached 0.5B model and a Metal device"]
 fn metal_q8_0_kv_answers_like_f32_on_a_real_model() {
@@ -524,6 +565,7 @@ fn metal_q8_0_kv_answers_like_f32_on_a_real_model() {
     use crate::models::{Device, ModelDef};
 
     let _g = crate::metal::metal_test_lock();
+    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -630,6 +672,7 @@ fn metal_q8_0_kv_answers_like_f32_on_a_real_model() {
 #[test]
 fn metal_packed_session_round_trips() {
     let _g = crate::metal::metal_test_lock();
+    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");

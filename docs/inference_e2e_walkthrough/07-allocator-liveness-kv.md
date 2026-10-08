@@ -78,7 +78,7 @@ Three terms, defined once and used everywhere after:
 One deliberate simplification shapes everything: **every pool buffer is
 f32-typed**. The allocator counts sizes in f32 elements (`Backend::alloc_buffer`
 "allocate / release a buffer of `size` f32 elements", `supports_fused` (`backend.rs:25`),
-Metal sizes buffers as `size * 4` bytes in `alloc_buffer` (`metal_backend.rs:867`), and weights
+Metal sizes buffers as `size * 4` bytes in `alloc_buffer` (`metal_backend.rs:870`), and weights
 keep their quantized bytes elsewhere (registered by name in doc 03). One dtype
 means one allocator, one copy path, one set of host-access functions — and,
 as §2.6 shows, even integers ride along as f32 bit patterns.
@@ -155,7 +155,7 @@ passes. The walk is a single forward pass with a running clock:
 5. **Walk nodes in order** (`alloc.rs:597-786`, the main walk). For each node, first
    **sweep**: free every tracked buffer whose `last_use < i` — its readers
    have all been positioned earlier, so its contents are officially dead
-   `GraphAllocator::sweep` (`alloc.rs:1254-1265`). Then decide where this node's output lives:
+   `GraphAllocator::sweep` (`alloc.rs:1256-1267`). Then decide where this node's output lives:
    - KV store/load nodes → the layer's persistent K region (§2.5);
    - fused QKV nodes → their persistent regions *plus* an ordinary output
      buffer for the concatenated `q|k|v` result;
@@ -339,7 +339,7 @@ The graph declares three inputs for a prefill — `token_ids` (`models/qwen2/gra
 `[nt,1,1,1]`, `positions` `[nt,1,1,1]`, and (when the tail-row
 optimization is active) `tail_ids` — all typed `DType::I32` in the IR. Yet
 every pool buffer is f32 (§2.1). The bridge is `fill_input_i32`
-`fill_input_i32` (`alloc.rs:1901`): each u32 is packaged as `f32::from_bits(v)` — a pure
+`fill_input_i32` (`alloc.rs:1903`): each u32 is packaged as `f32::from_bits(v)` — a pure
 bit reinterpretation, *not* a numeric conversion — and written into the input
 node's buffer via the backend's `write_host`. On the consumer side the
 kernels run the inverse, `x.to_bits()`, recovering the exact integer:
@@ -387,7 +387,7 @@ the consumer's inputs across `execute` (`scheduler.rs:266-275`, the phase-A stag
 allocator's `copy_across`, which routes through `copy_to_cpu` (a host round
 trip — Metal/CUDA buffers here are CPU-visible, so this is a plain memcpy)
 and then `write_host` into a buffer on the *destination* pool
-`copy_across` (`alloc.rs:2447`), the staging copy).
+`copy_across` (`alloc.rs:2449`), the staging copy).
 
 That destination staging buffer must be **fresh** — `alloc_fresh_in` (`alloc.rs:955-957`)
 — never drawn from the recycle free list. The trait
@@ -579,7 +579,7 @@ for (i, &id) in order.iter().enumerate() {
         }
 ```
 
-`GraphAllocator::sweep` (`alloc.rs:1254-1265`) collects every `buf_alive` entry whose deadline
+`GraphAllocator::sweep` (`alloc.rs:1256-1267`) collects every `buf_alive` entry whose deadline
 passed (`al < i`), removes it, and hands the id to `free_in_pool` — which
 pushes it onto the backend's free list. Nothing is *deallocated*; "free" here
 means "return to the recycling pool", which is why the next `alloc_in_pool`
@@ -656,8 +656,8 @@ The region is also sized on **first use only**: if a later graph asked for a
 different size, it would silently get the old buffer — one reason `n_ctx`
 must stay consistent across a run (§3.3, question 3).
 
-**Excerpt 6 — I32 input filling** `fill_input_i32` (`alloc.rs:1901`) plus the routing tail
-of `fill_input_impl`, `alloc.rs:2075`).
+**Excerpt 6 — I32 input filling** `fill_input_i32` (`alloc.rs:1903`) plus the routing tail
+of `fill_input_impl`, `alloc.rs:2077`).
 
 ```rust
 /// Fill an I32 input (token ids / positions). Stored as `f32::from_bits`
@@ -761,7 +761,7 @@ fn alloc_fresh(&mut self, size: usize) -> usize {
 ```
 
 (Metal's pool is the same shape with `MTLBuffer` lengths in bytes,
-`alloc_buffer` (`metal_backend.rs:867`), except recycled buffers are *not* re-zeroed —
+`alloc_buffer` (`metal_backend.rs:870`), except recycled buffers are *not* re-zeroed —
 kernels fully overwrite their outputs, and the driver zero-fills only new
 allocations.)
 
@@ -879,7 +879,7 @@ sometimes needed a copy: the original allocator materialized cross-backend and
 in-place inputs through a host `copy_in`. On Metal, though, one split's
 kernels are *encoded* into an `MpsCommandBuffer` as they execute — and only
 *submitted* at the split boundary `capture_split` (`metal_backend.rs:144`),
-`execute_node` (`metal_backend.rs:895`). A host copy enqueued mid-split therefore read
+`execute_node` (`metal_backend.rs:898`). A host copy enqueued mid-split therefore read
 the buffer's *old* contents: freshly allocated Metal memory, i.e. **zeros**.
 The copy captured zeros, RoPE dutifully rotated them, `KvcacheStore` wrote
 them into the layer's persistent region — and the whole KV region was zeros,

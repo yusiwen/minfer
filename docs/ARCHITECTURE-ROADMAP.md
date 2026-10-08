@@ -770,7 +770,7 @@ behavioural defects found while executing the plan, already fixed.
    by `(graph uid, node, dst_backend)`; two foreign consumers can now be served.
 10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2268`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
-    with `copy_to_host` (`alloc.rs:2135-2141`).
+    with `copy_to_host` (`alloc.rs:2137-2143`).
 11. **CUDA pool never releases device memory** (`cuda_backend.rs:2148-2156`),
     documented as accepted debt but reasoned about for fixed-shape CLI runs; a
     varying-`n_tokens` workload accumulates one buffer set per distinct shape.
