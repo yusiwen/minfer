@@ -853,10 +853,10 @@ actual values `execute_node_inner` (`cuda_backend.rs:916`). AGENTS states the co
 "kernel-invariant violations return `Err` from `execute_node` — never a
 silent CPU fallback; backend assignment is decided at build time"
 (`AGENTS.md:128` ("GPU Safety", the Err-never-fallback contract)); TECH-PRIMER §7 repeats it
-(`docs/CUDA-TECH-PRIMER.md:312-314` (§7 "Synchronization discipline (GPU Safety, `docs/GP")); the design record explains why — silent
-fallbacks make performance and correctness bugs indistinguishable
-(`docs/COMPUTE-GRAPH-DESIGN.md:1105-1107` (§9 "Eligibility") , the §9.2 "Eligibility" no-silent-fallback
-clause).
+(`docs/CUDA-TECH-PRIMER.md:312-314` (§7 "Synchronization discipline (GPU Safety, `docs/GP")); the design record states
+the rule (`docs/COMPUTE-GRAPH-DESIGN.md:1105-1107` (§9.2 "Eligibility") ); the assignment walkthrough gives the
+reason — a quiet fallback would mask the bug the guard exists to catch
+(`docs/inference_e2e_walkthrough/06-assign-fusion.md:111-112`).
 
 ## 4. Performance intuition
 

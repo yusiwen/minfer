@@ -283,7 +283,7 @@ Same math, three mechanical changes. The kernel header states the mapping
 // the aligned float4 loads; the scalar kernel covers the general case.
 ```
 
-First change — **the constants and the mapping** (`ops_misc.cu:320-335`, the `f32_f32_matmul_vec` constants):
+First change — **the constants and the mapping** (`ops_misc.cu:320-336`, the `f32_f32_matmul_vec` constants):
 
 ```c
     const int NR0 = 4;
@@ -401,11 +401,11 @@ flag (`_layout` — whether a Q6_K weight was registered with the padded
 224-byte stride). The decision tree inside `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`) has three
 tiers:
 
-**Tier 1 — prefill GEMM** (`src/cuda/methods/dispatch.rs:191-218`, the prefill-GEMM gate): `nt >= 9` **and** `id % 32 == 0`
-**and** a supported quant type → a tiled GEMM — `prefill_mmq` (int8,
-default) or `prefill_gemm_f16` (the f16 escape, §3.5) depending on
-`mmq_active()` (`src/cuda/methods/policy.rs:39`: the resolved device tier's MMQ flag — a table flag, or `cc >= 800` — and `MINFER_MMQ`
-not `0`).
+**Tier 1 — prefill GEMM** (`src/cuda/methods/dispatch.rs:191-218`, the prefill-GEMM gate): `nt >= 9` (or
+`nt >= 2` when the off-by-default `MINFER_SMALL_M_GEMM=1` experiment routes nt 2–8 here, doc 91) **and**
+`id % 32 == 0` **and** a supported quant type → a tiled GEMM — `prefill_mmq` (int8, default) or
+`prefill_gemm_f16` (the f16 escape, §3.5) depending on `mmq_active()` (`src/cuda/methods/policy.rs:39`:
+the resolved device tier's MMQ flag — a table flag, or `cc >= 800` — and `MINFER_MMQ` not `0`).
 
 **Tier 2 — decode/small-batch per-type kernels**: everything else falls
 through to a `match ttype` with per-type shape gates. The Q4_0 arm
@@ -570,7 +570,7 @@ dp4a pair per 4 bytes of nibbles (`mmvq_skipwrite.cu:235-236`), and the two-term
 min. The v2 variant (`mmvq_skipwrite.cu:376`) reorganizes the same math for 16-byte `uint4`
 weight loads (the R2 "weight-streaming" rework,
 `docs/cuda_optimization_steps/09-r2-mmvq-weight-streaming.md`), and the
-`_multi` variants (`mmvq_multi.cu:25`) wrap the unit loop in the token loop — the nt 2–8
+`_multi` variants (`mmvq_multi.cu:25`) wrap the token loop in the unit loop — the nt 2–8
 regime. The differences are load widths and loop nesting, never dot algebra.
 
 **Why int8 dots at all — the intensity arithmetic.** Rung 3's payoff on
@@ -783,12 +783,12 @@ Qwen2.5-0.5B `ffn_down` layer `[od=896, id=4864]` in Q4_0 (dims:
 | decode, any type (`nt == 1`) | — | one weight stream | ~1 MAC/weight-byte (`docs/GLOSSARY.md:126` ("L3 — Performance model")) | bandwidth, always |
 | prefill, `nt = 512` (MMQ) | `mmq_raw_nb_bt_kernel` | 2.45 MB weights + 3.1 MB pad40 activations + 1.8 MB output ≈ **7.4 MB** | **≈ 600** | math (tensor-core) throughput |
 
-The derivation of the last row: FLOPs = 2·512·896·4864 ≈ 4.46 GFLOP; MMQ
-bytes ≈ 512·152·40 B (activations) + 2.45 MB (weights) + 512·896·4 B
-(output) ≈ 7.4 MB; 4.46e9 / 7.4e6 ≈ 600. Between the first and last row the
-intensity swings by three orders of magnitude — and that swing, not any
-kernel's cleverness, is what the dispatch gate `nt >= 9` (`src/cuda/methods/dispatch.rs:191`)
-reacts to.
+The derivation of the last row: FLOPs = 2·512·896·4864 ≈ 4.46 GFLOP; MMQ bytes ≈
+512·152·40 B (activations) + 2.45 MB (weights) + 512·896·4 B (output) ≈ 7.4 MB;
+4.46e9 / 7.4e6 ≈ 600. Between the first and last row the intensity swings by
+three orders of magnitude — and that swing, not any kernel's cleverness, is what
+the dispatch gate `nt >= 9` (`src/cuda/methods/dispatch.rs:191`) reacts to (or
+`nt >= 2` under the off-by-default `MINFER_SMALL_M_GEMM=1` experiment, doc 91).
 
 Two consequences worth internalizing:
 
