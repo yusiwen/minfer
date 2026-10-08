@@ -62,3 +62,63 @@ pub fn prefill_window_flash_enabled(hd: usize) -> bool {
     *V.get_or_init(|| std::env::var("MINFER_NO_WINDOW_FLASH").map_or(true, |v| v != "1"))
         && (hd == 64 || hd == 128)
 }
+
+/// #310: which kernel family a packed `q8_0` KV region's `Op::Attn` takes. The
+/// fast families are f16/f32-only, so a packed region either reads packed cells
+/// natively (mechanism A, decode only) or dequantizes the needed window into a
+/// transient **f32** stage and runs the existing f32 fast kernel (mechanism B);
+/// everything a fast family does not cover keeps the classic packed kernel.
+///
+/// This is the whole routing matrix, factored out so it is testable with no
+/// Metal device. `hd == 64 || hd == 128` is folded in by the `*_enabled`
+/// predicates, so `Classic` is also the answer for a small/odd `hd` and for any
+/// `MINFER_NO_*` opt-out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedRoute {
+    /// `nt == 1` causal decode: the packed native flash
+    /// (`kernel_flash_attn_ext_q8_0` / `_hd128_q8_0`).
+    NativeDecode,
+    /// `nt == 1` causal decode with the stage forced: dequantize, then the f32
+    /// flash. The A/B twin of [`PackedRoute::NativeDecode`].
+    StageThenFlash,
+    /// `nt > 1` causal prefill: dequantize, then `kernel_flash_attn_blk_*`.
+    StageThenPrefill,
+    /// `nt > 1` explicit window (one-range `attn_span` or set-valued `kv_map`):
+    /// dequantize, then `kernel_flash_attn_window_*`. The host picks the map or
+    /// one-range kernel from the window input's size; the route is shared.
+    StageThenWindow,
+    /// The classic packed kernel, for every shape no fast family covers.
+    Classic,
+}
+
+/// #310: the packed `Op::Attn` routing matrix (see [`PackedRoute`]). Pure: it
+/// reads only `hd`/`nt`/`explicit_span`, the caller-supplied `stage_forced`
+/// switch and the device-independent `*_enabled` policy predicates. It is the
+/// single authority the Metal dispatch and its off-device gate share.
+pub fn packed_attn_route(
+    hd: usize,
+    nt: usize,
+    explicit_span: bool,
+    stage_forced: bool,
+) -> PackedRoute {
+    if explicit_span {
+        if nt > 1 && prefill_window_flash_enabled(hd) {
+            PackedRoute::StageThenWindow
+        } else {
+            PackedRoute::Classic
+        }
+    } else if nt == 1 && flash_attn_enabled(hd) {
+        if stage_forced {
+            PackedRoute::StageThenFlash
+        } else {
+            PackedRoute::NativeDecode
+        }
+    } else if nt > 1 && prefill_flash_enabled(hd) {
+        PackedRoute::StageThenPrefill
+    } else {
+        PackedRoute::Classic
+    }
+}
+
+#[cfg(test)]
+mod route_tests;

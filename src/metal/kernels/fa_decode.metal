@@ -514,3 +514,233 @@ kernel void kernel_flash_attn_ext_hd128_f16(
     partial[pbase + 2 + tx * 4 + 3] = acc.w;
 }
 
+// Packed Q8_0 KV variant of kernel_flash_attn_ext_f16 (decode nt==1, hd==64; C4
+// S2b / issue #310): the structure, threadgroup layout, `partial` format, chunk
+// loop and barriers are identical to the f16 kernel; only the per-lane K/V read
+// changes from a `half4` device load to one packed block's four dequantized
+// elements (`dequant_q8_0_kv4`). `row_bytes` (buffer 11) is one cell's
+// word-padded byte width (`KvFormat::Q8_0.row_bytes`), so buffers 0..10 keep
+// their indices and partials stay shared with `kernel_gqa_attn_combine_f32`.
+kernel void kernel_flash_attn_ext_q8_0(
+    device const float * q        [[buffer(0)]],
+    device const uchar * k        [[buffer(1)]],
+    device const uchar * v        [[buffer(2)]],
+    device       float * partial  [[buffer(3)]],
+    constant    int    * positions [[buffer(4)]],
+    constant    int    & nh        [[buffer(5)]],
+    constant    int    & nk        [[buffer(6)]],
+    constant    int    & hd        [[buffer(7)]],
+    constant    float  & scale     [[buffer(8)]],
+    constant    int    & nt        [[buffer(9)]],
+    constant    int    & n_chunks  [[buffer(10)]],
+    constant    uint   & row_bytes [[buffer(11)]],
+    uint3  tgpig   [[threadgroup_position_in_grid]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    threadgroup float * shmem [[threadgroup(0)]]
+) {
+    constexpr int DK  = 64;
+    constexpr int NE  = 2;
+    constexpr int C   = 32;
+    constexpr int NW  = 32;
+    constexpr int NL  = NW / NE;
+    constexpr int DK4 = DK / 4;
+    constexpr float MINF_MAXHALF = 65504.0f;
+
+    const int t   = (int)tgpig.x;
+    const int h   = (int)tgpig.y;
+    const int iwg = (int)tgpig.z;
+    if (t >= nt || h >= nh) return;
+
+    const int nkv = positions[t] + 1;
+    const int gqa = nh / nk;
+    const int hk  = h / gqa;
+    const int tx  = (int)tiisg % NL;
+    const int ty  = (int)tiisg / NL;
+    // First element of this lane's float4 inside the cell (the f16 path's
+    // `hk*hd + tx*4`), which `dequant_q8_0_kv4` maps to one 32-element block.
+    const int e0  = hk * hd + tx * 4;
+
+    threadgroup float4 * sq4 = (threadgroup float4 *)shmem;
+    threadgroup float  * ss  = shmem + DK4 * 4;
+    threadgroup float4 * so4 = (threadgroup float4 *)(ss + C);
+
+    device const float4 * q4 = (device const float4 *)(q + t * (nh * hd) + h * hd);
+    for (int i = (int)tiisg; i < DK4; i += NW) sq4[i] = q4[i];
+    for (int i = (int)tiisg; i < C; i += NW) ss[i] = 0.0f;
+    so4[tiisg] = (float4)0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float M = -INFINITY;
+    float S = 0.0f;
+
+    for (int ic0 = iwg; ; ic0 += n_chunks) {
+        int ic = ic0 * C;
+        if (ic >= nkv) break;
+
+        float mqk[C / NE];
+        for (int cc = 0; cc < C / NE; ++cc) {
+            int token = ic + NE * cc + ty;
+            if (token >= nkv) token = nkv - 1;
+            float4 kv4 = dequant_q8_0_kv4(k, token, row_bytes, e0);
+            float4 qv = sq4[tx] * kv4;
+            mqk[cc] = qv.x + qv.y + qv.z + qv.w;
+            mqk[cc] += simd_shuffle_down(mqk[cc],  8);
+            mqk[cc] += simd_shuffle_down(mqk[cc],  4);
+            mqk[cc] += simd_shuffle_down(mqk[cc],  2);
+            mqk[cc] += simd_shuffle_down(mqk[cc],  1);
+            mqk[cc] = simd_shuffle(mqk[cc], NL * ty);
+        }
+        ss[NE * tx + ty] = mqk[tx] * scale
+                         + ((ic + NE * tx + ty < nkv) ? 0.0f : -MINF_MAXHALF);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            const float m = M;
+            const float s = ss[tiisg];
+            M = simd_max(max(M, s));
+            const float ms = exp(m - M);
+            const float vs = exp(s - M);
+            S = S * ms + simd_sum(vs);
+            ss[tiisg] = vs;
+            if (ty == 0) so4[tiisg] *= ms;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            float4 lo = (float4)0.0f;
+            for (int cc = 0; cc < C / NE; ++cc) {
+                int token = ic + NE * cc + ty;
+                if (token >= nkv) token = nkv - 1;
+                float4 pv4 = dequant_q8_0_kv4(v, token, row_bytes, e0);
+                lo += pv4 * ss[NE * cc + ty];
+            }
+            lo += simd_shuffle_down(lo, 16);
+            if (ty == 0) so4[tiisg] += lo;
+        }
+    }
+
+    int pbase = ((t * nh + h) * n_chunks + iwg) * (2 + hd);
+    if (tiisg == 0) {
+        partial[pbase + 0] = M;
+        partial[pbase + 1] = S;
+    }
+    if (ty == 0) {
+        float4 acc = so4[tiisg];
+        partial[pbase + 2 + tx * 4 + 0] = acc.x;
+        partial[pbase + 2 + tx * 4 + 1] = acc.y;
+        partial[pbase + 2 + tx * 4 + 2] = acc.z;
+        partial[pbase + 2 + tx * 4 + 3] = acc.w;
+    }
+}
+
+// Packed Q8_0 KV variant of kernel_flash_attn_ext_hd128_f16 (decode nt==1,
+// hd==128; issue #310). The NE=1 structure is identical; only the per-lane
+// K/V read changes to `dequant_q8_0_kv4`. `row_bytes` is buffer 11.
+kernel void kernel_flash_attn_ext_hd128_q8_0(
+    device const float * q        [[buffer(0)]],
+    device const uchar * k        [[buffer(1)]],
+    device const uchar * v        [[buffer(2)]],
+    device       float * partial  [[buffer(3)]],
+    constant    int    * positions [[buffer(4)]],
+    constant    int    & nh        [[buffer(5)]],
+    constant    int    & nk        [[buffer(6)]],
+    constant    int    & hd        [[buffer(7)]],
+    constant    float  & scale     [[buffer(8)]],
+    constant    int    & nt        [[buffer(9)]],
+    constant    int    & n_chunks  [[buffer(10)]],
+    constant    uint   & row_bytes [[buffer(11)]],
+    uint3  tgpig   [[threadgroup_position_in_grid]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    threadgroup float * shmem [[threadgroup(0)]]
+) {
+    constexpr int DK  = 128;
+    constexpr int NE  = 1;
+    constexpr int C   = 32;
+    constexpr int NW  = 32;
+    constexpr int NL  = NW / NE;
+    constexpr int DK4 = DK / 4;
+    constexpr float MINF_MAXHALF = 65504.0f;
+
+    const int t   = (int)tgpig.x;
+    const int h   = (int)tgpig.y;
+    const int iwg = (int)tgpig.z;
+    if (t >= nt || h >= nh) return;
+
+    const int nkv = positions[t] + 1;
+    const int gqa = nh / nk;
+    const int hk  = h / gqa;
+    const int tx  = (int)tiisg % NL;
+    const int e0  = hk * hd + tx * 4;
+
+    threadgroup float4 * sq4 = (threadgroup float4 *)shmem;
+    threadgroup float  * ss  = shmem + DK4 * 4;
+    threadgroup float4 * so4 = (threadgroup float4 *)(ss + C);
+
+    device const float4 * q4 = (device const float4 *)(q + t * (nh * hd) + h * hd);
+    for (int i = (int)tiisg; i < DK4; i += NW) sq4[i] = q4[i];
+    for (int i = (int)tiisg; i < C; i += NW) ss[i] = 0.0f;
+    so4[tiisg] = (float4)0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float M = -INFINITY;
+    float S = 0.0f;
+
+    for (int ic0 = iwg; ; ic0 += n_chunks) {
+        int ic = ic0 * C;
+        if (ic >= nkv) break;
+
+        float mqk[C / NE];
+        for (int cc = 0; cc < C / NE; ++cc) {
+            int token = ic + cc;
+            if (token >= nkv) token = nkv - 1;
+            float4 kv4 = dequant_q8_0_kv4(k, token, row_bytes, e0);
+            float4 qv = sq4[tx] * kv4;
+            mqk[cc] = qv.x + qv.y + qv.z + qv.w;
+            mqk[cc] = simd_sum(mqk[cc]);
+        }
+        ss[tx] = mqk[tx] * scale
+               + ((ic + tx < nkv) ? 0.0f : -MINF_MAXHALF);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            const float m = M;
+            const float s = ss[tiisg];
+            M = simd_max(max(M, s));
+            const float ms = exp(m - M);
+            const float vs = exp(s - M);
+            S = S * ms + simd_sum(vs);
+            ss[tiisg] = vs;
+            so4[tiisg] *= ms;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        {
+            float4 lo = (float4)0.0f;
+            for (int cc = 0; cc < C / NE; ++cc) {
+                int token = ic + cc;
+                if (token >= nkv) token = nkv - 1;
+                float4 pv4 = dequant_q8_0_kv4(v, token, row_bytes, e0);
+                lo += pv4 * ss[cc];
+            }
+            so4[tiisg] += lo;
+        }
+    }
+
+    int pbase = ((t * nh + h) * n_chunks + iwg) * (2 + hd);
+    if (tiisg == 0) {
+        partial[pbase + 0] = M;
+        partial[pbase + 1] = S;
+    }
+    float4 acc = so4[tiisg];
+    partial[pbase + 2 + tx * 4 + 0] = acc.x;
+    partial[pbase + 2 + tx * 4 + 1] = acc.y;
+    partial[pbase + 2 + tx * 4 + 2] = acc.z;
+    partial[pbase + 2 + tx * 4 + 3] = acc.w;
+}
+

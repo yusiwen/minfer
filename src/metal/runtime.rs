@@ -194,6 +194,9 @@ impl MpsState {
             let pl_flash_attn_f16 = get_pl("kernel_flash_attn_ext_f16")?;
             let pl_flash_attn_hd128 = get_pl("kernel_flash_attn_ext_hd128_f32")?;
             let pl_flash_attn_hd128_f16 = get_pl("kernel_flash_attn_ext_hd128_f16")?;
+            // #310 mechanism A: the packed Q8_0 decode flash twins.
+            let pl_flash_attn_q8_0 = get_pl("kernel_flash_attn_ext_q8_0")?;
+            let pl_flash_attn_hd128_q8_0 = get_pl("kernel_flash_attn_ext_hd128_q8_0")?;
             let pl_flash_attn_blk = get_pl("kernel_flash_attn_blk_f32")?;
             let pl_flash_attn_blk_f16 = get_pl("kernel_flash_attn_blk_f16")?;
             let pl_flash_attn_blk_hd128 = get_pl("kernel_flash_attn_blk_hd128_f32")?;
@@ -214,6 +217,8 @@ impl MpsState {
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
             let pl_store_kv_q8_0 = get_pl("kernel_store_kv_q8_0")?;
+            // #310 mechanism B: packed cell window -> transient f32 stage.
+            let pl_dequant_kv_q8_0_to_f32 = get_pl("kernel_dequant_kv_q8_0_to_f32")?;
             let pl_attn_bsr = get_pl("kernel_attn_bias_rope_store")?;
             let pl_attn_rope_store = get_pl("kernel_attn_rope_store")?;
             let pl_attn_scores = get_pl("kernel_attn_scores")?;
@@ -289,6 +294,8 @@ impl MpsState {
                 pl_flash_attn_f16,
                 pl_flash_attn_hd128,
                 pl_flash_attn_hd128_f16,
+                pl_flash_attn_q8_0,
+                pl_flash_attn_hd128_q8_0,
                 pl_flash_attn_blk,
                 pl_flash_attn_blk_f16,
                 pl_flash_attn_blk_hd128,
@@ -305,6 +312,7 @@ impl MpsState {
                 pl_store_kv,
                 pl_store_kv_f16,
                 pl_store_kv_q8_0,
+                pl_dequant_kv_q8_0_to_f32,
                 pl_attn_bsr,
                 pl_attn_rope_store,
                 pl_attn_scores,
@@ -317,6 +325,8 @@ impl MpsState {
                 buf_positions: std::sync::Mutex::new(dummy_buf.clone()),
                 buf_attn_scores: std::sync::Mutex::new(dummy_buf.clone()),
                 buf_attn_pad: std::sync::Mutex::new(dummy_buf.clone()),
+                buf_kv_stage_k: std::sync::Mutex::new(dummy_buf.clone()),
+                buf_kv_stage_v: std::sync::Mutex::new(dummy_buf.clone()),
                 dispatch_trace: std::sync::Mutex::new(std::collections::VecDeque::new()),
             };
             eprintln!(

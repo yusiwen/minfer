@@ -209,3 +209,18 @@ static inline float dequant_q8_0_kv_elem(device const uchar * base, int row, uin
     return d * float((signed char)blk[2 + (e & 31)]);
 }
 
+// #310: the decode flash family reads K/V four elements at a time. This returns
+// elements `e..e+4` of one packed Q8_0 cell (the caller's `e` is `4`-aligned).
+// Within a head, `hd ∈ {64,128}`, so `hk*hd` is a multiple of 32 and `tx*4` is a
+// multiple of 4 with `tx*4 <= hd-4 < 32 + 32k`; the four elements therefore
+// never straddle a 32-element block boundary: `(e >> 5) == ((e + 3) >> 5)`.
+// Only scalar byte loads are alignment-safe — a block begins at byte
+// `row*row_bytes + 34*b`, and `34` is `2 mod 4` for odd `b`, so a vector load
+// would be misaligned under MSL's rules.
+static inline float4 dequant_q8_0_kv4(device const uchar * base, int row, uint row_bytes, int e) {
+    device const uchar * blk = base + (size_t)row * (size_t)row_bytes + (size_t)(e >> 5) * 34;
+    const float d = float(*(device const half *)blk);
+    device const signed char * qs = (device const signed char *)(blk + 2) + (e & 31);
+    return float4((float)qs[0], (float)qs[1], (float)qs[2], (float)qs[3]) * d;
+}
+

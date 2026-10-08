@@ -69,6 +69,35 @@ kernel void kernel_store_kv_q8_0(
     }
 }
 
+// #310 mechanism B: dequantize a window of packed Q8_0 KV cells into a transient
+// **f32** staging buffer, so the f32 fast prefill/windowed-flash families can read
+// a packed region unchanged. `dst` is indexed by the ABSOLUTE cell row
+// (`row0 + r`), which is what lets the windowed kernels keep their absolute
+// addressing (`k + lo_min*nkt + ic*nkt + hoff`). One element per thread; the
+// caller runs it once for K and once for V. `ncols` is the elements per cell
+// (`nkt`), `row_bytes` the packed cell's word-padded byte width.
+//
+// The stage is f32, not f16: staging to f16 would round the already-Q8_0-
+// dequantized value a **second** time, and on Qwen3-0.6B that extra rounding
+// amplified through 8 decode steps to a 16.9 logit delta (measured), exceeding
+// the inherited CUDA packed-cache class (<=4.0 / <=1.0 at the argmax). f32
+// staging removes the second rounding and restores the classic path's accuracy
+// (1.28 / 0.36) at parity speed — `docs/METAL-BACKEND-DESIGN.md` §4.4.
+kernel void kernel_dequant_kv_q8_0_to_f32(
+    device const uchar * src     [[buffer(0)]],
+    device       float * dst     [[buffer(1)]],
+    constant    int    & nrows   [[buffer(2)]],
+    constant    int    & ncols   [[buffer(3)]],
+    constant    uint   & row_bytes [[buffer(4)]],
+    constant    int    & row0    [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const int i = (int)gid;
+    if (i >= nrows * ncols) return;
+    const int r = i / ncols, c = i % ncols;
+    dst[(row0 + r) * ncols + c] = dequant_q8_0_kv_elem(src, row0 + r, row_bytes, c);
+}
+
 // ─── Fused bias-add + RoPE + KV-store (nt==1 decode) ──────────
 // One kernel replaces add_bias×3 + rope×2 + store_kv×2 (7 dispatches → 1).
 // bqkv layout (nt==1): [q: 0..nqt][k: nqt..nqt+nkt][v: nqt+nkt..nqt+2nkt].

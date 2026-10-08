@@ -1466,6 +1466,90 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d(nt as u64, nh as u64, 32, 1);
     }
 
+    /// #310 mechanism A: packed Q8_0 causal decode flash — the exact twin of
+    /// [`Self::gqa_attn_flash`] with the `kernel_flash_attn_ext_q8_0` /
+    /// `kernel_flash_attn_ext_hd128_q8_0` partial pass. K/V are packed cells;
+    /// `row_bytes` (buffer 11) is one cell's word-padded byte width. The combine
+    /// pass, shmem sizes and grid are unchanged, so a packed decode shares its
+    /// partial format and combine kernel with the f16 path.
+    pub fn gqa_attn_flash_q8_0(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        o: &MetalBuffer,
+        positions: &MetalBuffer,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        nt: usize,
+        n_chunks: usize,
+        row_bytes: usize,
+    ) {
+        self.trace_op("gqa_attn_flash_q8_0");
+        let need = (nt * nh * n_chunks * (2 + hd) * 4) as u64;
+        let partial = MpsState::get_or_grow(&self.state.buf_attn_partial, need, &self.state.device);
+
+        self.enc.setComputePipelineState(
+            &**(if hd == 128 {
+                &self.state.pl_flash_attn_hd128_q8_0
+            } else {
+                &self.state.pl_flash_attn_q8_0
+            }),
+        );
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(k)), (0) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(v)), (0) as usize, (2) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&*partial), (0) as usize, (3) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (4) as usize)
+        };
+        self.set_params(5, &(nh as i32));
+        self.set_params(6, &(nk as i32));
+        self.set_params(7, &(hd as i32));
+        self.set_params(8, &(scale.to_bits() as i32));
+        self.set_params(9, &(nt as i32));
+        self.set_params(10, &(n_chunks as i32));
+        self.set_params(11, &(row_bytes as i32));
+        let shmem = if hd == 128 { 1152 } else { 1024 };
+        unsafe {
+            self.enc
+                .setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize)
+        };
+        self.dispatch_3d(nt as u64, nh as u64, n_chunks as u64, 32, 1, 1);
+
+        // pass 2: combine (shared with the f32/f16 paths)
+        self.enc
+            .setComputePipelineState(&*self.state.pl_gqa_attn_combine);
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&*partial), (0) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(o)), (0) as usize, (1) as usize)
+        };
+        self.set_params(2, &(nh as i32));
+        self.set_params(3, &(hd as i32));
+        self.set_params(4, &(nt as i32));
+        self.set_params(5, &(n_chunks as i32));
+        self.dispatch_2d(nt as u64, nh as u64, 32, 1);
+    }
+
     /// Scatter nt rows of src[nt][nkt] into dst[positions[t]][nkt].
     /// Writes f32 (default) or f16 (MINFER_CACHE_TYPE=f16) into the KV cache.
     pub fn store_kv(
@@ -1543,6 +1627,47 @@ impl MpsCommandBuffer<'_> {
         };
         self.set_params(5, &(row_bytes as i32));
         self.dispatch_2d(nt as u64, (nkt / 32) as u64, 1, 1);
+    }
+
+    /// #310 mechanism B: dequantize `nrows` packed Q8_0 cells starting at the
+    /// ABSOLUTE cell `row0` into the transient f32 stage buffers, once for K and
+    /// once for V. The stage is arena-addressed (row `i` holds cell `i`), so the
+    /// existing f32 fast prefill/windowed-flash kernels read it unchanged: a
+    /// caller passes the stage buffers with `f16 = false`. `ncols` is `nkt` and
+    /// `row_bytes` the packed cell's word-padded byte width. Both buffers grow on
+    /// demand and are never shrunk (`MpsState::get_or_grow`).
+    pub fn dequant_kv_q8_0_window(
+        &self,
+        kv_k: &MetalBuffer,
+        kv_v: &MetalBuffer,
+        row0: usize,
+        nrows: usize,
+        ncols: usize,
+        row_bytes: usize,
+    ) -> (MetalBuffer, MetalBuffer) {
+        self.trace_op("dequant_kv_q8_0_to_f32");
+        let dev = &self.state.device;
+        let need = ((row0 + nrows) * ncols * 4) as u64;
+        let stage_k = MpsState::get_or_grow(&self.state.buf_kv_stage_k, need, dev);
+        let stage_v = MpsState::get_or_grow(&self.state.buf_kv_stage_v, need, dev);
+        self.enc
+            .setComputePipelineState(&*self.state.pl_dequant_kv_q8_0_to_f32);
+        for (src, dst) in [(kv_k, &stage_k), (kv_v, &stage_v)] {
+            unsafe {
+                self.enc
+                    .setBuffer_offset_atIndex(Some(&**(src)), (0) as usize, (0) as usize)
+            };
+            unsafe {
+                self.enc
+                    .setBuffer_offset_atIndex(Some(&**dst), (0) as usize, (1) as usize)
+            };
+            self.set_params(2, &(nrows as i32));
+            self.set_params(3, &(ncols as i32));
+            self.set_params(4, &(row_bytes as i32));
+            self.set_params(5, &(row0 as i32));
+            self.dispatch_1d((nrows * ncols) as u64, 256);
+        }
+        (stage_k, stage_v)
     }
 
     /// Prefill parallel attention (P1 2026-08-11): replaces the classic
