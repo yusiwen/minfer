@@ -226,7 +226,7 @@ touch, as a function of i?"
 
 - **Where minfer uses it**: the elementwise family is written warp-dense — e.g.
   `store_kv_f16` maps one lane to four *consecutive* floats — the load
-  `src + t*nkt + j`, `store_kv_f16` (`src/cuda/kernels/kv_store.cu:31`), the `float4` at :2561), and the MMVQ
+  `src + t*nkt + j`, `store_kv_f16` (`src/cuda/kernels/kv_store.cu:31`, the `float4` read at `:42`), and the MMVQ
   decode kernels' shape gate explicitly protects against the uncoalesced case —
   doc 06 records that small shapes lose because "1–2 units per thread expose
   the uncoalesced q5/q6 byte loads" (`src/cuda/methods/dispatch.rs:350-357`, the
@@ -255,11 +255,11 @@ re-read from DRAM/L2 but eat shared memory, and shared memory per block
 *limits how many blocks fit per SM* (occupancy, §3.4). Chapter 04 walked
 `gemm_f16_nt_kernel_t` line by line; the design arithmetic is in step doc 02.
 
-- **Where minfer uses it**: `gemm_f16_nt_kernel_t`
-  `gemm_f16_nt_kernel_t` (`src/cuda/kernels/gemm_wmma.cu:367`) — TN=64 × TM tile, KS=32 k-step, dynamic smem
-  (`extern __shared__` at :4796); the MMQ GEMM family tiles the same way with
-  raw quantized bytes (`mmq_raw_nb_kernel`, `src/cuda/kernels/mmq_nb.cu:9`; its BT
-  successor `mmq_raw_nb_bt_kernel` :6656; q6_K variant :6976).
+- **Where minfer uses it**: `gemm_f16_nt_kernel_t` (`src/cuda/kernels/gemm_wmma.cu:367`) —
+  TN=64 × TM tile, KS=32 k-step, dynamic smem (`extern __shared__` at `src/cuda/kernels/gemm_wmma.cu:376`);
+  the MMQ GEMM family tiles the same way with raw quantized bytes
+  (`mmq_raw_nb_kernel`, `src/cuda/kernels/mmq_nb.cu:9`, BT successor `mmq_raw_nb_bt_kernel` `:289`; q6_K variant
+  `mmq_raw_nb_bt_q6k_kernel` `src/cuda/kernels/mmq_bt_q6k.cu:42`).
 - **Step records**: [02-wmma-f16-prefill-gemm-8m.md](../cuda_optimization_steps/02-wmma-f16-prefill-gemm-8m.md)
   (the 64×64×32 tile turned prefill from 30.7 → 1204 tok/s, 39×, by cutting
   weight re-reads from nt× to ~1×; also records the two *negative* tile
@@ -284,8 +284,8 @@ alignment).
 - **Where minfer uses it**: `store_kv_f16` (`float4` load + two `__half2`
   stores, `store_kv_f16` (`src/cuda/kernels/kv_store.cu:31`); the q6_K B-expand reads packed data as
   `uint4` groups; the q8_0 p32 decode planes are *designed around* the
-  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda/kernels/mmvq_multi.cu:655`, row
-  pointer :8302, the `__ldg` group loads :8308).
+  `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda/kernels/mmvq_multi.cu:655`, the row pointer
+  and the `__ldg` group loads: `src/cuda/kernels/mmvq_multi.cu:665-671`).
 - **Step records**: [11-p5-gemm-tiles-fa-rewrite.md](../cuda_optimization_steps/11-p5-gemm-tiles-fa-rewrite.md)
   (P5·1, +4%); [44-r41-q6k-bexpand-uint4.md](../cuda_optimization_steps/44-r41-q6k-bexpand-uint4.md)
   (widening 32 per-byte loads to `uint4` groups: q6_K GEMM kernel −61.5%, the
@@ -319,8 +319,8 @@ registers.
   (`mmq_raw_nb_bt_q6k_kernel`, `src/cuda/kernels/mmq_bt_q6k.cu:42`) — the compiler
   limit of 80 regs/thread to fit 3 blocks/SM (80 × 768 threads = 61,440 ≤ the
   65,536-register file, vs 87 regs → only 2 blocks); the q4_K NB kernel's
-  45,056 B smem budget → 2 blocks/SM (`mmq_raw_nb_kernel`,
-  `mmq_raw_nb_kernel` (`src/cuda/kernels/mmq_nb.cu:9`), the r28 kernel doc 31 measures); the
+  43,008 B smem budget → 2 blocks/SM (`mmq_raw_nb_kernel`,
+  `src/cuda/kernels/mmq_nb.cu:9`, the `:15` comment; doc 31 measures the r28 45,056 B); the
   MMVQ family's `__launch_bounds__(256)` everywhere.
 - **Step records**: [31-r28-nb-kernel-2blocks.md](../cuda_optimization_steps/31-r28-nb-kernel-2blocks.md)
   (smem 45,056 B ⇒ 2 blocks/SM, +2.56%; ncu
@@ -360,7 +360,7 @@ across a warp it explicitly documents the uniformity invariant.
   producer quantizes "THIS warp's row (warp-uniform row ⇒ the shfl_xor
   reductions below never see divergence)" — the comment is at
   `rms_norm_quant_nw_f32_t` (`src/cuda/kernels/mmvq_skipwrite.cu:25`, the comment `:71-72`); the dequant kernels
-  (`dequant_q4_0_f16`, :4449) have a single uniform body with a bounds check
+  (`dequant_q4_0_f16`, `src/cuda/kernels/gemm_wmma.cu:38`) have a single uniform body with a bounds check
   only. Divergence still shows up in the accounting: doc 43 attributes part of
   the gap between achieved and theoretical occupancy to wave-tail divergence,
   and doc 62 rejects a chunk-distribution scheme precisely because "differing
@@ -487,9 +487,9 @@ a *policy* decision (which tensors convert, who else reads the region), so it
 is gated and load-time-decided.
 
 - **Where minfer uses it**: `store_kv_f16` (`src/cuda/kernels/kv_store.cu:31`) and
-  the f16-KV attention mirror `gqa_attn_f32_f16kv` (:2677); policy in
-  `src/cuda.rs` (`kv_cache_is_f16`): auto-f16 when `n_layers × n_kv_embd ≥
-  8192`, `MINFER_CACHE_TYPE=f16|f32` override.
+  the f16-KV attention mirror `gqa_attn_f32_f16kv` (`src/cuda/kernels/attention_decode.cu:18`); the policy
+  is per engine now — `KvFormat` (`src/graph/kvformat.rs`, stamped into CUDA's `kv_layout`
+  tag): auto-f16 on a GPU at `n_layers × n_kv_embd ≥ 8192`; `MINFER_CACHE_TYPE=f32|f16|q8_0` override.
 - **Step records**: [79-phase8-coverage-batch.md](../cuda_optimization_steps/79-phase8-coverage-batch.md)
   (8b: 7B @2K decode +11%; the caveat on record — `MINFER_GRAPH_DUMP` reads KV
   as f32, so dump and f16-KV are incompatible on the debug path).
@@ -512,9 +512,9 @@ from llama.cpp (the MMQ analysis doc), then re-derived kernel by kernel over
 - **Where minfer uses it**: the A-plane prepass
   (`quantize_q8_0_pad40_t`, `src/cuda/kernels/mmvq_aquant.cu:85` — the pre-transposed,
   64-token-blocked layout), the raw-byte NB/BT GEMM family
-  (`mmq_raw_nb_bt_kernel` :6656, q6_K variant :6976), dispatched for
-  `nt ≥ 16` under the `MINFER_MMQ` gate read through `CudaState::mmq_gate_on`
-  `mmq_gate_on` (`src/cuda/methods/policy.rs:14`).
+  (`mmq_raw_nb_bt_kernel`, `src/cuda/kernels/mmq_nb.cu:289`; q6_K variant
+  `mmq_raw_nb_bt_q6k_kernel`, `src/cuda/kernels/mmq_bt_q6k.cu:42`), dispatched for `nt ≥ 9`
+  under the `MINFER_MMQ` gate read through `CudaState::mmq_gate_on` (`src/cuda/methods/policy.rs:14`).
 - **Step records**: [08-r1-int8-mmq-prefill-gemm.md](../cuda_optimization_steps/08-r1-int8-mmq-prefill-gemm.md)
   (R1: parity-first strategy — "parity-clean but ~2.9 TMAC/s vs llama ~24: the
   8× gap was unprofiled"), the r9→r59 redesign ladder
@@ -561,8 +561,8 @@ class it defends* — doc 77's first lesson is that a gate which cannot is
 ritual, not verification. The doc's three villain names are **phantom gain**,
 **correctness erosion**, and **baseline drift**.
 
-**Gate 1 — the parity trio (numeric correctness).** Three independent test
-binaries run before any landing: `cuda_prefill_mmq` (1/0, 8 quant types × 8
+**Gate 1 — the parity trio (numeric correctness).** Three independent parity
+checks run before any landing: `cuda_prefill_mmq` (1/0, 8 quant types × 8
 shapes against the host reference — defends the quant kernels' numeric path),
 `cuda_prefill` (7/0 — the prefill graph end to end), and
 `cuda_fa_prefill_attention_parity` (1/0 — the attention kernel). The 1e-3
@@ -597,7 +597,7 @@ prints `fallback!`) and baseline drift (the r59/r59b story: a "baseline"
 binary that was actually a stale deficient build inflated a +26.2% claim down
 to its true +11.1%, doc 63).
 
-**Gate 4 — the suite.** The device test suite (166 → 174+ over the campaign)
+**Gate 4 — the suite.** The device test suite (166 → 174+ over the campaign; 576 on 2026-10-07)
 guards collateral damage; a test that flakes under a co-tenant window is
 adjudicated with an isolated `--exact` rerun, never silently retried to green.
 Catches: regression in *other* kernels — the change you did not mean to make.
