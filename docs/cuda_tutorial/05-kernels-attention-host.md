@@ -354,7 +354,7 @@ and packed layouts, so a f32 cache keeps the general kernel). If the shared-memo
 launch `launch_fa_prefill_kv` (`attention_prefill.cu:394`) the launcher returns `−1`, prints one loud warning,
 and the wrapper falls back to the legacy per-token kernel — the one visible fallback in the
 attention path, and it is *announced*, not silent. Note for Qwen2.5-0.5B specifically: its head dim
-is 64 (`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models") (§4 "Verified models")), so 0.5B prefill runs the legacy
+is 64 (`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models")), so 0.5B prefill runs the legacy
 `gqa_attn_f32_f16kv` kernel; `fa_prefill_kv` serves the hd=128 classes (Qwen2.5-7B, Qwen3-4B…).
 The CPU counterpart — the same online softmax in scalar Rust — is walkthrough 11 §3.2's
 attention arms.
@@ -470,7 +470,7 @@ and they compound:
 1. **Launch overhead.** Every kernel launch has a fixed CPU-side cost, and the
    decode step is a chain of hundreds of small kernels (§4 does the arithmetic);
    TECH-PRIMER §6.4 puts decode chains in the "launch-overhead-bound" regime
-   ("2 µs/graph-gap scale", `docs/CUDA-TECH-PRIMER.md:300-302` (§6 "Element-wise and fused epilogue kernels") (§6 "Element-wise and fused epilogue kernels")). Three launches
+   ("2 µs/graph-gap scale", `docs/CUDA-TECH-PRIMER.md:300-302` (§6 "Element-wise and fused epilogue kernels")). Three launches
    replaced by one saves two gaps *per layer per token*, plus the L2
    (layer-2 cache on the GPU) round-trips of writing q/k/v out and reading them
    back.
@@ -484,7 +484,7 @@ and they compound:
 The graph-level counterpart of this kernel is `Op::FusedQKV` — AGENTS rule 7:
 "Decode fusions: `Op::FusedQKV` (concat matmul + bias/rope/store)…"
 (`AGENTS.md:84` ("Build & Run")), with the mechanics in TECH-PRIMER §6.4
-(`docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels") (§6 "Element-wise and fused epilogue kernels")). Section 3.4 shows the Rust arm that
+(`docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels")). Section 3.4 shows the Rust arm that
 launches it.
 
 **Two ways to call the same kernel.** The `q/k/v` parameters are *pointer-form
@@ -589,7 +589,7 @@ boundary. The one structural guard on that layout: attention requires
 `hd == hd_kv` and `nkt == n_head_kv · hd` (the kernels stride KV rows by
 `nkt`), and violations return `Err`, not a workaround
 `execute_node_inner` (`cuda_backend.rs:916`); the same guard has a GPU_SAFETY audit entry,
-`docs/GPU_SAFETY.md:83` (§2 "The cross-backend staging copy (F5/#137) — bound") (§2 "The cross-backend staging copy (F5/#137) — bound").
+`docs/GPU_SAFETY.md:83` (§2 "The cross-backend staging copy (F5/#137) — bound").
 
 ### 3.4 The Rust host side — `cuda_backend.rs` as a `Backend`
 
@@ -724,14 +724,14 @@ The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — i
 AGENTS rule 5 (`AGENTS.md:82` ("Build & Run")), written in the blood of Phase 3. In three
 sentences: a per-node host readback inside a split whose command buffer was
 still open read *stale* (not-yet-written) data, which surfaced as an all-zero
-KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:977-979` (§7 "In-place execution and the aliasing rule") (§7 "In-place execution and the aliasing rule"), the §7.3
+KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:977-979` (§7 "In-place execution and the aliasing rule"), the §7.3
 "In-place execution and the aliasing rule" hard rule). The fix
 was not "sync more" but structural — the in-place aliasing rule plus a single
 sanctioned copy point at split boundaries — so the bug class has nowhere to
 reappear. The GPU_SAFETY audit generalizes the lesson: any change to shared
 mutable GPU state must be validated against a known-good reference, not just
 an A/B of two paths over the same corrupted state
-(`docs/GPU_SAFETY.md:151-156` (§4 "Device metrics: query at runtime, never guess (2") (§4 "Device metrics: query at runtime, never guess (2")).
+(`docs/GPU_SAFETY.md:151-156` (§4 "Device metrics: query at runtime, never guess (2")).
 
 **`synchronize` and the bounded-wait rule.**
 
@@ -752,7 +752,7 @@ closes here, and the actual wait is `CudaState::sync` (`src/cuda/methods/events.
 `cudaGetLastError` checked, then `cudaStreamSynchronize`, and its error code
 checked. That is the CUDA expression of the GPU-safety rule "synchronize() is
 the one choke point: stream-ordered work is waited with a bounded loop and the
-status is checked" (TECH-PRIMER §7, `docs/CUDA-TECH-PRIMER.md:317-318` (§7 "Synchronization discipline (GPU Safety, `docs/GP") (§7 "Synchronization discipline (GPU Safety, `docs/GP"); the
+status is checked" (TECH-PRIMER §7, `docs/CUDA-TECH-PRIMER.md:317-318` (§7 "Synchronization discipline (GPU Safety, `docs/GP"); the
 rules themselves are `docs/GPU_SAFETY.md`). At a split boundary the scheduler
 calls `alloc.retire_backend`, whose CUDA arm is the deferred-wait form — §3.5 picks up.
 
@@ -761,7 +761,7 @@ calls `alloc.retire_backend`, whose CUDA arm is the deferred-wait form — §3.5
 **The problem.** A decode step is a few hundred small kernel launches (§4
 counts them), each paying a CPU-side cost — TECH-PRIMER §8's one-liner:
 "per-launch CPU overhead (~2–7 µs) is pure tax"
-(`docs/CUDA-TECH-PRIMER.md:322-323` (§8 "CUDA Graphs — capture once, replay many (Phase 7") (§8 "CUDA Graphs — capture once, replay many (Phase 7")). **CUDA Graphs** (record a sequence of
+(`docs/CUDA-TECH-PRIMER.md:322-323` (§8 "CUDA Graphs — capture once, replay many (Phase 7")). **CUDA Graphs** (record a sequence of
 launches once, then submit them all with a single replay call) remove most of
 that tax without changing the kernels. The scheduler asks the CUDA backend,
 before executing a split, whether it wants to replay a capture
@@ -784,7 +784,7 @@ between steps. Two invariants hold it up. First, **positions are data**
 (§3.3): kernel arguments (pointers, dims) are identical every step; only
 buffer *contents* change, and those are rewritten before replay — TECH-PRIMER
 §8's "why replay is safe in minfer's design"
-(`docs/CUDA-TECH-PRIMER.md:338-343` (§8 "CUDA Graphs — capture once, replay many (Phase 7") (§8 "CUDA Graphs — capture once, replay many (Phase 7")). Second, **pool generations**: any
+(`docs/CUDA-TECH-PRIMER.md:338-343` (§8 "CUDA Graphs — capture once, replay many (Phase 7")). Second, **pool generations**: any
 buffer (re)allocation bumps `pool_gen`, and a replay whose captured `pool_gen`
 differs is destroyed and re-captured `graph_replay_step` (`cuda_backend.rs:459`).
 
@@ -795,9 +795,9 @@ runs the plain per-node launch path. It is also the *recovery* switch: any
 capture/replay failure disables graphs for the rest of the session with a loud
 message saying exactly that (`cuda_backend.rs:499` and `:545`, the two "graphs disabled for this session" messages). TECH-PRIMER
 §8 calls it "the A/B control used by every graph-adjacent step doc"
-(`docs/CUDA-TECH-PRIMER.md:336-337` (§8 "CUDA Graphs — capture once, replay many (Phase 7") (§8 "CUDA Graphs — capture once, replay many (Phase 7")). A related hard rule: nothing inside a
+(`docs/CUDA-TECH-PRIMER.md:336-337` (§8 "CUDA Graphs — capture once, replay many (Phase 7")). A related hard rule: nothing inside a
 capture window may sync — a debug readback corrupts the capture, the 7e②
-"faster but wrong" incident (`docs/GPU_SAFETY.md:206` (§4b "b. Flash-attention kernels (`kernel_flash_attn_e") (§4b "b. Flash-attention kernels (`kernel_flash_attn_e")) — which is why
+"faster but wrong" incident (`docs/GPU_SAFETY.md:206` (§4b "b. Flash-attention kernels (`kernel_flash_attn_e")) — which is why
 trace/viz capture disables replay in the scheduler (`BackendScheduler::execute` (`src/graph/scheduler.rs:137`)).
 
 **The split/copy story at backend boundaries.** On a mixed graph — or any
@@ -853,9 +853,9 @@ actual values `execute_node_inner` (`cuda_backend.rs:916`). AGENTS states the co
 "kernel-invariant violations return `Err` from `execute_node` — never a
 silent CPU fallback; backend assignment is decided at build time"
 (`AGENTS.md:72` ("Build & Run")); TECH-PRIMER §7 repeats it
-(`docs/CUDA-TECH-PRIMER.md:312-314` (§7 "Synchronization discipline (GPU Safety, `docs/GP") (§7 "Synchronization discipline (GPU Safety, `docs/GP")); the design record explains why — silent
+(`docs/CUDA-TECH-PRIMER.md:312-314` (§7 "Synchronization discipline (GPU Safety, `docs/GP")); the design record explains why — silent
 fallbacks make performance and correctness bugs indistinguishable
-(`docs/COMPUTE-GRAPH-DESIGN.md:1105-1107` (§9 "Eligibility") (§9 "Eligibility"), the §9.2 "Eligibility" no-silent-fallback
+(`docs/COMPUTE-GRAPH-DESIGN.md:1105-1107` (§9 "Eligibility"), the §9.2 "Eligibility" no-silent-fallback
 clause).
 
 ## 4. Performance intuition
@@ -863,7 +863,7 @@ clause).
 **Launch overhead, decoded into numbers.** Count the kernels one decode step
 launches, directly off the dispatch table of §3.4, for **Qwen2.5-0.5B** (24
 layers, 14 query heads / 2 KV heads, `hd = 64`, `n_kv_embd = 128` —
-`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models") (§4 "Verified models") with the default decode fusions on:
+`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models") with the default decode fusions on:
 
 | per layer | launches |
 |---|---|
@@ -880,7 +880,7 @@ conversion, final norm, and lm_head ≈ **292 launches per token** — counted
 from the dispatch table, not measured; `nsys stats` (§5) shows the real
 number for your quant and gate combination. Price it: TECH-PRIMER §8's
 measured band for per-launch CPU overhead is ~2–7 µs
-(`docs/CUDA-TECH-PRIMER.md:322-323` (§8 "CUDA Graphs — capture once, replay many (Phase 7") (§8 "CUDA Graphs — capture once, replay many (Phase 7")), so the eager path spends roughly
+(`docs/CUDA-TECH-PRIMER.md:322-323` (§8 "CUDA Graphs — capture once, replay many (Phase 7")), so the eager path spends roughly
 **0.6–2.0 ms per token just launching kernels** — before the GPU has done any
 work. A captured step replays all of it with one launch call. The repo has a
 measured anchor for this class of win: the positions-conversion memo (§3.4)
@@ -888,19 +888,19 @@ eliminated re-conversions that cost "240 launches/step … ~0.28 ms of pure
 launch overhead" at a 14B decode (`cuda_backend.rs:68-74`, the positions-memo comment) — about 1.2 µs per
 launch, right in TECH-PRIMER's band. §3.2's fusion is the same arithmetic at
 graph level — the 7-launch QKV tail becomes 1 ("−310 launches/step" across a
-whole model, `docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels") (§6 "Element-wise and fused epilogue kernels") — and the dispatch notes
+whole model, `docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels") — and the dispatch notes
 price even one wasted launch at "~1-2 us/layer" (`attention_decode.cu:930`, the split-K dispatch note).
 
 **f16 KV bytes per token per layer.** With `nkt = n_head_kv · hd`, each region
 stores `nkt` elements per position. Qwen2.5-0.5B: `nkt = 2·64 = 128` elements
 → one f32 K row is 512 B, K + V together **1 KB per token per layer** (the
 walkthrough's number: 24 KB/token across 24 layers,
-`docs/inference_e2e_walkthrough/09-prefill-forward-path.md:253` (§2 "Sizing the context once for both phases") (§2 "Sizing the context once for both phases"). With f16 KV
+`docs/inference_e2e_walkthrough/09-prefill-forward-path.md:253` (§2 "Sizing the context once for both phases"). With f16 KV
 each row is 256 B → **512 B per token per layer, 12 KB/token** model-wide.
 Decode attention at context length `p` reads `2 · p` such rows per layer, so
 the halving directly halves the attention kernel's KV traffic; at Qwen3-4B
 scale (`n_kv_embd = 1024`, 36 layers — 288 KB per position in f32,
-`docs/inference_e2e_walkthrough/11-attention-vecops-kv.md:71` (§2 "Why the KV cache exists") (§2 "Why the KV cache exists") that is ~144 KB
+`docs/inference_e2e_walkthrough/11-attention-vecops-kv.md:71` (§2 "Why the KV cache exists") that is ~144 KB
 per position *touched*, though the regions stay f32-sized in allocation
 (§3.3). The flip side is precision: K/V are rounded to f16 on store and every
 downstream kernel reads the rounded values — which is why the parity tests
