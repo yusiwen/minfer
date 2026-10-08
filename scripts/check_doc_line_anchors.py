@@ -55,6 +55,16 @@ to failures by `--strict-symbols` — so "why did this pass?" always has an answ
 rule-E range miss used to join them on the same terms; since [#371] swept that
 population to zero it **fails** the plain run — see ``E`` below.
 
+The spans are paired **across lines** (issue #383). A code span may wrap: when a line
+ends inside one, the next line's first backtick *closes* it, so a line-by-line pairing
+would take that backtick as an opener and shift every pair on the line by one, hiding a
+symbol genuinely adjacent to the anchor there. `code_spans` therefore takes the
+open-span state `ends_inside` left for the line, and rules C and D both read spans
+through it. The state is *inline* markdown state: a fence's backticks are literal and a
+blank line ends the paragraph, so neither carries it into the next line. The pairing of
+a line that starts outside a span is byte-identical to ``CODE_SPAN``'s, so only wrapped
+lines change (measured on the tree: one anchor, `docs/LLAMA-CPP-MMQ-ANALYSIS.md:241`).
+
 ``D`` **the continuation is range-checked too.** A backticked span whose whole content
 is `:NNN` or `:NNN-MMM` — a second range in the file the line already cited — attaches
 to the nearest *preceding* `path.ext:NNN` match on the same line and is judged against
@@ -185,8 +195,15 @@ ANCHOR = re.compile(
     r":(?P<start>\d+)(?:-(?P<end>\d+))?"
 )
 
-#: One backticked span.
+#: One backticked span. Kept as the *pairing* primitive: `code_spans` below runs it
+#: over the part of a line that is known to lie outside a span, which is what keeps a
+#: balanced line's pairing byte-identical to the pre-#383 behaviour.
 CODE_SPAN = re.compile(r"`([^`]+)`")
+
+#: A fenced code block delimiter, read the way `scripts/check_docs_links.py` reads it.
+#: Backticks inside a fence are literal, so the open-span state is neither read nor
+#: advanced there — otherwise the fence lines of every listing would flip it.
+FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 
 #: A **bare continuation**: a backticked span whose whole content is `:NNN` or
 #: `:NNN-MMM`, i.e. a second range in the file the line already cited. The attachment
@@ -395,25 +412,91 @@ def is_missing_path(path: str, root: Path) -> bool:
     return tail != ""
 
 
-def symbol_of(line: str, span: tuple[int, int]) -> str | None:
+def code_spans(line: str, starts_inside: bool = False) -> list[tuple[int, int, str]]:
+    """The backticked spans of ``line``, given whether the line begins inside one.
+
+    ``CODE_SPAN`` pairs backticks line by line, which is wrong for the continuation
+    line of a span that *wraps*: that line's first backtick **closes** the span opened
+    on the line before, so pairing it as an opener shifts every pair on the line by one
+    and a token genuinely adjacent to an anchor is never seen (issue #383). A code span
+    may cross a line break in CommonMark — a line-length reflow creates one — so the
+    state is carried from line to line by ``ends_inside``.
+
+    ``starts_inside`` set means the text from offset 0 to the line's **first** backtick
+    is the tail of the span opened on an earlier line: a span whose content begins at
+    offset 0 and whose closing backtick is that first one. Pairing then alternates
+    normally over the rest of the line.
+
+    Returns ``(start, end, content)`` triples with the geometry ``re.Match.span``
+    always had — ``end`` is one past the closing backtick — so the callers compute a
+    gap exactly as they did against ``CODE_SPAN``. Empty content is never reported
+    (``CODE_SPAN`` needs one character between two backticks), which is what keeps an
+    anchor's own wrapping backticks — an empty segment on either side of it — from
+    registering as a span. A trailing backtick with no partner is not a span either;
+    it is the state ``ends_inside`` reports for the next line. Delimiter *runs* longer
+    than one backtick are paired the way ``CODE_SPAN`` always paired them (leftmost
+    backtick with leftmost backtick).
+    """
+    spans: list[tuple[int, int, str]] = []
+    rest = line
+    offset = 0
+    if starts_inside:
+        close = line.find("`")
+        if close < 0:
+            return spans
+        if line[:close]:
+            spans.append((0, close + 1, line[:close]))
+        offset = close + 1
+        rest = line[offset:]
+    spans.extend(
+        (match.start() + offset, match.end() + offset, match.group(1))
+        for match in CODE_SPAN.finditer(rest)
+    )
+    return spans
+
+
+def ends_inside(line: str, starts_inside: bool) -> bool:
+    """Whether ``line`` leaves a code span open for the line that follows it."""
+    return starts_inside ^ (line.count("`") % 2 == 1)
+
+
+def closes_fence(line: str, fence: str) -> bool:
+    """Whether ``line`` ends the fenced code block opened by ``fence``."""
+    match = FENCE.match(line)
+    if match is None:
+        return False
+    marker = match.group(1)
+    return marker[0] == fence[0] and len(marker) >= len(fence) and not line[match.end() :].strip()
+
+
+def symbol_of(line: str, span: tuple[int, int], starts_inside: bool = False) -> str | None:
     """The backticked symbol adjacent to the anchor at ``span``, if any.
 
     "Adjacent" is a documented rule, not a guess: only fillers (punctuation and
     whitespace) may sit between the two spans, at most ``ADJACENT_GAP`` characters,
     so a table cell's other columns or an earlier sentence never donate a symbol.
+
+    ``starts_inside`` is the state of the anchor's line (``ends_inside`` of the line
+    above): a line that continues a wrapped span scans its leading text as that span's
+    tail, so the pairing of the two slices below is the state-aware one (issue #383).
+    Both slices are scanned from the *line's* state, as they were scanned from the
+    fixed "outside" state before, so an anchor's own wrapping backtick is still read as
+    an opener on the ``after`` side — a separate, within-line shift of the same family
+    (``(`scheduler.rs:60-69`). `` halves the quote it sits in). Closing it would
+    re-point seven live anchors in four docs and is left to its own ticket.
     """
     before, after = line[: span[0]], line[span[1] :]
-    for match in reversed(list(CODE_SPAN.finditer(before))):
-        token = match.group(1).strip()
-        gap = before[match.end() :]
+    for _start, end, token in reversed(code_spans(before, starts_inside)):
+        token = token.strip()
+        gap = before[end:]
         if len(gap) > ADJACENT_GAP or not GAP_FILLER.match(gap):
             break
         if looks_like_symbol(token):
             return token
         break
-    for match in CODE_SPAN.finditer(after):
-        token = match.group(1).strip()
-        gap = after[: match.start()]
+    for start, _end, token in code_spans(after, starts_inside):
+        token = token.strip()
+        gap = after[:start]
         if len(gap) > ADJACENT_GAP or not GAP_FILLER.match(gap):
             break
         if looks_like_symbol(token):
@@ -460,7 +543,9 @@ class Checker:
                 return reason
         return None
 
-    def anchors_on_line(self, rel: str, number: int, text: str) -> list[tuple[Anchor, tuple[int, int] | None]]:
+    def anchors_on_line(
+        self, rel: str, number: int, text: str, starts_inside: bool = False
+    ) -> list[tuple[Anchor, tuple[int, int] | None]]:
         """The anchors one doc line carries, in written order, with a symbol span.
 
         A `path.ext:NNN` match is an anchor with its own span (rule C reads the
@@ -469,6 +554,9 @@ class Checker:
         nearest *preceding* path anchor on this line and is judged against that
         anchor's written path. A continuation with no such anchor is dropped — the
         documented silent class — and counted on the report.
+
+        ``starts_inside`` is the state ``ends_inside`` left for this line, so a
+        continuation is found under the same pairing rule C uses (issue #383).
         """
         matches = list(ANCHOR.finditer(text))
         entries: list[tuple[int, Anchor, tuple[int, int] | None]] = []
@@ -486,17 +574,17 @@ class Checker:
                     match.span(),
                 )
             )
-        for span in CODE_SPAN.finditer(text):
-            bare = CONTINUATION.match(span.group(1).strip())
+        for start, _end, content in code_spans(text, starts_inside):
+            bare = CONTINUATION.match(content.strip())
             if bare is None:
                 continue
-            preceding = [m for m in matches if m.start() < span.start()]
+            preceding = [m for m in matches if m.start() < start]
             if not preceding:
                 self._unattached += 1
                 continue
             entries.append(
                 (
-                    span.start(),
+                    start,
                     Anchor(
                         doc=rel,
                         line=number,
@@ -523,12 +611,31 @@ class Checker:
             reason = self.frozen_reason(rel)
             lines = path.read_text(encoding="utf-8").splitlines()
             here: list[Anchor] = []
+            # Whether the line begins inside a code span the previous line left open
+            # (a wrapped span). Rule C and rule D both read spans, so both get it. The
+            # state is *inline* markdown state: a fence's backticks are literal, and a
+            # blank line ends the paragraph, so neither carries it into the next line.
+            inside_span = False
+            fence: str | None = None
             for number, text in enumerate(lines, start=1):
-                for anchor, span in self.anchors_on_line(rel, number, text):
+                if fence is not None:
+                    inside_span = False
+                elif not text.strip():
+                    inside_span = False
+                for anchor, span in self.anchors_on_line(rel, number, text, inside_span):
                     if span is not None:
-                        anchor.symbol = symbol_of(text, span)
+                        anchor.symbol = symbol_of(text, span, inside_span)
                     self._judge(anchor)
                     here.append(anchor)
+                if fence is not None:
+                    if closes_fence(text, fence):
+                        fence = None
+                    continue
+                opener = FENCE.match(text)
+                if opener is not None:
+                    fence = opener.group(1)
+                    continue
+                inside_span = ends_inside(text, inside_span)
             if reason is not None:
                 pattern = next(p for p in self.frozen if fnmatch.fnmatch(rel, p))
                 if here:
@@ -1056,6 +1163,98 @@ def selftest() -> int:
         _range_miss(report, "docs/range.md") == 21,
         "a one-line anchor whose line does not hold the symbol is a range miss",
     )
+
+    # 8b. A code span that wraps (#383). The continuation line begins *inside* the
+    #     span, so its first backtick closes the span opened on the line before; read
+    #     line by line, that backtick is taken as an opener and every later pair on
+    #     the line shifts by one, hiding a symbol genuinely adjacent to the anchor.
+    #     Direct pairing first, then the report end to end.
+    for balanced in (
+        "The `target_symbol` (`src/thing.rs:21`) line.",
+        "`a` `b` `c`",
+        "no backticks at all",
+        "trailing `open",
+    ):
+        expect(
+            code_spans(balanced, False)
+            == [(m.start(), m.end(), m.group(1)) for m in CODE_SPAN.finditer(balanced)],
+            f"the state-off pairing must stay CODE_SPAN's ({balanced!r})",
+        )
+    expect(code_spans("`a` `b`", False) == [(0, 3, "a"), (4, 7, "b")], "balanced pairs, in order")
+    expect(code_spans("`a", False) == [], "an unclosed trailing span is not a span")
+    expect(ends_inside("`a", False) is True, "an odd backtick hands the state to the next line")
+    expect(ends_inside("`a`", False) is False, "a balanced line closes it again")
+    expect(
+        code_spans("t*nkt`, `sym` (`", True) == [(0, 6, "t*nkt"), (8, 13, "sym")],
+        "a continuation line reads its leading text as the open span's tail",
+    )
+    # The issue's own shape: a wrapped expression, then a balanced `symbol` span right
+    # before the anchor. `src/thing.rs:42` is `tail_20`; `target_symbol` is at :21,
+    # inside the ±25 window but not inside the cited range — so the fix turns a silent
+    # `ok` into the rule-E miss the sentence actually claims.
+    row_line = "  t*nkt`, `target_symbol` (`src/thing.rs:42`)."
+    span = ANCHOR.search(row_line).span()
+    expect(
+        symbol_of(row_line, span, False) is None,
+        "the pre-#383 pairing is blind on the continuation line (the defect, pinned)",
+    )
+    expect(
+        symbol_of(row_line, span, True) == "target_symbol",
+        "the state-aware pairing sees the symbol adjacent to the anchor (the fix)",
+    )
+    wrapped = "The span `src +\n" + row_line + "\n"
+    report = _run_case({"docs/wrapped.md": wrapped})
+    rows = [a for a in report.anchors if a.doc == "docs/wrapped.md"]
+    expect(len(rows) == 1, "the continuation-line anchor is found once")
+    expect(rows and rows[0].symbol == "target_symbol", "... and rule C names the symbol")
+    expect(
+        _range_miss(report, "docs/wrapped.md") == 21,
+        "... so rule E judges it against the cited range, which is not :42",
+    )
+    expect(
+        _exit_code({"docs/wrapped.md": wrapped}) == 1,
+        "a wrapped-span citation whose range misses the symbol now fails the run",
+    )
+
+    # The control: the same wrap and no symbol anywhere near the anchor. The line
+    # stays silent — the fix must see symbols, not invent them.
+    control_line = "  t*nkt` (`src/thing.rs:42`)."
+    cspan = ANCHOR.search(control_line).span()
+    expect(symbol_of(control_line, cspan, True) is None, "no adjacent symbol -> None")
+    report = _run_case({"docs/wrapped.md": "The span `src +\n" + control_line + "\n"})
+    expect(_verdicts(report, "docs/wrapped.md") == ["ok"], "the absent-symbol control stays ok")
+    expect(_range_miss(report, "docs/wrapped.md") is None, "and carries no rule-E miss")
+    expect(
+        _exit_code({"docs/wrapped.md": "The span `src +\n" + control_line + "\n"}) == 0,
+        "and the run stays green",
+    )
+
+    # The state is *inline* markdown state. A fence's backticks are literal and a blank
+    # line ends the paragraph, so neither may hand the state to the line after it: the
+    # balanced anchor below would otherwise lose its symbol (the shifted pairing).
+    fenced = "```\nodd ` backtick\n```\nThe `target_symbol` (`src/thing.rs:42`) line.\n"
+    rows = [a for a in _run_case({"docs/fence.md": fenced}).anchors if a.doc == "docs/fence.md"]
+    expect(
+        rows and rows[0].symbol == "target_symbol",
+        "a fence's literal backticks do not carry the open-span state",
+    )
+    blanked = "dangling ` backtick\n\nThe `target_symbol` (`src/thing.rs:42`) line.\n"
+    rows = [a for a in _run_case({"docs/blank.md": blanked}).anchors if a.doc == "docs/blank.md"]
+    expect(
+        rows and rows[0].symbol == "target_symbol",
+        "a blank line ends the paragraph and the open-span state with it",
+    )
+
+    # Rule D reads the same state: on the wrapped line the continuation is found under
+    # the state-aware pairing, where the line-by-line pairing had paired it away.
+    wrapped_cont = "The span `src +\n  t*nkt`, `src/thing.rs:42` and `:21`.\n"
+    report = _run_case({"docs/wrapped.md": wrapped_cont})
+    conts = [a for a in report.anchors if a.doc == "docs/wrapped.md" and a.continuation]
+    expect(
+        len(conts) == 1 and conts[0].shown() == ":21",
+        "a continuation on a wrapped line is found",
+    )
+    expect(conts and conts[0].verdict == "ok", "and judged against the anchor it follows")
 
     # 9. The exit codes, end to end.
     expect(
