@@ -427,8 +427,8 @@ Architectures that share Qwen2's tensor naming convention (LLaMA, Mistral,
 Phi) are the easiest ports. The `RopeStyle` enum defines both Qwen2
 (non-interleaved) and Llama (interleaved) pairings, but **only the
 non-interleaved form is wired up**: both loaders hard-code it
-(`models/qwen2/loader.rs:154`, `models/qwen3/loader.rs:172`) and the CUDA
-backend refuses the interleaved style (`graph/cuda_backend.rs:1324`). A family
+(`models/qwen2/loader.rs:155`, `models/qwen3/loader.rs:173`) and the CUDA
+backend refuses the interleaved style (`graph/cuda_backend.rs:1522`). A family
 that needs interleaved RoPE requires a loader change plus a CUDA kernel — see
 `docs/MODEL-SUPPORT-ROADMAP.md`, "Cost model: what a port actually costs".
 

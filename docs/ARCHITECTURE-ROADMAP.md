@@ -730,7 +730,7 @@ behavioural defects found while executing the plan, already fixed.
    [#38](https://github.com/yusiwen/minfer/issues/38) added the arm-level Metal
    guard (`MetalBackend::check_kv_store_rows`) for the fill paths that bypass it —
    §2.4 states the same closure in the gap list.
-2. **`ensure_kv` ignores a changed size** (`alloc.rs:385-393`). The KV region is
+2. **`ensure_kv` ignores a changed size** (`alloc.rs:995-1002`). The KV region is
    frozen at first allocation while `CParams.n_ctx` remains part of the reuse
    identity, so a size change is neither honoured nor detected.
 3. **Metal weakens kernel guards.** Both halves are **closed**: the decode-fusion
@@ -741,22 +741,22 @@ behavioural defects found while executing the plan, already fixed.
    tensor instead. Neither contradicts `docs/GPU_SAFETY.md` and `AGENTS.md`'s
    no-silent-fallback rule any more.
 4. ~~**Server worker had no panic isolation outside the forward call**
-   (`chat.rs:454-518`): a panic anywhere else unwound the worker, permanently
+   (`src/server/chat.rs::guarded_forward_batch`): a panic anywhere else unwound the worker, permanently
    degrading the server (503 for new jobs, empty 200/SSE for queued ones) with
    no log.~~ **Fixed in A4** — the whole per-job body is now guarded.
 5. ~~**Backend op-set asymmetry drives silent path changes.** `FusedQkvNorm` is
-   Metal-only (`metal_backend.rs:276`) but absent from CUDA's `supports_op`
-   (`cuda_backend.rs:1289-1321`), so Qwen3 decode takes the fused path on Metal
+   Metal-only (`MetalBackend::supports_op`) but absent from CUDA's `supports_op`,
+   so Qwen3 decode takes the fused path on Metal
    and the unfused path on CUDA. `QkvBiasRopeStore` is the mirror case
-   (`metal_backend.rs:282`). Neither is documented in `SUPPORT-MATRIX.md`.~~
+   (`MetalBackend::supports_op` returns `false` for it). Neither is documented in `SUPPORT-MATRIX.md`.~~
    **Documented in A8**: `SUPPORT-MATRIX.md` now has an "Operator Coverage by
    Backend" table; the asymmetry is visible rather than silent.
-6. **CUDA RoPE is non-interleaved only** (`cuda_backend.rs:1324`), so any model
+6. **CUDA RoPE is non-interleaved only** (`cuda_backend.rs:1522`), so any model
    needing the interleaved style splits every layer between CUDA and CPU,
-   producing two host round trips per layer (§2.2). `ARCHITECTURE.md:393-395`
-   advertises both styles as available.
-7. **Stale `unreachable!("CUDA pool not implemented")`** in the non-CUDA arms
-   (`alloc.rs:333`, `:357`) — misleading text in a live panic path.
+   producing two host round trips per layer (§2.2); `docs/ARCHITECTURE.md:428-432`
+   now states that limitation rather than advertising both styles.
+7. ~~**Stale `unreachable!("CUDA pool not implemented")`** in the non-CUDA arms —
+   the string and any `unreachable!` are gone from `alloc.rs`.~~ **Fixed in [#57](https://github.com/yusiwen/minfer/issues/57)** (`cdf41b2`).
 8. ~~**Dead fields in the reuse identity**: `CParams.n_batch` and
    `GraphParams.n_seqs` are compared by `params_match` (`cache.rs:95-101`) but no
    builder reads them; every construction site hard-codes 1 / `n_tokens`.~~
@@ -765,13 +765,13 @@ behavioural defects found while executing the plan, already fixed.
    decision lives in `CParams.explicit_span`), with
    `sequence_count_is_data_not_topology` pinning that a sequence-count change no
    longer rebuilds an otherwise identical graph.
-9. ~~**Single-entry cross-backend staging** (`alloc.rs:34`, `:646`), mitigated by
-   the consumer-side filter at `scheduler.rs:252-255`.~~ **Fixed in A5** — keyed
-   by `(node, dst_backend)`; two foreign consumers can now be served.
-10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:1403-1408`), so the
+9. ~~**Single-entry cross-backend staging** (`GraphAllocator::cross_staging`), mitigated by
+   the consumer-side filter at `scheduler::cross_input_ready`.~~ **Fixed in A5** — keyed
+   by `(graph uid, node, dst_backend)`; two foreign consumers can now be served.
+10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2268`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
     with `copy_to_host` (`alloc.rs:2135-2141`).
-11. **CUDA pool never releases device memory** (`cuda_backend.rs:1355-1362`),
+11. **CUDA pool never releases device memory** (`cuda_backend.rs:2148-2156`),
     documented as accepted debt but reasoned about for fixed-shape CLI runs; a
     varying-`n_tokens` workload accumulates one buffer set per distinct shape.
 12. ~~**Tests**: no Linux/CUDA/CPU in CI, four of five integration files macOS-only
