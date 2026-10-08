@@ -387,11 +387,11 @@ the consumer's inputs across `execute` (`scheduler.rs:266-275`, the phase-A stag
 allocator's `copy_across`, which routes through `copy_to_cpu` (a host round
 trip — Metal/CUDA buffers here are CPU-visible, so this is a plain memcpy)
 and then `write_host` into a buffer on the *destination* pool
-`alloc_graph` (`alloc.rs:513`)).
+`copy_across` (`alloc.rs:2447`), the staging copy).
 
 That destination staging buffer must be **fresh** — `alloc_fresh_in` (`alloc.rs:955-957`)
 — never drawn from the recycle free list. The trait
-comment is the design record `supports_attn_span` (`backend.rs:34`)):
+comment is the design record (`backend.rs:56-62`)):
 
 ```rust
 /// Allocate a buffer that bypasses the recycle free list. Split-boundary
@@ -416,7 +416,7 @@ by never consulting the list.
 Staging buffers are one-per-(node, destination backend) per graph: the first
 execute allocates, every later execute of the reused graph just rewrites the
 same buffer (`alloc.rs:119-121`, the `cross` field's "no per-step allocation" note). They are freed at
-the next rebuild `GraphAllocator` (`alloc.rs:107`)) — the "at graph rebuild" moment the
+the next rebuild (`alloc.rs:121-124`, where E4 S3 keeps the staging entries)) — the "at graph rebuild" moment the
 trait comment mentions, where returning them to the normal free list *is*
 safe because the next build's monotonic sweep re-establishes the invariant
 from scratch.
@@ -509,7 +509,7 @@ consuming backend — which would break execute #2 of a reused graph, when the
 producing split needs its buffer back where it was.
 
 **Excerpt 2 — liveness in build order, with inputs and outputs pinned**
-`GraphAllocator` (`alloc.rs:180-211`)). This is the code that bug G3 rewrote; the comment is
+(`alloc.rs:526-561`). This is the code that bug G3 rewrote; the comment is
 the tombstone.
 
 ```rust
@@ -737,7 +737,7 @@ let kv_pair = match &node.op {
 ```
 
 `execute_node` takes `kv_pair: Option<(usize, usize)>` alongside the ordinary
-input ids `free_buffer` (`backend.rs:50`)) — the K/V regions are *not* the node's `src`
+input ids `execute_node` (`backend.rs:80`)) — the K/V regions are *not* the node's `src`
 inputs; they are process-lifetime siblings only KV-aware ops know about. The
 CPU store kernel shows the split-brain clearly `execute_node` (`cpu_backend.rs:308-359`)):
 K is written through `out_buf` (which the allocator guaranteed is the K
@@ -761,7 +761,7 @@ fn alloc_fresh(&mut self, size: usize) -> usize {
 ```
 
 (Metal's pool is the same shape with `MTLBuffer` lengths in bytes,
-`cross_take` (`metal_backend.rs:285`), except recycled buffers are *not* re-zeroed —
+`alloc_buffer` (`metal_backend.rs:846`), except recycled buffers are *not* re-zeroed —
 kernels fully overwrite their outputs, and the driver zero-fills only new
 allocations.)
 
@@ -910,7 +910,7 @@ logits off by **21.79** (`COMPUTE-GRAPH-DESIGN.md` deviation 22). The fix is
 excerpt 2: call `topo_order()?` purely to reject cycles, then compute
 liveness over `0..n_nodes` — the order the scheduler actually runs. (Small
 forensics note: the doc comment on `topo_order` still says "used by the
-allocator" `PersistentBuf` (`graph/mod.rs:148`)) — a stale leftover; `GraphAllocator` (`alloc.rs:107`) is
+allocator" (`graph/mod.rs:237`)) — a stale leftover; `GraphAllocator` (`alloc.rs:107`) is
 authoritative.)
 
 **Bug 2b — input buffers are never freed.** Same fix series, complementary
@@ -933,7 +933,7 @@ longer matters.
 - Split-boundary staging always allocates fresh; it rejoins the free list only
   at rebuild (§2.7).
 - KV positions are data: the region is sized `n_kv_embd × n_ctx`, and a
-  position ≥ `n_ctx` is a loud error, not an overflow `SUPPORTS_ATTN_SPAN` (`cpu_backend.rs:167`),
+  position ≥ `n_ctx` is a loud error, not an overflow (`cpu_backend.rs:359`),
   plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:387`)).
 - Dead nodes get no buffer and the scheduler skips them — so adding an op the
   fusion pass orphans cannot corrupt memory, it just does nothing — skipped
