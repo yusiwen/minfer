@@ -215,7 +215,7 @@ the full `n_ctx` from the start — the whole reason a fixed graph can serve a
 growing cache (§2.4). The cost grows linearly with context: at `nkv = 1024`
 a decode step reads ≈ 24 MB of K/V (`2 × 24 layers × 128 × 1024 × 4 B`), and
 ~96 MB at `n_ctx = 4096`. The position-derived `nkv = max_pos + 1` predates
-E1 (PR #3, 2026-09-17) and now lives only on Metal (`metal_backend.rs:1324-1325`).
+E1 (PR #3, 2026-09-17) and now lives only on Metal (`metal_backend.rs:1433-1434`).
 
 **What reuse removes.** Build + assign + fuse + allocate are per-*graph*
 costs, not per-token math. Reuse means a decode step pays only: two small
@@ -644,7 +644,7 @@ and Qwen3 chat models do). Two ids, one boolean — but this function is the
 model's only "voice": everything else about stopping is user policy (stop
 strings, `-n`), while this is the model saying "I'm done".
 
-#### Inside the forward: building the params — `GraphParams` (`src/models/qwen2/graph.rs:535-591`)
+#### Inside the forward: building the params — `GraphParams` (`src/models/qwen2/graph.rs:541-597`)
 
 The loop's `forward` call lands in `forward_cached`, which first expresses
 "what kind of graph does this step need?" as a plain data value:
@@ -762,7 +762,7 @@ invariant in one breath (`params.rs:1-7`, the module comment): these are "the ON
 graph reuse … `n_past` (KV position) is deliberately absent: it is
 execution data."
 
-#### The rebuild branch `forward_cached` (`src/models/qwen2/graph.rs:450`, `599-645`)
+#### The rebuild branch `forward_cached` (`src/models/qwen2/graph.rs:456`, `599-645`)
 
 When the comparison fails, the five-phase pipeline of docs 05–08 runs, and
 its result is stored back into the same cache:
@@ -859,7 +859,7 @@ or a truncated copy — never a full-`nt` logits matrix (doc 09 covered the
 prefill-side benefit; in decode `n_out == nt == 1`, so the buffer is one
 row regardless).
 
-#### Why the KV survives: the allocator's two kinds of memory (`alloc_graph` (`src/graph/alloc.rs:513-519`), `alloc_persistent` (`alloc.rs:1078-1087`))
+#### Why the KV survives: the allocator's two kinds of memory (`alloc_graph` (`src/graph/alloc.rs:513-519`), `alloc_persistent` (`alloc.rs:1080-1089`))
 
 The claim everywhere above is that a rebuild "keeps the KV". The mechanism
 is that the allocator distinguishes two kinds of buffers, and only one kind
@@ -1003,7 +1003,7 @@ consumer's first read, and the capture read above is windowed (`window_of`,
 `execute_node` (`scheduler.rs:398`); a GPU build replays a captured split by
 `uid` (doc 15 owns that).
 
-#### The one structural difference: prefill's G3 tail — `tail_ids` (`src/models/qwen2/graph.rs:246-252`)
+#### The one structural difference: prefill's G3 tail — `tail_ids` (`src/models/qwen2/graph.rs:252-258`)
 
 It is worth seeing the actual node-level difference that forces the
 prefill→decode rebuild — the G3 tail-row reduction, which exists only in
