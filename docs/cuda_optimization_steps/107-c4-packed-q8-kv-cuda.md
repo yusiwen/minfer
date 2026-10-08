@@ -26,6 +26,16 @@ record said so:
 | Qwen3-0.6B Q8_0 (hd 128) `pp2048` | 8604.56 | 562.76 | **15.3x slower** |
 | Qwen3-0.6B Q8_0 (hd 128) `tg128` | 137.85 | 122.21 | 1.13x slower |
 
+> **Superseded 2026-10-07.** This section is the pre-[#144](https://github.com/yusiwen/minfer/issues/144)
+> state the step started from, kept as written: the table and the three cuts below record what was
+> open then, not current behaviour. [#144](https://github.com/yusiwen/minfer/issues/144) items 1+3
+> (`041de15`, 2026-09-26), [#186](https://github.com/yusiwen/minfer/issues/186) (`cc19b4f`,
+> 2026-09-27, which landed cut 2) and [#202](https://github.com/yusiwen/minfer/issues/202) (`798fd32`,
+> 2026-09-27) have since landed. The current A/B is the 2026-10-07 comment on
+> [#310](https://github.com/yusiwen/minfer/issues/310), measured at `740e0ff` on
+> `dgxspark (aarch64, GB10 sm_121)`: **1.23x** decode / **1.24x** prefill at hd 64, and **1.01x** /
+> **1.04x** at hd 128. §5 below is the post-#144 measurement and stands.
+
 The three cuts were:
 
 1. **No fused decode QKV epilogue.** `Op::FusedQKV` / `Op::QkvBiasRopeStore`'s epilogue writes one

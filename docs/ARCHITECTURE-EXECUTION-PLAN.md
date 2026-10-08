@@ -1157,10 +1157,22 @@ host already passes, and the Q8_0 move gate pins it), and the CPU path is untouc
   single-row Q8_0 window against the dequantized V cell (max |Δ| 1.71 under the block-base
   mutation), so it cannot pass on consistency alone.
 
-**The A/B against f16, measured on GB10 (sm_121)** — the bar was named before the work as "Q8_0
-decode no worse than `1/1.30` of f16" and **it is not met against the fused f16 baseline**:
+**The A/B against f16, measured on `dgxspark (aarch64, GB10 sm_121)`** — the bar was named before
+the work as "Q8_0 decode no worse than `1/1.30` of f16" and **it is not met against the fused f16
+baseline**:
 
-| model / config | f16 (default policy) | q8_0 | factor |
+> **Superseded 2026-10-07 — read the numbers as measured, not as current.** This table is the
+> pre-[#144](https://github.com/yusiwen/minfer/issues/144) S2b measurement (2026-09-24; its baseline
+> was re-measured in the #144 round at master `85c712e`, which reproduced it within a few percent),
+> and three later changes moved it: [#144](https://github.com/yusiwen/minfer/issues/144) items 1+3
+> (`041de15`, 2026-09-26), [#186](https://github.com/yusiwen/minfer/issues/186) (`cc19b4f`,
+> 2026-09-27, the dp4a packed K dot) and [#202](https://github.com/yusiwen/minfer/issues/202)
+> (`798fd32`, 2026-09-27, the wide u16 block load). The current A/B is the 2026-10-07 comment on
+> [#310](https://github.com/yusiwen/minfer/issues/310), measured at `740e0ff` on
+> `dgxspark (aarch64, GB10 sm_121)`: **1.23x** decode / **1.24x** prefill at hd 64, and **1.01x** /
+> **1.04x** at hd 128 — the 15.3x is gone, and `q8_0` is still never faster than f16 on CUDA.
+
+| model / config | f16 (pinned `MINFER_CACHE_TYPE=f16`) | q8_0 | factor |
 |---|---|---|---|
 | Qwen2.5-0.5B q4_0, `pp2048` @ n_ctx 4096 | 2693.54 tok/s | 2171.85 tok/s | 1.24x slower |
 | Qwen2.5-0.5B q4_0, `tg128` @ n_ctx 4096 | 239.76 tok/s | 162.46 tok/s | **1.48x slower** |
@@ -1168,14 +1180,24 @@ decode no worse than `1/1.30` of f16" and **it is not met against the fused f16 
 | Qwen3-0.6B Q8_0 (hd 128), `pp2048` | 8604.56 tok/s | 562.76 tok/s | **15.3x slower** |
 | Qwen3-0.6B Q8_0 (hd 128), `tg128` | 137.85 tok/s | 122.21 tok/s | 1.13x slower |
 
-Read honestly: decode on the 0.5B misses the named 1.30x because ~1.18x of the gap is the **stated
-cut** (no fused QKV epilogue for a packed cache — the unfused chain adds launches on a model whose
-decode is launch-bound) and the remaining **1.25x** is the packed load itself (`kv4<Q8_0>` costs
-four int8 converts and four multiplies where f16 costs two `__half2` converts; there is no dp4a
-packed dot in this increment). On Qwen3-0.6B, where the fused epilogue is not on the f16 default
-path in the same way, decode is 1.13x — inside the bar. The prefill is a different story: at hd 128
-the f16 path is `fa_prefill_f16kv` (**8604** tok/s) and the packed path is the general kernel
-(**563** tok/s), i.e. the packed cache is correct but off its tuned route by 15x. **The win is
+**The `f16` column is pinned, not `auto`.** `auto_device_format` needs
+`n_layers × n_kv_embd ≥ 8192` (`AUTO_F16_MIN_KV_ELEMS`, `src/graph/kvformat.rs`), so today's
+resolver answers **f32** for the 0.5B (24 × 128 = 3072) and **f16** for Qwen3-0.6B (28 × 1024 =
+28672); both arms in this table were run with `MINFER_CACHE_TYPE=f16` explicitly, and the header's
+older "(default policy)" wording does not describe the 0.5B arm on the current resolver.
+
+Read honestly *[as measured pre-[#144](https://github.com/yusiwen/minfer/issues/144); the clauses
+that no longer hold are marked inline]*: decode on the 0.5B misses the named
+1.30x because ~1.18x of the gap is the **stated cut** (no fused QKV epilogue for a packed cache — the
+unfused chain adds launches on a model whose decode is launch-bound) and the remaining **1.25x** is
+the packed load itself (`kv4<Q8_0>` costs four int8 converts and four multiplies where f16 costs two
+`__half2` converts; *there is no dp4a packed dot in this increment* — **[#186](https://github.com/yusiwen/minfer/issues/186)
+landed it on 2026-09-27, `cc19b4f`]**). On Qwen3-0.6B, where the fused epilogue is not on the f16
+default path in the same way, decode is 1.13x — inside the bar (*the superseding run at `740e0ff`
+measures 1.01x*). The prefill is a different story: at hd 128 the f16 path is `fa_prefill_f16kv`
+(**8604** tok/s) and the packed path is the general kernel (**563** tok/s), i.e. the packed cache is
+correct but off its tuned route by 15x — *[#144](https://github.com/yusiwen/minfer/issues/144) item 3
+then landed the packed FA prefill, so the superseding run measures **1.04x** here]*. **The win is
 memory, as stated up front**: measured on both models, the f32/f16 region is 6 291 456 B and the
 Q8_0 region 1 671 168 B — **3.76x smaller than f32 and, against f16's actual 2 B/element payload
 (3 145 728 B), 1.88x smaller.**
@@ -1201,7 +1223,8 @@ Q8_0 region 1 671 168 B — **3.76x smaller than f32 and, against f16's actual 2
 
 **Handed off after S2b:** the packed **fused decode epilogue**, a **dp4a packed K dot** and the
 **FA prefill on packed cells** — taken up as [#144](https://github.com/yusiwen/minfer/issues/144)
-and recorded in the next subsection (items 1 and 3 landed; item 2 stays open).
+and recorded in the next subsection (items 1 and 3 landed; item 2 then landed as
+[#186](https://github.com/yusiwen/minfer/issues/186) below, **DONE 2026-09-27**).
 [Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
 
 ### C4 — #144: the packed fused decode epilogue and the packed FA prefill · [#144](https://github.com/yusiwen/minfer/issues/144) — **DONE (items 1 + 3) 2026-09-26**
