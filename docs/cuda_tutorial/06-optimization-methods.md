@@ -229,8 +229,8 @@ touch, as a function of i?"
   `src + t*nkt + j`, `store_kv_f16` (`src/cuda/kernels/kv_store.cu:31`), the `float4` at :2561), and the MMVQ
   decode kernels' shape gate explicitly protects against the uncoalesced case —
   doc 06 records that small shapes lose because "1–2 units per thread expose
-  the uncoalesced q5/q6 byte loads" (`store_kv_f16` (`src/cuda/kernels/kv_store.cu:31`) and the
-  dispatch comment recorded at `src/cuda.rs`).
+  the uncoalesced q5/q6 byte loads" (`src/cuda/methods/dispatch.rs:350-357`, the
+  `q5_k` MMVQ shape-gate comment).
 - **Step records**: [11-p5-gemm-tiles-fa-rewrite.md](../cuda_optimization_steps/11-p5-gemm-tiles-fa-rewrite.md)
   (P5·1: the 1-element-per-thread elementwise kernels "left 15/16 of every
   transaction unused"; vectorizing to 4/8 elements per lane: 1435 → 1493 tok/s,
@@ -359,7 +359,7 @@ across a warp it explicitly documents the uniformity invariant.
   mean the hot loop never asks "which type am I?"; the fused rms+quantize
   producer quantizes "THIS warp's row (warp-uniform row ⇒ the shfl_xor
   reductions below never see divergence)" — the comment is at
-  `q4_k_q8_mmvq` (`src/cuda/kernels/mmvq_skipwrite.cu:201`); the dequant kernels
+  `rms_norm_quant_nw_f32_t` (`src/cuda/kernels/mmvq_skipwrite.cu:25`, the comment `:71-72`); the dequant kernels
   (`dequant_q4_0_f16`, :4449) have a single uniform body with a bounds check
   only. Divergence still shows up in the accounting: doc 43 attributes part of
   the gap between achieved and theoretical occupancy to wave-tail divergence,
@@ -390,7 +390,7 @@ counted the difference.
   `attn_bias_rope_store_f32` (`src/cuda/kernels/kv_store.cu:118`) — one launch replaces the 7-launch decode tail;
   the graph ops `Op::FusedQKV` (concat matmul + fused epilogue) and
   `Op::FusedFFN` (gate|up concat matmul + in-place swiglu) are declared in
-  `Op::FusedQKV` (`src/graph/ops.rs:158`), `Op::FusedFFN` (`:177`), executed in `capture_enq` (`src/graph/cuda_backend.rs:837`), `:715`,
+  `Op::FusedQKV` (`src/graph/ops.rs:158`), `Op::FusedFFN` (`:177`), executed in `execute_node_inner` (`src/graph/cuda_backend.rs:916`; the `Op::FusedFFN` arm `:1236`, the `Op::FusedQKV` arm `:1365`),
   and gated at build time in `fuse_qkv` (`src/models/qwen2/graph.rs:120-122`). The decode
   A-quantize fusion (`swiglu_quant_pad40`, `rms_norm_quant_pad40`,
   `swiglu_quant_pad40` (`src/cuda/kernels/ops_elementwise.cu:215`), `rms_norm_quant_pad40` (`:90`)) writes the quantized activation plane
@@ -408,7 +408,7 @@ counted the difference.
   counts before/after (launches deleted are the point), then the A/B gate:
   `MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1` flip the same binary to the
   unfused topology (they are part of the graph-reuse identity — the rebuild is
-  forced for you; `verify_structural` (`src/graph/cache.rs:134`)).
+  forced for you; `try_reuse` (`src/graph/cache.rs:69`)).
 
 ### 3.7 CUDA Graph launch amortization (`MINFER_NO_CUDA_GRAPH=1`)
 
@@ -752,7 +752,7 @@ separation. For doc 43 the modern equivalent knob is the q6_K kernel's
 `__launch_bounds__` line itself (do not modify the repo — build a scratch
 worktree copy in `/tmp` if you want to flip it); for P5·2 note the era
 shift first: `MINFER_GEMM_TM` (64/128/256, read at
-`gemm_f16_nt_kernel_t` (`src/cuda/kernels/gemm_wmma.cu:367`)) retiles the *f16 wmma GEMM*, which is only
+`launch_gemm_f16` (`src/cuda/kernels/gemm_wmma.cu:847`)) retiles the *f16 wmma GEMM*, which is only
 on the hot path when you run the escape side `MINFER_MMQ=0` — exactly the A/B
 frame P5·2 was measured in. Then compare your numbers with the doc's recorded
 ones.

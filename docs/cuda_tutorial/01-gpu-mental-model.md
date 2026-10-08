@@ -168,7 +168,7 @@ well when batched (TECH-PRIMER §4).
 
 **Contrast with the CPU pool you already know** (walkthrough doc 10). minfer's
 CPU backend parallelizes a matmul with a hand-built persistent pool
-(`get_pool` (`src/kernel/pool.rs:258`)): workers are OS threads spawned once because
+(`get_pool`, `src/kernel/pool.rs:258`): workers are OS threads spawned once because
 spawning measured ~170 µs (`src/kernel/pool.rs:7`, the file's measurement comment) — against a per-token budget of
 a few milliseconds; they spin on an atomic generation counter to wake in
 microseconds; the work unit is a *chunk of output rows*
