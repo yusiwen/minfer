@@ -13,7 +13,6 @@ mod copy_cells;
 mod fusion_shape;
 mod map_window;
 mod norm_weight;
-#[cfg(target_os = "macos")]
 mod packed_kv;
 mod staging;
 fn f32t(name: &str, shape: [i64; 4], data: Vec<f32>) -> crate::tensor::Tensor {
