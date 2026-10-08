@@ -417,7 +417,7 @@ kernels in a profile:
 - Why a cache at all: the two-pass prefill GEMM used to dequantize W on
   *every* call — "288 ms per 7B @2K forward" — because weights are immutable
   after registration, the dequant result is cached per weight pointer
-  (`w16_cache` comment, `src/cuda/methods/prefill_f16.rs:116-118`).
+  (`w16_cache` (`src/cuda.rs:615-623`)).
 
 And why dequantize at all, when the CPU side made a point of *never*
 dequantizing at load (walkthrough doc 10 §2.1's bandwidth argument)? The
