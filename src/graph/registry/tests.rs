@@ -253,10 +253,10 @@ fn the_name_surface_fences_devices_and_keeps_cpu() {
 /// The #87 seam: `reads_packed_kv` is one authority, and the two call sites
 /// that used to hardcode "CPU only" read it.
 ///
-/// C4 S2b flipped CUDA's answer, and [#310] flipped Metal's (the packed
-/// `store_kv_q8_0` plus the `kernel_gqa_attn_q8_0` / window / map kernels read a
-/// packed region directly), so on macOS this is a three-backend yes (CPU + CUDA
-/// + Metal). A build without a backend's feature registers no entry, so it
+/// C4 S2b flipped CUDA's answer; [#310] implemented Metal's packed path but
+/// **kept Metal's answer false** (the fast families refuse packed and the classic
+/// fallback costs 4–17×), so this is a two-backend yes (CPU + CUDA) with Metal
+/// still refusing. A build without a backend's feature registers no entry, so it
 /// claims nothing — which is the point of reading a registry field instead of a
 /// hardcoded list.
 ///
@@ -265,9 +265,8 @@ fn the_name_surface_fences_devices_and_keeps_cpu() {
 #[test]
 fn the_packed_kv_capability_is_the_registrys_answer() {
     assert!(Backend::CPU.caps().reads_packed_kv);
-    #[cfg(target_os = "macos")]
-    assert!(Backend::METAL.caps().reads_packed_kv);
-    #[cfg(not(target_os = "macos"))]
+    // Metal implemented the path (#310) but ships the refusal, so its entry
+    // still answers false on every platform.
     assert!(!Backend::METAL.caps().reads_packed_kv);
     assert!(reads_packed_kv(Backend::CPU));
     #[cfg(feature = "cuda")]

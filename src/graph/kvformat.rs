@@ -142,9 +142,10 @@ impl KvFormat {
     /// CPU's attention kernel dots the stored K blocks against the quantized query
     /// and accumulates V out of the cell; CUDA's kernels are layout-tagged
     /// (`KV_LAYOUT_F32/F16/Q8_0` plus the byte-addressed `kv4<LAYOUT>` load) since
-    /// C4 S2b, so it reads a packed region too; and since [#310] Metal's packed
-    /// store plus its `kernel_gqa_attn_q8_0` / window / map kernels read one as
-    /// well.
+    /// C4 S2b, so it reads a packed region too. [#310] implemented Metal's packed
+    /// store and reads, but the capability ships **false**: the fast families
+    /// refuse packed and the classic fallback measures 4–17× slower, so Metal
+    /// still answers no here (`docs/METAL-BACKEND-DESIGN.md` §4.4).
     ///
     /// [#87]: https://github.com/yusiwen/minfer/issues/87
     /// [#44]: https://github.com/yusiwen/minfer/issues/44
@@ -189,8 +190,9 @@ pub fn auto_device_format(device: Device, n_layers: usize, n_kv_embd: usize) -> 
 ///   `docs/BACKENDS.md` documents "CPU: f32 regions", so an env var set for a GPU run
 ///   must not break a CPU one;
 /// - anything else → **refused on every device** (a typo must not silently run f32);
-/// - a format the device has no kernel for → **refused** (the CPU, CUDA and Metal
-///   kernels all read a packed region since C4 S2a / S2b and [#310]).
+/// - a format the device has no kernel for → **refused** (the CPU's and CUDA's
+///   kernels read a packed region since C4 S2a / S2b; Metal's packed read is
+///   implemented but not enabled — [#310]).
 pub fn resolve(
     device: Device,
     cache_type: Option<&str>,
@@ -216,9 +218,9 @@ pub fn resolve(
     };
     if !format.supports(device) {
         return Err(format!(
-            "MINFER_CACHE_TYPE={} is not supported on {} yet: the {} attention kernel has no \
-             packed Q8_0 read (the CPU's, CUDA's and Metal's do); refusing rather than silently \
-             falling back to f32",
+            "MINFER_CACHE_TYPE={} is not supported on {} yet: the {} attention needs a packed \
+             Q8_0 read (the CPU's and CUDA's kernels have one; Metal's is implemented but not \
+             enabled — issue #310); refusing rather than silently falling back to f32",
             format.name(),
             device.name(),
             device.name()
