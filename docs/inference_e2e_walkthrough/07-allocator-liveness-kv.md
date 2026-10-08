@@ -78,7 +78,7 @@ Three terms, defined once and used everywhere after:
 One deliberate simplification shapes everything: **every pool buffer is
 f32-typed**. The allocator counts sizes in f32 elements (`Backend::alloc_buffer`
 "allocate / release a buffer of `size` f32 elements", `supports_fused` (`backend.rs:25`),
-Metal sizes buffers as `size * 4` bytes in `alloc_buffer` (`metal_backend.rs:870`), and weights
+Metal sizes buffers as `size * 4` bytes in `alloc_buffer` (`metal_backend.rs:897`), and weights
 keep their quantized bytes elsewhere (registered by name in doc 03). One dtype
 means one allocator, one copy path, one set of host-access functions — and,
 as §2.6 shows, even integers ride along as f32 bit patterns.
@@ -761,7 +761,7 @@ fn alloc_fresh(&mut self, size: usize) -> usize {
 ```
 
 (Metal's pool is the same shape with `MTLBuffer` lengths in bytes,
-`alloc_buffer` (`metal_backend.rs:870`), except recycled buffers are *not* re-zeroed —
+`alloc_buffer` (`metal_backend.rs:897`), except recycled buffers are *not* re-zeroed —
 kernels fully overwrite their outputs, and the driver zero-fills only new
 allocations.)
 
@@ -878,8 +878,8 @@ buffer).** After doc 06's assignment, a GPU-resident layer's RoPE input
 sometimes needed a copy: the original allocator materialized cross-backend and
 in-place inputs through a host `copy_in`. On Metal, though, one split's
 kernels are *encoded* into an `MpsCommandBuffer` as they execute — and only
-*submitted* at the split boundary `capture_split` (`metal_backend.rs:144`),
-`execute_node` (`metal_backend.rs:898`). A host copy enqueued mid-split therefore read
+*submitted* at the split boundary `capture_split` (`metal_backend.rs:173`),
+`execute_node` (`metal_backend.rs:925`). A host copy enqueued mid-split therefore read
 the buffer's *old* contents: freshly allocated Metal memory, i.e. **zeros**.
 The copy captured zeros, RoPE dutifully rotated them, `KvcacheStore` wrote
 them into the layer's persistent region — and the whole KV region was zeros,
