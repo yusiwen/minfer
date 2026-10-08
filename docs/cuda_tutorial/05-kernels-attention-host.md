@@ -22,7 +22,7 @@ Two things make attention special compared to the matmuls you have already read:
   number of keys accumulated so far — and that is *data on the GPU*, not a host
   integer. Both kernels in this chapter read the `positions` array on the device
   to find their work. This is minfer's graph rule 1 — "KV positions are data, not
-  structure" (`AGENTS.md:78` ("Build & Run")) — doing real work inside a kernel.
+  structure" (`AGENTS.md:134` ("Compute Graph — core rules", rule 1)) — doing real work inside a kernel.
 - **It has a serial dependency the matmuls do not have.** Softmax (the
   exponentiate-and-normalize that turns scores into weights) needs the *largest
   score of the whole row* before any output can be finalized. The online softmax
@@ -354,7 +354,7 @@ and packed layouts, so a f32 cache keeps the general kernel). If the shared-memo
 launch `launch_fa_prefill_kv` (`attention_prefill.cu:394`) the launcher returns `−1`, prints one loud warning,
 and the wrapper falls back to the legacy per-token kernel — the one visible fallback in the
 attention path, and it is *announced*, not silent. Note for Qwen2.5-0.5B specifically: its head dim
-is 64 (`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models")), so 0.5B prefill runs the legacy
+is 64 (`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models") ), so 0.5B prefill runs the legacy
 `gqa_attn_f32_f16kv` kernel; `fa_prefill_kv` serves the hd=128 classes (Qwen2.5-7B, Qwen3-4B…).
 The CPU counterpart — the same online softmax in scalar Rust — is walkthrough 11 §3.2's
 attention arms.
@@ -470,7 +470,7 @@ and they compound:
 1. **Launch overhead.** Every kernel launch has a fixed CPU-side cost, and the
    decode step is a chain of hundreds of small kernels (§4 does the arithmetic);
    TECH-PRIMER §6.4 puts decode chains in the "launch-overhead-bound" regime
-   ("2 µs/graph-gap scale", `docs/CUDA-TECH-PRIMER.md:300-302` (§6 "Element-wise and fused epilogue kernels")). Three launches
+   ("2 µs/graph-gap scale", `docs/CUDA-TECH-PRIMER.md:300-302` (§6 "Element-wise and fused epilogue kernels") ). Three launches
    replaced by one saves two gaps *per layer per token*, plus the L2
    (layer-2 cache on the GPU) round-trips of writing q/k/v out and reading them
    back.
@@ -483,8 +483,8 @@ and they compound:
 
 The graph-level counterpart of this kernel is `Op::FusedQKV` — AGENTS rule 7:
 "Decode fusions: `Op::FusedQKV` (concat matmul + bias/rope/store)…"
-(`AGENTS.md:84` ("Build & Run")), with the mechanics in TECH-PRIMER §6.4
-(`docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels")). Section 3.4 shows the Rust arm that
+(`AGENTS.md:140` ("Compute Graph — core rules", rule 7)), with the mechanics in TECH-PRIMER §6.4
+(`docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels") ). Section 3.4 shows the Rust arm that
 launches it.
 
 **Two ways to call the same kernel.** The `q/k/v` parameters are *pointer-form
@@ -525,7 +525,7 @@ and the registry's `reads_packed_kv`, and an existing region must match `n_ctx`,
 backend and packing — else `Err`. `alloc_persistent` (`alloc.rs:1079`) routes
 through the same pool allocator as everything else — on CUDA a `cudaMalloc` held
 in the backend's buffer pool (§3.4) — and registers it as *never freed*. Because the
-allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:79` ("Build & Run")), the regions survive
+allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:135` ("Compute Graph — core rules", rule 2)), the regions survive
 rebuilds and hold their contents across decode steps: two device buffers per layer nobody may recycle.
 
 **Size and layout.** The size comes from the graph builder:
@@ -544,7 +544,7 @@ now receives the allocator-resolved **cell** row (C6: `positions` ropes, `cells`
 stores; they coincide only while a run starts at cell 0). `n_past` never
 appears in the layout — it is only ever *how many leading rows are valid*, and
 that count lives in the on-device boundary array. That is precisely
-AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:78` ("Build & Run")): the
+AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:134` ("Compute Graph — core rules", rule 1)): the
 graph topology is identical at position 0 and position 2000, and the kernels
 discover the valid range from the data — `attention_prefill.cu:206-208` records
 the exclusive per-row limit, and `fa_prefill_kv` computes `kv_end = bound[last_t] + 1`
@@ -589,7 +589,7 @@ boundary. The one structural guard on that layout: attention requires
 `hd == hd_kv` and `nkt == n_head_kv · hd` (the kernels stride KV rows by
 `nkt`), and violations return `Err`, not a workaround
 `execute_node_inner` (`cuda_backend.rs:916`); the same guard has a GPU_SAFETY audit entry,
-`docs/GPU_SAFETY.md:83` (§2 "The cross-backend staging copy (F5/#137) — bound").
+`docs/GPU_SAFETY.md:105` (§3 "Audit findings (2026-08-02) — status", the H1 finding).
 
 ### 3.4 The Rust host side — `cuda_backend.rs` as a `Backend`
 
@@ -701,7 +701,7 @@ still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
 (`cuda_backend.rs:859`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
 "Backends own their buffer pools; the allocator is the single owner"
-(`AGENTS.md:85` ("Build & Run")) — the `GraphAllocator` decides *which* buffer a node gets and
+(`AGENTS.md:141` ("Compute Graph — core rules", rule 8)) — the `GraphAllocator` decides *which* buffer a node gets and
 when it dies; the backend only manages device memory behind those decisions.
 
 **`read_host` / `write_host` — and the copy rule.** The asymmetry is the
@@ -721,17 +721,17 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
 (`write_host` (`cuda_backend.rs:2275`)) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
 The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — is
-AGENTS rule 5 (`AGENTS.md:82` ("Build & Run")), written in the blood of Phase 3. In three
+AGENTS rule 5 (`AGENTS.md:138` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
 sentences: a per-node host readback inside a split whose command buffer was
 still open read *stale* (not-yet-written) data, which surfaced as an all-zero
-KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:977-979` (§7 "In-place execution and the aliasing rule"), the §7.3
+KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:977-979` (§7 "In-place execution and the aliasing rule") , the §7.3
 "In-place execution and the aliasing rule" hard rule). The fix
 was not "sync more" but structural — the in-place aliasing rule plus a single
 sanctioned copy point at split boundaries — so the bug class has nowhere to
 reappear. The GPU_SAFETY audit generalizes the lesson: any change to shared
 mutable GPU state must be validated against a known-good reference, not just
 an A/B of two paths over the same corrupted state
-(`docs/GPU_SAFETY.md:151-156` (§4 "Device metrics: query at runtime, never guess (2")).
+(`docs/GPU_SAFETY.md:175-180` (§4a "Split-attention and float4 kernel guards", the shared-mutable-state lesson)).
 
 **`synchronize` and the bounded-wait rule.**
 
@@ -797,7 +797,7 @@ message saying exactly that (`cuda_backend.rs:499` and `:545`, the two "graphs d
 §8 calls it "the A/B control used by every graph-adjacent step doc"
 (`docs/CUDA-TECH-PRIMER.md:336-337` (§8 "CUDA Graphs — capture once, replay many (Phase 7")). A related hard rule: nothing inside a
 capture window may sync — a debug readback corrupts the capture, the 7e②
-"faster but wrong" incident (`docs/GPU_SAFETY.md:206` (§4b "b. Flash-attention kernels (`kernel_flash_attn_e")) — which is why
+"faster but wrong" incident (`docs/GPU_SAFETY.md:230` ("CUDA (Phase 7, aarch64 GB10)", rule 2, the 7e② incident)) — which is why
 trace/viz capture disables replay in the scheduler (`BackendScheduler::execute` (`src/graph/scheduler.rs:137`)).
 
 **The split/copy story at backend boundaries.** On a mixed graph — or any
@@ -852,10 +852,10 @@ weight lookup still fails inside `execute_node`, it is
 actual values `execute_node_inner` (`cuda_backend.rs:916`). AGENTS states the contract once:
 "kernel-invariant violations return `Err` from `execute_node` — never a
 silent CPU fallback; backend assignment is decided at build time"
-(`AGENTS.md:72` ("Build & Run")); TECH-PRIMER §7 repeats it
+(`AGENTS.md:128` ("GPU Safety", the Err-never-fallback contract)); TECH-PRIMER §7 repeats it
 (`docs/CUDA-TECH-PRIMER.md:312-314` (§7 "Synchronization discipline (GPU Safety, `docs/GP")); the design record explains why — silent
 fallbacks make performance and correctness bugs indistinguishable
-(`docs/COMPUTE-GRAPH-DESIGN.md:1105-1107` (§9 "Eligibility"), the §9.2 "Eligibility" no-silent-fallback
+(`docs/COMPUTE-GRAPH-DESIGN.md:1105-1107` (§9 "Eligibility") , the §9.2 "Eligibility" no-silent-fallback
 clause).
 
 ## 4. Performance intuition
@@ -863,7 +863,7 @@ clause).
 **Launch overhead, decoded into numbers.** Count the kernels one decode step
 launches, directly off the dispatch table of §3.4, for **Qwen2.5-0.5B** (24
 layers, 14 query heads / 2 KV heads, `hd = 64`, `n_kv_embd = 128` —
-`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models") with the default decode fusions on:
+`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models")  with the default decode fusions on:
 
 | per layer | launches |
 |---|---|
@@ -888,19 +888,19 @@ eliminated re-conversions that cost "240 launches/step … ~0.28 ms of pure
 launch overhead" at a 14B decode (`cuda_backend.rs:68-74`, the positions-memo comment) — about 1.2 µs per
 launch, right in TECH-PRIMER's band. §3.2's fusion is the same arithmetic at
 graph level — the 7-launch QKV tail becomes 1 ("−310 launches/step" across a
-whole model, `docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels") — and the dispatch notes
+whole model, `docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels")  — and the dispatch notes
 price even one wasted launch at "~1-2 us/layer" (`attention_decode.cu:930`, the split-K dispatch note).
 
 **f16 KV bytes per token per layer.** With `nkt = n_head_kv · hd`, each region
 stores `nkt` elements per position. Qwen2.5-0.5B: `nkt = 2·64 = 128` elements
 → one f32 K row is 512 B, K + V together **1 KB per token per layer** (the
 walkthrough's number: 24 KB/token across 24 layers,
-`docs/inference_e2e_walkthrough/09-prefill-forward-path.md:253` (§2 "Sizing the context once for both phases"). With f16 KV
+`docs/inference_e2e_walkthrough/09-prefill-forward-path.md:253` (§2 "Sizing the context once for both phases") . With f16 KV
 each row is 256 B → **512 B per token per layer, 12 KB/token** model-wide.
 Decode attention at context length `p` reads `2 · p` such rows per layer, so
 the halving directly halves the attention kernel's KV traffic; at Qwen3-4B
 scale (`n_kv_embd = 1024`, 36 layers — 288 KB per position in f32,
-`docs/inference_e2e_walkthrough/11-attention-vecops-kv.md:71` (§2 "Why the KV cache exists") that is ~144 KB
+`docs/inference_e2e_walkthrough/11-attention-vecops-kv.md:71` (§2 "Why the KV cache exists")  that is ~144 KB
 per position *touched*, though the regions stay f32-sized in allocation
 (§3.3). The flip side is precision: K/V are rounded to f16 on store and every
 downstream kernel reads the rounded values — which is why the parity tests
