@@ -30,7 +30,7 @@ reuses:
 
 ```mermaid
 flowchart LR
-    A["Rust: Op match arm<br/>graph/cuda_backend.rs"] --> B["Rust device layer<br/>CudaState method (cuda.rs)"]
+    A["Rust: Op match arm<br/>graph/cuda_backend.rs"] --> B["Rust device layer<br/>CudaState method (cuda/methods/*.rs)"]
     B --> C["C launcher: grid sizing<br/>launch_* (cuda/kernels/*.cu)"]
     C --> D["__global__ kernel<br/>one thread's worth of math"]
 ```
@@ -52,30 +52,30 @@ The forensics protocol from `STYLE.md` starts with enumeration. Run:
 grep -n '__global__' src/cuda/kernels/*.cu
 ```
 
-Today that prints **89 kernels** in an 8,386-line file. Nobody memorizes 89
-entries; you navigate by family. Here is the map (counts from the same grep):
+Today that prints **99 `__global__ void` definitions** — plus six prose mentions — across **17 files**
+(10,147 lines). Nobody memorizes 99 entries; you navigate by family. Here is the map (file and line):
 
-| Family | Examples (first hit line) | What it does | Where taught |
+| Family | Examples (file, first hit line) | What it does | Where taught |
 |---|---|---|---|
-| Elementwise / epilogue | `add_f32` :2403, `add_bias_f32` :2391, `silu_f32` :2429, `rope_f32` :2503, `store_kv_f16` :2550 | one pass over a buffer, per-element math | **this chapter** |
-| Dequant to f16 | `dequant_q8_0_f16` :4434 … `dequant_q6_k_f16` :4585 | quantized weight bytes → dense f16 | **this chapter** |
-| Embedding gather | `embed_rows_q8_0` :2061 … `embed_rows_q4_1` :3615 | token ids → dequantized weight rows | **this chapter** |
-| Small helpers | `gather_rows_f32` :2046, `f32_bits_to_i32` :2489, `convert_f32_f16_kernel` :4614 | glue: format conversion, device-side decodes | **this chapter** (quick-read) |
-| Decode matvec (MMVQ) | `q4_k_q8_mmvq` :1254, `q4_0_q8_mmvq` :8091 | one output row per block, dp4a integer dots | ch 04 |
-| Prefill GEMM | `gemm_f16_nt_kernel_t` :4787, `mmq_nt_kernel` :5663 | tiled tensor-core GEMM, f16 or int8 | ch 04 |
-| Attention | `gqa_attn_f32_f16kv` :2677, `fa_prefill_f16kv` :4157 | GQA attention, flash-style prefill | ch 05 |
-| Fused decode tail | `attn_bias_rope_store_f32` :2590 | bias×3 + rope×2 + store×2 in one launch | ch 05 |
-| Activation quantize | `quantize_q8_0_pad40_t` :794, `rms_norm_quant_f32_t` :881 | f32 activations → q8 blocks for MMQ | ch 04 |
+| Elementwise / epilogue | `add_f32` (`ops_elementwise.cu:163`), `add_bias_f32` (`:151`), `silu_f32` (`:189`), `rope_f32` (`:263`), `store_kv_f16` (`kv_store.cu:31`) | one pass over a buffer, per-element math | **this chapter** |
+| Dequant to f16 | `dequant_q8_0_f16` (`gemm_wmma.cu:23`) … `dequant_q6_k_f16` (`:174`) | quantized weight bytes → dense f16 | **this chapter** |
+| Embedding gather | `embed_rows_q8_0` (`ops_misc.cu:160`) … `embed_rows_q4_1` (`:671`) | token ids → dequantized weight rows | **this chapter** |
+| Small helpers | `gather_rows_f32` (`ops_misc.cu:145`), `f32_bits_to_i32` (`ops_elementwise.cu:249`), `convert_f32_f16_kernel` (`gemm_wmma.cu:203`) | glue: format conversion, device-side decodes | **this chapter** (quick-read) |
+| Decode matvec (MMVQ) | `q4_k_q8_mmvq_multi` (`mmvq_multi.cu:25`), `q4_0_q8_mmvq` (`:446`) | one output row per block, dp4a integer dots | ch 04 |
+| Prefill GEMM | `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`), `mmq_nt_kernel` (`mmq_int8.cu:236`) | tiled tensor-core GEMM, f16 or int8 | ch 04 |
+| Attention | `gqa_attn_f32_f16kv` (`attention_decode.cu:18`), `fa_prefill_kv` (`attention_prefill.cu:117`) | GQA attention, flash-style prefill | ch 05 |
+| Fused decode tail | `attn_bias_rope_store_f32` (`kv_store.cu:118`) | bias×3 + rope×2 + store×2 in one launch | ch 05 |
+| Activation quantize | `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`), `rms_norm_quant_f32_t` (`:169`) | f32 activations → q8 blocks for MMQ | ch 04 |
 
 Two structural facts the table hides, and both matter for reading:
 
-1. **Kernels and launchers live in the same file, but are different APIs.**
+1. **Kernels and launchers live in the same translation unit, but are different APIs.**
    The `__global__` functions are device code. The `void launch_*` functions
    (plain C++, called through FFI from Rust) own the grid arithmetic. When you
    want to know "how many threads does this launch", find the launcher, not
    the kernel.
 2. **Type-generic dispatch is done with `switch (type_id)`, not C++
-   templates.** `launch_embed_rows` (:3643) and `launch_dequant_f16` (:5043)
+   templates.** `launch_embed_rows` (`ops_misc.cu:699`) and `launch_dequant_f16` (`gemm_wmma.cu:777`)
    each take an integer type id and select one of eight concrete kernels. The
    Rust side owns the id tables — and, as §3.2 will show, the two tables do
    not use the same numbering. That is a real trap when you first read the
@@ -83,7 +83,7 @@ Two structural facts the table hides, and both matter for reading:
 
 ### 2.2 The three thread-to-data mapping patterns
 
-Nearly every easy kernel in the file answers one question first: *what does
+Nearly every easy kernel in these files answers one question first: *what does
 one thread process?* The elementwise/dequant/embed families use three answers:
 
 - **One thread per element** — `add_f32`, `mul_f32`, `silu_f32`,
@@ -116,15 +116,14 @@ to exceed it rather than launch something invalid.
 
 ### 2.3 Where the Rust side hands over
 
-`src/cuda.rs` declares the launchers in an `extern "C"` block (the FFI
-surface, e.g. `launch_add_f32` (`src/cuda/methods/elementwise.rs:25`), `launch_dequant_f16` (`src/cuda/methods/prefill_f16.rs:12`)
-and wraps each in a small safe method on `CudaState`. The graph
-backend never sees kernel names; it sees graph ops. The three call sites this
-chapter follows:
+`src/cuda/methods/*.rs` declares the launchers, one `extern "C"` block per
+family (the FFI surface, e.g. `launch_add_f32` (`src/cuda/methods/elementwise.rs:25`), `launch_dequant_f16` (`src/cuda/methods/prefill_f16.rs:12`))
+and wraps each in a small safe method on `CudaState`. The graph backend never
+sees kernel names; it sees graph ops. The three call sites this chapter follows:
 
 - `Op::Add` → `CudaState::add_f32` — `src/graph/cuda_backend.rs:1003`
-- the MatMul bias epilogue → `CudaState::add_bias_f32` — `:990`
-- `Op::GetRows` → `embed_rows_on_gpu` / `gather_rows_f32_on_gpu` — `:452` / `:466`
+- the MatMul bias epilogue → `CudaState::add_bias_f32` — `:1514`
+- `Op::GetRows` → `embed_rows_on_gpu` / `gather_rows_f32_on_gpu` — `:972` / `:986`
 
 One safety rule from `docs/GPU_SAFETY.md` colors all of these arms: when a
 kernel's input violates its invariants (wrong sizes, unsupported layout), the
@@ -180,32 +179,33 @@ void launch_add_f32(
     int block_sz = 256;
     dim3 block(block_sz, 1, 1);
     dim3 grid((n + block_sz - 1) / block_sz, 1, 1);
-    add_f32<<<grid, block, 0, stream>>>(x, y, z, n);
+    add_f32<<<grid, minfer_launch_block("launch:add_f32", block), 0, stream>>>(x, y, z, n);
 }
 ```
 
 The **ceil-div is over the total element count `n`** — not over tokens, not
-over rows. 256 threads per block is the file's default block size (a multiple
+over rows. 256 threads per block is the sources' default block size (a multiple
 of 32, the warp width, so no partially-filled warp). The stream argument
 (`cudaStream_t` — a queue of device work; every kernel in one stream runs in
 order) is threaded through from Rust so the backend can order its own work
-without global synchronization.
+without global synchronization. #162 brackets each launch with
+`minfer_launch_prelude`/`minfer_launch_ok`, which read its own error (elided above).
 
 The Rust call chain: the backend's `Op::Add` arm checks that both inputs have
 the same element count as the output and calls
-`CudaState::add_f32` (`src/cuda/methods/elementwise.rs`), which is a three-line FFI shim.
+`CudaState::add_f32` (`src/cuda/methods/elementwise.rs`), which is a thin FFI shim.
 The dispatch site is `Op::Add` (`src/graph/cuda_backend.rs:998`):
 
 ```rust
 Op::Add => {
-    let n = self.elems(out_buf);
-    if self.elems(in_bufs[0]) != n || self.elems(in_bufs[1]) != n {
+    let n = out_buf.len;
+    if in_bufs[0].len != n || in_bufs[1].len != n {
         return Err(format!("cuda: {}: add input size mismatch", node.name));
     }
     self.state.add_f32(
-        self.ptr_of(in_bufs[0])?,
-        self.ptr_of(in_bufs[1])?,
-        self.ptr_of(out_buf)?,
+        self.ptr_of_ref(in_bufs[0])?,
+        self.ptr_of_ref(in_bufs[1])?,
+        self.ptr_of_ref(out_buf)?,
         n,
     );
     Ok(())
@@ -254,7 +254,7 @@ records the one bug-prone detail of this kernel's contract:
 // add_bias_f32's last argument is the ROW COUNT (nt), not
 // the total element count — the kernel grid maps one block
 // row per token (a wrong count writes out of bounds).
-self.state.add_bias_f32(self.ptr_of(out_buf)?, bptr, od, nt);
+self.state.add_bias_f32(self.ptr_of_ref(out_buf)?, bptr, od, nt);
 ```
 
 Pass the element count instead of the row count and `grid.x` becomes `nt * d`
@@ -264,7 +264,7 @@ chapter's first lesson in **grid-shape contracts**: a kernel is not just its
 body, it is the geometry its launcher assumes.
 
 **CPU counterpart.** Doc 11 §2.0–§2.1 walks the same residual adds on the CPU
-(`Op::Add` nodes over the residual stream, `vec_ops.rs` helpers), and doc 06
+(`Op::Add` nodes over the residual stream, `vec_ops/` helpers), and doc 06
 covers how the fusion pass minimizes how often they materialize. The math is
 identical; the only difference is who schedules the loop — the CPU does a
 `vec_add_f32` over one core's SIMD lanes, the GPU spreads it across 26,880
@@ -289,7 +289,7 @@ pub struct BlockQ4_0 {
 ```
 
 with `pub const Q4B: usize = 18` at `Q4B` (`block.rs:30`) and a compile-time
-`assert!(core::mem::size_of::<BlockQ4_0>() == 2 + 16)` at `:191`. So the
+`assert!(core::mem::size_of::<BlockQ4_0>() == 2 + 16)` at `:203`. So the
 byte layout is exactly:
 
 ```text
@@ -302,13 +302,12 @@ one BlockQ4_0 = 18 bytes = 32 dequantized f32/f16 values
 value = d * (nibble - 8)        // the +8 stored offset
 ```
 
-Two conventions to burn in, because every quant kernel in the file assumes
+Two conventions to burn in, because every quant kernel in these files assumes
 them:
 
 - **Nibble order**: element `j` comes from the **low** 4 bits of byte `j`;
-  element `j + 16` from the **high** 4 bits. The kernel comment states it
-  verbatim `q4_0_q8_0_matmul` (`matmul_f32act.cu:14`) and both the embed and dequant kernels
-  implement it identically.
+  element `j + 16` from the **high** 4 bits — `q4_0_q8_0_matmul`
+  (`matmul_f32act.cu:14-64`) decodes exactly that, as do the embed and dequant kernels.
 - **The +8 offset**: minfer (like llama.cpp) stores `round(v/d) + 8`, so the
   unsigned nibble 0..15 maps back by subtracting 8 — that is the `- 8.0f`
   you will see in every Q4_0 body. Q4_K weights instead carry a per-sub-block
@@ -356,7 +355,7 @@ grid has `od * nb` threads. Reading it line by line:
   length `id` is a multiple of 32 — the backend gates it before dispatching:
   the MatMul arm rejects `id % 32 != 0` (`src/graph/cuda_backend.rs:1481`, the quant-block gate) and the f16
   warm path requires `id % 256 == 0` (`warm_w16`, `src/cuda/methods/prefill_f16.rs:89`).
-- **`h2f(...)`** — the file's helper `h2f` (`src/cuda/kernels/common.cuh:97`): reinterpret the
+- **`h2f(...)`** — the shared helper `h2f` (`src/cuda/kernels/common.cuh:97`): reinterpret the
   2 scale bytes as `__half` and convert to f32. The scale is stored f16, read
   once per block.
 - **The unrolled loop** — each byte yields two f16 outputs: `& 0x0F` takes the
@@ -385,14 +384,15 @@ void launch_dequant_f16(
     long long grid = (total + block - 1) / block;
     if (grid > 2147483647LL) grid = 2147483647LL;
     switch (type_id) {
-        case 0: dequant_q8_0_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
-        case 1: dequant_q4_0_f16<<<(int)grid, block, 0, stream>>>(w, out, od, id); break;
+        case 0: dequant_q8_0_f16<<<…>>>(w, out, od, id); break;
+        case 1: dequant_q4_0_f16<<<…>>>(w, out, od, id); break;
         ...
 ```
 
 Grid = ceil-div over **`od * nb` blocks** (Q6_K splits into 16-element
 sub-blocks, hence its special case). One launch geometry serves eight quant
-types; only the per-thread decode differs.
+types; only the per-thread decode differs. #162 wraps each arm in
+`minfer_launch_prelude`/`minfer_launch_block`/`minfer_launch_ok` (elided above).
 
 #### Who calls it, and when — the honest picture
 
@@ -439,7 +439,7 @@ which streams raw quantized bytes and never touches `dequant_*_f16` —
 
 **CPU counterpart.** Doc 10 §2.1 is the CPU-side dequant argument and §2.4
 the K-quant pairing (Q8_K activations with precomputed `bsums`); the CPU
-dequantize helpers live in `quants.rs` and the scalar reference formula
+dequantize helpers live in `quants/` and the scalar reference formula
 `(nibble − 8) · d` appears in doc 10's parity notes. The GPU kernel is the
 same formula — that is the point of the parity tests.
 
@@ -521,12 +521,12 @@ token-major f32 `[nt][896]` — the layout every later kernel assumes.
 
 **Dispatch.** The backend arm `Op::GetRows` (`src/graph/cuda_backend.rs:962`) matches
 `Op::GetRows` on metadata: with `NodeMeta::Embed` it calls
-`embed_rows_on_gpu` (`:452`), with plain metadata it calls the generic
-`gather_rows_f32_on_gpu` (`:466`) — the same `GetRows` node serves the
+`embed_rows_on_gpu` (`:972`), with plain metadata it calls the generic
+`gather_rows_f32_on_gpu` (`:986`) — the same `GetRows` node serves the
 embedding *and* the tail-row selects before `lm_head` (doc 09 §2.4). The
 Rust wrapper `embed_rows_on_gpu` (`src/cuda/methods/gpu_act.rs:176`) maps `TensorType` to `(type_id,
-block_stride)` — `Q4_0 => (1, 18)` at `:4124` — and `F32` embeddings skip the
-quant kernels entirely by calling the f32 gather (`:4133`). The C launcher
+block_stride)` — `Q4_0 => (1, 18)` at `src/cuda/methods/gpu_act.rs:189` — and `F32` embeddings skip the
+quant kernels entirely by calling the f32 gather (`src/cuda/methods/gpu_act.rs:196`). The C launcher
 (`launch_embed_rows`, `ops_misc.cu:699`) computes the grid per type
 (eight `embed_rows_*` kernels behind one `switch`) with the same
 one-thread-per-32-block geometry.
