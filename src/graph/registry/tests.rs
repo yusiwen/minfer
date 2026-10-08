@@ -253,20 +253,25 @@ fn the_name_surface_fences_devices_and_keeps_cpu() {
 /// The #87 seam: `reads_packed_kv` is one authority, and the two call sites
 /// that used to hardcode "CPU only" read it.
 ///
-/// C4 S2b flipped CUDA's answer; [#310] implemented Metal's packed path but
-/// **kept Metal's answer false** (the fast families refuse packed and the classic
-/// fallback costs 4–17×), so this is a two-backend yes (CPU + CUDA) with Metal
-/// still refusing. A build without a backend's feature registers no entry, so it
-/// claims nothing — which is the point of reading a registry field instead of a
-/// hardcoded list.
+/// [#310] flipped Metal's answer on: with mechanisms A (native packed decode) and
+/// B (f16-stage the fast prefill/window families) every attention shape reads a
+/// packed region, so this is a three-backend yes where the backend is compiled in
+/// (CPU + CUDA + Metal). A build without a backend's feature registers no entry,
+/// so it claims nothing — which is the point of reading a registry field instead
+/// of a hardcoded list.
 ///
 /// [#44]: https://github.com/yusiwen/minfer/issues/44
 /// [#310]: https://github.com/yusiwen/minfer/issues/310
 #[test]
 fn the_packed_kv_capability_is_the_registrys_answer() {
     assert!(Backend::CPU.caps().reads_packed_kv);
-    // Metal implemented the path (#310) but ships the refusal, so its entry
-    // still answers false on every platform.
+    // Metal reads packed since #310 (mechanism A/B plus the classic fallback).
+    #[cfg(target_os = "macos")]
+    {
+        assert!(Backend::METAL.caps().reads_packed_kv);
+        assert!(reads_packed_kv(Backend::METAL));
+    }
+    #[cfg(not(target_os = "macos"))]
     assert!(!Backend::METAL.caps().reads_packed_kv);
     assert!(reads_packed_kv(Backend::CPU));
     #[cfg(feature = "cuda")]

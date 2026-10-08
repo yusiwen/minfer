@@ -42,6 +42,35 @@ const CROSS_WAIT_TIMEOUT_MS: u64 = 10_000;
 /// copy owns a fresh event, so 1 is always "this copy finished".
 const CROSS_EVENT_VALUE: u64 = 1;
 
+/// #310 mechanism B switch: route a packed decode/prefill that would take a
+/// native packed kernel through the f32-staging twin instead. The environment
+/// spelling (`MINFER_PACKED_KV_STAGE=1`) is the user-facing A/B; a `#[cfg(test)]`
+/// thread-local lets the differential gate compare mechanism A with mechanism B
+/// on the same shape without mutating process-wide state (the house thread-local
+/// test-seam pattern — the macOS suite runs in parallel).
+fn stage_forced() -> bool {
+    #[cfg(test)]
+    if STAGE_FORCED.with(|c| c.get()) {
+        return true;
+    }
+    std::env::var("MINFER_PACKED_KV_STAGE").map_or(false, |v| v == "1")
+}
+
+/// #310: the per-thread `MINFER_PACKED_KV_STAGE` override [`stage_forced`]
+/// consults; test-only and thread-local so it cannot leak into a concurrently
+/// running test. A gate pairs it with `set_stage_forced(false)`.
+#[cfg(test)]
+thread_local! {
+    static STAGE_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #310: set the calling thread's mechanism-B override (test-only; see
+/// [`stage_forced`]).
+#[cfg(test)]
+pub(crate) fn set_stage_forced(on: bool) {
+    STAGE_FORCED.with(|c| c.set(on));
+}
+
 // ─── op profiler (MINFER_OP_PROFILE=1, debug aid) ────────────────────
 // Host-side encode time per op label (accumulated across the process) plus
 // per-submit GPU wait time. The first submit prints the full per-op table
@@ -698,20 +727,18 @@ pub fn supports_fused(fused: &FusedOp) -> bool {
 /// [#315]: https://github.com/yusiwen/minfer/issues/315
 pub const SUPPORTS_ATTN_SPAN: bool = true;
 
-/// C4 (#310): the packed `q8_0` KV path is **implemented on this branch but not
-/// enabled** — Metal still refuses `MINFER_CACHE_TYPE=q8_0` by default, so this
-/// stays `false`. The store (`kernel_store_kv_q8_0`) and the classic / window /
-/// map reads exist and are exercised through a test-only capability seam
-/// (`registry::set_force_packed_kv`), but the fast causal families (flash /
-/// split / prefill / parallel-prefill) and the fast windowed-flash family have
-/// no packed kernel, so an enabled packed region would fall to the classic
-/// tiled kernel at a measured 4–17× cost. Enabling it requires packing those
-/// families first; the refusal is the shipped decision
-/// (`docs/METAL-BACKEND-DESIGN.md` §4.4, `docs/SUPPORT-MATRIX.md`), and [#310]
-/// tracks the fast-family work.
-///
-/// [#310]: https://github.com/yusiwen/minfer/issues/310
-pub const READS_PACKED_KV: bool = false;
+/// C4 (#310): Metal reads a packed `q8_0` KV region. The store
+/// (`kernel_store_kv_q8_0`) and two read mechanisms cover every attention shape:
+/// **mechanism A** reads packed cells natively in the decode flash family
+/// (`kernel_flash_attn_ext_q8_0` / `_hd128_q8_0`), and **mechanism B**
+/// dequantizes the needed window into a transient **f32** stage
+/// (`kernel_dequant_kv_q8_0_to_f32`) and runs the unchanged f32 prefill /
+/// windowed-flash kernels. The classic packed kernels
+/// (`kernel_gqa_attn_q8_0` / `_window_q8_0` / `_map_q8_0`) stay the fallback for
+/// every shape no fast family covers (a small/odd `hd`, `nt == 1` explicit
+/// windows and any `MINFER_NO_*` opt-out). The routing matrix is the pure
+/// [`crate::metal::packed_attn_route`]. See `docs/METAL-BACKEND-DESIGN.md` §4.4.
+pub const READS_PACKED_KV: bool = true;
 
 /// F5 ([#58], ported by [#137]): registry hook **phase A** of a cross-backend
 /// staging copy out of Metal.
@@ -1209,12 +1236,44 @@ impl Backend for MetalBackend {
                         )
                     })?;
                     if win.len == 2 * nt {
-                        // #310: a packed region has no fast windowed flash kernel,
-                        // so the packed path always takes the correctness window
-                        // kernel (its own Q8_0 variant) — an explicit selection,
-                        // never a silent dequantize-then-f32.
                         let win_buf = self.buf(win.id);
+                        // #310: a packed region's route is explicit. A
+                        // prefill-shaped one-range window dequantizes its union
+                        // window into the f32 stage and runs the *unchanged*
+                        // fast windowed-flash kernel (`f16 = false`); every shape
+                        // the fast family does not cover (small/odd hd, nt == 1,
+                        // an opt-out) keeps the correctness Q8_0 window kernel.
                         if self.kv_packed() {
+                            if crate::metal::packed_attn_route(meta.hd, nt, true, stage_forced())
+                                == crate::metal::PackedRoute::StageThenWindow
+                            {
+                                let (lo_min, hi_max) = Self::window_range(win_buf, nt);
+                                let nkv = hi_max.saturating_sub(lo_min);
+                                if nkv > 0 {
+                                    let row_bytes = self.kv_row_bytes(meta.nkt);
+                                    let (sk, sv) = cb.dequant_kv_q8_0_window(
+                                        k, v, lo_min, nkv, meta.nkt, row_bytes,
+                                    );
+                                    cb.attn_flash_window(
+                                        q,
+                                        &sk,
+                                        &sv,
+                                        o,
+                                        win_buf,
+                                        nkv,
+                                        lo_min,
+                                        meta.nkt,
+                                        nt,
+                                        meta.n_head,
+                                        meta.n_head_kv,
+                                        meta.hd,
+                                        meta.scale,
+                                        false,
+                                        false,
+                                    );
+                                    return Ok(());
+                                }
+                            }
                             cb.gqa_attn_window_q8_0(
                                 q,
                                 k,
@@ -1277,10 +1336,41 @@ impl Backend for MetalBackend {
                     }
                     let kmax = crate::graph::kvcache::KV_MAP_MAX_SPANS;
                     if win.len == nt * kmax * 2 {
-                        // #310: packed regions take the correctness map kernel's
-                        // Q8_0 variant (explicit selection).
                         let map_buf = self.buf(win.id);
+                        // #310: the set-valued sibling of the one-range packed
+                        // route above — same stage, same fast kernel, the map
+                        // mask. The correctness Q8_0 map kernel is the fallback.
                         if self.kv_packed() {
+                            if crate::metal::packed_attn_route(meta.hd, nt, true, stage_forced())
+                                == crate::metal::PackedRoute::StageThenWindow
+                            {
+                                let (lo_min, hi_max) = Self::window_map_range(map_buf, nt);
+                                let nkv = hi_max.saturating_sub(lo_min);
+                                if nkv > 0 {
+                                    let row_bytes = self.kv_row_bytes(meta.nkt);
+                                    let (sk, sv) = cb.dequant_kv_q8_0_window(
+                                        k, v, lo_min, nkv, meta.nkt, row_bytes,
+                                    );
+                                    cb.attn_flash_window(
+                                        q,
+                                        &sk,
+                                        &sv,
+                                        o,
+                                        map_buf,
+                                        nkv,
+                                        lo_min,
+                                        meta.nkt,
+                                        nt,
+                                        meta.n_head,
+                                        meta.n_head_kv,
+                                        meta.hd,
+                                        meta.scale,
+                                        false,
+                                        true,
+                                    );
+                                    return Ok(());
+                                }
+                            }
                             cb.gqa_attn_map_q8_0(
                                 q,
                                 k,
@@ -1358,12 +1448,77 @@ impl Backend for MetalBackend {
                 // `explicit_span` branch above is new.
                 let positions = self.buf(in_bufs[2].id);
                 if self.kv_packed() {
-                    // #310: a packed region has no packed kernel in the fast
-                    // causal families (flash / split / prefill / parallel), so the
-                    // packed path always takes `kernel_gqa_attn_q8_0` — the classic
-                    // tiling, which covers `nt == 1` decode and `nt > 1` prefill for
-                    // any `hd`. The selection is explicit here; the fast families
-                    // are never handed a Q8_0 region.
+                    // #310: the packed route (see `crate::metal::packed_attn_route`).
+                    // Decode (`nt == 1`) reads packed cells natively (mechanism A);
+                    // with the stage forced it dequantizes first and runs the f32
+                    // flash (mechanism B, the A/B twin). A prefill (`nt > 1`)
+                    // dequantizes its `[0, nkv)` window into the f32 stage and runs
+                    // the unchanged f32 blk family. Every other shape keeps the
+                    // classic `kernel_gqa_attn_q8_0`.
+                    let row_bytes = self.kv_row_bytes(meta.nkt);
+                    match crate::metal::packed_attn_route(meta.hd, nt, false, stage_forced()) {
+                        crate::metal::PackedRoute::NativeDecode => {
+                            let chunks = self.attention_chunks(positions, nt);
+                            cb.gqa_attn_flash_q8_0(
+                                q,
+                                k,
+                                v,
+                                o,
+                                positions,
+                                meta.n_head,
+                                meta.n_head_kv,
+                                meta.hd,
+                                meta.scale,
+                                1,
+                                chunks,
+                                row_bytes,
+                            );
+                            return Ok(());
+                        }
+                        crate::metal::PackedRoute::StageThenFlash => {
+                            let nkv = Self::positions_max(positions, nt) + 1;
+                            let (sk, sv) =
+                                cb.dequant_kv_q8_0_window(k, v, 0, nkv, meta.nkt, row_bytes);
+                            let chunks = self.attention_chunks(positions, nt);
+                            cb.gqa_attn_flash(
+                                q,
+                                &sk,
+                                &sv,
+                                o,
+                                positions,
+                                meta.n_head,
+                                meta.n_head_kv,
+                                meta.hd,
+                                meta.scale,
+                                1,
+                                chunks,
+                                false,
+                            );
+                            return Ok(());
+                        }
+                        crate::metal::PackedRoute::StageThenPrefill => {
+                            let nkv = Self::positions_max(positions, nt) + 1;
+                            let (sk, sv) =
+                                cb.dequant_kv_q8_0_window(k, v, 0, nkv, meta.nkt, row_bytes);
+                            cb.attn_flash_prefill(
+                                q,
+                                &sk,
+                                &sv,
+                                o,
+                                positions,
+                                nkv,
+                                meta.nkt,
+                                nt,
+                                meta.n_head,
+                                meta.n_head_kv,
+                                meta.hd,
+                                meta.scale,
+                                false,
+                            );
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                     cb.gqa_attn_q8_0(
                         q,
                         k,
@@ -1375,7 +1530,7 @@ impl Backend for MetalBackend {
                         meta.hd,
                         meta.scale,
                         nt,
-                        self.kv_row_bytes(meta.nkt),
+                        row_bytes,
                     );
                     return Ok(());
                 }

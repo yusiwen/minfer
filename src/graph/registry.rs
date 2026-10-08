@@ -406,38 +406,7 @@ pub fn unavailable_reason(backend: Backend) -> Option<&'static str> {
 /// Whether this backend's attention kernel reads a packed `q8_0` KV region —
 /// the registry's answer to #87's question (see [`BackendCaps::reads_packed_kv`]).
 pub fn reads_packed_kv(backend: Backend) -> bool {
-    // #310 test seam: the packed Metal implementation landed but is **not
-    // enabled** (`metal_backend::READS_PACKED_KV` stays false — the fast families
-    // refuse packed and the classic fallback costs 4–17×, see
-    // `docs/METAL-BACKEND-DESIGN.md` §4.4). The packed Metal gates still drive
-    // the real production entry points through this thread-local override, so
-    // they test the kernels without flipping the shipped capability and without
-    // perturbing a concurrently-running test on another thread. Off unless a
-    // test sets it; absent from every non-test build.
-    #[cfg(test)]
-    {
-        if FORCE_PACKED_KV.with(|c| c.get()) {
-            return true;
-        }
-    }
     backend.caps().reads_packed_kv
-}
-
-/// #310 test seam: the per-thread packed-KV capability override
-/// [`reads_packed_kv`] consults. `#[cfg(test)]`-only and thread-local by design
-/// (a process global would let a packed test's capability leak into every
-/// concurrently-running `resolve` / `ensure_kv` assertion — the #99 lesson).
-#[cfg(test)]
-thread_local! {
-    static FORCE_PACKED_KV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Set the calling thread's packed-KV capability override (test-only; see
-/// [`reads_packed_kv`]). A test pairs it with an RAII guard so a panic cannot
-/// leave it on for the next test that reuses the thread.
-#[cfg(test)]
-pub(crate) fn set_force_packed_kv(on: bool) {
-    FORCE_PACKED_KV.with(|c| c.set(on));
 }
 
 /// A set of backends a run may use: the fence `--backend` / `MINFER_BACKENDS`

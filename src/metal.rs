@@ -207,9 +207,10 @@ struct MpsStateInner {
     pl_rope: MetalComputePipelineState,
     pl_gqa_attn: MetalComputePipelineState,
     pl_gqa_attn_f16: MetalComputePipelineState,
-    // #310: the packed Q8_0 causal attention kernel (classic tiling; the fast
-    // flash/split/prefill families are f32/f16-only and are not selected when the
-    // engine's KV format is Q8_0 — see `metal_backend`'s Attn arm).
+    // #310: the packed Q8_0 causal attention kernel (classic tiling). Since
+    // #310 the fast families also read a packed region — natively (mechanism A)
+    // or through the f32 stage (mechanism B) — so this is the fallback for the
+    // shapes no fast family covers; see `metal_backend`'s Attn arm.
     pl_gqa_attn_q8_0: MetalComputePipelineState,
     // E1 `attn_span` read path (issue #44, G5a): the windowed kernel family.
     pl_gqa_attn_window: MetalComputePipelineState,
@@ -228,6 +229,10 @@ struct MpsStateInner {
     pl_flash_attn_f16: MetalComputePipelineState,
     pl_flash_attn_hd128: MetalComputePipelineState,
     pl_flash_attn_hd128_f16: MetalComputePipelineState,
+    // #310 mechanism A: the packed Q8_0 decode flash family (the f16 kernels'
+    // twin, reading one block's four dequantized elements per lane).
+    pl_flash_attn_q8_0: MetalComputePipelineState,
+    pl_flash_attn_hd128_q8_0: MetalComputePipelineState,
     pl_flash_attn_blk: MetalComputePipelineState,
     pl_flash_attn_blk_f16: MetalComputePipelineState,
     pl_flash_attn_blk_hd128: MetalComputePipelineState,
@@ -249,6 +254,8 @@ struct MpsStateInner {
     pl_store_kv: MetalComputePipelineState,
     pl_store_kv_f16: MetalComputePipelineState,
     pl_store_kv_q8_0: MetalComputePipelineState,
+    // #310 mechanism B: packed Q8_0 cell window -> transient f32 stage.
+    pl_dequant_kv_q8_0_to_f32: MetalComputePipelineState,
     pl_attn_bsr: MetalComputePipelineState,
     pl_attn_rope_store: MetalComputePipelineState,
     pl_attn_scores: MetalComputePipelineState,
@@ -273,6 +280,11 @@ struct MpsStateInner {
     buf_attn_scores: std::sync::Mutex<MetalBuffer>,
     // Flash-prefill tail pad (2026-08-14): [2][64][nkt] f32/f16 K-tail + V-tail.
     buf_attn_pad: std::sync::Mutex<MetalBuffer>,
+    // #310 mechanism B: transient f32 K/V windows dequantized from a packed Q8_0
+    // region so the f32 fast families can read it. Grow-on-demand; never
+    // shrunk (the `get_or_grow` contract).
+    buf_kv_stage_k: std::sync::Mutex<MetalBuffer>,
+    buf_kv_stage_v: std::sync::Mutex<MetalBuffer>,
     // Ring of recent dispatch op labels (for GPU-fault diagnosis, MINFER_TRACE only).
     dispatch_trace: std::sync::Mutex<std::collections::VecDeque<String>>,
 }
@@ -487,8 +499,8 @@ mod policy;
 mod runtime;
 
 pub use policy::{
-    flash_attn_enabled, matmul_attn_enabled, prefill_flash_enabled, prefill_window_flash_enabled,
-    rms_norm_256_enabled,
+    flash_attn_enabled, matmul_attn_enabled, packed_attn_route, prefill_flash_enabled,
+    prefill_window_flash_enabled, rms_norm_256_enabled, PackedRoute,
 };
 
 #[cfg(test)]
