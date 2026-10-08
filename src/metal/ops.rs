@@ -980,7 +980,64 @@ impl MpsCommandBuffer<'_> {
         self.dispatch_2d(nt as u64, nk as u64, 32, gqa as u64);
     }
 
-    /// E1 `attn_span` windowed attention (issue #44, G5a): the read side of the
+    /// #310: packed Q8_0 causal attention — `kernel_gqa_attn_q8_0`, the classic
+    /// tiling with K/V read from packed Q8_0 cells. Same grid/threadgroup shape
+    /// as [`Self::gqa_attn_f32`]; `row_bytes` (buffer 10) is one cell's
+    /// word-padded byte width (`KvFormat::Q8_0.row_bytes(nkt)`). The fast causal
+    /// families (flash / split / prefill / parallel) have no packed kernel and
+    /// are not selected when the engine's KV format is Q8_0.
+    pub fn gqa_attn_q8_0(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        o: &MetalBuffer,
+        positions: &MetalBuffer,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        nt: usize,
+        row_bytes: usize,
+    ) {
+        self.trace_op("gqa_attn_q8_0");
+        let gqa = nh / nk;
+        self.enc
+            .setComputePipelineState(&*self.state.pl_gqa_attn_q8_0);
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(k)), (0) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(v)), (0) as usize, (2) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(o)), (0) as usize, (3) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (4) as usize)
+        };
+        self.set_params(5, &(nh as i32));
+        self.set_params(6, &(nk as i32));
+        self.set_params(7, &(hd as i32));
+        self.set_params(8, &(scale.to_bits() as i32));
+        self.set_params(9, &(nt as i32));
+        self.set_params(10, &(row_bytes as i32));
+        const BC: u64 = 32;
+        let shmem = BC * hd as u64 * 2 * std::mem::size_of::<f32>() as u64;
+        unsafe {
+            self.enc
+                .setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize)
+        };
+        self.dispatch_2d(nt as u64, nk as u64, 32, gqa as u64);
+    }
     /// explicit window. Same grid and threadgroup shape as [`Self::gqa_attn_f32`]
     /// — one threadgroup per `(query, KV head)`, `gqa` simdgroups — but `window`
     /// (buffer 4) is the `attn_span` input: `lo` at `window[t]`, `hi` at
@@ -1039,6 +1096,63 @@ impl MpsCommandBuffer<'_> {
         self.set_params(7, &(hd as i32));
         self.set_params(8, &(scale.to_bits() as i32));
         self.set_params(9, &(nt as i32));
+        const BC: u64 = 32;
+        let shmem = BC * hd as u64 * 2 * std::mem::size_of::<f32>() as u64;
+        unsafe {
+            self.enc
+                .setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize)
+        };
+        self.dispatch_2d(nt as u64, nk as u64, 32, gqa as u64);
+    }
+
+    /// #310: packed Q8_0 one-range windowed attention —
+    /// `kernel_gqa_attn_window_q8_0`. Same `attn_span` `[lo, hi)` resolution and
+    /// shape as [`Self::gqa_attn_window`]; K/V are packed Q8_0 cells and
+    /// `row_bytes` (buffer 10) is one cell's byte width.
+    pub fn gqa_attn_window_q8_0(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        o: &MetalBuffer,
+        window: &MetalBuffer,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        nt: usize,
+        row_bytes: usize,
+    ) {
+        self.trace_op("gqa_attn_window_q8_0");
+        let gqa = nh / nk;
+        self.enc
+            .setComputePipelineState(&*self.state.pl_gqa_attn_window_q8_0);
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(k)), (0) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(v)), (0) as usize, (2) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(o)), (0) as usize, (3) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(window)), (0) as usize, (4) as usize)
+        };
+        self.set_params(5, &(nh as i32));
+        self.set_params(6, &(nk as i32));
+        self.set_params(7, &(hd as i32));
+        self.set_params(8, &(scale.to_bits() as i32));
+        self.set_params(9, &(nt as i32));
+        self.set_params(10, &(row_bytes as i32));
         const BC: u64 = 32;
         let shmem = BC * hd as u64 * 2 * std::mem::size_of::<f32>() as u64;
         unsafe {
@@ -1109,6 +1223,63 @@ impl MpsCommandBuffer<'_> {
         self.set_params(7, &(hd as i32));
         self.set_params(8, &(scale.to_bits() as i32));
         self.set_params(9, &(nt as i32));
+        const BC: u64 = 32;
+        let shmem = BC * hd as u64 * 2 * std::mem::size_of::<f32>() as u64;
+        unsafe {
+            self.enc
+                .setThreadgroupMemoryLength_atIndex((shmem) as usize, (0) as usize)
+        };
+        self.dispatch_2d(nt as u64, nk as u64, 32, gqa as u64);
+    }
+
+    /// #310: packed Q8_0 set-valued `kv_map` attention —
+    /// `kernel_gqa_attn_map_q8_0`. Same run walk and shape as
+    /// [`Self::gqa_attn_map`]; K/V are packed Q8_0 cells and `row_bytes`
+    /// (buffer 10) is one cell's byte width.
+    pub fn gqa_attn_map_q8_0(
+        &self,
+        q: &MetalBuffer,
+        k: &MetalBuffer,
+        v: &MetalBuffer,
+        o: &MetalBuffer,
+        map: &MetalBuffer,
+        nh: usize,
+        nk: usize,
+        hd: usize,
+        scale: f32,
+        nt: usize,
+        row_bytes: usize,
+    ) {
+        self.trace_op("gqa_attn_map_q8_0");
+        let gqa = nh / nk;
+        self.enc
+            .setComputePipelineState(&*self.state.pl_gqa_attn_map_q8_0);
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(q)), (0) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(k)), (0) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(v)), (0) as usize, (2) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(o)), (0) as usize, (3) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(map)), (0) as usize, (4) as usize)
+        };
+        self.set_params(5, &(nh as i32));
+        self.set_params(6, &(nk as i32));
+        self.set_params(7, &(hd as i32));
+        self.set_params(8, &(scale.to_bits() as i32));
+        self.set_params(9, &(nt as i32));
+        self.set_params(10, &(row_bytes as i32));
         const BC: u64 = 32;
         let shmem = BC * hd as u64 * 2 * std::mem::size_of::<f32>() as u64;
         unsafe {
@@ -1333,6 +1504,45 @@ impl MpsCommandBuffer<'_> {
                 .setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (4) as usize)
         };
         self.dispatch_2d(nt as u64, nkt as u64, 1, 1);
+    }
+
+    /// #310: packed Q8_0 KV store — `kernel_store_kv_q8_0`. One thread per
+    /// (row, 32-element block); `row_bytes` (buffer 5) is the packed cell's
+    /// word-padded byte width (`KvFormat::Q8_0.row_bytes(nkt)`), and `nkt` must
+    /// be a multiple of 32 (`KvFormat::check_width` is the gate that refuses
+    /// anything else, so the grid arithmetic is exact).
+    pub fn store_kv_q8_0(
+        &self,
+        src: &MetalBuffer,
+        dst: &MetalBuffer,
+        nkt: usize,
+        nt: usize,
+        positions: &MetalBuffer,
+        off: usize,
+        row_bytes: usize,
+    ) {
+        self.trace_op("store_kv_q8_0");
+        self.enc
+            .setComputePipelineState(&*self.state.pl_store_kv_q8_0);
+        unsafe {
+            self.enc.setBuffer_offset_atIndex(
+                Some(&**(src)),
+                ((off * 4) as u64) as usize,
+                (0) as usize,
+            )
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(dst)), (0) as usize, (1) as usize)
+        };
+        self.set_params(2, &(nkt as i32));
+        self.set_params(3, &(nt as i32));
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (4) as usize)
+        };
+        self.set_params(5, &(row_bytes as i32));
+        self.dispatch_2d(nt as u64, (nkt / 32) as u64, 1, 1);
     }
 
     /// Prefill parallel attention (P1 2026-08-11): replaces the classic
