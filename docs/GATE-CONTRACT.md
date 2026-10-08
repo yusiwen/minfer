@@ -438,13 +438,27 @@ The convention, stated once here and implemented as rule D:
   its pre-split absolute number — fixed in the [#355] PR), **2** are in the frozen
   `docs/ARCHITECTURE-EXECUTION-PLAN.md`, and **7** are silent by the two rules above.
   The `FROZEN` exemption covers bare continuations exactly as it covers path anchors.
+  **[#367] swept this class:** the seven silent spans were re-written in the explicit
+  form — five live citations, the two in the frozen `docs/ARCHITECTURE-EXECUTION-PLAN.md`
+  left under that exemption — so the **live silent count is 0**. The checker's own counts
+  moved with it: `unattached` 93 → 89 and `checked` 1045 → 1051, because a written path is
+  an anchor the gates can see. What stays silent is not a citation: this page's own
+  §"Prose anchors" illustrates the rule with the two doc-line numbers of the [#339] rows,
+  and the frozen `docs/ARCHITECTURE-EXECUTION-PLAN.md` keeps its two under the exemption
+  above. Writing a path is the whole fix; none of them would become a citation by a wider
+  window.
 - **Prefer the explicit form when the two citations are in *different* files.** The
   rule attaches the number to the nearest anchor, not to the file the sentence meant:
   `03-kernels-elementwise.md`'s ``(`src/cuda/methods.rs:NNN`, launch at `:MMM`)`` meant
   the launcher that the [#262] split moved to
-  `src/cuda/methods/prefill_f16.rs`, so the fix names that file. Widening the window to
-  the paragraph is the follow-up the silent class leaves open — [#367] carries the seven
-  measured spans and both options, and [#336] is the same sweep for bare ranges generally.
+  `src/cuda/methods/prefill_f16.rs`, so the fix names that file. **The explicit form is
+  what [#367] chose for the residual**: widening the window to the paragraph or the table
+  cell was rejected, because a *forward* window is exactly wrong in the case that
+  motivated the rule — the two standalone 1289-1321 spans in
+  `docs/ARCHITECTURE-ROADMAP.md` continue a file named on the *previous* line, while the
+  anchor that follows on their own line names `metal_backend.rs`. [#336] is the
+  neighbouring sweep: bare ranges that carry no symbol at all, so no rule can see whether
+  they still hold the text their sentence describes.
 
 The convention for the *content* of a range is unchanged from §"Prose anchors" above: a
 heading or a symbol is still the stable locator, and a bare range is still the fallback.

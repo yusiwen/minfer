@@ -939,6 +939,29 @@ def selftest() -> int:
     expect(_verdicts(report, "docs/edge.md") == [], "a line with no anchor carries no anchor")
     expect(report.unattached == 1, "a line with no anchor still counts its silent span")
 
+    # 7e. The residual this rule leaves (#367): a line with no anchor in either direction
+    #     keeps its bare span silent — the number is checked against nothing — so the fix
+    #     is to *write the path*, which puts the same number under rule B. The pair below
+    #     is the rule the sweep applies: silent stays green, explicit is range-checked.
+    report = _run_case({"docs/silent.md": "interleaved RoPE (`:999`) is refused.\n"})
+    expect(
+        _verdicts(report, "docs/silent.md") == [],
+        "a bare span with no anchor on its line creates no anchor (the silent class)",
+    )
+    expect(report.unattached == 1, "and it is counted, so the boundary stays visible")
+    expect(
+        _exit_code({"docs/silent.md": "interleaved RoPE (`:999`) is refused.\n"}) == 0,
+        "the silent form is green — which is why the residual is fixed by writing the path",
+    )
+    expect(
+        _exit_code({"docs/silent.md": "interleaved RoPE (`src/thing.rs:999`) is refused.\n"}) == 1,
+        "the explicit form is range-checked: the same number now fails",
+    )
+    expect(
+        _exit_code({"docs/silent.md": "interleaved RoPE (`src/thing.rs:21`) is refused.\n"}) == 0,
+        "and a correct explicit number passes",
+    )
+
     # 7c. Two path candidates on one line: each continuation follows the *nearest*
     #     preceding anchor, so the second one is judged against two-line `other.rs`
     #     (out of range) and not against the 61-line `thing.rs` (which would pass).
