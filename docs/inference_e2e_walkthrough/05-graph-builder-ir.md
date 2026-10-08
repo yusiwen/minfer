@@ -6,12 +6,12 @@
 > **nothing has been computed yet**. This stage writes the entire transformer
 > forward pass as one pure data structure: a declarative compute graph that
 > later stages assign to hardware, fuse, allocate, and execute.
-> **Code**: `src/graph/mod.rs` (`CNode` :84, `ComputeGraph` :107,
-> `topo_order` :154), `src/graph/ops.rs` (`Op` :40, `NodeMeta` :166),
-> `src/graph/builder.rs` (`GraphBuilder` :15, method family :58–421),
-> `src/models/qwen2/graph.rs` (`Qwen2Graph::build` :38, `forward_cached`
-> :403), `src/graph/params.rs` (`GraphParams` :52), `src/graph/cache.rs`
-> (`try_reuse` :47) — lines verified at commit `e7fa0da`.
+> **Code**: `src/graph/mod.rs` (`CNode` :156, `ComputeGraph` :201,
+> `topo_order` :238), `src/graph/ops.rs` (`Op` :47, `NodeMeta` :196),
+> `src/graph/builder.rs` (`GraphBuilder` :16, method family :264–711),
+> `src/models/qwen2/graph.rs` (`Qwen2Graph::build` :39, `forward_cached`
+> :450), `src/graph/params.rs` (`GraphParams` :88), `src/graph/cache.rs`
+> (`try_reuse` :69) — lines verified at commit `15fa45c`.
 
 ## 1. Background — where this stage sits
 
@@ -156,7 +156,7 @@ layout is `[out][in]` row-major, and activations are token-major `[nt][d]`
 
 ### 2.5 The main event: one forward pass, node by node
 
-`Qwen2Graph::build` (`src/models/qwen2/graph.rs:38`) is where the forward
+`Qwen2Graph::build` (`src/models/qwen2/graph.rs:39`) is where the forward
 pass is actually written down. The real thing below is from the Qwen2.5-0.5B
 model (24 layers, hidden 896, 14 query heads of dim 64, 2 KV heads — more on
 that below, FFN width 4864, vocabulary 151936), prefilled with a 30-token
@@ -288,7 +288,7 @@ counts are 24. In the DOT dump you can literally see the stale edge
 
 Here is the sentence the whole design stands on: **the graph topology is a
 deterministic function of `GraphParams`** — equal parameters produce an
-identical graph, node for node. `GraphParams` (`src/graph/params.rs:52`)
+identical graph, node for node. `GraphParams` (`src/graph/params.rs:88-98`)
 contains exactly `n_tokens`, `n_out` (tail rows, §2.8), `gtype`
 (prefill or decode), `cparams` (context size, flash-attn flag, GPU
 participation, the two fusion toggles), and `weights_version`.
@@ -703,7 +703,7 @@ sides of the add must shrink or the shapes would disagree.
 
 No node walk, no comparison of 440 nodes — six field comparisons, because
 §2.7's invariant makes them sufficient. The caller
-(`Qwen2Graph::forward_cached`, `models/qwen2/graph.rs:472-518`) shows the
+(`Qwen2Graph::forward_cached`, `models/qwen2/graph.rs:450-466`) shows the
 whole production loop in one glance: `try_reuse`; if it fails, `build` →
 register weights → `assign_backends` (doc 06) → `FusionPass` (doc 06) →
 `alloc_graph` (doc 07) → store in the cache with a fresh `uid`; then execute
@@ -829,7 +829,7 @@ comment — and asserted by the unit test `kv_nodes_carry_layer_only`
    "real" operations.
 6. **Attention's output shape comes from metadata, not from Q.** With
    `FusedQKV`, Q is a slice of a wider concat buffer, so `attn` sizes its
-   output from `AttnMeta` (`builder.rs:336-339`). Shapes in this IR are
+   output from `AttnMeta` (`builder.rs:607`). Shapes in this IR are
    declared facts, not derived ones.
 7. **GPU participation and fusion toggles are part of the reuse identity**
    (`CParams.gpu`, `fuse_qkv`, `fuse_ffn`): they change the topology, so

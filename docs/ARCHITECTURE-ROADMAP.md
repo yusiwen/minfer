@@ -245,7 +245,7 @@ are prerequisites for multi-device execution and for any heterogeneous split.
 
 ### 2.3 L3 — Allocator and memory
 
-**Today.** `GraphAllocator::alloc_graph` (`alloc.rs:165`) rebuilds the whole
+**Today.** `GraphAllocator::alloc_graph` (`alloc.rs:513-521`) rebuilds the whole
 node→buffer mapping on every graph rebuild: it frees every previously live
 buffer back to the backend pool (`:165-177`), recomputes `last_use` over build
 order, and re-allocates. Buffer pools are per backend, not unified
@@ -404,7 +404,7 @@ The prefill is one graph covering the entire prompt (`main.rs:862-890`):
 server rejects any prompt longer than the slot context (`chat.rs:118-124`) and
 allocates `n_ctx_total / n_slots` per slot (`slot.rs:27-37`). `worker_loop`
 drains the queue **serially, one slot at a time** (`chat.rs:452-518`), and every
-request starts from a fresh `GraphCache` (`chat.rs:491`). Default `--n-slots` is
+request starts from a fresh `GraphCache` (`chat.rs:77`). Default `--n-slots` is
 1 (`main.rs:211`), so the default server is strictly serial with a cold KV per
 request.
 
@@ -433,7 +433,7 @@ Two smaller but immediate items sit in this layer:
   219-token second turn): prefill 219 → 16 tokens, time-to-first-token
   ≈2.8 s → 0.25 s (≈11×), with the cold-slot turn unchanged.
 - ~~**No panic isolation.**~~ **Fixed in A4.** The guard that existed
-  (`guarded_forward`, `chat.rs:438-450`) only covered
+  (`guarded_forward`, `chat.rs:585-597`) only covered
   `forward_graph_cached`; the speculative path calls both models' forwards
   directly (`spec.rs`) and the tokenizer, sampler and stop-string paths were
   bare. A panic in any of them unwound `worker_loop`, dropping the bounded job
@@ -547,7 +547,7 @@ bf16 output is refused ([#142](https://github.com/yusiwen/minfer/issues/142)).
 🟢 for conversion/quantization of the supported set.
 
 **CPU SIMD.** AVX2 (Advanced Vector Extensions 2) dot kernels exist for
-`Q4_0`/`Q8_0` (`src/quants/dot_q4_0.rs:29`, `src/quants/dot_q8_0.rs:28`), and since
+`Q4_0`/`Q8_0` (`src/quants/dot_q4_0.rs:1-9`, `src/quants/dot_q8_0.rs:28`), and since
 [#56](https://github.com/yusiwen/minfer/issues/56) (2026-10-08) the K-quants too:
 `Q4_K`/`Q5_K`/`Q6_K × Q8_K` have AVX2+FMA kernels (`src/quants/avx2.rs`) and
 AVX-512/VNNI variants (`src/quants/avx512.rs`), dispatched **AVX-512 → AVX2 →
@@ -608,7 +608,7 @@ device-side mask — the mask is host work before any backend runs. Still
 missing: top-n-sigma, adaptive-p, infill. 🟡
 
 **No LoRA (Low-Rank Adaptation) / adapter support.** There is no adapter path
-at all. minfer's `weights_version` field in `GraphParams` (`params.rs:62`) exists
+at all. minfer's `weights_version` field in `GraphParams` (`params.rs:88-98`) exists
 precisely to break reuse on a weight swap, but nothing produces such a swap. 🟡
 
 ---
@@ -620,7 +620,7 @@ parity-only stubs that no architecture emits (`Scale`, `Softmax`, `View`,
 `Reshape`, `Permute`, `AttnMode::Mha` — `COMPUTE-GRAPH-DESIGN.md §1.3`), and
 `View`/`Reshape`/`Permute` execute as copies. CUDA additionally refuses
 `transpose_b` matmul (`cuda_backend.rs:932-937`) and `FusedQkvNorm`
-(`:1289-1321`), and Metal refuses `QkvBiasRopeStore` (`metal_backend.rs:282`) —
+(`:1289-1321`), and Metal refuses `QkvBiasRopeStore` (`metal_backend.rs:656`) —
 so the two GPU backends do not implement the same op set, and a model's decode
 path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
 **Fixed in A8**: `SUPPORT-MATRIX.md` now carries an "Operator Coverage by
@@ -758,7 +758,7 @@ behavioural defects found while executing the plan, already fixed.
 7. **Stale `unreachable!("CUDA pool not implemented")`** in the non-CUDA arms
    (`alloc.rs:333`, `:357`) — misleading text in a live panic path.
 8. ~~**Dead fields in the reuse identity**: `CParams.n_batch` and
-   `GraphParams.n_seqs` are compared by `params_match` (`cache.rs:57-64`) but no
+   `GraphParams.n_seqs` are compared by `params_match` (`cache.rs:95-101`) but no
    builder reads them; every construction site hard-codes 1 / `n_tokens`.~~
    **Fixed in A7, closed in E2**: `n_batch` is deleted; `n_seqs` was kept for
    item 3 and then deleted by it (the sequence count is data — the topology
@@ -770,7 +770,7 @@ behavioural defects found while executing the plan, already fixed.
    by `(node, dst_backend)`; two foreign consumers can now be served.
 10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:1403-1408`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
-    with `copy_to_host` (`alloc.rs:510`).
+    with `copy_to_host` (`alloc.rs:2135-2141`).
 11. **CUDA pool never releases device memory** (`cuda_backend.rs:1355-1362`),
     documented as accepted debt but reasoned about for fixed-shape CLI runs; a
     varying-`n_tokens` workload accumulates one buffer set per distinct shape.

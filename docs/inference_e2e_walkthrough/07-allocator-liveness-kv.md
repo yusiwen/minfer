@@ -657,7 +657,7 @@ different size, it would silently get the old buffer — one reason `n_ctx`
 must stay consistent across a run (§3.3, question 3).
 
 **Excerpt 6 — I32 input filling** (`alloc.rs:437-447` plus the routing tail
-of `fill_input_impl`, `alloc.rs:455-466`).
+of `fill_input_impl`, `alloc.rs:2075`).
 
 ```rust
 /// Fill an I32 input (token ids / positions). Stored as `f32::from_bits`
@@ -743,8 +743,8 @@ CPU store kernel shows the split-brain clearly (`cpu_backend.rs:143-175`):
 K is written through `out_buf` (which the allocator guaranteed is the K
 region), V through the sibling id, both reached with `split_at_mut` for
 disjoint mutable borrows, and positions decoded from the I32 input with
-`to_bits` (`cpu_backend.rs:152-155`) — with a hard error if a position
-exceeds `n_ctx` (`cpu_backend.rs:169-171`), never a silent overflow.
+`to_bits` (`cpu_backend.rs:332-337`) — with a hard error if a position
+exceeds `n_ctx` (`cpu_backend.rs:358-359`), never a silent overflow.
 
 **Excerpt 9 — the pool's two remaining flavors** (`cpu_backend.rs:121-131`;
 `alloc_buffer` was already shown in §2.3, so this is just its siblings).

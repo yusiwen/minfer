@@ -846,7 +846,7 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
   Keep that boundary: pattern pass = local substitution, builder = structural change.
 - **GPU feasibility is a precondition, not a per-node property.** `supports_op(Metal)` says
   nothing about whether the *weights* are resident; that is the model-level all-or-nothing gate
-  (`weights_on_gpu`, qwen2/graph.rs:630) feeding `metal_on`, feeding `enable_metal()`. A
+  (`weights_on_gpu`, qwen2/graph.rs:807) feeding `metal_on`, feeding `enable_metal()`. A
   backend enabled without its weights would abort at the first matmul with "weight not
   registered" — loud, but avoidable.
 - **In-place aliasing interacts with fusion only indirectly** (full story in docs 07/08): the

@@ -5,17 +5,17 @@
 > rebuilt once and then reused for every step** → the same loop runs unchanged
 > on the GPU backends (docs 14–15, which swap out the kernels *inside* the
 > loop, never the loop itself).
-> **Code**: `src/main.rs` (decode loop `main.rs:883-941`, loop setup
-> `main.rs:832-861`, `is_stop_token` `main.rs:1020-1022`), the cached forward
-> `src/models/qwen2/graph.rs::forward_cached` (`graph.rs:403-626`), the reuse
-> decision `src/graph/cache.rs::try_reuse` (`cache.rs:47-64`), the params
-> `src/graph/params.rs` (`GraphParams` `params.rs:52-63`), the allocator's
-> persistent KV regions `src/graph/alloc.rs` (`alloc_graph` `alloc.rs:165`,
-> `ensure_kv` `alloc.rs:385`), the per-step execution
-> `src/graph/scheduler.rs::execute` (`scheduler.rs:123-354`), and the
-> multi-turn session `src/conversation.rs` (`user_turn` `conversation.rs:259`,
-> `generate_assistant_with_logits` `conversation.rs:490`) — lines verified at
-> commit `e7fa0da`.
+> **Code**: `src/main.rs` (decode loop `main.rs:1727-1791`, loop setup
+> `main.rs:1553-1566`, `is_stop_token` `main.rs:1868-1870`), the cached forward
+> `src/models/qwen2/graph.rs::forward_cached` (`graph.rs:450-466`), the reuse
+> decision `src/graph/cache.rs::try_reuse` (`cache.rs:69-85`), the params
+> `src/graph/params.rs` (`GraphParams` `params.rs:88-97`), the allocator's
+> persistent KV regions `src/graph/alloc.rs` (`alloc_graph` `alloc.rs:513`,
+> `ensure_kv` `alloc.rs:995`), the per-step execution
+> `src/graph/scheduler.rs::execute` (`scheduler.rs:137-473`), and the
+> multi-turn session `src/conversation.rs` (`user_turn` `conversation.rs:757-764`,
+> `generate_assistant_with_logits` `conversation.rs:1271-1278`) — lines verified at
+> commit `15fa45c`.
 
 ## 1. Background — where this stage sits
 
@@ -74,7 +74,7 @@ those params — it is input *data***. Equal params ⇒ identical graph ⇒ the
 cached graph, its backend assignment, its buffers, and above all its KV
 regions can be reused as-is; the only thing that changes per step is a handful
 of bytes written into the input nodes. The reuse decision itself is a
-six-field struct comparison in `GraphCache::try_reuse` (`cache.rs:47-64`) —
+six-field struct comparison in `GraphCache::try_reuse` (`cache.rs:69-85`) —
 no graph traversal, no node-by-node diff.
 
 That rule is why the KV regions must live *outside* the graph, in an allocator
@@ -304,7 +304,7 @@ If topology were *not* a pure function of these, a params hit would reuse a
 graph that was subtly wrong for the new inputs — the worst kind of bug,
 because it looks like a numerics problem. The defense is a debug-build-only
 second line of checks: `GraphCache::verify_structural`
-(`cache.rs:92-102`) compares two graphs built from equal params node by node
+(`cache.rs:134-145`) compares two graphs built from equal params node by node
 (op, shape, dependencies) and is wired into tests, so a *non-deterministic*
 builder — the one way params-equality could lie — is caught in CI rather
 than in production. In release builds the six-field comparison is all there
@@ -326,11 +326,11 @@ the graph*; on the "survives" side, everything that *holds data*:
 
 | Survives the rebuild | Recomputed on rebuild |
 |---|---|
-| The `GraphAllocator` itself (it lives inside `GraphCache`, `cache.rs:24-28`) | The node list (`Self::build`, `graph.rs:473`) |
-| Registered weights (registered once by name; `register_weight`, `alloc.rs:136`) | Backend assignment (`assign_backends`, `graph.rs:486`) |
-| **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:385-393`; `alloc_graph` explicitly frees only liveness buffers, `alloc.rs:162-178`) | The fusion pass (`FusionPass::run`, `graph.rs:509-514`) |
-| Backend buffer *pools* (freed liveness buffers return to their pool; the memory is recycled, not released) | The node→buffer mapping (`alloc_graph` clears `node_to_buf`, `alloc.rs:171`) |
-| The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `cache.rs:69-73` + §3.4) | Cross-backend staging buffers (freed and re-materialized on first execute, `alloc.rs:172-178`) |
+| The `GraphAllocator` itself (it lives inside `GraphCache`, `cache.rs:38-45`) | The node list (`Self::build`, `graph.rs:473`) |
+| Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `graph.rs:486`) |
+| **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:995-1002`; `alloc_graph` explicitly frees only liveness buffers, `alloc.rs:513-519`) | The fusion pass (`FusionPass::run`, `graph.rs:509-514`) |
+| Backend buffer *pools* (freed liveness buffers return to their pool; the memory is recycled, not released) | The node→buffer mapping (`alloc_graph` clears `node_to_buf`, `alloc.rs:519`) |
+| The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `cache.rs:106-114` + §3.4) | Cross-backend staging buffers (freed and re-materialized on first execute, `alloc.rs:520-527`) |
 
 The first row is the one that matters most: the allocator is a field of the
 cache, not a local of the forward function, so a rebuild cannot take the KV
@@ -384,7 +384,7 @@ Three gates, three different owners, all on the sampler's output before or
 instead of the next forward (§3.2 walks the code):
 
 1. **End-of-generation token.** The sampled id equals the model's `eos` or
-   `<|im_end|>` (`is_stop_token`, `main.rs:1020-1022`; the ids come from
+   `<|im_end|>` (`is_stop_token`, `main.rs:1868-1870`; the ids come from
    `model.special_tokens()`, `main.rs:839`). Decided in the loop
    (`main.rs:900-902`); the token is *not* appended and *not* fed to the
    graph — the run just ends. (Conversation mode deliberately does the
@@ -419,7 +419,7 @@ and is only read:
 |---|---|---|---|
 | `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`graph.rs:524`) |
 | `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` — starts at `input_ids.len()` (`main.rs:840`), incremented once per step (`main.rs:940`) | same, `graph.rs:526`; the KV store uses it as the write slot, attention as the last readable slot |
-| K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:385-393`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
+| K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:995-1002`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
 | logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `graph.rs:618-625`) | moved into the loop's `logits` variable (`main.rs:932-933`) for the next sample |
 | `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens (`main.rs:847, 903-907`) | the sampler's repeat/frequency/presence penalties (doc 12) |
 | `generated` | `Vec<u32>` | pushed per step (`main.rs:903`) | stop checks, final stats; decode_bytes streams it to stdout |
@@ -560,7 +560,7 @@ Reading it as a state machine, one iteration:
    then top-k → top-p → temperature → one seeded draw. Out comes one token
    id. Note what the loop does *not* do: it never inspects logits itself.
    The 607 KB of scores are noise to everyone but the sampler.
-3. **Gate: EOS.** `is_stop_token` (`main.rs:1020-1022`) is a two-line
+3. **Gate: EOS.** `is_stop_token` (`main.rs:1868-1870`) is a two-line
    comparison against `special.eos` and `special.im_end`. On a hit the loop
    breaks *before* pushing the token: the EOS sentinel is a control
    character, not text — it must not be printed, must not enter
@@ -631,7 +631,7 @@ stop gate fires or (in conversation mode) a guard stops it before the
 regions overflow.
 
 `is_stop_token` itself is the smallest function in the pipeline
-(`main.rs:1020-1022`):
+(`main.rs:1868-1870`):
 
 ```rust
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
@@ -819,7 +819,7 @@ session":
   fresh-process graph. There is no "quick rebuild" path that skips phases;
   determinism (§2.4) is what makes reuse sound, and the rebuild path is
   where that determinism is produced.
-- `replace_graph` (`cache.rs:69-73`) stores the new node list and params,
+- `replace_graph` (`cache.rs:106-114`) stores the new node list and params,
   and stamps the graph with a fresh monotonic `uid` (`cache.rs:22, 70`) —
   the CUDA Graph cache keys captures by uid, so a new topology naturally
   invalidates the old capture while a *reused* graph keeps its uid and its
@@ -860,7 +860,7 @@ or a truncated copy — never a full-`nt` logits matrix (doc 09 covered the
 prefill-side benefit; in decode `n_out == nt == 1`, so the buffer is one
 row regardless).
 
-#### Why the KV survives: the allocator's two kinds of memory (`src/graph/alloc.rs:162-178, 382-403`)
+#### Why the KV survives: the allocator's two kinds of memory (`src/graph/alloc.rs:513-519, 382-403`)
 
 The claim everywhere above is that a rebuild "keeps the KV". The mechanism
 is that the allocator distinguishes two kinds of buffers, and only one kind
@@ -997,7 +997,7 @@ re-walks the split list and executes every node in build order — the
 which backends, which buffers, which splits) is the cached graph's. The
 KV ops resolve their layer's persistent regions by layer index during the
 walk (`scheduler.rs:261-271`) and dispatch to the backend's
-`execute_node` (`scheduler.rs:274-292`) — on a GPU build this is also
+`execute_node` (`scheduler.rs:398`) — on a GPU build this is also
 where the CUDA Graph replay shortcut lives, keyed by the graph's `uid`
 (`scheduler.rs:190-213`): an entire captured split replays as one launch
 per step (doc 15). Doc 08 owns the full split/sync story; here the point
@@ -1041,7 +1041,7 @@ comparison must fail across the prefill→decode boundary.
 
 #### Multi-turn conversation: the delta prefill (`src/conversation.rs:331-341`)
 
-The conversation engine (`GraphEngine`, `conversation.rs:56-80`) wraps the
+The conversation engine (`GraphEngine`, `conversation.rs:113-117`) wraps the
 same `forward_graph_cached` with a *session-private* cache — turn 9 of a
 chat reuses turn 8's decode graph, not just this turn's. When the user
 submits a new message, `user_turn` prefills only the delta:
@@ -1115,7 +1115,7 @@ required to be deterministic in `GraphParams` (each architecture's `build`
 doc-comment carries the invariant, `graph.rs:36-37`), and once that
 contract holds, six field comparisons are a complete decision procedure.
 The failure mode of the contract (a non-deterministic builder) is covered
-in debug builds by `verify_structural` (`cache.rs:92-102`), which
+in debug builds by `verify_structural` (`cache.rs:134-145`), which
 re-derives the graph and compares node-by-node — a test-only safety net
 that keeps the production path comparison-free.
 
@@ -1133,7 +1133,7 @@ keeps every graph immutable and self-describing.
 
 **The allocator lives in the cache, not in the forward call.** The
 `GraphCache` struct holds `graph` *and* `alloc` side by side
-(`cache.rs:24-28`) precisely so that one can be replaced without the other.
+(`cache.rs:38-45`) precisely so that one can be replaced without the other.
 If the allocator were created per forward (or per rebuild), every rebuild
 would zero the KV cache and chat would forget itself at every turn
 boundary; if it were a global keyed by nothing, two concurrent sessions
@@ -1142,7 +1142,7 @@ other's regions. Hence the three ownership tiers that exist in the tree:
 the CLI's plain mode uses a process-wide static cache (`graph_cache()`,
 `graph.rs:796-798` — one run, one session); the conversation engine holds a
 session-private cache (`conversation.rs:56-69`); the server hands each slot
-its own cache via `forward_graph_cached` (`models/mod.rs:65-75`). Same
+its own cache via `forward_graph_cached` (`models/mod.rs:288-298`). Same
 mechanism, scoped ownership.
 
 **Positions as data — the founding decision.** The plan's first revision
@@ -1173,7 +1173,7 @@ would mean periodic huge copies and, on GPU, buffer re-creation; sizing
 once at `n_ctx` means a step's KV write is a plain `copy_from_slice` into
 existing memory (`cpu_backend.rs:167-175`). The cost is bounded by
 `--n-ctx`, which the CLI deliberately decouples from the model's
-`max_seq_len` (`main.rs:744-748` cites the multi-GB over-allocation and
+`max_seq_len` (`main.rs:1448-1451` cites the multi-GB over-allocation and
 first-submit Metal tax this avoids — `docs/PERF-QWEN3-4B-VS-LLAMACPP.md`
 §2). The cursor-derives-`nkv` rule (§2.2) is what makes the slack harmless:
 unread region contents beyond `nkv` are never touched by attention.
@@ -1248,7 +1248,7 @@ difference between the two runs is the QKV fusion itself. The test
 identity half.
 
 **6. Graph uid discipline.** A reused graph keeps its `uid`; a rebuilt one
-gets the next monotonic value (`cache.rs:69-73`). The CUDA backend's
+gets the next monotonic value (`cache.rs:106-114`). The CUDA backend's
 replay cache is keyed by uid (`scheduler.rs:201`, doc 15), so the pairing
 is load-bearing: same uid ⇒ same topology ⇒ replay is valid; new uid ⇒ the
 old capture is orphaned (and simply never requested again). Breaking this —
@@ -1267,7 +1267,7 @@ going anyway.
 **8. `n_ctx` is computed once, before prefill, for both phases.**
 `ctx = params.n_ctx.max(input_ids.len())` (`main.rs:749`) with the comment
 "Computed ONCE so prefill and decode size the same KV regions"
-(`main.rs:744-748`). If prefill and the first decode step disagreed on
+(`main.rs:1448-1451`). If prefill and the first decode step disagreed on
 `ctx`, they would disagree on `CParams`, the params comparison would fail,
 and — worse — `ensure_kv` would have sized regions from the prefill graph
 that the decode graph considers too small. One variable, computed early,
@@ -1307,7 +1307,7 @@ the evidence is on stderr of any plain run.
   visible.
 - **`MINFER_TRACE=<path>`.** Records a per-node data trace; the CLI marks
   the prefill/decode phase boundary (`main.rs:755, 835`), tags each decode
-  step with its sampled token (`set_token`, `main.rs:926-930`), and
+  step with its sampled token (`set_token`, `main.rs:1690-1693`), and
   attaches both the prefill graph and a *separate decode graph* JSON at the
   end (`main.rs:978-996`). Opening the trace in `viz/` shows the two
   topologies side by side — the G3 tail nodes present in one and absent in
