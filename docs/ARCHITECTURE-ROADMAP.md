@@ -183,10 +183,10 @@ fusions become compiler output instead of bespoke ops.
 
 ### 2.2 L2 — Scheduler and execution
 
-**Today.** `assign_backends` walks nodes in build order and assigns the
-highest-priority backend whose `supports_op` returns true
-(`scheduler.rs:60-69`). `split_graph` partitions into *contiguous* same-backend
-runs derived from that positional assignment (`scheduler.rs:73-120`); split
+**Today.** `assign_backends` (`scheduler.rs:68-83`) walks nodes in build order
+and assigns the highest-priority backend whose `supports_op` returns true.
+`split_graph` partitions into *contiguous* same-backend runs derived from that
+positional assignment (`scheduler.rs:73-120`); split
 inputs/outputs are the crossing edges. Execution then walks splits, calling
 `sync_backend(prev)` and `copy_across` for each cross edge
 (`scheduler.rs:176-189`), and finally `sync_backend`.
@@ -401,10 +401,10 @@ sequences in one batch would attend to each other.
 
 The prefill is one graph covering the entire prompt (`main.rs:862-890`):
 `n_ctx = max(--n-ctx, prompt_len)`, one forward with `nt = prompt_len`. The
-server rejects any prompt longer than the slot context (`chat.rs:118-124`) and
-allocates `n_ctx_total / n_slots` per slot (`slot.rs:27-37`). `worker_loop`
-drains the queue **serially, one slot at a time** (`chat.rs:452-518`), and every
-request starts from a fresh `GraphCache` (`chat.rs:77`). Default `--n-slots` is
+server rejects any prompt longer than the slot context (`chat.rs:118-124`);
+`new_slots` (`slot.rs:33-36`) divides `n_ctx_total` equally per slot.
+`worker_loop` drains the queue **serially, one slot at a time** (`chat.rs:452-518`),
+and every request starts from a fresh `GraphCache` (`chat.rs:77`). Default `--n-slots` is
 1 (`main.rs:211`), so the default server is strictly serial with a cold KV per
 request.
 
@@ -452,11 +452,11 @@ Two smaller but immediate items sit in this layer:
 (`graph/registry.rs`, F4) and a trait (`graph/backend.rs:21-98`). The ids are a
 KV-session file-format contract, and the name-keyed registry carries each backend's
 priority, capability matrix and pool hooks; consumers read it instead of matching.
-Before F4 the enum was matched in `GraphAllocator::supports`
-(`alloc.rs:141-158`), `alloc_in_pool`/`alloc_fresh_in`/`free_in_pool`
-(`:315-381`), `sync_backend` (`:560-580`), `copy_across` (`:593-654`), and the
-scheduler's execute match (`scheduler.rs:274-292`) — nine `#[cfg]`-laden match
-sites, each of which had to be taught about a new backend.
+Before F4, adding a backend meant teaching nine `#[cfg]`-laden match sites
+about it: `GraphAllocator::supports` (`alloc.rs:384-386`),
+`alloc_in_pool`/`alloc_fresh_in`/`free_in_pool` (`:819`, `:955`, `:959`),
+`sync_backend` (`alloc.rs:2398`), `copy_across` (`alloc.rs:2447`), and the
+scheduler's execute match (`scheduler.rs:274-292`); the functions are registry-driven now.
 
 GPU participation is decided by an all-or-nothing model-level gate: every weight
 must be registered on the GPU or the model runs on CPU (`ARCHITECTURE.md §5.2`;

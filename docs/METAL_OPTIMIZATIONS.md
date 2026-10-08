@@ -881,7 +881,7 @@ models. Revisit when a >32K-context model is the user-facing one.
 
 **Observed**: 7B run twice in a row → the second run ≈ 2× faster (Total
 1.46 s → 0.77 s). Note the CLI's `Total` timing starts AFTER model load
-(`main.rs:313 infer_start`), so the 2× is in the **inference phases**
+(`main.rs:1442 infer_start`), so the 2× is in the **inference phases**
 (prefill + decode), not the load. Root causes:
 
 | Factor | Effect | Evidence |

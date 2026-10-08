@@ -246,9 +246,9 @@ technicality:
   lm_head down to the `n_out` output rows (`src/models/qwen2/graph.rs:78-84`, `src/models/qwen2/graph.rs:250-251`).
   In decode `n_out == nt == 1`, so those nodes don't exist at all;
 - on a GPU build, the **decode fusions** apply only when `nt == 1`
-  (`src/models/qwen2/graph.rs:120-125`, and the same gate in the `CParams` construction at
-  `src/models/qwen2/graph.rs:578-584`): `Op::FusedQKV` merges 3 matmuls + 3 biases + 2 RoPEs +
-  2 KV stores into one kernel. Different node set ⇒ different graph.
+  (`src/models/qwen2/graph.rs:120-125`), and the same gate in the `CParams` construction
+  (`src/models/qwen2/graph.rs:578-584`): `fuse_qkv`. `Op::FusedQKV` merges 3 matmuls + 3 biases
+  + 2 RoPEs + 2 KV stores into one kernel. Different node set ⇒ different graph.
 
 And then the third row is the payoff: step 2's params and step 3's params are
 *equal* — same `n_tokens`, same `n_out`, same `gtype`, same `cparams` — so

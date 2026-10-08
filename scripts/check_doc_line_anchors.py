@@ -65,6 +65,16 @@ blank line ends the paragraph, so neither carries it into the next line. The pai
 a line that starts outside a span is byte-identical to ``CODE_SPAN``'s, so only wrapped
 lines change (measured on the tree: one anchor, `docs/LLAMA-CPP-MMQ-ANALYSIS.md:241`).
 
+The **within-line** half of the same defect is issue #418: an anchor's own citation is
+normally backtick-wrapped (``(`src/x.rs:42`)``), which leaves its opening backtick in
+the text before the anchor. `symbol_of` reads the text *before* it from the line's
+state (a prefix pairs as the whole line would) but the text *after* it from the parity
+``before`` computes — ``ends_inside(before, starts_inside)``. Read from the line's
+state instead, the anchor's **closing** backtick is taken as an opener and every pair
+after the anchor shifts by one, hiding the symbol adjacent to it. The fix surfaced
+seven live anchors in four docs — all re-pointed in the same change — and credits
+sixteen anchors that were previously blind.
+
 ``D`` **the continuation is range-checked too.** A backticked span whose whole content
 is `:NNN` or `:NNN-MMM` — a second range in the file the line already cited — attaches
 to the nearest *preceding* `path.ext:NNN` match on the same line and is judged against
@@ -479,13 +489,20 @@ def symbol_of(line: str, span: tuple[int, int], starts_inside: bool = False) -> 
     ``starts_inside`` is the state of the anchor's line (``ends_inside`` of the line
     above): a line that continues a wrapped span scans its leading text as that span's
     tail, so the pairing of the two slices below is the state-aware one (issue #383).
-    Both slices are scanned from the *line's* state, as they were scanned from the
-    fixed "outside" state before, so an anchor's own wrapping backtick is still read as
-    an opener on the ``after`` side — a separate, within-line shift of the same family
-    (``(`scheduler.rs:60-69`). `` halves the quote it sits in). Closing it would
-    re-point seven live anchors in four docs and is left to its own ticket.
+
+    The two slices are **not** scanned from the same state. ``before`` is a prefix of
+    the line, so the line's start state pairs it exactly as the whole line would —
+    including the anchor's own opening backtick, which is left as an unpaired opener
+    and dropped. ``after`` begins *past* that opener, so it starts inside the anchor's
+    own quote whenever ``before`` leaves one open: reading it from ``starts_inside``
+    would take the anchor's **closing** backtick as an opener and shift every later
+    pair by one, hiding a symbol genuinely adjacent to the anchor (issue #418). Its
+    state is therefore the parity ``before`` computes — ``ends_inside(before, …)``,
+    which is ``starts_inside ^ (before.count("`") % 2 == 1)`` — so the wrapped
+    anchor's own backticks are one span and the pairing after it is unshifted.
     """
     before, after = line[: span[0]], line[span[1] :]
+    after_inside = ends_inside(before, starts_inside)
     for _start, end, token in reversed(code_spans(before, starts_inside)):
         token = token.strip()
         gap = before[end:]
@@ -494,7 +511,7 @@ def symbol_of(line: str, span: tuple[int, int], starts_inside: bool = False) -> 
         if looks_like_symbol(token):
             return token
         break
-    for start, _end, token in code_spans(after, starts_inside):
+    for start, _end, token in code_spans(after, after_inside):
         token = token.strip()
         gap = after[:start]
         if len(gap) > ADJACENT_GAP or not GAP_FILLER.match(gap):
@@ -1255,6 +1272,68 @@ def selftest() -> int:
         "a continuation on a wrapped line is found",
     )
     expect(conts and conts[0].verdict == "ok", "and judged against the anchor it follows")
+
+    # 8c. A backtick-wrapped anchor (#418). The normal citation shape —
+    #     ``(`src/thing.rs:42`)`` — leaves an *open* span in the text before the
+    #     anchor, so the slice after it begins inside that span. Read from the line's
+    #     state, the anchor's **closing** backtick is taken as an opener and every pair
+    #     after it shifts by one, hiding the symbol genuinely adjacent to the anchor.
+    #     The parity is ``ends_inside(before, starts_inside)``; the two controls below
+    #     keep it from inventing a symbol or shifting an unwrapped line.
+    wrapped_anchor = "Cite (`src/thing.rs:42`) `tail_20` here."
+    wspan = ANCHOR.search(wrapped_anchor).span()
+    expect(
+        ends_inside(wrapped_anchor[: wspan[0]], False) is True,
+        "the wrapped anchor leaves an open span before it (the parity is inside)",
+    )
+    expect(
+        symbol_of(wrapped_anchor, wspan, False) == "tail_20",
+        "a wrapped anchor sees the symbol after its closing backtick (the fix)",
+    )
+    report = _run_case({"docs/wrap.md": wrapped_anchor + "\n"})
+    rows = [a for a in report.anchors if a.doc == "docs/wrap.md"]
+    expect(rows and rows[0].symbol == "tail_20", "... and rule C names it")
+    expect(_verdicts(report, "docs/wrap.md") == ["ok"], "... and the cited :42 holds it")
+
+    # The same shape with a neighbour the citation does not hold: the fix *surfaces*
+    # it as the rule-E miss the sentence claims (the seven-anchor class of #418)
+    # instead of silently crediting nothing.
+    missed = "Cite (`src/thing.rs:42`) `target_symbol` here."
+    expect(
+        _range_miss(_run_case({"docs/wrap.md": missed + "\n"}), "docs/wrap.md") == 21,
+        "the now-visible neighbour is judged against the cited range",
+    )
+    expect(
+        _exit_code({"docs/wrap.md": missed + "\n"}) == 1,
+        "and a wrapped anchor whose neighbour is outside its range fails the run",
+    )
+
+    # Control 1: no symbol after the wrapped anchor. The parity must *see* symbols,
+    # not invent one, so the line stays silent and the run stays green.
+    absent = "Cite (`src/thing.rs:42`) here."
+    aspan = ANCHOR.search(absent).span()
+    expect(symbol_of(absent, aspan, False) is None, "no adjacent symbol -> None")
+    report = _run_case({"docs/wrap.md": absent + "\n"})
+    expect(_verdicts(report, "docs/wrap.md") == ["ok"], "the absent-symbol control stays ok")
+    expect(_range_miss(report, "docs/wrap.md") is None, "and carries no rule-E miss")
+    expect(_exit_code({"docs/wrap.md": absent + "\n"}) == 0, "and the run stays green")
+
+    # Control 2: a line with no wrapping is unchanged. Here the text before the anchor
+    # is backtick-balanced, so the parity is False and the ``after`` slice reads
+    # exactly as it did before #418 (a mutation that forces the parity on would lose
+    # the symbol below).
+    plain = "See `a` then src/thing.rs:42 `tail_20`."
+    pspan = ANCHOR.search(plain).span()
+    expect(
+        ends_inside(plain[: pspan[0]], False) is False,
+        "an unwrapped anchor on a balanced line leaves no open span",
+    )
+    expect(
+        symbol_of(plain, pspan, False) == "tail_20",
+        "an unwrapped anchor keeps the symbol after it (the pairing is unshifted)",
+    )
+    report = _run_case({"docs/wrap.md": plain + "\n"})
+    expect(_verdicts(report, "docs/wrap.md") == ["ok"], "and its report verdict is unchanged")
 
     # 9. The exit codes, end to end.
     expect(
