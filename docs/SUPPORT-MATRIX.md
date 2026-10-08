@@ -163,12 +163,15 @@ Notes:
   f16-tile staging dequantizes each packed block, so the tensor-core route is
   offered for a packed cell too (#144: Qwen3-0.6B `pp2048` 564.5 → 8231.1 tok/s).
   Still off their tuned route, and stated: the verify band (`1 < nt ≤ 16`) takes
-  the general layout-tagged kernel, the hybrid 4-warp decode dispatch is
-  f16-typed, and a **`dp4a` packed K dot** is a follow-up (it is a numerics
-  change needing its own accuracy statement). The general layout-tagged kernel
-  remains the fallback for every packed path. A **speculative** session refuses a
-  packed cache outright (its greedy identity contract rests on the batched split
-  kernel). See `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 C4 #144 and
+  the general layout-tagged kernel and the hybrid 4-warp decode dispatch is
+  f16-typed. The **`dp4a` packed K dot is not a follow-up** — it landed in
+  [#186](https://github.com/yusiwen/minfer/issues/186) (`cc19b4f`, 2026-09-27) as
+  the packed decode route, and `docs/ARCHITECTURE-EXECUTION-PLAN.md` §C4 #186
+  records it **DONE** with its tolerance class re-measured. The general
+  layout-tagged kernel remains the fallback for every packed path. A
+  **speculative** session refuses a packed cache outright (its greedy identity
+  contract rests on the batched split kernel). See
+  `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 C4 #144 and
   `docs/cuda_optimization_steps/107-c4-packed-q8-kv-cuda.md`.
 - **A Q8_0 cell width must be a whole number of 32-element blocks** (so `n_kv_embd
   % 32 == 0`, which every supported architecture satisfies); `ensure_kv` refuses
