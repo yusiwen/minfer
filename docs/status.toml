@@ -144,14 +144,14 @@ box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "unit"
 command = "cargo test --release"
 date = "2026-10-07"
-passed = 490
+passed = 491
 failed = 0
 ignored = 40
 integration_passed = 10
 integration_failed = 0
 integration_ignored = 6
 live_check = false
-note = "recorded measurement; CI runs x86_64; the +4 over the 2026-10-06 measurement are #205's three fixture-manifest tests (the manifest reader, the outside-the-cache arm and the tampered-cache refusal) plus #349's parity-verdict classifier, and the +1 on top is #306's format-aware physical-shift gate; the next +1 is #362's platform-neutral `every_device_gathers_the_attn_map`; #354 adds two more platform-neutral tests (the manifest-override resolver arm and the broken-override refusal), measured on dgxspark 2026-10-07 — 488 -> 490"
+note = "recorded measurement; CI runs x86_64; the +4 over the 2026-10-06 measurement are #205's three fixture-manifest tests (the manifest reader, the outside-the-cache arm and the tampered-cache refusal) plus #349's parity-verdict classifier, and the +1 on top is #306's format-aware physical-shift gate; the next +1 is #362's platform-neutral `every_device_gathers_the_attn_map`; #354 adds two more platform-neutral tests (the manifest-override resolver arm and the broken-override refusal), measured on dgxspark 2026-10-07 — 488 -> 490; #310 adds one platform-neutral pure test of `packed_attn_route` (the packed Metal routing matrix) — 490 -> 491, derived from the Mac measurement because the test compiles on every configuration"
 file = "AGENTS.md"
 regex = 'CPU unit, box `(?P<box>[^`]+)`, `cargo test --release`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
 
@@ -161,14 +161,14 @@ box = "x86_64 (CI runner)"
 suite = "unit"
 command = "cargo test --release"
 date = "2026-10-08"
-passed = 491
+passed = 492
 failed = 0
 ignored = 41
 integration_passed = 10
 integration_failed = 0
 integration_ignored = 6
 live_check = true
-note = "compared live by the test-linux-cpu job; the first direct measurement of the x86_64 suite (#56): 491 = aarch64 (490) - the two cfg(aarch64) `quants::neon_correctness` tests + the three new cfg(x86_64) `quants::avx2_correctness` gates, and ignored 41 = aarch64 40 + that module's `#[ignore]`d `kquant_simd_dot_speedup` harness"
+note = "compared live by the test-linux-cpu job; the first direct measurement of the x86_64 suite (#56): 492 = aarch64 (491) - the two cfg(aarch64) `quants::neon_correctness` tests + the three new cfg(x86_64) `quants::avx2_correctness` gates, and ignored 41 = aarch64 40 + that module's `#[ignore]`d `kquant_simd_dot_speedup` harness; the aarch64 491 carries #310's platform-neutral `packed_route_covers_the_matrix`"
 file = "AGENTS.md"
 regex = 'CPU unit, box `(?P<box>[^`]+)`, `cargo test --release`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
 
@@ -248,14 +248,14 @@ box = "macbook (macOS 27.0.1, Apple M4 Pro)"
 suite = "unit"
 command = "cargo test --release --no-fail-fast"
 date = "2026-10-08"
-passed = 550
+passed = 553
 failed = 0
 ignored = 45
 integration_passed = 21
 integration_failed = 0
 integration_ignored = 6
 live_check = false
-note = "recorded measurement; CI's build-macos compiles the test target but has no Metal device; the +5 over the previous 545 are #310's packed-Q8_0 KV gates in graph::metal_backend::tests::packed_kv (the byte-identical store, the causal decode/prefill, the one-range attn_span and the kv_map window, and the C5 FLAG_PACKED round trip) plus the +1 ignored real-model gate, so the ignored row moved 44 -> 45; #310 is a DRAFT: the packed path is implemented but NOT enabled (READS_PACKED_KV stays false, so MINFER_CACHE_TYPE=q8_0 is still refused on Metal — the fast families refuse packed and the classic fallback costs 4-17x), and these gates reach it through the thread-local #[cfg(test)] capability seam registry::set_force_packed_kv; the +1 under the 542 baseline is #369's fast-map gate window_map_flash_matches_the_cpu_reference; the +1 under that is #359's fast-windowed-kernel gate window_flash_matches_the_cpu_reference; the +3 under that are #362's two Metal kv_map window gates plus the pure every_device_gathers_the_attn_map, and the earlier +4 are #205's three fixture-manifest tests plus #349's parity-verdict classifier with the +1 on top being #306's platform-neutral format-aware shift gate; the +2 over the #54 baseline are #329's dispatch-refusal gate and #299's weights-charged E4 gate; the +1 ignored before this round is #315's macOS-only #[ignore]d windowed-prefill measurement harness (passed unchanged); #354's two platform-neutral manifest-override tests are derived here (543 -> 545), not re-measured on a Mac"
+note = "recorded measurement; CI's build-macos compiles the test target but has no Metal device; #310 is now ENABLED (Metal READS_PACKED_KV = true, so MINFER_CACHE_TYPE=q8_0 loads on Metal) and adds three tests over the previous 550: the platform-neutral pure `packed_route_covers_the_matrix` (the routing matrix) plus the macOS-only `metal_packed_decode_stage_matches_the_native_read` (the mechanism-A/B differential) and `metal_packed_window_stages_at_the_absolute_row` (the absolute-row staging arm the zero-lo_min gates cannot see) — 550 -> 553; the underlying +5 (the byte-identical store, the causal decode/prefill, the one-range attn_span and the kv_map window, and the C5 FLAG_PACKED round trip) and the +1 ignored real-model gate are the earlier #310 gates (the ignored row stays 45); the +1 under the 542 baseline is #369's fast-map gate window_map_flash_matches_the_cpu_reference; the +1 under that is #359's fast-windowed-kernel gate window_flash_matches_the_cpu_reference; the +3 under that are #362's two Metal kv_map window gates plus the pure every_device_gathers_the_attn_map, and the earlier +4 are #205's three fixture-manifest tests plus #349's parity-verdict classifier with the +1 on top being #306's platform-neutral format-aware shift gate; the +2 over the #54 baseline are #329's dispatch-refusal gate and #299's weights-charged E4 gate; the +1 ignored before this round is #315's macOS-only #[ignore]d windowed-prefill measurement harness (passed unchanged); #354's two platform-neutral manifest-override tests are derived here (543 -> 545), not re-measured on a Mac"
 file = "AGENTS.md"
 regex = 'macOS unit, box `(?P<box>[^`]+)`, `cargo test --release --no-fail-fast`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
 
@@ -268,7 +268,7 @@ date = "2026-10-08"
 passed = 45
 failed = 0
 live_check = false
-note = "recorded measurement; no residual — #362 gave Metal the set-valued kv_map gather, so a_store_inside_a_shared_prefix_takes_a_private_row passes; the set is 45 because #310's macOS-only #[ignore]d metal_q8_0_kv_answers_like_f32_on_a_real_model gate joined the --ignored set (44 -> 45), after #315's gate had taken it 42 -> 43; the #310 gate enables the capability for its own run via the #[cfg(test)] thread-local seam (production still refuses q8_0 on Metal)"
+note = "recorded measurement; no residual — #362 gave Metal the set-valued kv_map gather, so a_store_inside_a_shared_prefix_takes_a_private_row passes; the set is 45 because #310's macOS-only #[ignore]d metal_q8_0_kv_answers_like_f32_on_a_real_model gate joined the --ignored set (44 -> 45), after #315's gate had taken it 42 -> 43; since #310 enabled Metal's packed read, the gate drives the production capability directly (no test seam)"
 file = "AGENTS.md"
 regex = 'macOS real-model set, box `(?P<box>[^`]+)`, `PARALLEL=0 scripts/real_model_gates\.sh` \(serial\), (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) / (?P<failed>[0-9]+)\*\*'
 

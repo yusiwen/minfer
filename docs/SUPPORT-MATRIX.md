@@ -147,7 +147,7 @@ never silently mapped to f32.
 |---|---|:---:|:---:|:---:|
 | `f32` (default) | 4 B/element, f32 | ✅ | ✅ | ✅ |
 | `f16` | 2 B/element in the f32-shaped region | → f32 | ✅ | ✅ |
-| `q8_0` | packed Q8_0 blocks, 34 B per 32 elements, cell padded to whole f32 words | ✅ (C4 S1+S2) | ✅ (C4 S2b) | ❌ — implemented on the #310 draft branch but **not enabled** (the fast families refuse packed and the classic fallback costs 4–17×; see the note) |
+| `q8_0` | packed Q8_0 blocks, 34 B per 32 elements, cell padded to whole f32 words | ✅ (C4 S1+S2) | ✅ (C4 S2b) | ✅ (C4 S2b, #310 enabled) |
 
 Notes:
 
@@ -173,21 +173,22 @@ Notes:
   contract rests on the batched split kernel). See
   `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 C4 #144 and
   `docs/cuda_optimization_steps/107-c4-packed-q8-kv-cuda.md`.
-- **Metal ([#310](https://github.com/yusiwen/minfer/issues/310)) — implemented but NOT enabled.**
-  The `#310` branch carries the whole packed path: `kernel_store_kv_q8_0` writes the same bytes as
-  the CPU quantizer, and `kernel_gqa_attn_q8_0` (classic causal) plus
-  `kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0` read the packed cells directly. But
-  `READS_PACKED_KV` stays **false**: the **fast** causal families (flash decode, split, flash
-  prefill, parallel prefill) and the fast windowed-flash family are f32/f16-only — a packed region
-  is refused them by the dispatch (their simdgroup loads cannot transform a packed cell) — so an
-  enabled packed Metal run would take the classic kernel. The memory win is 3.76×; the speed cost is
-  measured and severe (`macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-08, `minfer bench -p 1024 -n
-  64 -r 3 --n-ctx 2048`, 3 interleaved runs, capability force-enabled for the measurement):
-  Qwen3-0.6B `pp1024` 4835 → 291 tok/s and `tg64` 196.2 → 18.1 tok/s, Qwen2.5-0.5B `pp1024` 6196 →
-  1492 and `tg64` 298.1 → 43.3; region sizes 58 720 256 → 15 597 568 B and 6 291 456 → 1 671 168 B
-  (both 3.76×). **Enabling packed KV on Metal requires packing the fast families first**; until then
-  Metal refuses `MINFER_CACHE_TYPE=q8_0` and `f16` remains the default.
-  `docs/METAL-BACKEND-DESIGN.md` §4.4 records the implementation, the refusal and the gates.
+- **Metal ([#310](https://github.com/yusiwen/minfer/issues/310)) — enabled.**
+  `kernel_store_kv_q8_0` writes the same bytes as the CPU quantizer. Two read mechanisms cover every
+  attention shape, selected by the pure `crate::metal::packed_attn_route`: **mechanism A** reads packed
+  cells natively in the decode flash family (`kernel_flash_attn_ext_q8_0` / `_hd128_q8_0`, `nt == 1`,
+  `hd ∈ {64,128}`); **mechanism B** dequantizes the needed window into a transient **f32** stage
+  (`kernel_dequant_kv_q8_0_to_f32`) and runs the unchanged f32 prefill / windowed-flash family. The
+  classic `kernel_gqa_attn_q8_0` / `_window_q8_0` / `_map_q8_0` remain the fallback for a small/odd
+  `hd`, an `nt == 1` explicit window and any `MINFER_NO_*` opt-out. `READS_PACKED_KV` is now **true**,
+  so `MINFER_CACHE_TYPE=q8_0` loads and runs on Metal. The memory win is 3.76×; the measured speed
+  (`macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-08, `minfer bench -p 1024 -n 64 -r 3 --n-ctx 2048`,
+  3 interleaved runs, medians; f16 baseline): Qwen3-0.6B `pp1024` 4844 → 4683 tok/s (0.967×) and `tg64`
+  193.5 → 176.6 (0.913×), Qwen2.5-0.5B `pp1024` 6175 → 6154 (0.997×) and `tg64` 295.7 → 245.5 (0.830×);
+  region sizes 58 720 256 → 15 597 568 B and 6 291 456 → 1 671 168 B (both 3.76×). The stage is f32, not
+  f16: f16 staging's second rounding was measured to amplify to 16.9 logit delta on Qwen3-0.6B over 8
+  decode steps, outside the inherited C4 class; f32 staging restores it (1.28 / 0.36) at parity speed.
+  `docs/METAL-BACKEND-DESIGN.md` §4.4 records the mechanisms, the measurements and the gates.
 - **A Q8_0 cell width must be a whole number of 32-element blocks** (so `n_kv_embd
   % 32 == 0`, which every supported architecture satisfies); `ensure_kv` refuses
   anything else.

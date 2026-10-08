@@ -129,10 +129,12 @@ and the struct is `unsafe impl Send/Sync` on that basis.
   explicit `f16` argument to every store/attention/fused decode. There is **no** process-wide
   Metal tag any more: the old `metal::KV_F16` `OnceLock`, `kv_cache_is_f16` and `set_kv_cache_type`
   were deleted in #44 part (b), so two engines with different dims can hold different layouts in
-  one process. A third value, `q8_0`, is the packed cache the CPU and CUDA kernels read since C4;
-  Metal's packed path is **implemented but not enabled** ([#310](https://github.com/yusiwen/minfer/issues/310)):
-  `READS_PACKED_KV` stays `false` (the fast families refuse packed and the classic fallback costs
-  4–17×), so Metal still **refuses** `MINFER_CACHE_TYPE=q8_0`. `f16` remains the device default.
+  one process. A third value, `q8_0`, is the packed cache the CPU, CUDA and Metal kernels read;
+  Metal's packed path is **enabled** ([#310](https://github.com/yusiwen/minfer/issues/310)):
+  `READS_PACKED_KV` is `true`, two read mechanisms cover every shape (mechanism A native packed
+  decode, mechanism B an f32 staging window for the fast prefill/window families), and the classic
+  packed kernels stay the fallback — `MINFER_CACHE_TYPE=q8_0` loads and runs. `f16` remains the
+  device default.
 
 ### 2.4 Command buffers and submission
 
@@ -414,58 +416,68 @@ true for Metal, so both explicit layouts are read on the device. The causal path
 parallel-prefill / classic) are **byte-untouched**: the windowed families are used only for an
 explicit window, so a single-sequence causal forward keeps its previous numbers.
 
-**Packed `q8_0` is implemented but NOT enabled ([#310](https://github.com/yusiwen/minfer/issues/310)).**
-This branch carries the whole path — the packed store (`kernel_store_kv_q8_0`, byte-identical to the
-CPU quantizer), the direct classic/window/map reads (`kernel_gqa_attn_q8_0` /
-`kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0`) and the C5 `FLAG_PACKED` session round
-trip — but **`READS_PACKED_KV` stays `false`**, so Metal still **refuses `MINFER_CACHE_TYPE=q8_0`**
-and `GraphAllocator::ensure_kv` still refuses a packed Metal region. The reason is the measured cost
-below: the fast families have no packed kernel, so an enabled region falls to the classic tiled
-kernel at **4–17×** the f16 route. The implementation is kept (a draft for the enabling PR) because
-the store and reads are correct; the gates drive it through a documented `#[cfg(test)]` capability
-seam (`registry::set_force_packed_kv`, thread-local, so it cannot leak into another test) rather than
-shipping the flip. The real-model twin of the CUDA C4 gate
-(`metal_q8_0_kv_answers_like_f32_on_a_real_model`) puts a loaded Qwen2.5-0.5B / Qwen3-0.6B engine's
-Q8_0 logits inside the C4 tolerance class (at the argmax ≤ 1.0, tail ≤ 4.0 of the spread).
+**Packed `q8_0` KV is enabled ([#310](https://github.com/yusiwen/minfer/issues/310)).** Metal reads a
+packed region: `READS_PACKED_KV = true` (the registry's `reads_packed_kv`, which
+`GraphAllocator::ensure_kv` and `KvFormat::Q8_0::supports` read), so `MINFER_CACHE_TYPE=q8_0` loads
+and runs on Metal and a C5 session file carries `FLAG_PACKED`. The store
+(`kernel_store_kv_q8_0`, byte-identical to the CPU quantizer) and **two read mechanisms** cover every
+attention shape, selected by the pure `crate::metal::packed_attn_route`:
 
-**Why the fast families refuse a packed region.** `kernel_flash_attn_ext_{f32,f16}[_hd128]`
-(decode), `kernel_gqa_attn_partial_{f32,f16}` (split), `kernel_flash_attn_blk_*` (prefill),
-`kernel_attn_{scores,output}`/`kernel_softmax_attn` (parallel prefill) and
-`kernel_flash_attn_window_{blk,map}_*` are f32/f16-only — the simdgroup-matrix prefill family loads
-K/V tiles straight from global memory (`simdgroup_load`), so a packed cell cannot be transformed in
-place. A packed region therefore takes the classic `kernel_gqa_attn_q8_0` (causal) or the
-`kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0` correctness kernels, selected by the
-`if self.kv_packed()` arm before any fast-family branch — an explicit selection, never a silent f32
-fallback. `metal_packed_prefill_matches_the_dequantized_reference` pins it: dropping that arm takes
-the fast prefill family over packed bytes and the gate goes red at max |Δ| ≈ 1.3e37. **Enabling
-packed KV requires packing those families first**; the measured cost of the classic fallback is the
-reason it is not enabled today. Each explicit layout still has two families — a **fast** prefill family
-(the one-range `blk` family, [#359](https://github.com/yusiwen/minfer/issues/359); the map family,
-[#369](https://github.com/yusiwen/minfer/issues/369)) and the #44/#362 **correctness** family, still
-the reference and still serving every other explicit-span shape; a packed explicit window keeps the
-correctness kernel (its Q8_0 variant), the fast one being f32/f16-only. Keeping them separate is what
-leaves the causal instruction streams (and their measured numbers) byte-identical. Issue
-[#315](https://github.com/yusiwen/minfer/issues/315) measured the correctness families as
-**materially slower** than the causal flash prefill; [#359](https://github.com/yusiwen/minfer/issues/359)
-and [#369](https://github.com/yusiwen/minfer/issues/369) added the fast families and re-measured —
-the records follow.
+- **Mechanism A — native packed reads in the decode flash family.** `kernel_flash_attn_ext_q8_0` and
+  `kernel_flash_attn_ext_hd128_q8_0` (`fa_decode.metal`) are the f16 kernels' twins — the same
+  threadgroup layout, chunk loop, barriers, `MINF_MAXHALF` masking and `partial` buffer, so the shared
+  `kernel_gqa_attn_combine_f32` merges them unchanged. Only the per-lane K/V read changes: one 34-byte
+  block's four dequantized elements via `dequant_q8_0_kv4` (`dequantize.h`, four scalar byte loads —
+  a block begins at `row*row_bytes + 34*b`, and `34*b` is `2 mod 4` for odd `b`, so no vector load is
+  alignment-safe). `row_bytes` is the one added argument (buffer 11), so buffers 0..10 keep their
+  indices. `nt == 1`, `hd ∈ {64,128}`, causal.
+- **Mechanism B — an f32 staging window for every other packed path.** `kernel_dequant_kv_q8_0_to_f32`
+  (`kv.metal`) dequantizes the needed window of packed cells into a transient, arena-addressed **f32**
+  scratch buffer (row `i` = cell `i`), then the *unchanged* f32 prefill (`kernel_flash_attn_blk_*`) or
+  windowed-flash (`kernel_flash_attn_window_{blk,map}_*`) family runs against it with `f16 = false`.
+  Because the stage is arena-addressed, the windowed kernels keep their absolute `lo_min` addressing
+  and the tail-pad kernel its relative offset — no kernel in those families is edited. `nt > 1` causal
+  prefill and every `nt > 1` explicit window.
+- Anything neither covers — a small/odd `hd`, an `nt == 1` explicit window, any `MINFER_NO_*` opt-out
+  — keeps the classic packed kernels `kernel_gqa_attn_q8_0` / `kernel_gqa_attn_window_q8_0` /
+  `kernel_gqa_attn_map_q8_0`, still reachable and still the correctness fallback.
+
+`MINFER_PACKED_KV_STAGE=1` routes a shape mechanism A would take through mechanism B, so the decode
+A/B is measurable; the differential gate (`metal_packed_decode_stage_matches_the_native_read`) drives
+that switch through a `#[cfg(test)]` thread-local rather than the environment.
+
+**Why f32 staging, not f16.** Staging to f16 would round every already-Q8_0-dequantized cell element a
+**second** time. The extra rounding is small per element, but on Qwen3-0.6B it is amplified through 8
+decode steps: the interleaved f16-stage run measured **max |Δlogit| 16.9** (at the argmax 9.46) against
+the f32 engine, over the same prompt where the classic f32-dequant packed path measures **1.29 / 0.43**
+and the f16 cache measures **0.011**. The prefill-step delta is tiny (0.19) but compounds; the
+mechanism is the decode trajectory's sensitivity to the specific error realization, not a kernel
+fault. f32 staging removes the second rounding and restores the classic / CUDA class
+(`docs/SUPPORT-MATRIX.md`): the ignored real-model gate measures **1.28 / 0.36** on Qwen3-0.6B and
+**2.37 / 0.46** on Qwen2.5-0.5B, both inside the inherited ≤ 4.0 tail / ≤ 1.0 argmax bars — at
+**parity speed** (below).
 
 **Measured (issue [#310], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
-2026-10-08).** Size and speed with the capability force-enabled (the draft measurement; the shipped
-default refuses `q8_0`), `MINFER_CACHE_TYPE=f16` vs `q8_0`, 3 interleaved runs
-(`minfer bench -p 1024 -n 64 -r 3 --n-ctx 2048`, medians; `q8_0` runs the classic packed kernels
-because the fast families are refused):
+2026-10-08).** Size and speed with the capability enabled and the two mechanisms in place,
+`MINFER_CACHE_TYPE=f16` vs `q8_0`, 3 interleaved runs (`minfer bench -p 1024 -n 64 -r 3 --n-ctx 2048`,
+medians):
 
 | model | KV regions f32 vs q8_0 | pp1024 f16 → q8_0 | tg64 f16 → q8_0 |
 |---|---|---|---|
-| Qwen3-0.6B Q8_0 (`hd` 128) | 58 720 256 B → 15 597 568 B (**3.76×**) | 4 835 → 291 tok/s (**0.060×**) | 196.2 → 18.1 tok/s (**0.092×**) |
-| Qwen2.5-0.5B Q4_0 (`hd` 64) | 6 291 456 B → 1 671 168 B (**3.76×**) | 6 196 → 1 492 tok/s (**0.241×**) | 298.1 → 43.3 tok/s (**0.145×**) |
+| Qwen3-0.6B Q8_0 (`hd` 128) | 58 720 256 B → 15 597 568 B (**3.76×**) | 4 844 → 4 683 tok/s (**0.967×**) | 193.5 → 176.6 tok/s (**0.913×**) |
+| Qwen2.5-0.5B Q4_0 (`hd` 64) | 6 291 456 B → 1 671 168 B (**3.76×**) | 6 175 → 6 154 tok/s (**0.997×**) | 295.7 → 245.5 tok/s (**0.830×**) |
 
-The memory win is 3.76×. The speed cost is why the path is **not enabled**: with the fast families
-refusing packed, an enabled region drops to the classic O(`nt`·`nkv`) kernel — prefill 0.5B
-6 196 → 1 492 tok/s and Qwen3-0.6B 4 835 → 291; decode 298.1 → 43.3 and 196.2 → 18.1. Enabling it needs
-packed kernels in the fast causal/windowed families; until then the loud refusal is the shipped
-behaviour. This is the documented asymmetry, not a silent one.
+The memory win is 3.76×. Prefill (mechanism B) lands within noise of f16 (0.997× / 0.967×); decode
+(mechanism A) is **1.20× / 1.10× slower** than f16 — the native packed kernel issues five 2-byte
+loads per lane against the f16 kernel's one vectorized `half4`, so at these short, dispatch-bound
+contexts it is LSU-bound rather than bandwidth-bound and the 34 B/32-element read does not pay off.
+That is inside the CUDA precedent after [#144](https://github.com/yusiwen/minfer/issues/144)
+(1.01–1.24×). `MINFER_PACKED_KV_STAGE=1` on the 0.5B
+`tg64` shape (mechanism B decode: dequantize, then the f32 flash) measures **238.8 tok/s**, ~2.7%
+below mechanism A's 245.5 — the stage cost is small and the mechanism-A decode is the slower one. The
+gate `metal_packed_decode_stage_matches_the_native_read` pins A vs B at max |Δ| **1.7e-8** (f32
+reduction order). This is the enabled behaviour, not a refusal.
+
 
 **Measured (issue [#315], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
 2026-10-07).** Bar named before the run (`docs/GATE-CONTRACT.md` rules 3 and 5): the windowed
@@ -613,8 +625,9 @@ one cell changes the output (the rule-2 control). The #44 correctness gates
   layouts and a C5 session header is described under the width its region really uses (the
   registry `kv_format` hook reads the allocator's stamp so it answers before the pool is
   enabled — the CUDA hook's shape). Gate `metal_kv_format_is_per_engine`.
-- **Packed `q8_0`** stays refused; [#310](https://github.com/yusiwen/minfer/issues/310) is the
-  follow-up and `docs/SUPPORT-MATRIX.md` carries the asymmetry.
+- **Packed `q8_0`** is enabled since [#310](https://github.com/yusiwen/minfer/issues/310)
+  (`READS_PACKED_KV = true`); §4.4 records the two mechanisms and the measurements, and
+  `docs/SUPPORT-MATRIX.md` carries the format row.
 
 The decode chunk count is `MINFER_ATTN_CHUNKS` or `((max_pos + 1 + 31) / 32).clamp(1, 16)` — one
 chunk per 32 KV rows, capped at 16. `nkv` for the prefill kernels and the chunk count come from a
