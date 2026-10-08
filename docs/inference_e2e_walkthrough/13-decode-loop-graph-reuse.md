@@ -195,27 +195,27 @@ the loop is running as fast as RAM allows.
 
 **Budget 3 — attention (shrinks from quadratic to one scan).** Prefill
 attention is causal all-pairs work over `nt` queries (doc 11); decode has
-**one** query, which scans the `nkv` keys cached so far. `nkv` is *derived
-from the positions input at execution time* — `execute_node` (`cpu_backend.rs:308`):
+**one** query, whose scan a *data* window bounds: the allocator resolves it
+from the KV cell store and hands it to the kernel as the `attn_span` /
+`kv_map` input (E1, C8b). The CPU path decodes that window — `decode_window`
+(`cpu_backend.rs:683`):
 
 ```rust
-// `execute_node` (src/graph/cpu_backend.rs:308)
-                // current KV size = max position + 1
-                let nkv = (0..nt)
-                    .map(|t| ins[2][t].to_bits() as usize + 1)
-                    .max()
-                    .unwrap_or(0)
-                    .min(n_ctx);
+                // E1/C8b S2: the allowed cells are an explicit input, not a bound
+                // derived from `positions` — that is what lets a batch hold several
+                // sequences, and (S2) what lets one query's window be a list of runs.
+                // The allocator resolved it from the cell store; here it is only
+                // validated and decoded.
+                let (runs, off) = decode_window(ins[3], nt, n_ctx)?;
 ```
 
 No field of the graph knows or cares how large the cache has grown; the
-attention kernel reads `nkv = position + 1` rows out of a region that was
-allocated at the full `n_ctx` from the start. That is the whole reason a
-fixed graph can serve a growing cache (§2.4). The cost of this budget grows
-linearly with context: one decode step at `nkv = 1024` reads K and V regions
-of `2 × 24 layers × 128 channels × 1024 slots × 4 B ≈ 24 MB`; by `n_ctx =
-4096` it reads ~96 MB per step. Long generations get slower for this reason
-alone — same graph, bigger window.
+kernel reads exactly the cells the window names out of a region allocated at
+the full `n_ctx` from the start — the whole reason a fixed graph can serve a
+growing cache (§2.4). The cost grows linearly with context: at `nkv = 1024`
+a decode step reads ≈ 24 MB of K/V (`2 × 24 layers × 128 × 1024 × 4 B`), and
+~96 MB at `n_ctx = 4096`. The position-derived `nkv = max_pos + 1` predates
+E1 (PR #3, 2026-09-17) and now lives only on Metal (`metal_backend.rs:1324-1325`).
 
 **What reuse removes.** Build + assign + fuse + allocate are per-*graph*
 costs, not per-token math. Reuse means a decode step pays only: two small
@@ -367,8 +367,8 @@ the token at position `p`), which makes the whole session strategy possible:
 - **Rollback without erasing.** `/regen` rewinds `current_pos` to
   `turn_pos` (the start of the last turn's delta) and regenerates
   (`conversation.rs:965-977`, the `regen_turn` rollback). The rolled-back slots in the KV region are
-  now *stale but never read*: attention only scans slots `0..=nkv-1`, and
-  `nkv` follows the cursor. Regeneration simply overwrites those slots as
+  now *stale but never read*: attention reads only the window the cursor
+  bounds. Regeneration simply overwrites those slots as
   it appends. (A full `/clear` or a template mismatch falls back to
   `rehydrate_full` — reset the cache, re-render everything, re-prefill
   once, `rehydrate_full` (`conversation.rs:518`).)
@@ -511,17 +511,22 @@ already printed before anyone could know a stop string was forming.
 ```rust
     while generated.len() < params.n_predict {
         t0 = std::time::Instant::now();
-        let sampled = sampler::sample_with_penalties(
+        let sampled = match sampler::sample_with_config_grammar(
             &mut logits,
-            params.temp,
-            params.top_k,
-            params.top_p,
-            params.repeat_penalty,
-            params.frequency_penalty,
-            params.presence_penalty,
+            &sampler_cfg,
             &prev_tokens,
+            &mut mirostat,
+            &mut grammar_state,
             &mut rng,
-        );
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // The loud stop the grammar contract requires: the emitted text
+                // is a valid prefix, nothing illegal is appended.
+                eprintln!("\n[grammar] {e}");
+                break;
+            }
+        };
         if timing {
             t_samp += t0.elapsed().as_secs_f64();
         }
@@ -530,6 +535,7 @@ already printed before anyone could know a stop string was forming.
             break;
         }
         generated.push(sampled.token_id);
+        token_trace(current_pos, sampled.token_id);
         prev_tokens.push(sampled.token_id);
         if prev_tokens.len() > REPEAT_LAST_N {
             prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
@@ -553,29 +559,23 @@ already printed before anyone could know a stop string was forming.
 
 Reading it as a state machine, one iteration:
 
-1. **Gate: the cap.** The `while` condition is gate 3 — if the previous
-   iteration filled the quota, the loop exits without touching anything.
-2. **Sample.** `sample_with_penalties` (doc 12) consumes *and mutates*
-   `logits` (that is why it takes `&mut`): penalties are applied in place,
-   then top-k → top-p → temperature → one seeded draw. Out comes one token
-   id. Note what the loop does *not* do: it never inspects logits itself.
-   The 607 KB of scores are noise to everyone but the sampler.
-3. **Gate: EOS.** `is_stop_token` (`main.rs:1868-1870`) is a two-line
-   comparison against `special.eos` and `special.im_end`. On a hit the loop
-   breaks *before* pushing the token: the EOS sentinel is a control
-   character, not text — it must not be printed, must not enter
-   `generated`, and must not be fed to the graph.
-4. **Append.** The token goes into `generated` (the run's output record)
-   and into the sliding penalty window, which is kept at exactly 64 entries
-   by draining from the front.
-5. **Gate: stop strings** — the tail of the excerpt. The token's bytes are
-   appended to `full`, and `match_stop_suffix` (doc 12 §3 owns the matcher)
-   checks whether `full` now *ends* with any user stop string
-   `match_stop_suffix` (`main.rs:1760-1768`); a suffix match is enough because the check runs
-   every token, so the stop string is caught the moment its last byte
-   arrives. On a hit the text is truncated back to just before the match
-   and the loop breaks. Otherwise any newly complete bytes are flushed
-   through the think-highlighter to stdout (`main.rs:1769-1772`, the `emitted` flush).
+1. **Gate: the cap.** The `while` condition is gate 3: a full quota exits
+   without touching anything.
+2. **Sample.** `sample_with_config_grammar` (doc 12) consumes *and mutates*
+   `logits` (hence `&mut`): the config's penalties and DRY, then the grammar
+   mask, then top-k → top-p → temperature (or mirostat) → one seeded draw.
+   Out comes one token id; the loop never inspects logits itself, and the
+   607 KB of scores are noise to everyone but the sampler. A `SampleError`
+   (no token the grammar allows) is the loud stop the excerpt handles: the
+   loop prints it and breaks, never emitting an arbitrary token.
+3. **Gate: EOS.** `is_stop_token` (`main.rs:1868-1870`) checks `eos`/`im_end`;
+   a hit breaks *before* the token is pushed — the sentinel is not text.
+4. **Append.** The token enters `generated` and the 64-entry sliding
+   penalty window, drained from the front.
+5. **Gate: stop strings** — the tail of the excerpt: the token's bytes join
+   `full`, and `match_stop_suffix` (`main.rs:1760-1768`) tests whether it
+   now *ends* with a stop string; on a hit the text is truncated before the
+   match, else the new bytes are flushed to stdout (`main.rs:1769-1772`).
 
 Only when all three gates pass does the iteration continue to the forward —
 the loop never runs the transformer for a token it has already decided to
@@ -587,12 +587,12 @@ discard.
         // forward() returns n_out*nv logits (n_out=1 for single-token decode,
         // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
         if trace_on {
-            let text =
-                String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id])).into_owned();
+            let text = String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id]))
+                .into_owned();
             crate::trace::set_token(sampled.token_id, &text);
         }
         t1 = std::time::Instant::now();
-        logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1, ctx);
+        logits = model.forward(&[sampled.token_id], &[current_pos], 1, ctx);
         if trace_on {
             crate::trace::attach_step(&logits);
         }
@@ -607,10 +607,10 @@ discard.
 The heart of the whole document is one line:
 
 ```rust
-logits = model.forward(&[sampled.token_id], &[current_pos], &mut kv_cache, 1, ctx);
+logits = model.forward(&[sampled.token_id], &[current_pos], 1, ctx);
 ```
 
-Five arguments, and every one of them is either constant across the whole
+Four arguments, and every one of them is either constant across the whole
 loop or a single value that changes: the input is a **one-element slice**
 containing last iteration's sampled token; the position is a **one-element
 slice** containing the cursor; `n_out` is 1 (we need logits for exactly one
@@ -661,41 +661,41 @@ The loop's `forward` call lands in `forward_cached`, which first expresses
             cparams: CParams {
                 n_ctx,
                 flash_attn: false,
+                explicit_span,
+                kv_map,
                 gpu: metal_on || cuda_on,
-                // G4/G5: decode fusions are part of the topology — the env
-                // toggles force a rebuild so they can be A/B'd reliably.
-                // G5 (FFN gate+up) is decoupled from the QKV fusion gate
-                // (mirrors Qwen3) so A/B-ing one fusion does not flip the
-                // other; 7e⑤ extends it to the CUDA backend.
-                // D3-8: CUDA joins the decode QKV fusion (G4 CUDA port) —
-                // the backend claims Op::FusedQKV in supports_op and the
-                // loader registers blk.{i}.attn_qkv; qkv_concat_available
-                // probes the concat feasibility per backend (same shape as
-                // the fuse_ffn gate below).
+                gpu_layers: if metal_on || cuda_on {
+                    model.offload.plan.gpu_layers
+                } else {
+                    0
+                },
                 fuse_qkv: nt == 1
                     && (metal_on || cuda_on)
+                    && (cuda_on || !explicit_span)
                     && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
                 fuse_ffn: nt == 1
                     && (metal_on || cuda_on)
                     && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1"),
+                kv_format: model.kv_format,
             },
             weights_version: 1,
         };
 ```
 
 Everything the reuse decision will ever need is assembled here, before the
-cache is even consulted. `gtype` is derived from `nt` (one token = decode);
-`gpu` records whether a GPU backend will participate — it is a *param*
-because backend assignment is baked into the built graph, so "Metal became
-available between two calls" must look like different params and force a
-rebuild (`params.rs:33`, the `gpu` field). The fusion gates are the subtlest part of this
-struct: they are runtime env vars (`MINFER_NO_FUSE_QKV=1` and
-`MINFER_NO_FUSE_FFN=1`, for A/B-ing the decode fusions), but because they
-change which `Op`s the graph contains, they must live inside `CParams` —
-flipping one mid-run changes the params, the params comparison fails, and
-the graph is rebuilt with the new fusion state. That is how an
-*environment variable* safely participates in a build cache. The two gates
-are separate so that A/B-ing one does not silently flip the other.
+cache is consulted (comments elided): `gtype` is derived from `nt`; the new
+`explicit_span` / `kv_map` pair selects the attention window *layout* — both
+are topology, both derived from the KV reservations, never from `n_past` —
+and `gpu` (`params.rs:33`) records whether a GPU backend participates, a
+*param* because backend assignment is baked into the graph, so "Metal became
+available between two calls" must force a rebuild. `gpu_layers` carries the
+E5 offload plan (its assignment is topology too), and `kv_format`
+(`params.rs:61-67`, C4) sizes every KV cell, so a graph built for one format
+never serves another. The fusion gates are the subtlest part: runtime env
+vars (`MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1`) change which `Op`s
+the graph contains, so they live in `CParams` — flipping one mid-run fails
+the comparison and rebuilds with the new state. That is how an *environment
+variable* safely joins a build cache, and the two gates are separate so that A/B-ing one cannot flip the other.
 
 Before this struct is built, `forward_cached` has already done two quiet
 checks worth noting (`graph.rs:411-437`): it asserts every position is
@@ -766,7 +766,7 @@ invariant in one breath (`params.rs:1-7`, the module comment): these are "the ON
 graph reuse … `n_past` (KV position) is deliberately absent: it is
 execution data."
 
-#### The rebuild branch `forward_cached` (`src/models/qwen2/graph.rs:450`) and `509-518`)
+#### The rebuild branch `forward_cached` (`src/models/qwen2/graph.rs:450`, `599-645`)
 
 When the comparison fails, the five-phase pipeline of docs 05–08 runs, and
 its result is stored back into the same cache:
@@ -860,7 +860,7 @@ or a truncated copy — never a full-`nt` logits matrix (doc 09 covered the
 prefill-side benefit; in decode `n_out == nt == 1`, so the buffer is one
 row regardless).
 
-#### Why the KV survives: the allocator's two kinds of memory (``alloc_graph` (src/graph/alloc.rs:513-519), 382-403`)
+#### Why the KV survives: the allocator's two kinds of memory (`alloc_graph` (`src/graph/alloc.rs:513-519`), `alloc_persistent` (`alloc.rs:1078-1087`))
 
 The claim everywhere above is that a rebuild "keeps the KV". The mechanism
 is that the allocator distinguishes two kinds of buffers, and only one kind
@@ -1154,9 +1154,9 @@ addressed by position, with the position injected through an input node —
 the design llama.cpp's `allow_reuse` also relies on. Everything else in
 this document (params-only comparison, KV-survives-rebuild, append-only
 sessions) is downstream of that one move. It also explains the odd-looking
-`nkv` derivation in §2.2: there is no "cache length" field anywhere in the
-engine, because *the query window is data*: it is
-decoded at execution time — `decode_window` (`cpu_backend.rs:683`).
+window derivation in §2.2: there is no "cache length" field anywhere in the
+engine, because *the query window is data*: it is decoded at execution time
+(`decode_window`, `cpu_backend.rs:683`).
 
 **Sample-first loop shape.** The loop samples from logits that already
 exist and runs its forward at the *end* of the body. The alternative —
@@ -1175,8 +1175,8 @@ existing memory (`cpu_backend.rs:377-378`, the KV `copy_from_slice`). The cost i
 `--n-ctx`, which the CLI deliberately decouples from the model's
 `max_seq_len` (`main.rs:1448-1451` cites the multi-GB over-allocation and
 first-submit Metal tax this avoids — `docs/PERF-QWEN3-4B-VS-LLAMACPP.md`
-§2). The cursor-derives-`nkv` rule (§2.2) is what makes the slack harmless:
-unread region contents beyond `nkv` are never touched by attention.
+§2). The cursor-bounded window (§2.2) is what makes the slack harmless:
+unread region contents beyond it are never touched by attention.
 
 **Two stop policies for EOG, not one.** §3.2's conversation excerpt shows
 EOG being *written* to the KV before breaking, while the CLI's loop drops
@@ -1230,8 +1230,8 @@ land in the buffers the scheduler will read.
 
 **4. Stale-but-unread KV after rollback.** `/regen` rewinds the cursor
 without erasing the region (`conversation.rs:965-977`, the `regen_turn` rollback), so slots past the
-cursor hold abandoned tokens. This is safe *only* because of the
-`nkv = positions + 1` rule: attention masks slots `≥ vl` per head
+cursor hold abandoned tokens. This is safe *only* because attention reads a
+window that ends at the cursor: the span input names the cells per head
 (`cpu_backend.rs:1111-1140`, the per-head `vl` window) and the store overwrites slot `p` on the
 next append. The invariant "the cursor is the truth; region contents past
 it are garbage" is what makes rollback O(1) — but it means *nothing* may
