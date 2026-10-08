@@ -2517,7 +2517,8 @@ impl GraphAllocator {
         let id = self.alloc_fresh_in(dst_backend, len);
         // Staging is exact (it is not an activation, so the class ladder does not
         // apply), but it is still pool memory the budget must see: charge it as
-        // resident and live until the next rebuild frees it (E4 S2).
+        // resident and live for the entry's whole life — a rebuild and a re-map keep
+        // it; only a re-request at a different size replaces it (E4 S3).
         let bytes = len * 4;
         self.buf_bytes.insert((dst_backend, id), bytes);
         *self.pool_bytes.entry(dst_backend).or_insert(0) += bytes;

@@ -7,7 +7,7 @@
 > loop, never the loop itself).
 > **Code**: `src/main.rs` (decode loop (`main.rs:1727-1791`, the `while generated.len() < params.n_predict` loop), the repeat window `REPEAT_LAST_N` (`conversation.rs:426`), loop setup
 > `main.rs:1553-1566` (the decode-loop setup), `is_stop_token` `main.rs:1868-1870`), the cached forward
-> `src/models/qwen2/graph.rs::forward_cached` (`graph.rs:450-466`), the reuse
+> `src/models/qwen2/graph.rs::forward_cached` (`src/models/qwen2/graph.rs:450-466`), the reuse
 > decision `src/graph/cache.rs::try_reuse` `try_reuse` (`cache.rs:69-85`), the params
 > `src/graph/params.rs` (`GraphParams` `params.rs:88-97`), the allocator's
 > persistent KV regions `src/graph/alloc.rs` (`alloc_graph` `alloc.rs:513`,
@@ -243,11 +243,11 @@ technicality:
   (doc 07's layouts), so the whole liveness mapping must be redone;
 - the prefill graph contains the **G3 tail reduction** — an extra `tail_ids`
   input node and two `GetRows` nodes that cut the last layer's FFN and the
-  lm_head down to the `n_out` output rows (`graph.rs:61-67`, `graph.rs:214-226`).
+  lm_head down to the `n_out` output rows (`src/models/qwen2/graph.rs:78-84`, `src/models/qwen2/graph.rs:250-251`).
   In decode `n_out == nt == 1`, so those nodes don't exist at all;
 - on a GPU build, the **decode fusions** apply only when `nt == 1`
-  (`graph.rs:93-98`, and the same gate in the `CParams` construction at
-  `graph.rs:462-467`): `Op::FusedQKV` merges 3 matmuls + 3 biases + 2 RoPEs +
+  (`src/models/qwen2/graph.rs:120-125`, and the same gate in the `CParams` construction at
+  `src/models/qwen2/graph.rs:578-584`): `Op::FusedQKV` merges 3 matmuls + 3 biases + 2 RoPEs +
   2 KV stores into one kernel. Different node set ⇒ different graph.
 
 And then the third row is the payoff: step 2's params and step 3's params are
@@ -258,7 +258,7 @@ structural work. Within one generation run there is **exactly one rebuild**
 
 It is worth being explicit about what does *not* appear in the comparison:
 the token ids, the positions, and `n_past`. Those are execution data, injected
-into input nodes after the reuse check (`graph.rs:522-536`). The plan
+into input nodes after the reuse check (`src/models/qwen2/graph.rs:649-672`). The plan
 document records this as the design's founding correction: an earlier
 sketch encoded `n_past` into the KV-cache op, which "causes the decode
 topology to change at every step and structurally breaks graph reuse"
@@ -276,7 +276,7 @@ is worth checking each one `GraphParams` (`params.rs:88-97`), defined below in �
 
 - **`n_tokens`** — every activation buffer's shape and loop trip counts
   derive from it; also selects the per-layer QKV build path (`nt == 1`
-  enables the decode fusions, `graph.rs:93-98`).
+  enables the decode fusions, `src/models/qwen2/graph.rs:120-125`).
 - **~~`n_seqs`~~** — *deleted in E2 (A7 closure).* A batch's sequence count is
   data, like `n_past`: the one topology decision it can force — `explicit_span`,
   the explicit attention window — lives in `cparams` and is derived from the KV
@@ -309,7 +309,7 @@ second line of checks: `GraphCache::verify_structural`
 builder — the one way params-equality could lie — is caught in CI rather
 than in production. In release builds the six-field comparison is all there
 is, and it is enough *because* the builder is deterministic by contract
-(`graph.rs:36-37`: "deterministic in `params` — the reuse invariant").
+(`src/models/qwen2/graph.rs:37-38`: "deterministic in `params` — the reuse invariant").
 
 This is a deliberate about-face from an earlier plan sketch that built the
 new graph first and compared node sequences ("build then compare") — which
@@ -417,10 +417,10 @@ and is only read:
 
 | Data | Type / shape | Where it comes from | Where it goes |
 |---|---|---|---|
-| `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`graph.rs:524`) |
-| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`main.rs:1561`) — starts at `input_ids.len()`, incremented once per step at `current_pos` (`main.rs:1790`) | same, `graph.rs:526`; the KV store uses it as the write slot, attention as the last readable slot |
+| `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`src/models/qwen2/graph.rs:651`) |
+| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`main.rs:1561`) — starts at `input_ids.len()`, incremented once per step at `current_pos` (`main.rs:1790`) | same, `src/models/qwen2/graph.rs:653`; the KV store uses it as the write slot, attention as the last readable slot |
 | K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:995-1002`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
-| logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `graph.rs:618-625`) | moved into the loop's `logits` variable (`main.rs:1782-1783`, the `logits = model.forward(...)` assignment) for the next sample |
+| logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `src/models/qwen2/graph.rs:746-758`) | moved into the loop's `logits` variable (`main.rs:1782-1783`, the `logits = model.forward(...)` assignment) for the next sample |
 | `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens — `recent_window` (`main.rs:1568, 1752-1757`) | the sampler's repeat/frequency/presence penalties (doc 12) |
 | `generated` | `Vec<u32>` | pushed per step (`main.rs:1752`, the `generated.push(...)` call) | stop checks, final stats; decode_bytes streams it to stdout |
 
@@ -698,9 +698,9 @@ the comparison and rebuilds with the new state. That is how an *environment
 variable* safely joins a build cache, and the two gates are separate so that A/B-ing one cannot flip the other.
 
 Before this struct is built, `forward_cached` has already done two quiet
-checks worth noting (`graph.rs:411-437`): it asserts every position is
+checks worth noting (`src/models/qwen2/graph.rs:507-521`): it asserts every position is
 below `n_ctx` — out-of-range positions would write past the KV regions, so
-the failure is a loud panic, not silent corruption (`graph.rs:415-420`) —
+the failure is a loud panic, not silent corruption (`src/models/qwen2/graph.rs:507-514`) —
 and it probes GPU availability (`metal_on` / `cuda_on`), which feeds the
 `gpu` field above.
 
@@ -852,8 +852,8 @@ the batch's `out_rows` (`src/models/qwen2/graph.rs:671`) — that input *only
 exists in prefill graphs* (`n_out < nt`), so its presence is data too.
 
 Finally `sched.execute(graph, alloc)` runs one scheduler walk
-(`graph.rs:549-550`), and the output buffer is copied back as the returned
-logits (`graph.rs:613-625`). With G3 active the output buffer already holds
+(`src/models/qwen2/graph.rs:686`), and the output buffer is copied back as the returned
+logits (`src/models/qwen2/graph.rs:746-758`). With G3 active the output buffer already holds
 exactly `n_out × n_vocab` values, so the return is either the buffer itself
 or a truncated copy — never a full-`nt` logits matrix (doc 09 covered the
 prefill-side benefit; in decode `n_out == nt == 1`, so the buffer is one
@@ -1031,7 +1031,7 @@ Prefill computes attention and projections for all `nt` tokens (it must —
 every token's K/V goes into the cache), but only the *last* token's logits
 are wanted. So after the last layer's attention output projection, two
 `GetRows` nodes gather just the `n_out` tail rows (`tail_ids` is filled
-with `nt-1, …, nt-n_out` at `graph.rs:534`), and the remaining FFN +
+with `nt-1, …, nt-n_out` at `src/models/qwen2/graph.rs:671`), and the remaining FFN +
 residual + lm_head run on `n_out` rows instead of `nt`. With `n_out = 1`
 and a 2000-token prompt, that saves a 2000-row lm_head GEMM — a 151,936
 column × 2000 row output — per run. In decode, `n_out == nt == 1`, the
@@ -1074,7 +1074,7 @@ two additions the single-shot CLI doesn't need. First, a context guard
 before sampling (`conversation.rs:1314-1318`, the cursor guard): if `current_pos >= n_ctx`, the
 turn ends "cleanly" — reported as `hit_n_predict` — because writing at slot
 `n_ctx` would overflow the regions (the single-shot path instead relies on
-`forward_cached`'s position assert, `graph.rs:415-420`). Second, the EOG
+`forward_cached`'s position assert, `src/models/qwen2/graph.rs:507-514`). Second, the EOG
 token is *written into the KV* before breaking:
 
 ```rust
@@ -1112,7 +1112,7 @@ sketch built the new graph and diffed node sequences against the cached one
 never skip the build — the expensive half of the rebuild — so it saves
 nothing. The shipped design inverts the burden of proof: the *builder* is
 required to be deterministic in `GraphParams` (each architecture's `build`
-doc-comment carries the invariant, `graph.rs:36-37`), and once that
+doc-comment carries the invariant, `src/models/qwen2/graph.rs:37-38`), and once that
 contract holds, six field comparisons are a complete decision procedure.
 The failure mode of the contract (a non-deterministic builder) is covered
 in debug builds by `verify_structural` (`cache.rs:134-145`), which
@@ -1140,7 +1140,7 @@ boundary; if it were a global keyed by nothing, two concurrent sessions
 (server mode, `OPENAI-CHAT-API-PLAN.md`) would share and corrupt each
 other's regions. Hence the three ownership tiers that exist in the tree:
 the CLI's plain mode uses a process-wide static cache (`graph_cache()`,
-`graph.rs:796-798` — one run, one session); the conversation engine holds a
+`src/models/qwen2/graph.rs:1014-1019` — one run, one session); the conversation engine holds a
 session-private cache (`conversation.rs:113-117`, the `GraphEngine` `cache` field); the server hands each slot
 its own cache via `forward_graph_cached` (`models/mod.rs:288-298`). Same
 mechanism, scoped ownership.
@@ -1195,7 +1195,7 @@ at `conversation.rs:1331-1332`.
 guards it.** The cursor is incremented per step with no loop-level
 ceiling in single-shot mode (only `-n` bounds the run), so the defense is
 layered: `forward_cached` asserts `max(positions) < n_ctx` before anything
-runs (`graph.rs:415-420` — "fail loudly instead of corrupting memory");
+runs (`src/models/qwen2/graph.rs:507-514` — "fail loudly instead of corrupting memory");
 the CPU KV-store kernel bounds-checks each slot and returns `Err` — never
 a silent clamp (`cpu_backend.rs:358-360`, the `p >= n_ctx` refusal); the conversation loop checks the
 cursor *before* sampling and stops the turn cleanly
@@ -1225,7 +1225,7 @@ as live for the whole step — `last_use` (`alloc.rs:555-561`) — so that a liv
 can never clobber `token_ids` after it was filled but before its consumer
 ran. On a rebuild, `node_to_buf` is cleared and re-derived — the input
 *fill* in `forward_cached` happens *after* `alloc_graph` has produced the
-new mapping (`graph.rs:515` before `graph.rs:522-526`), so fills always
+new mapping (`src/models/qwen2/graph.rs:635` before `src/models/qwen2/graph.rs:649-653`), so fills always
 land in the buffers the scheduler will read.
 
 **4. Stale-but-unread KV after rollback.** `/regen` rewinds the cursor
@@ -1239,7 +1239,7 @@ read a region by extent (only by position), or it would see the garbage.
 
 **5. Fusion toggles are part of the identity — A/B tests must keep the
 FusionPass.** `fuse_qkv`/`fuse_ffn` live inside `CParams`
-(`graph.rs:462-467`), so `MINFER_NO_FUSE_QKV=1` at any point forces a
+(`src/models/qwen2/graph.rs:578-584`), so `MINFER_NO_FUSE_QKV=1` at any point forces a
 rebuild with the unfused node set — reliable A/B. The flip side: the fused
 and unfused graphs must be *bit-identical* in output, and the unfused path
 must still run the FusionPass (AGENTS.md rule 7) so that the only
@@ -1319,7 +1319,7 @@ the evidence is on stderr of any plain run.
   see exactly which nodes the rebuild adds or removes.
 - **`MINFER_GRAPH_DUMP=<dir>`.** Writes `logits_decode.f32` plus every
   layer's `kv{ℓ}_decode.f32` *per step, overwritten in place*
-  (`graph.rs:552-611`). Each file is the full persistent region (fixed
+  (`src/models/qwen2/graph.rs:688-744`). Each file is the full persistent region (fixed
   2 MiB for 0.5B at `--n-ctx 4096`), so across steps you watch the *valid
   prefix* of `kv0_decode.f32` grow — 512 B of new K values per step
   (128 f32) — which is the append-only KV made tangible; the per-step
