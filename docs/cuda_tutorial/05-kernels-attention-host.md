@@ -522,7 +522,7 @@ fn ensure_kv(&mut self, layer: usize, backend: Backend, n_embd: usize, row_elems
 
 `ensure_kv` is fallible: a packed `row_elems` is checked against the format
 and the registry's `reads_packed_kv`, and an existing region must match `n_ctx`,
-backend and packing — else `Err`. `alloc_persistent` (`alloc.rs:1079`) routes
+backend and packing — else `Err`. `alloc_persistent` (`alloc.rs:1081`) routes
 through the same pool allocator as everything else — on CUDA a `cudaMalloc` held
 in the backend's buffer pool (§3.4) — and registers it as *never freed*. Because the
 allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:135` ("Compute Graph — core rules", rule 2)), the regions survive
@@ -581,7 +581,7 @@ allocation does not shrink, the bytes written per store and read per attention c
 `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1011`).
 
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
-copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1090`) maps the node to
+copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1092`) maps the node to
 `pair[0]`; the CUDA arm comments "out_buf IS the region — no kernel" at
 (`cuda_backend.rs:942`, the `KvcacheLoad` arm comment). So the whole path — matmul, fused tail, cache,
 attention, next layer — touches pool device memory and crosses no host
