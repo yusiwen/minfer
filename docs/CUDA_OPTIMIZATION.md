@@ -300,8 +300,8 @@ All in `src/cuda/kernels/*.cu` + `src/cuda.rs`, dispatched by
 
 The full per-step chapters (process narrative, principle explanations, real code
 excerpts, verification gates, lessons — previously inlined here) now live in
-**[`docs/cuda_optimization_steps/`](./cuda_optimization_steps/README.md)** as 106
-standalone documents (01–106, including the Phase-8 supplementary records 78–79
+**[`docs/cuda_optimization_steps/`](./cuda_optimization_steps/README.md)** as 109
+standalone documents (01–109, including the Phase-8 supplementary records 78–79
 and the verification-methodology capstone 77). The §0 master table above remains
 the one-row-per-step index; the tables below link each row to its step document.
 Appendix B points at the cross-cutting methodology.
