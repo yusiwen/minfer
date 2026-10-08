@@ -326,11 +326,11 @@ the graph*; on the "survives" side, everything that *holds data*:
 
 | Survives the rebuild | Recomputed on rebuild |
 |---|---|
-| The `GraphAllocator` itself (it lives inside `GraphCache`, `cache.rs:38-45`) | The node list (`Self::build`, `graph.rs:473`) |
-| Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `graph.rs:486`) |
-| **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:995-1002`; `alloc_graph` explicitly frees only liveness buffers, `alloc_graph` (`alloc.rs:513-519`)) | The fusion pass (`FusionPass::run`, `graph.rs:509-514`) |
+| The `GraphAllocator` itself (it lives inside `GraphCache`, `cache.rs:38-45`) | The node list (`Self::build`, `src/models/qwen2/graph.rs:605`) |
+| Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `src/models/qwen2/graph.rs:622`) |
+| **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:995-1002`; `alloc_graph` explicitly frees only liveness buffers, `alloc_graph` (`alloc.rs:513-519`)) | The fusion pass (`FusionPass::run`, `src/models/qwen2/graph.rs:630-634`) |
 | Backend buffer *pools* (freed liveness buffers return to their pool; the memory is recycled, not released) | The node→buffer mapping (`alloc_graph` clears `node_to_buf`, `alloc.rs:519`) |
-| The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `replace_graph` (`cache.rs:106-114`) + §3.4) | Cross-backend staging buffers (freed and re-materialized on first execute, `alloc_graph` (`alloc.rs:513`)) |
+| The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `replace_graph` (`cache.rs:106-114`) + §3.4) | Cross-backend staging buffers (keyed by `(graph uid, node, backend)` and surviving a rebuild *and* a re-map — E4 S3; `alloc_graph` clears only the in-flight `cross_pending` set, `alloc_graph` (`alloc.rs:513-528`)) |
 
 The first row is the one that matters most: the allocator is a field of the
 cache, not a local of the forward function, so a rebuild cannot take the KV
@@ -706,40 +706,36 @@ and it probes GPU availability (`metal_on` / `cuda_on`), which feeds the
 
 #### The reuse decision itself `GraphCache` (`src/graph/cache.rs:38-64`)
 
-With params in hand, the cache is asked one question (`graph.rs:472`):
-`if !cache.try_reuse(&params) { ...rebuild... }`. Here is the whole
-machinery:
+With params in hand, the cache is asked one question
+(`src/models/qwen2/graph.rs:599`): `if !cache.try_reuse(&params).expect("re-map
+onto a cached graph") { … }`. Here is the whole machinery:
 
 ```rust
-    /// Params-only reuse check. On success the previously stored graph is
-    /// reused without rebuilding (caller then refreshes input data).
-    pub fn try_reuse(&mut self, params: &GraphParams) -> bool {
-        match (&self.prev_params, &self.graph) {
-            (Some(prev), Some(_)) if Self::params_match(prev, params) => {
-                self.prev_params = Some(params.clone());
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn params_match(a: &GraphParams, b: &GraphParams) -> bool {
-        a.n_tokens == b.n_tokens
-            && a.n_out == b.n_out
-            && a.gtype == b.gtype
-            && a.cparams == b.cparams
-            && a.weights_version == b.weights_version
+    pub fn try_reuse(&mut self, params: &GraphParams) -> Result<bool, String> {
+        let Some(pos) = self
+            .graphs
+            .iter()
+            .position(|(p, _)| Self::params_match(p, params))
+        else {
+            return Ok(false);
+        };
+        let (_, graph) = self.graphs.remove(pos);
+        …(the `Err` carries the failed re-map back to the caller)…
+        self.alloc.alloc_graph(&graph)?;
+        self.graphs.insert(0, (params.clone(), graph));
+        self.reuses += 1;
+        Ok(true)
     }
 ```
 
-That is the entire "cache": one stored graph, one stored params, one
-comparison. Six field comparisons replace rebuilding a few hundred nodes,
-re-assigning backends, re-running fusion, and re-walking liveness. Note
-what the `match` requires: *both* a previous params and a previous graph
-must exist (the very first call of a run has neither — miss), and
-`params_match` must hold. On a hit the stored params are refreshed (so
-`CParams` identity stays canonical) and the caller falls through to input
-refresh + execute.
+That is the entire cache: an MRU `Vec` of at most `MAX_CACHED_GRAPHS = 8`
+`(GraphParams, ComputeGraph)` pairs, one per distinct shape
+(`cache.rs:36-45`) — a session alternates a handful, so they all fit. Six
+field comparisons (`params_match`, `cache.rs:95-101`) replace rebuilding a
+few hundred nodes, re-assigning backends, re-running fusion, and re-walking
+liveness. A miss means no cached graph has these params; a hit moves that
+graph to the front and re-maps the allocator onto it, which is the one step
+that can fail — hence the `Result`, which the caller `.expect`s (loud panic).
 
 The `GraphParams` and `CParams` types behind the comparison
 `CParams` (`src/graph/params.rs:30-63`) and `GraphType` (`params.rs:19`) carry exactly the fields
@@ -772,32 +768,31 @@ When the comparison fails, the five-phase pipeline of docs 05–08 runs, and
 its result is stored back into the same cache:
 
 ```rust
-        if !cache.try_reuse(&params) {
+        if !cache
+            .try_reuse(&params)
+            .expect("re-map onto a cached graph")
+        {
+            let rebuild_t0 = std::time::Instant::now();
+            let trace_rb = std::env::var("MINFER_REBUILD_TRACE").map_or(false, |v| v == "1");
             let mut graph = Self::build(model, &params);
             let sched = BackendScheduler::new();
             {
                 let alloc = cache.alloc();
                 Self::register_graph_weights(model, alloc);
-                #[cfg(target_os = "macos")]
-                if metal_on {
-                    alloc.enable_metal();
-                }
-                #[cfg(feature = "cuda")]
-                if cuda_on {
-                    alloc.enable_cuda();
-                }
+                …(the `#[cfg]` enable_metal / enable_cuda blocks, doc 07)…
+                alloc.set_offload_plan(Some(model.offload.plan));
                 sched.assign_backends(&mut graph, alloc);
 ```
 
-…(the middle of the block assembles the `backends` vector used by fusion —
-`graph.rs:488-508`)…
+…(the middle of the block is the fusion pass's backend list, which comes from
+the allocator's registry view rather than a hand-built `Vec` — `src/models/qwen2/graph.rs:623-629`)…
 
 ```rust
-                FusionPass::new().run(&mut graph, &backends, &|g, id| match g.node(id).backend {
-                    Some(crate::graph::Backend::CPU) => Some(0),
-                    Some(crate::graph::Backend::Metal) => Some(1),
-                    Some(crate::graph::Backend::Cuda) => cuda_idx,
-                    _ => None,
+                let backends: Vec<&dyn Backend> = alloc.fusion_backends();
+                FusionPass::new().run(&mut graph, &backends, &|g, id| {
+                    g.node(id)
+                        .backend
+                        .and_then(|b| alloc.fusion_backend_index(b))
                 });
                 alloc.alloc_graph(&graph).unwrap();
             }
@@ -808,17 +803,17 @@ its result is stored back into the same cache:
 ```
 
 Three details turn this from "a rebuild" into "a rebuild that preserves the
-session":
+session", and the `.expect("re-map onto a cached graph")` above makes a
+failed re-map a loud panic, never a silent rebuild:
 
-- `cache.alloc()` — the allocator is *borrowed from the cache*, not created
-  here. `register_graph_weights` re-registers weights by name, which is
-  idempotent (doc 03/07); `alloc_graph` will free the old liveness mapping
-  but keep the persistent KV regions (§2.5, and the excerpt below).
+- `cache.alloc()` — the allocator is *borrowed from the cache*; `register_graph_weights`
+  re-registers weights by name, idempotently (doc 03/07), and `set_offload_plan` (E5)
+  puts the block plan in force *before* assignment. `alloc_graph` frees the old
+  liveness mapping but keeps the persistent KV regions (§2.5, below).
 - The pipeline is the *full* one — assign, fusion (backend-gated per node),
   allocate — because a rebuilt graph must be indistinguishable from a
-  fresh-process graph. There is no "quick rebuild" path that skips phases;
-  determinism (§2.4) is what makes reuse sound, and the rebuild path is
-  where that determinism is produced.
+  fresh-process graph; determinism (§2.4) is what makes that sound.
+  `MINFER_REBUILD_TRACE=1` prints `rebuild_t0`'s build+assign+alloc ms.
 - `replace_graph` (`cache.rs:106-114`) stores the new node list and params,
   and stamps the graph with a fresh monotonic `uid` — `replace_graph` (`cache.rs:106-107`) —
   the CUDA Graph cache keys captures by uid, so a new topology naturally
@@ -833,6 +828,10 @@ Then, on *both* paths (rebuilt or reused), the inputs are refreshed:
         alloc.fill_input_i32(graph, "token_ids", &ids).unwrap();
         let pos: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         alloc.fill_input_i32(graph, "positions", &pos).unwrap();
+        …(E1/E2: `fill_batch_inputs` resolves every query's window)…
+        alloc
+            .fill_batch_inputs(graph, batch)
+            .unwrap_or_else(|e| panic!("batch inputs: {e}"));
         // G3: the last-layer tail-row reduction reads `tail_ids` (filled when
         // the graph was built with n_out < nt, i.e. prefill)
         if graph
@@ -840,17 +839,17 @@ Then, on *both* paths (rebuilt or reused), the inputs are refreshed:
             .iter()
             .any(|&i| graph.node(i).name == "tail_ids")
         {
-            let tail: Vec<u32> = ((nt - n_out)..nt).map(|x| x as u32).collect();
-            alloc.fill_input_i32(graph, "tail_ids", &tail).unwrap();
+            alloc.fill_input_i32(graph, "tail_ids", &out_rows).unwrap();
         }
 ```
 
 This is "positions are data" in executable form: the same code runs for a
 23-token prefill (23 positions) and for decode step 400 (one position,
-value 422) — the graph is never told which situation it is in; it reads
-the buffers. The `tail_ids` fill is conditional because that input *only
-exists in prefill graphs* (when `n_out < nt`) — its presence is itself
-determined by params, checked here rather than assumed.
+value 422) — the graph is never told which situation it is in; it reads the
+buffers. `fill_batch_inputs` (`src/models/qwen2/graph.rs:661-663`) resolves
+each sequence's window first; the `tail_ids` fill is conditional and takes
+the batch's `out_rows` (`src/models/qwen2/graph.rs:671`) — that input *only
+exists in prefill graphs* (`n_out < nt`), so its presence is data too.
 
 Finally `sched.execute(graph, alloc)` runs one scheduler walk
 (`graph.rs:549-550`), and the output buffer is copied back as the returned
@@ -878,60 +877,60 @@ clears only the liveness-managed mappings:
         }
         self.buf_alive.clear();
         self.node_to_buf.clear();
-        // cross-backend staging buffers belong to the previous graph (their
-        // sizes follow that graph's shapes) — free and re-materialize on the
-        // first execute of the new graph
-        let prev_cross: Vec<(NodeId, BufRef)> = self.cross.drain().collect();
-        for (_, cb) in prev_cross {
-            self.free_in_pool(cb.backend, cb.id);
-        }
+        // F5: a rebuild starts a fresh execution — no staging copy can be in
+        // flight across it (the boundary either completed or failed loudly).
+        self.cross_pending.clear();
 ```
 
-Note the two `free_in_pool` calls: freed buffers *return to their backend's
-pool* rather than being deallocated — the prefill graph's big activation
-buffers are immediately available to serve the decode graph's smaller ones,
-which is why a rebuild does not reallocate GPU memory or fragment the pools
-(doc 07's pool mechanics). And the KV regions are *never in* `buf_alive` to
-begin with. They are created on first use by `ensure_kv` and recorded in a
-separate `persistent` list that nothing in the rebuild path touches:
+Note the `free_in_pool` call: freed buffers *return to their backend's pool*
+rather than being deallocated — the prefill graph's big activation buffers
+are immediately available to serve the decode graph's smaller ones, which is
+why a rebuild does not reallocate GPU memory or fragment the pools (doc 07's
+pool mechanics). `cross_pending.clear()` only forgets the in-flight copies:
+the staging buffers themselves are keyed by `(graph uid, node, backend)` and
+survive both a rebuild and a re-map — re-creating them per switch would leak,
+as staging is `alloc_fresh`, which never recycles from the free list
+(`alloc.rs:520-528`). The KV regions are *never in* `buf_alive`: `ensure_kv`
+creates them on first use into a separate `persistent` list nothing touches:
 
 ```rust
-    /// Per-layer KV persistent regions (K and V), created on first use on the
-    /// layer's assigned backend.
-    fn ensure_kv(&mut self, layer: usize, backend: Backend, size: usize) -> [BufRef; 2] {
-        if let Some(&pair) = self.kv.get(&layer) {
-            return pair;
+    fn ensure_kv(…, n_embd: usize, row_elems: usize, n_ctx: usize) -> Result<[BufRef; 2], String> {
+        …(the C4 packed-width checks)…
+        let elems = row_elems * n_ctx;
+        if let Some(region) = self.kv.get(layer) {
+            …(elems / backend / packed checks)…
+            return Ok([region.k, region.v]);
         }
-        let k = self.alloc_persistent(&format!("kv.{layer}.k"), backend, size);
-        let v = self.alloc_persistent(&format!("kv.{layer}.v"), backend, size);
-        self.kv.insert(layer, [k, v]);
-        [k, v]
+        let k = self.alloc_persistent(&format!("kv.{layer}.k"), backend, elems);
+        let v = self.alloc_persistent(&format!("kv.{layer}.v"), backend, elems);
+        self.kv
+            .insert(layer, k, v, n_embd, row_elems, n_ctx, packed);
+        Ok([k, v])
     }
 
     /// Allocate a persistent (never-freed) region on a backend.
     pub fn alloc_persistent(&mut self, name: &str, backend: Backend, size: usize) -> BufRef {
-        let id = self.alloc_in_pool(backend, size);
+        let id = self.alloc_exact_in_pool(backend, size);
         self.persistent.push(PersistentBuf {
             name: name.to_string(),
             backend,
             id,
         });
-        BufRef { backend, id }
+        BufRef::own(backend, id, size)
     }
 ```
 
 `ensure_kv` is the "allocate once, then look up forever" pattern: the first
 graph that touches layer ℓ's KV creates both regions at the *full*
-`n_ctx`-sized extent (`size = nkt × n_ctx` f32 — 2 MiB per region for
-0.5B at `--n-ctx 4096`), and every later graph — including the decode
-graph of every subsequent step — just gets the same `BufRef`s back
-(`alloc.rs:1043-1069`, the existing-region early return). The allocation happens during `alloc_graph` when it
-walks `KvcacheStore`/`KvcacheLoad` (`alloc.rs:670-681`: the
-store node's buffer *is* the K region; V is its sibling). The `size`
-argument comes from the node metadata (`kv_elems: nkt * n_ctx`,
-`graph.rs:125`), which is why `n_ctx` is a `CParams` field: it fixes a
-buffer extent, and a different `--n-ctx` must be a params change (a
-rebuild, and on first use a *reallocation* of regions).
+`n_ctx`-sized extent (`elems = row_elems × n_ctx` — 2 MiB per region for
+0.5B f32 at `--n-ctx 4096`; a packed Q8_0 region counts packed words, not
+f32 elements), and every later graph — including the decode graph of every
+subsequent step — just gets the same `BufRef`s back (`alloc.rs:1043-1069`,
+the existing-region early return), allocated exact into the never-freed
+`persistent` list by `alloc_persistent` (`alloc.rs:1078-1087`), during
+`alloc_graph`'s walk of `KvcacheStore`/`KvcacheLoad` (`alloc.rs:670-681`: the store
+node's buffer *is* the K region; V is its sibling) — `n_ctx` is a `CParams` field
+because `kv_elems: nkt * n_ctx` (`src/models/qwen2/graph.rs:152`) fixes its extent.
 
 This is the exact contract doc 07 promised and the decode loop depends on:
 **the KV cache is not a structure the graph owns — it is two never-freed
@@ -951,14 +950,14 @@ run there is exactly one split, so none of it fires:
         for split in &splits {
             if let Some(pb) = prev_backend {
                 if pb != split.backend {
-                    // 1. flush the previous backend's async work
-                    alloc.sync_backend(pb);
+                    // 1. retire the previous backend's async work (#138)
+                    alloc.retire_backend(pb);
                     // 1b. staged Metal/CUDA captures are valid now — read back
                     flush_metal_captures(graph, alloc, &mut staged, trace_on, live_on);
                     flush_cuda_captures(graph, alloc, &mut cuda_caps, trace_on, live_on);
                     // 2. copy this split's inputs across backends
                     for &inp in &split.inputs {
-                        alloc.copy_across(inp, split.backend)?;
+                        alloc.copy_across(graph.uid, inp, split.backend)?;
                     }
                 }
             }
@@ -973,7 +972,9 @@ and inside each split, the per-node walk (`scheduler.rs:305-326`, the node loop)
                     // inputs are host-filled before execute — no pending GPU
                     // work, so reading them here is always current
                     if let Some(br) = alloc.node_buffer(id) {
-                        if let Some(d) = read_host_buffer(alloc, br.backend, br.id) {
+                        if let Some(d) = read_host_buffer(alloc, br.backend, br.id)
+                            .and_then(|d| window_of(br, d))
+                        {
                             record_node_data(node, d, trace_on, live_on);
                         }
                     }
@@ -989,19 +990,18 @@ and inside each split, the per-node walk (`scheduler.rs:305-326`, the node loop)
                 };
 ```
 
-The comment at `scheduler.rs:184-186` (the one-step-per-`execute()` note) is the decode-relevant summary:
-capture happens "one step per `execute()` (prefill = 1 step, each decode
-forward = 1)". So "one split walk per token" is literal: each decode step
-re-walks the split list and executes every node in build order — the
-*kernels* run fresh every step (new data!), but the *plan* (which nodes,
-which backends, which buffers, which splits) is the cached graph's. The
-KV ops resolve their layer's persistent regions by layer index during the
-walk — `kv_pair` (`scheduler.rs:360-370`) and dispatch to the backend's
-`execute_node` (`scheduler.rs:398`) — on a GPU build this is also
-where the CUDA Graph replay shortcut lives, keyed by the graph's `uid`
-`graph_replay` (`scheduler.rs:286-304`): an entire captured split replays as one launch
-per step (doc 15). Doc 08 owns the full split/sync story; here the point
-is only that nothing in this walk depends on which *step* it is.
+The comment at `scheduler.rs:184-186` (the one-step-per-`execute()` note) is
+the decode-relevant summary: capture happens "one step per `execute()` (prefill
+= 1 step, each decode forward = 1)". So "one split walk per token" is literal:
+each decode step re-walks the split list and executes every node in build
+order — the *kernels* run fresh every step (new data!), but the *plan* (which
+nodes, which backends, which buffers, which splits) is the cached graph's.
+`copy_across` only *enqueues* (F5/#138): the single wait is issued at the
+consumer's first read, and the capture read above is windowed (`window_of`,
+`scheduler.rs:483`). The KV ops resolve their layer's regions by index —
+`kv_pair` (`scheduler.rs:360-370`) — then dispatch to the backend's
+`execute_node` (`scheduler.rs:398`); a GPU build replays a captured split by
+`uid` (doc 15 owns that).
 
 #### The one structural difference: prefill's G3 tail — `tail_ids` (`src/models/qwen2/graph.rs:246-252`)
 
