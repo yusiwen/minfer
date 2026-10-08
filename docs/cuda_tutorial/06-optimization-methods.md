@@ -391,7 +391,7 @@ counted the difference.
   the graph ops `Op::FusedQKV` (concat matmul + fused epilogue) and
   `Op::FusedFFN` (gate|up concat matmul + in-place swiglu) are declared in
   `Op::FusedQKV` (`src/graph/ops.rs:158`), `Op::FusedFFN` (`:177`), executed in `execute_node_inner` (`src/graph/cuda_backend.rs:916`; the `Op::FusedFFN` arm `:1236`, the `Op::FusedQKV` arm `:1365`),
-  and gated at build time in `fuse_qkv` (`src/models/qwen2/graph.rs:120-122`). The decode
+  and gated at build time in `fuse_qkv` (`src/models/qwen2/graph.rs:131-138`). The decode
   A-quantize fusion (`swiglu_quant_pad40`, `rms_norm_quant_pad40`,
   `swiglu_quant_pad40` (`src/cuda/kernels/ops_elementwise.cu:215`), `rms_norm_quant_pad40` (`:90`) writes the quantized activation plane
   beside the f32 output so the following matmul skips a standalone quantize

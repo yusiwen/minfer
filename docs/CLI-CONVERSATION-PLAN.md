@@ -195,7 +195,7 @@ if add_ass && fmt_past 以 '\n' 结尾: delta = "\n" + delta   // 尾部换行�
 | 组件 | 位置 | 用途 |
 |---|---|---|
 | `render_messages(template, messages, add_gen_prompt, bos)` | `src/template.rs` | 多消息渲染 + ChatML fallback（server 在用）——差分法的两个渲染原语 |
-| `forward_cached(model, tokens, positions, n_out, n_ctx, &mut GraphCache)` | `src/models/qwen2/graph.rs:276` | 位置寻址、KV 区域跨重建持久、显式 n_ctx——**追加式 KV 的基础** |
+| `forward_cached(model, tokens, positions, n_out, n_ctx, &mut GraphCache)` | `src/models/qwen2/graph.rs:282` | 位置寻址、KV 区域跨重建持久、显式 n_ctx——**追加式 KV 的基础** |
 | `GraphCache::new()` | `src/graph/cache.rs` | 每会话独立 cache（server `slot.rs` 同款用法） |
 | `sampler::{sample_with_penalties, recent_window, match_stop_suffix}` | `src/sampler.rs` | 采样链 / 惩罚窗口 / stop 串后缀匹配 |
 | `Tokenizer::{encode, decode_bytes, complete_utf8_prefix_len}` | `src/tokenizer.rs` | 字节级解码，UTF-8 安全输出 |

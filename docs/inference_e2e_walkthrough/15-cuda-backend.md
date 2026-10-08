@@ -602,7 +602,7 @@ persistent KV regions. So the model wiring applies an **all-or-nothing
 gate** before the graph is even built:
 
 ```rust
-// src/models/qwen2/graph.rs:430-451 (abridged)
+// src/models/qwen2/graph.rs:436-457 (abridged)
 // CUDA participation (Phase 7): requires a usable device AND every
 // matmul weight registered on the CUDA registry in a kernel-supported
 // type (all-or-nothing; 7e③ moved the embedding gather on device, so
@@ -618,7 +618,7 @@ cparams: CParams {
 },
 ```
 
-`weights_on_cuda` (`qwen2/graph.rs:875`) walks every weight the graph reads
+`weights_on_cuda` (`qwen2/graph.rs:881`) walks every weight the graph reads
 — embedding, output head, every layer's norms/biases/matmul weights — and
 requires each to be (a) registered and (b) a type with a matching kernel.
 The type check is per *role*: matmul weights admit all eight quant types

@@ -48,7 +48,7 @@
 | P0 | Backend & scheduler init | Create Metal backend, MTLCommandQueue, kernel library, scheduler; pre-reserve compute buffers | `ggml-metal.cpp:689` `ggml-metal-context.m:84` `llama-context.cpp:581` `ggml-backend.cpp:1792` | `src/metal/ops.rs` (MpsState::try_new) |
 | P1 | Model loading / weight registration | Allocate Metal buffers per tensor and upload quantized weights | `llama-model.cpp:1401` `llama-model-loader.cpp:1426` `ggml-metal-device.m:1631` | `src/models/qwen2/loader.rs` + `src/metal/ops.rs` (register_weight) |
 | P2 | Batch preparation & microbatching | Split the API batch into micro-batches, reserve host output buffers | `llama-context.cpp:1635` `llama-batch.cpp:25` | `src/main.rs` (single batch, no split) "N/A" |
-| P3 | Compute graph build (Qwen2) | Build the ggml compute graph (DFS topological order) | `src/models/qwen2.cpp:53` `llama-graph.cpp` `ggml.c:7188` | `src/models/qwen2/graph.rs:432` (declarative graph build) |
+| P3 | Compute graph build (Qwen2) | Build the ggml compute graph (DFS topological order) | `src/models/qwen2.cpp:53` `llama-graph.cpp` `ggml.c:7188` | `src/models/qwen2/graph.rs:438` (declarative graph build) |
 | P4 | Scheduler split & allocation | Assign nodes to backends, split into runs, gallocr allocation | `ggml-backend.cpp:1936`→`:1055` | "N/A" (single MPS backend, static buffers) |
 | P5 | Scheduler compute | Per-split: copy inputs, call backend graph_compute | `ggml-backend.cpp:1594` `ggml-metal.cpp:535` | `forward.rs:88-134` (single CB, all layers) |
 | P6 | Metal graph compute | Multi-command-buffer encode (main thread + n_cb workers) | `ggml-metal-context.m:438` `:663` | `src/metal/ops.rs` (submit, single CB) |
@@ -95,7 +95,7 @@
 
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
-| 3.1 | Entry | `llama_model::build_graph` → `build_arch_graph` | `llama-model.cpp:2457` | `src/models/qwen2/graph.rs:432` (forward) |
+| 3.1 | Entry | `llama_model::build_graph` → `build_arch_graph` | `llama-model.cpp:2457` | `src/models/qwen2/graph.rs:438` (forward) |
 | 3.2 | Input embd | `build_inp_embd`: token ids + `ggml_get_rows(tok_embd, inp_tokens)` | `llama-graph.cpp:2284` | `src/metal/` (embed_tokens_gpu, get_rows — **2026-08-21: all minfer quants on GPU + dispatched into the MAIN command buffer, llama-graph-style single submit, #38/#39**) |
 | 3.3 | Position input | `build_inp_pos` | `llama-graph.cpp:2373` | `src/metal/ops.rs` (upload_positions) |
 | 3.4 | KV graph inputs | `build_attn_inp_kv` (k_idxs/v_idxs, mask, rotation tensors) | `llama-graph.cpp:2729` | `src/metal/` (store_kv uses pos_buf) |

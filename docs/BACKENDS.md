@@ -142,7 +142,7 @@ in `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5.
 
 The fusion pass consults `supports_fused` before producing fused IR nodes, so
 the same model builds a different graph per backend: Metal accepts
-`SwiGLU` (`metal_backend.rs:661-665`); CUDA accepts `SwiGLU`
+`SwiGLU` (`metal_backend.rs:676-680`); CUDA accepts `SwiGLU`
 (`cuda_backend.rs:1303-1305`) and carries its own fused decode kernels from
 the campaign (see the CUDA docs for the inventory). The decode fusions
 (`Op::FusedQKV`, `Op::FusedFFN`) are env-revertable

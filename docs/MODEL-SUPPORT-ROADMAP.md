@@ -47,7 +47,7 @@ Four items are **not** covered by that estimate and apply to every port:
    registered the concatenated tensors — once for Metal and once for CUDA
    (`models/qwen2/loader.rs:425`, `:488`; `models/qwen3/loader.rs:426`, `:468`)
    — plus the matching `qkv_concat_available` / `gu_concat_available`
-   predicates (`models/qwen2/graph.rs:282-320`). Skip them and the port is
+   predicates (`models/qwen2/graph.rs:288-326`). Skip them and the port is
    still **correct**, but decode fusion silently disables: no error, just a
    slower decode path.
 2. **RoPE style.** `rope_style` is hard-coded to `NonInterleaved` in both

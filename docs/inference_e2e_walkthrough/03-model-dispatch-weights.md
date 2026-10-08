@@ -167,7 +167,7 @@ to f32 it would be 2 GB — 7× more, copied at load time, for zero benefit.
 **Why does cloning a `Tensor` not copy bytes?** Because `Cow::Borrowed`
 clones as pointer + length. That is what makes it affordable for the graph
 path to re-register all weights on every graph (re)build (`t.clone()` at
-`qwen2/graph.rs:348`) — the clone duplicates a small struct and a name
+`qwen2/graph.rs:354`) — the clone duplicates a small struct and a name
 string, not gigabytes. The one caveat — registries still guard against
 re-registration when a caller hands them *owned* bytes — has a measured war
 story attached, told with excerpt 10.
@@ -227,10 +227,10 @@ every weight this model will use registered — and kernel-supported — on this
 backend?" Two functions do this:
 
 - `Qwen2Graph::weights_on_gpu` (Metal): every weight name must be present in
-  `MpsState`'s registry (`models/qwen2/graph.rs:630-671`).
+  `MpsState`'s registry (`models/qwen2/graph.rs:636-677`).
 - `Qwen2Graph::weights_on_cuda` (CUDA): every weight must be registered *and*
   of a type a kernel exists for — e.g. the embedding gather supports every
-  registered type except Q4_1 (`models/qwen2/graph.rs:689-750`).
+  registered type except Q4_1 (`models/qwen2/graph.rs:695-756`).
 
 The result — `metal_on || cuda_on` — is stored in `CParams.gpu`, which is
 part of the *reuse identity*: the fingerprint that decides whether a cached
@@ -706,7 +706,7 @@ clones. The graph allocator simply forwards to it
 why the allocator's registration costs nothing on CPU.
 
 Excerpt 11 — the graph's own registration pass, at first build.
-(`src/models/qwen2/graph.rs:338-372`, abridged)
+(`src/models/qwen2/graph.rs:344-378`, abridged)
 
 ```rust
     /// Register every weight the graph references on the allocator's backend.
@@ -737,7 +737,7 @@ The list is deliberately spelled out — not derived by reflection — so the
 compiler catches field renames in *both* the registration and the gate
 (excerpt 12), which must enumerate the same weights.
 
-Excerpt 12 — the Metal participation gate. (`src/models/qwen2/graph.rs:628-671`,
+Excerpt 12 — the Metal participation gate. (`src/models/qwen2/graph.rs:634-677`,
 names list abridged)
 
 ```rust
@@ -761,7 +761,7 @@ names list abridged)
     }
 ```
 
-And where the verdict lands (`src/models/qwen2/graph.rs:425-451,462-470`):
+And where the verdict lands (`src/models/qwen2/graph.rs:431-457,462-470`):
 
 ```rust
         #[cfg(target_os = "macos")]
@@ -879,14 +879,14 @@ deletion, so keeping the parameter bought nothing.
 - **Loader registers ⊋ gate accepts (on CUDA).** Some types are registered
   for the legacy path but have no graph kernel; the gate's type check is
   what keeps those on CPU. The embedding's Q4_1 exclusion is the standing
-  example (`qwen2/graph.rs:679-687`).
+  example (`qwen2/graph.rs:685-693`).
 - **The KV element-type decision is write-once.** `set_kv_cache_type`
   initializes a `OnceLock`; it must run before the first forward, which is
   why the loaders do it mid-load — and why the Qwen3 loader resolves
   `n_kv_embd` *before* calling it.
 - **`positions[i] < n_ctx` is a caller obligation.** The KV regions are
   sized `n_kv_embd × n_ctx` once; `forward_cached` asserts it loudly
-  (`qwen2/graph.rs:415-420`) rather than corrupting a region.
+  (`qwen2/graph.rs:421-426`) rather than corrupting a region.
 
 ## 4. Observe & verify
 

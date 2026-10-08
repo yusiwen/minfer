@@ -94,7 +94,7 @@ Two facts make GPU assignment possible at all, and both are decided before this 
   weight tensor it needs is only on the host. The model layer therefore gates GPU participation
   all-or-nothing: `metal_on = metal_available() && Self::weights_on_gpu(model)` — either every
   matmul weight is registered on the GPU registry, or the whole graph stays on CPU
-  (`src/models/qwen2/graph.rs:425-427`; the CUDA arm is the same shape at line 435). This is why
+  (`src/models/qwen2/graph.rs:431-433`; the CUDA arm is the same shape at line 435). This is why
   doc 03 (weight registration) is a *precondition* of this stage.
 - **The user can opt out.** `MINFER_DISABLE_MPS=1` makes `metal_available()` false
   (`src/metal/runtime.rs`), so the priority question falls straight through to CPU.
@@ -286,7 +286,7 @@ ops its assigned backend claimed.
 ### 2.5 The env toggles: fusion as a first-class A/B experiment
 
 Both builder fusions are controlled by environment variables read at graph-build time
-(`models/qwen2/graph.rs:462-467`):
+(`models/qwen2/graph.rs:468-473`):
 
 ```
 MINFER_NO_FUSE_QKV=1  →  CParams.fuse_qkv = false  →  builder emits the decomposed QKV chain
@@ -340,7 +340,7 @@ splits and dispatch.
 **Where the stage physically runs:** inside the model's `forward_cached` — the first place a
 forward needs a graph. The sequence there is `try_reuse → build → register weights → enable
 backends → assign_backends → FusionPass → alloc_graph → replace_graph`
-(`src/models/qwen2/graph.rs:472-517`). Note the pipeline lives in *model* code, not the
+(`src/models/qwen2/graph.rs:478-523`). Note the pipeline lives in *model* code, not the
 scheduler: the scheduler provides `assign_backends`, but the model orchestrates, because only
 the model knows whether its weights made it onto the GPU.
 
@@ -623,7 +623,7 @@ because `SwiGLU`'s output shape equals the Mul's by definition.
 and its `FusedOp::BiasRope` capability tag were removed (§2.3): no backend claimed the capability,
 so the matcher was unreachable code. `run()` now composes exactly one rewrite.
 
-**The call site that wires it all together** — `src/models/qwen2/graph.rs:472-517`, trimmed:
+**The call site that wires it all together** — `src/models/qwen2/graph.rs:478-523`, trimmed:
 
 ```rust
 if !cache.try_reuse(&params) {
@@ -846,7 +846,7 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
   Keep that boundary: pattern pass = local substitution, builder = structural change.
 - **GPU feasibility is a precondition, not a per-node property.** `supports_op(Metal)` says
   nothing about whether the *weights* are resident; that is the model-level all-or-nothing gate
-  (`weights_on_gpu`, qwen2/graph.rs:807) feeding `metal_on`, feeding `enable_metal()`. A
+  (`weights_on_gpu`, qwen2/graph.rs:813) feeding `metal_on`, feeding `enable_metal()`. A
   backend enabled without its weights would abort at the first matmul with "weight not
   registered" — loud, but avoidable.
 - **In-place aliasing interacts with fusion only indirectly** (full story in docs 07/08): the

@@ -547,7 +547,7 @@ simpler: **no sources at all** (it is a view of the region, which is why
 `kv_load` nodes have no incoming edges in the DOT dump), carrying
 `{layer}` again and nothing positional.
 
-#### The main event, part 1: inputs and the QKV branch (`src/models/qwen2/graph.rs:53-131`)
+#### The main event, part 1: inputs and the QKV branch (`src/models/qwen2/graph.rs:53-130`)
 
 ```rust
         let inp_ids = b.input("token_ids", [nt, 1, 1, 1], crate::graph::DType::I32);
@@ -615,7 +615,7 @@ each branch emits a different topology. A different `GraphParams` (nt = 1 vs
 and because the deciding values all live in `GraphParams`, the difference is
 exactly reproducible.
 
-#### The main event, part 2: attention, tail rows, FFN (`src/models/qwen2/graph.rs:195-263`, abridged)
+#### The main event, part 2: attention, tail rows, FFN (`src/models/qwen2/graph.rs:201-269`, abridged)
 
 ```rust
             // attention
@@ -703,7 +703,7 @@ sides of the add must shrink or the shapes would disagree.
 
 No node walk, no comparison of 440 nodes — six field comparisons, because
 §2.7's invariant makes them sufficient. The caller
-(`Qwen2Graph::forward_cached`, `models/qwen2/graph.rs:450-466`) shows the
+(`Qwen2Graph::forward_cached`, `models/qwen2/graph.rs:456-472`) shows the
 whole production loop in one glance: `try_reuse`; if it fails, `build` →
 register weights → `assign_backends` (doc 06) → `FusionPass` (doc 06) →
 `alloc_graph` (doc 07) → store in the cache with a fresh `uid`; then execute
