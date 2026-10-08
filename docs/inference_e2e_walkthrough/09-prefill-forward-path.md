@@ -447,7 +447,7 @@ qwen2/graph.rs:403-626   forward_cached — the real work (below)
 ```
 
 The two trait-level aliases on the way are worth one glance
-(`models/mod.rs:48-75`): `forward_graph` and `forward_graph_cached` expose
+(`models/mod.rs:262-298`): `forward_graph` and `forward_graph_cached` expose
 the same two implementations at trait level — `forward_graph_cached` is the
 server/multi-slot entry point (it takes an explicit `&mut GraphCache`
 instead of using the process-global one). The CLI goes through plain
