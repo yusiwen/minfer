@@ -8,7 +8,7 @@
 > **Code**: `src/main.rs` (decode loop (`main.rs:1727-1791`, the `while generated.len() < params.n_predict` loop), the repeat window `REPEAT_LAST_N` (`conversation.rs:426`), loop setup
 > `main.rs:1553-1566` (the decode-loop setup), `is_stop_token` `main.rs:1868-1870`), the cached forward
 > `src/models/qwen2/graph.rs::forward_cached` (`graph.rs:450-466`), the reuse
-> decision `src/graph/cache.rs::try_reuse` `try_reuse` (`cache.rs:69-85`)), the params
+> decision `src/graph/cache.rs::try_reuse` `try_reuse` (`cache.rs:69-85`), the params
 > `src/graph/params.rs` (`GraphParams` `params.rs:88-97`), the allocator's
 > persistent KV regions `src/graph/alloc.rs` (`alloc_graph` `alloc.rs:513`,
 > `ensure_kv` `alloc.rs:995`), the per-step execution
@@ -296,7 +296,7 @@ is worth checking each one `GraphParams` (`params.rs:88-97`), defined below in �
   `fuse_qkv` / `fuse_ffn` (the A/B env toggles must reliably force a
   rebuild, hence they live inside `cparams` and inside the equality check —
   the test `fuse_flags_are_part_of_the_reuse_identity` pins this,
-  `verify_structural` (`cache.rs:134`)).
+  `verify_structural` (`cache.rs:134`).
 - **`weights_version`** — the future LoRA/reload hook: bumped whenever
   weights change, invalidating every cached graph (`params.rs:96-97`, the `weights_version` field).
 
@@ -304,7 +304,7 @@ If topology were *not* a pure function of these, a params hit would reuse a
 graph that was subtly wrong for the new inputs — the worst kind of bug,
 because it looks like a numerics problem. The defense is a debug-build-only
 second line of checks: `GraphCache::verify_structural`
-`verify_structural` (`cache.rs:134-145`)) compares two graphs built from equal params node by node
+`verify_structural` (`cache.rs:134-145`) compares two graphs built from equal params node by node
 (op, shape, dependencies) and is wired into tests, so a *non-deterministic*
 builder — the one way params-equality could lie — is caught in CI rather
 than in production. In release builds the six-field comparison is all there
@@ -631,7 +631,7 @@ stop gate fires or (in conversation mode) a guard stops it before the
 regions overflow.
 
 `is_stop_token` itself is the smallest function in the pipeline
-`is_stop_token` (`main.rs:1868-1870`)):
+`is_stop_token` (`main.rs:1868-1870`):
 
 ```rust
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
@@ -704,7 +704,7 @@ the failure is a loud panic, not silent corruption (`graph.rs:415-420`) —
 and it probes GPU availability (`metal_on` / `cuda_on`), which feeds the
 `gpu` field above.
 
-#### The reuse decision itself `GraphCache` (`src/graph/cache.rs:38-64`))
+#### The reuse decision itself `GraphCache` (`src/graph/cache.rs:38-64`)
 
 With params in hand, the cache is asked one question (`graph.rs:472`):
 `if !cache.try_reuse(&params) { ...rebuild... }`. Here is the whole
@@ -742,7 +742,7 @@ must exist (the very first call of a run has neither — miss), and
 refresh + execute.
 
 The `GraphParams` and `CParams` types behind the comparison
-`CParams` (`src/graph/params.rs:30-63`) and `GraphType` (`params.rs:19`)) carry exactly the fields
+`CParams` (`src/graph/params.rs:30-63`) and `GraphType` (`params.rs:19`) carry exactly the fields
 argued for in §2.4:
 
 ```rust
@@ -942,7 +942,7 @@ cached K or V value.
 #### One split walk per token (`src/graph/scheduler.rs:219-285`, the per-split boundary and walk)
 
 Reuse also means the execution machinery runs the same cached plan every
-step. `execute` `split_graph` (`scheduler.rs:87`)) splits the graph into contiguous
+step. `execute` `split_graph` (`scheduler.rs:87`) splits the graph into contiguous
 same-backend ranges once per call, then walks them. The per-split boundary
 handling is where cross-backend sync and copies happen — and on a CPU-only
 run there is exactly one split, so none of it fires:
@@ -1133,7 +1133,7 @@ keeps every graph immutable and self-describing.
 
 **The allocator lives in the cache, not in the forward call.** The
 `GraphCache` struct holds `graph` *and* `alloc` side by side
-`GraphCache` (`cache.rs:38-45`)) precisely so that one can be replaced without the other.
+`GraphCache` (`cache.rs:38-45`) precisely so that one can be replaced without the other.
 If the allocator were created per forward (or per rebuild), every rebuild
 would zero the KV cache and chat would forget itself at every turn
 boundary; if it were a global keyed by nothing, two concurrent sessions
@@ -1156,7 +1156,7 @@ this document (params-only comparison, KV-survives-rebuild, append-only
 sessions) is downstream of that one move. It also explains the odd-looking
 `nkv` derivation in §2.2: there is no "cache length" field anywhere in the
 engine, because *the query window is data*: it is
-decoded at execution time — `decode_window` (`cpu_backend.rs:683`)).
+decoded at execution time — `decode_window` (`cpu_backend.rs:683`).
 
 **Sample-first loop shape.** The loop samples from logits that already
 exist and runs its forward at the *end* of the body. The alternative —
@@ -1212,7 +1212,7 @@ moment was the Phase-3 KV-corruption bug (recorded in
 `docs/COMPUTE-GRAPH-DESIGN.md` and AGENTS.md rule 5): the copy read stale
 bytes and wrote them back over freshly stored K/V. The scheduler's split
 boundaries (the boundary's own close-out wait before any cross-backend read,
-`sync_backend` (`scheduler.rs:466-471`)) are the only sanctioned sync points — which is
+`sync_backend` (`scheduler.rs:466-471`) are the only sanctioned sync points — which is
 also why the decode loop's *reuse* discipline matters: no code path between
 steps touches buffers out-of-band.
 
@@ -1248,7 +1248,7 @@ difference between the two runs is the QKV fusion itself. The test
 identity half.
 
 **6. Graph uid discipline.** A reused graph keeps its `uid`; a rebuilt one
-gets the next monotonic value `replace_graph` (`cache.rs:106-114`)). The CUDA backend's
+gets the next monotonic value `replace_graph` (`cache.rs:106-114`). The CUDA backend's
 replay cache is keyed by uid — `graph_replay` (`scheduler.rs:286-304`, doc 15) — so the pairing
 is load-bearing: same uid ⇒ same topology ⇒ replay is valid; new uid ⇒ the
 old capture is orphaned (and simply never requested again). Breaking this —
@@ -1332,7 +1332,7 @@ the evidence is on stderr of any plain run.
   `fuse_flags_are_part_of_the_reuse_identity` (`cache/tests.rs:36`), and
   `structural_check_detects_different_graph` (`cache/tests.rs:176`). On the
   model side, `forward_cached_isolates_kv_between_caches`
-  `forward_cached_isolates_kv_between_caches` (`src/models/qwen2/graph/tests/batching.rs:742`)) proves two caches don't share KV. The
+  `forward_cached_isolates_kv_between_caches` (`src/models/qwen2/graph/tests/batching.rs:742`) proves two caches don't share KV. The
   conversation state machine is tested without a model via a mock engine:
   `second_turn_appends_only_delta` (`conversation/tests/turns.rs:48`) asserts the
   delta prefill is smaller than the first turn's, and

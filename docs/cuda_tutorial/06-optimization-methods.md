@@ -104,7 +104,7 @@ chapter: the bare command printed `ERR_NVGPUCTRPERM`; the sudo form worked.
 `TMPDIR=/tmp/yourtmp` or fix the directory ownership.)
 
 The kernel lines of the observed output (Qwen3-0.6B Q8_0, 9-token prompt,
-decode `q8_0_p32_q8_mmvq` — the kernel at `q8_0_p32_q8_mmvq` (`src/cuda/kernels/mmvq_multi.cu:655`)):
+decode `q8_0_p32_q8_mmvq` — the kernel at `q8_0_p32_q8_mmvq` (`src/cuda/kernels/mmvq_multi.cu:655`):
 
 ```text
   q8_0_p32_q8_mmvq(...) (1024, 1, 1)x(256, 1, 1), Context 1, Stream 13, Device 0, CC 12.1
@@ -172,7 +172,7 @@ D3-8 fusion verdict "`total launches −310 per decode step`" and the D3-5
 verdict "`standalone quantize_q8_0_pad40: 4448 → 964 launches per trace`" are
 nsys instance counts, not beliefs (step docs
 [73](../cuda_optimization_steps/73-d3-8-fusedqkv-port.md) and
-[70](../cuda_optimization_steps/70-d3-5-fused-producer-a-quantize.md)). When
+[70](../cuda_optimization_steps/70-d3-5-fused-producer-a-quantize.md). When
 you propose a fusion, this table is how you measure what you deleted.
 
 ### 2.3 The evidence discipline — the 15-line version
@@ -282,7 +282,7 @@ when the layout does not cooperate it is a parity bug factory (nibble offsets,
 alignment).
 
 - **Where minfer uses it**: `store_kv_f16` (`float4` load + two `__half2`
-  stores, `store_kv_f16` (`src/cuda/kernels/kv_store.cu:31`)); the q6_K B-expand reads packed data as
+  stores, `store_kv_f16` (`src/cuda/kernels/kv_store.cu:31`); the q6_K B-expand reads packed data as
   `uint4` groups; the q8_0 p32 decode planes are *designed around* the
   `uint4*` row pointer (`q8_0_p32_q8_mmvq`, `src/cuda/kernels/mmvq_multi.cu:655`, row
   pointer :8302, the `__ldg` group loads :8308).
@@ -393,7 +393,7 @@ counted the difference.
   `Op::FusedQKV` (`src/graph/ops.rs:158`), `Op::FusedFFN` (`:177`), executed in `execute_node_inner` (`src/graph/cuda_backend.rs:916`; the `Op::FusedFFN` arm `:1236`, the `Op::FusedQKV` arm `:1365`),
   and gated at build time in `fuse_qkv` (`src/models/qwen2/graph.rs:120-122`). The decode
   A-quantize fusion (`swiglu_quant_pad40`, `rms_norm_quant_pad40`,
-  `swiglu_quant_pad40` (`src/cuda/kernels/ops_elementwise.cu:215`), `rms_norm_quant_pad40` (`:90`)) writes the quantized activation plane
+  `swiglu_quant_pad40` (`src/cuda/kernels/ops_elementwise.cu:215`), `rms_norm_quant_pad40` (`:90`) writes the quantized activation plane
   beside the f32 output so the following matmul skips a standalone quantize
   launch.
 - **Step records**: [73-d3-8-fusedqkv-port.md](../cuda_optimization_steps/73-d3-8-fusedqkv-port.md)
@@ -408,7 +408,7 @@ counted the difference.
   counts before/after (launches deleted are the point), then the A/B gate:
   `MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1` flip the same binary to the
   unfused topology (they are part of the graph-reuse identity — the rebuild is
-  forced for you; `try_reuse` (`src/graph/cache.rs:69`)).
+  forced for you; `try_reuse` (`src/graph/cache.rs:69`).
 
 ### 3.7 CUDA Graph launch amortization (`MINFER_NO_CUDA_GRAPH=1`)
 
@@ -672,7 +672,7 @@ int main() {
         cudaMemcpy(y, hy, bytes, cudaMemcpyHostToDevice);   // fresh y per run
         cudaEventRecord(beg);
         saxpy_float4<<<(int)((n / 4 + blocks - 1) / blocks), (int)blocks>>>(
-            n / 4, a, reinterpret_cast<const float4*>(x), reinterpret_cast<float4*>(y));
+            n / 4, a, reinterpret_cast<const float4*>(x), reinterpret_cast<float4*>(y);
         cudaEventRecord(end); cudaEventSynchronize(end);
         cudaEventElapsedTime(&ms_v, beg, end);
         // both kernels move 3 x bytes (x read, y read, y write): GB/s = 3*bytes/ms
@@ -752,7 +752,7 @@ separation. For doc 43 the modern equivalent knob is the q6_K kernel's
 `__launch_bounds__` line itself (do not modify the repo — build a scratch
 worktree copy in `/tmp` if you want to flip it); for P5·2 note the era
 shift first: `MINFER_GEMM_TM` (64/128/256, read at
-`launch_gemm_f16` (`src/cuda/kernels/gemm_wmma.cu:847`)) retiles the *f16 wmma GEMM*, which is only
+`launch_gemm_f16` (`src/cuda/kernels/gemm_wmma.cu:847`) retiles the *f16 wmma GEMM*, which is only
 on the hot path when you run the escape side `MINFER_MMQ=0` — exactly the A/B
 frame P5·2 was measured in. Then compare your numbers with the doc's recorded
 ones.
@@ -793,7 +793,7 @@ whole gate chain; doc
   bounded waits, no early returns past barriers, errors not silent fallbacks.
 - Chapters 03–05 ([03 · Reading minfer's kernels I](03-kernels-elementwise.md),
   `04-kernels-matmul.md`,
-  [05 · Reading minfer's kernels III](05-kernels-attention-host.md)) — the
+  [05 · Reading minfer's kernels III](05-kernels-attention-host.md) — the
   kernels this chapter's catalog points into, taught line by line.
 
 ← [05 · Reading minfer's kernels III](05-kernels-attention-host.md) · [Index](./README.md) · [07 →](07-where-next.md)
