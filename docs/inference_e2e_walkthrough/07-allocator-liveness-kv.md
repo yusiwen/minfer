@@ -237,7 +237,7 @@ the allocator maps the rope node's output to the *input's* buffer:
 q_buf ──▶ rope kernel reads and overwrites q_buf in place   [1 buffer]
 ```
 
-`enable_metal` (`alloc.rs:264-300`) implements this, guarded by exactly two conditions — the
+(`alloc.rs:736-775`, the in-place alias arm) implements this, guarded by exactly two conditions — the
 input's **sole consumer** is this op (`n_consumers[src] == 1`, from step 4
 above) and the input lives **on the same backend**. Both guards are load
 bearing. If another node also reads the input, overwriting it destroys data
@@ -268,7 +268,7 @@ Why bother? Three reasons, in decreasing order of "wow":
    path, but there the whole `Silu` node is folded into `SwiGLU`, so it is
    fusion's win, not aliasing's.)
 3. **Parity with llama.cpp**, which executes rope and silu in place for the
-   same reasons `enable_metal` (`alloc.rs:260`)).
+   same reasons (`alloc.rs:736-775`, the same in-place alias arm)).
 
 The model-side code cooperates with the rule. In the mixed-quant QKV decode
 path, the builder deliberately wires attention to the epilogue node *so that*
@@ -290,7 +290,7 @@ phrase) means deciding *how big* that notepad is before anything is written.
 minfer's allocator owns it as **persistent regions**: each layer gets two
 buffers, K and V, each sized `n_kv_embd × n_ctx` f32 elements, allocated the
 first time any node of that layer mentions the layer and then **never freed
-and never recycled** `register_weight` (`alloc.rs:374`)). `n_kv_embd` is the KV width —
+and never recycled** `ensure_kv` (`alloc.rs:995`). `n_kv_embd` is the KV width —
 128 for Qwen2.5-0.5B (2 KV heads × head-dim 64), 1024 for Qwen3-4B — and
 `n_ctx` is the context budget from the CLI (`--n-ctx`, default 4096). The
 store/load node shapes carry the size `kvcache_store` (`builder.rs:655`) builds the store
@@ -339,7 +339,7 @@ The graph declares three inputs for a prefill — `token_ids` (`models/qwen2/gra
 `[nt,1,1,1]`, `positions` `[nt,1,1,1]`, and (when the tail-row
 optimization is active) `tail_ids` — all typed `DType::I32` in the IR. Yet
 every pool buffer is f32 (§2.1). The bridge is `fill_input_i32`
-`supports_for` (`alloc.rs:403`)): each u32 is packaged as `f32::from_bits(v)` — a pure
+`fill_input_i32` (`alloc.rs:1901`): each u32 is packaged as `f32::from_bits(v)` — a pure
 bit reinterpretation, *not* a numeric conversion — and written into the input
 node's buffer via the backend's `write_host`. On the consumer side the
 kernels run the inverse, `x.to_bits()`, recovering the exact integer:
@@ -585,7 +585,7 @@ pushes it onto the backend's free list. Nothing is *deallocated*; "free" here
 means "return to the recycling pool", which is why the next `alloc_in_pool`
 of the same size is a zero-cost reuse (plus one zero-fill on CPU).
 
-**Excerpt 4 — the in-place alias arm** `enable_metal` (`alloc.rs:274-300`)). The two guards
+**Excerpt 4 — the in-place alias arm** (`alloc.rs:736-775`). The two guards
 and the live-range extension, exactly as argued in §2.4.
 
 ```rust
@@ -622,7 +622,7 @@ The `else` branch matters as much as the `if`: a cross-backend or
 multi-consumer input silently falls back to a normal buffer. Aliasing is an
 optimization with strict preconditions, never an assumption.
 
-**Excerpt 5 — persistent region creation** `register_weight` (`alloc.rs:374`)).
+**Excerpt 5 — persistent region creation** `ensure_kv` (`alloc.rs:995`).
 
 ```rust
 /// Per-layer KV persistent regions (K and V), created on first use on the
@@ -656,7 +656,7 @@ The region is also sized on **first use only**: if a later graph asked for a
 different size, it would silently get the old buffer — one reason `n_ctx`
 must stay consistent across a run (§3.3, question 3).
 
-**Excerpt 6 — I32 input filling** `supports_for` (`alloc.rs:403`) plus the routing tail
+**Excerpt 6 — I32 input filling** `fill_input_i32` (`alloc.rs:1901`) plus the routing tail
 of `fill_input_impl`, `alloc.rs:2075`).
 
 ```rust
@@ -739,7 +739,7 @@ let kv_pair = match &node.op {
 `execute_node` takes `kv_pair: Option<(usize, usize)>` alongside the ordinary
 input ids `free_buffer` (`backend.rs:50`)) — the K/V regions are *not* the node's `src`
 inputs; they are process-lifetime siblings only KV-aware ops know about. The
-CPU store kernel shows the split-brain clearly `supports_op` (`cpu_backend.rs:143-175`)):
+CPU store kernel shows the split-brain clearly `execute_node` (`cpu_backend.rs:308-359`)):
 K is written through `out_buf` (which the allocator guaranteed is the K
 region), V through the sibling id, both reached with `split_at_mut` for
 disjoint mutable borrows, and positions decoded from the I32 input with
