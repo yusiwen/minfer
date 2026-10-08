@@ -1,19 +1,23 @@
 //! C4 S2b Metal packed `q8_0` KV gates (issue #310).
 //!
-//! The packed path is **implemented on this branch but not enabled**: production
-//! keeps `READS_PACKED_KV = false` (the fast causal/windowed families refuse a
-//! packed region and the classic fallback measures 4–17× slower than f16 — see
-//! `docs/METAL-BACKEND-DESIGN.md` §4.4), so `MINFER_CACHE_TYPE=q8_0` is still
-//! refused at load and `GraphAllocator::ensure_kv` still refuses a packed region
-//! by default. These gates therefore run under a **documented `#[cfg(test)]`
-//! capability seam** ([`PackedKvEnabled`], the registry's thread-local
-//! `set_force_packed_kv`) that lets them drive the real production entry points
-//! without flipping the shipped capability.
+//! Metal **reads a packed region** since #310 (`metal_backend::READS_PACKED_KV =
+//! true`), so `MINFER_CACHE_TYPE=q8_0` loads and runs on Metal. Two reading
+//! mechanisms cover every attention shape, selected by the pure
+//! `crate::metal::packed_attn_route`:
 //!
-//! #310 adds the packed store (`kernel_store_kv_q8_0`) and the packed reads
-//! (`kernel_gqa_attn_q8_0` for the causal classic path and
-//! `kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0` for the explicit
-//! window layouts), selected whenever the engine's KV format is Q8_0.
+//! - **Mechanism A** — native packed reads in the decode flash family
+//!   (`kernel_flash_attn_ext_q8_0` / `_hd128_q8_0`, `nt == 1`, `hd ∈ {64,128}`).
+//! - **Mechanism B** — `kernel_dequant_kv_q8_0_to_f32` stages the needed window
+//!   of packed cells into a transient **f32** buffer, then the *unchanged* f32
+//!   prefill (`kernel_flash_attn_blk_*`) or windowed-flash
+//!   (`kernel_flash_attn_window_*`) family runs against it. f32 staging keeps the
+//!   classic path's accuracy: an f16 stage would round the already-Q8_0-
+//!   dequantized value a second time, which on Qwen3-0.6B amplified to a 16.9
+//!   logit delta across 8 decode steps (the ignored real-model gate measures the
+//!   f32 stage at 1.28 / 0.36, passing the inherited ≤4.0 / ≤1.0 class).
+//! - Anything neither covers (a small/odd `hd`, an `nt == 1` explicit window, an
+//!   opt-out) keeps the classic packed kernels `kernel_gqa_attn_q8_0`,
+//!   `kernel_gqa_attn_window_q8_0` and `kernel_gqa_attn_map_q8_0`.
 //!
 //! These gates drive the production graph path:
 //!
@@ -24,13 +28,16 @@
 //! - [`metal_packed_decode_matches_the_dequantized_reference`] and
 //!   [`metal_packed_attn_span_matches_the_v_row`] are the value arms for the
 //!   reads: a one-key window's softmax is exactly 1, so the output is the cell's
-//!   dequantized V row **bitwise**, computed on the host independently of
-//!   Metal. `HD = 64` is deliberate — that is the shape whose causal/window fast
-//!   families (flash / prefill / windowed flash) the dispatch bypasses for a
-//!   packed region; a kernel that took the f32 fast path over packed bytes would
-//!   return a different value and be red.
+//!   dequantized V row **bitwise** (mechanism A) or, through mechanism B, its
+//!   f32-staged image **bitwise**. `HD = 64` is deliberate — it is the shape the
+//!   fast families cover, so the decode arm reaches mechanism A and the window
+//!   arm (`nt = 6`) reaches mechanism B.
 //! - [`metal_packed_prefill_matches_the_dequantized_reference`] covers the
-//!   multi-key softmax at a named tolerance.
+//!   multi-key softmax at a named tolerance, over the f32-staged K/V the
+//!   production route reads.
+//! - [`metal_packed_decode_stage_matches_the_native_read`] is the A/B
+//!   differential: the same decode through mechanism A and mechanism B must
+//!   agree within the f16-staging tolerance.
 //! - [`metal_packed_session_round_trips`] is the C5 `FLAG_PACKED` round trip: a
 //!   Metal arena saves and restores bitwise, and a fresh F32 allocator refuses
 //!   the file (the header really carries Q8_0), which is the store + container
@@ -42,29 +49,6 @@ use super::*;
 use crate::graph::kvformat::{pack_q8_0_cell, unpack_q8_0_cells, KvFormat};
 use crate::graph::kvsession::KvSessionExpect;
 use crate::graph::ops::{AttnMeta, AttnMode};
-
-/// #310 gate seam: enable packed KV for the calling thread while a test runs.
-///
-/// Production ships `READS_PACKED_KV = false` (the fast families refuse packed,
-/// so the classic fallback is 4–17× slower), but the implementation is real and
-/// must stay exercised. This guard flips the registry's **thread-local**
-/// override, so it drives the production `resolve` / `ensure_kv` / session
-/// entry points without changing the shipped answer and without leaking into a
-/// concurrently-running test. `Drop` restores it, so a panic cannot leave it on.
-struct PackedKvEnabled;
-
-impl PackedKvEnabled {
-    fn on() -> Self {
-        crate::graph::registry::set_force_packed_kv(true);
-        Self
-    }
-}
-
-impl Drop for PackedKvEnabled {
-    fn drop(&mut self) {
-        crate::graph::registry::set_force_packed_kv(false);
-    }
-}
 
 const NH: usize = 2;
 const NK: usize = 2;
@@ -293,7 +277,6 @@ fn span_window(spans: &[(u32, u32)]) -> Vec<u32> {
 #[test]
 fn metal_packed_store_is_byte_identical_to_the_cpu_quantizer() {
     let _g = crate::metal::metal_test_lock();
-    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -363,7 +346,6 @@ fn metal_packed_store_is_byte_identical_to_the_cpu_quantizer() {
 #[test]
 fn metal_packed_decode_matches_the_dequantized_reference() {
     let _g = crate::metal::metal_test_lock();
-    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -392,18 +374,96 @@ fn metal_packed_decode_matches_the_dequantized_reference() {
     );
 }
 
+/// A `rows`-long KV store followed by an `nt == 1` causal decode at the last
+/// cell — a genuine multi-key softmax at the one query, which is the shape
+/// mechanism A's native packed read serves.
+fn make_decode_graph(rows: usize) -> (ComputeGraph, usize) {
+    let mut gb = GraphBuilder::new();
+    gb.set_kv_format(KvFormat::Q8_0);
+    let pos = gb.input("positions", [1, 1, 1, 1], DType::I32);
+    let q = gb.input("q", [NQT, 1, 1, 1], DType::F32);
+    let k = gb.input("k", [NKT, rows, 1, 1], DType::F32);
+    let v = gb.input("v", [NKT, rows, 1, 1], DType::F32);
+    gb.kvcache_store(0, k, v, N_CTX);
+    let kv = gb.kvcache_load(0, NKT, N_CTX, NK);
+    let o = gb.attn(
+        q,
+        kv,
+        pos,
+        AttnMode::Gqa,
+        AttnMeta {
+            layer: 0,
+            n_head: NH,
+            n_head_kv: NK,
+            hd: HD,
+            hd_kv: HD,
+            nkt: NKT,
+            scale: 1.0 / (HD as f32).sqrt(),
+        },
+    );
+    gb.output(o);
+    (gb.build(), o)
+}
+
+/// The A/B differential (issue #310): the same packed decode runs once through
+/// mechanism A (native packed flash) and once through mechanism B
+/// (`MINFER_PACKED_KV_STAGE`, driven through the `#[cfg(test)]` thread-local so
+/// the parallel macOS suite is not perturbed). Mechanism B dequantizes the cells
+/// into an **f32** stage, so the two paths differ only in f32 reduction order:
+/// the measured max |Δ| at `rows = 48` is reported below and gated at 1e-3 (the
+/// shared decode-flash reduction is exact for one query, so the measured value is
+/// ~1e-7; a wrong block base or stride would be orders of magnitude larger).
+#[test]
+fn metal_packed_decode_stage_matches_the_native_read() {
+    let _g = crate::metal::metal_test_lock();
+    crate::metal::MpsState::init();
+    if MetalBackend::new().is_none() {
+        eprintln!("MPS unavailable; skipping");
+        return;
+    }
+
+    const ROWS: usize = 48;
+    let (g, out) = make_decode_graph(ROWS);
+    let q = q_data(1);
+    let k = kv_data(11, ROWS);
+    let v = kv_data(23, ROWS);
+    let cells: Vec<u32> = (0..ROWS as u32).collect();
+    let positions = [ROWS as u32 - 1];
+
+    // Mechanism A: the native packed decode (the default route).
+    crate::graph::metal_backend::set_stage_forced(false);
+    let got_a = run_causal(&g, out, &q, &k, &v, &cells, &positions);
+
+    // Mechanism B: dequantize to the f32 stage, then the f32 flash.
+    crate::graph::metal_backend::set_stage_forced(true);
+    let got_b = run_causal(&g, out, &q, &k, &v, &cells, &positions);
+    crate::graph::metal_backend::set_stage_forced(false);
+
+    let d = max_delta(&got_a, &got_b);
+    eprintln!("[packed decode A/B] rows={ROWS}: max|Δ|={d} (A native, B f32 stage)");
+    assert!(
+        got_a.iter().any(|&x| x != 0.0),
+        "the fixture returned all zeros; the comparison is vacuous"
+    );
+    assert!(
+        d <= 1e-3,
+        "mechanism A and mechanism B diverge on the decode shape (max|Δ| = {d})"
+    );
+}
+
 /// Rule 1, causal read half, multi-key: an `nt`-token prefill at `HD = 64` (the
-/// shape whose `kernel_flash_attn_blk_*` family would be chosen for f32/f16) is
-/// bypassed for a packed region and runs `kernel_gqa_attn_q8_0`. The host oracle
-/// runs a scalar softmax over the dequantized K/V, so a packed read that used
-/// the wrong block base or stride is red.
+/// shape whose `kernel_flash_attn_blk_*` family would be chosen for f32/f16)
+/// dequantizes the window into the f32 stage and runs that f32 family
+/// (mechanism B). The host oracle runs a scalar softmax over the **f32-staged**
+/// dequantized K/V, so a packed read that used the wrong block base or stride is
+/// red. (The decode shape in the gate above is the one shape that reads packed
+/// cells natively, mechanism A.)
 ///
 /// Bar named before measuring: max|Δ| ≤ 1e-4, the class `metal_attn_span_multi_key_matches_cpu`
 /// already uses for Metal-vs-CPU attention (different f32 reduction orders).
 #[test]
 fn metal_packed_prefill_matches_the_dequantized_reference() {
     let _g = crate::metal::metal_test_lock();
-    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -469,14 +529,15 @@ fn run_causal(
     alloc.copy_to_cpu(out).unwrap()
 }
 
-/// Rule 1, window read half (`kernel_gqa_attn_window_q8_0` and its `kv_map`
-/// sibling): one-cell windows resolve to the dequantized V row **bitwise**, in
-/// both explicit layouts, at `HD = 64` (the shape whose fast windowed-flash
-/// family the packed dispatch bypasses).
+/// Rule 1, window read half (mechanism B, `kernel_dequant_kv_q8_0_to_f32` then
+/// `kernel_flash_attn_window_blk_*`/`_map_*`): one-cell windows resolve to the
+/// f32-staged dequantized V row **bitwise** (softmax over one key is exactly 1),
+/// in both explicit layouts, at `HD = 64` (the shape whose fast windowed-flash
+/// family the packed dispatch now reaches through the stage; `nt = 6` is a
+/// prefill, so the route is `StageThenWindow`).
 #[test]
 fn metal_packed_attn_span_matches_the_v_row() {
     let _g = crate::metal::metal_test_lock();
-    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -507,10 +568,57 @@ fn metal_packed_attn_span_matches_the_v_row() {
         );
         assert_eq!(
             d, 0.0,
-            "map={map}: Metal's packed one-cell window is not the dequantized V row \
+            "map={map}: Metal's packed one-cell window is not the f32-staged dequantized V row \
              (max|Δ| = {d})"
         );
     }
+}
+
+/// #310 mutation-observable arm: mechanism B's dequant kernel stages the window
+/// at its **absolute** cell row (`dst[(row0 + r) * ncols + c]`), which the
+/// zero-`lo_min` gates above cannot see (there `row0 == 0`). Here the store fills
+/// `OFFSET + N` rows and each of the `N` queries names a single cell `OFFSET + t`
+/// (`lo_min = OFFSET > 0`). A one-key softmax is exactly 1, so the output is the
+/// f32-staged dequantized V row of that absolute cell — but only if the stage is
+/// addressed absolutely. Dropping `row0` from the dequant kernel writes the
+/// window at row 0 and the fast kernel reads the uninitialised rows
+/// `[OFFSET, OFFSET+N)`, a large max|Δ|.
+#[test]
+fn metal_packed_window_stages_at_the_absolute_row() {
+    let _g = crate::metal::metal_test_lock();
+    crate::metal::MpsState::init();
+    if MetalBackend::new().is_none() {
+        eprintln!("MPS unavailable; skipping");
+        return;
+    }
+
+    const N: usize = 6;
+    const OFFSET: usize = 37;
+    let rows = OFFSET + N;
+    let (g, out) = make_graph(N, rows, false);
+    let q = q_data(N);
+    let k = kv_data(11, rows);
+    let v = kv_data(23, rows);
+    let cells: Vec<u32> = (0..rows as u32).collect();
+    let window = span_window(
+        &(0..N as u32)
+            .map(|t| ((OFFSET as u32) + t, (OFFSET as u32) + t + 1))
+            .collect::<Vec<_>>(),
+    );
+    let got = run(&g, out, &q, &k, &v, &cells, &window);
+
+    let v_deq = q8_roundtrip(&v, rows);
+    let want = v_rows(&v_deq, &(OFFSET..OFFSET + N).collect::<Vec<_>>());
+    let d = max_delta(&got, &want);
+    eprintln!("[packed window offset] lo_min={OFFSET}: max|Δ|={d}");
+    assert!(
+        want.iter().any(|&x| x != 0.0) && got.iter().any(|&x| x != 0.0),
+        "the fixture returned all zeros; the comparison is vacuous"
+    );
+    assert_eq!(
+        d, 0.0,
+        "mechanism B did not stage the window at its absolute cell row (max|Δ| = {d})"
+    );
 }
 
 /// The default cached gate model (Qwen2.5-0.5B Q4_0), overridable by
@@ -553,10 +661,6 @@ fn argmax(x: &[f32]) -> u32 {
 /// at the f32 reference's argmax |Δ| ≤ 1.0, and over the whole logit vector
 /// |Δ| ≤ 4.0 (a gross-error detector — a wrong cell width is off by the spread).
 /// Ignored: needs the cached model and a Metal device.
-///
-/// It enables the packed capability for its own run via [`PackedKvEnabled`] — the
-/// explicit enabling path an ignored arm is allowed, because production keeps
-/// `READS_PACKED_KV = false`.
 #[test]
 #[ignore = "requires the cached 0.5B model and a Metal device"]
 fn metal_q8_0_kv_answers_like_f32_on_a_real_model() {
@@ -565,7 +669,6 @@ fn metal_q8_0_kv_answers_like_f32_on_a_real_model() {
     use crate::models::{Device, ModelDef};
 
     let _g = crate::metal::metal_test_lock();
-    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
@@ -672,7 +775,6 @@ fn metal_q8_0_kv_answers_like_f32_on_a_real_model() {
 #[test]
 fn metal_packed_session_round_trips() {
     let _g = crate::metal::metal_test_lock();
-    let _packed = PackedKvEnabled::on();
     crate::metal::MpsState::init();
     if MetalBackend::new().is_none() {
         eprintln!("MPS unavailable; skipping");
