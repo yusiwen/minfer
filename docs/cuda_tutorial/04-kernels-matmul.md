@@ -401,7 +401,7 @@ flag (`_layout` — whether a Q6_K weight was registered with the padded
 224-byte stride). The decision tree inside `Q4KB` (`src/cuda/methods/weights.rs:426`)) has three
 tiers:
 
-**Tier 1 — prefill GEMM** `prewarm_prefill` (`src/cuda/methods/weights.rs:13`)): `nt >= 9` **and** `id % 32 == 0`
+**Tier 1 — prefill GEMM** `prewarm_prefill` (`src/cuda/methods/weights.rs:474`)): `nt >= 9` **and** `id % 32 == 0`
 **and** a supported quant type → a tiled GEMM — `prefill_mmq` (int8,
 default) or `prefill_gemm_f16` (the f16 escape, §3.5) depending on
 `mmq_active()` (`src/cuda/methods/policy.rs:39`: compute capability ≥ 8.0 and `MINFER_MMQ`
@@ -459,7 +459,7 @@ the gate and the whole step is MMVQ — plus the v2 variants, since
 `mmvq_v2(id)` `rope_f32` (`src/cuda/methods/elementwise.rs:171`)) additionally requires `id % 256 == 0`
 (3584 = 256·14 ✓). The gate is not an oversight: the arms' comments record
 the measured crossovers (small-`id` MMVQ loses — the uncoalesced nibble
-loads dominate when rows are short, `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:141`)). The reading habit
+loads dominate when rows are short, `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`)). The reading habit
 this tutorial keeps hammering: **the master table gives the structure; the
 gates give your model's truth.**
 
@@ -730,7 +730,7 @@ its pieces in a profile:
 
 - **Activation prepass**: `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`)
   quantizes f32 activations to int8 *and writes them pre-transposed and
-  swizzled* into the exact layout the GEMM stages `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:141`);
+  swizzled* into the exact layout the GEMM stages `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`);
   llama.cpp's `quantize_mmq_q8_1` design — "byte-identical … only
   reordered", :782-790).
 - **The GEMM**: `mmq_raw_nb_bt_kernel` (`mmq_nb.cu:289`) — raw
@@ -741,7 +741,7 @@ its pieces in a profile:
   kernel (:6976);
   non-BT-consumable shapes fall back to `mmq_nt_kernel` (:5663).
 - **Split-K**: when the grid is M-starved (small `nt`), doc 92's auto
-  ksplit `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:141`)) slices the k-range across `grid.z` and
+  ksplit `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`)) slices the k-range across `grid.z` and
   `mmq_ksplit_reduce_kernel` (:7316) adds the partials — the same split-K
   family as decode attention (chapter 05 §2.4).
 
@@ -787,7 +787,7 @@ The derivation of the last row: FLOPs = 2·512·896·4864 ≈ 4.46 GFLOP; MMQ
 bytes ≈ 512·152·40 B (activations) + 2.45 MB (weights) + 512·896·4 B
 (output) ≈ 7.4 MB; 4.46e9 / 7.4e6 ≈ 600. Between the first and last row the
 intensity swings by three orders of magnitude — and that swing, not any
-kernel's cleverness, is what the dispatch gate `nt >= 9` `prewarm_prefill` (`src/cuda/methods/weights.rs:13`))
+kernel's cleverness, is what the dispatch gate `nt >= 9` `prewarm_prefill` (`src/cuda/methods/weights.rs:474`))
 reacts to.
 
 Two consequences worth internalizing:
