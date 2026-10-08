@@ -117,7 +117,7 @@ to exceed it rather than launch something invalid.
 ### 2.3 Where the Rust side hands over
 
 `src/cuda.rs` declares the launchers in an `extern "C"` block (the FFI
-surface, e.g. `launch_add_f32` at `src/cuda/methods/prefill_f16.rs:12`, `launch_dequant_f16` at
+surface, e.g. `launch_add_f32` at `launch_dequant_f16` (`src/cuda/methods/prefill_f16.rs:12`), `launch_dequant_f16` at
 `:340`) and wraps each in a small safe method on `CudaState`. The graph
 backend never sees kernel names; it sees graph ops. The three call sites this
 chapter follows:
@@ -142,7 +142,7 @@ the most frequent nodes (doc 05 walks the topology; doc 11 explains the
 pre-norm layout), which makes them the right first read: they are everywhere,
 and they are the "hello world" shape of this codebase.
 
-The kernel — `src/cuda/kernels/ops_elementwise.cu:163`:
+The kernel — `add_f32` (`src/cuda/kernels/ops_elementwise.cu:163`):
 
 ```c
 __global__ void add_f32(
@@ -171,7 +171,7 @@ Line by line:
   `__restrict__` qualifiers promise the compiler the three buffers do not
   alias, which lets nvcc keep the loads before the store.
 
-The launcher — `src/cuda/kernels/ops_elementwise.cu:363`:
+The launcher — `rope_f32` (`src/cuda/kernels/ops_elementwise.cu:263`):
 
 ```c
 void launch_add_f32(
@@ -194,7 +194,7 @@ without global synchronization.
 The Rust call chain: the backend's `Op::Add` arm checks that both inputs have
 the same element count as the output and calls
 `CudaState::add_f32` (`src/cuda/methods/elementwise.rs`), which is a three-line FFI shim.
-The dispatch site is `src/graph/cuda_backend.rs:478`:
+The dispatch site is `graph_replay_step` (`src/graph/cuda_backend.rs:459`):
 
 ```rust
 Op::Add => {
@@ -219,7 +219,7 @@ the GPU_SAFETY rule from §2.3, applied to a five-line kernel.
 
 **`add_bias_f32`** looks similar but solves a different indexing problem —
 broadcasting a one-dimensional bias across token rows. Kernel,
-`src/cuda/kernels/ops_elementwise.cu:151`:
+`add_bias_f32` (`src/cuda/kernels/ops_elementwise.cu:151`):
 
 ```c
 __global__ void add_bias_f32(
@@ -247,7 +247,7 @@ __global__ void add_bias_f32(
   is read by every row, so it stays hot in L2 across the grid.
 
 The bias call site sits *inside* the MatMul arm
-(`src/graph/cuda_backend.rs:931`, epilogue at `:990`), and the comment there
+`execute_node_inner` (`src/graph/cuda_backend.rs:916`), epilogue at `:990`), and the comment there
 records the one bug-prone detail of this kernel's contract:
 
 ```rust
@@ -259,7 +259,7 @@ self.state.add_bias_f32(self.ptr_of(out_buf)?, bptr, od, nt);
 
 Pass the element count instead of the row count and `grid.x` becomes `nt * d`
 rows — the kernel indexes `y[t * d + i]` far past the buffer. The Rust
-wrapper's docstring (`src/cuda/methods/prefill_mmq.rs:108`) repeats the warning. This is the
+wrapper's docstring `CudaState` (`src/cuda/methods/prefill_mmq.rs:107`)) repeats the warning. This is the
 chapter's first lesson in **grid-shape contracts**: a kernel is not just its
 body, it is the geometry its launcher assumes.
 
@@ -274,7 +274,7 @@ threads (§4 does that arithmetic).
 
 #### The data layout first
 
-Everything in this section depends on 18 bytes. `src/block.rs:51`:
+Everything in this section depends on 18 bytes. `unpack_q4k_scales` (`src/block.rs:44`):
 
 ```rust
 // Q4_0 — 4-bit quantization, 32 elements per block (line 184-189)
@@ -288,7 +288,7 @@ pub struct BlockQ4_0 {
 }
 ```
 
-with `pub const Q4B: usize = 18` at `block.rs:18` and a compile-time
+with `pub const Q4B: usize = 18` at `fp16_to_f32` (`block.rs:12`) and a compile-time
 `assert!(core::mem::size_of::<BlockQ4_0>() == 2 + 16)` at `:191`. So the
 byte layout is exactly:
 
@@ -307,7 +307,7 @@ them:
 
 - **Nibble order**: element `j` comes from the **low** 4 bits of byte `j`;
   element `j + 16` from the **high** 4 bits. The kernel comment states it
-  verbatim (`matmul_f32act.cu:14`) and both the embed and dequant kernels
+  verbatim `q4_0_q8_0_matmul` (`matmul_f32act.cu:14`)) and both the embed and dequant kernels
   implement it identically.
 - **The +8 offset**: minfer (like llama.cpp) stores `round(v/d) + 8`, so the
   unsigned nibble 0..15 maps back by subtracting 8 — that is the `- 8.0f`
@@ -316,7 +316,7 @@ them:
 
 #### The kernel
 
-`src/cuda/kernels/gemm_wmma.cu:38` (family header + type-id table at `:10-21`):
+`dequant_q4_0_f16` (`src/cuda/kernels/gemm_wmma.cu:38`) (family header + type-id table at `:10-21`):
 
 ```c
 __global__ void dequant_q4_0_f16(
@@ -354,9 +354,9 @@ grid has `od * nb` threads. Reading it line by line:
   row-major and each row is exactly `nb` blocks, the flat block index `g` is
   *also* the byte offset in units of 18. This only works because the row
   length `id` is a multiple of 32 — the backend gates it before dispatching:
-  the MatMul arm rejects `id % 32 != 0` (`cuda_backend.rs:960`) and the f16
-  warm path requires `id % 256 == 0` (`src/cuda/methods/policy.rs:87`).
-- **`h2f(...)`** — the file's helper (`gemm_fused_dequant.cu:30`): reinterpret the
+  the MatMul arm rejects `id % 32 != 0` `execute_node_inner` (`cuda_backend.rs:916`)) and the f16
+  warm path requires `id % 256 == 0` `mmq_a_fuse_mode` (`src/cuda/methods/policy.rs:73`)).
+- **`h2f(...)`** — the file's helper `bqa_q8_0` (`gemm_fused_dequant.cu:26`)): reinterpret the
   2 scale bytes as `__half` and convert to f32. The scale is stored f16, read
   once per block.
 - **The unrolled loop** — each byte yields two f16 outputs: `& 0x0F` takes the
@@ -369,7 +369,7 @@ grid has `od * nb` threads. Reading it line by line:
   start in the dense `[od][id]` f16 matrix, plus 32 elements per block. The
   writes of one thread are fully contiguous.
 
-The launcher — `src/cuda/kernels/gemm_wmma.cu:777`:
+The launcher — `MINFER_GEMM_OPTIN_SET` (`src/cuda/kernels/gemm_wmma.cu:596`):
 
 ```c
 void launch_dequant_f16(
@@ -402,22 +402,22 @@ version, which is worth knowing because it explains *when* you will see these
 kernels in a profile:
 
 - The **persistent f16 weight cache** (Phase 8p) is warmed **at load time**
-  by the model loaders: `enable_w16_cache` + `warm_w16` per weight
-  (`src/models/qwen2/loader.rs:580-591`; the `warm_w16` body at
-  `src/cuda/methods/policy.rs:72` maps `TensorType` → the same type ids and calls
+  by the model loaders: `enable_w16_cache` (`src/models/qwen2/loader.rs:685`) + `warm_w16`
+  (`:690`) per weight; the `warm_w16` body (`src/cuda/methods/prefill_f16.rs:89`) maps
+  `TensorType` → the same type ids and calls
   `w16_get`, which launches the dequant). But only for models whose matmul
-  weights total ≥ `W16_ENABLE_BYTES` = 2 GiB (`src/cuda/ffi_runtime.rs:135`) **and**
+  weights total ≥ `W16_ENABLE_BYTES` = 2 GiB `gemm_prefill_smem_limit` (`src/cuda/ffi_runtime.rs:135`)) **and**
   when the int8 MMQ prefill path is not active
-  (`qwen2/loader.rs:578`). A 0.5B Q4_0 model is far below that bar (its
+  (`mmq_active` (`qwen2/loader.rs:683`)). A 0.5B Q4_0 model is far below that bar (its
   largest tensor, `tok_embd`, is 76.6 MB in Q4_0 — §4.1) and therefore runs
   **no** dequant at load today.
 - Otherwise `launch_dequant_f16` runs **per call** into a scratch buffer,
   from the f16 prefill GEMM path `prefill_gemm_f16`
-  (`src/cuda/methods.rs:224`, launch at `src/cuda/methods/prefill_f16.rs:159`).
+  `prefill_gemm_f16` (`src/cuda/methods.rs:224`), launch at `w16_get` (`src/cuda/methods/prefill_f16.rs:119`)).
 - Why a cache at all: the two-pass prefill GEMM used to dequantize W on
   *every* call — "288 ms per 7B @2K forward" — because weights are immutable
   after registration, the dequant result is cached per weight pointer
-  (`w16_cache` comment, `src/cuda/methods/prefill_f16.rs:131`).
+  (`w16_cache` comment, `w16_get` (`src/cuda/methods/prefill_f16.rs:119`)).
 
 And why dequantize at all, when the CPU side made a point of *never*
 dequantizing at load (walkthrough doc 10 §2.1's bandwidth argument)? The
@@ -432,7 +432,7 @@ token; on the GPU it buys access to hardware the packed format cannot feed.
 the full story.)
 
 An honest footnote from the same dispatch comment
-(`src/cuda/methods/weights.rs:469-480`): the *default* prefill today is the int8 MMQ GEMM,
+`Q4KB` (`src/cuda/methods/weights.rs:426`)): the *default* prefill today is the int8 MMQ GEMM,
 which streams raw quantized bytes and never touches `dequant_*_f16` —
 `MINFER_MMQ=0` escapes to the f16 wmma path that does. Both paths coexist;
 §5 shows how to run each.
@@ -446,7 +446,7 @@ same formula — that is the point of the parity tests.
 ### 3.3 `embed_rows_q4_0` — the gather
 
 The first real op of every forward: turn token ids into embedding vectors.
-The family comment (`src/cuda/kernels/ops_misc.cu:180`) states the job:
+The family comment `embed_rows_q4_0` (`src/cuda/kernels/ops_misc.cu:180`)) states the job:
 
 ```c
 // Embedding = gather + dequantize weight rows on device (removes the CPU
@@ -456,7 +456,7 @@ The family comment (`src/cuda/kernels/ops_misc.cu:180`) states the job:
 // f32 kernel.
 ```
 
-The kernel — `src/cuda/kernels/ops_misc.cu:180`:
+The kernel — `embed_rows_q4_0` (`src/cuda/kernels/ops_misc.cu:180`):
 
 ```c
 __global__ void embed_rows_q4_0(
@@ -493,7 +493,7 @@ what is new is the *gather* around it:
 
 - **`int id = __float_as_int(ids[t]);`** — the graph convention that integer
   inputs (token ids, positions) ride through f32 buffers as **bit patterns**
-  (`f32::from_bits(v)` at fill time — `src/graph/alloc.rs:439`,
+  (`f32::from_bits(v)` at fill time — `supports_for` (`src/graph/alloc.rs:403`),
   `fill_input_i32`). `__float_as_int` is a *bit reinterpretation*, not a
   numeric conversion: it hands back the exact i32 that was stored. A reading
   note in the forensics spirit: the family comment above still says "read
@@ -519,12 +519,12 @@ matrix picks one row (doc 05's graph excerpt shows the node:
 `embed(3) GetRows — h = one token_embd row per id, [896, nt]`). The output is
 token-major f32 `[nt][896]` — the layout every later kernel assumes.
 
-**Dispatch.** The backend arm (`src/graph/cuda_backend.rs:442`) matches
+**Dispatch.** The backend arm `set_graphs_enabled_for_test` (`src/graph/cuda_backend.rs:433`)) matches
 `Op::GetRows` on metadata: with `NodeMeta::Embed` it calls
 `embed_rows_on_gpu` (`:452`), with plain metadata it calls the generic
 `gather_rows_f32_on_gpu` (`:466`) — the same `GetRows` node serves the
 embedding *and* the tail-row selects before `lm_head` (doc 09 §2.4). The
-Rust wrapper (`src/cuda/methods/mmq_quant.rs:214`) maps `TensorType` to `(type_id,
+Rust wrapper `swiglu_quant` (`src/cuda/methods/mmq_quant.rs:192`)) maps `TensorType` to `(type_id,
 block_stride)` — `Q4_0 => (1, 18)` at `:4124` — and `F32` embeddings skip the
 quant kernels entirely by calling the f32 gather (`:4133`). The C launcher
 (`launch_embed_rows`, `ops_misc.cu:699`) computes the grid per type
@@ -564,7 +564,7 @@ if §3.1 made sense, these read themselves.
 ### 4.1 Bytes per element — before and after dequant
 
 The fixed exchange rate of this chapter, from the block layouts
-(`block.rs:16-22`, walkthrough doc 02):
+`fp16_to_f32` (`block.rs:12`), walkthrough doc 02):
 
 | Representation | Bytes / element | 0.5B tok_embd (151,936 × 896) |
 |---|---|---|
@@ -577,18 +577,18 @@ What that does to bandwidth, both directions:
 - **Every kernel that reads the f16 copy pays 3.56× the weight bytes** that
   the packed MMQ kernels pay (2 vs 0.5625 B/elem). That is the standing cost
   of the f16 prefill path, and the reason the int8 MMQ GEMM — which streams
-  raw nibbles — is the default (dispatch comment, `src/cuda/methods/weights.rs:473-478`).
+  raw nibbles — is the default (dispatch comment, `Q4KB` (`src/cuda/methods/weights.rs:426`)).
 - **The one-time dequant itself moves ≈ 349 MB** (read 76.6 + write 272.3)
   per weight tensor of that size, which is why the campaign cached the
   result: doing it per call cost a measured 288 ms per 7B @2K forward before
-  Phase 8p (`src/cuda/methods/prefill_f16.rs:131`).
+  Phase 8p `w16_get` (`src/cuda/methods/prefill_f16.rs:119`)).
 - Versus f32, the f16 copy still halves weight traffic — the same 2× argument
   that made the *KV* cache f16 (Phase 8b).
 
 ### 4.2 Threads launched — three real launches
 
 Dims verified in-repo: Qwen2.5-0.5B has `n_embd = 896`, 24 layers
-(`docs/QWEN2-SUPPORT.md:79`), and `n_vocab = 151936` (walkthrough doc 09
+(`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models")), and `n_vocab = 151936` (walkthrough doc 09
 §2.4: the 0.5B `lm_head` costs `30 × 896 × 151936`).
 
 **Embed gather, 30-token prefill** (`embed_rows_q4_0`):
@@ -624,7 +624,7 @@ contiguous).
 - **A wrong grid contract.** Pass element count instead of row count to
   `add_bias_f32` and you launch `nt × d` block-rows — out-of-bounds writes,
   not a slowdown but a crash or silent corruption (the call-site comment,
-  `cuda_backend.rs:987`).
+  `execute_node_inner` (`cuda_backend.rs:916`)).
 - **Element-per-thread dequant.** One thread per *element* would re-read the
   scale byte and re-enter the nibble 32× more often per output; the
   block-per-thread shape exists to amortize the scale read and emit
