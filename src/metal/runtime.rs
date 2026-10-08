@@ -177,12 +177,16 @@ impl MpsState {
             let pl_rope = get_pl("kernel_rope_f32")?;
             let pl_gqa_attn = get_pl("kernel_gqa_attn_f32")?;
             let pl_gqa_attn_f16 = get_pl("kernel_gqa_attn_f16")?;
+            // #310: the packed Q8_0 causal attention kernel.
+            let pl_gqa_attn_q8_0 = get_pl("kernel_gqa_attn_q8_0")?;
             // E1 `attn_span` read path (issue #44, G5a).
             let pl_gqa_attn_window = get_pl("kernel_gqa_attn_window_f32")?;
             let pl_gqa_attn_window_f16 = get_pl("kernel_gqa_attn_window_f16")?;
+            let pl_gqa_attn_window_q8_0 = get_pl("kernel_gqa_attn_window_q8_0")?;
             // C8b S4 `kv_map` read path (issue #362).
             let pl_gqa_attn_map = get_pl("kernel_gqa_attn_map_f32")?;
             let pl_gqa_attn_map_f16 = get_pl("kernel_gqa_attn_map_f16")?;
+            let pl_gqa_attn_map_q8_0 = get_pl("kernel_gqa_attn_map_q8_0")?;
             let pl_gqa_attn_partial = get_pl("kernel_gqa_attn_partial_f32")?;
             let pl_gqa_attn_partial_f16 = get_pl("kernel_gqa_attn_partial_f16")?;
             let pl_gqa_attn_combine = get_pl("kernel_gqa_attn_combine_f32")?;
@@ -209,6 +213,7 @@ impl MpsState {
             let pl_kv_tail_pad = get_pl("kernel_kv_tail_pad")?;
             let pl_store_kv = get_pl("kernel_store_kv_f32")?;
             let pl_store_kv_f16 = get_pl("kernel_store_kv_f16")?;
+            let pl_store_kv_q8_0 = get_pl("kernel_store_kv_q8_0")?;
             let pl_attn_bsr = get_pl("kernel_attn_bias_rope_store")?;
             let pl_attn_rope_store = get_pl("kernel_attn_rope_store")?;
             let pl_attn_scores = get_pl("kernel_attn_scores")?;
@@ -270,10 +275,13 @@ impl MpsState {
                 pl_rope,
                 pl_gqa_attn,
                 pl_gqa_attn_f16,
+                pl_gqa_attn_q8_0,
                 pl_gqa_attn_window,
                 pl_gqa_attn_window_f16,
+                pl_gqa_attn_window_q8_0,
                 pl_gqa_attn_map,
                 pl_gqa_attn_map_f16,
+                pl_gqa_attn_map_q8_0,
                 pl_gqa_attn_partial,
                 pl_gqa_attn_partial_f16,
                 pl_gqa_attn_combine,
@@ -296,6 +304,7 @@ impl MpsState {
                 pl_kv_tail_pad,
                 pl_store_kv,
                 pl_store_kv_f16,
+                pl_store_kv_q8_0,
                 pl_attn_bsr,
                 pl_attn_rope_store,
                 pl_attn_scores,

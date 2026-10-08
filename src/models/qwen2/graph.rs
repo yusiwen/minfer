@@ -117,18 +117,24 @@ impl Qwen2Graph {
             // 32-element K block) and one V block, so it can quantize a cell's
             // blocks in place. Pre-#144 the gate read `&& !b.kv_is_packed()` and a
             // Q8_0 decode ran the unfused bias/rope/store chain.
-            let fuse_qkv = nt == 1
-                && layer_gpu
-                && params.cparams.fuse_qkv
-                && l.bq.is_some()
-                && l.bk.is_some()
-                && l.bv.is_some();
+            //
+            // #310: that packed fused epilogue is CUDA-only. Metal's fused kernel
+            // is f32/f16-only, so a packed Metal cache takes the unfused chain
+            // (`qkv_epilogue_ok` is false without the CUDA feature), exactly as
+            // Qwen3's `fused_qkv_norm` already gates on `!b.kv_is_packed()`.
             // class 2 is CUDA-only: on macOS (feature off) the mixed-quant
             // layers keep the unfused chain, bitwise-neutral vs pre-D3-8.
             #[cfg(feature = "cuda")]
             let qkv_epilogue_ok = crate::cuda::CudaState::get().is_some();
             #[cfg(not(feature = "cuda"))]
             let qkv_epilogue_ok = false;
+            let fuse_qkv = nt == 1
+                && layer_gpu
+                && params.cparams.fuse_qkv
+                && (!b.kv_is_packed() || qkv_epilogue_ok)
+                && l.bq.is_some()
+                && l.bk.is_some()
+                && l.bv.is_some();
             let (q, kv) = if fuse_qkv && Self::qkv_concat_available(&l.wq, &l.wk, &l.wv) {
                 let qkv = b.fused_qkv(
                     normed,

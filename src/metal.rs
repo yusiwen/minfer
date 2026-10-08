@@ -207,14 +207,20 @@ struct MpsStateInner {
     pl_rope: MetalComputePipelineState,
     pl_gqa_attn: MetalComputePipelineState,
     pl_gqa_attn_f16: MetalComputePipelineState,
+    // #310: the packed Q8_0 causal attention kernel (classic tiling; the fast
+    // flash/split/prefill families are f32/f16-only and are not selected when the
+    // engine's KV format is Q8_0 — see `metal_backend`'s Attn arm).
+    pl_gqa_attn_q8_0: MetalComputePipelineState,
     // E1 `attn_span` read path (issue #44, G5a): the windowed kernel family.
     pl_gqa_attn_window: MetalComputePipelineState,
     pl_gqa_attn_window_f16: MetalComputePipelineState,
+    pl_gqa_attn_window_q8_0: MetalComputePipelineState,
     // C8b S4 `kv_map` read path (issue #362): the set-valued window's sibling
     // kernels. Deliberately separate from the one-range window family above,
     // whose instruction stream is a measured contract (#315).
     pl_gqa_attn_map: MetalComputePipelineState,
     pl_gqa_attn_map_f16: MetalComputePipelineState,
+    pl_gqa_attn_map_q8_0: MetalComputePipelineState,
     pl_gqa_attn_partial: MetalComputePipelineState,
     pl_gqa_attn_partial_f16: MetalComputePipelineState,
     pl_gqa_attn_combine: MetalComputePipelineState,
@@ -242,6 +248,7 @@ struct MpsStateInner {
     pl_kv_tail_pad: MetalComputePipelineState,
     pl_store_kv: MetalComputePipelineState,
     pl_store_kv_f16: MetalComputePipelineState,
+    pl_store_kv_q8_0: MetalComputePipelineState,
     pl_attn_bsr: MetalComputePipelineState,
     pl_attn_rope_store: MetalComputePipelineState,
     pl_attn_scores: MetalComputePipelineState,

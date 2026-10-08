@@ -31,6 +31,44 @@ kernel void kernel_store_kv_f16(
     dst[positions[t] * nkt + j] = half(src[t * nkt + j]);
 }
 
+// C4 S2b Metal twin (issue #310): quantize nt f32 rows into packed Q8_0 cells
+// of a persistent KV region. One thread per (row, 32-element block). The
+// quantizer is the CPU's (`quants::quantize_row_q8_0_into`, whose aarch64 path
+// is `quantize_scalar`): `d = amax/127`, the f16 scale written round-to-nearest-
+// even, and each quant `rint(x/d)` clamped to the i8 range — `rint` is
+// round-to-nearest-even under Metal's default rounding mode, the same
+// `round_ties_even` the CPU uses, so both backends write the same bytes for the
+// same row. `row_bytes` is the packed cell's word-padded byte width
+// (`KvFormat::Q8_0.row_bytes(nkt)`), which is what makes a cell move a plain
+// word copy. This is the only packed store: CUDA's `store_kv_q8_0` is its
+// counterpart.
+kernel void kernel_store_kv_q8_0(
+    device const float * src [[buffer(0)]],
+    device       uchar * dst [[buffer(1)]],
+    constant    int    & nkt [[buffer(2)]],
+    constant    int    & nt  [[buffer(3)]],
+    constant    int    * positions [[buffer(4)]],
+    constant    uint   & row_bytes [[buffer(5)]],
+    uint2 tid [[thread_position_in_grid]]
+) {
+    int t   = tid.x;
+    int blk = tid.y;
+    int nblk = nkt / 32;
+    if (t >= nt || blk >= nblk) return;
+    int p = positions[t];
+    device const float * x = src + (size_t)t * nkt + (size_t)blk * 32;
+    float am = 0.0f;
+    for (int i = 0; i < 32; i++) am = max(am, fabs(x[i]));
+    const float d = am / 127.0f;
+    const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    device uchar * cell = dst + (size_t)p * (size_t)row_bytes + (size_t)blk * 34;
+    *(device half *)cell = half(d);
+    device char * q = (device char *)(cell + 2);
+    for (int i = 0; i < 32; i++) {
+        q[i] = (char)(int)clamp(rint(x[i] * id), -128.0f, 127.0f);
+    }
+}
+
 // ─── Fused bias-add + RoPE + KV-store (nt==1 decode) ──────────
 // One kernel replaces add_bias×3 + rope×2 + store_kv×2 (7 dispatches → 1).
 // bqkv layout (nt==1): [q: 0..nqt][k: nqt..nqt+nkt][v: nqt+nkt..nqt+2nkt].

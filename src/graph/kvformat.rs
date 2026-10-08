@@ -142,11 +142,13 @@ impl KvFormat {
     /// CPU's attention kernel dots the stored K blocks against the quantized query
     /// and accumulates V out of the cell; CUDA's kernels are layout-tagged
     /// (`KV_LAYOUT_F32/F16/Q8_0` plus the byte-addressed `kv4<LAYOUT>` load) since
-    /// C4 S2b, so it reads a packed region too. Metal still addresses f32/f16 rows
-    /// and stays at G5.
+    /// C4 S2b, so it reads a packed region too; and since [#310] Metal's packed
+    /// store plus its `kernel_gqa_attn_q8_0` / window / map kernels read one as
+    /// well.
     ///
     /// [#87]: https://github.com/yusiwen/minfer/issues/87
     /// [#44]: https://github.com/yusiwen/minfer/issues/44
+    /// [#310]: https://github.com/yusiwen/minfer/issues/310
     pub fn supports(self, device: Device) -> bool {
         match self {
             KvFormat::Q8_0 => super::registry::reads_packed_kv(device.backend()),
@@ -187,8 +189,8 @@ pub fn auto_device_format(device: Device, n_layers: usize, n_kv_embd: usize) -> 
 ///   `docs/BACKENDS.md` documents "CPU: f32 regions", so an env var set for a GPU run
 ///   must not break a CPU one;
 /// - anything else → **refused on every device** (a typo must not silently run f32);
-/// - a format the device has no kernel for → **refused** (`q8_0` on Metal, which is
-///   G5; the CPU and CUDA kernels read a packed region since C4 S2a / S2b).
+/// - a format the device has no kernel for → **refused** (the CPU, CUDA and Metal
+///   kernels all read a packed region since C4 S2a / S2b and [#310]).
 pub fn resolve(
     device: Device,
     cache_type: Option<&str>,
@@ -215,8 +217,8 @@ pub fn resolve(
     if !format.supports(device) {
         return Err(format!(
             "MINFER_CACHE_TYPE={} is not supported on {} yet: the {} attention kernel has no \
-             packed Q8_0 read (the CPU's and CUDA's do, since C4 S2a / S2b; Metal's packed \
-             read is issue #310); refusing rather than silently falling back to f32",
+             packed Q8_0 read (the CPU's, CUDA's and Metal's do); refusing rather than silently \
+             falling back to f32",
             format.name(),
             device.name(),
             device.name()

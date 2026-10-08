@@ -378,10 +378,25 @@ impl MetalBackend {
         self.kv_format
     }
 
-    /// Whether the KV kernels must read half-width rows. Metal refuses `Q8_0`
-    /// (`READS_PACKED_KV = false`), so the only other answer is f32.
+    /// Whether the KV kernels must read half-width rows. F16 is the only
+    /// half-width format; F32 and Q8_0 are both read by their own full-width
+    /// kernels (Q8_0's `dequant_q8_0_kv_elem` addresses whole words).
     fn kv_f16(&self) -> bool {
         self.kv_format == super::kvformat::KvFormat::F16
+    }
+
+    /// #310: whether this pool's KV regions are packed Q8_0 cells. The packed
+    /// kernels (`gqa_attn_q8_0`, `gqa_attn_window_q8_0`, `gqa_attn_map_q8_0`,
+    /// `store_kv_q8_0`) are selected instead of the f32/f16 family.
+    fn kv_packed(&self) -> bool {
+        self.kv_format == super::kvformat::KvFormat::Q8_0
+    }
+
+    /// #310: one cell's word-padded byte width (`row_elems * 4`), the stride the
+    /// packed kernels address cells by. Computed from `row_elems` so it needs no
+    /// CUDA-gated helper.
+    fn kv_row_bytes(&self, nkt: usize) -> usize {
+        super::kvformat::KvFormat::Q8_0.row_elems(nkt) * super::kvformat::WORD_BYTES
     }
 
     fn buf(&self, id: usize) -> &crate::metal::MetalBuffer {
@@ -683,11 +698,17 @@ pub fn supports_fused(fused: &FusedOp) -> bool {
 /// [#315]: https://github.com/yusiwen/minfer/issues/315
 pub const SUPPORTS_ATTN_SPAN: bool = true;
 
-/// C4: Metal addresses f32/f16 KV rows, so it does not read a packed `q8_0`
-/// region; [#310] owns the kernel that adds the packed half and flips this.
+/// C4 (#310): Metal reads a packed `q8_0` KV region directly — the packed
+/// `store_kv_q8_0` writes cells and the `kernel_gqa_attn_q8_0` /
+/// `kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0` kernels dequantize
+/// them block-by-block as K/V are staged. The fast causal families (flash /
+/// split / prefill / parallel-prefill) and the fast windowed flash family have
+/// no packed kernel; when the engine's KV format is Q8_0 the dispatch selects
+/// the classic packed kernels instead (see the `Op::Attn` arm) — an explicit
+/// selection, never a silent fallback.
 ///
 /// [#310]: https://github.com/yusiwen/minfer/issues/310
-pub const READS_PACKED_KV: bool = false;
+pub const READS_PACKED_KV: bool = true;
 
 /// F5 ([#58], ported by [#137]): registry hook **phase A** of a cross-backend
 /// staging copy out of Metal.
@@ -1097,24 +1118,49 @@ impl Backend for MetalBackend {
                 // #38: bound every row against the region the kernel writes into
                 // (`node.out_shape[1]` is the `n_ctx` the region was sized with).
                 self.check_kv_store_rows(self.buf(in_bufs[2].id), nt, node.out_shape[1], *layer)?;
-                cb.store_kv(
-                    self.buf(in_bufs[0].id),
-                    self.buf(k_id),
-                    nkt,
-                    nt,
-                    self.buf(in_bufs[2].id),
-                    0,
-                    self.kv_f16(),
-                );
-                cb.store_kv(
-                    self.buf(in_bufs[1].id),
-                    self.buf(v_id),
-                    nkt,
-                    nt,
-                    self.buf(in_bufs[2].id),
-                    0,
-                    self.kv_f16(),
-                );
+                if self.kv_packed() {
+                    // #310: one packet per (row, 32-element block) — the whole
+                    // K/V row is quantized as one cell (blocks laid flat across
+                    // all KV heads), so the CPU quantizer's bytes are the row's.
+                    let row_bytes = self.kv_row_bytes(nkt);
+                    cb.store_kv_q8_0(
+                        self.buf(in_bufs[0].id),
+                        self.buf(k_id),
+                        nkt,
+                        nt,
+                        self.buf(in_bufs[2].id),
+                        0,
+                        row_bytes,
+                    );
+                    cb.store_kv_q8_0(
+                        self.buf(in_bufs[1].id),
+                        self.buf(v_id),
+                        nkt,
+                        nt,
+                        self.buf(in_bufs[2].id),
+                        0,
+                        row_bytes,
+                    );
+                } else {
+                    cb.store_kv(
+                        self.buf(in_bufs[0].id),
+                        self.buf(k_id),
+                        nkt,
+                        nt,
+                        self.buf(in_bufs[2].id),
+                        0,
+                        self.kv_f16(),
+                    );
+                    cb.store_kv(
+                        self.buf(in_bufs[1].id),
+                        self.buf(v_id),
+                        nkt,
+                        nt,
+                        self.buf(in_bufs[2].id),
+                        0,
+                        self.kv_f16(),
+                    );
+                }
                 Ok(())
             }
             Op::KvcacheLoad { .. } => Ok(()), // view of the K region
@@ -1160,13 +1206,33 @@ impl Backend for MetalBackend {
                         )
                     })?;
                     if win.len == 2 * nt {
+                        // #310: a packed region has no fast windowed flash kernel,
+                        // so the packed path always takes the correctness window
+                        // kernel (its own Q8_0 variant) — an explicit selection,
+                        // never a silent dequantize-then-f32.
+                        let win_buf = self.buf(win.id);
+                        if self.kv_packed() {
+                            cb.gqa_attn_window_q8_0(
+                                q,
+                                k,
+                                v,
+                                o,
+                                win_buf,
+                                meta.n_head,
+                                meta.n_head_kv,
+                                meta.hd,
+                                meta.scale,
+                                nt,
+                                self.kv_row_bytes(meta.nkt),
+                            );
+                            return Ok(());
+                        }
                         // #359: a prefill-shaped one-range window takes the fast
                         // windowed flash family (the causal blk family's tile
                         // structure with an explicit `[lo, hi)` mask). The
                         // #44 correctness kernel stays the fallback for every
                         // shape it alone covers (small hd, nt == 1, opt-out),
                         // and is byte-untouched.
-                        let win_buf = self.buf(win.id);
                         if nt > 1 && crate::metal::prefill_window_flash_enabled(meta.hd) {
                             let (lo_min, hi_max) = Self::window_range(win_buf, nt);
                             let nkv = hi_max.saturating_sub(lo_min);
@@ -1208,12 +1274,30 @@ impl Backend for MetalBackend {
                     }
                     let kmax = crate::graph::kvcache::KV_MAP_MAX_SPANS;
                     if win.len == nt * kmax * 2 {
+                        // #310: packed regions take the correctness map kernel's
+                        // Q8_0 variant (explicit selection).
+                        let map_buf = self.buf(win.id);
+                        if self.kv_packed() {
+                            cb.gqa_attn_map_q8_0(
+                                q,
+                                k,
+                                v,
+                                o,
+                                map_buf,
+                                meta.n_head,
+                                meta.n_head_kv,
+                                meta.hd,
+                                meta.scale,
+                                nt,
+                                self.kv_row_bytes(meta.nkt),
+                            );
+                            return Ok(());
+                        }
                         // #369: a prefill-shaped set-valued `kv_map` window takes
                         // the fast map family — the same tile with a
                         // run-membership mask over the launch's global union. The
                         // #362 correctness kernel stays the fallback for the
                         // shapes it alone covers (small hd, nt == 1, opt-out).
-                        let map_buf = self.buf(win.id);
                         if nt > 1 && crate::metal::prefill_window_flash_enabled(meta.hd) {
                             let (lo_min, hi_max) = Self::window_map_range(map_buf, nt);
                             let nkv = hi_max.saturating_sub(lo_min);
@@ -1270,6 +1354,28 @@ impl Backend for MetalBackend {
                 // path below is byte-untouched by the E1 window (G5a): only the
                 // `explicit_span` branch above is new.
                 let positions = self.buf(in_bufs[2].id);
+                if self.kv_packed() {
+                    // #310: a packed region has no packed kernel in the fast
+                    // causal families (flash / split / prefill / parallel), so the
+                    // packed path always takes `kernel_gqa_attn_q8_0` — the classic
+                    // tiling, which covers `nt == 1` decode and `nt > 1` prefill for
+                    // any `hd`. The selection is explicit here; the fast families
+                    // are never handed a Q8_0 region.
+                    cb.gqa_attn_q8_0(
+                        q,
+                        k,
+                        v,
+                        o,
+                        positions,
+                        meta.n_head,
+                        meta.n_head_kv,
+                        meta.hd,
+                        meta.scale,
+                        nt,
+                        self.kv_row_bytes(meta.nkt),
+                    );
+                    return Ok(());
+                }
                 if nt == 1 {
                     if crate::metal::flash_attn_enabled(meta.hd) {
                         let chunks = self.attention_chunks(positions, nt);
@@ -1732,10 +1838,12 @@ impl Backend for MetalBackend {
         }
         // An f16 region addresses `half[cell * nkt]` while `elems_per_cell` is
         // counted in f32 words (the unit the caller passes): a cell is `nkt / 2`
-        // f32 words apart. CUDA's `copy_cells` halves the same stride; a Q8_0
-        // cell is already whole words including padding and is passed through
-        // unchanged (the caller passes `region.elems / n_ctx`), but Metal refuses
-        // Q8_0 (`READS_PACKED_KV = false`) so only the f16 branch is live here.
+        // f32 words apart. CUDA's `copy_cells` halves the same stride. A Q8_0
+        // cell is already whole f32 words including padding (the caller passes
+        // `region.elems / n_ctx`, which `ensure_kv` sized to
+        // `KvFormat::Q8_0.row_elems`), so the f32 word stride is passed through
+        // unchanged — the move is a plain whole-word copy that keeps every
+        // packed block and its padding verbatim (#310).
         let elems_per_cell = if self.kv_f16() {
             (elems_per_cell / 2).max(1)
         } else {

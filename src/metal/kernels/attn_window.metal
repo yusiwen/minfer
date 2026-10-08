@@ -243,6 +243,111 @@ kernel void kernel_gqa_attn_window_f16(
     }
 }
 
+// Packed Q8_0 variant of kernel_gqa_attn_window_f32 (C4 S2b Metal twin, issue
+// #310): the same one-range `[lo, hi)` window resolution and online softmax,
+// with K/V packed Q8_0 cells dequantized block-by-block into the tiles. A cell
+// is `row_bytes` bytes wide; the element at `hk*hd + di` of row `lo + ki` is
+// the value the f32 kernel would read.
+kernel void kernel_gqa_attn_window_q8_0(
+    device const float * q        [[buffer(0)]],
+    device const uchar * k        [[buffer(1)]],
+    device const uchar * v        [[buffer(2)]],
+    device       float * o        [[buffer(3)]],
+    constant    int    * window   [[buffer(4)]],
+    constant    int    & nh        [[buffer(5)]],
+    constant    int    & nk        [[buffer(6)]],
+    constant    int    & hd        [[buffer(7)]],
+    constant    float  & scale     [[buffer(8)]],
+    constant    int    & nt        [[buffer(9)]],
+    constant    uint   & row_bytes [[buffer(10)]],
+    uint3  tgpig   [[threadgroup_position_in_grid]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    ushort sgitg   [[simdgroup_index_in_threadgroup]],
+    threadgroup float * shmem [[threadgroup(0)]]
+) {
+    const int Bc = 32;
+    int t  = (int)tgpig.x;
+    int hk = (int)tgpig.y;
+    if (t >= nt || hk >= nk) return;
+
+    int lo  = window[t];
+    int hi  = window[nt + t];
+    int nkv = hi - lo;
+    if (nkv <= 0) return;
+
+    int gqa  = nh / nk;
+    int  h0         = hk * gqa + (int)sgitg;
+    bool valid_head = (h0 < nh);
+    int  h          = valid_head ? h0 : 0;
+
+    int stride_q  = nh * hd;
+
+    device const float * qhead = q + t * stride_q + h * hd;
+    device       float * ohead = o + t * stride_q + h * hd;
+
+    threadgroup float * k_tile = shmem;
+    threadgroup float * v_tile = shmem + Bc * hd;
+
+    float mx = -INFINITY;
+    float S = 0.0f;
+    float acc[256];
+    for (int i = 0; i < hd; i++) acc[i] = 0.0f;
+
+    int n_tiles = (nkv + Bc - 1) / Bc;
+    for (int tile_idx = 0; tile_idx < n_tiles; tile_idx++) {
+        int kv_start = tile_idx * Bc;
+        int tile_sz  = min(Bc, nkv - kv_start);
+
+        int total = tile_sz * hd;
+        int tgsz = 32 * gqa;
+        for (int i = tiisg + (int)sgitg * 32; i < total; i += tgsz) {
+            int ki = kv_start + i / hd;
+            int di = i % hd;
+            int e  = hk * hd + di;
+            k_tile[i] = dequant_q8_0_kv_elem(k, lo + ki, row_bytes, e);
+            v_tile[i] = dequant_q8_0_kv_elem(v, lo + ki, row_bytes, e);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int j0 = 0; j0 < tile_sz; j0 += 32) {
+            const int j = j0 + (int)tiisg;
+            const bool valid = (j < tile_sz);
+            float dot = -INFINITY;
+            if (valid) {
+                threadgroup float * kj = k_tile + j * hd;
+                dot = 0.0f;
+                for (int d = 0; d < hd; d++) dot += qhead[d] * kj[d];
+                dot *= scale;
+            }
+
+            float batch_mx = simd_max(dot);
+            float new_mx = max(mx, batch_mx);
+            float corr = exp(mx - new_mx);
+            for (int d = 0; d < hd; d++) acc[d] *= corr;
+            S *= corr;
+            float e = valid ? exp(dot - new_mx) : 0.0f;
+            if (valid) {
+                threadgroup float * vj = v_tile + j * hd;
+                for (int d = 0; d < hd; d++) acc[d] += e * vj[d];
+                S += e;
+            }
+            mx = new_mx;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    S = simd_sum(S);
+    for (int d = 0; d < hd; d++) acc[d] = simd_sum(acc[d]);
+
+    float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
+    if (valid_head) {
+        for (int d = tiisg; d < hd; d += 32) {
+            ohead[d] = acc[d] * inv;
+        }
+    }
+}
+
 // ─── C8b S4: the set-valued `kv_map` read path (issue #362) ─────────────────
 //
 // A sequence that reads part of its prefix in place has a window that is not one
@@ -340,6 +445,109 @@ kernel void kernel_gqa_attn_map_f32(
             int cell = kv_map_cell(map, t, ki);
             k_tile[i] = k[cell * stride_kv + hk * hd + di];
             v_tile[i] = v[cell * stride_kv + hk * hd + di];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int j0 = 0; j0 < tile_sz; j0 += 32) {
+            const int j = j0 + (int)tiisg;
+            const bool valid = (j < tile_sz);
+            float dot = -INFINITY;
+            if (valid) {
+                threadgroup float * kj = k_tile + j * hd;
+                dot = 0.0f;
+                for (int d = 0; d < hd; d++) dot += qhead[d] * kj[d];
+                dot *= scale;
+            }
+
+            float batch_mx = simd_max(dot);
+            float new_mx = max(mx, batch_mx);
+            float corr = exp(mx - new_mx);
+            for (int d = 0; d < hd; d++) acc[d] *= corr;
+            S *= corr;
+            float e = valid ? exp(dot - new_mx) : 0.0f;
+            if (valid) {
+                threadgroup float * vj = v_tile + j * hd;
+                for (int d = 0; d < hd; d++) acc[d] += e * vj[d];
+                S += e;
+            }
+            mx = new_mx;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    S = simd_sum(S);
+    for (int d = 0; d < hd; d++) acc[d] = simd_sum(acc[d]);
+
+    float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
+    if (valid_head) {
+        for (int d = tiisg; d < hd; d += 32) {
+            ohead[d] = acc[d] * inv;
+        }
+    }
+}
+
+// Packed Q8_0 variant of kernel_gqa_attn_map_f32 (C4 S2b Metal twin, issue
+// #310): the same set-valued `kv_map` run resolution and online softmax, with
+// K/V packed Q8_0 cells dequantized block-by-block. The run walk is unchanged;
+// only the per-row load reads a packed cell.
+kernel void kernel_gqa_attn_map_q8_0(
+    device const float * q        [[buffer(0)]],
+    device const uchar * k        [[buffer(1)]],
+    device const uchar * v        [[buffer(2)]],
+    device       float * o        [[buffer(3)]],
+    constant    int    * map      [[buffer(4)]],
+    constant    int    & nh        [[buffer(5)]],
+    constant    int    & nk        [[buffer(6)]],
+    constant    int    & hd        [[buffer(7)]],
+    constant    float  & scale     [[buffer(8)]],
+    constant    int    & nt        [[buffer(9)]],
+    constant    uint   & row_bytes [[buffer(10)]],
+    uint3  tgpig   [[threadgroup_position_in_grid]],
+    ushort tiisg   [[thread_index_in_simdgroup]],
+    ushort sgitg   [[simdgroup_index_in_threadgroup]],
+    threadgroup float * shmem [[threadgroup(0)]]
+) {
+    const int Bc = 32;
+    int t  = (int)tgpig.x;
+    int hk = (int)tgpig.y;
+    if (t >= nt || hk >= nk) return;
+
+    int nkv = kv_map_nkv(map, t);
+    if (nkv <= 0) return;
+
+    int gqa  = nh / nk;
+    int  h0         = hk * gqa + (int)sgitg;
+    bool valid_head = (h0 < nh);
+    int  h          = valid_head ? h0 : 0;
+
+    int stride_q  = nh * hd;
+
+    device const float * qhead = q + t * stride_q + h * hd;
+    device       float * ohead = o + t * stride_q + h * hd;
+
+    threadgroup float * k_tile = shmem;
+    threadgroup float * v_tile = shmem + Bc * hd;
+
+    float mx = -INFINITY;
+    float S = 0.0f;
+    float acc[256];
+    for (int i = 0; i < hd; i++) acc[i] = 0.0f;
+
+    int n_tiles = (nkv + Bc - 1) / Bc;
+    for (int tile_idx = 0; tile_idx < n_tiles; tile_idx++) {
+        int kv_start = tile_idx * Bc;
+        int tile_sz  = min(Bc, nkv - kv_start);
+
+        int total = tile_sz * hd;
+        int tgsz = 32 * gqa;
+        for (int i = tiisg + (int)sgitg * 32; i < total; i += tgsz) {
+            int ki = kv_start + i / hd;
+            int di = i % hd;
+            int cell = kv_map_cell(map, t, ki);
+            int e = hk * hd + di;
+            k_tile[i] = dequant_q8_0_kv_elem(k, cell, row_bytes, e);
+            v_tile[i] = dequant_q8_0_kv_elem(v, cell, row_bytes, e);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

@@ -111,12 +111,23 @@ fn the_cache_type_gate_is_strict_and_device_aware() {
         KvFormat::F32,
         "an explicit f32 overrides the auto policy"
     );
-    // A packed format is refused exactly where the kernels are missing: Metal
-    // (G5, issue #44) always, CUDA only in a build that compiles no CUDA at
-    // all. The answer comes from the registry, not from a list here.
-    let err = resolve(Device::Metal, Some("q8_0"), 24, 512).unwrap_err();
-    assert!(err.contains("q8_0"), "{err}");
-    assert!(err.contains(Device::Metal.name()), "{err}");
+    // A packed format is refused exactly where the kernels are missing. Since
+    // #310 Metal reads a packed region too, so on macOS it is accepted; a build
+    // with no Metal entry claims nothing and refuses. CUDA is refused only in a
+    // build that compiles no CUDA at all. The answer comes from the registry,
+    // not from a list here.
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        resolve(Device::Metal, Some("q8_0"), 24, 512).unwrap(),
+        KvFormat::Q8_0,
+        "#310 gave Metal a packed read"
+    );
+    #[cfg(not(target_os = "macos"))]
+    {
+        let err = resolve(Device::Metal, Some("q8_0"), 24, 512).unwrap_err();
+        assert!(err.contains("q8_0"), "{err}");
+        assert!(err.contains(Device::Metal.name()), "{err}");
+    }
     #[cfg(feature = "cuda")]
     assert_eq!(
         resolve(Device::Cuda, Some("q8_0"), 24, 512).unwrap(),

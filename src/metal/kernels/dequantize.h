@@ -196,3 +196,16 @@ inline void get_scale_min_k4(int j, device const uchar * q, thread uchar & d, th
 // NR0=2 rows per simdgroup, NSG=2 simdgroups per threadgroup => 64 threads.
 // Grid: x = ceil(od / (NR0*NSG)), y = nt, TG = (64, 1, 1).
 
+// ─── Q8_0 packed KV cell read (C4 S2b Metal twin, issue #310) ──
+// One element of a packed Q8_0 KV cell, addressed the way `kvformat.rs` lays a
+// cell out: `base` is the arena, `row` the cell, `row_bytes` the cell's
+// word-padded byte width (`KvFormat::Q8_0.row_bytes`), and `e` the element
+// index inside the cell. A block is 34 bytes (one f16 scale + 32 int8), so
+// element `e` lives in block `e/32` at offset `e%32`. Apple Silicon is
+// little-endian, the same byte order the CPU quantizer writes.
+static inline float dequant_q8_0_kv_elem(device const uchar * base, int row, uint row_bytes, int e) {
+    device const uchar * blk = base + (size_t)row * (size_t)row_bytes + (size_t)(e >> 5) * 34;
+    const float d = float(*(device const half *)blk);
+    return d * float((signed char)blk[2 + (e & 31)]);
+}
+

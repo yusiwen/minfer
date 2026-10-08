@@ -130,7 +130,9 @@ and the struct is `unsafe impl Send/Sync` on that basis.
   Metal tag any more: the old `metal::KV_F16` `OnceLock`, `kv_cache_is_f16` and `set_kv_cache_type`
   were deleted in #44 part (b), so two engines with different dims can hold different layouts in
   one process. A third value, `q8_0`, is the packed cache the CPU and CUDA kernels read since C4;
-  Metal's kernels address f32/f16 rows and **refuse** it ([#310](https://github.com/yusiwen/minfer/issues/310)).
+  since [#310](https://github.com/yusiwen/minfer/issues/310) Metal reads it too — the packed
+  `kernel_store_kv_q8_0` plus the `kernel_gqa_attn_q8_0` / `kernel_gqa_attn_window_q8_0` /
+  `kernel_gqa_attn_map_q8_0` reads, selected whenever the engine's `kv_format` is `Q8_0`.
 
 ### 2.4 Command buffers and submission
 
@@ -410,18 +412,50 @@ time), mirroring CUDA's arm:
 `supports_attn_span()` is now `true` (`SUPPORTS_ATTN_SPAN`) and `Device::gathers_attn_map` is now
 true for Metal, so both explicit layouts are read on the device. The causal paths (flash / split /
 parallel-prefill / classic) are **byte-untouched**: the windowed families are used only for an
-explicit window, so a single-sequence causal forward keeps its previous numbers. The one asymmetry
-that remains is a **packed `q8_0`** region, refused (`READS_PACKED_KV` false) until
-[#310](https://github.com/yusiwen/minfer/issues/310) adds its store and reads; that is a deliberate
-asymmetry, not a silent gap. Each explicit layout now has two families — a **fast** prefill family
+explicit window, so a single-sequence causal forward keeps its previous numbers. **Packed `q8_0`
+landed in [#310](https://github.com/yusiwen/minfer/issues/310).** `READS_PACKED_KV` is now `true`:
+`MINFER_CACHE_TYPE=q8_0` loads on a Metal engine, the packed store writes cells whose bytes are the
+CPU quantizer's **bitwise**, the C5 session round-trips its `FLAG_PACKED` header, and the packed
+reads are direct (no dequantize-into-scratch). The store and the three read kernels are covered by
+`graph::metal_backend::tests::packed_kv`, and the real-model twin of the CUDA C4 gate
+(`metal_q8_0_kv_answers_like_f32_on_a_real_model`) puts a loaded Qwen2.5-0.5B / Qwen3-0.6B engine's
+Q8_0 logits inside the C4 tolerance class (at the argmax ≤ 1.0, tail ≤ 4.0 of the spread).
+
+**The fast families stay refused for a packed region.** `kernel_flash_attn_ext_{f32,f16}[_hd128]`
+(decode), `kernel_gqa_attn_partial_{f32,f16}` (split), `kernel_flash_attn_blk_*` (prefill),
+`kernel_attn_{scores,output}`/`kernel_softmax_attn` (parallel prefill) and
+`kernel_flash_attn_window_{blk,map}_*` are f32/f16-only — the simdgroup-matrix prefill family loads
+K/V tiles straight from global memory (`simdgroup_load`), so a packed cell cannot be transformed in
+place. A packed region therefore takes the classic `kernel_gqa_attn_q8_0` (causal) or the
+`kernel_gqa_attn_window_q8_0` / `kernel_gqa_attn_map_q8_0` correctness kernels, selected by the
+`if self.kv_packed()` arm before any fast-family branch — an explicit selection, never a silent f32
+fallback. `metal_packed_prefill_matches_the_dequantized_reference` pins it: dropping that arm takes
+the fast prefill family over packed bytes and the gate goes red at max |Δ| ≈ 1.3e37. The cost of the
+refusal is real and measured (below); a follow-up that adds packed fast-family kernels would remove
+it. Each explicit layout still has two families — a **fast** prefill family
 (the one-range `blk` family, [#359](https://github.com/yusiwen/minfer/issues/359); the map family,
 [#369](https://github.com/yusiwen/minfer/issues/369)) and the #44/#362 **correctness** family, still
-the reference and still serving every other explicit-span shape. Keeping them separate is what
+the reference and still serving every other explicit-span shape; a packed explicit window keeps the
+correctness kernel (its Q8_0 variant), the fast one being f32/f16-only. Keeping them separate is what
 leaves the causal instruction streams (and their measured numbers) byte-identical. Issue
 [#315](https://github.com/yusiwen/minfer/issues/315) measured the correctness families as
 **materially slower** than the causal flash prefill; [#359](https://github.com/yusiwen/minfer/issues/359)
 and [#369](https://github.com/yusiwen/minfer/issues/369) added the fast families and re-measured —
 the records follow.
+
+**Measured (issue [#310], `macbookpro (macOS 27.0.1, Apple M4 Pro)`, 2026-10-08).** Size and speed,
+`MINFER_CACHE_TYPE=f16` vs `q8_0`, 3 interleaved runs (`minfer bench -p 1024 -n 64 -r 3 --n-ctx 2048`,
+medians; `MINFER_CACHE_TYPE=q8_0` runs the classic packed kernels because the fast families are
+refused):
+
+| model | KV regions f32 vs q8_0 | pp1024 f16 → q8_0 | tg64 f16 → q8_0 |
+|---|---|---|---|
+| Qwen3-0.6B Q8_0 (`hd` 128) | 58 720 256 B → 15 597 568 B (**3.76×**) | 4 835 → 291 tok/s (**0.060×**) | 196.2 → 18.1 tok/s (**0.092×**) |
+| Qwen2.5-0.5B Q4_0 (`hd` 64) | 6 291 456 B → 1 671 168 B (**3.76×**) | 6 196 → 1 492 tok/s (**0.241×**) | 298.1 → 43.3 tok/s (**0.145×**) |
+
+The memory win is the point (the issue's framing: memory, not speed) and is 3.76×. The speed cost
+is severe because the fast families are refused: prefill drops to the classic O(`nt`·`nkv`) kernel.
+This is the documented asymmetry, not a silent one.
 
 **Measured (issue [#315], `macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`,
 2026-10-07).** Bar named before the run (`docs/GATE-CONTRACT.md` rules 3 and 5): the windowed
@@ -538,8 +572,10 @@ one cell changes the output (the rule-2 control). The #44 correctness gates
   Apple documents an overlapping same-buffer copy as undefined, and a separate submission
   would overlap the producer split ([#137](https://github.com/yusiwen/minfer/issues/137)).
   **f16** halves `elems_per_cell` (`half[cell * nkt]` is `nkt / 2` f32 words apart); a packed
-  Q8_0 cell is whole words and needs no division, but Metal refuses Q8_0 so only the f16
-  branch is live. Gates: `metal_copy_cells_moves_overlapping_rows_in_both_directions`,
+  Q8_0 cell is already whole f32 words including padding and is passed through unchanged (the
+  caller passes `region.elems / n_ctx`, which `ensure_kv` sized to `KvFormat::Q8_0.row_elems`),
+  so the move is a plain whole-word copy that keeps every packed block and its padding verbatim
+  ([#310](https://github.com/yusiwen/minfer/issues/310)). Gates: `metal_copy_cells_moves_overlapping_rows_in_both_directions`,
   `metal_f16_kv_cell_move_strides_by_row_bytes`.
 - **C2 shift / C5 sessions — `GraphAllocator::copy_kv_to_cpu`.** The `CPU || CUDA` hardcode is
   gone; the read goes through the registry `host_read` hook for every backend, so a Metal

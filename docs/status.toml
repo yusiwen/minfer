@@ -247,15 +247,15 @@ key = "macos-unit"
 box = "macbook (macOS 27.0.1, Apple M4 Pro)"
 suite = "unit"
 command = "cargo test --release --no-fail-fast"
-date = "2026-10-07"
-passed = 545
+date = "2026-10-08"
+passed = 550
 failed = 0
-ignored = 44
+ignored = 45
 integration_passed = 21
 integration_failed = 0
 integration_ignored = 6
 live_check = false
-note = "recorded measurement; CI's build-macos compiles the test target but has no Metal device; the +1 over the previous 542 is #369's fast-map gate window_map_flash_matches_the_cpu_reference; the +1 under that is #359's fast-windowed-kernel gate window_flash_matches_the_cpu_reference; the +3 under that are #362's two Metal kv_map window gates plus the pure every_device_gathers_the_attn_map, and the earlier +4 are #205's three fixture-manifest tests plus #349's parity-verdict classifier with the +1 on top being #306's platform-neutral format-aware shift gate; the +2 over the #54 baseline are #329's dispatch-refusal gate and #299's weights-charged E4 gate; the +1 ignored is #315's macOS-only #[ignore]d windowed-prefill measurement harness (passed unchanged); #354's two platform-neutral manifest-override tests are derived here (543 -> 545), not re-measured on a Mac"
+note = "recorded measurement; CI's build-macos compiles the test target but has no Metal device; the +5 over the previous 545 are #310's packed-Q8_0 KV gates in graph::metal_backend::tests::packed_kv (the byte-identical store, the causal decode/prefill, the one-range attn_span and the kv_map window, and the C5 FLAG_PACKED round trip) plus the +1 ignored real-model gate, so the ignored row moved 44 -> 45; the +1 under the 542 baseline is #369's fast-map gate window_map_flash_matches_the_cpu_reference; the +1 under that is #359's fast-windowed-kernel gate window_flash_matches_the_cpu_reference; the +3 under that are #362's two Metal kv_map window gates plus the pure every_device_gathers_the_attn_map, and the earlier +4 are #205's three fixture-manifest tests plus #349's parity-verdict classifier with the +1 on top being #306's platform-neutral format-aware shift gate; the +2 over the #54 baseline are #329's dispatch-refusal gate and #299's weights-charged E4 gate; the +1 ignored before this round is #315's macOS-only #[ignore]d windowed-prefill measurement harness (passed unchanged); #354's two platform-neutral manifest-override tests are derived here (543 -> 545), not re-measured on a Mac"
 file = "AGENTS.md"
 regex = 'macOS unit, box `(?P<box>[^`]+)`, `cargo test --release --no-fail-fast`, (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ \*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
 
@@ -264,11 +264,11 @@ key = "macos-real-model"
 box = "macbook (macOS 27.0.1, Apple M4 Pro)"
 suite = "real-model"
 command = "PARALLEL=0 scripts/real_model_gates.sh (serial)"
-date = "2026-10-07"
-passed = 44
+date = "2026-10-08"
+passed = 45
 failed = 0
 live_check = false
-note = "recorded measurement; no residual — #362 gave Metal the set-valued kv_map gather, so a_store_inside_a_shared_prefix_takes_a_private_row passes; the set is 44 because #315's macOS-only #[ignore]d windowed-prefill gate joined the --ignored set (42 -> 43) before its one failure was fixed"
+note = "recorded measurement; no residual — #362 gave Metal the set-valued kv_map gather, so a_store_inside_a_shared_prefix_takes_a_private_row passes; the set is 45 because #310's macOS-only #[ignore]d metal_q8_0_kv_answers_like_f32_on_a_real_model gate joined the --ignored set (44 -> 45), after #315's gate had taken it 42 -> 43"
 file = "AGENTS.md"
 regex = 'macOS real-model set, box `(?P<box>[^`]+)`, `PARALLEL=0 scripts/real_model_gates\.sh` \(serial\), (?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): \*\*(?P<passed>[0-9]+) / (?P<failed>[0-9]+)\*\*'
 
