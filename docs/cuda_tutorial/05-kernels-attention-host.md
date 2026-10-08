@@ -22,7 +22,7 @@ Two things make attention special compared to the matmuls you have already read:
   number of keys accumulated so far — and that is *data on the GPU*, not a host
   integer. Both kernels in this chapter read the `positions` array on the device
   to find their work. This is minfer's graph rule 1 — "KV positions are data, not
-  structure" (`AGENTS.md:78` ("Build & Run")) — doing real work inside a kernel.
+  structure" (`AGENTS.md:134` ("Compute Graph — core rules", rule 1)) — doing real work inside a kernel.
 - **It has a serial dependency the matmuls do not have.** Softmax (the
   exponentiate-and-normalize that turns scores into weights) needs the *largest
   score of the whole row* before any output can be finalized. The online softmax
@@ -483,7 +483,7 @@ and they compound:
 
 The graph-level counterpart of this kernel is `Op::FusedQKV` — AGENTS rule 7:
 "Decode fusions: `Op::FusedQKV` (concat matmul + bias/rope/store)…"
-(`AGENTS.md:84` ("Build & Run")), with the mechanics in TECH-PRIMER §6.4
+(`AGENTS.md:140` ("Compute Graph — core rules", rule 7)), with the mechanics in TECH-PRIMER §6.4
 (`docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels") (§6 "Element-wise and fused epilogue kernels")). Section 3.4 shows the Rust arm that
 launches it.
 
@@ -525,7 +525,7 @@ and the registry's `reads_packed_kv`, and an existing region must match `n_ctx`,
 backend and packing — else `Err`. `alloc_persistent` (`alloc.rs:1079`) routes
 through the same pool allocator as everything else — on CUDA a `cudaMalloc` held
 in the backend's buffer pool (§3.4) — and registers it as *never freed*. Because the
-allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:79` ("Build & Run")), the regions survive
+allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:135` ("Compute Graph — core rules", rule 2)), the regions survive
 rebuilds and hold their contents across decode steps: two device buffers per layer nobody may recycle.
 
 **Size and layout.** The size comes from the graph builder:
@@ -544,7 +544,7 @@ now receives the allocator-resolved **cell** row (C6: `positions` ropes, `cells`
 stores; they coincide only while a run starts at cell 0). `n_past` never
 appears in the layout — it is only ever *how many leading rows are valid*, and
 that count lives in the on-device boundary array. That is precisely
-AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:78` ("Build & Run")): the
+AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:134` ("Compute Graph — core rules", rule 1)): the
 graph topology is identical at position 0 and position 2000, and the kernels
 discover the valid range from the data — `attention_prefill.cu:206-208` records
 the exclusive per-row limit, and `fa_prefill_kv` computes `kv_end = bound[last_t] + 1`
@@ -589,7 +589,7 @@ boundary. The one structural guard on that layout: attention requires
 `hd == hd_kv` and `nkt == n_head_kv · hd` (the kernels stride KV rows by
 `nkt`), and violations return `Err`, not a workaround
 `execute_node_inner` (`cuda_backend.rs:916`); the same guard has a GPU_SAFETY audit entry,
-`docs/GPU_SAFETY.md:83` (§2 "The cross-backend staging copy (F5/#137) — bound") (§2 "The cross-backend staging copy (F5/#137) — bound").
+`docs/GPU_SAFETY.md:105` (§3 "Audit findings (2026-08-02) — status", the H1 finding).
 
 ### 3.4 The Rust host side — `cuda_backend.rs` as a `Backend`
 
@@ -701,7 +701,7 @@ still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
 (`cuda_backend.rs:859`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
 "Backends own their buffer pools; the allocator is the single owner"
-(`AGENTS.md:85` ("Build & Run")) — the `GraphAllocator` decides *which* buffer a node gets and
+(`AGENTS.md:141` ("Compute Graph — core rules", rule 8)) — the `GraphAllocator` decides *which* buffer a node gets and
 when it dies; the backend only manages device memory behind those decisions.
 
 **`read_host` / `write_host` — and the copy rule.** The asymmetry is the
@@ -721,7 +721,7 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
 (`write_host` (`cuda_backend.rs:2275`)) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
 The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — is
-AGENTS rule 5 (`AGENTS.md:82` ("Build & Run")), written in the blood of Phase 3. In three
+AGENTS rule 5 (`AGENTS.md:138` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
 sentences: a per-node host readback inside a split whose command buffer was
 still open read *stale* (not-yet-written) data, which surfaced as an all-zero
 KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:977-979` (§7 "In-place execution and the aliasing rule") (§7 "In-place execution and the aliasing rule"), the §7.3
@@ -731,7 +731,7 @@ sanctioned copy point at split boundaries — so the bug class has nowhere to
 reappear. The GPU_SAFETY audit generalizes the lesson: any change to shared
 mutable GPU state must be validated against a known-good reference, not just
 an A/B of two paths over the same corrupted state
-(`docs/GPU_SAFETY.md:151-156` (§4 "Device metrics: query at runtime, never guess (2") (§4 "Device metrics: query at runtime, never guess (2")).
+(`docs/GPU_SAFETY.md:175-180` (§4a "Split-attention and float4 kernel guards", the shared-mutable-state lesson)).
 
 **`synchronize` and the bounded-wait rule.**
 
@@ -797,7 +797,7 @@ message saying exactly that (`cuda_backend.rs:499` and `:545`, the two "graphs d
 §8 calls it "the A/B control used by every graph-adjacent step doc"
 (`docs/CUDA-TECH-PRIMER.md:336-337` (§8 "CUDA Graphs — capture once, replay many (Phase 7") (§8 "CUDA Graphs — capture once, replay many (Phase 7")). A related hard rule: nothing inside a
 capture window may sync — a debug readback corrupts the capture, the 7e②
-"faster but wrong" incident (`docs/GPU_SAFETY.md:206` (§4b "b. Flash-attention kernels (`kernel_flash_attn_e") (§4b "b. Flash-attention kernels (`kernel_flash_attn_e")) — which is why
+"faster but wrong" incident (`docs/GPU_SAFETY.md:230` ("CUDA (Phase 7, aarch64 GB10)", rule 2, the 7e② incident)) — which is why
 trace/viz capture disables replay in the scheduler (`BackendScheduler::execute` (`src/graph/scheduler.rs:137`)).
 
 **The split/copy story at backend boundaries.** On a mixed graph — or any
@@ -852,7 +852,7 @@ weight lookup still fails inside `execute_node`, it is
 actual values `execute_node_inner` (`cuda_backend.rs:916`). AGENTS states the contract once:
 "kernel-invariant violations return `Err` from `execute_node` — never a
 silent CPU fallback; backend assignment is decided at build time"
-(`AGENTS.md:72` ("Build & Run")); TECH-PRIMER §7 repeats it
+(`AGENTS.md:128` ("GPU Safety", the Err-never-fallback contract)); TECH-PRIMER §7 repeats it
 (`docs/CUDA-TECH-PRIMER.md:312-314` (§7 "Synchronization discipline (GPU Safety, `docs/GP") (§7 "Synchronization discipline (GPU Safety, `docs/GP")); the design record explains why — silent
 fallbacks make performance and correctness bugs indistinguishable
 (`docs/COMPUTE-GRAPH-DESIGN.md:1105-1107` (§9 "Eligibility") (§9 "Eligibility"), the §9.2 "Eligibility" no-silent-fallback
