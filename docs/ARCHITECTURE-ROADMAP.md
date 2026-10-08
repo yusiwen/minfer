@@ -200,8 +200,8 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    practice this is masked today because the supported models build a *single*
    GPU split on both GPU backends (`CUDA-BACKEND-DESIGN.md:313-315`), but it is
    exactly what breaks the first time an op is unsupported — e.g. interleaved
-   RoPE on CUDA (`cuda_backend.rs:1324`), or `FusedQkvNorm`, which CUDA does
-   not advertise (`:1289-1321`) while Metal does (`metal_backend.rs:276`).
+   RoPE on CUDA (`cuda_backend.rs:1522`), or `FusedQkvNorm`, which CUDA does
+   not advertise (`cuda_backend.rs:1905`) while Metal does (`metal_backend.rs:642`).
 2. **Synchronous, host-mediated cross-backend movement.** — **partly closed by
    F5** ([#58](https://github.com/yusiwen/minfer/issues/58), 2026-09-24): the
    boundary is now two registered phases. Phase A (`copy_across` →
@@ -619,8 +619,8 @@ precisely to break reuse on a weight swap, but nothing produces such a swap. �
 parity-only stubs that no architecture emits (`Scale`, `Softmax`, `View`,
 `Reshape`, `Permute`, `AttnMode::Mha` — `COMPUTE-GRAPH-DESIGN.md §1.3`), and
 `View`/`Reshape`/`Permute` execute as copies. CUDA additionally refuses
-`transpose_b` matmul (`cuda_backend.rs:932-937`) and `FusedQkvNorm`
-(`:1289-1321`), and Metal refuses `QkvBiasRopeStore` (`metal_backend.rs:656`) —
+`transpose_b` matmul (`cuda_backend.rs:1454-1459`) and `FusedQkvNorm`
+(`cuda_backend.rs:1905`), and Metal refuses `QkvBiasRopeStore` (`metal_backend.rs:656`) —
 so the two GPU backends do not implement the same op set, and a model's decode
 path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
 **Fixed in A8**: `SUPPORT-MATRIX.md` now carries an "Operator Coverage by
