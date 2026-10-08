@@ -245,7 +245,7 @@ f32-activation family.
 
 **Bytes moved — the number that decides everything.** Qwen2.5-0.5B has
 `n_embd = 896` and FFN width 4864 (`docs/QWEN2-SUPPORT.md:79` (§4Verified models");
-`docs/inference_e2e_walkthrough/05-graph-builder-ir.md:162` (§2The main event: one forward pass, node by node")). Two layers,
+`docs/inference_e2e_walkthrough/05-graph-builder-ir.md:162` (§2The main event: one forward pass, node by node"). Two layers,
 f32 weights, one decode token:
 
 - attention `wo` `[896 out, 896 in]`: weights = 896·896·4 B = **3.21 MB**;
@@ -459,7 +459,7 @@ the gate and the whole step is MMVQ — plus the v2 variants, since
 `mmvq_v2(id)` (`src/cuda/methods/mmvq.rs:725`, the `mmvq_v2` gate) additionally requires `id % 256 == 0`
 (3584 = 256·14 ✓). The gate is not an oversight: the arms' comments record
 the measured crossovers (small-`id` MMVQ loses — the uncoalesced nibble
-loads dominate when rows are short, `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`)). The reading habit
+loads dominate when rows are short, `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`). The reading habit
 this tutorial keeps hammering: **the master table gives the structure; the
 gates give your model's truth.**
 
@@ -627,7 +627,7 @@ the weight stream across blocks — the weight matrix streams from DRAM ~once
 per forward instead of once per token-tile.
 
 **Layer 2 — shared-memory staging, double-buffered.** The setup
-`gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`)) carves one dynamic shared-memory allocation
+`gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`) carves one dynamic shared-memory allocation
 into `As` (2 × 64×KS f16 — two buffers), `Bs` (2 × TM×KS f16), and `Cs` (a
 per-warp staging area for the store). The k-loop `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`)):
 
@@ -688,7 +688,7 @@ both k-halves must accumulate; fragment indexing bugs do not crash, they
 silently halve your dot products (the parity gates catch them, chapter 06).
 
 **The store.** After the k-loop, each warp spills its fragments through
-`Cs` (shared) and writes out with bounds masks `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`)):
+`Cs` (shared) and writes out with bounds masks `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`):
 `store_matrix_sync` lands the 16×16 fragment in shared memory, then lanes
 copy the 256 values to global `C[n * od + m]` for in-range `(n, m)` — how
 the kernel handles the ragged tail of a 30-token prompt without a second
@@ -741,7 +741,7 @@ its pieces in a profile:
   kernel (:6976);
   non-BT-consumable shapes fall back to `mmq_nt_kernel` (:5663).
 - **Split-K**: when the grid is M-starved (small `nt`), doc 92's auto
-  ksplit `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`)) slices the k-range across `grid.z` and
+  ksplit `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`) slices the k-range across `grid.z` and
   `mmq_ksplit_reduce_kernel` (:7316) adds the partials — the same split-K
   family as decode attention (chapter 05 §2.4).
 
@@ -808,7 +808,7 @@ The **roofline model** prices any kernel as
 `time ≥ max(FLOPs / peak-FLOPs, bytes / peak-BW)` — the larger term wins
 (`docs/GLOSSARY.md:125` ("L3 — Performance model")). On GB10 the bandwidth term uses the documented
 ~273 GB/s unified LPDDR5x figure (`docs/GLOSSARY.md:127` ("L3 — Performance model"); chapter 01's toy
-measured ~225–229 GB/s of it, `01-gpu-mental-model.md:227` (§2The memory hierarchy — where the bytes actually")), and the
+measured ~225–229 GB/s of it, `01-gpu-mental-model.md:227` (§2The memory hierarchy — where the bytes actually"), and the
 glossary's one-line classification is this chapter's summary: **GB10 decode
 is memory-bound, prefill compute-bound** (`docs/GLOSSARY.md:124` ("L3 — Performance model")). Check it
 against the table: decode Q4_0 at AI ≈ 3.6 tops out near 273 GB/s × 3.6 ≈

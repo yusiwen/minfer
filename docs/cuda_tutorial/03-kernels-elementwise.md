@@ -117,7 +117,7 @@ to exceed it rather than launch something invalid.
 ### 2.3 Where the Rust side hands over
 
 `src/cuda.rs` declares the launchers in an `extern "C"` block (the FFI
-surface, e.g. `launch_add_f32` (`src/cuda/methods/elementwise.rs:25`), `launch_dequant_f16` (`src/cuda/methods/prefill_f16.rs:12`))
+surface, e.g. `launch_add_f32` (`src/cuda/methods/elementwise.rs:25`), `launch_dequant_f16` (`src/cuda/methods/prefill_f16.rs:12`)
 and wraps each in a small safe method on `CudaState`. The graph
 backend never sees kernel names; it sees graph ops. The three call sites this
 chapter follows:
@@ -307,7 +307,7 @@ them:
 
 - **Nibble order**: element `j` comes from the **low** 4 bits of byte `j`;
   element `j + 16` from the **high** 4 bits. The kernel comment states it
-  verbatim `q4_0_q8_0_matmul` (`matmul_f32act.cu:14`)) and both the embed and dequant kernels
+  verbatim `q4_0_q8_0_matmul` (`matmul_f32act.cu:14`) and both the embed and dequant kernels
   implement it identically.
 - **The +8 offset**: minfer (like llama.cpp) stores `round(v/d) + 8`, so the
   unsigned nibble 0..15 maps back by subtracting 8 — that is the `- 8.0f`
@@ -581,7 +581,7 @@ What that does to bandwidth, both directions:
 - **The one-time dequant itself moves ≈ 349 MB** (read 76.6 + write 272.3)
   per weight tensor of that size, which is why the campaign cached the
   result: doing it per call cost a measured 288 ms per 7B @2K forward before
-  Phase 8p `w16_get` (`src/cuda/methods/prefill_f16.rs:119`)).
+  Phase 8p `w16_get` (`src/cuda/methods/prefill_f16.rs:119`).
 - Versus f32, the f16 copy still halves weight traffic — the same 2× argument
   that made the *KV* cache f16 (Phase 8b).
 
@@ -641,7 +641,7 @@ contiguous).
 ## 5. Try it / Observe
 
 Three commands, all from the repo root (build details and the ccbin/arch
-pitfalls: [`docs/BUILD.md`](../BUILD.md)):
+pitfalls: [`docs/BUILD.md`](../BUILD.md):
 
 ```bash
 # 1. build with the CUDA backend (needs nvcc on PATH or /usr/local/cuda/bin)
