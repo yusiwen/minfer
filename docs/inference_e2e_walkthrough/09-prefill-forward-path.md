@@ -438,12 +438,12 @@ main.rs:757   model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx)
 qwen2/mod.rs:33-42   impl ModelDef for Qwen2Model
   │           one line: graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out, n_ctx)
   ▼           (qwen3/mod.rs mirrors this identically for Qwen3)
-qwen2/graph.rs:384-395   Qwen2Graph::forward
+qwen2/graph.rs:390-401   Qwen2Graph::forward
   │           n_ctx = n_ctx.min(model.hparams.max_seq_len)  ← 2nd clamp
   │           locks the process-global GraphCache (graph_cache())
   ▼           delegates to forward_cached — the CLI wrapper; server code
               calls forward_cached directly with a slot-scoped cache
-qwen2/graph.rs:403-626   forward_cached — the real work (below)
+qwen2/graph.rs:409-632   forward_cached — the real work (below)
 ```
 
 The two trait-level aliases on the way are worth one glance
@@ -455,7 +455,7 @@ instead of using the process-global one). The CLI goes through plain
 implementation, not one per caller.
 
 #### `forward_cached`: the build → fill → execute → read pipeline
-(`src/models/qwen2/graph.rs:403-470`, `520-550`, `617-625` — abridged)
+(`src/models/qwen2/graph.rs:409-476`, `520-550`, `617-625` — abridged)
 
 ```rust
     pub fn forward_cached(model: &Qwen2Model, tokens: &[u32], positions: &[usize],

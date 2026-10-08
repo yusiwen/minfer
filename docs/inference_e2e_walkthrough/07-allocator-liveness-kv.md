@@ -78,7 +78,7 @@ Three terms, defined once and used everywhere after:
 One deliberate simplification shapes everything: **every pool buffer is
 f32-typed**. The allocator counts sizes in f32 elements (`Backend::alloc_buffer`
 "allocate / release a buffer of `size` f32 elements", `supports_fused` (`backend.rs:25`),
-Metal sizes buffers as `size * 4` bytes in `alloc_buffer` (`metal_backend.rs:846`), and weights
+Metal sizes buffers as `size * 4` bytes in `alloc_buffer` (`metal_backend.rs:867`), and weights
 keep their quantized bytes elsewhere (registered by name in doc 03). One dtype
 means one allocator, one copy path, one set of host-access functions — and,
 as §2.6 shows, even integers ride along as f32 bit patterns.
@@ -273,7 +273,7 @@ Why bother? Three reasons, in decreasing order of "wow":
 The model-side code cooperates with the rule. In the mixed-quant QKV decode
 path, the builder deliberately wires attention to the epilogue node *so that*
 the q matmul's buffer has exactly one consumer and can alias — the epilogue is
-`qkv_bias_rope_store` (`models/qwen2/graph.rs:163-175`: "Attention is wired to the epilogue node so
+`qkv_bias_rope_store` (`models/qwen2/graph.rs:169-181`: "Attention is wired to the epilogue node so
 q's matmul buffer has exactly one consumer (in-place alias rule, §5)").
 
 ### 2.5 The KV cache as persistent regions
@@ -374,7 +374,7 @@ the per-layer path needs no host sync (and stays CUDA-Graph-replayable)"
 `f32_bits_to_i32` (`ops_elementwise.cu:249`).
 
 Filling happens at a strict moment: after `alloc_graph`, *before* the
-scheduler runs `forward_batch` (`models/qwen2/graph.rs:459`): `cache.current()` → three
+scheduler runs `forward_batch` (`models/qwen2/graph.rs:465`): `cache.current()` → three
 `fill_input_i32` calls). That ordering is exactly why inputs must be pinned
 out of the recycling pool (§2.2 rule 2) — the fills would otherwise fight
 each other over a shared buffer before any node had executed (§3.4, bug 2b).
@@ -454,7 +454,7 @@ planted persistent region `allocator_survives_rebuild` (`cache/tests.rs:159`).
   allocator's CPU pool is the same object weight registration went through
   `GraphAllocator` (`alloc.rs:107`) delegates to `self.cpu.register_weight`).
 - Host data for inputs: `&[u32]` token ids, positions, tail ids
-  `forward_batch` (`models/qwen2/graph.rs:459`).
+  `forward_batch` (`models/qwen2/graph.rs:465`).
 
 **Out:**
 
@@ -761,7 +761,7 @@ fn alloc_fresh(&mut self, size: usize) -> usize {
 ```
 
 (Metal's pool is the same shape with `MTLBuffer` lengths in bytes,
-`alloc_buffer` (`metal_backend.rs:846`), except recycled buffers are *not* re-zeroed —
+`alloc_buffer` (`metal_backend.rs:867`), except recycled buffers are *not* re-zeroed —
 kernels fully overwrite their outputs, and the driver zero-fills only new
 allocations.)
 
@@ -854,7 +854,7 @@ driver's one-time first-submit setup, which scales with total buffer bytes:
 hands (`--n-ctx`, default 4096; doc 01 covered that side) and clamped it:
 `main.rs` computes `ctx` as the larger of `params.n_ctx` and `input_ids` (`main.rs:1451-1453`) — a long prompt
 must never overflow the notepad — and the model clamps again with
-`Qwen2Graph::forward` (`src/models/qwen2/graph.rs:432-439`), which applies `n_ctx.min(max_seq_len)`.
+`Qwen2Graph::forward` (`src/models/qwen2/graph.rs:438-445`), which applies `n_ctx.min(max_seq_len)`.
 One more consistency requirement hides here: because `ensure_kv` sizes on
 *first use only* (excerpt 5), prefill and decode must pass the **same** `n_ctx`
 so the regions created during prefill are correctly sized for every decode
@@ -879,7 +879,7 @@ sometimes needed a copy: the original allocator materialized cross-backend and
 in-place inputs through a host `copy_in`. On Metal, though, one split's
 kernels are *encoded* into an `MpsCommandBuffer` as they execute — and only
 *submitted* at the split boundary `capture_split` (`metal_backend.rs:144`),
-`execute_node` (`metal_backend.rs:874`). A host copy enqueued mid-split therefore read
+`execute_node` (`metal_backend.rs:895`). A host copy enqueued mid-split therefore read
 the buffer's *old* contents: freshly allocated Metal memory, i.e. **zeros**.
 The copy captured zeros, RoPE dutifully rotated them, `KvcacheStore` wrote
 them into the layer's persistent region — and the whole KV region was zeros,
@@ -934,7 +934,7 @@ longer matters.
   at rebuild (§2.7).
 - KV positions are data: the region is sized `n_kv_embd × n_ctx`, and a
   position ≥ `n_ctx` is a loud error, not an overflow (`cpu_backend.rs:359`),
-  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:387`).
+  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:393`).
 - Dead nodes get no buffer and the scheduler skips them — so adding an op the
   fusion pass orphans cannot corrupt memory, it just does nothing — skipped
   where `node_buffer` (`scheduler.rs:321-326`, the bufferless-node skip) reads `None`.
