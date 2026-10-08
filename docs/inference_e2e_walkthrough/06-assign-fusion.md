@@ -171,7 +171,7 @@ layer**, and one dispatch. Now put real numbers on it (Qwen2.5-0.5B: hidden 896,
   time.
 - **Decode** (`nt = 1`): `A = 19.4 KB`, so 2A ≈ 39 KB per layer → under 1 MB across the model —
   *bandwidth is irrelevant here*. The decode win is the **dispatch**: every Metal pass costs a
-  host-side encode (`MINFER_OP_PROFILE=1` prints this cost per op; metal_backend.rs:224-242),
+  host-side encode (`MINFER_OP_PROFILE=1` prints this cost per op; metal_backend.rs:253-271),
   and at one token per forward there is nothing else to hide it behind.
 
 That decode asymmetry is why minfer has *two* fusion mechanisms, and keeping them apart is the
@@ -475,7 +475,7 @@ version computes `silu(gate[i]) * up[i]` in one loop and is bit-identical to tha
 formula, same per-element order — pinned by `vec_ops::tests::swiglu_matches_silu_then_mul`).
 
 **Metal's table, with the decode fusions and the CUDA-only epilogue negative** —
-`src/graph/metal_backend.rs:265-290`:
+`src/graph/metal_backend.rs:294-319`:
 
 ```rust
 fn supports_op(&self, op: &Op, dtype: DType) -> bool {

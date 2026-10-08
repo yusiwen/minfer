@@ -215,7 +215,7 @@ the full `n_ctx` from the start — the whole reason a fixed graph can serve a
 growing cache (§2.4). The cost grows linearly with context: at `nkv = 1024`
 a decode step reads ≈ 24 MB of K/V (`2 × 24 layers × 128 × 1024 × 4 B`), and
 ~96 MB at `n_ctx = 4096`. The position-derived `nkv = max_pos + 1` predates
-E1 (PR #3, 2026-09-17) and now lives only on Metal (`metal_backend.rs:1433-1434`).
+E1 (PR #3, 2026-09-17) and now lives only on Metal (`metal_backend.rs:1588-1589`).
 
 **What reuse removes.** Build + assign + fuse + allocate are per-*graph*
 costs, not per-token math. Reuse means a decode step pays only: two small
