@@ -12,9 +12,9 @@ the GPU's processor units, each running many warps concurrently). This chapter
 turns that model into the concrete API surface minfer actually uses.
 
 The surface is small. CUDA (NVIDIA's C/C++ extension plus its runtime library)
-exposes hundreds of API calls, but minfer's whole device layer — all 6,225
-lines of `src/cuda.rs` — is built on roughly twenty of them, one language
-feature (`__global__` functions) and one launch syntax (`<<<...>>>`). The five
+exposes hundreds of API calls, but minfer's device layer — `src/cuda.rs` (1,014
+lines) plus the `src/cuda/methods/*.rs` families #262 split out — is built on
+roughly twenty of them, one language feature (`__global__` functions) and one launch syntax (`<<<...>>>`). The five
 things you cannot read minfer's CUDA code without: kernel syntax and indexing
 (§2.1); error checking and sync semantics (§2.2); device memory and the Rust
 FFI layer (§2.3); streams and asynchronous execution (§2.4); and the build
@@ -285,30 +285,31 @@ is re-created — so a misdiagnosed "error at line 4000" is usually the first
 *sync after* the real culprit. Bisect by syncing after each launch suspicion,
 which is what minfer's debug sync (below) is for.
 
-**How minfer wraps this.** minfer checks at *sync points*, not per launch,
-and the wrapper is 10 lines `CudaState::sync` (`src/cuda/methods/events.rs:143`):
+**How minfer wraps this.** minfer checks each launch's own error and drains at
+*sync points*; the wrapper is `CudaState::sync` (`src/cuda/methods/events.rs:143-157`):
 
 ```rust
-// `CudaState::sync` (src/cuda/methods/events.rs:143)
+// `CudaState::sync` (src/cuda/methods/events.rs:143-157; #145 comment elided)
 pub fn sync(&self) {
     let err = unsafe { cudaGetLastError() };
     if err != 0 {
-        eprintln!("CUDA kernel launch error: {}", err);
+        LATCHED_API_ERRORS.fetch_add(1, Ordering::Relaxed);
+        eprintln!("{}", latched_api_error_message(err));
     }
     let err = unsafe { cudaStreamSynchronize(self.stream()) };
     if err != 0 {
-        eprintln!("CUDA stream sync error: {}", err);
+        eprintln!("CUDA stream sync error: {} ({err})", cuda_error_name(err));
     }
 }
 ```
 
-`cudaGetLastError()` picks up anything sticky from launches since the last
-check (launch-time errors); `cudaStreamSynchronize(self.stream())` blocks
-until the one shared stream has drained — which both (a) makes the host wait
-so results are trustworthy and (b) transfers any *execution* error into the
-return value, checked and printed. Note what it does **not** do: no panic, no
-abort, no `Result`. `CudaState::sync` is a *drain point*; the safety contract
-lives one level up, in the backend, where invariant violations become `Err`.
+`cudaGetLastError()` picks up whatever an *earlier* call latched — not
+evidence about the kernel (the #145 lesson); `LATCHED_API_ERRORS` counts it
+and `latched_api_error_message` names the observer and the real error.
+`cudaStreamSynchronize(self.stream())` blocks until the bound stream has
+drained: (a) the host waits so results are trustworthy, (b) any *execution*
+error lands in the return value, checked and printed. Note what it does **not**
+do: no panic, no abort, no `Result` — `CudaState::sync` is a *drain point*, and the safety contract lives one level up, in the backend, where invariant violations become `Err`.
 There also used to be a per-node debug variant, `debug_sync(il, label)`
 (gated behind `MINFER_CUDA_DEBUG=1`), printing the layer index and label with
 any launch or sync error — the bisection tool. It belonged to the legacy
@@ -316,13 +317,13 @@ any launch or sync error — the bisection tool. It belonged to the legacy
 the graph path's `CudaState::sync()` is the drain point, and `MINFER_OP_TIMING=1`
 the per-op timing tool.
 
-Why "at sync points, not per launch"? The graph path launches ~100+ kernels
-per decode step; a `cudaGetLastError()` after each is cheap, but a *sync*
-after each would serialize the pipeline. The compromise — one drain point per
-split, plus sticky-error pickup — is `docs/GPU_SAFETY.md` rule 4
-(`docs/GPU_SAFETY.md:232`, the CUDA section's rule 4): *"Launch errors are checked at sync points, not
-per launch: `CudaState::sync()` polls `cudaGetLastError` +
-`cudaStreamSynchronize` and reports both."*
+Why no *sync* per launch? The graph path launches ~100+ kernels per decode
+step; a `cudaGetLastError()` after each is cheap and does happen, but a
+`cudaStreamSynchronize` after each would serialize the pipeline — so the
+drain happens once per split, and `docs/GPU_SAFETY.md` rule 4
+(`docs/GPU_SAFETY.md:232`, the CUDA section's rule 4) keeps that latch honest: *"A latched error is never blamed on
+the kernel that just ran."* The first call reports whatever an *earlier* call
+latched — not evidence about the kernel — and the error is counted, never dropped.
 
 **The GPU safety contract.** `docs/GPU_SAFETY.md` (CUDA section,
 `docs/GPU_SAFETY.md:225-242` (the CUDA section) translates the project-wide hard rules to the
@@ -334,8 +335,8 @@ while CUDA records a graph corrupts the capture (the 7e② "faster but wrong"
 incident; §2.4 builds on this, `docs/GPU_SAFETY.md:230`). **Device memory is not host-readable
 via plain memcpy on GB10** — dereferencing a device pointer from the host
 segfaults; all D2H (device-to-host) traffic goes through `cudaMemcpy`
-(`docs/GPU_SAFETY.md:231`). Launch errors checked at sync points; same-stream ordering is the
-correctness contract for async fills (`docs/GPU_SAFETY.md:232`, `:238`). Rule 1's Rust shape is on
+(`docs/GPU_SAFETY.md:231`). A latched error is reported, never blamed on the kernel that just ran;
+same-stream ordering is the correctness contract for async fills (`docs/GPU_SAFETY.md:232`, `:238`). Rule 1's Rust shape is on
 the elementwise dispatch arm: the backend checks the kernel's preconditions
 *before* launching and returns a formatted `Err` naming the node
 (`src/graph/cuda_backend.rs:998`, the `Op::Add` arm) — `Op::Add` rejects input-size
@@ -490,18 +491,18 @@ file: *register a weight → use it → (never) free it*.
    (§2.2).
 5. **Drop.** For weights: never — process-lifetime by design (the registry
    owns them until exit; the OS reclaims the context). For pool scratch:
-   `CudaBackend::drop` frees every pool buffer with `cudaFree`, which
-   implicitly synchronizes the device — that is why the `Drop` first takes
-   the stream lock (`src/graph/cuda_backend.rs:859`, `impl Drop for CudaBackend`). For the
+   `CudaBackend::drop` frees every pool buffer with `cudaFree` (a
+   context-wide call); the pre-#188 stream lock is gone, and the Drop now
+   first binds this backend's own stream with `self.bind()` (`src/graph/cuda_backend.rs:866`) for the teardown's host-side transfers. For the
    grow-on-demand scratch slots there is a middle pattern, `get_or_grow`
    (`src/cuda/methods.rs`): if the slot's allocation is too small, *free
    the old buffer then allocate the new one*, only under the slot's own
    `Mutex` so two graph executions cannot grow the same slot concurrently.
 
 That is the complete path: alloc → upload → registry (single owner) →
-name-resolve at dispatch → lifetime-by-design. Every other part of
-`src/cuda.rs` — the KV regions, the f16 cache, the MMQ scratch planes — is a
-variation on this skeleton.
+name-resolve at dispatch → lifetime-by-design. Every other part of the
+device layer — the KV regions (`src/cuda/methods/kvstore.rs`), the f16 cache
+(`prefill_f16.rs`), the MMQ scratch planes (`mmq_quant.rs`/`prefill_mmq.rs`) — is a variation on this skeleton.
 
 ### 2.4 Streams and asynchronous execution
 
@@ -612,10 +613,10 @@ every SM cannot physically run side by side — streams give the GPU
 `cudaEventRecord(end)` is *enqueued*, the real wait is
 `cudaEventSynchronize(end)` — the event version of the §2.2 sync story.
 
-**minfer's actual stream usage.** The surprise: for all that machinery, minfer
-runs **one** context stream, created once at device init
-`try_new` (`src/cuda/methods/init.rs:55`)) and fetched by every wrapper via `stream()`
-`CudaState::stream` (`src/cuda/methods/stream.rs:18`), a `Mutex<CudaPtr>` deref. Why one stream, when
+**minfer's actual stream usage.** The surprise: for all that machinery, each
+engine's backend runs **one** non-blocking stream, created when the backend is
+built (`with_layout`, `src/graph/cuda_backend.rs:204`); `stream()` (`src/cuda/methods/stream.rs:18`)
+answers that bound stream, falling back to the context stream (`try_new`, `src/cuda/methods/init.rs:55`) only for an unbound caller. Why one stream, when
 streams exist for overlap? First, the workload is a dependency chain — a
 decode step is a strict sequence (norm → matmul → rope → attention → … →
 lm_head) with nothing to overlap *within* it. Second, the real per-step
@@ -623,17 +624,17 @@ overhead was launches, not gaps between kernels — ~100+ launches per decode
 step, each a few µs of host time — so minfer's answer was not streams but
 **CUDA Graph capture/replay**: record the whole step's launches once, then
 replay the graph as a single launch. Capture is *per-stream* (only work
-enqueued on the capturing stream is recorded), which is why the capture
-window takes the process-wide stream lock `stream_guard` (`src/graph/cuda_backend.rs:556`): any
-other backend's stream work must block rather than be recorded into the graph
-`with_layout` (`src/graph/cuda_backend.rs:204`)). The state machine lives in
+enqueued on the capturing stream is recorded) and opens in thread-local mode,
+so each backend captures into its own stream; `stream_guard` (`src/graph/cuda_backend.rs:556`) is
+now a `None`-returning shim — [#188](https://github.com/yusiwen/minfer/issues/188) took the stream-work
+serialization away, and a caller must not rely on mutual exclusion there. The state machine lives in
 `graph_replay_step` (`src/graph/cuda_backend.rs:459`): executions 1–2 of
 a split run as plain launches (warmup — llama.cpp's protocol), the 3rd opens
 the capture window, `synchronize()` closes it (instantiate + launch once +
 cache, `close_capture_or_sync` (`src/graph/cuda_backend.rs:573`)), and every later execution is a
 single `graph_launch_exec` (`src/graph/cuda_backend.rs:496`). The
 backend's `CudaBackend::synchronize` (`src/graph/cuda_backend.rs:2307`) is the
-split-boundary drain point from §2.2: take the stream guard, clear the
+split-boundary drain point from §2.2: bind its own stream, clear the
 per-execution memos, then `close_capture_or_sync`. Replay is gated by
 `MINFER_NO_CUDA_GRAPH=1` (falls back to per-kernel launches — §5 makes the
 launch stream visible in `nsys`). The mental model: **streams are the
@@ -742,10 +743,10 @@ CUDA node takes; the layered picture first (the one diagram of this chapter):
      │
      ▼
  `Op::Silu` (cuda_backend.rs:1026)   Op::Silu arm               (guards → Err or launch)
-     │   in_bufs[0] != out_buf?  → copy_d2d (D2D stage)
+     │   in_bufs[0].id != out_buf.id?  → copy_d2d (D2D stage)
      ▼
  `silu_f32` (src/cuda/methods/elementwise.rs:145)         CudaState::silu_f32        (thin unsafe wrapper)
-     │   self.stream() = the one shared cudaStream_t
+     │   self.stream() = this backend's bound cudaStream_t
      ▼
  `launch_silu_f32` (src/cuda/methods/elementwise.rs:39)               extern "C" launch_silu_f32 (FFI declaration)
      ▼
@@ -755,7 +756,7 @@ CUDA node takes; the layered picture first (the one diagram of this chapter):
      ▼
  [ GPU: 19 blocks × 256 threads, enqueued on the stream, drains async ]
      …
- `CudaState::sync` (src/cuda/methods/events.rs:143)         CudaState::sync()          (sticky errors + drain,
+ `CudaState::sync` (src/cuda/methods/events.rs:143)         CudaState::sync()          (latched errors + drain,
                                                        at the split boundary)
 ```
 
@@ -765,15 +766,14 @@ never-silently-fallback rule from `docs/GPU_SAFETY.md`). The CUDA backend's
 `Op::Silu` arm (`src/graph/cuda_backend.rs:1026`, the arm in `execute_node_inner`) is seven lines:
 
 ```rust
-// `Op::Silu` (src/graph/cuda_backend.rs:1026)
+// `Op::Silu` (src/graph/cuda_backend.rs:1026-1032)
 // In-place op (alias rule, graph rules §5): stage via D2D copy when
 // the allocator did not alias the input, then run on the output.
 Op::Silu => {
-    if in_bufs[0] != out_buf {
+    if in_bufs[0].id != out_buf.id {
         self.copy_d2d(in_bufs[0], out_buf)?;
     }
-    self.state
-        .silu_f32(self.ptr_of(out_buf)?, self.elems(out_buf));
+    self.state.silu_f32(self.ptr_of_ref(out_buf)?, out_buf.len);
     Ok(())
 }
 ```
@@ -786,12 +786,12 @@ backend stages a device-to-device copy first so the in-place kernel can never
 write a buffer some other node still needs. `copy_d2d`
 `copy_d2d` (`src/graph/cuda_backend.rs:1795`) resolves both pool slots to device
 pointers, refuses on a byte-size mismatch (`Err` — the §2.2 contract), and
-enqueues `cudaMemcpyDeviceToDevice` on the shared stream. Two GPU operations
+enqueues `cudaMemcpyDeviceToDevice` on the backend's bound stream. Two GPU operations
 (copy + kernel) for the price of one node, both asynchronous, both ordered by
 the stream.
 
 Then the descent from §2.3 step 4: `CudaState::silu_f32`
-(`src/cuda/methods/elementwise.rs`) fetches the shared stream and calls the extern
+(`src/cuda/methods/elementwise.rs`) fetches the bound stream and calls the extern
 launcher (declared at `launch_silu_f32` (`src/cuda/methods/elementwise.rs:39`)); the C launcher computes
 `grid = (4864 + 255) / 256 = 19` and enqueues
 `silu_f32<<<19, 256, 0, stream>>>`; the kernel gives each of the 4,864
@@ -890,7 +890,7 @@ step; add none.
 
 Toy #3's 2.00× came from two kernels that *fit* side by side; when two
 kernels each saturate DRAM bandwidth (as two big prefill GEMMs would), two
-streams buy zero. minfer's single stream is therefore the correct design for
+streams buy zero. minfer's one stream per engine is therefore the correct design for
 a dependency-chained workload, with CUDA Graphs attacking the *actual*
 overhead (launches) — keep both tools in mind and let the measurement pick.
 
