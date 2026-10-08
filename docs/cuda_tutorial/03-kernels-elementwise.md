@@ -403,7 +403,7 @@ kernels in a profile:
 
 - The **persistent f16 weight cache** (Phase 8p) is warmed **at load time**
   by the model loaders: `enable_w16_cache` (`src/models/qwen2/loader.rs:685`) + `warm_w16`
-  (`:690`) per weight; the `warm_w16` body (`src/cuda/methods/prefill_f16.rs:89`) maps
+  (`:690`) per weight. `warm_w16` (`src/cuda/methods/prefill_f16.rs:89`) maps
   `TensorType` → the same type ids and calls
   `w16_get`, which launches the dequant). But only for models whose matmul
   weights total ≥ `W16_ENABLE_BYTES` = 2 GiB `gemm_prefill_smem_limit` (`src/cuda/ffi_runtime.rs:135`)) **and**
