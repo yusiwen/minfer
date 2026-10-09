@@ -219,6 +219,60 @@ is now **0.86-0.93×** (1.07-1.16× slower) and decode is **0.88-0.99×** (7B at
 parity). Short-prompt `pp30` stays dispatch/overhead-bound on both engines and is
 not a clean attention lever (0.72-0.85×).
 
+### §0.3 Small-batch prefill re-measurement (#40, 2026-10-09)
+
+[#40](https://github.com/yusiwen/minfer/issues/40) closed with "the nt∈[2,8]
+small-od gap vs llama's ext kernel (0.5B pp4 141 vs 583) remains open — low value
+(2-8 token prompts), deferred": a **0.24×** A/B taken 2026-08-21 against a then-HEAD
+llama.cpp. That figure is stale, and a reader of §0 could not tell the deferral from
+an oversight. Re-measured 2026-10-09 at minfer `270b6b3` on
+`macbook (macOS 27.0.1, Apple M4 Pro)`, hostname `macbookpro-ysw`, AC power
+(~79 %), the box otherwise loaded (Edge + agent; 15-min load ≈ 7-8), against the
+§0.2 llama.cpp reference **`c479922ac`** (build 11458, AppleClang 21.0.0.21000334,
+`-O3 -DNDEBUG -ffp-contract=fast`).
+
+**Protocol.** Same GGUF for both engines, from
+`/Volumes/WD_BLACK/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/`:
+`qwen2.5-0.5b-instruct-q4_k_m.gguf` (the §0.2 model) and `…q4_0.gguf`. §0 #40
+recorded the `pp` point ("pp4") but not the `tg`, so the §0.2 harness is used whole.
+Each engine ran **its own contiguous sweep** (minfer first, then llama) from a
+settled box, `-r 5`:
+
+```
+./target/release/minfer bench -p P -n 128 -r 5 <model>                      # Metal default
+~/git/reading/llama.cpp/build-fpc/bin/llama-bench -m <model> -p P -n 128 -r 5 -b 512 -t 8
+```
+
+| `pp` | minfer k_m | llama k_m | ratio | minfer q4_0 | llama q4_0 | ratio |
+|---|---|---|---|---|---|---|
+| 2 | 230.5 | 352.5 | 0.65 | 279.1 | 501.1 | 0.56 |
+| 4 | 306.1 | 917.7 | 0.33 | 533.2 | 821.7 | 0.65 |
+| 8 | 446.8 | 1658.1 | 0.27 | 884.3 | 1679.0 | 0.53 |
+| 30 | 2258.2 | 2136.7 | 1.06 | 2432.8 | 2703.3 | 0.90 |
+
+**Reading.** The recorded `0.24×` is stale: minfer's `pp4` roughly doubled since
+#40 and the ratio at `pp2-8` is now **~0.3-0.65×**. Repeats spread that band — the
+tiny-`pp` timing is a few ms of per-call setup, so the session's ambient dominates
+(llama's own `pp30` moved 2845 → 2137 between §0.2 and this run; each engine's `pp4`
+ratio across four sessions fell in 0.33-0.52 for k_m and 0.52-0.65 for q4_0). At
+`pp30` the engines are within ~±15 %. The gap is real and lives exactly where #40
+left it: the `nt∈[2,8]` small-od matmuls still take the serialized `_multi` kernel
+where llama runs `kernel_mul_mv_ext` (the batched matvec), because the GEMM gate is
+`nt >= 2 && (od >= 2048 || nt >= 9)` (`src/metal/ops.rs:40`), so a 0.5B's `attn_qkv`
+(od 1152) stays on the multi path through `nt` 8; the GEMM does kick in at `nt >= 9`,
+which is why the ratio improves through `pp12-16`.
+
+**Decision — kept deferred (2026-10-09).** The fix is a `mul_mv_ext`-style
+batched-matvec kernel family (comparable surface to the q4_K decode port of
+[#27](https://github.com/yusiwen/minfer/issues/27)) that speeds up **only 2-8 token
+prompts**, a window real chat/system prompts never occupy: the engines are already at
+**0.86-0.93×** at `pp30-495` (§0.2). The cost buys a few milliseconds of one-time
+prompt processing for single-word-style inputs and does not justify the kernel
+surface. **Revisit trigger:** a workload that actually runs 2-8 token prompts at
+volume (single-token completions, an embedding/similarity path, or speculative-draft
+prefill), or a batched-matvec kernel landing anyway for a larger reason. Until then
+this is a decision, not an oversight.
+
 ### ✅ Done
 
 | # | Item | Measured effect | Commit |
@@ -262,7 +316,7 @@ not a clean attention lever (0.72-0.85×).
 | 37 | **f16 KV auto-default (2026-08-21)**: `set_kv_cache_type(n_layers, n_kv_embd)` at model load auto-selects the GPU KV element type — **f16 for the 7B class** (n_layers×n_kv_embd ≥ 8192: KV bandwidth-bound decode), f32 for small models; `MINFER_CACHE_TYPE=f16/f32` overrides. llama always defaults F16 (`llama-context.cpp:3539`); minfer had kept f32 default because 0.5B f16 measured ~3% slower (§0 decided-not #8) — the auto rule applies f16 exactly where it wins and keeps the 0.5B class on f32 | 7B @2K ctx steady decode **f16 ≈ 20.15 ms vs f32 21.13 ms/token (~1 ms, ~5 %)**; 7B greedy byte-identical across auto/f32/f16 (16 tokens); 0.5B untouched (auto→f32); 34/35 bin tests green | this commit  `9099f79` |
 | 38 | **GPU get_rows for the remaining embedding types (2026-08-21)**: llama's `kernel_get_rows_q` covers every quant; minfer had Q4_0+Q4_K only (#33), so the 0.5B Q5_0/Q5_1/Q8_0/Q6_K-embedding models (q4_k_m embd=Q5_0, q5_k_m embd=Q5_1, q5_0/q8_0/q6_k models) fell back to CPU scalar dequant + `upload_hidden` per prefill. Added MSL templates `kernel_get_rows_q32` (Q4_1/Q5_0/Q5_1/Q8_0, one thread per 32-elem block, reuses the validated `dequant_*_16` helpers) + `kernel_get_rows_q256` (Q6_K/Q5_K, one thread per 16-elem group, same structure as the Q4_K kernel) + pipeline routing/guards (ne%32 / ne%256) in `embed_tokens_gpu` | `tests/gemm_isolation.rs::get_rows_multi_type_isolation` — all 6 new kernels **bit-exact vs CPU** (rel 0); end-to-end q5_0/q5_k_m/q8_0 GPU == CPU greedy (same seed); 0.5B q4_k_m (embd Q5_0) now embeds on GPU (was CPU fallback); 1.5B Q4_K / 7B Q4_K unchanged; 34/35 bin tests green. **Note**: the 0.5B q6_k model shows a PRE-EXISTING GPU-vs-CPU greedy divergence (reproduced on the pre-#38 binary — not from this change; its 896-dim Q6_K embd is ne%256≠0 → CPU fallback) — flagged for later investigation | this commit |
 | 39 | **GPU warm-up read + merged embed (2026-08-21)**: (a) the mmap loader (#36) REGRESSED cold-start prefill — the FIRST GPU access to file-backed (mmap) pages costs ~44 ms of one-time page/TLB setup per process (0.5B pp1 wall 20 → 56 ms vs the copy path; a CPU-side madvise/touch does NOT fix it — the cost is the GPU's own access). Fix: `register_part` now dispatches a dummy `kernel_warmup_read` over the whole part buffer at model load (outside the CLI's Total timing; llama-bench numbers are equally warm). (b) the embed is now dispatched into the MAIN command buffer (llama builds `ggml_get_rows` into the main graph — one submit instead of two). | 0.5B pp1 wall **56 → 14 ms**, pp31 prefill **~430 → ~950 t/s** (llama 2686, gap 6× → 2.4×); 7B pp31 **~190 → ~247 t/s** (llama 328, gap 1.7× → 1.3×), pp499 GPU 1215 → **1142 ms (~6 %)**, first-decode −~50 ms; cost: +~0.2 s 7B load (the read is amortized into load), 0.5B/7B outputs byte-identical, 34/35 bin tests green | this commit |
-| 40 | **Small-batch prefill matmul threshold (2026-08-21)**: minfer dispatched the simdgroup GEMMs only for nt ≥ 16 (chosen on the 0.5B in P0); nt∈[9,15] fell to the `_multi` kernels which serialize t INSIDE the threadgroup — measured **7B pp12: 16.6 t/s vs llama 130 (~7.8×)**, 0.5B pp12 ~3.9×. Fix: adaptive rule `nt ≥ 2 && (od ≥ 2048 || nt ≥ 9)` — GEMM for all nt ≥ 9 (llama `ne11_mm_min=8` → MM for ne11>8) AND for nt∈[2,8] with large od (7B class: od≥3584 — GEMM ≈ llama's `kernel_mul_mv_ext` there, measured pp4 7B 34 vs llama 61); small-od 0.5B matmuls keep the multi at [2,8] (measured better). The nt∈[2,8] small-od gap vs llama's ext kernel (0.5B pp4 141 vs 583) remains open — low value (2-8 token prompts), deferred | **7B pp12 16.6 → ~124 t/s (≈llama 130, parity)**, pp4 15 → 34 t/s; 0.5B pp12 278 → ~500 t/s, pp31 unchanged (~950); byte-identical (7B/0.5B greedy), pp499 parity, 34/35 bin tests green | this commit |
+| 40 | **Small-batch prefill matmul threshold (2026-08-21)**: minfer dispatched the simdgroup GEMMs only for nt ≥ 16 (chosen on the 0.5B in P0); nt∈[9,15] fell to the `_multi` kernels which serialize t INSIDE the threadgroup — measured **7B pp12: 16.6 t/s vs llama 130 (~7.8×)**, 0.5B pp12 ~3.9×. Fix: adaptive rule `nt ≥ 2 && (od ≥ 2048 || nt ≥ 9)` — GEMM for all nt ≥ 9 (llama `ne11_mm_min=8` → MM for ne11>8) AND for nt∈[2,8] with large od (7B class: od≥3584 — GEMM ≈ llama's `kernel_mul_mv_ext` there, measured pp4 7B 34 vs llama 61); small-od 0.5B matmuls keep the multi at [2,8] (measured better). The nt∈[2,8] small-od gap vs llama's ext kernel was re-measured 2026-10-09 and **kept deferred by decision** — the 2026-08-21 "0.5B pp4 141 vs 583" (0.24×) is stale; fresh numbers and rationale in [§0.3](#03-small-batch-prefill-re-measurement-40-2026-10-09) | **7B pp12 16.6 → ~124 t/s (≈llama 130, parity)**, pp4 15 → 34 t/s; 0.5B pp12 278 → ~500 t/s, pp31 unchanged (~950); byte-identical (7B/0.5B greedy), pp499 parity, 34/35 bin tests green | this commit |
 
 **Completed optimizations in detail** (every done / decided-not item):
 [§3.1 Correctness fixes](#31-correctness-fixes-metal-backend-foundation) ·
