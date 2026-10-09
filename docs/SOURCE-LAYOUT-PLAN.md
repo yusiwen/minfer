@@ -882,3 +882,22 @@ must read the rows from that file rather than quote this document, and a step th
 
 Standing rule for every step: a layout PR moves code and nothing else; anything else it notices is
 filed, not fixed inside it.
+
+## The layering convention and the test-module rule (moved from `AGENTS.md`)
+
+The backend layers: each device backend is organised as L1 runtime, L2 launch/dispatch, L3 kernel
+sources and L4 graph executor, and **only L4 is polymorphic** — `graph/backend.rs` + `graph/registry.rs`
+stay the single device seam, so the directory tree is device-first and the layer is the *second* axis
+inside each device (`<backend>/kernels/` is where kernel sources live). A shared `common` is added only
+when two backends implement it and two callers use it (`allocplan::DeviceMemory` is the one candidate
+today). CPU's `quants.rs`/`vec_ops.rs` are deliberately not a device-private layer: they are the crate's
+numeric kernel library, shared with `graph/kvformat.rs` and `graph/cuda_backend.rs`. The four long
+backend files are split along this convention — the three CUDA files, the CPU trio and the two Metal
+files are done (`src/cuda/`, `src/cuda/kernels/`, `src/quants/`, `src/vec_ops/`, `src/kernel/`,
+`src/metal/`, `src/metal/kernels/`). Plan and target tree: `docs/SOURCE-LAYOUT-PLAN.md`
+([#261](https://github.com/yusiwen/minfer/issues/261)); the file list above is updated by each step as
+the code moves.
+
+`src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op + NodeMeta · `builder.rs` GraphBuilder · `scheduler.rs` assign → split → execute · `backend.rs` + `cpu_backend.rs`/`metal_backend.rs`/`cuda_backend.rs` executors · `registry.rs` backend registry (F4; F5's `copy_cross`/`await_cross`) · `alloc.rs` liveness allocator + persistent KV regions (E4) · `allocplan.rs` size-class ladder + pure plan + `DeviceMemory`/`budget_decision` · `offload.rs` layer offload plan (E5) · `kvcache.rs` cell store, removal/shift/compaction, span list, prefix sharing (C1–C3, C8b) · `kvformat.rs` KV format + `MINFER_CACHE_TYPE` gate (C4) · `kvsession.rs` versioned KV session container (C5) · `cache.rs`/`params.rs` params-only graph reuse · `fusion.rs` SwiGLU fusion · `copystats.rs` split-boundary counters · `batch.rs` batch composition · `dot.rs`/`json.rs` exporters.
+
+Unit tests live beside their module as `<module>/tests.rs`, declared `#[cfg(test)] mod tests;`, so a non-test build does not parse them (e.g. `src/graph/alloc/tests.rs` for `src/graph/alloc.rs`). `src/graph/op_matrix.rs` was already this pattern. Note this buys build *hygiene*, not speed: a warm `cargo check --release --features cuda` measured 1.43–1.45 s with the tests inline vs 1.52–1.57 s extracted. Both halves are enforced: `scripts/check_source_layout.py` (CI `check-docs`) rejects an inline `#[cfg(…test…)] mod … {` (the cfg *predicate* is read, so a compound `#[cfg(all(test, …))]` is caught too), and rejects a `src/**.rs` that no `mod` declaration names — the latter is the quiet one, because an undeclared file is never compiled and the tests inside it would silently not run. A long test module is split further into `<module>/tests/<topic>.rs`, each topic declared by a `mod <topic>;` in its `tests.rs` (`src/graph/cuda_backend/tests/` is the first, [#267](https://github.com/yusiwen/minfer/issues/267)); the same declaration walk reaches those files, so the orphan rule guards the split as well.
