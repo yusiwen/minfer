@@ -23,22 +23,21 @@
 # `cuda`  = `cargo check --release --features cuda` -> the `build-linux-cuda` job
 # `macos` = `cargo check --release` **on a macOS host** -> no CI job; the
 #           on-demand Mac run that compiles the `cfg(target_os = "macos")`
-#           modules. The checker refuses this config on any other host, and the
-#           marker below is the documented "not measured yet" state (#332).
+#           modules. The checker refuses this config on any other host; it was run
+#           on a Mac 2026-10-09 (#332) and the `[[macos]]` section at the end of
+#           the file is that measurement.
 # (`cuda` is the maximal configuration: `src/cuda.rs` and
 # `src/graph/cuda_backend.rs` exist only under the feature. `--features
 # debug_dump` and `cuda_static` are not covered.)
 #
-# macOS is **unjudged**, on purpose. Both halves of the blind spot:
-#   * a macOS-only module is never compiled on Linux (or in the Linux CI jobs),
-#     so nothing here is evidence about it;
-#   * a cross-platform item whose only caller sits in a
-#     `#[cfg(target_os = "macos")]` test block *looks* dead here while it is live
-#     there — `ModelDef::forward_graph` was exactly that case, which is why it is
-#     listed below with the test named in its reason.
-# `build-macos` compiles the test target since #303 (`cargo test --release --no-run`),
-# but it cannot run the Linux oracle on a macOS module, so the manifest records
-# the blind spot instead of pretending coverage: hence the marker below.
+# The two halves of the old macOS blind spot are both closed by the run below:
+#   * a macOS-only module is compiled and judged there (it reports **no** dead item
+#     under `src/metal/` or `src/graph/metal_backend*`);
+#   * a cross-platform item whose only caller sits in a macOS test block is
+#     reported dead by the non-test check and is listed with that test named in
+#     its reason — `ModelDef::forward_graph` is exactly that case.
+# `build-macos` still compiles the test target since #303 (`cargo test --release
+# --no-run`); the Mac run is the on-demand oracle, not a CI job.
 #
 # Architecture. The dead set can differ by `cfg(target_arch)` (NEON vs AVX2-gated
 # code). This manifest is the **union** of the host and the x86_64 CI runner: an
@@ -47,29 +46,41 @@
 # x86_64-unknown-linux-gnu` reproduces the CI set locally; the authoritative run
 # is the CI job itself, which passes no `--target`.
 #
-# The marker `macos = "unjudged"` means **no recorded measurement**, and only a
-# config the checker marks `unjudgeable` may carry it: `cpu`/`cuda` are
-# machine-checked in CI, where the marker would silently disable a gate and is
-# refused. It is reported as *unjudged*, never as a pass. Replace it with a
-# `[[macos]]` section (seeded by `--print-toml` on a Mac) once the oracle has been
-# run there, or with the count + date + box label — see #332.
+# The macOS half is **judged**, not marked: it was run on a Mac on 2026-10-09
+# (#332's Mac half) — the same stripped `cargo check --release`, where the
+# `#[cfg(target_os = "macos")]` modules are compiled. It reports **42** items,
+# and the macOS set is exactly the CPU set **minus** `QueryFailed`/`Reported`
+# (`graph/allocplan.rs`) and `allows_weight` (`graph/offload.rs`): macOS makes all
+# three live — `MpsState::device_memory` constructs the two `DeviceMemory`
+# variants, and the loaders call `allows_weight` under
+# `#[cfg(any(target_os = "macos", feature = "cuda"))]`. Every one of the 42
+# therefore carries the same platform-neutral reason as its `[[cpu]]` twin; the
+# `[[macos]]` section at the end of the file mirrors them.
 #
-# Re-stated 2026-10-06 (#54), re-scoped 2026-10-09 (#332). The value stays
-# `unjudged` until a Mac runs `--config macos`: the Linux oracle still cannot
-# compile a macOS-only module. `build-macos` does compile the test target since
-# #303, so a macOS-only reference is *seen* there; what was missing was the
-# configuration to run the oracle at all, and #332 added it (refused off a Mac).
-# The round *did* judge the two `src/metal.rs` annotations that were this
-# marker's concrete cases — [#255] (PR #294) turned `matmul_on_gpu_buf` into
-# `#[cfg(test)]` and deleted the container-level `impl MpsState` blanket — and it
-# re-verified the two `forward_graph` rows below: the macOS **test** build emits no
-# `dead_code` for them, so `src/models/mod.rs`'s
-# `#[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]` applies
-# no allow where its caller lives
-# (`models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits`).
+# The same run reports **no** dead item under `src/metal/` or
+# `src/graph/metal_backend*`. That is the evidence [#255]'s two dispositions rest
+# on: the container-level `impl MpsState` blanket is deleted (loaders, `main.rs`,
+# `graph/metal_backend.rs` and `get_or_grow`/`cmd_buffer` read all ten members) and
+# `matmul_on_gpu_buf` is `#[cfg(test)]`, so the non-test macOS build has neither.
+#
+# `forward_graph` is in the set (dead in this non-test macOS check), and its
+# `#[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]`
+# (`src/models/mod.rs`) applies no allow in the macOS **test** build, where its
+# caller `models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits`
+# keeps it live — that test is named in its `[[macos]]` reason.
+#
+# The `"unjudged"` marker is still the spelling for a config with no recorded
+# measurement, and only an `unjudgeable` config may carry it; `macos` no longer
+# does. A macOS-only dead item is an **addition** on the next Mac run.
+#
+# Measurement — box `macbook (macOS 27.0.1, Apple M4 Pro)` (hostname
+# `macbookpro-ysw`), 2026-10-09, command
+# `python3 scripts/check_dead_code_oracle.py --config macos --print-toml`:
+# `stripped 40 annotation(s); dead_code diagnostics: 29; src/ spans (sites): 53;
+# items: 42`. Re-run it on a Mac after any source change: `macos` is still an
+# on-demand run, not a CI job (`build-macos` only compiles the test target).
 #
 # [#255]: https://github.com/yusiwen/minfer/issues/255
-macos = "unjudged"
 
 # ---- cpu: 45 dead item(s), union of aarch64 + x86_64 ----
 [[cpu]]
@@ -238,7 +249,7 @@ reason = "A lookup helper of the CUDA-path device-tier selector; read by `device
 name = "forward_graph"
 kind = "fn"
 file = "src/models/mod.rs"
-reason = "Reachable only from the `#[cfg(target_os = \"macos\")]` test `models::qwen2::graph::tests::graph_metal_matches_cpu_logits` — the macOS half of the blind spot (#244)."
+reason = "Reachable only from the `#[cfg(target_os = \"macos\")]` test `models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits` — the macOS half of the blind spot (#244)."
 
 [[cpu]]
 name = "id_to_score"
@@ -461,7 +472,7 @@ reason = "Held pending #138: the F5 device→device staging copy is what would c
 name = "forward_graph"
 kind = "fn"
 file = "src/models/mod.rs"
-reason = "Reachable only from the `#[cfg(target_os = \"macos\")]` test `models::qwen2::graph::tests::graph_metal_matches_cpu_logits` — the macOS half of the blind spot (#244)."
+reason = "Reachable only from the `#[cfg(target_os = \"macos\")]` test `models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits` — the macOS half of the blind spot (#244)."
 
 [[cuda]]
 name = "id_to_score"
@@ -542,6 +553,263 @@ file = "src/cuda/methods/events.rs"
 reason = "Held pending #138: the F5 device→device staging copy is what would call it — no caller yet by construction."
 
 [[cuda]]
+name = "text"
+kind = "field"
+file = "src/conversation.rs"
+reason = "Read by `conversation::tests`; the streaming path hands each delta to the caller as it is produced, so no production code reads the assembled field."
+
+# ---- macos: 42 dead item(s), measured on a Mac 2026-10-09 (#332) ----
+# The macOS set is the CPU set minus QueryFailed/Reported/allows_weight, which
+# macOS makes live; every reason below is therefore the platform-neutral one its
+# [[cpu]] twin carries. No item under src/metal/ or src/graph/metal_backend* is
+# reported (see the header).
+[[macos]]
+name = "AutoWithBudget"
+kind = "variant"
+file = "src/graph/offload.rs"
+reason = "Deferred (#244): the loader reads the budget, but no production spelling constructs this variant — a CLI flag or a server field carrying the budget as an argument is what would construct it; `not(test)` names the configuration it is unused in."
+
+[[macos]]
+name = "BatchMatMul"
+kind = "variant"
+file = "src/graph/ops.rs"
+reason = "Deferred op vocabulary (#244): a batched matmul the single-output IR cannot express; a builder that needs one is what would construct it."
+
+[[macos]]
+name = "CudaWeightReg"
+kind = "enum"
+file = "src/models/weight_reg.rs"
+reason = "The pure CUDA weight-registration decision is deliberately outside the `cuda` feature so CI's CPU job runs its tests; only the `cuda`-gated `register_cuda_weight` half constructs it."
+
+[[macos]]
+name = "DeviceKey"
+kind = "struct"
+file = "src/device_tier.rs"
+reason = "The vec-keyed capability lookup of the T-series device-tier table; the CUDA-path selector and `device_tier::tests` are the only users, so the whole module is silent without the feature."
+
+[[macos]]
+name = "DeviceTier"
+kind = "struct"
+file = "src/device_tier.rs"
+reason = "One row of the T-series device-tier table; the CUDA-path selector and `device_tier::tests` are the only constructors."
+
+[[macos]]
+name = "F16"
+kind = "variant"
+file = "src/graph/mod.rs"
+reason = "Deferred (ggml parity): a kernel taking an f16 activation buffer is what would construct this dtype; the device kernels read f32 today."
+
+[[macos]]
+name = "GENERIC"
+kind = "const"
+file = "src/device_tier.rs"
+reason = "The device-tier table's fallback row index, used by the CUDA-path selector and `device_tier::tests` only."
+
+[[macos]]
+name = "Interleaved"
+kind = "variant"
+file = "src/vec_ops/rope.rs"
+reason = "Kept for llama.cpp parity: `graph::op_matrix`'s RoPE cases construct it, and a LLaMA-family loader with an interleaved RoPE style would construct it in production."
+
+[[macos]]
+name = "Mha"
+kind = "variant"
+file = "src/graph/ops.rs"
+reason = "Part of the attention-mode vocabulary (ggml parity): an architecture with `n_head_kv == n_head` that spelled its attention out would construct it."
+
+[[macos]]
+name = "Off"
+kind = "variant"
+file = "src/optiming.rs"
+reason = "Constructed by `optiming::tests`; a production caller that wants timing off without touching the environment would construct it."
+
+[[macos]]
+name = "Permute"
+kind = "variant"
+file = "src/graph/ops.rs"
+reason = "Deferred op vocabulary (#244): a builder that wants a transposed view rather than a copied or reshaped buffer would construct it."
+
+[[macos]]
+name = "Private"
+kind = "variant"
+file = "src/optiming.rs"
+reason = "Constructed by `optiming::tests` and `graph::scheduler::tests`; a caller that wants per-instance timing rather than the process-global sink would construct it."
+
+[[macos]]
+name = "Provenance"
+kind = "enum"
+file = "src/device_tier.rs"
+reason = "The provenance tag of a device-tier row; read by the CUDA-path selector and by `device_tier::tests`."
+
+[[macos]]
+name = "Q8_0"
+kind = "variant"
+file = "src/graph/mod.rs"
+reason = "Deferred (ggml parity): the IR node exposing a quantized activation buffer is what would construct it — the CPU quantizes inside the matmul kernels today."
+
+[[macos]]
+name = "QClass"
+kind = "enum"
+file = "src/device_tier.rs"
+reason = "The per-type batch-override class of a device-tier row; the CUDA-path selector and `device_tier::tests` construct it."
+
+[[macos]]
+name = "Reshape"
+kind = "variant"
+file = "src/graph/ops.rs"
+reason = "Deferred op vocabulary (#244): a builder that needs a non-contiguous reinterpretation would construct it."
+
+[[macos]]
+name = "Scale"
+kind = "variant"
+file = "src/graph/ops.rs"
+reason = "Deferred op vocabulary (#244): a builder that scales an activation in place (llama.cpp's `ggml_scale`) would construct it."
+
+[[macos]]
+name = "Selected"
+kind = "struct"
+file = "src/device_tier.rs"
+reason = "The selector's answer (tier + key), produced by `select`/`select_forced`, which the CUDA path calls at init."
+
+[[macos]]
+name = "Softmax"
+kind = "variant"
+file = "src/graph/ops.rs"
+reason = "Deferred op vocabulary (#244): an attention or sampling graph that exposes the normalized probabilities as a node output would construct it; the kernels fuse the softmax."
+
+[[macos]]
+name = "TIERS"
+kind = "const"
+file = "src/device_tier.rs"
+reason = "The device-tier table, read by the CUDA-path selector and by `device_tier::tests`."
+
+[[macos]]
+name = "Vendor"
+kind = "enum"
+file = "src/device_tier.rs"
+reason = "The vendor tag of a device-tier capability key; the CUDA-path selector and `device_tier::tests` read it."
+
+[[macos]]
+name = "as_any"
+kind = "fn"
+file = "src/models/mod.rs"
+reason = "Kept for `#[cfg(test)]` callers that hold `Arc<dyn ModelDef>` (`tooling::tests`, `models::qwen2::graph::tests`, …); no production path downcasts (#244)."
+
+[[macos]]
+name = "cuda_weight_reg"
+kind = "fn"
+file = "src/models/weight_reg.rs"
+reason = "The pure CUDA weight-registration decision, kept without the `cuda` feature so CI's CPU job runs its tests; the `cuda`-gated `register_cuda_weight` half is its only caller."
+
+[[macos]]
+name = "family_row"
+kind = "fn"
+file = "src/device_tier.rs"
+reason = "A lookup helper of the CUDA-path device-tier selector; read by `device_tier::tests`."
+
+[[macos]]
+name = "forward_graph"
+kind = "fn"
+file = "src/models/mod.rs"
+reason = "Dead in the non-test macOS check; live in the macOS test build, whose only caller is the `#[cfg(target_os = \"macos\")]` test `models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits` (#244)."
+
+[[macos]]
+name = "id_to_score"
+kind = "field"
+file = "src/tokenizer.rs"
+reason = "Deferred vocabulary (#244): the loader parses the GGUF scores but nothing reads them back; a sampler or diagnostic that weights candidates by the declared score would."
+
+[[macos]]
+name = "id_to_type"
+kind = "field"
+file = "src/tokenizer.rs"
+reason = "Deferred vocabulary (#244): the loader's local copy of the array derives the special-token table, so only a metadata re-emitter or a tokenizer test that inspects the loaded types would read the field."
+
+[[macos]]
+name = "im_end"
+kind = "field"
+file = "src/tokenizer.rs"
+reason = "Read by `conversation::tests` and `grammar::tests`; production reaches the token through `SpecialTokens`."
+
+[[macos]]
+name = "im_start"
+kind = "field"
+file = "src/tokenizer.rs"
+reason = "Read by `tokenizer::tests`; production reaches the token through the merged special-token index."
+
+[[macos]]
+name = "llama_key"
+kind = "fn"
+file = "src/device_tier.rs"
+reason = "Encodes the minfer runtime cc as llama.cpp's tier key; used by the CUDA-path selector and by `device_tier::tests`."
+
+[[macos]]
+name = "name"
+kind = "field"
+file = "src/graph/registry.rs"
+reason = "Read only by tests (`convert::tests`, `cuda::issue162_tests`, `cuda::issue218_tests`); production spelling goes through `Backend::name()` and `NAMES` (#244)."
+
+[[macos]]
+name = "order"
+kind = "field"
+file = "src/convert.rs"
+reason = "Retained pending #209: `canonical_order` computes the permutation but nothing applies it; #209's writer change is what would read it."
+
+[[macos]]
+name = "q4k_dsc_payload_bytes"
+kind = "fn"
+file = "src/q4k_dsc.rs"
+reason = "Part of the CUDA loader's q4_K `W_dsc` admission rule, kept pure so the CPU job executes its tests; `mmq_raw_nb_bt` (CUDA-only) is the consumer."
+
+[[macos]]
+name = "q4k_dsc_payload_ok"
+kind = "fn"
+file = "src/q4k_dsc.rs"
+reason = "Part of the CUDA loader's q4_K `W_dsc` admission rule, kept pure so the CPU job executes its tests; `mmq_raw_nb_bt` (CUDA-only) is the consumer."
+
+[[macos]]
+name = "q4k_dsc_plane_admitted"
+kind = "fn"
+file = "src/q4k_dsc.rs"
+reason = "The CUDA loader's q4_K `W_dsc` plane admission contract, kept pure so the CPU job executes its tests (and CI's CUDA job only compile-checks)."
+
+[[macos]]
+name = "select"
+kind = "fn"
+file = "src/device_tier.rs"
+reason = "The device-tier selector; the CUDA-path init is its production caller and `device_tier::tests` drives it."
+
+[[macos]]
+name = "select_by_key"
+kind = "fn"
+file = "src/device_tier.rs"
+reason = "A helper of the CUDA-path device-tier selector; `device_tier::tests` drives it."
+
+[[macos]]
+name = "select_forced"
+kind = "fn"
+file = "src/device_tier.rs"
+reason = "A helper of the CUDA-path device-tier selector (forced llama.cpp key); `device_tier::tests` drives it."
+
+[[macos]]
+name = "special_tokens"
+kind = "field"
+file = "src/tokenizer.rs"
+reason = "Read by `tokenizer::tests` (`rebuild_special_index`) and `conversation::tests`; production matches through `special_by_first`."
+
+[[macos]]
+name = "stopped_by_eog"
+kind = "field"
+file = "src/conversation.rs"
+reason = "Read by `conversation::tests`; the streaming path uses the local copy."
+
+[[macos]]
+name = "stopped_by_string"
+kind = "field"
+file = "src/conversation.rs"
+reason = "Read by `conversation::tests`; the streaming path uses the local copy."
+
+[[macos]]
 name = "text"
 kind = "field"
 file = "src/conversation.rs"
