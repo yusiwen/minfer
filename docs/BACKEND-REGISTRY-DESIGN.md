@@ -10,30 +10,20 @@ refusals. Gaps and the backlog item live in
 
 ## 1. Why the enum was the problem
 
-`Backend` was `enum Backend { CPU, Metal, Cuda }` in `src/graph/mod.rs`. Every
-consumer matched on it:
+`Backend` was `enum Backend { CPU, Metal, Cuda }` in `src/graph/mod.rs`, and every consumer
+matched on it. `GraphAllocator` alone dispatched **twelve** operations through
+`match backend { … }`; `BackendScheduler::execute` matched to pick the executing pool and again
+for the `MINFER_TRACE` capture path; and the fusion wiring built a `Vec<&dyn Backend>` by hand and
+found a node's backend with a `position(|b| b.name() == "cuda")` lookup that existed only because
+the `match` could not express "whichever device is present". Adding a backend therefore meant
+editing the allocator, the scheduler, the fusion wiring, the exporters, the KV-session tag table
+and the op matrix; and none of it told a *user* anything — there was no way to ask for a backend by
+name or to learn that a requested one did not exist.
 
-- `GraphAllocator` (`src/graph/alloc.rs`) held one field per backend
-  (`cpu: CpuBackend`, `metal: Option<MetalBackend>`, `cuda: Option<CudaBackend>`)
-  and dispatched **twelve** operations to it through `match backend { … }`:
-  `alloc_buffer`, `alloc_fresh`, `free_buffer`, `pool_len`, `weights_bytes`,
-  `write_host`, `write_host_window`, `read_host`/`copy_to_host`, `synchronize`,
-  `copy_cells`, the KV element format and the lazy `enable` of a session's pool.
-- `BackendScheduler::execute` (`src/graph/scheduler.rs`) matched to pick the
-  pool that executes a node, and again to read a node's output back for the
-  `MINFER_TRACE`/viz capture path.
-- The fusion-pass wiring in `models/qwen2/graph.rs`, `models/qwen3/graph.rs` and
-  `graph/json.rs` built a `Vec<&dyn Backend>` **by hand** and mapped a node's
-  backend to an index in that vector with a match whose CUDA arm was
-  `cuda_idx = backends.iter().position(|b| b.name() == "cuda")` — a lookup that
-  existed only because the `match` could not express "whichever device is
-  present".
-
-Adding a backend therefore meant editing the allocator, the scheduler, the
-fusion wiring, the JSON/DOT exporters, the KV-session tag table and the op
-matrix — the enum was a shape every consumer had to be taught. None of that
-told a *user* anything either: there was no way to ask for a backend by name,
-and no way to find out that a requested one did not exist.
+That argument is a decision, and it is frozen in [ADR-0001](adr/0001-inference-runs-through-one-declarative-compute-graph.md)
+(one device seam, build-time assignment) and [ADR-0011](adr/0011-backend-ids-are-append-only.md)
+(the id space and the name surface). This page keeps the *shape* that replaced it — the handle, the
+registered set, the ordering rule and the refusals.
 
 ## 2. The handle: `Backend(u16)`
 
