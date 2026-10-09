@@ -37,14 +37,24 @@ sections, every ADR listed below, and `Superseded by` written from *both* ends.
 
 ## Index
 
+**Ordered by `Date:`**, because a number is a citation and a date is the chronology. Backfilled
+ADRs are numbered in the order they were written, so a lower number does not imply an earlier
+decision — see the numbering rule above.
+
 | # | Date | Decision | Status |
 |---|---|---|---|
+| [0007](./0007-no-ml-frameworks-every-operator-is-hand-written.md) | 2026-06-24 | No ML frameworks: every operator is hand-written | Accepted |
+| [0008](./0008-gpu-safety-bounded-waits-and-runtime-limits.md) | 2026-08-02 | GPU safety: bounded waits, no early return past a barrier, runtime device limits | Accepted |
+| [0009](./0009-a-failure-is-an-error-never-a-silent-fallback.md) | 2026-08-17 | A failure is an error, never a silent fallback | Accepted |
 | [0001](./0001-inference-runs-through-one-declarative-compute-graph.md) | 2026-08-21 | Inference runs through one declarative compute graph | Accepted |
 | [0002](./0002-topology-is-a-function-of-graph-params.md) | 2026-08-21 | Topology is a function of `GraphParams` alone, so `positions` cannot be structure | Accepted |
+| [0010](./0010-the-identity-gate-bitwise-by-default.md) | 2026-08-28 | The identity gate: bitwise by default, a named tolerance class otherwise | Accepted |
 | [0003](./0003-metal-is-out-of-scope-for-this-round.md) | 2026-09-16 | Metal is out of scope for this round | Superseded by ADR-0005 |
 | [0004](./0004-the-batching-default-follows-the-device.md) | 2026-09-19 | The batching default follows the device | Accepted |
 | [0005](./0005-metal-becomes-a-first-class-backend.md) | 2026-09-20 | Metal becomes a first-class backend | Accepted (supersedes ADR-0003) |
+| [0011](./0011-backend-ids-are-append-only.md) | 2026-09-24 | Backend ids are a file-format contract: appended, never renumbered | Accepted |
 | [0006](./0006-kv-format-is-a-per-engine-gate.md) | 2026-09-25 | The KV storage format is a per-engine gate, not a process-wide global | Accepted |
+| [0012](./0012-device-first-layering-and-no-premature-common.md) | 2026-10-04 | Device is the first axis, the layer the second — and no premature `common` | Accepted |
 
 ## The template
 
