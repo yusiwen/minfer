@@ -178,7 +178,7 @@
 | `kernel_mul_mm<...>` | simdgroup/tensor matmul (64×32 tile, §3.2 variants) | `ggml-src/metal/kernels/` (template + instantiations) | `src/metal/kernels/mul_mm.metal` (kernel_q4_0_mm_f32) and 7 more mm kernels |
 | `kernel_mul_mv_*` | mat-vec (decode, per quant type) | `ggml-src/metal/kernels/fa_decode.metal` (q4_0), `:8498` (q4_K), etc. | `src/metal/kernels/` `*_f32_matmul` kernels |
 | `kernel_mul_mv_ext_*` | small-batch (ne11∈[2,8]) mat-mv | `ggml-src/metal/kernels/fa_prefill.metal` | "N/A" |
-| `kernel_flash_attn_ext_kv_f16` | **quantized KV → f16 dequant pre-pass** (Q4_0/1, Q5_0/1, Q8_0) | `ggml-src/metal/kernels/` | "N/A" (minfer KV stores f32/f16 raw, `MINFER_CACHE_TYPE=f16`) |
+| `kernel_flash_attn_ext_kv_f16` | **quantized KV → f16 dequant pre-pass** (Q4_0/1, Q5_0/1, Q8_0) | `ggml-src/metal/kernels/` | "N/A" (minfer KV stores f32/f16 raw, `MINFER_CACHE_TYPE=f16`; a packed Q8_0 cache is also stored, and mechanism B is the analogous per-window dequant stage — not llama's `kv_f16` variant) |
 | `kernel_flash_attn_ext_pad` | pad pre-pass for partial KV blocks | `ggml-src/metal/kernels/` | `src/metal/kernels/: kernel_kv_tail_pad` (equivalent) |
 | `kernel_flash_attn_ext_blk` | mask pre-pass (nqptg/ncpsg blocks) | `ggml-src/metal/kernels/` | inline causal mask (`kernel_flash_attn_blk_f32`) |
 | `kernel_flash_attn_ext` / `_impl` | flash attention main kernel (half8x8) | `ggml-src/metal/kernels/,7184` | `src/metal/kernels/: kernel_flash_attn_blk_f32` |
@@ -319,8 +319,8 @@ threads, 8192 B smem) (see minfer `docs/METAL_OPTIMIZATIONS.md §3.6`).
    per-layer dispatch-count difference in decode/prefill.
 4. **KV format**: llama defaults f16 + optional quantized KV (since #27390, a
    `kv_f16` dequant pass); minfer auto-selects f16 for the 7B class / f32 for small models (#37,
-   `MINFER_CACHE_TYPE=f16/f32` overrides), and since C4 also has a **packed Q8_0** cache — CPU
-   only so far, `MINFER_CACHE_TYPE=q8_0`; Metal refuses it until [#87](https://github.com/yusiwen/minfer/issues/87).
+   `MINFER_CACHE_TYPE=f16/f32` overrides), and since C4 also has a **packed Q8_0** cache — CUDA since
+   C4 S2b, Metal since [#310](https://github.com/yusiwen/minfer/issues/310), `MINFER_CACHE_TYPE=q8_0`.
 5. **Multi-CB**: llama 2-CB concurrent encode; minfer single CB all layers.
    Measured (minfer §3.6): llama's 2-CB split is **slower** in a pure-GEMM
    replay — not a speed source.
