@@ -45,7 +45,10 @@ fn f141_f16_weights_run_on_the_cuda_device() {
             eprintln!("no CUDA device; skipping the #141 device gate");
             return;
         }
-        let Some(path) = env_path("MINFER_F141_F16_GGUF", "/tmp/f141-work/minfer-f16.gguf") else {
+        let Some(path) = env_path(
+            "MINFER_F141_F16_GGUF",
+            "~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f16.gguf",
+        ) else {
             return;
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("f16 GGUF parses");

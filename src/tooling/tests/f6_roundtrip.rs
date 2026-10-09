@@ -11,7 +11,7 @@ use super::*;
 /// every tensor payload is byte-identical, and logits after a 4-token greedy
 /// continuation are `assert_eq!`-identical (a *bitwise* claim).
 #[test]
-#[ignore = "requires a cached 0.5B GGUF and writes ~0.5 GB under /tmp/f6-work"]
+#[ignore = "requires the cached 0.5B GGUF and writes ~0.5 GB of scratch under /tmp/f6-work"]
 fn f6_rewriting_a_gguf_is_bitwise_and_metadata_equivalent() {
     let src = env_path(
         "MINFER_F6_ROUNDTRIP_MODEL",
@@ -65,9 +65,12 @@ fn f6_rewriting_a_gguf_is_bitwise_and_metadata_equivalent() {
 /// tokenizer/template gates accept it, and logits from the two files are
 /// bitwise identical under minfer.
 #[test]
-#[ignore = "requires the HF checkpoint and a llama.cpp-converted reference under /tmp/f6-work"]
+#[ignore = "requires the HF checkpoint from ~/.cache/minfer/f6-src/ and a llama.cpp-converted reference"]
 fn f6_hf_conversion_matches_the_llamacpp_reference() {
-    let Some(hf_dir) = env_path("MINFER_F6_HF_DIR", "/tmp/f6-work/hf-src") else {
+    let Some(hf_dir) = env_path(
+        "MINFER_F6_HF_DIR",
+        "~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct",
+    ) else {
         return;
     };
     let Some(ref_gguf) = env_path("MINFER_F6_LLAMACPP_GGUF", "/tmp/f6-work/ref-f16.gguf") else {
@@ -119,7 +122,7 @@ fn f6_hf_conversion_matches_the_llamacpp_reference() {
 /// G3: the split file's merged index is exactly the single-file index and
 /// the logits are bitwise identical after a re-load.
 #[test]
-#[ignore = "requires a cached 0.5B GGUF and writes ~0.5 GB under /tmp/f6-work"]
+#[ignore = "requires the cached 0.5B GGUF and writes ~0.5 GB of scratch under /tmp/f6-work"]
 fn f6_split_merged_index_and_logits_match_the_single_file() {
     let Some(src) = env_path("MINFER_F6_SPLIT_MODEL", &cached_qwen05().to_string_lossy()) else {
         return;

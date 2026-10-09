@@ -59,7 +59,8 @@ fn f208_metal_greedy(
 /// has no bf16 encoder, so the F6 writer is the only producer).
 ///
 /// `$MINFER_F208_BF16_GGUF` points at a **ready** file and skips the conversion;
-/// otherwise the cached HF checkpoint is converted into `/tmp/f6-work/f208/`. The
+/// otherwise the cached HF checkpoint is converted into the scratch dir
+/// `/tmp/f6-work/f208/`. The
 /// helper skips loudly (naming the path) when neither exists, the same shape as
 /// `env_path` in the parent module.
 #[cfg(target_os = "macos")]
