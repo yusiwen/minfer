@@ -82,6 +82,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md) | 2026-10-09 | A defect in a frozen ADR is corrected by a new ADR, not by editing it | Accepted (corrected by ADR-0023) |
 | [0023](./0023-the-machine-ledgers-live-beside-their-checkers.md) | 2026-10-09 | Each machine ledger lives beside its checker, one per prose target | Accepted |
 | [0024](./0024-a-machine-read-record-is-not-book-content.md) | 2026-10-09 | A machine-read record is not book content | Accepted |
+| [0025](./0025-a-docs-only-change-skips-the-compilers.md) | 2026-10-09 | A docs-only change runs the docs gate, not the compilers | Accepted |
 
 ## The template
 
