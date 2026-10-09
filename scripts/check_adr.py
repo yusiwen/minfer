@@ -67,6 +67,7 @@ class Adr:
         sm = STATUS.match(self.status)
         self.superseded_by = sm.group(2) if (sm and sm.group(2)) else None
         self.supersedes = REF.findall(self.fields.get("supersedes", ""))
+        self.corrects = REF.findall(self.fields.get("corrects", ""))
 
 
 def read(path: Path) -> str:
@@ -161,6 +162,7 @@ def check(root: Path) -> int:
 
     # the index lists every ADR, and renumbers nothing that does not exist
     index = adr_dir / "README.md"
+    itext = ""
     if not index.is_file():
         problems.append("docs/adr/README.md: missing — the corpus needs an index")
     else:
@@ -179,6 +181,25 @@ def check(root: Path) -> int:
                 "docs/SUMMARY.md: does not reference `./adr/README.md` — an index outside the "
                 "book is an index nobody reads"
             )
+
+    # a correction is forward-only and visible from the corrected ADR's index row
+    for adr in adrs:
+        rel = adr.path.relative_to(root)
+        for cor in adr.corrects:
+            target = seen.get(cor)
+            if target is None:
+                problems.append(f"{rel}: Corrects ADR-{cor}, which does not exist")
+                continue
+            if cor >= (adr.file_number or ""):
+                problems.append(f"{rel}: Corrects ADR-{cor} must be a *lower* number")
+            row = next((line for line in itext.split("\n") if target.name in line), None)
+            if row is None:
+                problems.append(f"{rel}: corrects ADR-{cor}, but its index row is missing")
+            elif f"ADR-{adr.file_number}" not in row:
+                problems.append(
+                    f"{rel}: corrects ADR-{cor}, whose index row must name it back with "
+                    f"`ADR-{adr.file_number}` — a correction is visible from both ends"
+                )
 
     if problems:
         for p in problems:
@@ -294,6 +315,35 @@ def selftest() -> int:
         root = Path(tmp)
         _fixture(root, {"0001-first-decision.md": FIXTURE_ADR.replace("## Consequences", "## Notes")})
         expect("a missing required section fails", check(root) == 1)
+
+    corrected_row = ("| [0001](./0001-first-decision.md) | 2026-01-01 | The first decision | "
+                     "Accepted (corrected by ADR-0002) |")
+    plain_row = "| [0001](./0001-first-decision.md) | 2026-01-01 | The first decision | Accepted |"
+    second_row = "| [0002](./0002-second.md) | 2026-01-02 | Second | Accepted |\n"
+
+    def two_adr(corrects: str, index_row: str = plain_row) -> tuple[dict[str, str], str]:
+        second = (FIXTURE_ADR.replace("# 0001.", "# 0002.").replace("0001-first", "0002-second")
+                  .replace("- Status: Accepted", f"- Status: Accepted\n- Corrects: {corrects}"))
+        return ({"0001-first-decision.md": FIXTURE_ADR, "0002-second.md": second},
+                FIXTURE_README.replace(plain_row, index_row) + second_row)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        adrs, readme = two_adr("ADR-0001", corrected_row)
+        _fixture(root, adrs, readme=readme)
+        expect("a two-way Corrects link passes", check(root) == 0)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        adrs, readme = two_adr("ADR-0001")          # index row does not name the corrector
+        _fixture(root, adrs, readme=readme)
+        expect("a Corrects link the index row does not name back fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        adrs, readme = two_adr("ADR-0009", corrected_row)   # no such target
+        _fixture(root, adrs, readme=readme)
+        expect("a Corrects target that does not exist fails", check(root) == 1)
 
     failed = 0
     for name, ok, note in cases:

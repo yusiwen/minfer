@@ -15,14 +15,25 @@ has exactly one home:
 | The current contract: capabilities, file formats, semantics | the design doc (`docs/KV-CACHE-DESIGN.md`, `docs/COMPUTE-GRAPH-DESIGN.md`, …), which links `Decision: ADR-NNNN` | Yes |
 | Measurements, suite counts, per-ticket history | `docs/status.toml`, `docs/TEST-BASELINES.md`, `docs/ARCHITECTURE-EXECUTION-PLAN.md` | Yes |
 
-**An ADR never says "currently supports X" and never carries a test count.** Those rot, and the ADR's
-entire value is that it does not. `docs/status.toml` is the machine source for counts.
+Two rules keep it that way. Both are about **kind**, not about banning a form:
 
-Two consequences worth stating outright:
+- **A capability is a dated consequence, never a present-tense claim.** "At the `Date:` above, #310
+  enabled X" is allowed; "X is now true" is not — that is the sentence that rots. The authority for
+  what is true *today* is the design doc and `docs/SUPPORT-MATRIX.md`, which are mutable.
+- **A number may be evidence, never a baseline.** A count that is part of an argument — the rejected
+  alternative's failures, a named boundary — is frozen with the ADR and belongs in it. A *current*
+  suite baseline belongs in `docs/TEST-BASELINES.md` and `docs/status.toml`, which are
+  machine-checked. An ADR that quotes today's suite result is a bug.
+
+Three consequences worth stating outright:
 
 - **Superseding is additive.** Correcting a decision means writing a new ADR and setting the old
   one's `Status` to `Superseded by ADR-NNNN`. The old text is never edited — the record of what we
   believed, and why, is the useful part.
+- **Corrections are additive too.** A defect in a frozen ADR's *text* is corrected by a new ADR
+  carrying `- Corrects: ADR-NNNN`, and the corrected ADR's row below names the corrector — both ends,
+  enforced by `check_adr.py`. The old text is never edited. See
+  [ADR-0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md).
 - **Numbers are citations.** They are dense from `0001`, never reused, never renumbered. A number
   is assigned once, in the order decisions are established when their ADR is written, and the
   `Date:` field carries the date the decision was actually *taken*. Because most of this corpus is
@@ -33,7 +44,8 @@ Two consequences worth stating outright:
 
 `scripts/check_adr.py` (CI job `check-docs`) enforces the mechanically checkable half: filename and
 heading agree, dense numbering, one of four `Status` values, a `YYYY-MM-DD` date, the required
-sections, every ADR listed below, and `Superseded by` written from *both* ends.
+sections, every ADR listed below, `Superseded by` written from *both* ends, and a `Corrects:` target
+that exists, is lower-numbered and is named on its own index row.
 
 ## Index
 
@@ -46,13 +58,13 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0007](./0007-no-ml-frameworks-every-operator-is-hand-written.md) | 2026-06-24 | No ML frameworks: every operator is hand-written | Accepted |
 | [0013](./0013-cpu-quantizes-activations-device-reads-f32.md) | 2026-06-24 | The CPU quantizes activations to `Q8_0`; a device reads f32 | Accepted |
 | [0008](./0008-gpu-safety-bounded-waits-and-runtime-limits.md) | 2026-08-02 | GPU safety: bounded waits, no early return past a barrier, runtime device limits | Accepted |
-| [0001](./0001-inference-runs-through-one-declarative-compute-graph.md) | 2026-08-21 | Inference runs through one declarative compute graph | Accepted |
+| [0001](./0001-inference-runs-through-one-declarative-compute-graph.md) | 2026-08-21 | Inference runs through one declarative compute graph | Accepted (citation corrected by ADR-0022) |
 | [0002](./0002-topology-is-a-function-of-graph-params.md) | 2026-08-21 | Topology is a function of `GraphParams` alone, so `positions` cannot be structure | Accepted |
 | [0009](./0009-a-failure-is-an-error-never-a-silent-fallback.md) | 2026-08-21 | A failure is an error, never a silent fallback | Accepted |
-| [0010](./0010-the-identity-gate-bitwise-by-default.md) | 2026-08-28 | The identity gate: bitwise by default, a named tolerance class otherwise | Accepted |
+| [0010](./0010-the-identity-gate-bitwise-by-default.md) | 2026-08-28 | The identity gate: bitwise by default, a named tolerance class otherwise | Accepted (citation corrected by ADR-0022) |
 | [0003](./0003-metal-is-out-of-scope-for-this-round.md) | 2026-09-16 | Metal is out of scope for this round | Superseded by ADR-0005 |
 | [0004](./0004-the-batching-default-follows-the-device.md) | 2026-09-19 | The batching default follows the device | Accepted |
-| [0005](./0005-metal-becomes-a-first-class-backend.md) | 2026-09-20 | Metal becomes a first-class backend | Accepted (supersedes ADR-0003) |
+| [0005](./0005-metal-becomes-a-first-class-backend.md) | 2026-09-20 | Metal becomes a first-class backend | Accepted (supersedes ADR-0003; corrected by ADR-0022) |
 | [0014](./0014-a-kv-session-is-a-versioned-file.md) | 2026-09-22 | A KV session is a versioned, checksummed file — never a memory dump | Accepted |
 | [0015](./0015-the-offload-auto-fit-takes-a-prefix.md) | 2026-09-23 | The offload `auto` fit takes a prefix, not a knapsack | Accepted |
 | [0011](./0011-backend-ids-are-append-only.md) | 2026-09-24 | Backend ids are a file-format contract: appended, never renumbered | Accepted |
@@ -64,6 +76,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0020](./0020-a-quantized-file-is-byte-identical-or-wrong.md) | 2026-09-27 | A quantized file is byte-identical to `llama-quantize`, or it is wrong | Accepted |
 | [0021](./0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) | 2026-09-27 | bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32 | Accepted |
 | [0012](./0012-device-first-layering-and-no-premature-common.md) | 2026-10-04 | Device is the first axis, the layer the second — and no premature `common` | Accepted |
+| [0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md) | 2026-10-09 | A defect in a frozen ADR is corrected by a new ADR, not by editing it | Accepted |
 
 ## The template
 
@@ -74,6 +87,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 - Date: YYYY-MM-DD
 - Issues: #NN, #NN            (optional)
 - Supersedes: ADR-NNNN        (required when this ADR replaces one)
+- Corrects: ADR-NNNN          (when this ADR corrects an earlier one's text; see ADR-0022)
 
 ## Context
 
