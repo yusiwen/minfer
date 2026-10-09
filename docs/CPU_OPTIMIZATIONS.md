@@ -395,7 +395,7 @@ bitwise, not merely close.
 **Difficulty:** Medium.
 
 **Current state:** the KV store is the graph allocator's persistent regions, whose width is the
-per-engine `KvFormat` (`graph/kvformat.rs`; f16/q8_0 supported on CPU + CUDA, f32 default —
+per-engine `KvFormat` (`graph/kvformat.rs`; f16 on the GPU backends, packed `q8_0` on CPU + CUDA + Metal ([#310](https://github.com/yusiwen/minfer/issues/310)), f32 default —
 `MINFER_CACHE_TYPE`). The pre-graph `src/cache.rs` `Vec<f32>` this line used to name was deleted in
 [#252](https://github.com/yusiwen/minfer/issues/252).
 
