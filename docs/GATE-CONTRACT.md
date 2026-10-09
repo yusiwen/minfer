@@ -261,8 +261,8 @@ label) and `x86_64 (CI runner)` (GitHub's runner). A newly used machine gets its
 that matters for the counts — and its own `[[counts]]` rows; a suffix or a
 re-used label would make two machines' numbers indistinguishable. The label is
 part of the machine-checked identity: it is the `box` field in
-[`docs/status.toml`](./status.toml) and the `--box` argument of
-`scripts/check_status.py --check-live`, so a rename must move both the manifest
+[`scripts/test-baselines.toml`](https://github.com/yusiwen/minfer/blob/master/scripts/test-baselines.toml) and the `--box` argument of
+`scripts/check_baselines.py --check-live`, so a rename must move both the manifest
 and the prose in the same commit. A box whose name has no manifest row fails
 `--check-live` loudly, which is deliberate: a fabricated box must not pass
 vacuously.
@@ -519,10 +519,15 @@ the body through `env:`, so it needs no token and works on a fork PR ([#175],
 
 Moved here from `AGENTS.md`, which keeps the two-line pointer.
 
-**Doc status is machine-checked.** `docs/status.toml` is the source of truth for the plan's phase
-counters / `next:` sentence / baseline commits and for the suite counts in [`TEST-BASELINES.md`](./TEST-BASELINES.md);
-`scripts/check_status.py --check` (CI `check-docs`) fails when the prose disagrees, naming the file,
-line and both values — edit *that* file, not a counter. The same job runs `scripts/build_book.sh`
+**Doc status is machine-checked.** Two ledgers, each beside the checker that reads it
+(ADR-0023): [`scripts/status.toml`](https://github.com/yusiwen/minfer/blob/master/scripts/status.toml)
+is the source of truth for the plan's phase counters / `next:` sentence / baseline commits, and
+[`scripts/test-baselines.toml`](https://github.com/yusiwen/minfer/blob/master/scripts/test-baselines.toml)
+for the suite counts in [`TEST-BASELINES.md`](./TEST-BASELINES.md). `scripts/check_status.py --check`
+and `scripts/check_baselines.py --check` (CI `check-docs`) fail when the prose disagrees, naming the
+file, line and both values — edit the ledger, not a counter. The suite ledger's one live-checkable row
+is compared against the real `cargo test` log by `scripts/check_baselines.py --check-live` in
+`test-linux-cpu`. The same job runs `scripts/build_book.sh`
 (pinned mdBook + a sha384-checked Mermaid download) and `scripts/check_docs_links.py`, which fails on
 a relative link whose target does not exist, and `scripts/check_doc_line_anchors.py` (#266), which
 fails on a `path:NNN` anchor whose file or line is gone — and, when the anchor names a backticked

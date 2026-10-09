@@ -28,10 +28,11 @@ deliverables, acceptance criteria and dependencies.
 53b3ace` (2026-10-06, the macOS/Metal round's final master); it is refreshed when a
 phase or round closes, not on every PR.
 **Derived facts:** the phase counters above, the `next:` sentence and the two commit
-ids are not hand-maintained prose — [`docs/status.toml`](./status.toml) is the source of
+ids are not hand-maintained prose — [`scripts/status.toml`](https://github.com/yusiwen/minfer/blob/master/scripts/status.toml) is the source of
 truth, and `scripts/check_status.py --check` (CI job `check-docs`) fails when this block
 disagrees with it, naming the file, the line and both values. Edit the source, not the
-counter. The same checker reads `AGENTS.md`'s suite counts: `--check-live` compares the
+counter. The suite counts are the sibling ledger `scripts/test-baselines.toml`, read by
+`scripts/check_baselines.py`: its `--check-live` compares the
 one CI-verifiable box against the `test-linux-cpu` log, while the CUDA / real-model /
 sanitizer rows are labelled *recorded measurements* because CI has no GPU. The
 per-ticket ✔ marks in the §11 diagram are **not** derivable from `(done, total)` and are

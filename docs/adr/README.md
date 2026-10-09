@@ -13,7 +13,8 @@ has exactly one home:
 |---|---|---|
 | The decision, the alternatives considered, the accepted consequences | `docs/adr/NNNN-*.md` | **No** — a change is a *new* ADR plus `Superseded by` on the old one |
 | The current contract: capabilities, file formats, semantics | the design doc (`docs/KV-CACHE-DESIGN.md`, `docs/COMPUTE-GRAPH-DESIGN.md`, …), which links `Decision: ADR-NNNN` | Yes |
-| Measurements, suite counts, per-ticket history | `docs/status.toml`, `docs/TEST-BASELINES.md`, `docs/ARCHITECTURE-EXECUTION-PLAN.md` | Yes |
+| Measurements, suite counts, per-ticket history | `scripts/test-baselines.toml`, `docs/TEST-BASELINES.md`, `docs/ARCHITECTURE-EXECUTION-PLAN.md` | Yes |
+| The plan's phase counters, `next:` sentence and baseline commits | `scripts/status.toml`, `docs/ARCHITECTURE-EXECUTION-PLAN.md` | Yes |
 
 Two rules keep it that way. Both are about **kind**, not about banning a form:
 
@@ -22,7 +23,8 @@ Two rules keep it that way. Both are about **kind**, not about banning a form:
   what is true *today* is the design doc and `docs/SUPPORT-MATRIX.md`, which are mutable.
 - **A number may be evidence, never a baseline.** A count that is part of an argument — the rejected
   alternative's failures, a named boundary — is frozen with the ADR and belongs in it. A *current*
-  suite baseline belongs in `docs/TEST-BASELINES.md` and `docs/status.toml`, which are
+  suite baseline belongs in `docs/TEST-BASELINES.md` and its ledger
+  `scripts/test-baselines.toml`, which are
   machine-checked. An ADR that quotes today's suite result is a bug.
 
 Three consequences worth stating outright:
@@ -76,7 +78,8 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0020](./0020-a-quantized-file-is-byte-identical-or-wrong.md) | 2026-09-27 | A quantized file is byte-identical to `llama-quantize`, or it is wrong | Accepted |
 | [0021](./0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) | 2026-09-27 | bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32 | Accepted |
 | [0012](./0012-device-first-layering-and-no-premature-common.md) | 2026-10-04 | Device is the first axis, the layer the second — and no premature `common` | Accepted |
-| [0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md) | 2026-10-09 | A defect in a frozen ADR is corrected by a new ADR, not by editing it | Accepted |
+| [0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md) | 2026-10-09 | A defect in a frozen ADR is corrected by a new ADR, not by editing it | Accepted (corrected by ADR-0023) |
+| [0023](./0023-the-machine-ledgers-live-beside-their-checkers.md) | 2026-10-09 | Each machine ledger lives beside its checker, one per prose target | Accepted |
 
 ## The template
 
