@@ -724,7 +724,7 @@ The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — i
 AGENTS rule 5 (`AGENTS.md:117` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
 sentences: a per-node host readback inside a split whose command buffer was
 still open read *stale* (not-yet-written) data, which surfaced as an all-zero
-KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:977-979` (§7 "In-place execution and the aliasing rule") , the §7.3
+KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:974-976` (§7 "In-place execution and the aliasing rule") , the §7.3
 "In-place execution and the aliasing rule" hard rule). The fix
 was not "sync more" but structural — the in-place aliasing rule plus a single
 sanctioned copy point at split boundaries — so the bug class has nowhere to
@@ -854,7 +854,7 @@ actual values `execute_node_inner` (`cuda_backend.rs:916`). AGENTS states the co
 silent CPU fallback; backend assignment is decided at build time"
 (`AGENTS.md:107` ("GPU Safety", the Err-never-fallback contract)); TECH-PRIMER §7 repeats it
 (`docs/CUDA-TECH-PRIMER.md:312-314` (§7 "Synchronization discipline (GPU Safety, `docs/GP")); the design record states
-the rule (`docs/COMPUTE-GRAPH-DESIGN.md:1105-1107` (§9.2 "Eligibility") ); the assignment walkthrough gives the
+the rule (`docs/COMPUTE-GRAPH-DESIGN.md:1102-1104` (§9.2 "Eligibility") ); the assignment walkthrough gives the
 reason — a quiet fallback would mask the bug the guard exists to catch
 (`docs/inference_e2e_walkthrough/06-assign-fusion.md:111-112`).
 
