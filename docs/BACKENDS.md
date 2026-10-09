@@ -10,7 +10,7 @@ execute, `docs/COMPUTE-GRAPH-DESIGN.md`) on three interchangeable backends:
 | Platform | any | macOS (Apple GPU) | NVIDIA, **opt-in** `--features cuda` |
 | Assign priority | last (always answers) | first on macOS | second, when built in |
 | Activations | quantized to Q8_0 (Q8_K for K-quant weights) | read as f32 | f32; int8 MMQ for prefill |
-| KV cache | f32 regions, or packed Q8_0 (`MINFER_CACHE_TYPE=q8_0` — C4, 3.76× smaller) | f32, f16 or packed Q8_0 (C4 S2b, [#310](https://github.com/yusiwen/minfer/issues/310)) | f32 or f16 |
+| KV cache | f32 regions, or packed Q8_0 (`MINFER_CACHE_TYPE=q8_0` — C4, 3.76× smaller) | f32, f16 or packed Q8_0 (C4 S2b, [#310](https://github.com/yusiwen/minfer/issues/310)) | f32, f16 or packed Q8_0 (C4 S2b) |
 | Async model | synchronous | one `MpsCommandBuffer` per split | stream + CUDA Graph capture/replay |
 | Deep dives | [walkthrough 10](./inference_e2e_walkthrough/10-cpu-matmul-kernels.md), [11](./inference_e2e_walkthrough/11-attention-vecops-kv.md), [CPU optimizations](./CPU_OPTIMIZATIONS.md) | [walkthrough 14](./inference_e2e_walkthrough/14-metal-backend.md), [Metal optimizations](./METAL_OPTIMIZATIONS.md) | [walkthrough 15](./inference_e2e_walkthrough/15-cuda-backend.md), [backend plan](./CUDA-BACKEND-DESIGN.md), [campaign](./CUDA_OPTIMIZATION.md) |
 
