@@ -8,9 +8,12 @@ use super::*;
 /// G4: quantizing the converted f16 model to q8_0 produces a file that
 /// loads, runs, and stays within a stated bound of the f16 source.
 #[test]
-#[ignore = "requires the converted f16 GGUF under /tmp/f6-work"]
+#[ignore = "requires the converted f16 GGUF from ~/.cache/minfer/f6-src/"]
 fn f6_quantize_end_to_end_stays_within_the_stated_bound() {
-    let Some(src) = env_path("MINFER_F6_F16_GGUF", "/tmp/f6-work/minfer-f16.gguf") else {
+    let Some(src) = env_path(
+        "MINFER_F6_F16_GGUF",
+        "~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f16.gguf",
+    ) else {
         return;
     };
     let dir = work_dir("quant");
@@ -153,7 +156,7 @@ fn logits_greedy_any(
 /// exercise the engine's K-quant decode path on *every* 2-D tensor, rather
 /// than on the 0.5B's 24 tensors that are not demoted.
 #[test]
-#[ignore = "requires an f16 GGUF and writes ~0.5 GB under /tmp/f6-work"]
+#[ignore = "requires an f16 GGUF from ~/.cache/minfer/f6-src/ and writes ~0.5 GB of scratch under /tmp/f6-work"]
 fn f6_k_quant_output_runs_within_the_stated_bound() {
     let Some(src) = env_path(
         "MINFER_F6_F16_GGUF",

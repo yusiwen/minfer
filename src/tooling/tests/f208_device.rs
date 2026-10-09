@@ -241,7 +241,8 @@ fn f208_bf16_weights_run_on_the_cuda_device() {
 /// encoder in `minfer quantize`, so the F6 writer is the only producer).
 ///
 /// `$MINFER_F208_BF16_GGUF` points at a **ready** file and skips the conversion;
-/// otherwise the cached HF checkpoint is converted into `/tmp/f6-work/f208/`.
+/// otherwise the cached HF checkpoint is converted into the scratch dir
+/// `/tmp/f6-work/f208/`.
 /// The gate skips **loudly** (an `eprintln` naming the path) when neither
 /// exists, the same shape as `env_path` in the parent module.
 #[cfg(feature = "cuda")]

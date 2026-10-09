@@ -42,7 +42,10 @@ fn f167_f16_qwen3_weights_run_on_the_cuda_device() {
             eprintln!("no CUDA device; skipping the #167 f16 Qwen3 gate");
             return;
         }
-        let Some(path) = env_path("MINFER_F167_F16_GGUF", "/tmp/f167-work/qwen3-f16.gguf") else {
+        let Some(path) = env_path(
+            "MINFER_F167_F16_GGUF",
+            "~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf",
+        ) else {
             return;
         };
         let gguf = crate::gguf::load_gguf_model(&path).expect("f16 GGUF parses");

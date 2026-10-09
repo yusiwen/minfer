@@ -12,11 +12,11 @@
 //! ```text
 //! ./target/release/minfer quantize \
 //!   ~/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf \
-//!   /tmp/f164-work/minfer-f16.gguf --type f16
+//!   ~/.cache/minfer/f6-src/f164/minfer-f16.gguf --type f16
 //! ```
 //!
 //! and the Qwen3 fixture identically from the cached Qwen3-0.6B Q8_0
-//! (`Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` -> `/tmp/f164-work/qwen3-f16.gguf`).
+//! (`Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` -> `~/.cache/minfer/f6-src/f164/qwen3-f16.gguf`).
 //! `minfer quantize --type f16` keeps 1-D tensors f32 and writes 2-D f16, which
 //! is the file contract the kernels read. Override the path with
 //! `MINFER_F164_F16_GGUF` / `MINFER_F164_QWEN3_F16_GGUF`.
@@ -228,7 +228,7 @@ fn f164_run(env_key: &str, default: &str, ns: &str, n_ctx: usize, steps: usize) 
 fn f164_f16_weights_run_on_the_metal_device() {
     f164_run(
         "MINFER_F164_F16_GGUF",
-        "/tmp/f164-work/minfer-f16.gguf",
+        "~/.cache/minfer/f6-src/f164/minfer-f16.gguf",
         "f164:",
         512,
         4,
@@ -242,7 +242,7 @@ fn f164_f16_weights_run_on_the_metal_device() {
 fn f164_f16_weights_run_on_the_metal_device_qwen3() {
     f164_run(
         "MINFER_F164_QWEN3_F16_GGUF",
-        "/tmp/f164-work/qwen3-f16.gguf",
+        "~/.cache/minfer/f6-src/f164/qwen3-f16.gguf",
         "f164q3:",
         512,
         4,
