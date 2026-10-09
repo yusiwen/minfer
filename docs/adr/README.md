@@ -36,7 +36,8 @@ Three consequences worth stating outright:
 - **Corrections are additive too.** A defect in a frozen ADR's *text* is corrected by a new ADR
   carrying `- Corrects: ADR-NNNN`, and the corrected ADR's row below names the corrector — both ends,
   enforced by `check_adr.py`. The old text is never edited. See
-  [ADR-0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md).
+  [ADR-0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md) (three citations at once) and
+  [ADR-0026](./0026-the-classifier-carries-no-docs-path-exception.md) (a path a follow-through had moved).
 - **Numbers are citations.** They are dense from `0001`, never reused, never renumbered. A number
   is assigned once, in the order decisions are established when their ADR is written, and the
   `Date:` field carries the date the decision was actually *taken*. Because most of this corpus is
@@ -82,7 +83,8 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md) | 2026-10-09 | A defect in a frozen ADR is corrected by a new ADR, not by editing it | Accepted (corrected by ADR-0023) |
 | [0023](./0023-the-machine-ledgers-live-beside-their-checkers.md) | 2026-10-09 | Each machine ledger lives beside its checker, one per prose target | Accepted |
 | [0024](./0024-a-machine-read-record-is-not-book-content.md) | 2026-10-09 | A machine-read record is not book content | Accepted |
-| [0025](./0025-a-docs-only-change-skips-the-compilers.md) | 2026-10-09 | A docs-only change runs the docs gate, not the compilers | Accepted |
+| [0025](./0025-a-docs-only-change-skips-the-compilers.md) | 2026-10-09 | A docs-only change runs the docs gate, not the compilers | Accepted (corrected by ADR-0026) |
+| [0026](./0026-the-classifier-carries-no-docs-path-exception.md) | 2026-10-10 | The classifier carries no docs-path exception, and its list is ratcheted | Accepted |
 
 ## The template
 
