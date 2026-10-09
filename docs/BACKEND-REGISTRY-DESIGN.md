@@ -653,3 +653,8 @@ cargo test --release --bin minfer async_cross_copies_never_block_and_stay_bitwis
 
 [#300]: https://github.com/yusiwen/minfer/issues/300
 
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0001](adr/0001-inference-runs-through-one-declarative-compute-graph.md) — Inference runs through one declarative compute graph
+- [ADR-0011](adr/0011-backend-ids-are-append-only.md) — Backend ids are a file-format contract: appended, never renumbered

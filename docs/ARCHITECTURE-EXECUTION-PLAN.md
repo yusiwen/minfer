@@ -57,8 +57,8 @@ greedy 0.5B stopping on EOG within 16 tokens) instead of the engine's rule that 
 
 | Decision | Consequence for this plan |
 |---|---|
-| **Metal is out of scope this round.** | No ticket here edits `src/graph/metal_backend.rs`, `src/metal.rs` or `src/metal.metal`. Every phase records what it defers into **Phase G (Metal alignment)**. |
-| **Dead reuse-identity fields: option (a), then (c).** | A7 deleted `CParams.n_batch`; E2 then **deleted** `GraphParams.n_seqs` too — item 3 landed and showed the sequence count is data, not topology (A7 closed, rationale in §8). |
+| **Metal is out of scope this round** — **superseded**: [ADR-0005](adr/0005-metal-becomes-a-first-class-backend.md) reversed it on 2026-09-20 and Phase G is **complete (7/7)**. | Recorded as [ADR-0003](adr/0003-metal-is-out-of-scope-for-this-round.md); no ticket here needs the old "defer to Phase G" marking any more. |
+| **Dead reuse-identity fields: option (a), then (c)** — the decision is [ADR-0002](adr/0002-topology-is-a-function-of-graph-params.md). | A7 deleted `CParams.n_batch`; E2 then **deleted** `GraphParams.n_seqs` too — item 3 landed and showed the sequence count is data, not topology (A7 closed, rationale in §8). |
 | **Phase A (A0–A8) is complete** (2026-09-16, PR #1); **Phase B (B1–B3) is complete** (2026-09-16, PR #1); **Phase C's C1 and C2 are complete** (2026-09-16, PR #2); **E1 and its CUDA half (E1b) are complete** (2026-09-17, PR #3) — E1b was compile-verified and SASS-checked then, and is **device-verified** since 2026-09-18 (see its record); **E2 landed and is closed** (2026-09-17, PR #4; **re-measured on the GPU 2026-09-18**): mechanism in, A7 closed by deleting `n_seqs`, acceptance **refuted on CPU (0.49x) and met on GPU (1.9x)** — the sign of the effect is a property of the device. **The CUDA device is available from 2026-09-18** (A0 superseded); E1b's windowed attention is device-verified and its causal path is timing-neutral, and the A1 matrix's CUDA column now runs on hardware. | The next work is **C3 + D1 increment 3** (the explicit cell-copy op C3 needs, and multi-output nodes — also the MoE/MLA prerequisite), then **C4/C5**; **E6 settled the batching default** (device-aware: batches iff the model runs on CUDA or — since [#44](https://github.com/yusiwen/minfer/issues/44) part (b), 2026-10-06 — Metal, off on CPU, `MINFER_BATCH=0/1` to force either way), and **§14 row 0 closed the GPU-batching correctness blocker** behind it (the f16 windowed FA prefill mask, fixed 2026-09-19); a CPU `nt>1` decode kernel (F1 family) remains the only CPU route to the throughput claim; Phases D–G remain planned. |
 
 ## 1. Standing rules
@@ -68,20 +68,20 @@ own invariants rather than inventing new ones.
 
 1. **Params-only reuse.** Anything that changes graph topology must join
    `GraphParams` / `CParams` and be compared in `GraphCache::params_match`
-   (`src/graph/cache.rs:57-64`); `n_past` never enters the identity.
+   (`src/graph/cache.rs:57-64`); `n_past` never enters the identity. Decision: [ADR-0002](adr/0002-topology-is-a-function-of-graph-params.md).
 2. **No silent fallback.** A kernel-invariant violation returns `Err` from
-   `execute_node` with the actual values; assignment is decided at build time.
+   `execute_node` with the actual values; assignment is decided at build time. Decision: [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md).
 3. **Identity gate.** Any change to a kernel or an execution path is A/B'd
    against the existing path. Bitwise-identical is the default bar; where that
    is impossible, the ticket must name the tolerance class and its cause
-   (the project's existing example: `nt ≤ 8` bitwise, `nt = 9` tolerance-class).
+   (the project's existing example: `nt ≤ 8` bitwise, `nt = 9` tolerance-class). Decision: [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md).
 4. **GPU safety.** Bounded waits, status checks, device limits queried at
-   runtime, no hardcoded device constants.
+   runtime, no hardcoded device constants. Decision: [ADR-0008](adr/0008-gpu-safety-bounded-waits-and-runtime-limits.md).
 5. **Index docs move with the code.** `README.md`, `AGENTS.md`,
    `docs/SUPPORT-MATRIX.md` and `docs/ARCHITECTURE-ROADMAP.md` are updated in
    the same commit as the change they describe.
-6. **Deferred-Metal marking.** A ticket whose cross-backend design changes
-   Metal's behaviour must add a Phase G line *in the same commit*.
+6. **Deferred-Metal marking — retired.** A ticket whose cross-backend design changed
+   Metal had to add a Phase G line in the same commit. Metal is in scope since [ADR-0005](adr/0005-metal-becomes-a-first-class-backend.md) (2026-09-20), so the rule has no subject.
 
 ## 2. Verification matrix (what dgxspark can prove)
 

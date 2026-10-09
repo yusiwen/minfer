@@ -597,3 +597,8 @@ answer from the PR, not as property tests.
 [#356]: https://github.com/yusiwen/minfer/issues/356
 [#371]: https://github.com/yusiwen/minfer/issues/371
 [PR #343]: https://github.com/yusiwen/minfer/pull/343
+
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) — The identity gate: bitwise by default, a named tolerance class otherwise

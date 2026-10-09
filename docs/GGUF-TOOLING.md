@@ -946,3 +946,9 @@ minfer split /tmp/model-q4_0.gguf /tmp/rewrite --max-size 4G   # one part -> a p
 ## Multi-part GGUF files (moved from `AGENTS.md`)
 
 Multi-part GGUF: written by `minfer split` (F6) as `{stem}-NNNNN-of-MMMMM.gguf` with `split.no`/`split.count`/`split.tensors.count`; entry is part 0, all parts parsed into one merged tensor index (part order preserved), and download resume is size-checked (`download::check_downloaded_size` refuses a wrong-length file and removes it).
+
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0020](adr/0020-a-quantized-file-is-byte-identical-or-wrong.md) — A quantized file is byte-identical to `llama-quantize`, or it is wrong
+- [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32

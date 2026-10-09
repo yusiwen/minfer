@@ -346,3 +346,9 @@ step-by-step guide. In brief:
 
 Architectures that share Qwen2's tensor naming convention (LLaMA, Mistral, Phi)
 should be relatively straightforward to port.
+
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32
+- [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32

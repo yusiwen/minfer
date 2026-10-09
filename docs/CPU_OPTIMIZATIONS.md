@@ -763,3 +763,8 @@ The CPU path went from **1.1 tok/s decode (single-threaded scalar) to
   is the main thread's serial work (quantize, dispatch, attention), not a
   kernel problem; the attention-parallelization and NEON quantize closed most
   of it.
+
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32

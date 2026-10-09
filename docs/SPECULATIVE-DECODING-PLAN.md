@@ -184,3 +184,8 @@ Net: the closure rested on a real 0.52× measurement but a miscalibrated bar
 and a void anchor. Doc 82 fixed the underlying dispatch hole (0.52× → 2.14×),
 the corrected batteries showed the strategy wins on GB10, and the campaign
 reopens as D5-R.
+
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0017](adr/0017-speculative-decoding-refuses-what-it-cannot-carry.md) — Speculative decoding refuses the features its identity contract cannot carry
