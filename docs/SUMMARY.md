@@ -158,6 +158,7 @@
 # Testing
 
 - [The gate contract](./GATE-CONTRACT.md)
+- [Test baselines — the recorded suite measurements](./TEST-BASELINES.md)
 
 # Reference
 
