@@ -7020,32 +7020,36 @@ sets as the aarch64 column, so no `arch` field was needed and the manifest neede
 `check-docs` printed `annotation shapes clean (11 grandfathered bare site(s))`, the Layer-1
 selftest's `14 cases pass` and the oracle's `strip, item and capture cases pass`.
 
-**The manifest (`docs/dead-code-baseline.toml`).** 45 `[[cpu]]` + 34 `[[cuda]]` entries, each
-`name` / `kind` / `file` / `reason`, plus the top-level marker `macos = "unjudged"` — the
-documented spelling for a configuration with **no recorded measurement yet** ([#332]). Only a
-config whose spec sets `unjudgeable` may carry it: `cpu`/`cuda` are machine-checked in CI, so the
-marker there would silently disable a gate and is refused; `macos` is an on-demand Mac run. A
-marked config is reported as *unjudged*, never as a pass. The update rule is
-written into the file: an addition is a decision — make the item live, delete it, or add the entry
-**in the same PR** with a one-line reason — and the checker prints the entry to paste; a removal
-is informational. `--print-toml` regenerates the block (reusing the existing reasons), and
-`--selftest` pins the strip, the item derivation and the capture parser in `check-docs`, so
-regression in the strip is caught without cargo.
+**The manifest (`docs/dead-code-baseline.toml`).** 45 `[[cpu]]` + 34 `[[cuda]]` + **42 `[[macos]]`**
+entries, each `name` / `kind` / `file` / `reason`. The macOS section is a **measured** set since
+2026-10-09, run on a Mac (#332's Mac half); the macOS set is the CPU set **minus**
+`QueryFailed`/`Reported`/`allows_weight`, which macOS makes live, so each `[[macos]]` entry reuses
+its `[[cpu]]` twin's reason (see the manifest header). The `"unjudged"` spelling still exists for a
+config with **no recorded measurement yet** ([#332]), and only a config whose spec sets
+`unjudgeable` may carry it: `cpu`/`cuda` are machine-checked in CI, so the marker there would
+silently disable a gate and is refused; `macos` is an on-demand Mac run and no longer carries it.
+The update rule is written into the file: an addition is a decision — make the item live, delete it,
+or add the entry **in the same PR** with a one-line reason — and the checker prints the entry to
+paste; a removal is informational. `--print-toml` regenerates the block (reusing the existing
+reasons), and `--selftest` pins the strip, the item derivation and the capture parser in `check-docs`,
+so regression in the strip is caught without cargo.
 
-**The blind spots, written into the manifest rather than discovered later.** (1) macOS is not
-compiled on Linux: a macOS-only module is invisible, and a cross-platform item whose only caller
-sits in a `#[cfg(target_os = "macos")]` **test** block *looks* dead here while it is live there —
-`ModelDef::forward_graph` is exactly that case, and its reason names the test
-  (`models::qwen2::graph::tests::graph_metal_matches_cpu_logits`). `build-macos` compiles the test
-target since [#303](https://github.com/yusiwen/minfer/issues/303) (`cargo test --release --no-run`),
-so a macOS-only *test* reference is compiled there; what the Linux oracle still cannot do is *run*
-on a macOS module, so the manifest records the marker and the two `src/metal.rs` sites stay with
-[#255]. Since [#332] the oracle carries the `macos` configuration (the plain `cargo check
---release`, refused on a non-Mac host) and `--print-toml` seeds its `[[macos]]` section, so the
-blind spot now closes by **running it on a Mac**: the marker is replaced by the judged set (or by a
-count with its date and box label), not left `unjudged` by default. (2) The
-oracle is a `cargo check`: “live” is a compile-time reference, not runtime reachability. (3)
-`--features debug_dump` and `cuda_static` are not covered.
+**The blind spots, written into the manifest rather than discovered later.** (1) macOS was **judged
+on 2026-10-09** (#332's Mac half), so the old blind spot is closed. The run is the plain `cargo
+check --release` with every annotation stripped, on a Mac, where the `#[cfg(target_os = "macos")]`
+modules are compiled: it reports **42 items** and **no** dead item under `src/metal/` or
+`src/graph/metal_backend*` — the evidence [#255]'s two dispositions rest on (the `MpsState`
+container blanket is deleted and `matmul_on_gpu_buf` is `#[cfg(test)]`). The macOS set is the CPU
+set **minus** `QueryFailed`/`Reported`/`allows_weight`, which macOS makes live, so the `[[macos]]`
+section mirrors the `[[cpu]]` reasons. The cross-platform half of the blind spot stays visible in
+the data: `ModelDef::forward_graph` is dead in the non-test check and its reason names the
+`#[cfg(target_os = "macos")]` test
+(`models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits`) that keeps it live in
+the macOS test build. `build-macos` compiles the test target since
+[#303](https://github.com/yusiwen/minfer/issues/303) (`cargo test --release --no-run`); the oracle
+itself is still an on-demand Mac run, not a CI job. (2) The oracle is a `cargo check`: “live” is a
+compile-time reference, not runtime reachability. (3) `--features debug_dump` and `cuda_static` are
+not covered.
 
 **Fixture evidence — both layers can fail.** Layer 1: appending a bare
 `#[allow(dead_code)] fn layer1_bare_allow_probe() {}` to a scratch copy makes
@@ -7087,6 +7091,54 @@ is caught the next time the oracle runs, not by Layer 1; that division of labour
 
 [#227]: https://github.com/yusiwen/minfer/issues/227
 [PR #258]: https://github.com/yusiwen/minfer/pull/258
+
+#### Test-infrastructure record (#332, 2026-10-09) — the macOS dead-code set, judged on a Mac
+
+**The ticket.** [#332] is the macOS half of the dead-code ratchet: [#254]'s stripped oracle carried
+only `cpu` (the `test-linux-cpu` job) and `cuda` (`build-linux-cuda`), so no oracle configuration
+compiled a macOS-only module and the manifest recorded a `macos = "unjudged"` marker instead of a
+verdict. The Linux half landed first (`4188a72`, PR [#424]): the checker gained a `macos`
+configuration (the plain `cargo check --release`, refused by name on a non-Mac host, covered by
+`--selftest`) and the schema accepted an `unjudgeable` config's marker. This record is the Mac-side
+half: the marker replaced by the measured set.
+
+**The run.** Box `macbook (macOS 27.0.1, Apple M4 Pro)` (hostname `macbookpro-ysw`), 2026-10-09,
+`python3 scripts/check_dead_code_oracle.py --config macos --print-toml`: **40** annotations
+stripped, **29** `dead_code` diagnostics, **53** `src/` spans (the sites), **42** items. Seeded into
+`docs/dead-code-baseline.toml` as `[[macos]]`, the re-run reports `42 entry/entries — 0
+addition(s), 0 removal(s); PASS`.
+
+**What the Mac run found.** The macOS set is exactly the CPU set **minus** three items, each live on
+macOS for a host reason rather than a feature one: `Reported`/`QueryFailed` (`graph/allocplan.rs`)
+are constructed by `MpsState::device_memory` — whose
+`#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]` is therefore redundant on macOS,
+as its doc comment already says — and `allows_weight` (`graph/offload.rs`) is called by both loaders
+under `#[cfg(any(target_os = "macos", feature = "cuda"))]`, so the `offload` module's
+`#[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))]` applies no blanket
+there. Every one of the 42 is **D4** (keep, with a reason): the set is the test-only/deferred
+vocabulary the CPU section had already judged, and each reason is platform-neutral, so the
+`[[macos]]` entries mirror them. The run reports **no** dead item under `src/metal/` or
+`src/graph/metal_backend*`, which is the positive evidence [#255]'s two dispositions rest on: the
+container-level `impl MpsState` blanket was correctly deleted (loaders, `main.rs`,
+`graph/metal_backend.rs` and `get_or_grow`/`cmd_buffer` read all ten members) and
+`matmul_on_gpu_buf` is `#[cfg(test)]`.
+
+**`ModelDef::forward_graph` (the known cross-platform case).** It appears in the macOS **non-test**
+set — its `#[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]`
+(`src/models/mod.rs`) reduces to an allow in a non-test macOS build — and its reason names its one
+caller, the `#[cfg(target_os = "macos")]` test
+`models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits`. In the macOS **test**
+build the same cfg applies no allow, so the method is live there; that is why the verdict is **D4**
+(keep the annotation), not D1/D3. The three `forward_graph` reasons (the `[[cpu]]`, `[[cuda]]` and
+`[[macos]]` rows) now spell the full `real_model::` test path.
+
+**Properties.** No source annotation changed (no D1/D2/D3 verdict), so no test count moves; the diff
+is the manifest, its header and this record. `--config cpu` and `--config cuda` are untouched, so
+the Linux CI jobs are unaffected. `macos` remains an **on-demand** run, not a CI job (`build-macos`
+compiles the test target only).
+
+[#332]: https://github.com/yusiwen/minfer/issues/332
+[PR #424]: https://github.com/yusiwen/minfer/pull/424
 
 #### Test-infrastructure record (#252, 2026-10-02) — the legacy `KVCache` and `ModelDef::forward`'s `&mut KVCache` parameter are deleted
 

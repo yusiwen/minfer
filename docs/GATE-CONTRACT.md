@@ -77,10 +77,13 @@ liveness by stripping every `allow(dead_code)` and reading rustc; on Linux it ca
 say nothing about a `#[cfg(target_os = "macos")]` module, and a run that reported
 "0 additions" there would be read as coverage of code it never compiled. The
 checker therefore carries the platform as an explicit configuration (`--config
-macos`), refuses it by name on a non-Mac host, and records the unrun half in the
-manifest as `macos = "unjudged"` — a verdict *absent*, never a pass. The list of
-configurations is part of a gate's claim: adding one is how a blind spot closes,
-and marking it unjudged is how it stays visible until someone runs it.
+macos`), refuses it by name on a non-Mac host, and records the state in the
+manifest: `macos = "unjudged"` while no measurement exists — a verdict *absent*,
+never a pass — and, since it was **run on a Mac 2026-10-09** (`macbook (macOS
+27.0.1, Apple M4 Pro)`, 42 items, 0 additions after seeding the set), the judged
+`[[macos]]` section instead. The list of configurations is part of a gate's claim:
+adding one is how a blind spot closes, and the marker is how a not-yet-run one
+stays visible until someone runs it.
 
 ## 2. A control arm must differ in the property under test
 
@@ -543,6 +546,7 @@ answer from the PR, not as property tests.
 [#299]: https://github.com/yusiwen/minfer/issues/299
 [#303]: https://github.com/yusiwen/minfer/issues/303
 [#329]: https://github.com/yusiwen/minfer/issues/329
+[#332]: https://github.com/yusiwen/minfer/issues/332
 [#335]: https://github.com/yusiwen/minfer/issues/335
 [#336]: https://github.com/yusiwen/minfer/issues/336
 [#367]: https://github.com/yusiwen/minfer/issues/367
