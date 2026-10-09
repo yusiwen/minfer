@@ -54,10 +54,13 @@ gate](https://github.com/yusiwen/minfer/issues/154) checks its own robustness.
 crate: `cargo test --release --no-run` on the Linux CPU job (implicitly), `cargo test --release
 --features cuda --no-run` on the CUDA job and `cargo test --release --no-run` on `build-macos`
 ([#303](https://github.com/yusiwen/minfer/issues/303)) — `cargo build` does not compile
-`#[cfg(test)]`, and a macOS-only test module was invisible for eleven days because of it. Since the KV storage format became **per engine**
+`#[cfg(test)]`, and a macOS-only test module was invisible for eleven days because of it. Those
+three jobs are skipped when the change classifier finds no code change (ADR-0025): a docs-only
+change runs the doc gates instead, and the suite still runs whenever the suite ledger moves. Since the KV storage format became **per engine**
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
 longer makes one gate size another gate's KV regions. The current counts live in
-`AGENTS.md` (each with its date, device and command). Four fixes now make the
+[`TEST-BASELINES.md`](./TEST-BASELINES.md) and its ledger `scripts/test-baselines.toml`, each
+record dated, box-labelled and command-labelled. Four fixes now make the
 parallel form trustworthy: the [server batching
 gate](https://github.com/yusiwen/minfer/issues/154) (interleaved matched rounds,
 a median verdict), [#158](https://github.com/yusiwen/minfer/issues/158) (a work
