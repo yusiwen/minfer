@@ -127,9 +127,9 @@ and the struct is `unsafe impl Send/Sync` on that basis.
   otherwise; f16 measured ~3% slower on the 0.5B, dispatch-latency-bound). The answer is stored on
   `MetalBackend` as `kv_format`, stamped through `GraphAllocator::set_kv_format`, and passed as an
   explicit `f16` argument to every store/attention/fused decode. There is **no** process-wide
-  Metal tag any more: the old `metal::KV_F16` `OnceLock`, `kv_cache_is_f16` and `set_kv_cache_type`
-  were deleted in #44 part (b), so two engines with different dims can hold different layouts in
-  one process. A third value, `q8_0`, is the packed cache the CPU, CUDA and Metal kernels read;
+  Metal tag any more ([ADR-0005](adr/0005-metal-becomes-a-first-class-backend.md),
+  [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md)): two engines with different dims hold
+  different layouts in one process. A third value, `q8_0`, is the packed cache the CPU, CUDA and Metal kernels read;
   Metal's packed path is **enabled** ([#310](https://github.com/yusiwen/minfer/issues/310)):
   `READS_PACKED_KV` is `true`, two read mechanisms cover every shape (mechanism A native packed
   decode, mechanism B an f32 staging window for the fast prefill/window families), and the classic
@@ -1059,5 +1059,13 @@ left the macOS test binary uncompilable until `4add59f` (2026-10-05) with no CI 
 ## Decisions governing this document
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0001](adr/0001-inference-runs-through-one-declarative-compute-graph.md) — Inference runs through one declarative compute graph
+- [ADR-0002](adr/0002-topology-is-a-function-of-graph-params.md) — Topology is a function of `GraphParams` alone, so `positions` cannot be structure
 - [ADR-0005](adr/0005-metal-becomes-a-first-class-backend.md) — Metal becomes a first-class backend
+- [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — The KV storage format is a per-engine gate, not a process-wide global
 - [ADR-0008](adr/0008-gpu-safety-bounded-waits-and-runtime-limits.md) — GPU safety: bounded waits, no early return past a barrier, runtime device limits
+- [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md) — A failure is an error, never a silent fallback
+- [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) — The identity gate: bitwise by default, a named tolerance class otherwise
+- [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32
+- [ADR-0014](adr/0014-a-kv-session-is-a-versioned-file.md) — A KV session is a versioned, checksummed file — never a memory dump
+- [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32
