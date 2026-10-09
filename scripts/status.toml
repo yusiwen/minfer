@@ -1,0 +1,122 @@
+# scripts/status.toml — the machine-readable source of truth for the plan's prose.
+#
+# The plan's phase counters and its `next:` sentence, and its baseline /
+# `refreshed against` commit ids, are **derived facts**: they are written here and
+# `python3 scripts/check_status.py --check` (CI job `check-docs`) fails when the
+# prose disagrees with this file, naming the file, the line and both values. Edit
+# *this* file, not a counter.
+#
+# The suite counts are **not** here. They live in `scripts/test-baselines.toml`,
+# whose prose target is `docs/TEST-BASELINES.md` and whose one live consumer is the
+# `test-linux-cpu` job; this file's only target is the execution plan. The split,
+# and why each ledger sits beside its checker, are recorded in
+# `docs/adr/0023-the-machine-ledgers-live-beside-their-checkers.md`.
+#
+# Each prose target carries its own `file` + `regex` and the checker holds no
+# second copy of any value. A regex compares only the named groups it captures.
+# `kind` declares which half this file is: the checker refuses a file whose kind
+# is not `plan`, and requires the sections `plan` implies.
+
+schema = 1
+kind = "plan"
+
+# The commit the plan's status block was first baselined against, and the master
+# commit this status was last refreshed against. Both must be ancestors of HEAD.
+# The second is bumped when a phase or round closes, not on every PR — which is
+# what the plan's prose promised while the value sat at f663750 for 190 commits.
+baseline_commit = "f32daa7"
+refreshed_against = "53b3ace"
+
+# The one honest `next:` sentence. It replaced a stale one that still called
+# E4/E5 upcoming years after they landed (issue #94), and a later one that read
+# "F1 (needs x86)": accurate and useless at once, because the project's two
+# boxes are dgxspark (aarch64) and macbook (macOS) and the x86_64 CI runner
+# cannot host interactive work (#335). It now names a lane that can start on
+# each box; F1's hardware wait is recorded in the plan's §9 table, its §11
+# sequencing diagram and its §14 hardware row, where a reader of the plan sees
+# it. #56 landed F1's AVX2/AVX-512 K-quant dots on an x86 host (2026-10-08), so
+# the `next:` clause now names only the remaining weight-repacking increment. The
+# value is compared *literally* against the plan's `Next: ….**` sentence, so the
+# two must be edited together. The macOS round-2 plan ([#333]) closed 2026-10-09 —
+# every §A ticket landed and the §B debt was measured, decided or filed — so the
+# sentence no longer names a Mac lane; the residual fixture work is [#428].
+#
+# [#333]: https://github.com/yusiwen/minfer/issues/333
+# [#428]: https://github.com/yusiwen/minfer/issues/428
+next = "the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121), beginning with #428's three fixture producers, and F1's weight-repacking increment, which still wants an x86 host"
+
+# --- prose locations for the three scalars ----------------------------------
+
+[prose.baseline_commit]
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'HEAD = (?P<value>[0-9a-f]{7,40})'
+
+[prose.refreshed_against]
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'master =\s*(?P<value>[0-9a-f]{7,40})'
+
+[prose.next]
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Next: (?P<value>[^\n]+?)\.\*\*'
+
+# --- phase counters ---------------------------------------------------------
+# `done`/`total` are the preamble's `(done/total)`; `state` is its completion
+# word. Phase G is **complete** (7/7, 2026-10-06); the rows past G7 are the gaps
+# the round found while executing it.
+
+[[phase]]
+id = "A"
+done = 9
+total = 9
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase A\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "B"
+done = 3
+total = 3
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase B\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "C"
+done = 8
+total = 8
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase C\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "D"
+done = 3
+total = 3
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase D\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "E"
+done = 7
+total = 7
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase E\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "F"
+done = 7
+total = 8
+state = "in progress"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase F\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
+[[phase]]
+id = "G"
+done = 7
+total = 7
+state = "complete"
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = 'Phase G\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
+
