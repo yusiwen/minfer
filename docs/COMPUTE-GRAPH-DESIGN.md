@@ -1602,3 +1602,11 @@ figure dates from Phase 1 — later rows of the ledger record larger suites (80/
 for the CUDA phases). Run `cargo test --release` for the current number; a bare
 `cargo test --release` does not compile the CUDA backend unless `--features cuda` is passed.
 
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0001](adr/0001-inference-runs-through-one-declarative-compute-graph.md) — Inference runs through one declarative compute graph
+- [ADR-0002](adr/0002-topology-is-a-function-of-graph-params.md) — Topology is a function of `GraphParams` alone, so `positions` cannot be structure
+- [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md) — A failure is an error, never a silent fallback
+- [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) — The identity gate: bitwise by default, a named tolerance class otherwise
+- [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32

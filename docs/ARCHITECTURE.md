@@ -560,3 +560,9 @@ selected an f16 GPU cache (opt-in).
    `vec_ops::`, `cache::`.
 5. Implement `ModelDef` in `mod.rs`.
 6. Add a chat template format in `template.rs` if needed.
+
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0001](adr/0001-inference-runs-through-one-declarative-compute-graph.md) — Inference runs through one declarative compute graph
+- [ADR-0012](adr/0012-device-first-layering-and-no-premature-common.md) — Device is the first axis, the layer the second — and no premature `common`

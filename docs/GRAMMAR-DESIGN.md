@@ -381,3 +381,8 @@ covered by unit tests:
 
 The measured acceptance (both models, greedy, seed 42) is in
 `docs/ARCHITECTURE-EXECUTION-PLAN.md`'s F2 record.
+
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0018](adr/0018-the-grammar-mask-is-one-pipeline-stage.md) — The grammar mask is one stage inside the single sampler pipeline

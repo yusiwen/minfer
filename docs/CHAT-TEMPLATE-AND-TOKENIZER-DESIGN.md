@@ -238,3 +238,8 @@ Two of them changed the implementation and one the reference:
 
 Each new gate is mutation-checked (break the implementation, watch the gate
 fail, revert) and the mutation result is recorded in the PR.
+
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0019](adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md) — A chat template that cannot be rendered refuses the load

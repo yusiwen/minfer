@@ -1056,3 +1056,8 @@ left the macOS test binary uncompilable until `4add59f` (2026-10-05) with no CI 
 - **Cleanup candidates**: the `#[allow(dead_code)]` legacy block/comments in `src/metal/`, and adding a
   Metal gate diagnostic to match CUDA's `CUDA GATE:` line (§6 #6/#7).
 
+## Decisions governing this document
+
+This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0005](adr/0005-metal-becomes-a-first-class-backend.md) — Metal becomes a first-class backend
+- [ADR-0008](adr/0008-gpu-safety-bounded-waits-and-runtime-limits.md) — GPU safety: bounded waits, no early return past a barrier, runtime device limits
