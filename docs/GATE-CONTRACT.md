@@ -544,7 +544,7 @@ file's old→new lines, and fails an anchor the range moved without re-pointing 
 `doc:line (bare continuation) → target:old (now new)`. A cited line the range *deleted* has no image in the map, so it is
 reported for a human instead of guessed, and the same `FROZEN` set exempts the same records. It named
 **73** anchors over #299's range, the 69 its re-point commit fixed plus 4 it missed. It also runs
-`scripts/check_f6_fixtures.py` (#205), which checks the shape of the F6 fixture manifest `docs/f6-fixtures.json`,
+`scripts/check_f6_fixtures.py` (#205), which checks the shape of the F6 fixture manifest `tests/fixtures/f6-fixtures.json`,
 cross-checks every `~/.cache/minfer/f6-src/…` fixture the source tree names against it (and every `.gguf` path a
 recorded producer command names), pins each command's shape and classifies it with `--regenerate --dry-run`
 (#345 re-runs one and re-records what it produced), and whose `--selftest` proves a tampered copy is refused by

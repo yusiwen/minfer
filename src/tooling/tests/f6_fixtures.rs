@@ -5,7 +5,7 @@
 //! target. Both are inputs the gates do not produce, so a stale or replaced
 //! reference used to be compared against silently and the gate stayed green.
 //!
-//! `docs/f6-fixtures.json` is the record (path, bytes, sha256 or a recorded
+//! `tests/fixtures/f6-fixtures.json` is the record (path, bytes, sha256 or a recorded
 //! prefix, the exact producer command, the producer's identity, date and an
 //! absolute box label). `scripts/check_f6_fixtures.py` audits the manifest's
 //! structure and the whole cache; this module is the half that matters inside a
@@ -65,7 +65,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// The checked-in record. `CARGO_MANIFEST_DIR` keeps it correct from a worktree.
-const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/f6-fixtures.json");
+const MANIFEST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/f6-fixtures.json"
+);
 
 /// The record's own relocation (issue #354), the manifest-side twin of
 /// [`CACHE_ENV`]: the path this reader loads instead of [`MANIFEST`], so a test

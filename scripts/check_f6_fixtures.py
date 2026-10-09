@@ -7,7 +7,7 @@ reference per target. Those files are inputs the gates do not produce, so until
 this checker nothing noticed when the cache held *something else*: a stale or
 replaced reference was compared against silently and the gate stayed green.
 
-``docs/f6-fixtures.json`` is the record: one entry per **artifact content
+``tests/fixtures/f6-fixtures.json`` is the record: one entry per **artifact content
 identity** — ``path``, ``bytes``, ``sha256`` (or a recorded ``sha256_prefix``
 where the 2026-10-07 table truncated it), the exact ``producer`` command, the
 producer's identity (``minfer_commit`` for a minfer-produced file, or
@@ -167,7 +167,7 @@ import tempfile
 from pathlib import Path
 
 #: The checked-in manifest, relative to the repository root.
-MANIFEST = "docs/f6-fixtures.json"
+MANIFEST = "tests/fixtures/f6-fixtures.json"
 
 #: The manifest's own relocation (issue #354), the manifest-side twin of the
 #: cache override below: it selects which record is audited. ``--manifest`` wins
@@ -244,7 +244,7 @@ UNRECORDED = re.compile(r"unrecord|not recorded|unknown", re.I)
 def resolve_manifest(arg: str | None, env: str | None, root: Path) -> tuple[Path, str, list[str]]:
     """The manifest to audit, and where the choice came from (issue #354).
 
-    ``--manifest`` > ``MINFER_F6_MANIFEST`` > the tracked ``docs/f6-fixtures.json``.
+    ``--manifest`` > ``MINFER_F6_MANIFEST`` > the tracked ``tests/fixtures/f6-fixtures.json``.
     Returns ``(path, source, problems)`` with ``source`` one of ``"argv"``,
     ``"env"``, ``"default"``. An environment value that is set but blank is a
     usage problem, never a silent fall back to the tracked record: the whole point
@@ -582,7 +582,7 @@ def check_source_references(root: Path, doc: dict, problems: list[str]) -> None:
             if rel.endswith(".gguf"):
                 problems.append(
                     f"{f.relative_to(root)}: fixture {rel!r} is used by a gate but has no "
-                    "manifest entry (docs/f6-fixtures.json)"
+                    "manifest entry (tests/fixtures/f6-fixtures.json)"
                 )
             elif not any(k.startswith(rel + "/") for k in known):
                 problems.append(
