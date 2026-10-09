@@ -12,6 +12,12 @@
 # and why each ledger sits beside its checker, are recorded in
 # `docs/adr/0023-the-machine-ledgers-live-beside-their-checkers.md`.
 #
+# A change confined to this file needs no compile job: it is the classifier's
+# `plan` class (`scripts/classify_changes.py`), so all three code jobs skip it and
+# `check-docs` — which runs on every event — is the gate that validates it
+# (ADR-0025). The suite ledger is the `baselines` class instead, which keeps
+# `test-linux-cpu` running, because that job's `--check-live` reads it.
+#
 # Each prose target carries its own `file` + `regex` and the checker holds no
 # second copy of any value. A regex compares only the named groups it captures.
 # `kind` declares which half this file is: the checker refuses a file whose kind
