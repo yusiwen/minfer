@@ -43,7 +43,7 @@ The remaining work is at the **system layer**, and three items dominate it:
    those: C1/C2 the cell store and physical removal/shift, C3 the compaction — a
    pure planner, the counters, `Backend::copy_cells` on CPU and CUDA, the K re-rope
    a move needs while `positions` are cells, and a model-level continuation gate —
-   C4 the packed Q8_0 cache (CPU and CUDA) and C5 the session container. What is
+   C4 the packed Q8_0 cache (CPU, CUDA and Metal — the last in [#310](https://github.com/yusiwen/minfer/issues/310)) and C5 the session container. What is
    still open is driving the compaction from the server's serving model, which reserves every
    slot once and packed, the CUDA packed-decode residual's stall attribution ([#212](https://github.com/yusiwen/minfer/issues/212) —
    [#144](https://github.com/yusiwen/minfer/issues/144)/[#186](https://github.com/yusiwen/minfer/issues/186)/[#202](https://github.com/yusiwen/minfer/issues/202) landed the fused epilogue, the dp4a dot and the FA prefill), and Metal's

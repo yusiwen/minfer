@@ -9,7 +9,7 @@ directions, so a busy neighbour above the slot no longer blocks it); **C8** spli
 **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a
 block map and a gather in every attention kernel — S1a/S1b/S2/S3/S4/S5 landed, closed on
 CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4's fused
-dots and the CUDA/Metal kernels are [#87](https://github.com/yusiwen/minfer/issues/87);
+dots and the CUDA kernels are [#87](https://github.com/yusiwen/minfer/issues/87), Metal's packed read [#310](https://github.com/yusiwen/minfer/issues/310);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **complete** (3/3) (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
 **complete** (7/7) (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **in progress** (7/8) (F2, F3, **F4**, **F5**, **F6**, F7,
@@ -1123,7 +1123,7 @@ drift into a silent fallback:
 
 **Why it was not in the S2a increment.** ~10 kernel sites, 3 launchers, ~15 host sites and 41 test
 sites, each needing an nvcc iteration and — for the gates — a serial device run. It was recorded
-here rather than half-wired. [Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
+here rather than half-wired. [Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44) — since landed as [#310](https://github.com/yusiwen/minfer/issues/310).
 
 **What actually landed (2026-09-24).** The real counts are close to the estimate: **8 kernel
 sites**, **3 launchers** (`launch_gqa_attn_split_q8_0`, the layout-tagged `launch_gqa_attn_f32`,
@@ -1225,7 +1225,7 @@ Q8_0 region 1 671 168 B — **3.76x smaller than f32 and, against f16's actual 2
 **FA prefill on packed cells** — taken up as [#144](https://github.com/yusiwen/minfer/issues/144)
 and recorded in the next subsection (items 1 and 3 landed; item 2 then landed as
 [#186](https://github.com/yusiwen/minfer/issues/186) below, **DONE 2026-09-27**).
-[Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44).
+[Metal's half stays at G5](https://github.com/yusiwen/minfer/issues/44) — since landed as [#310](https://github.com/yusiwen/minfer/issues/310).
 
 ### C4 — #144: the packed fused decode epilogue and the packed FA prefill · [#144](https://github.com/yusiwen/minfer/issues/144) — **DONE (items 1 + 3) 2026-09-26**
 
