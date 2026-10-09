@@ -1,5 +1,7 @@
-# CI — seven jobs: one per backend that can be checked without a device, plus the
-# documentation gate, the viz gate, the workflow-lint gate and the PR-body gate.
+# CI — eight jobs: a change classifier, one job per backend that can be checked
+# without a device, plus the documentation gate, the viz gate, the workflow-lint
+# gate and the PR-body gate. The classifier (`changes`, #457) decides whether the
+# three code jobs run at all; the numbered list below still describes them.
 #
 # 1. test-linux-cpu   : the runtime net. Runs the whole unit suite (the
 #                       integration tests under tests/ need a GGUF model that is
@@ -114,13 +116,28 @@
 #                       It is also the one job that must keep running when the PR
 #                       body is *edited* — see the paragraph below.
 #
-# A `pull_request` `edited` event changes no code, but `types:` is workflow-level:
-# without a guard, fixing a typo in a PR body would re-run every job against an
-# unchanged tree. Jobs 1–6 therefore carry
-#   if: github.event_name != 'pull_request' || github.event.action != 'edited'
-# and report `skipped` on such an event, while check-pr-body (whose input *is* the
-# edited body) stays unconditional on `pull_request`. A push, `opened`,
-# `synchronize` and `reopened` still run every job exactly as before (#177).
+# Two triggers would otherwise waste a whole run, and both are handled by
+# *job-level* guards — never by `paths:` / `paths-ignore:`, which leaves a
+# workflow's required checks in `Pending` forever (a skipped *job* reports
+# `Success` instead, which is what makes the board green):
+#
+# 1. A `pull_request` `edited` event changes no code, but `types:` is
+#    workflow-level: without a guard, fixing a typo in a PR body would re-run every
+#    job against an unchanged tree. Jobs 1–7 therefore carry
+#      if: github.event_name != 'pull_request' || github.event.action != 'edited'
+#    and report `skipped` on such an event, while check-pr-body (whose input *is*
+#    the edited body) stays unconditional on `pull_request`. A push, `opened`,
+#    `synchronize` and `reopened` still run every job the classifier asks for
+#    (#177).
+# 2. A docs-only change does not need the crate compiled. `changes` runs
+#    `scripts/classify_changes.py` over the diff once, and the three code jobs add
+#    `needs.changes.outputs.rust == 'true'`; the suite job also runs when the suite
+#    ledger moved (`baselines == 'true'`, since its `--check-live` reads that file).
+#    The measurement behind it: over 13 runs on 2026-10-09, `build-linux-cuda` is
+#    12.3 min median and `build-macos` 1.9 — against `check-docs` 1.3 and
+#    `test-linux-cpu` 1.1 — while 104 of the last 200 non-merge commits changed
+#    documentation only (#457). `check-docs` and `check-pr-body` are never gated:
+#    the first *is* the docs gate, the second reads the PR body.
 #
 # `actions/checkout` is pinned to its Node.js 24 major (v5): the v4 line still
 # ships the Node.js 20 runtime, which GitHub now force-runs on 24 and reports as
@@ -135,13 +152,52 @@ on:
     branches: [master]
     # `edited` is what makes a body fix re-run the check: without it a PR whose
     # job failed on a missing section stays red after the section is filled in.
-    # The other six jobs carry an `if:` that makes an `edited` event a no-op for
+    # The other seven jobs carry an `if:` that makes an `edited` event a no-op for
     # them (#177): only check-pr-body reads the new body.
     types: [opened, synchronize, reopened, edited]
 
 jobs:
-  test-linux-cpu:
+  # The classifier for the three code jobs (#457). One job, one `git diff`, and the
+  # rest of the workflow reads its two outputs; a docs-only change therefore skips
+  # the builds without a path filter (the header says why that distinction is the
+  # whole point). It is the only place the diff is read.
+  changes:
     if: github.event_name != 'pull_request' || github.event.action != 'edited'
+    runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
+    outputs:
+      rust: ${{ steps.classify.outputs.rust }}
+      baselines: ${{ steps.classify.outputs.baselines }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The three-dot range needs the merge base, so the base branch must be
+          # present — the same `fetch-depth: 0` reason the doc job gives below.
+          fetch-depth: 0
+      - name: Classify the change
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          # A `pull_request` compares against the base branch (the classifier's own
+          # three-dot range takes the merge base); a push compares against `before`.
+          # The classifier treats the all-zero SHA git reports for a first push, an
+          # empty base, an empty diff and an unresolvable revision as "run
+          # everything", so a range it cannot read never skips a job.
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE="origin/$BASE_REF"
+          else
+            BASE="$BEFORE"
+          fi
+          python3 scripts/classify_changes.py --base "$BASE" --head "$SHA" >> "$GITHUB_OUTPUT"
+
+  test-linux-cpu:
+    needs: changes
+    if: >-
+      (github.event_name != 'pull_request' || github.event.action != 'edited')
+      && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.baselines == 'true')
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     steps:
       - uses: actions/checkout@v5
@@ -193,7 +249,10 @@ jobs:
   # `cargo build` alone silently skips them (that is how the A5 signature
   # change broke four CUDA test call sites without any local or CI signal).
   build-linux-cuda:
-    if: github.event_name != 'pull_request' || github.event.action != 'edited'
+    needs: changes
+    if: >-
+      (github.event_name != 'pull_request' || github.event.action != 'edited')
+      && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     container: nvidia/cuda:12.8.2-devel-ubuntu24.04
     steps:
@@ -223,7 +282,10 @@ jobs:
         run: python3 scripts/check_dead_code_oracle.py --config cuda
 
   build-macos:
-    if: github.event_name != 'pull_request' || github.event.action != 'edited'
+    needs: changes
+    if: >-
+      (github.event_name != 'pull_request' || github.event.action != 'edited')
+      && needs.changes.outputs.rust == 'true'
     runs-on: macos-14 # Apple Silicon (arm64)
     steps:
       - uses: actions/checkout@v5
