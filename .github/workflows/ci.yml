@@ -287,6 +287,14 @@ jobs:
         run: python3 scripts/check_agents_size.py
       - name: The AGENTS.md size ratchet's own pass/fail cases
         run: python3 scripts/check_agents_size.py --selftest
+      # The decision corpus (#439). An ADR is a frozen record: dense numbering from
+      # 0001 that is never reused, four allowed Status values, a two-way
+      # forward-only `Superseded` link, every ADR listed in the index, and the
+      # index a chapter of the book. A source audit needs no build.
+      - name: Every ADR must be numbered, dated and indexed
+        run: python3 scripts/check_adr.py
+      - name: The ADR checker's own pass/fail cases
+        run: python3 scripts/check_adr.py --selftest
       # #254 Layer 1: the shape of every `allow(dead_code)` — a bare annotation
       # is rejected (the 11 sites that predate the ratchet are grandfathered in
       # the script), a `cfg_attr` must name a cfg, and each annotation carries a

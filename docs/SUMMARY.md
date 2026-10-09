@@ -16,6 +16,10 @@
 - [Architecture Execution Plan](./ARCHITECTURE-EXECUTION-PLAN.md)
 - [Source Layout Plan](./SOURCE-LAYOUT-PLAN.md)
 
+# Decisions
+
+- [Architecture Decision Records — index](./adr/README.md)
+
 # Model Support
 
 - [Model Support Roadmap](./MODEL-SUPPORT-ROADMAP.md)
