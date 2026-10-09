@@ -15,7 +15,7 @@ has exactly one home:
 | The current contract: capabilities, file formats, semantics | the design doc (`docs/KV-CACHE-DESIGN.md`, `docs/COMPUTE-GRAPH-DESIGN.md`, …), which links `Decision: ADR-NNNN` | Yes |
 | Measurements, suite counts, per-ticket history | `scripts/test-baselines.toml`, `docs/TEST-BASELINES.md`, `docs/ARCHITECTURE-EXECUTION-PLAN.md` | Yes |
 | The plan's phase counters, `next:` sentence and baseline commits | `scripts/status.toml`, `docs/ARCHITECTURE-EXECUTION-PLAN.md` | Yes |
-| The recorded provenance of a fixture artifact | `tests/fixtures/f6-fixtures.json` (beside its readers, never in the book tree — ADR-0024) | Yes |
+| A machine-read record: fixture provenance, an accepted-annotation baseline | beside its readers, never in the book tree — `tests/fixtures/f6-fixtures.json`, `scripts/dead-code-baseline.toml` (ADR-0024) | Yes |
 
 Two rules keep it that way. Both are about **kind**, not about banning a form:
 

@@ -3,7 +3,7 @@
 
 Sibling of ``scripts/check_dead_code_oracle.py`` (Layer 2), which is the liveness
 half: it strips every annotation and compares rustc's own dead-code set against
-``docs/dead-code-baseline.toml``. This half is cheap — no build, no rustc — and
+``scripts/dead-code-baseline.toml``. This half is cheap — no build, no rustc — and
 **it checks the annotation's shape, not liveness.** It cannot see whether an item
 is really dead; it sees only that the annotation is spelled in a form whose
 meaning is checkable, and that a human wrote down *why*. Saying that plainly is

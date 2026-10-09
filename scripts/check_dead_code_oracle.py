@@ -21,7 +21,7 @@ than with a name census. This script productises that oracle:
    primary span undercounts by ~2.6× — and derive each item's ``(name, kind)``
    from the diagnostic's message (``fields `a`, `b` … are never read`` is two
    `field` items; ``variants `X`, `Y` …`` is two `variant` items).
-4. Compare the set against ``docs/dead-code-baseline.toml``. **An addition fails**
+4. Compare the set against ``scripts/dead-code-baseline.toml``. **An addition fails**
    and is printed with its file:line and a paste-ready manifest entry; a removal
    is informational (the manifest only needs to shrink when convenient). Renames
    and moves are invisible on purpose: the key is ``(name, kind)``, and the entry's
@@ -85,7 +85,7 @@ import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_BASELINE = REPO / "docs" / "dead-code-baseline.toml"
+DEFAULT_BASELINE = REPO / "scripts" / "dead-code-baseline.toml"
 
 #: The configurations the manifest carries. A config is not only a feature set:
 #:   * `features` — what cargo compiles. `None` is a plain `cargo check --release`.
