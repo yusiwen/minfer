@@ -17,8 +17,9 @@ notice:
 The boundary the corpus itself rests on is not checkable here and is stated in
 `docs/adr/README.md`: an ADR holds the decision and its rationale, never the
 current contract and never a measurement. Those live in the design docs (mutable)
-and in `docs/status.toml` (the machine source). A checker can force a shape, not a
-habit.
+and in the two machine ledgers `scripts/status.toml` (the plan's counters) and
+`scripts/test-baselines.toml` (the suite measurements), each beside its checker. A
+checker can force a shape, not a habit.
 
 Usage:
 
@@ -72,6 +73,23 @@ class Adr:
 
 def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def index_table_row(index_text: str, name: str) -> str | None:
+    """The index *table* row that links `name`, never a prose mention of it.
+
+    The row must start with `|`: the same file is also linked from the boundary
+    rule's prose, and looking for the first line that merely *names* it picked that
+    prose line instead of the row — so a corrector the prose happened to mention
+    looked recorded while the row still named nothing. Every row links its ADR as
+    `](./<name>)` or `](<name>)`.
+    """
+    for line in index_text.split("\n"):
+        if not line.lstrip().startswith("|"):
+            continue
+        if f"](./{name})" in line or f"]({name})" in line:
+            return line
+    return None
 
 
 def check(root: Path) -> int:
@@ -192,7 +210,7 @@ def check(root: Path) -> int:
                 continue
             if cor >= (adr.file_number or ""):
                 problems.append(f"{rel}: Corrects ADR-{cor} must be a *lower* number")
-            row = next((line for line in itext.split("\n") if target.name in line), None)
+            row = index_table_row(itext, target.name)
             if row is None:
                 problems.append(f"{rel}: corrects ADR-{cor}, but its index row is missing")
             elif f"ADR-{adr.file_number}" not in row:
@@ -332,6 +350,28 @@ def selftest() -> int:
         adrs, readme = two_adr("ADR-0001", corrected_row)
         _fixture(root, adrs, readme=readme)
         expect("a two-way Corrects link passes", check(root) == 0)
+
+    # The corrected ADR is also linked from the boundary rule's prose, above the
+    # table. The lookup must take the *row*: a first-line match picked the prose
+    # instead, so a corrector named only in prose looked recorded. The pair below
+    # differs only in where the corrector is named.
+    prose_link = "See [the first ADR](./0001-first-decision.md) before the table.\n\n"
+    prose_corrector = (
+        "The first decision ([the first ADR](./0001-first-decision.md)) was "
+        "corrected by ADR-0002 in prose only.\n\n"
+    )
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        adrs, readme = two_adr("ADR-0001", corrected_row)
+        _fixture(root, adrs, readme=prose_link + readme)
+        expect("a prose mention above the table does not shadow the index row", check(root) == 0)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        adrs, readme = two_adr("ADR-0001")          # the row does not name the corrector
+        _fixture(root, adrs, readme=prose_corrector + readme)
+        expect("a corrector named only in the prose is not the index row", check(root) == 1)
 
     with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
         root = Path(tmp)
