@@ -219,12 +219,15 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    identical). Counters (`graph/copystats.rs`), the per-backend table,
    the enumeration of the synchronization points and the measured before/after are
    in `docs/BACKEND-REGISTRY-DESIGN.md` §11 and the plan's F5 record.
-   **What remains:** true *overlap* — the split loop is still strictly sequential
-   (enqueue, then immediately wait), so there is no independent work for a copy to
-   overlap with; exploiting the substrate needs the scheduler to defer a wait to
-   the consumer's first use — the one filed follow-up
-   ([#300](https://github.com/yusiwen/minfer/issues/300); see the plan's F5
-   record), and multi-device execution still needs it.
+   **What remains:** nothing filed for the boundary copy. The wait is already
+   deferred to the consumer's first use
+   ([#138](https://github.com/yusiwen/minfer/issues/138)), so a boundary with
+   several staged inputs holds them in flight at once; true *cross-split* overlap
+   has no target on the reachable macOS topology, and
+   [#300](https://github.com/yusiwen/minfer/issues/300) recorded that negative
+   result — a single device split feeding a host consumer whose first node reads
+   the dominant staged tensor (`docs/BACKEND-REGISTRY-DESIGN.md` §11.6).
+   Multi-device execution is still the place that would need it.
 
 **Also:** ~~the cross-boundary staging map is keyed by node id alone
 (`alloc.rs:34`), so a node consumed by two different foreign backends can only

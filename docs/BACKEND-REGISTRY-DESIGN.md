@@ -546,15 +546,18 @@ drain covers an entry nothing reads. Two things follow, both measured on the
   with several staged inputs holds several transfers at once (**2** where the F5
   enqueue-then-wait order cannot exceed **1**).
 
-**Still not claimed:** true *cross-split* overlap (a later split's transfer — [#300](https://github.com/yusiwen/minfer/issues/300) owns the measured overlap or the recorded negative result; the boundary blit riding the producer's command buffer is why this stays serial)
-running beside an earlier split's kernels) — the split loop remains strictly
-sequential, and a host-side consumer must wait by definition. What the deferral
-buys is that the wait happens where the data is needed, not where it was
-produced.
+**Resolved by [#300]:** there is no *cross-split* overlap to gain on the reachable
+macOS topology, and §11.6 records the measured negative result — the boundary blit
+stays on the producer's command buffer, which is both correct (it reads the source
+in the submission that wrote it) and not slower than the explicit-dependency
+alternative. The split loop remains strictly sequential, and a host-side consumer
+must wait by definition. What the deferral buys is that the wait happens where the
+data is needed, not where it was produced.
 
 [#138]: https://github.com/yusiwen/minfer/issues/138
 [#185]: https://github.com/yusiwen/minfer/issues/185
 [#242]: https://github.com/yusiwen/minfer/issues/242
+[#300]: https://github.com/yusiwen/minfer/issues/300
 
 ### 11.5 The Metal port ([#137]): why the blit shares the split's command buffer
 
@@ -584,4 +587,68 @@ Measured on `macbook (macOS 27.0.1, Apple M4 Pro)` — the F5 S3 record in
 `docs/ARCHITECTURE-EXECUTION-PLAN.md`.
 
 [#137]: https://github.com/yusiwen/minfer/issues/137
+
+### 11.6 The #300 result: the serialization is a missing dependency, and there is no overlap to gain
+
+Ticket: [#300] ("true cross-split overlap after #137"). It asked for either a
+measured overlap or a recorded negative result beside the §11.5 note. The result
+is a **negative one**, with the mechanism measured on
+`macbook (macOS 27.0.1, Apple M4 Pro)` at `ad707c7` (2026-10-09).
+
+**The #137 divergence is a missing-dependency race, not a kernel perturbation.**
+§11.5 inferred from the then-red baseline that "the extra in-flight command buffer
+perturbed Metal kernel execution". Isolated, the mechanism is simpler and
+deterministic. The pathological first cut is a standalone boundary command buffer
+submitted from `copy_cross` **before** `retire` submits the producer's split
+buffer, with **no** dependency on that buffer. On the shared `MpsState` command
+queue the standalone buffer is committed first, so the blit reads the producer's
+`StorageModeShared` source window **before the producer's kernels wrote it**, and
+the consumer's wait on an already-signaled event returns the previous forward's
+bytes. On `models::qwen2::graph::tests::offload_copy::async_cross_copies_never_block_and_stay_bitwise_identical_on_metal`
+that cut reads **max |Δlogit| = 26.718678** at step 0, the same value on two runs
+(the §11.5 "staged bytes identical" check was stale-to-stale, which is why it
+looked consistent).
+
+**Option A — a separate boundary buffer with an explicit dependency — is
+correct.** Committing the boundary blit on its own `MTLCommandQueue`, with
+`encodeWaitForEvent` on an event the producer signals at its split end before the
+blit and its own event for the consumer, restores bitwise identity: the real-model
+gate reads **max |Δlogit| = 0** over the prefill + 6-decode loop (twice) with the
+counters unchanged — `copies=35 waits=35 deferred_waits=35 blocking_host_copies=0
+async_host_copies=21 event_syncs=21 sync_readbacks=0` async against
+`copies=35 waits=35 blocking_host_copies=21 sync_readbacks=21` sync — and the cheap
+3-node gate passes (`copies=2 waits=2 deferred=2 blocking=0 async_host=1
+event_syncs=1 sync_readbacks=0`). So the perturbation is avoidable: it is a
+dependency the shared queue did not supply, not a fragility of Metal kernel
+execution.
+
+**But Option A buys no measurable cross-split overlap, so the production design
+stays.** *Cross-split* overlap needs a second split whose work can run beside the
+copy. On the reachable macOS topology there is none: the E5 mixed graph (4 of 24
+blocks on the device) is a single CPU → Metal → CPU sequence, so there is exactly
+**one** device→host boundary per forward; that boundary's consumer is the **host**
+CPU split, whose first node directly reads the dominant staged tensor (the hidden
+state), so the copy is on the consumer's critical path by definition; and the
+boundary's other two staged tensors are read within the CPU split's first eight
+nodes (`add` at node 46, `cells` at 52, `attn_span` at 54 in the decode graph), so
+a separate buffer could only overlap a blit of two tiny index/window tensors with
+a handful of host-side node setups. A *general* non-blocking producer retire
+cannot be made safe without reordering the next device submission after the
+boundary blit, which reintroduces exactly the serialization it would remove. A
+device→device pair (Metal→Metal) would be the one topology with real overlap, and
+`copy_across` early-returns on it while no CUDA device exists on macOS — it stays
+reserved (§11.3). The boundary blit therefore keeps riding the producer's command
+buffer; it is bitwise, and on this topology it is not slower than Option A.
+
+Reproduction. Both cuts are `MINFER_300_*`-gated temporary patches to
+`MetalBackend::cross_enqueue` (a standalone `cmd_buffer()` + `submit()` before
+`retire` for the pathological cut; a second queue + `encodeWaitForEvent` /
+`encodeSignalEvent` for Option A) — neither is in the tree. The acceptance command
+is the same in every arm:
+
+```text
+cargo test --release --bin minfer async_cross_copies_never_block_and_stay_bitwise_identical_on_metal -- --ignored --test-threads=1 --nocapture
+```
+
+[#300]: https://github.com/yusiwen/minfer/issues/300
 
