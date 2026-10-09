@@ -170,10 +170,11 @@ an agent reaches for first.
 | Support matrix · build · usage · features | `docs/SUPPORT-MATRIX.md`, `docs/BUILD.md`, `docs/USAGE.md`, `docs/FEATURES.md` |
 | What is missing, and in what order | `docs/ARCHITECTURE-ROADMAP.md` |
 | The phase-by-phase plan and the per-ticket history | `docs/ARCHITECTURE-EXECUTION-PLAN.md` |
+| **Architecture decision records — why, and what was rejected** | `docs/adr/` |
 
 **Doc gates.** The `check-docs` CI job runs `scripts/build_book.sh` (mdBook) and the checkers
-`check_docs_links.py`, `check_status.py --check`, `check_doc_line_anchors.py`, `check_anchor_drift.py` and
-`check_f6_fixtures.py`; what each can and cannot prove is in its own `--help` and in
+`check_docs_links.py`, `check_status.py --check`, `check_doc_line_anchors.py`, `check_anchor_drift.py`,
+`check_f6_fixtures.py` and `check_adr.py`; what each can and cannot prove is in its own `--help` and in
 [`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) ("the doc gates"). Edit `docs/status.toml`, never a counter.
 `check_agents_size.py` also caps **this file** — move a block to its topic doc rather than raise the cap.
 **Open doc debt:** [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md`).

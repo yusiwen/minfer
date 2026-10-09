@@ -36,14 +36,16 @@ import sys
 import tempfile
 from pathlib import Path
 
-# The ratchet. 24 KiB leaves the file room to be a router (routing, commands,
+# The ratchet. 24.5 KiB leaves the file room to be a router (routing, commands,
 # numbered invariants one line each, a short doc index) without room to grow back
-# into a document. Measured at 24,516 B when this landed (issue #434 S3), so the
-# headroom is deliberately thin: a *section* of new prose fails the gate, and the
-# two sanctioned responses are to move a block to its topic doc (preferred) or to
-# raise this cap in the commit that needs it. A cap with slack would let the file
-# drift back one paragraph at a time, which is how it reached 72,692 B.
-CAP = 24_576
+# into a document. The two sanctioned responses to hitting it are to move a block
+# to its topic doc (preferred) or to raise this cap in the commit that needs it.
+# It was raised 24,576 -> 25,088 B when the ADR corpus landed (#439): the index
+# gained a chapter pointer and its gate. A cap with slack lets the file drift back
+# a paragraph at a time, which is how it reached 72,692 B — but a cap that fails
+# on *listing a new document* would just push authors to compress prose instead of
+# letting the index do its job.
+CAP = 25_088
 
 HEADING = re.compile(r"^## (?!#)")
 
