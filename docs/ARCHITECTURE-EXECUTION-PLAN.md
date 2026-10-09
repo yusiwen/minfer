@@ -6976,7 +6976,10 @@ tree is never modified), replaces **every** `allow(dead_code)` — bare, `cfg_at
 (dropping only `dead_code`) and the inner `#![...]` form — with a line-preserving marker, then
 runs `cargo check --release [--features cuda] --message-format=json` with
 `RUSTFLAGS=--cap-lints=warn` (never `deny(warnings)`, which turns the lint into an error and can
-truncate the pass). It takes **every `src/` span** of every `dead_code` diagnostic — the primary
+truncate the pass); a third configuration, `--config macos`, is that same plain
+`cargo check --release` **run on a macOS host**, where the `#[cfg(target_os = "macos")]` modules are
+compiled — elsewhere it is refused by name, because a run that compiles none of them would read
+green ([#332]). It takes **every `src/` span** of every `dead_code` diagnostic — the primary
 span alone undercounts ~2.6×, the first census's error — and every `(name, kind)` the diagnostic's
 message names (`fields `a`, `b` …` is two `field` items, `variants `X`, `Y` …` two `variant`
 items), and compares that set with the manifest. An **addition fails**, printed with `file:line`,
@@ -7017,8 +7020,12 @@ sets as the aarch64 column, so no `arch` field was needed and the manifest neede
 `check-docs` printed `annotation shapes clean (11 grandfathered bare site(s))`, the Layer-1
 selftest's `14 cases pass` and the oracle's `strip, item and capture cases pass`.
 
-**The manifest (`docs/dead-code-baseline.toml`).** 46 `[[cpu]]` + 34 `[[cuda]]` entries, each
-`name` / `kind` / `file` / `reason`, plus a top-level `macos = "unjudged"`. The update rule is
+**The manifest (`docs/dead-code-baseline.toml`).** 45 `[[cpu]]` + 34 `[[cuda]]` entries, each
+`name` / `kind` / `file` / `reason`, plus the top-level marker `macos = "unjudged"` — the
+documented spelling for a configuration with **no recorded measurement yet** ([#332]). Only a
+config whose spec sets `unjudgeable` may carry it: `cpu`/`cuda` are machine-checked in CI, so the
+marker there would silently disable a gate and is refused; `macos` is an on-demand Mac run. A
+marked config is reported as *unjudged*, never as a pass. The update rule is
 written into the file: an addition is a decision — make the item live, delete it, or add the entry
 **in the same PR** with a one-line reason — and the checker prints the entry to paste; a removal
 is informational. `--print-toml` regenerates the block (reusing the existing reasons), and
@@ -7032,8 +7039,11 @@ sits in a `#[cfg(target_os = "macos")]` **test** block *looks* dead here while i
   (`models::qwen2::graph::tests::graph_metal_matches_cpu_logits`). `build-macos` compiles the test
 target since [#303](https://github.com/yusiwen/minfer/issues/303) (`cargo test --release --no-run`),
 so a macOS-only *test* reference is compiled there; what the Linux oracle still cannot do is *run*
-on a macOS module, so `macos = "unjudged"` records that and the two `src/metal.rs` sites stay with
-[#255]. (2) The
+on a macOS module, so the manifest records the marker and the two `src/metal.rs` sites stay with
+[#255]. Since [#332] the oracle carries the `macos` configuration (the plain `cargo check
+--release`, refused on a non-Mac host) and `--print-toml` seeds its `[[macos]]` section, so the
+blind spot now closes by **running it on a Mac**: the marker is replaced by the judged set (or by a
+count with its date and box label), not left `unjudged` by default. (2) The
 oracle is a `cargo check`: “live” is a compile-time reference, not runtime reachability. (3)
 `--features debug_dump` and `cuda_static` are not covered.
 
