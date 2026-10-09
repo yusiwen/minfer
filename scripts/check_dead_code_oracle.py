@@ -40,12 +40,21 @@ default (``--target-dir``), so the run pays for the crate, not for every
 dependency. Only the local crate recompiles; the copy is deleted afterwards unless
 ``--keep`` is given.
 
+**Configurations are not all a feature axis (#332).** ``cpu`` and ``cuda`` are the
+feature axis and are machine-checked in CI. ``macos`` is a **host** axis: it is the
+plain ``cargo check --release`` run on a macOS box, where the
+``#[cfg(target_os = "macos")]`` modules are compiled. Asking for it on another host
+is refused by name (exit 2) rather than run, because a Linux run compiles none of
+those modules and would report a green set that says nothing about them.
+
 **Blind spots, stated rather than discovered.**
-* macOS is not compiled here (or on the Linux CI runner): a macOS-only module is
-  invisible, and a cross-platform item whose only caller sits in a
-  ``#[cfg(target_os = "macos")]`` test block *looks* dead here while it is live
-  there (``ModelDef::forward_graph`` was exactly this). ``build-macos`` only
-  type-checks, and the manifest carries ``macos = "unjudged"`` for that reason.
+* A macOS-only module is invisible to every non-macOS run, and a cross-platform
+  item whose only caller sits in a ``#[cfg(target_os = "macos")]`` test block
+  *looks* dead there while it is live on the Mac (``ModelDef::forward_graph`` was
+  exactly that). The ``macos`` config closes that blind spot only when it is
+  actually **run on a Mac**; until then the manifest records the string
+  ``macos = "unjudged"``, and a config carrying the marker is reported as
+  *unjudged* — never as a pass.
 * The oracle is a ``cargo check``: "live" is a compile-time reference, not runtime
   reachability.
 * ``--features debug_dump`` and ``cuda_static`` are not covered.
@@ -54,6 +63,7 @@ Usage::
 
     python3 scripts/check_dead_code_oracle.py --config cpu
     python3 scripts/check_dead_code_oracle.py --config cuda
+    python3 scripts/check_dead_code_oracle.py --config macos   # macOS host only
     python3 scripts/check_dead_code_oracle.py --selftest
     python3 scripts/check_dead_code_oracle.py --config cpu --print-toml   # seed/update
 
@@ -77,14 +87,53 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_BASELINE = REPO / "docs" / "dead-code-baseline.toml"
 
-#: The configurations the manifest carries, and the cargo feature set each one
-#: compiles. `cuda` is maximal: `src/cuda.rs` and `src/graph/cuda_backend.rs` exist
-#: only under the feature, so items they would have constructed are dead without
-#: it.
+#: The configurations the manifest carries. A config is not only a feature set:
+#:   * `features` — what cargo compiles. `None` is a plain `cargo check --release`.
+#:     `cuda` is maximal: `src/cuda.rs` and `src/graph/cuda_backend.rs` exist only
+#:     under the feature, so items they would have constructed are dead without it.
+#:   * `host` — the `sys.platform` the run must happen on, or `None` for any host;
+#:     `host_name` is the human label and `cfg` the Rust gate it exists to judge.
+#:     `macos` needs `darwin` because a `#[cfg(target_os = "macos")]` module is not
+#:     compiled elsewhere: a Linux run reports *nothing* about it and reads green,
+#:     which is the blind spot the marker exists to name (#332).
+#:   * `unjudgeable` — whether the manifest may record the string `"unjudged"` for
+#:     the config (no measurement yet). `cpu`/`cuda` are machine-checked in CI, so
+#:     marking one unjudged would silently disable its gate; only `macos`, whose
+#:     verdict is an on-demand Mac run, may carry the marker.
 CONFIGS = {
-    "cpu": None,
-    "cuda": "cuda",
+    "cpu": {"features": None, "host": None, "host_name": None, "cfg": None, "unjudgeable": False},
+    "cuda": {"features": "cuda", "host": None, "host_name": None, "cfg": None, "unjudgeable": False},
+    "macos": {
+        "features": None,
+        "host": "darwin",
+        "host_name": "macOS",
+        "cfg": 'target_os = "macos"',
+        "unjudgeable": True,
+    },
 }
+
+#: The manifest spelling meaning "this config has no recorded measurement yet".
+UNJUDGED = "unjudged"
+
+
+def host_refusal(config: str, platform: str) -> str | None:
+    """Why `config` cannot run on `platform`, or None when it can.
+
+    A host-constrained config is refused by name rather than run: elsewhere it
+    compiles none of the modules it exists to judge, so it would read green.
+    """
+    spec = CONFIGS[config]
+    want = spec["host"]
+    if want is None or platform == want:
+        return None
+    name = spec["host_name"] or want
+    return (
+        f"config `{config}` must run on {name} (this host is `{platform}`, not `{want}`): a "
+        f'`#[cfg({spec["cfg"]})]` module is not compiled elsewhere, so the run would compile '
+        f"none of it and read green. Run it on a {name} box and record the result, or leave "
+        f'`{config}` at the manifest marker "{UNJUDGED}" (an absent config is reported as not '
+        f"run, never as a pass)"
+    )
 
 #: Kinds the manifest may name, i.e. the message verbs rustc uses for dead code.
 KINDS = ("fn", "struct", "enum", "union", "trait", "type", "const", "static", "field", "variant")
@@ -267,24 +316,47 @@ def parse_capture(text: str) -> tuple[list[dict], set[tuple[str, int]], dict[tup
     return diags, sites, items
 
 
-def load_baseline(path: Path, allow_missing: bool = False) -> dict[str, list[dict]]:
+def load_baseline(
+    path: Path, allow_missing: bool = False
+) -> tuple[dict[str, list[dict]], set[str]]:
     """The manifest, validated: every entry names an item, a kind and a reason.
+
+    Returns the entries per config and the set of configs the manifest records as
+    ``"unjudged"`` (no measurement yet). Only a config whose spec sets
+    ``unjudgeable`` may carry that marker: `cpu`/`cuda` are machine-checked in CI,
+    and marking one unjudged would silently disable its gate (#332).
 
     ``allow_missing`` is the seeding path: with ``--print-toml`` the manifest does
     not exist yet, and an empty one is the correct starting point.
     """
     if not path.is_file():
         if allow_missing:
-            return {config: [] for config in CONFIGS}
+            return {config: [] for config in CONFIGS}, set()
         raise OracleError(f"{path}: manifest missing")
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as e:
         raise OracleError(f"{path}: not valid TOML: {e}") from e
+    entries_by: dict[str, list[dict]] = {}
+    unjudged: set[str] = set()
     for config in CONFIGS:
         entries = data.get(config, [])
+        if isinstance(entries, str) and entries == UNJUDGED:
+            if not CONFIGS[config]["unjudgeable"]:
+                allowed = sorted(c for c in CONFIGS if CONFIGS[c]["unjudgeable"])
+                raise OracleError(
+                    f'{path}: `{config} = "{UNJUDGED}"` is not allowed — that config is '
+                    f"machine-checked in CI, and the marker would silently disable its gate; "
+                    f"only {allowed} may record the marker"
+                )
+            entries_by[config] = []
+            unjudged.add(config)
+            continue
         if not isinstance(entries, list):
-            raise OracleError(f"{path}: [[{config}]] must be an array of tables")
+            raise OracleError(
+                f"{path}: [[{config}]] must be an array of tables, or the string "
+                + f'"{UNJUDGED}" when the config has no measurement yet'
+            )
         seen: set[tuple[str, str]] = set()
         for e in entries:
             for field in ("name", "kind", "reason"):
@@ -296,7 +368,8 @@ def load_baseline(path: Path, allow_missing: bool = False) -> dict[str, list[dic
             if key in seen:
                 raise OracleError(f"{path}: [[{config}]] lists `{e['name']}` ({e['kind']}) twice")
             seen.add(key)
-    return data
+        entries_by[config] = entries
+    return entries_by, unjudged
 
 
 def toml_string(s: str) -> str:
@@ -325,7 +398,10 @@ def check(
     keep: bool,
     print_toml: bool,
 ) -> int:
-    features = CONFIGS[config]
+    refusal = host_refusal(config, sys.platform)
+    if refusal is not None:
+        raise OracleError(refusal)
+    features = CONFIGS[config]["features"]
     made_root = scratch_root is None
     root = Path(tempfile.mkdtemp(prefix="minfer-dead-code-oracle-")) if made_root else scratch_root
     assert root is not None
@@ -373,7 +449,7 @@ def check(
             f"  dead_code diagnostics: {len(diags)}   src/ spans (sites): {len(sites)}   "
             f"items: {len(items)}"
         )
-        baseline = load_baseline(baseline_path, allow_missing=print_toml)
+        baseline, unjudged = load_baseline(baseline_path, allow_missing=print_toml)
         entries = baseline.get(config, [])
         base_keys = {(e["name"], e["kind"]) for e in entries}
         added = sorted(set(items) - base_keys)
@@ -398,6 +474,15 @@ def check(
                     else "TODO: why is this dead item retained, and what would construct/read it? (#254)"
                 )
                 print(toml_entry(config, name, kind, row["file"], reason))
+        if config in unjudged:
+            print(
+                f"  baseline [{config}]: the manifest records `{UNJUDGED}` — no measurement is "
+                f"recorded, so this run passes no verdict. The stripped tree yields {len(items)} "
+                f"item(s); seed the section with `--print-toml` and record the run (date + box) "
+                f"before replacing the marker."
+            )
+            print(f"\ncheck_dead_code_oracle.py [{config}]: UNJUDGED (not a pass)")
+            return 0
         for name, kind in removed:
             was = next((e.get("file", "?") for e in entries if (e["name"], e["kind"]) == (name, kind)), "?")
             print(f"  note: `{name}` ({kind}) is no longer dead here (was {was}) — drop the entry when convenient")
@@ -519,6 +604,58 @@ def selftest() -> int:
     expect("every src span is a site", sorted(sites), [("src/a.rs", 4), ("src/a.rs", 9)])
     expect("item key", sorted(items), [("never_called", "fn")])
     expect("unknown reason lines are ignored", parse_capture("not json\n")[0], [])
+
+    # --- configurations: the macOS host axis and the `unjudged` marker (#332) ---
+    expect("three configurations", sorted(CONFIGS), ["cpu", "cuda", "macos"])
+    expect("cuda compiles the feature", CONFIGS["cuda"]["features"], "cuda")
+    expect("macos compiles no feature", CONFIGS["macos"]["features"], None)
+    expect(
+        "only macos may be unjudged",
+        sorted(c for c in CONFIGS if CONFIGS[c]["unjudgeable"]),
+        ["macos"],
+    )
+    expect("macos needs a darwin host", CONFIGS["macos"]["host"], "darwin")
+    expect("cpu runs on any host", host_refusal("cpu", "linux"), None)
+    expect("macos runs on darwin", host_refusal("macos", "darwin"), None)
+    refusal = host_refusal("macos", "linux")
+    expect(
+        "macos refused on a linux host, naming the reason",
+        isinstance(refusal, str) and "darwin" in refusal and UNJUDGED in refusal,
+        True,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        manifest = Path(td) / "baseline.toml"
+        manifest.write_text(
+            'macos = "unjudged"\n[[cpu]]\nname = "a"\nkind = "fn"\nreason = "r"\n',
+            encoding="utf-8",
+        )
+        entries, unjudged = load_baseline(manifest)
+        expect(
+            "an unjudged macos parses to no entries",
+            (sorted(entries), sorted(unjudged), entries["macos"]),
+            (["cpu", "cuda", "macos"], ["macos"], []),
+        )
+        manifest.write_text(
+            '[[macos]]\nname = "m"\nkind = "fn"\nfile = "src/metal.rs"\nreason = "r"\n',
+            encoding="utf-8",
+        )
+        entries, unjudged = load_baseline(manifest)
+        expect(
+            "a judged macos section parses",
+            (entries["macos"][0]["name"], sorted(unjudged)),
+            ("m", []),
+        )
+        for body, name in (
+            ('cpu = "unjudged"\n', "a CI-checked config may not be unjudged"),
+            ("macos = 3\n", "a config that is neither a list nor the marker refuses"),
+        ):
+            manifest.write_text(body, encoding="utf-8")
+            try:
+                load_baseline(manifest)
+                expect(name, "no error", "OracleError")
+            except OracleError:
+                pass
 
     if failures:
         print(f"check_dead_code_oracle.py selftest: {failures} case(s) failed")

@@ -71,6 +71,17 @@ pre-warm again, through the *same* per-instantiation cache the launcher reads, s
 the attribute is set before any `CudaBackend` (the only holder of a capture
 window) can exist. Annotating the item without answering the question is neither.
 
+**The unrun-configuration instance ([#332]).** A gate is only as wide as the code
+its configuration actually compiles. `scripts/check_dead_code_oracle.py` judges
+liveness by stripping every `allow(dead_code)` and reading rustc; on Linux it can
+say nothing about a `#[cfg(target_os = "macos")]` module, and a run that reported
+"0 additions" there would be read as coverage of code it never compiled. The
+checker therefore carries the platform as an explicit configuration (`--config
+macos`), refuses it by name on a non-Mac host, and records the unrun half in the
+manifest as `macos = "unjudged"` — a verdict *absent*, never a pass. The list of
+configurations is part of a gate's claim: adding one is how a blind spot closes,
+and marking it unjudged is how it stays visible until someone runs it.
+
 ## 2. A control arm must differ in the property under test
 
 A negative control that is rejected by an *earlier* check never exercises the

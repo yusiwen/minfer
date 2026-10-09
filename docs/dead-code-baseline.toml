@@ -17,9 +17,14 @@
 # Regenerate (from the repository root, with a warm target dir):
 #   python3 scripts/check_dead_code_oracle.py --config cpu  --print-toml
 #   python3 scripts/check_dead_code_oracle.py --config cuda --print-toml
+#   python3 scripts/check_dead_code_oracle.py --config macos --print-toml  # on a Mac
 #
-# `cpu`  = `cargo check --release`            -> the `test-linux-cpu` CI job
-# `cuda` = `cargo check --release --features cuda` -> the `build-linux-cuda` job
+# `cpu`   = `cargo check --release`            -> the `test-linux-cpu` CI job
+# `cuda`  = `cargo check --release --features cuda` -> the `build-linux-cuda` job
+# `macos` = `cargo check --release` **on a macOS host** -> no CI job; the
+#           on-demand Mac run that compiles the `cfg(target_os = "macos")`
+#           modules. The checker refuses this config on any other host, and the
+#           marker below is the documented "not measured yet" state (#332).
 # (`cuda` is the maximal configuration: `src/cuda.rs` and
 # `src/graph/cuda_backend.rs` exist only under the feature. `--features
 # debug_dump` and `cuda_static` are not covered.)
@@ -42,10 +47,18 @@
 # x86_64-unknown-linux-gnu` reproduces the CI set locally; the authoritative run
 # is the CI job itself, which passes no `--target`.
 #
-# Re-stated 2026-10-06 (#54). The value stays `unjudged`: the Linux oracle still
-# cannot compile a macOS-only module. `build-macos` does compile the test target
-# since #303, so a macOS-only reference is *seen* there; what is missing is the
-# oracle run, not the compile.
+# The marker `macos = "unjudged"` means **no recorded measurement**, and only a
+# config the checker marks `unjudgeable` may carry it: `cpu`/`cuda` are
+# machine-checked in CI, where the marker would silently disable a gate and is
+# refused. It is reported as *unjudged*, never as a pass. Replace it with a
+# `[[macos]]` section (seeded by `--print-toml` on a Mac) once the oracle has been
+# run there, or with the count + date + box label — see #332.
+#
+# Re-stated 2026-10-06 (#54), re-scoped 2026-10-09 (#332). The value stays
+# `unjudged` until a Mac runs `--config macos`: the Linux oracle still cannot
+# compile a macOS-only module. `build-macos` does compile the test target since
+# #303, so a macOS-only reference is *seen* there; what was missing was the
+# configuration to run the oracle at all, and #332 added it (refused off a Mac).
 # The round *did* judge the two `src/metal.rs` annotations that were this
 # marker's concrete cases — [#255] (PR #294) turned `matmul_on_gpu_buf` into
 # `#[cfg(test)]` and deleted the container-level `impl MpsState` blanket — and it
@@ -58,7 +71,7 @@
 # [#255]: https://github.com/yusiwen/minfer/issues/255
 macos = "unjudged"
 
-# ---- cpu: 46 dead item(s), union of aarch64 + x86_64 ----
+# ---- cpu: 45 dead item(s), union of aarch64 + x86_64 ----
 [[cpu]]
 name = "AutoWithBudget"
 kind = "variant"
