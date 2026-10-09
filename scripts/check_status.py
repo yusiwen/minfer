@@ -1,51 +1,45 @@
 #!/usr/bin/env python3
-"""Check that the status prose agrees with its machine-readable source.
+"""Check that the execution plan's status prose agrees with its machine-readable source.
 
-The execution plan's phase counters and its `next:` sentence, its baseline and
-`refreshed against` commit ids, and the live suite counts recorded in `AGENTS.md`
-used to be hand-edited prose. They drifted (the preamble once read `Phase C 6/8`
-two lines above its own "complete (8/8)"; the `next:` sentence still called E4/E5
-upcoming long after they landed; `AGENTS.md`'s CUDA count trailed the real run by
-a week). This script makes them **derived facts**: `docs/status.toml` is the one
-source, and every prose target carries its own `file` + `regex` (with named
-groups), so the checker holds no second copy of any value and can report *the
-file, the line and both values* when they disagree (issue #94).
+`scripts/status.toml` is the one source for the plan's phase counters, its `next:`
+sentence and its baseline / `refreshed against` commit ids. Those were hand-edited
+prose once and drifted (the preamble read `Phase C 6/8` two lines above its own
+"complete (8/8)", and the `next:` sentence still called E4/E5 upcoming long after
+they landed — issue #94). Every prose target carries its own `file` + `regex` in
+the manifest, so this checker holds no second copy of any value and can report
+*the file, the line and both values* when they disagree.
 
 Modes:
 
-- ``--check`` (the default) reads `docs/status.toml` and asserts the prose agrees:
-  the plan's phase counters and completion words, its `next:` sentence, its two
+- ``--check`` (the default) reads `scripts/status.toml` and asserts the prose
+  agrees: the phase counters and completion words, the `next:` sentence and the two
   commit ids — and that both ids are ancestors of ``HEAD``
   (``git merge-base --is-ancestor``, so "refreshed against master = X" cannot point
-  at a rewritten-away commit) — plus `AGENTS.md`'s count rows (numbers, box and
-  date). A counts row may also carry a **projection** (``projection_key`` /
-  ``projection_box`` / ``projection_base_passed``): when the recorded row's CPU twin
-  has moved since it was measured, ``--check`` **prints** (never fails on) the
-  projected value, so a stale recorded row cannot look current without a hint beside
-  it (#207). The relation is inexact — the device-gated tests move independently —
-  which is why it is a hint and not a comparison.
-- ``--check-live LOG --box NAME`` parses a `cargo test` log into its unit and
-  integration totals and compares the manifest rows for that box. Hardening that
-  is not optional: a box with no manifest rows fails loudly; a log with no
-  ``Running unittests`` or no ``Running tests/`` block fails (truncated/empty);
-  a non-zero ``failed`` count fails; ANSI escapes are stripped before matching;
-  and each ``test result:`` block is attributed to the nearest preceding
-  ``Running`` header.
-- ``--selftest`` runs the pass/fail cases in a hermetic temp git repo (a good
-  tree, a mutated phase counter, a mutated count, a mutated source value, a
-  missing box, a truncated log and a non-ancestor commit), so CI exercises the
-  logic on every PR without a live cargo run.
+  at a rewritten-away commit).
+- ``--selftest`` runs the pass/fail cases in a hermetic temp git repo (a good tree,
+  a mutated phase counter, a mutated source value, a missing commit id, a
+  non-ancestor commit, a `[[phase]]`-less manifest and a foreign `kind`), so CI
+  exercises the logic on every PR without touching the real records.
+
+The suite measurements are **not** in this ledger and not checked here: they live
+in `scripts/test-baselines.toml`, are validated against `docs/TEST-BASELINES.md` by
+`scripts/check_baselines.py`, and its `--check-live` compares one row against a real
+`cargo test` log. The split exists because the two halves have different prose
+targets and different consumers; the placement rule is recorded in
+`docs/adr/0023-the-machine-ledgers-live-beside-their-checkers.md`. That sibling
+imports this module's shared plumbing (``read_text``, ``line_of``, ``label_of``,
+``has_problem``, ``require_kind``, ``usage_error``) rather than restating it — the
+pattern `scripts/check_anchor_drift.py` uses for `check_doc_line_anchors.py`.
 
 **What it proves, and what it cannot.** ``--help`` states the limit in full: this
-checker can prove that the prose *agrees with the source* and that a counts row's
-numbers *matched a cargo run that was parsed*; it cannot prove a measurement was
-real. The ``§11`` sequencing diagram's per-ticket check marks are deliberately
-**out of scope** — they are not derivable from ``(done, total)``.
+checker can prove that the prose *agrees with the source*; it cannot prove that a
+measurement was real. The plan's ``§11`` sequencing diagram's per-ticket check
+marks are deliberately **out of scope** — they are not derivable from
+``(done, total)``.
 
 Usage::
 
     python3 scripts/check_status.py --check
-    python3 scripts/check_status.py --check-live /tmp/cargo-test.log --box 'x86_64 (CI runner)'
     python3 scripts/check_status.py --selftest
 
 Pure and offline: stdlib only (``tomllib``), no network. ``git`` is invoked only
@@ -65,30 +59,35 @@ import tempfile
 import tomllib
 from pathlib import Path
 
-#: ANSI SGR escapes: the CI log carries them *inside* the `Running` header
-#: (`\x1b[1m\x1b[92m     Running\x1b[0m tests/...`), so they are stripped before
-#: any matching.
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-#: `Running unittests src/main.rs (…)` / `Running tests/foo.rs (…)`.
-RUNNING_RE = re.compile(r"Running (unittests|tests/)")
-#: `   Doc-tests minfer` — a later block without the `Running` prefix; a result
-#: under it must not be attributed to the last integration binary.
-DOCTEST_RE = re.compile(r"^\s*Doc-tests\b")
-#: `test result: ok. 455 passed; 0 failed; 33 ignored; …` (or `FAILED.`).
-RESULT_RE = re.compile(
-    r"test result: (?:ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored"
-)
+#: The manifest this checker owns, relative to `--root`. Its sibling
+#: `scripts/check_baselines.py` owns `scripts/test-baselines.toml`.
+MANIFEST = "scripts/status.toml"
+
+#: The `kind` this checker owns. A manifest declaring another kind is a different
+#: ledger handed to the wrong checker, and `require_kind` refuses it by name.
+KIND = "plan"
+
+#: The top-level scalars a `plan` manifest must carry. A missing one is a hard
+#: failure: a ledger that lost its declaration must not read as "nothing to check".
+REQUIRED_SCALARS = ("baseline_commit", "refreshed_against")
 
 #: The honest limit `--help` must state (also asserted by `--selftest`).
 HELP_LIMIT = (
-    "What it proves: the prose agrees with docs/status.toml, and (in --check-live) "
-    "that a counts row's numbers matched a cargo log that was parsed. What it cannot "
-    "prove: that a measurement was real. The §11 sequencing diagram's per-ticket check "
-    "marks are deliberately out of scope — they are not derivable from (done, total)."
+    "What it proves: the plan's prose agrees with scripts/status.toml. What it cannot "
+    "prove: that a measurement was real. The plan's §11 sequencing diagram's per-ticket "
+    "check marks are deliberately out of scope — they are not derivable from (done, total)."
 )
 
 #: Fields a phase regex may capture and the manifest stores.
 PHASE_FIELDS = ("state", "done", "total")
+
+
+# ---------------------------------------------------------------------------
+# Shared plumbing. `scripts/check_baselines.py` imports these rather than
+# restating them (the `scripts/check_anchor_drift.py` pattern), so the two
+# ledgers stay separate while their prose-comparison mechanics stay one
+# implementation.
+# ---------------------------------------------------------------------------
 
 
 def line_of(text: str, offset: int) -> int:
@@ -99,6 +98,43 @@ def line_of(text: str, offset: int) -> int:
 def read_text(path: Path) -> str:
     """Read `path` as UTF-8, or raise `OSError` (the caller reports it)."""
     return path.read_text(encoding="utf-8")
+
+
+def label_of(root: Path, path: Path) -> str:
+    """`path` relative to `root` when it is under it, else its absolute form."""
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def has_problem(problems: list[str], *needles: str) -> bool:
+    """Whether some problem message carries every one of `needles`."""
+    return any(all(needle in problem for needle in needles) for problem in problems)
+
+
+def require_kind(
+    manifest: dict, label: str, kind: str, problems: list[str]
+) -> bool:
+    """Refuse a manifest whose `kind` is not `kind`; True when it matched.
+
+    A missing or foreign `kind` is a hard failure, never a reason to skip the
+    sections it implies: "the ledger lost its declaration" must not read as
+    "there is nothing to check".
+    """
+    got = manifest.get("kind")
+    if got == kind:
+        return True
+    problems.append(
+        f"{label}: kind is {str(got)!r}, not {kind!r} — a different ledger was "
+        f"handed to this checker"
+    )
+    return False
+
+
+def usage_error(message: str) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
 
 
 def is_ancestor(root: Path, commit: str) -> tuple[bool, int, str]:
@@ -112,7 +148,7 @@ def is_ancestor(root: Path, commit: str) -> tuple[bool, int, str]:
 
 
 def compare_scalars(
-    root: Path, manifest: dict, problems: list[str]
+    root: Path, manifest: dict, label: str, problems: list[str]
 ) -> dict[str, tuple[str, int]]:
     """Compare each `[prose.<field>]` `value` group against the manifest scalar.
 
@@ -124,7 +160,7 @@ def compare_scalars(
         want = manifest.get(field)
         if want is None:
             problems.append(
-                f"docs/status.toml: [prose.{field}] has no matching top-level {field!r} value"
+                f"{label}: [prose.{field}] has no matching top-level {field!r} value"
             )
             continue
         text = read_text(root / target["file"])
@@ -132,7 +168,7 @@ def compare_scalars(
         if match is None or "value" not in match.groupdict():
             problems.append(
                 f'{target["file"]}: no prose match for {field!r} '
-                f'(docs/status.toml says {str(want)!r})'
+                f"(the ledger says {str(want)!r})"
             )
             continue
         line = line_of(text, match.start("value"))
@@ -140,14 +176,16 @@ def compare_scalars(
         if got != want:
             problems.append(
                 f'{target["file"]}:{line}: {field}: prose says {got!r}, '
-                f"docs/status.toml says {str(want)!r}"
+                f"the ledger says {str(want)!r}"
             )
         else:
             seen[field] = (got, line)
     return seen
 
 
-def compare_phases(root: Path, manifest: dict, problems: list[str]) -> int:
+def compare_phases(
+    root: Path, manifest: dict, label: str, problems: list[str]
+) -> int:
     """Compare every `[[phase]]` row against its own prose regex. Returns rows checked."""
     checked = 0
     for phase in manifest.get("phase", []):
@@ -174,118 +212,49 @@ def compare_phases(root: Path, manifest: dict, problems: list[str]) -> int:
                 except ValueError:
                     problems.append(
                         f'{phase["file"]}: phase {pid} {field}: prose says {got!r}, '
-                        f"docs/status.toml says {str(want)!r}"
+                        f"the ledger says {str(want)!r}"
                     )
                     continue
             if got_norm != want_norm:
                 line = line_of(text, match.start(field))
                 problems.append(
                     f'{phase["file"]}:{line}: phase {pid} {field}: prose says {got!r}, '
-                    f"docs/status.toml says {str(want)!r}"
-                )
-    return checked
-
-
-def projection_hints(manifest: dict) -> list[str]:
-    """Non-failing hints for a recorded row a CPU-side change has moved (#207).
-
-    The CUDA rows are recorded measurements refreshed only on a device run, but
-    they count the **same test binary plus the device-gated tests**: a
-    feature-independent test added by a CPU-only ticket moves both. A row may
-    therefore carry `projection_key` / `projection_box` (the CPU row that shares
-    its binary) and `projection_base_passed` (that row's `passed` value at the
-    moment this row was measured), and this function projects
-    `passed + (source_passed - base)`.
-
-    It is deliberately a **hint, never a check**: the device-gated tests move
-    independently of the CPU row, so the relation is inexact. The point is that a
-    stale row cannot look current without a projection beside it.
-    """
-    rows = {
-        (row.get("key"), row.get("box")): row for row in manifest.get("counts", [])
-    }
-    hints: list[str] = []
-    for row in manifest.get("counts", []):
-        if "projection_key" not in row:
-            continue
-        source = rows.get((row["projection_key"], row.get("projection_box")))
-        if source is None:
-            continue
-        base = int(row["projection_base_passed"])
-        delta = int(source["passed"]) - base
-        if delta == 0:
-            continue
-        hints.append(
-            f'{row["key"]} ({row["box"]}) records {row["passed"]} passed but the '
-            f'{source["key"]} ({source["box"]}) row it was measured with has moved '
-            f'{delta:+d} since then, so a device run would report about '
-            f'{int(row["passed"]) + delta} passed — refresh the row on the next '
-            f"device run (#207)"
-        )
-    return hints
-
-
-def compare_counts(root: Path, manifest: dict, problems: list[str]) -> int:
-    """Compare every `[[counts]]` row against its own prose regex.
-
-    A row's regex is searched for all matches; the match whose `box` group equals
-    the row's box is used, so two rows sharing a command (`cargo test --release`
-    on two boxes) still bind to distinct bullets. Returns rows checked.
-    """
-    checked = 0
-    for row in manifest.get("counts", []):
-        ident = f'{row["key"]} ({row["box"]})'
-        text = read_text(root / row["file"])
-        match = None
-        for candidate in re.finditer(row["regex"], text, re.MULTILINE):
-            groups = candidate.groupdict()
-            if "box" not in groups or groups["box"].strip() == row["box"]:
-                match = candidate
-                break
-        if match is None:
-            problems.append(
-                f'{row["file"]}: no prose match for {ident} '
-                f"(box {row['box']!r}) — the counter was edited or the box renamed"
-            )
-            continue
-        checked += 1
-        for field in match.groupdict():
-            if field == "box" or field not in row:
-                continue
-            got = match.group(field)
-            want = row[field]
-            got_norm: object = got.strip()
-            if isinstance(want, int):
-                try:
-                    got_norm = int(got)
-                except ValueError:
-                    pass
-            if got_norm != want:
-                line = line_of(text, match.start(field))
-                problems.append(
-                    f'{row["file"]}:{line}: {ident} {field}: prose says {got!r}, '
-                    f"docs/status.toml says {str(want)!r}"
+                    f"the ledger says {str(want)!r}"
                 )
     return checked
 
 
 def check_manifest(root: Path, status_path: Path) -> tuple[list[str], dict]:
-    """Every prose/source problem for `status_path` under `root`, plus a summary."""
-    manifest = tomllib.loads(status_path.read_text(encoding="utf-8"))
-    problems: list[str] = []
-    scalars = compare_scalars(root, manifest, problems)
-    phases = compare_phases(root, manifest, problems)
-    counts = compare_counts(root, manifest, problems)
+    """Every prose/source problem for `status_path` under `root`, plus a summary.
 
-    for field in ("baseline_commit", "refreshed_against"):
+    A manifest of the wrong `kind` short-circuits: the one problem names it, rather
+    than burying it under "this other ledger has no baseline_commit" noise.
+    """
+    label = label_of(root, status_path)
+    manifest = tomllib.loads(read_text(status_path))
+    problems: list[str] = []
+    if not require_kind(manifest, label, KIND, problems):
+        return problems, {"phases": 0, "scalars": 0}
+
+    for field in REQUIRED_SCALARS:
+        if not manifest.get(field):
+            problems.append(f"{label}: {field} is missing")
+    if not manifest.get("phase"):
+        problems.append(
+            f"{label}: no [[phase]] rows — a truncated ledger must not pass"
+        )
+
+    scalars = compare_scalars(root, manifest, label, problems)
+    phases = compare_phases(root, manifest, label, problems)
+
+    for field in REQUIRED_SCALARS:
         commit = manifest.get(field)
         if not commit:
-            problems.append(f"docs/status.toml: {field} is missing")
             continue
         ok, code, message = is_ancestor(root, commit)
         if ok:
             continue
-        where = manifest.get("prose", {}).get(field, {}).get("file", "docs/status.toml")
+        where = manifest.get("prose", {}).get(field, {}).get("file", label)
         line = scalars.get(field, (None, None))[1]
         location = f"{where}:{line}" if line else where
         detail = f" ({message})" if message else ""
@@ -294,108 +263,17 @@ def check_manifest(root: Path, status_path: Path) -> tuple[list[str], dict]:
             f"(git merge-base --is-ancestor exited {code}){detail}"
         )
 
-    live = [row for row in manifest.get("counts", []) if row.get("live_check")]
-    summary = {
-        "phases": phases,
-        "counts": counts,
-        "live": live,
-        "recorded": len(manifest.get("counts", [])) - len(live),
-        "scalars": len(scalars),
-        "hints": projection_hints(manifest),
-    }
-    return problems, summary
-
-
-def parse_cargo_log(text: str) -> tuple[dict[str, list[int]], set[str]]:
-    """`({suite: [passed, failed, ignored]}, suites_seen)` for a `cargo test` log."""
-    cleaned = ANSI_RE.sub("", text)
-    totals: dict[str, list[int]] = {"unit": [0, 0, 0], "integration": [0, 0, 0]}
-    seen: set[str] = set()
-    bucket: str | None = None
-    for raw in cleaned.splitlines():
-        running = RUNNING_RE.search(raw)
-        if running:
-            bucket = "unit" if running.group(1) == "unittests" else "integration"
-            seen.add(bucket)
-            continue
-        if DOCTEST_RE.match(raw):
-            bucket = "other"
-            continue
-        result = RESULT_RE.search(raw)
-        if result and bucket in totals:
-            for index in range(3):
-                totals[bucket][index] += int(result.group(index + 1))
-    return totals, seen
-
-
-def check_live(status_path: Path, log_path: Path, box: str) -> list[str]:
-    """Compare the manifest rows for `box` against a parsed cargo log."""
-    problems: list[str] = []
-    manifest = tomllib.loads(status_path.read_text(encoding="utf-8"))
-    rows = [row for row in manifest.get("counts", []) if row["box"] == box]
-    if not rows:
-        problems.append(
-            f"no manifest rows for box {box!r} — refusing a vacuous pass "
-            f"(known boxes: {sorted({r['box'] for r in manifest.get('counts', [])})})"
-        )
-        return problems
-    cargo_rows = [row for row in rows if row.get("suite") == "unit"]
-    if not cargo_rows:
-        problems.append(
-            f"no cargo-test rows for box {box!r} — refusing a vacuous pass"
-        )
-        return problems
-    try:
-        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        problems.append(f"cannot read the cargo log {log_path}: {exc}")
-        return problems
-
-    totals, seen = parse_cargo_log(text)
-    if "unit" not in seen:
-        problems.append(
-            f'{log_path}: no `Running unittests` block — the log is truncated or empty'
-        )
-    if "integration" not in seen:
-        problems.append(
-            f'{log_path}: no `Running tests/` block — the log is truncated or empty'
-        )
-    unit = totals["unit"]
-    integration = totals["integration"]
-    if unit[1] or integration[1]:
-        problems.append(
-            f"{log_path}: the run is red (unit {unit[1]} failed, "
-            f"integration {integration[1]} failed) — refusing to compare it"
-        )
-    for row in cargo_rows:
-        ident = f'{row["key"]} ({box})'
-        for field, got in (("passed", unit[0]), ("failed", unit[1]), ("ignored", unit[2])):
-            if field in row and row[field] != got:
-                problems.append(
-                    f'{row["file"]}: {ident} {field}: '
-                    f"docs/status.toml says {row[field]}, the run says {got}"
-                )
-        if "integration_passed" in row:
-            for field, got in (
-                ("integration_passed", integration[0]),
-                ("integration_failed", integration[1]),
-                ("integration_ignored", integration[2]),
-            ):
-                if field in row and row[field] != got:
-                    problems.append(
-                        f'{row["file"]}: {ident} {field}: '
-                        f"docs/status.toml says {row[field]}, the run says {got}"
-                    )
-    return problems
+    return problems, {"phases": phases, "scalars": len(scalars)}
 
 
 # --------------------------------------------------------------------------
-# --selftest: a hermetic fixture repo, so CI runs the logic without a cargo run
+# --selftest: a hermetic fixture repo, so CI runs the logic without a read of
+# the real records. The suite-count half's cases live in check_baselines.py.
 # --------------------------------------------------------------------------
 
-# The fixture is deliberately a *subset* of the real manifest/schema (two phases,
-# two count rows) with its own values; it exercises the code paths, not the real
-# numbers. Its regexes are written exactly as they appear in the TOML.
+# The fixture is deliberately a *subset* of the real manifest/schema (two phases)
+# with its own values; it exercises the code paths, not the real numbers. Its
+# regexes are written exactly as they appear in the TOML.
 FIXTURE_PLAN = r"""# Fixture plan
 
 **Status:** Phase A **complete** (9/9, 2026-09-01); Phase G **scheduled** (0/7) — later.
@@ -406,21 +284,8 @@ FIXTURE_PLAN = r"""# Fixture plan
 __REFRESH__` (2026-09-02); it is refreshed with every PR.
 """
 
-FIXTURE_AGENTS = r"""# Fixture agents
-
-  - CPU unit, box `dgxspark (aarch64, GB10 sm_121)`, `cargo test --release`, 2026-09-01: **457 passed / 0 failed / 3 ignored** unit + **10 / 0 / 6** integration.
-  - CPU unit, box `x86_64 (CI runner)`, `cargo test --release`, 2026-09-01: **455 passed / 0 failed / 3 ignored** unit + **10 / 0 / 6** integration.
-"""
-
-_FIXTURE_COUNTS_RE = (
-    r'CPU unit, box `(?P<box>[^`]+)`, `cargo test --release`, '
-    r'(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}): '
-    r'\*\*(?P<passed>[0-9]+) passed / (?P<failed>[0-9]+) failed / (?P<ignored>[0-9]+) ignored\*\* unit \+ '
-    r'\*\*(?P<integration_passed>[0-9]+) / (?P<integration_failed>[0-9]+) / (?P<integration_ignored>[0-9]+)\*\* integration'
-)
-
-FIXTURE_TOML = (
-    r"""schema = 1
+FIXTURE_STATUS = r"""schema = 1
+kind = "plan"
 baseline_commit = "__BASE__"
 refreshed_against = "__REFRESH__"
 next = "the Metal round (on a Mac)"
@@ -452,55 +317,7 @@ total = 7
 state = "scheduled"
 file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
 regex = 'Phase G\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
-
-[[counts]]
-key = "cpu-unit"
-box = "dgxspark (aarch64, GB10 sm_121)"
-suite = "unit"
-command = "cargo test --release"
-date = "2026-09-01"
-passed = 457
-failed = 0
-ignored = 3
-integration_passed = 10
-integration_failed = 0
-integration_ignored = 6
-live_check = false
-file = "AGENTS.md"
-regex = '__COUNTS_RE__'
-
-[[counts]]
-key = "cpu-unit"
-box = "x86_64 (CI runner)"
-suite = "unit"
-command = "cargo test --release"
-date = "2026-09-01"
-passed = 455
-failed = 0
-ignored = 3
-integration_passed = 10
-integration_failed = 0
-integration_ignored = 6
-live_check = true
-file = "AGENTS.md"
-regex = '__COUNTS_RE__'
 """
-).replace("__COUNTS_RE__", _FIXTURE_COUNTS_RE)
-
-FIXTURE_LOG = (
-    "\x1b[1m\x1b[92m     Running\x1b[0m unittests src/main.rs (target/release/deps/minfer-abc)\n"
-    "\nrunning 460 tests\n"
-    "test result: ok. 455 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.00s\n"
-    "\n"
-    "\x1b[1m\x1b[92m     Running\x1b[0m tests/conversation_cli.rs (target/release/deps/conversation_cli-abc)\n"
-    "\nrunning 16 tests\n"
-    "test result: ok. 10 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.05s\n"
-)
-
-FIXTURE_LOG_TRUNCATED = (
-    "\x1b[1m\x1b[92m     Running\x1b[0m unittests src/main.rs (target/release/deps/minfer-abc)\n"
-    "test result: ok. 455 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.00s\n"
-)
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -559,34 +376,29 @@ def default_plan(base: str, refresh: str | None = None) -> str:
     return FIXTURE_PLAN.replace("__BASE__", base).replace("__REFRESH__", refresh or base)
 
 
-def default_toml(base: str, refresh: str | None = None) -> str:
+def default_status(base: str, refresh: str | None = None) -> str:
     """The passing fixture manifest for `default_plan`."""
-    return FIXTURE_TOML.replace("__BASE__", base).replace("__REFRESH__", refresh or base)
+    return FIXTURE_STATUS.replace("__BASE__", base).replace(
+        "__REFRESH__", refresh or base
+    )
 
 
 def write_fixture(
     root: Path,
     base: str,
     plan: str | None = None,
-    agents: str | None = None,
-    toml: str | None = None,
+    status: str | None = None,
     refresh: str | None = None,
 ) -> None:
     """Write the fixture tree; `None` keeps the passing default for that file."""
     (root / "docs").mkdir(parents=True, exist_ok=True)
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
     (root / "docs" / "ARCHITECTURE-EXECUTION-PLAN.md").write_text(
         plan if plan is not None else default_plan(base, refresh), encoding="utf-8"
     )
-    (root / "AGENTS.md").write_text(
-        agents if agents is not None else FIXTURE_AGENTS, encoding="utf-8"
+    (root / "scripts" / "status.toml").write_text(
+        status if status is not None else default_status(base, refresh), encoding="utf-8"
     )
-    (root / "docs" / "status.toml").write_text(
-        toml if toml is not None else default_toml(base, refresh), encoding="utf-8"
-    )
-
-
-def _has(problems: list[str], *needles: str) -> bool:
-    return any(all(needle in problem for needle in needles) for problem in problems)
 
 
 def run_selftest() -> int:
@@ -594,7 +406,7 @@ def run_selftest() -> int:
     with tempfile.TemporaryDirectory(prefix="check_status_selftest_") as tmp:
         root = Path(tmp)
         c1, _c2, c3 = build_fixture(root)
-        status = root / "docs" / "status.toml"
+        status = root / "scripts" / "status.toml"
         results: list[tuple[str, bool, str]] = []
 
         def record(name: str, ok: bool, detail: str = "") -> None:
@@ -610,115 +422,66 @@ def run_selftest() -> int:
         problems, _ = check_manifest(root, status)
         record(
             "a mutated plan phase counter fails with file, line and both values",
-            _has(problems, "ARCHITECTURE-EXECUTION-PLAN.md", "phase A done", "'10'", "'9'"),
+            has_problem(problems, "ARCHITECTURE-EXECUTION-PLAN.md", "phase A done", "'10'", "'9'"),
             str(problems),
         )
 
-        # 3. A mutated AGENTS.md count.
-        write_fixture(root, c1, agents=FIXTURE_AGENTS.replace("**455 passed", "**999 passed"))
+        # 3. The other direction: the source edited, the prose left alone.
+        write_fixture(root, c1, status=default_status(c1).replace("done = 9", "done = 8", 1))
         problems, _ = check_manifest(root, status)
         record(
-            "a mutated AGENTS.md count fails with both values",
-            _has(problems, "AGENTS.md", "x86_64 (CI runner)", "'999'", "'455'"),
+            "a mutated scripts/status.toml value fails against the prose",
+            has_problem(problems, "phase A done", "'9'", "'8'"),
             str(problems),
         )
 
-        # 4. The other direction: the source edited, the prose left alone.
-        write_fixture(root, c1, toml=default_toml(c1).replace("done = 9", "done = 8", 1))
+        # 4. A missing commit id must not read as "nothing to check".
+        write_fixture(
+            root, c1, status=default_status(c1).replace('baseline_commit = "' + c1 + '"', "")
+        )
         problems, _ = check_manifest(root, status)
         record(
-            "a mutated docs/status.toml value fails against the prose",
-            _has(problems, "phase A done", "'9'", "'8'"),
+            "a missing baseline_commit fails by name",
+            has_problem(problems, "scripts/status.toml", "baseline_commit is missing"),
             str(problems),
         )
 
-        # 5. A box with no manifest rows (a fabricated box) must not pass vacuously.
-        write_fixture(root, c1)
-        problems = check_live(status, root / "cargo.log", "GB10 sm_121")
+        # 5. A [[phase]]-less manifest must not pass vacuously.
+        write_fixture(
+            root,
+            c1,
+            status="schema = 1\nkind = \"plan\"\nbaseline_commit = \"%s\"\n"
+            "refreshed_against = \"%s\"\n" % (c1, c1),
+        )
+        problems, _ = check_manifest(root, status)
         record(
-            "a box with no manifest rows fails loudly",
-            _has(problems, "no manifest rows for box"),
+            "a manifest with no [[phase]] rows fails",
+            has_problem(problems, "no [[phase]] rows"),
             str(problems),
         )
 
-        # 6. A truncated log (no `Running tests/` block) must not pass.
-        log = root / "cargo.log"
-        log.write_text(FIXTURE_LOG_TRUNCATED, encoding="utf-8")
-        problems = check_live(status, log, "x86_64 (CI runner)")
+        # 6. The sibling ledger handed to this checker: one problem, named.
+        write_fixture(root, c1, status=default_status(c1).replace('kind = "plan"', 'kind = "counts"'))
+        problems, _ = check_manifest(root, status)
         record(
-            "a truncated log fails on the missing integration block",
-            _has(problems, "no `Running tests/` block"),
+            "the counts ledger is refused by name, and alone",
+            has_problem(problems, "kind is 'counts', not 'plan'") and len(problems) == 1,
             str(problems),
         )
 
         # 7. A non-ancestor commit fails the ancestry test and *nothing else*, so
         #    the control differs only in the property under test (gate contract
         #    rule 2): the prose and the source both name the sibling-branch `c3`.
-        write_fixture(root, c1, plan=default_plan(c1, c3), toml=default_toml(c1, c3))
+        write_fixture(root, c1, plan=default_plan(c1, c3), status=default_status(c1, c3))
         problems, _ = check_manifest(root, status)
         record(
             "a non-ancestor commit fails the ancestry test",
-            _has(problems, "refreshed_against", "is not an ancestor of HEAD")
+            has_problem(problems, "refreshed_against", "is not an ancestor of HEAD")
             and len(problems) == 1,
             str(problems),
         )
 
-        # 8. The positive live case, then a live mismatch.
-        write_fixture(root, c1)
-        log.write_text(FIXTURE_LOG, encoding="utf-8")
-        problems = check_live(status, log, "x86_64 (CI runner)")
-        record("a matching cargo log passes --check-live", not problems, str(problems))
-        write_fixture(root, c1, toml=default_toml(c1).replace("passed = 455", "passed = 999"))
-        problems = check_live(status, log, "x86_64 (CI runner)")
-        record(
-            "a live count mismatch fails",
-            _has(problems, "passed", "999", "455"),
-            str(problems),
-        )
-
-        # 9. #207: a recorded row whose CPU twin has moved prints a *non-failing*
-        #    projection hint; a current one prints none. The hint is a projection,
-        #    not a comparison, so the pair is the mutation evidence: same code,
-        #    only the base value differs.
-        moved = {
-            "counts": [
-                {"key": "cpu-unit", "box": "b", "passed": 462},
-                {
-                    "key": "cuda-unit",
-                    "box": "g",
-                    "passed": 548,
-                    "projection_key": "cpu-unit",
-                    "projection_box": "b",
-                    "projection_base_passed": 455,
-                },
-            ]
-        }
-        moved_hints = projection_hints(moved)
-        record(
-            "a moved CPU twin prints a non-failing projection hint (#207)",
-            len(moved_hints) == 1 and "548" in moved_hints[0] and "555" in moved_hints[0],
-            str(moved_hints),
-        )
-        current = {
-            "counts": [
-                {"key": "cpu-unit", "box": "b", "passed": 462},
-                {
-                    "key": "cuda-unit",
-                    "box": "g",
-                    "passed": 555,
-                    "projection_key": "cpu-unit",
-                    "projection_box": "b",
-                    "projection_base_passed": 462,
-                },
-            ]
-        }
-        record(
-            "a recorded row refreshed together with its projection prints no hint",
-            projection_hints(current) == [],
-            str(projection_hints(current)),
-        )
-
-        # 10. `--help` states the honest limit.
+        # 8. `--help` states the honest limit.
         record(
             "--help states the honest limit",
             HELP_LIMIT in build_parser().description,
@@ -740,14 +503,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="check_status.py",
         description=(
-            "Check that the status prose agrees with docs/status.toml (phase "
-            "counters, the next: sentence, the baseline/refreshed commit ids and "
-            "AGENTS.md's suite counts), and optionally that the counts matched a "
-            "cargo log. " + HELP_LIMIT
+            "Check that the execution plan's status prose agrees with "
+            "scripts/status.toml (the phase counters, the next: sentence and the "
+            "baseline/refreshed commit ids). The suite counts are the sibling "
+            "ledger scripts/test-baselines.toml, checked by check_baselines.py. "
+            + HELP_LIMIT
         ),
         epilog=(
-            "Every prose target's file and regex live in docs/status.toml, so this "
-            "script holds no second copy of any value. Edit the source, not the counter."
+            "Every prose target's file and regex live in scripts/status.toml, so "
+            "this script holds no second copy of any value. Edit the source, not "
+            "the counter."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -755,16 +520,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="assert the prose agrees with the source (the default mode)",
-    )
-    parser.add_argument(
-        "--check-live",
-        metavar="CARGO-LOG",
-        help="parse a `cargo test` log and compare the rows for --box",
-    )
-    parser.add_argument(
-        "--box",
-        metavar="NAME",
-        help="the box whose rows --check-live compares (e.g. `x86_64 (CI runner)`)",
     )
     parser.add_argument(
         "--selftest",
@@ -779,14 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--status",
         metavar="FILE",
-        help="the manifest (default: docs/status.toml under --root)",
+        help=f"the manifest (default: {MANIFEST} under --root)",
     )
     return parser
-
-
-def usage_error(message: str) -> None:
-    print(message, file=sys.stderr)
-    raise SystemExit(2)
 
 
 def main(argv: list[str]) -> int:
@@ -794,34 +544,12 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv[1:])
 
     if args.selftest:
-        if args.check or args.check_live or args.box:
-            parser.error("--selftest does not combine with --check/--check-live/--box")
+        if args.check or args.status:
+            parser.error("--selftest does not combine with --check/--status")
         return run_selftest()
 
     root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parent.parent
-    status = Path(args.status).resolve() if args.status else root / "docs" / "status.toml"
-
-    if args.check_live:
-        if not args.box:
-            parser.error("--check-live requires --box")
-        try:
-            problems = check_live(status, Path(args.check_live), args.box)
-        except OSError as exc:
-            usage_error(f"check_status: cannot read {status}: {exc}")
-        if problems:
-            for problem in problems:
-                print(f"check_status: {problem}", file=sys.stderr)
-            print(
-                f"check_status: --check-live failed for box {args.box!r} "
-                f"({len(problems)} problem(s))",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"check_status: the {args.box!r} rows match {args.check_live}")
-        return 0
-
-    if args.box:
-        parser.error("--box is only meaningful with --check-live")
+    status = Path(args.status).resolve() if args.status else root / MANIFEST
 
     try:
         problems, summary = check_manifest(root, status)
@@ -841,14 +569,9 @@ def main(argv: list[str]) -> int:
         return 1
     print(
         f"check_status: prose agrees with {status} "
-        f"({summary['phases']} phases, {summary['counts']} count rows: "
-        f"{len(summary['live'])} live-checkable, {summary['recorded']} recorded "
-        f"measurements); baseline/refreshed commits are ancestors of HEAD"
+        f"({summary['phases']} phases, {summary['scalars']} scalars); "
+        f"baseline/refreshed commits are ancestors of HEAD"
     )
-    # #207: a recorded row whose CPU twin has moved since it was measured is
-    # *printed*, never failed on — the relation is inexact.
-    for hint in summary["hints"]:
-        print(f"check_status: projection hint: {hint}")
     return 0
 
 
