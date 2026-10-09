@@ -8503,7 +8503,8 @@ with an explicit dependency (a separate boundary command buffer that waits on a 
 evidence, or a dated, reproducible negative result with the mechanism.
 
 **The result is negative, and the mechanism is measured** on
-`macbook (macOS 27.0.1, Apple M4 Pro)` at `ad707c7` (2026-10-09). Two conclusions, both with numbers.
+`macbook (macOS 27.0.1, Apple M4 Pro)` at `ad707c7` (2026-10-09), recorded in `9df405d`. Two
+conclusions, both with numbers.
 
 **(1) The #137 divergence is a missing-dependency race, not a kernel perturbation.** The F5 S3 record
 inferred from the then-red baseline that "the extra in-flight command buffer perturbed Metal kernel

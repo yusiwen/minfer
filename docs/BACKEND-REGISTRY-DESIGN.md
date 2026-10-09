@@ -593,7 +593,8 @@ Measured on `macbook (macOS 27.0.1, Apple M4 Pro)` — the F5 S3 record in
 Ticket: [#300] ("true cross-split overlap after #137"). It asked for either a
 measured overlap or a recorded negative result beside the §11.5 note. The result
 is a **negative one**, with the mechanism measured on
-`macbook (macOS 27.0.1, Apple M4 Pro)` at `ad707c7` (2026-10-09).
+`macbook (macOS 27.0.1, Apple M4 Pro)` at `ad707c7` (2026-10-09), recorded in
+`9df405d`.
 
 **The #137 divergence is a missing-dependency race, not a kernel perturbation.**
 §11.5 inferred from the then-red baseline that "the extra in-flight command buffer
