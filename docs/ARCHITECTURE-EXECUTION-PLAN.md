@@ -8391,8 +8391,10 @@ requirement of that bullet — "a device consumer does not block the host" — i
 direction, whose fill is already stream-ordered on the destination pool's own stream (§11.3). The two
 grandfathered bare sites therefore **stay dead in every configuration**, and this PR leaves
 `GRANDFATHERED_BARE` and `docs/dead-code-baseline.toml` unchanged; the stripped oracle confirms it
-below. (c) **True cross-split overlap is still not claimed** — the split loop remains sequential and [#300](https://github.com/yusiwen/minfer/issues/300) owns the measured overlap or the recorded negative result;
-what the deferral buys is that the wait happens where the data is read, not where it was produced.
+below. (c) **True cross-split overlap is still not claimed** — the split loop remains sequential and
+[#300](https://github.com/yusiwen/minfer/issues/300) owns the measured overlap or the recorded negative
+result, delivered in the **F5 S4** record below (the negative result; the wait is still deferred to where
+the data is read, not where it was produced).
 
 **The dead-code ratchet, measured.** `python3 scripts/check_dead_code_annotations.py` reports the
 same **11** grandfathered bare sites (this PR adds no annotation and tightens none), and the stripped
@@ -8491,6 +8493,66 @@ branch takes it (`pb == BackendTag::METAL`), so a CUDA build's order is unchange
 device and CI only compiles the CUDA harness. (c) The 20 red Metal tests on this box were **not** fixed
 and are not claimed to be. (d) The port adds no *cross-split* overlap — the split loop is still
 sequential; the wait is deferred to the consumer read, as on CUDA.
+
+### F5 S4 — true cross-split overlap: the recorded negative result (#300) — **DONE 2026-10-09**
+
+**The ticket.** [#300](https://github.com/yusiwen/minfer/issues/300) is the follow-up the F5 S3 record
+names: after #137 the boundary blit rides the producer's command buffer, so the copy is asynchronous but
+serial with respect to the producer and the consumer. It asked for either a genuinely overlapping copy
+with an explicit dependency (a separate boundary command buffer that waits on a producer event) and
+evidence, or a dated, reproducible negative result with the mechanism.
+
+**The result is negative, and the mechanism is measured** on
+`macbook (macOS 27.0.1, Apple M4 Pro)` at `ad707c7` (2026-10-09). Two conclusions, both with numbers.
+
+**(1) The #137 divergence is a missing-dependency race, not a kernel perturbation.** The F5 S3 record
+inferred from the then-red baseline that "the extra in-flight command buffer perturbed Metal kernel
+execution" (max |Δlogit| ≈ 1.46). Isolated, the pathological first cut — a standalone boundary command
+buffer submitted from `copy_cross` *before* `retire` submits the producer's buffer, with no dependency on
+it — is deterministic: on the real-model gate it reads **max |Δlogit| = 26.718678** at step 0, the same
+value twice. The mechanism is the shared `MpsState` command queue's commit order: the standalone blit
+buffer is committed first, so it reads the producer's `StorageModeShared` source window before the
+producer's kernels wrote it, and the consumer waits on an already-signaled event holding the previous
+forward's bytes. The F5 S3 "staged bytes identical" comparison was stale-to-stale.
+
+**(2) A separate boundary buffer with an explicit dependency is correct — but buys no measurable
+cross-split overlap, so the production design stays.** Committing the boundary blit on its own
+`MTLCommandQueue` with `encodeWaitForEvent` on an event the producer signals at its split end (then
+signalling its own event for the consumer) restores bitwise identity: the real-model gate reads **max
+|Δlogit| = 0** over the prefill + 6-decode loop (twice), counters unchanged —
+`copies=35 waits=35 deferred_waits=35 blocking_host_copies=0 async_host_copies=21 event_syncs=21
+sync_readbacks=0` async against `copies=35 waits=35 blocking_host_copies=21 sync_readbacks=21` sync — and
+the cheap 3-node gate passes (`copies=2 waits=2 deferred=2 blocking=0 async_host=1 event_syncs=1
+sync_readbacks=0`). Cross-split overlap, however, needs a second split to overlap with, and the reachable
+macOS topology has none: the E5 mixed graph (4 of 24 blocks on the device) is a single CPU → Metal → CPU
+sequence, so there is exactly one device→host boundary per forward; its consumer is the host CPU split,
+whose first node reads the dominant staged tensor (the hidden state), so the copy is on the consumer's
+critical path; the other two staged tensors are read within the CPU split's first eight nodes (`add` at
+node 46, `cells` at 52, `attn_span` at 54), so a separate buffer could only overlap a blit of two tiny
+index/window tensors. A device→device pair (Metal→Metal) would have real overlap, and `copy_across`
+early-returns on it while no CUDA device exists on macOS. The boundary blit therefore keeps riding the
+producer's command buffer.
+
+**Reproduction.** Both cuts are `MINFER_300_*`-gated temporary patches to `MetalBackend::cross_enqueue`
+(a standalone `cmd_buffer()` + `submit()` before `retire`; a second queue + `encodeWaitForEvent` /
+`encodeSignalEvent`), neither retained in the tree. Every arm runs the same one command:
+
+```text
+cargo test --release --bin minfer async_cross_copies_never_block_and_stay_bitwise_identical_on_metal -- --ignored --test-threads=1 --nocapture
+```
+
+The production (blit in the producer's buffer) arm is **max |Δlogit| = 0** with the counters above. The
+full write-up is `docs/BACKEND-REGISTRY-DESIGN.md` §11.6.
+
+**Suite counts.** This record is documentation only — no production or test code changed. `cargo test
+--release --no-fail-fast` on `macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-09: **553 passed / 0 failed
+/ 45 ignored** unit + **21 / 0 / 6** integration (the macOS baseline of 2026-10-08, unchanged).
+
+**Honest scope.** The Option A cut was validated in-process (bitwise) and its counters read; the
+*overlap claim* was not measured as a wall-clock win because the structural target is negligible — that
+is the point of the negative result, not a gap in it. The second queue and the explicit event dependency
+are **not retained**: keeping a second queue alive for a copy that cannot overlap the producer and
+overlaps almost nothing else would be complexity without a measured benefit.
 
 ### F6 — Quantizer tooling: convert, quantize, split (#49) — **DONE 2026-09-24**
 
