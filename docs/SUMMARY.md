@@ -48,6 +48,8 @@
 # Compute Graph
 
 - [Compute Graph Design](./COMPUTE-GRAPH-DESIGN.md)
+- [KV Cache Design — cells, format, sessions](./KV-CACHE-DESIGN.md)
+- [Memory Policy — accounting and layer offload](./MEMORY-POLICY-DESIGN.md)
 - [Backends](./BACKENDS.md)
     - [Backend Registry (F4)](./BACKEND-REGISTRY-DESIGN.md)
     - [GPU Safety](./GPU_SAFETY.md)

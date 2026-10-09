@@ -85,6 +85,13 @@ never a pass — and, since it was **run on a Mac 2026-10-09** (`macbook (macOS
 adding one is how a blind spot closes, and the marker is how a not-yet-run one
 stays visible until someone runs it.
 
+### Corollary — the dead-code annotation rules
+
+`AGENTS.md` Core Convention 5 states the one-line rule; this is the full contract.
+Moved here from `AGENTS.md` (which keeps the point-of-use line and links back).
+
+**The non-test build is warning-free, and gated.** `src/main.rs` carries `#![cfg_attr(not(test), deny(warnings))]`, so any new warning fails `cargo build --release` on every platform — and the bin half of `cargo test --release`, which all three build jobs exercise. PR #216 cleared the 40-diagnostic dead-code backlog; this keeps it cleared. The `not(test)` scope is deliberate: the test build's own warnings (unused locals and imports inside test code) are a separate, tracked cleanup, not part of this gate. When code is only reachable in some configuration, silence it at the item with `#[cfg_attr(<cfg>, allow(dead_code))]` and say why — never widen the crate-level gate. The `<cfg>` must name the configuration in which the item is unused — `not(feature = "cuda")` for a device-only reader, `not(test)` for a test-only one — never a blanket `not(test)` when the real gate is a feature ([#243](https://github.com/yusiwen/minfer/issues/243)). A genuinely test-only item names the consuming test (or the feature `cfg`) in that note; an item that **looks** like production code and has no production caller is not silenced but *asked about* — why is there no caller? — because its own comment can claim a caller that a later cleanup deleted while the annotation kept the build green (the #218 orphan; answered in #223). A deliberately retained **deferred** item — a variant, dtype or field the data model can express but no architecture constructs yet — says in its note **what would construct or read it** (a CLI spelling, a kernel, an architecture), so "kept for the vocabulary" is a statement about the design and not a restatement of the lint ([#244](https://github.com/yusiwen/minfer/issues/244)). Both halves of that convention are mechanical since [#254](https://github.com/yusiwen/minfer/issues/254): `scripts/check_dead_code_annotations.py` (CI `check-docs`) rejects a bare `allow` and an annotation without a reason, and the stripped oracle `scripts/check_dead_code_oracle.py` (last step of `test-linux-cpu` / `build-linux-cuda`; the third configuration, `--config macos`, is the plain `cargo check --release` run on a Mac, refused on any other host — [#332](https://github.com/yusiwen/minfer/issues/332)) fails when a new `allow` hides an item rustc reports once every annotation is stripped — compared against `docs/dead-code-baseline.toml`, whose addition is a decision made in the same PR.
+
 ## 2. A control arm must differ in the property under test
 
 A negative control that is rejected by an *earlier* check never exercises the
@@ -507,6 +514,39 @@ left at their template placeholder (a stated `N/A — <reason>` is filled). The
 `pull_request` events only, after the checker's own `--selftest` cases. It reads
 the body through `env:`, so it needs no token and works on a fork PR ([#175],
 [#335]). This is the shape, not the rules: the rules stay stated once, above.
+
+### The doc gates (`check-docs`)
+
+Moved here from `AGENTS.md`, which keeps the two-line pointer.
+
+**Doc status is machine-checked.** `docs/status.toml` is the source of truth for the plan's phase
+counters / `next:` sentence / baseline commits and for the suite counts in [`TEST-BASELINES.md`](./TEST-BASELINES.md);
+`scripts/check_status.py --check` (CI `check-docs`) fails when the prose disagrees, naming the file,
+line and both values — edit *that* file, not a counter. The same job runs `scripts/build_book.sh`
+(pinned mdBook + a sha384-checked Mermaid download) and `scripts/check_docs_links.py`, which fails on
+a relative link whose target does not exist, and `scripts/check_doc_line_anchors.py` (#266), which
+fails on a `path:NNN` anchor whose file or line is gone — and, when the anchor names a backticked
+symbol, on a symbol that has left the file it points at; a bare `:NNN` continuation attaches to the
+nearest *preceding* `path:NNN` on its own doc line and is resolved and range-checked against that
+file the same way, while one that follows no anchor on its line stays silent (#355); the historical
+records whose anchors cite a
+pre-split revision are frozen inside it, one reason apiece, and an exemption that no longer covers a
+failure fails too. Resolving is not pointing, so the same job runs
+`scripts/check_anchor_drift.py` (#344) on `pull_request`: it diffs `HEAD` against the PR's merge base
+(`origin/<base_ref>...HEAD`, the second reason the checkout is `fetch-depth: 0`), maps every anchored
+file's old→new lines, and fails an anchor the range moved without re-pointing — naming it
+`doc:line → target:old (now new)`, and for a bare continuation
+`doc:line (bare continuation) → target:old (now new)`. A cited line the range *deleted* has no image in the map, so it is
+reported for a human instead of guessed, and the same `FROZEN` set exempts the same records. It named
+**73** anchors over #299's range, the 69 its re-point commit fixed plus 4 it missed. It also runs
+`scripts/check_f6_fixtures.py` (#205), which checks the shape of the F6 fixture manifest `docs/f6-fixtures.json`,
+cross-checks every `~/.cache/minfer/f6-src/…` fixture the source tree names against it (and every `.gguf` path a
+recorded producer command names), pins each command's shape and classifies it with `--regenerate --dry-run`
+(#345 re-runs one and re-records what it produced), and whose `--selftest` proves a tampered copy is refused by
+name and digest; the byte half runs where the cache exists, in the F6 gates themselves. **Open doc debt:** [#62](https://github.com/yusiwen/minfer/issues/62)
+(`docs/USAGE.md` after the elastic partition). Test health was [#82](https://github.com/yusiwen/minfer/issues/82),
+**closed**. A finding from a gate run belongs in the records too — a red baseline makes every later
+gate run ambiguous.
 
 ## Honest scope
 
