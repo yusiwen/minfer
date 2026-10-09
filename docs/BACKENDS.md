@@ -159,7 +159,7 @@ must still run the FusionPass.
 - `MINFER_DISABLE_MPS=1` — force the CPU backend on macOS.
 - `MINFER_NO_NEON=1` (aarch64) — drop the CPU NEON layer to scalar (A/B lever).
 - `MINFER_NO_AVX2=1` (x86) — drop the whole CPU quants AVX2 layer to scalar (A/B lever); `MINFER_NO_AVX512=1` drops just the AVX-512/VNNI K-quant dots to AVX2.
-- `MINFER_NO_CUDA_GRAPH=1`, `MINFER_CACHE_TYPE=f32|f16|q8_0` (`q8_0` = CPU only, C4),
+- `MINFER_NO_CUDA_GRAPH=1`, `MINFER_CACHE_TYPE=f32|f16|q8_0` (`q8_0` = packed, on CPU + CUDA + Metal since [#310](https://github.com/yusiwen/minfer/issues/310), C4),
   `MINFER_NO_FUSED_Q8_KV=1` (keep S1's dequantizing read of a packed cache, for the A/B),
   `MINFER_NO_FUSE_QKV` / `MINFER_NO_FUSE_FFN` — per-backend behavior levers.
 - Which backend to expect: the startup banner and `MINFER_TRACE` /
