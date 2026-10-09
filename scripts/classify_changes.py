@@ -24,8 +24,7 @@ Classes and the one rule that makes them safe:
 - `baselines` — `scripts/test-baselines.toml`, read by `check_baselines.py --check`
   in `check-docs` **and** by its `--check-live` in `test-linux-cpu`, so that one job
   must still run.
-- `rust` — everything else, including every path this file has not been taught and
-  the one `docs/` file a *code* job reads (`docs/dead-code-baseline.toml`).
+- `rust` — everything else, including every path this file has not been taught.
 **The unknown path is `rust`.** A path this classifier does not recognise is a
 reason to run the jobs, never to skip them — and so is a range it cannot read (an
 empty `--base`, the all-zero `before` git reports for a first push, a revision that
@@ -62,14 +61,11 @@ DOCS_PREFIXES = ("docs/",)
 DOCS_FILES = ("README.md", "AGENTS.md", "LICENSE")
 
 #: The `docs/` paths a **code** job reads, so the prefix above must not claim them.
-#: Today there is one: the dead-code oracle's accepted-annotation baseline, compared
-#: against rustc's stripped-annotation output in `test-linux-cpu` (`--config cpu`)
-#: and `build-linux-cuda` (`--config cuda`). Every other `docs/**` reader — the
-#: ledgers, the prose targets, the anchors, the book build — runs in `check-docs`,
-#: which is never gated. Moving this file beside its checkers (ADR-0024) deletes the
-#: exception; until then it is a fail-safe, because it runs jobs it could have
-#: skipped (`#461`).
-RUST_DOC_FILES = ("docs/dead-code-baseline.toml",)
+#: Empty, and that is the point: it is the list the audit in the module docstring
+#: produces, and ADR-0024's remedy (move the record beside its readers) is what
+#: keeps it empty. #459 moved the F6 fixture manifest to `tests/fixtures/` and #461
+#: moved the dead-code baseline to `scripts/`, each deleting its entry here.
+RUST_DOC_FILES: tuple[str, ...] = ()
 
 #: The plan's ledger: read by `check_status.py` inside `check-docs`, by nothing else.
 PLAN_LEDGER = "scripts/status.toml"
@@ -204,8 +200,8 @@ FIXTURE_CASES = (
         True,
     ),
     (
-        "the one docs/ path a code job reads",
-        ["docs/dead-code-baseline.toml"],
+        "a checker's own record, beside it (ADR-0024)",
+        ["scripts/dead-code-baseline.toml"],
         True,
         False,
     ),
@@ -269,6 +265,15 @@ def run_selftest() -> int:
             decision["rust"] == want_rust and decision["baselines"] == want_baselines,
             f"got {decision}, wanted rust={want_rust} baselines={want_baselines}",
         )
+
+    # The ratchet behind the exception list: it is empty because the audit found no
+    # `docs/` path a code job reads, and adding one has to be a deliberate edit that
+    # changes this case too (with its justification in the module docstring).
+    record(
+        "no docs/ path is carried as a code-job exception",
+        RUST_DOC_FILES == (),
+        f"RUST_DOC_FILES={RUST_DOC_FILES!r}",
+    )
 
     # The range itself, end to end, in a hermetic repo: a docs commit, then a source
     # commit, then the three fail-safe ranges.
