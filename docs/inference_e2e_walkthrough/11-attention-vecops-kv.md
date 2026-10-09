@@ -99,7 +99,7 @@ and flows into the graph as `attn_scale` (`models/qwen2/graph.rs:93`), landing i
 
 Docs 14/15 run the *same* formulas with different execution models; three deltas to keep in mind so nothing here surprises you later:
 
-- **Storage**: Metal/CUDA may keep the K/V regions in `f16` (`MINFER_CACHE_TYPE=f16`), halving the bandwidth of §2.2's arithmetic. The CPU stores `f32` by default and offers a **packed Q8_0** cache instead (`MINFER_CACHE_TYPE=q8_0`, C4): a cell is a Q8_0 block row — `ceil(n_kv_embd/32 * 34)` bytes instead of `4 * n_kv_embd`, 3.76x smaller measured — with the store quantizing and the attention read dequantizing the window it is about to use (§3.3).
+- **Storage**: Metal/CUDA may keep the K/V regions in `f16` (`MINFER_CACHE_TYPE=f16`), halving the bandwidth of §2.2's arithmetic. The CPU, CUDA and Metal (the last since [#310](https://github.com/yusiwen/minfer/issues/310)) store `f32` by default and offer a **packed Q8_0** cache instead (`MINFER_CACHE_TYPE=q8_0`, C4): a cell is a Q8_0 block row — `ceil(n_kv_embd/32 * 34)` bytes instead of `4 * n_kv_embd`, 3.76x smaller measured — with the store quantizing and the attention read dequantizing the window it is about to use (§3.3).
 - **Shape**: the GPU attention kernels tile the (query, key) matrix and apply the softmax *online* — max and sum accumulate block-by-block instead of one full pass — the "flash attention" trick; the CPU path computes full rows because everything already fits in cache.
 - **Parallelism axis**: CPU splits by head (§3.3); CUDA additionally splits the KV dimension across blocks and reduces (`split-KV`), because a GPU has thousands of threads and only 14–40 heads to give them.
 

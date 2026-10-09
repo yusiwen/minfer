@@ -869,7 +869,7 @@ bandwidth, not memory.
   policy (`resolve`, pure so CI covers the matrix): an unknown value is refused on every
   device — CUDA used to read anything that was not `f16` as f32, which is exactly the
   silent fallback the ticket forbids — and `q8_0` is refused loudly on CUDA and Metal,
-  whose attention kernels address f32/f16 rows. `f16` on CPU stays the documented f32
+  whose attention kernels address f32/f16 rows (both since lifted: CUDA in C4 S2b below, Metal in [#310](https://github.com/yusiwen/minfer/issues/310)). `f16` on CPU stays the documented f32
   (a process whose env is set for a GPU run must not fail a CPU one); the load path
   (`models::load_model_ns`) turns any refusal into a failed load with the reason printed.
 - **Packed rows stay addressable by the C3/C8b machinery.** A cell is rounded up to a
@@ -901,7 +901,7 @@ bandwidth, not memory.
   `minfer: MINFER_CACHE_TYPE=q8_0 is not supported on cuda yet: …`, and a typo
   (`banana`) with `… is not a KV cache type (f32, f16, q8_0); refusing rather than
   silently running with f32`. `ensure_kv` backstops both: a packed width on a non-CPU
-  backend, and a width Q8_0 cannot express, are `Err` where the region is sized.
+  backend, and a width Q8_0 cannot express, are `Err` where the region is sized. (Superseded: CUDA stops refusing it in C4 S2b below, Metal in [#310](https://github.com/yusiwen/minfer/issues/310).)
 
 **Coverage, stated rather than implied.** The packed layout, the parser/policy matrix, the
 store-exactness check, the refusal and the region accounting are unit-tested and run in
@@ -986,7 +986,7 @@ loud. CUDA is the one that matters for throughput, and it is a kernel project ra
 read-path change: `kv_ld4<KV>` and `stride_kv` address *elements*, so a packed cell needs
 byte-based addressing plus a block-dequantizing load in every attention kernel (three window
 modes each), a Q8_0 store, and the fused decode QKV epilogue's own store. Metal stays at G5
-by the round's own decision.
+by the round's own decision. (Superseded: CUDA landed in C4 S2b below, Metal in [#310](https://github.com/yusiwen/minfer/issues/310).)
 
 **C4 S2b — the CUDA Q8_0 kernels: landed 2026-09-24 ([#87](https://github.com/yusiwen/minfer/issues/87)).**
 The subsection below is the plan of record as it was written *before* the kernels; the design
@@ -7289,7 +7289,7 @@ sentence, and `docs/status.toml`'s `next:` no longer says so. What can start on
 the two boxes instead, per the §14 hardware row: on **macbook** the macOS round-2
 tickets tracked in [#333](https://github.com/yusiwen/minfer/issues/333) (the
 Metal-only list and the order, with [#310](https://github.com/yusiwen/minfer/issues/310)
-the last capability gap); on **dgxspark** the open Linux-side tickets —
+since landed — its last capability gap closed; on **dgxspark** the open Linux-side tickets —
 [#200](https://github.com/yusiwen/minfer/issues/200) (the CUDA
 `Op::FusedQkvNorm` kernel), [#212](https://github.com/yusiwen/minfer/issues/212),
 [#354](https://github.com/yusiwen/minfer/issues/354) and
@@ -9327,10 +9327,10 @@ per-engine `kv_format` — **landed in [#316](https://github.com/yusiwen/minfer/
 `offset_sensitivity_is_narrowed_to_multi_query_attention` are **green in the full
 macOS run** (recorded 2026-10-06 at `6b95763`, `docs/METAL-BACKEND-DESIGN.md`
 §7.4). E6's Metal batching default therefore follows the device
-(`chat::batch_mode` answers `Batched` for `Device::Metal`). The one
-deliberately-owed piece is the set-valued `kv_map` read (packed `q8_0` KV and the
-`gathers_attn_map` capability), tracked in
-[#310](https://github.com/yusiwen/minfer/issues/310).
+(`chat::batch_mode` answers `Batched` for `Device::Metal`). The two
+deliberately-owed pieces then were the set-valued `kv_map` read and packed `q8_0` KV; both
+have since landed — the `gathers_attn_map` capability in
+[#362](https://github.com/yusiwen/minfer/issues/362) and the packed read in [#310](https://github.com/yusiwen/minfer/issues/310).
 
 Entry condition: G1–G3 need only a machine that builds Metal (CI's `build-macos`);
 G5's device claims need a Mac. Exit condition: `SUPPORT-MATRIX.md`'s per-backend op

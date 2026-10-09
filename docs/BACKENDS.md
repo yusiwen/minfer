@@ -10,7 +10,7 @@ execute, `docs/COMPUTE-GRAPH-DESIGN.md`) on three interchangeable backends:
 | Platform | any | macOS (Apple GPU) | NVIDIA, **opt-in** `--features cuda` |
 | Assign priority | last (always answers) | first on macOS | second, when built in |
 | Activations | quantized to Q8_0 (Q8_K for K-quant weights) | read as f32 | f32; int8 MMQ for prefill |
-| KV cache | f32 regions, or packed Q8_0 (`MINFER_CACHE_TYPE=q8_0` — C4, 3.76× smaller) | f32 or f16 (`MINFER_CACHE_TYPE=f16`) | f32 or f16 |
+| KV cache | f32 regions, or packed Q8_0 (`MINFER_CACHE_TYPE=q8_0` — C4, 3.76× smaller) | f32, f16 or packed Q8_0 (C4 S2b, [#310](https://github.com/yusiwen/minfer/issues/310)) | f32 or f16 |
 | Async model | synchronous | one `MpsCommandBuffer` per split | stream + CUDA Graph capture/replay |
 | Deep dives | [walkthrough 10](./inference_e2e_walkthrough/10-cpu-matmul-kernels.md), [11](./inference_e2e_walkthrough/11-attention-vecops-kv.md), [CPU optimizations](./CPU_OPTIMIZATIONS.md) | [walkthrough 14](./inference_e2e_walkthrough/14-metal-backend.md), [Metal optimizations](./METAL_OPTIMIZATIONS.md) | [walkthrough 15](./inference_e2e_walkthrough/15-cuda-backend.md), [backend plan](./CUDA-BACKEND-DESIGN.md), [campaign](./CUDA_OPTIMIZATION.md) |
 
@@ -116,8 +116,8 @@ reads the packed blocks directly — the K score is a `Q8_0 × Q8_0` dot against
 query, V accumulates out of the cell, and S1's dequantize-into-a-scratch pass is gone).
 An unknown value is refused on every device, and a backend without a packed-read kernel refuses
 `q8_0` loudly rather than run f32 — the answer is the registry's `reads_packed_kv`, which is **true
-for the CPU (C4 S1/S2a) and CUDA (C4 S2b)** and **false for Metal**, which stays at G5
-([#44](https://github.com/yusiwen/minfer/issues/44); the three C4 items left on
+for the CPU (C4 S1/S2a), CUDA (C4 S2b) and Metal ([#310](https://github.com/yusiwen/minfer/issues/310) enabled Metal's
+packed read, whose attention window rides [#44](https://github.com/yusiwen/minfer/issues/44); the three C4 items left on
 [#87](https://github.com/yusiwen/minfer/issues/87) — the packed fused epilogue, the packed FA prefill
 and the dp4a packed dot — **landed** ([#144](https://github.com/yusiwen/minfer/issues/144) items 1+3, [#186](https://github.com/yusiwen/minfer/issues/186) item 2; the CUDA residual is [#212](https://github.com/yusiwen/minfer/issues/212)). A physical context shift
 (`kv_rm`/`kv_shift`) works on a packed region: the survivors move verbatim and are

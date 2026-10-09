@@ -756,7 +756,7 @@ one layout cannot replay for another. `models::load_model_configured` no longer 
 on `MetalBackend`, stamped from `GraphAllocator::set_kv_format`, and every store/attention dispatch
 takes it as an explicit `f16` argument — the old `metal::KV_F16` `OnceLock` and
 `kv_cache_is_f16`/`set_kv_cache_type` are gone, so all three backends now keep the format per engine.
-(The packed `q8_0` read is still [#310](https://github.com/yusiwen/minfer/issues/310).)
+(Metal reads packed since [#310](https://github.com/yusiwen/minfer/issues/310).)
 
 **Host transfers.**
 

@@ -554,8 +554,8 @@ why: the f16 auto-select multiplies `n_layers × n_kv_embd`), and its assert
 turns a wrong `key_length` fallback into a load-time crash instead of
 silently corrupting attention. The policy `set_kv_cache_type` implements
 (`src/metal/policy.rs`): if `MINFER_CACHE_TYPE` says `f16`/`f32`, obey (since C4 the
-value is parsed strictly on every device — an unknown spelling, or `q8_0`, which
-only the CPU kernels read, fails the load instead of quietly running f32);
+value is parsed strictly on every device — an unknown spelling, or `q8_0` on a
+backend whose attention kernel has no packed read, fails the load instead of quietly running f32);
 otherwise auto-select — f16 (half precision: 2 bytes per value instead of 4)
 when `n_layers × n_kv_embd ≥ 8192`, i.e. models big enough that decode is
 KV-bandwidth-bound (measured −1 ms/token on the 7B at 2K context), f32 for
