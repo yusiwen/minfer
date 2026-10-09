@@ -59,7 +59,7 @@
 #                       audit needs no build; the liveness half is the oracle that
 #                       the two build/test jobs run last.
 #                       It also runs `scripts/check_f6_fixtures.py` (#205): the
-#                       F6 fixture manifest (`docs/f6-fixtures.json`) must be
+#                       F6 fixture manifest (`tests/fixtures/f6-fixtures.json`) must be
 #                       complete and explain every cross-box divergence, every
 #                       `~/.cache/minfer/f6-src/…` fixture the source tree names
 #                       must be an entry, and the checker's own cases prove a

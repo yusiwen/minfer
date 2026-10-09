@@ -239,7 +239,7 @@ fn f6_k_quant_output_runs_within_the_stated_bound() {
 /// **The claim is conditional on the reference's build, and the gate names which
 /// one it is looking at** (issues #334, #342, #349). Three things have to hold at
 /// once — the compiler, the effective `-ffp-contract`, and the llama.cpp
-/// revision — and `docs/f6-fixtures.json` records all three per content
+/// revision — and `tests/fixtures/f6-fixtures.json` records all three per content
 /// (§4.2.2). The gate therefore asks the record first and the bytes second, and
 /// there are five outcomes:
 ///
@@ -322,7 +322,8 @@ fn f6_quantize_encoder_is_byte_identical_to_llamacpp() {
         (Some(b), _) => b.describe(),
         (None, true) => "recorded, but its entry carries no build identity".to_string(),
         (None, false) => {
-            "not recorded (no entry in docs/f6-fixtures.json describes this file)".to_string()
+            "not recorded (no entry in tests/fixtures/f6-fixtures.json describes this file)"
+                .to_string()
         }
     };
     let authoritative_note = match &record.authoritative {
@@ -431,7 +432,7 @@ fn f6_quantize_encoder_is_byte_identical_to_llamacpp() {
                 ),
                 f6_fixtures::ParityVerdict::Unattributable => panic!(
                     "{primary} ({provenance}, build unmatched). The file's digest matches no \
-                     recorded content in docs/f6-fixtures.json, so the mismatch cannot be \
+                     recorded content in tests/fixtures/f6-fixtures.json, so the mismatch cannot be \
                      attributed to a different compiler: a corrupted, replaced or deliberately \
                      perturbed reference matches neither model in exactly the same way. Record \
                      the content first if it is a legitimate build — a reference outside the \

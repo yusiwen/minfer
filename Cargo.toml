@@ -30,7 +30,7 @@ futures-util = "0.3"
 # `io-util`, and cargo unifies the feature for the test build only.
 #
 # `sha2` is test-only for the same reason, and is #205's whole point: the F6
-# fixture manifest (`docs/f6-fixtures.json`) records each cached reference's
+# fixture manifest (`tests/fixtures/f6-fixtures.json`) records each cached reference's
 # content hash, and the gate that consumes a reference verifies it before
 # comparing (`src/tooling/tests/f6_fixtures.rs`). Hashing is not something to
 # hand-write in a test module, and the production dependency graph — which
