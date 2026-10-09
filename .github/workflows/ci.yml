@@ -276,6 +276,17 @@ jobs:
         run: python3 scripts/check_source_layout.py
       - name: The source-layout checker's own pass/fail cases
         run: python3 scripts/check_source_layout.py --selftest
+      # The always-loaded index has a byte cap (#434). `AGENTS.md` is loaded into
+      # every session as workspace instructions, so once it is long enough the
+      # budget truncates it and drops the *other* instruction files entirely —
+      # which is how the global ~/.dsh/AGENTS.md was lost. The cap is a ratchet:
+      # raising it is allowed, but it is a decision taken in the commit that
+      # grows the file, and moving the block to its topic doc is preferred. The
+      # failure names the largest section, so it says what to move.
+      - name: AGENTS.md must stay small enough to be an index
+        run: python3 scripts/check_agents_size.py
+      - name: The AGENTS.md size ratchet's own pass/fail cases
+        run: python3 scripts/check_agents_size.py --selftest
       # #254 Layer 1: the shape of every `allow(dead_code)` — a bare annotation
       # is rejected (the 11 sites that predate the ratchet are grandfathered in
       # the script), a `cfg_attr` must name a cfg, and each annotation carries a

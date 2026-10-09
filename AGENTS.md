@@ -175,4 +175,5 @@ an agent reaches for first.
 `check_docs_links.py`, `check_status.py --check`, `check_doc_line_anchors.py`, `check_anchor_drift.py` and
 `check_f6_fixtures.py`; what each can and cannot prove is in its own `--help` and in
 [`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) ("the doc gates"). Edit `docs/status.toml`, never a counter.
+`check_agents_size.py` also caps **this file** — move a block to its topic doc rather than raise the cap.
 **Open doc debt:** [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md`).
