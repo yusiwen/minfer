@@ -41,9 +41,14 @@
 #                       renders a dead link into the HTML, which is how the docs
 #                       rotted before; `scripts/check_status.py --check` proves the
 #                       plan's phase counters / `next:` sentence / baseline commits
-#                       and AGENTS.md's suite counts agree with docs/status.toml,
-#                       and `--selftest` runs the checker's own cases. The ancestry
-#                       test needs history, so this job fetches with `fetch-depth: 0`.
+#                       agree with `scripts/status.toml`, and
+#                       `scripts/check_baselines.py --check` proves the suite
+#                       measurements agree with `scripts/test-baselines.toml`; each
+#                       binary's `--selftest` runs its own cases. Both ledgers live
+#                       beside the checker that reads them (#455), and each step
+#                       names its ledger, so a rename or a deletion fails the job
+#                       instead of silently disabling a gate. The ancestry test needs
+#                       history, so this job fetches with `fetch-depth: 0`.
 #                       It also runs the source-level CUDA launch-return audit (#162):
 #                       every `<<<>>>` in src/cuda/kernels/*.cu must read its own error
 #                       and carry an injection lever, which needs no GPU.
@@ -163,7 +168,7 @@ jobs:
           set -o pipefail
           cargo test --release 2>&1 | tee /tmp/cargo-test.log
       - name: The x86_64 suite counts must match this run
-        run: python3 scripts/check_status.py --check-live /tmp/cargo-test.log --box 'x86_64 (CI runner)'
+        run: python3 scripts/check_baselines.py --check-live /tmp/cargo-test.log --box 'x86_64 (CI runner)'
       # #254 Layer 2, the default configuration. Deliberately the last step: the
       # scratch copy shares this job's warm target/, so only the crate is
       # rechecked, and nothing below would want the stripped tree.
@@ -251,10 +256,17 @@ jobs:
           fetch-depth: 0
       - name: Check every relative link in the markdown
         run: python3 scripts/check_docs_links.py
-      - name: The status prose must agree with docs/status.toml
+      # The two ledgers are one file each, and each lives beside the checker that
+      # reads it (#455). Every invocation names its ledger explicitly, so a rename
+      # or a deletion is a red job, never a silently disabled gate.
+      - name: The plan's status prose must agree with scripts/status.toml
         run: python3 scripts/check_status.py --check
-      - name: The status checker's own pass/fail cases
+      - name: The plan status checker's own pass/fail cases
         run: python3 scripts/check_status.py --selftest
+      - name: The suite measurements must agree with scripts/test-baselines.toml
+        run: python3 scripts/check_baselines.py --check
+      - name: The suite-baseline checker's own pass/fail cases
+        run: python3 scripts/check_baselines.py --selftest
       # #162: every `<<<>>>` in src/cuda/kernels/*.cu must read its own launch
       # error through minfer_launch_ok/_opt and carry a real-failure injection
       # lever. A source audit needs no GPU, and the CUDA container's python3 is
