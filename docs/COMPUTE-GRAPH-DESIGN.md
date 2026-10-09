@@ -29,16 +29,13 @@ mapping.
 
 ### 1.1 The problem
 
-The pre-rewrite engine computed a forward pass imperatively: a hand-written `forward()` walked the
-layers, dispatched each operation to a GPU "whole layer" fast path or a CPU fallback, and allocated
-scratch buffers per step. That shape had four structural costs:
+The pre-rewrite engine computed a forward pass imperatively, and that shape had four structural
+costs: no reuse across decode steps, fusion hard-wired and invisible, a backend chosen **inside**
+the loop (so a support limitation could silently change the execution path mid-run), and ~620 lines
+of per-architecture loop to rewrite for a new model.
 
-- **No reuse.** Topology was recomputed every decode step, together with the CPU scratch.
-- **No explicit fusion.** Fusion existed (Metal `swiglu_f32`, `attn_bias_rope_store`, batched QKV
-  matmul) but was hard-wired and invisible to the rest of the code.
-- **Backend choice was runtime and per layer.** `layer_gpu()` decided inside the loop, and a support
-  limitation could silently change the execution path mid-run.
-- **New architectures meant rewriting the loop** (~620 lines of `qwen2/forward.rs`).
+Those costs, and the decision they forced, are [ADR-0001](adr/0001-inference-runs-through-one-declarative-compute-graph.md);
+this page assumes it and states what was built instead.
 
 ### 1.2 Goals and outcome
 
