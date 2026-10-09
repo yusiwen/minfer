@@ -39,8 +39,13 @@ refreshed_against = "53b3ace"
 # it. #56 landed F1's AVX2/AVX-512 K-quant dots on an x86 host (2026-10-08), so
 # the `next:` clause now names only the remaining weight-repacking increment. The
 # value is compared *literally* against the plan's `Next: ….**` sentence, so the
-# two must be edited together.
-next = "the macOS round-2 tickets tracked in #333, on macbook (macOS 27.0.1, Apple M4 Pro), and the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121); F1's weight-repacking increment still wants an x86 host"
+# two must be edited together. The macOS round-2 plan ([#333]) closed 2026-10-09 —
+# every §A ticket landed and the §B debt was measured, decided or filed — so the
+# sentence no longer names a Mac lane; the residual fixture work is [#428].
+#
+# [#333]: https://github.com/yusiwen/minfer/issues/333
+# [#428]: https://github.com/yusiwen/minfer/issues/428
+next = "the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121), beginning with #428's three fixture producers, and F1's weight-repacking increment, which still wants an x86 host"
 
 # --- prose locations for the three scalars ----------------------------------
 

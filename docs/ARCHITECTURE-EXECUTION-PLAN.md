@@ -16,7 +16,7 @@ Phase D **complete** (3/3) (**D1 done**: views, multi-output via `split_parts`, 
 F8 done; **F1 waits for an x86 host**); Phase G
 **complete** (7/7) — G1–G7 all landed on a Mac (the KV port G5 and the
 measurement bookend G7 last; [#54](https://github.com/yusiwen/minfer/issues/54) recorded the round's final baseline).
-**Next: the macOS round-2 tickets tracked in #333, on macbook (macOS 27.0.1, Apple M4 Pro), and the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121); F1's weight-repacking increment still wants an x86 host.** The order was
+**Next: the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121), beginning with #428's three fixture producers, and F1's weight-repacking increment, which still wants an x86 host.** The order was
 deliberate: the Metal KV port (G5) came **after** the CUDA arena stopped changing shape
 (C7, C7b, C8), so those semantics were written into Metal once — it landed on a Mac 2026-10-06. Per-ticket evidence is in
 each phase's record and in the §14 open-risks table.
