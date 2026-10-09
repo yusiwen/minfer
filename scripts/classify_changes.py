@@ -187,15 +187,31 @@ def emit(decision: dict[str, bool]) -> None:
 
 #: `(name, paths, rust, baselines)` for `classify` + `decide`; the pair of booleans
 #: is what the workflow's job guards read.
+#:
+#: The two ledger paths are written as **literals**, never as `PLAN_LEDGER` /
+#: `BASELINES_LEDGER`. A case built from the constant moves with it — including the
+#: `./`-normalisation one — so a misspelled constant passes every case while the real
+#: file silently changes class (#466). Written out here, renaming a ledger fails a
+#: named case until this table is updated deliberately.
 FIXTURE_CASES = (
     ("a docs chapter alone", ["docs/ARCHITECTURE.md"], False, False),
     ("README.md and AGENTS.md", ["README.md", "AGENTS.md"], False, False),
     ("the LICENSE", ["LICENSE"], False, False),
-    ("the plan ledger alone", [PLAN_LEDGER], False, False),
-    ("the suite ledger alone", [BASELINES_LEDGER], False, True),
+    (
+        "the plan ledger alone is scripts/status.toml",
+        ["scripts/status.toml"],
+        False,
+        False,
+    ),
+    (
+        "the suite ledger alone is scripts/test-baselines.toml",
+        ["scripts/test-baselines.toml"],
+        False,
+        True,
+    ),
     (
         "the suite ledger beside its prose",
-        [BASELINES_LEDGER, "docs/TEST-BASELINES.md"],
+        ["scripts/test-baselines.toml", "docs/TEST-BASELINES.md"],
         False,
         True,
     ),
@@ -214,7 +230,7 @@ FIXTURE_CASES = (
     ("a deleted docs file", ["docs/old-chapter.md"], False, False),
     (
         "./-prefixed paths are normalised",
-        ["./docs/x.md", "./README.md", "./" + PLAN_LEDGER],
+        ["./docs/x.md", "./README.md", "./scripts/status.toml"],
         False,
         False,
     ),
