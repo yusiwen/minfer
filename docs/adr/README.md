@@ -15,6 +15,7 @@ has exactly one home:
 | The current contract: capabilities, file formats, semantics | the design doc (`docs/KV-CACHE-DESIGN.md`, `docs/COMPUTE-GRAPH-DESIGN.md`, …), which links `Decision: ADR-NNNN` | Yes |
 | Measurements, suite counts, per-ticket history | `scripts/test-baselines.toml`, `docs/TEST-BASELINES.md`, `docs/ARCHITECTURE-EXECUTION-PLAN.md` | Yes |
 | The plan's phase counters, `next:` sentence and baseline commits | `scripts/status.toml`, `docs/ARCHITECTURE-EXECUTION-PLAN.md` | Yes |
+| The recorded provenance of a fixture artifact | `tests/fixtures/f6-fixtures.json` (beside its readers, never in the book tree — ADR-0024) | Yes |
 
 Two rules keep it that way. Both are about **kind**, not about banning a form:
 
@@ -57,7 +58,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 
 | # | Date | Decision | Status |
 |---|---|---|---|
-| [0007](./0007-no-ml-frameworks-every-operator-is-hand-written.md) | 2026-06-24 | No ML frameworks: every operator is hand-written | Accepted |
+| [0007](./0007-no-ml-frameworks-every-operator-is-hand-written.md) | 2026-06-24 | No ML frameworks: every operator is hand-written | Accepted (citation corrected by ADR-0024) |
 | [0013](./0013-cpu-quantizes-activations-device-reads-f32.md) | 2026-06-24 | The CPU quantizes activations to `Q8_0`; a device reads f32 | Accepted |
 | [0008](./0008-gpu-safety-bounded-waits-and-runtime-limits.md) | 2026-08-02 | GPU safety: bounded waits, no early return past a barrier, runtime device limits | Accepted |
 | [0001](./0001-inference-runs-through-one-declarative-compute-graph.md) | 2026-08-21 | Inference runs through one declarative compute graph | Accepted (citation corrected by ADR-0022) |
@@ -75,11 +76,12 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0018](./0018-the-grammar-mask-is-one-pipeline-stage.md) | 2026-09-24 | The grammar mask is one stage inside the single sampler pipeline | Accepted |
 | [0019](./0019-a-chat-template-that-cannot-render-refuses-the-load.md) | 2026-09-24 | A chat template that cannot be rendered refuses the load | Accepted |
 | [0006](./0006-kv-format-is-a-per-engine-gate.md) | 2026-09-25 | The KV storage format is a per-engine gate, not a process-wide global | Accepted |
-| [0020](./0020-a-quantized-file-is-byte-identical-or-wrong.md) | 2026-09-27 | A quantized file is byte-identical to `llama-quantize`, or it is wrong | Accepted |
+| [0020](./0020-a-quantized-file-is-byte-identical-or-wrong.md) | 2026-09-27 | A quantized file is byte-identical to `llama-quantize`, or it is wrong | Accepted (citation corrected by ADR-0024) |
 | [0021](./0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) | 2026-09-27 | bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32 | Accepted |
 | [0012](./0012-device-first-layering-and-no-premature-common.md) | 2026-10-04 | Device is the first axis, the layer the second — and no premature `common` | Accepted |
 | [0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md) | 2026-10-09 | A defect in a frozen ADR is corrected by a new ADR, not by editing it | Accepted (corrected by ADR-0023) |
 | [0023](./0023-the-machine-ledgers-live-beside-their-checkers.md) | 2026-10-09 | Each machine ledger lives beside its checker, one per prose target | Accepted |
+| [0024](./0024-a-machine-read-record-is-not-book-content.md) | 2026-10-09 | A machine-read record is not book content | Accepted |
 
 ## The template
 
