@@ -268,7 +268,7 @@ scan a free list for an exact byte-length match and otherwise allocate fresh.
 2. **No size classes / no rounding.** Because matching is exact, a workload
    touching *k* distinct activation shapes ends up with *k* sets of live
    buffers. The pool is a per-`GraphCache` high-water mark that never shrinks
-   (documented as accepted debt, `CUDA-BACKEND-DESIGN.md:495`) — but that was
+   (documented as accepted debt, `CUDA-BACKEND-DESIGN.md:447`) — but that was
    reasoned about for a fixed-shape CLI run, not for a server whose prompt
    lengths vary per request. **E4 S2 (2026-09-23)** rounds every pooled
    activation to its class, so shapes inside one class share a buffer across
