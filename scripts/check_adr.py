@@ -13,6 +13,13 @@ notice:
    `Superseded by ADR-0015` requires `0015` to exist, to have a *higher* number,
    and to name it back in `Supersedes:`. That back-link is what makes "the
    decision changed" visible from the newer record as well as the older one.
+3. **A path citation is either resolvable or pinned with a reason.** An ADR is
+   immutable, so a path it cited can legitimately stop existing — a file moves, a
+   layout is split, a rejected option was never created. `scripts/adr-citations.toml`
+   records that set (`(adr, path)`, never a line number, which drifts on any edit
+   above it), so the checker can tell history from staleness: a *new* unresolvable
+   citation fails, a pinned one passes, and an entry nothing cites any more fails so
+   the ledger cannot rot (ADR-0027).
 
 The boundary the corpus itself rests on is not checkable here and is stated in
 `docs/adr/README.md`: an ADR holds the decision and its rationale, never the
@@ -36,6 +43,7 @@ import argparse
 import re
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 NAME = re.compile(r"^(\d{4})-([a-z0-9][a-z0-9-]*)\.md$")
@@ -45,6 +53,20 @@ STATUS = re.compile(r"^(Proposed|Accepted|Rejected|Superseded by ADR-(\d{4}))$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 REF = re.compile(r"ADR-(\d{4})")
 REQUIRED_SECTIONS = ("## Context", "## Decision", "## Alternatives considered", "## Consequences")
+
+#: Repository-rooted path shapes an ADR may cite. A token carrying a wildcard, a
+#: placeholder or a trailing `/` is a pattern or a directory, not a citation.
+CITATION = re.compile(
+    r"`((?:src|docs|scripts|tests|\.github)/[A-Za-z0-9_./+-]+"
+    r"|AGENTS\.md|README\.md|Cargo\.toml)(?::\d+(?:-\d+)?)?`"
+)
+CITATION_KINDS = (
+    "historical-before-state",
+    "corrected-elsewhere",
+    "named-in-the-move",
+    "rejected-alternative",
+)
+LEDGER = ("scripts", "adr-citations.toml")
 
 
 class Adr:
@@ -73,6 +95,42 @@ class Adr:
 
 def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def citations(text: str) -> list[str]:
+    """The repository paths an ADR cites; patterns and directories are not citations."""
+    out: list[str] = []
+    for m in CITATION.finditer(text):
+        token = m.group(1).rstrip(".")
+        if "*" in token or "<" in token or "{" in token or token.endswith("/"):
+            continue
+        out.append(token)
+    return out
+
+
+def load_citation_ledger(root: Path) -> tuple[dict[tuple[str, str], str], list[str]]:
+    """`(adr, path) -> kind`, plus any problem with the ledger's own shape."""
+    path = root.joinpath(*LEDGER)
+    rel = path.relative_to(root)
+    if not path.is_file():
+        return {}, [f"{rel}: missing — every unresolvable citation must be pinned (ADR-0027)"]
+    entries: dict[tuple[str, str], str] = {}
+    problems: list[str] = []
+    for i, entry in enumerate(tomllib.loads(path.read_text(encoding="utf-8")).get("citation", []), 1):
+        adr, token = entry.get("adr"), entry.get("path")
+        kind, reason = entry.get("kind"), entry.get("reason")
+        if not (adr and token and kind and reason):
+            problems.append(f"{rel}: entry {i} needs all of adr, path, kind and reason")
+            continue
+        if kind not in CITATION_KINDS:
+            problems.append(
+                f"{rel}: entry {i} has kind {kind!r}, not one of {', '.join(CITATION_KINDS)}"
+            )
+        key = (adr, token)
+        if key in entries:
+            problems.append(f"{rel}: {adr} {token} is pinned twice")
+        entries[key] = kind
+    return entries, problems
 
 
 def index_table_row(index_text: str, name: str) -> str | None:
@@ -219,6 +277,29 @@ def check(root: Path) -> int:
                     f"`ADR-{adr.file_number}` — a correction is visible from both ends"
                 )
 
+    # every path citation resolves, or is pinned in the ledger with a reason (ADR-0027)
+    ledger, ledger_problems = load_citation_ledger(root)
+    problems.extend(ledger_problems)
+    cited: set[tuple[str, str]] = set()
+    for adr in adrs:
+        rel = adr.path.relative_to(root)
+        for token in citations(adr.text):
+            if (root / token).exists():
+                continue
+            key = (adr.file_number or "", token)
+            cited.add(key)
+            if key not in ledger:
+                problems.append(
+                    f"{rel}: cites `{token}`, which does not resolve — point at the kind of home, "
+                    f"date the citation, or pin it in {'/'.join(LEDGER)} with a reason (ADR-0027)"
+                )
+    for number, token in sorted(ledger):
+        if (number, token) not in cited:
+            problems.append(
+                f"{'/'.join(LEDGER)}: pins {number} `{token}`, but no ADR cites it any more — "
+                f"drop the entry (the ledger only has to keep new dead paths out)"
+            )
+
     if problems:
         for p in problems:
             print(f"check_adr: {p}")
@@ -265,10 +346,13 @@ def _write(root: Path, name: str, text: str) -> None:
 
 
 def _fixture(root: Path, adrs: dict[str, str], readme: str = FIXTURE_README,
-             summary: str = "# Summary\n\n- [ADR index](./adr/README.md)\n") -> None:
+             summary: str = "# Summary\n\n- [ADR index](./adr/README.md)\n",
+             citations: str = "") -> None:
     for name, text in adrs.items():
         _write(root, name, text)
     _write(root, "README.md", readme)
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
+    (root / "scripts" / "adr-citations.toml").write_text(citations, encoding="utf-8")
     (root / "docs" / "SUMMARY.md").write_text(summary, encoding="utf-8")
 
 
@@ -384,6 +468,43 @@ def selftest() -> int:
         adrs, readme = two_adr("ADR-0009", corrected_row)   # no such target
         _fixture(root, adrs, readme=readme)
         expect("a Corrects target that does not exist fails", check(root) == 1)
+
+    def cited_adr(path: str) -> str:
+        return FIXTURE_ADR.replace(
+            "## Decision\n\ndecided", f"## Decision\n\ndecided, and the file lives at `{path}`"
+        )
+
+    def pinned(adr: str, path: str, kind: str = "historical-before-state") -> str:
+        return (f'[[citation]]\nadr = "{adr}"\npath = "{path}"\nkind = "{kind}"\n'
+                f'reason = "pin for the selftest"\n')
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": cited_adr("docs/gone.md")})
+        expect("an unpinned unresolvable citation fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": cited_adr("docs/gone.md")},
+                 citations=pinned("0001", "docs/gone.md"))
+        expect("a pinned unresolvable citation passes", check(root) == 0)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 citations=pinned("0001", "docs/gone.md"))
+        expect("a pinned citation no ADR cites any more fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": cited_adr("docs/gone.md")},
+                 citations=pinned("0001", "docs/gone.md", kind="because"))
+        expect("an unknown citation kind fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": cited_adr("docs/adr/NNNN-*.md")})
+        expect("a wildcard path pattern is not a citation", check(root) == 0)
 
     failed = 0
     for name, ok, note in cases:
