@@ -1028,3 +1028,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0015](adr/0015-the-offload-auto-fit-takes-a-prefix.md) — The offload `auto` fit takes a prefix, not a knapsack
 - [ADR-0016](adr/0016-a-failed-device-query-is-not-a-zero-budget.md) — A failed device-memory query is not a zero budget
 - [ADR-0032](adr/0032-the-packed-kv-staging-window-is-f32.md) — The packed-KV staging window is f32, not f16
+- [ADR-0036](adr/0036-bf16-gets-its-own-device-kernels.md) — bf16 weights get their own device kernels, not a dtype flag on the f16 ones
