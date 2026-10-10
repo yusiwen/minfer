@@ -986,46 +986,19 @@ on Linux the Metal-only tests self-skip and the isolation binaries are empty.
 
 ### 7.4 The macOS suite baseline (#298, recorded by [#54] at the round's end)
 
-The macOS suite was **red for the whole Metal round**; this is the dated,
-enumerated baseline a later Mac gate run **diffs against — anything new is a
-regression**. Taken at `6b95763` (the round's final master), 2026-10-06, on
-`macbook (macOS 27.0.1, Apple M4 Pro)`.
+The **current** machine-checked baseline is not on this page. It is `docs/TEST-BASELINES.md` ("macOS
+unit", box `macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-08) backed by the `macos-unit` row of
+`scripts/test-baselines.toml`, together with that page's macOS real-model row. Edit that ledger, never a
+counter. A later Mac gate run diffs against it: anything new is a regression.
 
-- **unit** `cargo test --release --no-fail-fast`: **531 passed / 0 failed / 43
-  ignored** — green. (The live count is **541 / 0 / 44** as of [#362] on
-  2026-10-07: [#329] added the Metal dispatch-refusal gate, [#299] the
-  weights-charged E4 gate, and [#362] the two Metal `kv_map` window gates plus the
-  pure `every_device_gathers_the_attn_map`; the enumeration below is this round's
-  record at `6b95763`.)
-- **integration**: **21 passed / 0 failed / 6 ignored**.
-- **real-model** (`PARALLEL=0 scripts/real_model_gates.sh`, serial), both cached
-  models (0.5B f32 KV and Qwen3-0.6B f16 KV): **44 passed / 0 failed** each —
-  **no residual**. The set is 44 because [#315]'s macOS-only `#[ignore]`d
-  windowed-prefill harness joined it (42 → 43). The failure this section used to
-  record,
-  `server::batch::tests::kv_sharing::a_store_inside_a_shared_prefix_takes_a_private_row`,
-  now passes: [#362] gave Metal the set-valued `kv_map` gather
-  (`Device::gathers_attn_map`, the sibling `kernel_gqa_attn_map_f32/_f16`), so a
-  shared-prefix slot reads the donor's rows in place instead of copying them.
+**The round-era record is in the plan.** The round's final master was `6b95763`; the round's *start* was
+`97823e4`, where the same suite had 21 failures, and the enumeration that followed — the three root causes
+they decomposed into, the two order-dependent flakes, and the eleven-day `build-macos` blind spot that hid
+the macOS test target from `cdf41b2` to `4add59f` — is the plan's record: G7's row (#54) for the baseline,
+the #298/#231 suite enumeration for the failures, and the #303 record for the blind spot.
 
-**History (so the green is legible).** At the round's start (`97823e4`, after
-[#137]) the same unit suite was **21 failures**. Three root causes explained them:
-**twelve were one production bug** — `Op::KvcacheStore` derived `nt` from the
-class-rounded pool length instead of the logical node length ([#305], PR [#312]);
-the other two were [#317] (an f32 weight silently ran the Q4_0 matmul kernel on
-Metal, PR [#320]) and [#314] (the flash-prefill partial KV block overlapped the
-previous one, so any >64-token prefill drifted, PR [#322]). Two further failures
-were **order-dependent flakes** — `graph::op_matrix::matrix_cases_match_their_reference`
-(Metal's op-matrix column depended on another test having initialized `MpsState`)
-and `models::qwen2::graph::tail_tests::cuda_conversation_multiturn_reuse` (passed
-alone 3/3 but failed in the full run) — both green in the full run at `6b95763`
-after [#317]'s Metal engine isolation work; they are recorded here as the
-historical class-(c) entries rather than left to reappear. [#298] is the ticket
-that asked for this enumeration. One more entry belongs here because it explains the round's
-*finding* window: an earlier CI blind spot hid the macOS test target for **eleven days** — `cargo
-build` does not compile `#[cfg(test)]`, so the pre-F4 `Tag::Metal` spelling (`cdf41b2`, 2026-09-24)
-left the macOS test binary uncompilable until `4add59f` (2026-10-05) with no CI signal
-([#303], fixed by making `build-macos` run `cargo test --release --no-run`).
+The purpose is unchanged: a Mac gate run compares against a **dated** baseline, so a green suite cannot
+hide a new failure. Only the baseline's home moved.
 
 [#54]: https://github.com/yusiwen/minfer/issues/54
 [#298]: https://github.com/yusiwen/minfer/issues/298
