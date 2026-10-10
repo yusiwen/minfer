@@ -18,6 +18,14 @@
 > ⚠️ **The §0 progress table is the single source of truth for tracking**; §1-§6
 > are the detailed explanations behind it. Update §0 first before changing code.
 >
+> ⚠️ **Commit hashes in this document predate a repository history rewrite and do not resolve.**
+> Measured on 2026-10-10: **44 of the 47** hash-like tokens here fail `git cat-file -t`, and the three
+> that pass are not this repository's commits anyway (llama.cpp's own `c479922ac` and `88b47a755`, and
+> an AppleClang version). They are kept as history, not as citations. Subject-matched equivalents from the
+> current history — each verified with `git cat-file -t` — are listed in
+> [`METAL-BACKEND-DESIGN.md`](METAL-BACKEND-DESIGN.md) §5.2; cite the equivalent **and** that section
+> together, and treat a bare hash in this file as a pre-rewrite label rather than a locator.
+>
 > 📌 **Compute-graph era note (2026-08-21+, Phase 6)**: inference now runs through
 > the declarative compute graph (`src/graph/`, `MetalBackend`), which dispatches
 > these kernels **per op** instead of the old whole-layer `layer_gpu`. **Every
@@ -277,7 +285,7 @@ Until then this is a decision, not an oversight.
 
 ### ✅ Done
 
-| # | Item | Measured effect | Commit |
+| # | Item | Measured effect | Commit (pre-rewrite) |
 |---|---|---|---|
 | 1 | Metal backend foundation + 4 correctness fixes (RoPE freq_scale / output_b / softmax max / stack array) | Qwen2-0.5B 130→334 t/s | `2473981` / `26f0e4d` (early; TODO-trace) |
 | 2 | Q5_K formula (unsigned) + qh index fix | Q5_K_M CPU/GPU output correct | pre-`3f23560` (TODO-trace) |
@@ -643,7 +651,7 @@ on the ≤k survivors).
 
 ### 3.3 Decode optimizations (GPU)
 
-| Item | Effect | Commit |
+| Item | Effect | Commit (pre-rewrite) |
 |---|---|---|
 | Fused QKV + FFN gate/up (nt==1 single matmul/group) | ~5 % decode | `6f0c847` |
 | KV-parallel split attention (2-pass online-softmax) | ~32 % decode | `b3d4c7a` |
@@ -966,7 +974,7 @@ The compute graph is now the inference path (Phase 6). Kernel-level parity work
 is complete (§0); the remaining gap is **wiring already-tested kernels into
 `MetalBackend`** — see §0.1 for the status table and measured numbers.
 
-| # | Item | Status | Approach / Result | Commit |
+| # | Item | Status | Approach / Result | Commit (pre-rewrite) |
 |---|---|---|---|---|
 | G1 | **Attention: wire the fast kernels** | ✅ **done** | per-op `Attn` dispatch: nt==1 → `flash_attn_enabled(hd)` → `gqa_attn_flash` (chunked `MINFER_ATTN_CHUNKS`) else `gqa_attn_split_f32` else classic; nt>1 → hd 64/128 + `prefill_flash_enabled(hd)` → `attn_flash_prefill` else `matmul_attn_enabled()` → `attn_parallel_prefill` else classic. Gated like the old path (`MINFER_NO_FLASH`/`MINFER_NO_SPLIT_ATTN`/`MINFER_NO_PREFILL_FLASH`/`MINFER_NO_MATMUL_ATTN`). Decode KV-growth closed: 0.5B KV206 ~122 → **~256 t/s (2.1×)**, 7B ~32.5 → **~49 t/s**; greedy byte-identical | `32b0d03` |
 | G2 | **RMSNorm: 256-thread kernel** | ✅ **done** | `RmsNorm` dispatches `rms_norm_256` when `rms_norm_256_enabled()` (#16), falls back to the 32-thread kernel | `32b0d03` |
@@ -1023,7 +1031,7 @@ the relevant §3 section → update the §1 gap numbers.
 
 ### 5.3 Tested-and-rejected ideas (with commits)
 
-| Idea | Result | Commit |
+| Idea | Result | Commit (pre-rewrite) |
 |---|---|---|
 | Parallel command buffers (A1) | regressed (encode already hidden), reverted | `b1256d5` |
 | nt==1 matmul full-block matvec rewrite | at bandwidth floor, not integrated | — |
