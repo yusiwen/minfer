@@ -730,9 +730,8 @@ CParams.gpu = metal_on || cuda_on
   `MpsState::weights_bytes` sums it (recovering a poisoned lock rather than reporting `0`, the CUDA
   twin); `MetalBackend::weights_bytes` forwards it, so `weights + pooled + request > budget` is the
   one comparison on Metal too. Until #299 the trait-default `0` let the E4 gate ignore the resident
-  weights the E5 `auto` fit already charged from the GGUF index — on the measured Mac a 7B Q4_K_M's
-  ~4.4 GiB against a 38 339 MiB `recommendedMaxWorkingSetSize` (the gate could admit the weights
-  more than the pool it protects). The gate is
+  weights the E5 `auto` fit already charged from the GGUF index — it could admit weights against a
+  budget that never counted them. The recorded Mac measurement is in the plan's #299 entry. The gate is
   `graph::alloc::tests::budget::metal_registered_weights_are_charged_in_the_budget_gate`; with
   `weights_bytes` forced back to `0` its budget refusal does not happen and the gate fails at the
   `unwrap_err`. The per-weight extent is `tensor.data().len()`: 2 B/element for f16/bf16, the block
@@ -789,59 +788,42 @@ One `MpsCommandBuffer` per split, submitted at boundaries, is the whole executio
    - **KV-store bound (#38, gap-table G1).** Every Metal arm that writes the persistent K/V region
      — `KvcacheStore` (row = `cells`), `FusedQKV` and `FusedQkvNorm` (row = `positions`) — reads the
      small `StorageModeShared` index buffer back and returns `Err` naming the offending cell and the
-     region's `n_ctx` *before* any dispatch (`MetalBackend::check_kv_store_rows`). The allocator
-     already bounds the same input on the `fill_input_i32` path
-     (`GraphAllocator::check_positions_bound`), so the arm guard closes the fill paths that do not go
-     through it; a kernel-side range check would be a *silent* no-write, which this rule forbids. The
-      gate `metal_kvcache_store_refuses_a_cell_past_the_arena` drives the real `KvcacheStore` dispatch
-      with an out-of-range cell written through the generic f32 `fill_input` (bypassing the
-      allocator's i32-only check), so it fails if the arm stops guarding. Two scope notes: the check
-      compares against the layer region's `n_ctx`, which is **not** the same number the allocator uses
-      when a per-layer `n_ctx` is smaller than the arena's `max` — that path stays the allocator's; and
-      the `FusedQKV`/`FusedQkvNorm` arms share the helper but have **no dispatch gate of their own**, so
-      their guard is covered only by the shared helper's mutation.
+     region's `n_ctx` *before* any dispatch (`MetalBackend::check_kv_store_rows`). A kernel-side range
+     check would be a *silent* no-write, which this rule forbids. The allocator bounds the same input on
+     the `fill_input_i32` path (`GraphAllocator::check_positions_bound`), so the arm guard closes the
+     fill paths that bypass it. Gate: `metal_kvcache_store_refuses_a_cell_past_the_arena`. Scope: the
+     check compares against the layer region's `n_ctx`, **not** the allocator's arena `max` when a
+     per-layer `n_ctx` is smaller; and the `FusedQKV`/`FusedQkvNorm` arms share the helper but have no
+     dispatch gate of their own. Record: the plan's #38 entry.
    - **Decode-fusion shape guards (#39, gap-table G2).** The three decode-only fused arms —
      `FusedFFN`, `FusedQKV`, `FusedQkvNorm` — refuse a non-decode shape (`nt != 1`) with an `Err`
      naming the node and the observed `nt`, and the check runs **before** the weight lookup (shape
      validation is weight-independent and cheaper, so a bad shape on a weightless node reports the
      shape, not the missing weight; this matches CUDA's `FusedQKV`/`QkvBiasRopeStore` order). Before
-     #39 the arms asserted this with `debug_assert!`, which a **release** build compiles out and then
-     dispatches a shape the kernel does not handle — exactly the asymmetry CUDA never had. The gates
-      `metal_fused_ffn_refuses_nt_other_than_one`, `metal_fused_qkv_refuses_nt_other_than_one` and
-      `metal_fused_qkv_norm_refuses_nt_other_than_one` drive each arm through the real
-      `BackendScheduler::execute` with `nt == 2` and assert the message names the node and the `nt`
-      (`src/graph/metal_backend/tests/fusion_shape.rs`).
+     #39 the arms asserted this with `debug_assert!`, which a **release** build compiles out — the
+     asymmetry CUDA never had. Gates: `metal_fused_ffn_refuses_nt_other_than_one`,
+     `metal_fused_qkv_refuses_nt_other_than_one`, `metal_fused_qkv_norm_refuses_nt_other_than_one`
+     (`src/graph/metal_backend/tests/fusion_shape.rs`). Record: the plan's #39 entry.
    - **Norm-weight guards (#40, gap-table G3).** `Op::RmsNorm` / `Op::QkNorm` no longer fall through
      to the weightless `rms_norm` kernel when the gain cannot be resolved. Both `None` meanings —
-     `NormMeta::weight_name` absent, or a set name the device never registered — are a *missing
-     gain*, and the old path produced plausible-looking output from a wrong computation, the failure
-     mode this section forbids. Both arms now call `MetalBackend::norm_weight`, which returns `Err`
-     naming the node and the missing tensor (the CUDA twin is `CudaBackend::norm_weight`). No
-     supported producer (`models/qwen2`, `models/qwen3`) builds a weightless norm, so there is no
-     legitimate path to preserve and the unregistered-name case is exactly the assignment mistake the
-     guard must catch. The gates `metal_rms_norm_refuses_a_weight_not_on_gpu`,
-     `metal_rms_norm_refuses_a_weightless_node` and `metal_qk_norm_refuses_a_weight_not_on_gpu` drive
-     the arms through the real `BackendScheduler::execute`
-     (`src/graph/metal_backend/tests/norm_weight.rs`). Two scope notes: the CPU arm keeps its
-     `None => rms_norm_f32` fall-through (`src/graph/cpu_backend.rs`), untouched because #40 is a Metal
-     ticket — CPU is exposed to the same weightless computation; and the harness that reported it
-     (`src/graph/op_matrix.rs`) registered weights on `CudaState` but not on `MpsState`, so its Metal
-     norm cells had always run weightless — it now registers per device, which is what makes the gate
-     exercise the real kernel.
+     `NormMeta::weight_name` absent, or a set name the device never registered — are a *missing gain*,
+     and the old path produced plausible-looking output from a wrong computation, the failure mode this
+     section forbids. Both arms call `MetalBackend::norm_weight`, which returns `Err` naming the node
+     and the missing tensor (the CUDA twin is `CudaBackend::norm_weight`); no supported producer
+     (`models/qwen2`, `models/qwen3`) builds a weightless norm, so there is no legitimate path to
+     preserve. Gates: `metal_rms_norm_refuses_a_weight_not_on_gpu`,
+     `metal_rms_norm_refuses_a_weightless_node`, `metal_qk_norm_refuses_a_weight_not_on_gpu`
+     (`src/graph/metal_backend/tests/norm_weight.rs`). Scope: the CPU arm keeps its `None =>
+     rms_norm_f32` fall-through (`src/graph/cpu_backend.rs`) — untouched, since #40 is a Metal ticket —
+     so CPU remains exposed to the same weightless computation. Record: the plan's #40 entry.
    - **KV-store row count (#305).** `Op::KvcacheStore` derives `nt` from the K input's **logical**
-     length (`BufRef::len`), not `self.pool[id].length()`: the pool allocates at the E4 S2 size
-     class, so the physical length over-counts `nt` whenever `nkt * nt` is not itself a class size
-     and the store reads `cells` past the filled prefix into the class's uninitialised tail, writing
-     those garbage rows into the arena. On a Mac this corrupted the KV region at `nt = 12` and
-     `nt = 30` (nt = 8, 16 are class sizes and were unaffected). The five
-     `metal_attn_*`/`metal_store_*` fixtures in `src/graph/metal_backend/tests.rs` exposed it once
-     their input fill was moved onto the production entry point (they had first panicked in the CPU
-     `decode_window` reference on a zero `attn_span`); the same root cause is why
-     `graph_metal_layer0_isolation` (#301) and `fused_qkv_matches_unfused_decode` (#302) were red,
-     and both pass with it. The other `self.pool[..].length()` uses were audited with it and are
-     harmless: `Silu`/`Add`/`Mul`/`QkNorm` over-process their own output padding (writing the class's
-     tail, which nothing reads), and `FusedQKV`/`FusedQkvNorm` slice to the rounded length but read only
-     `p[0]` for the concat — only a *store* writes the over-counted rows into an arena other nodes read.
+     length (`BufRef::len`), not `self.pool[id].length()`: the pool allocates at the E4 S2 size class,
+     so the physical length over-counts `nt` whenever `nkt * nt` is not itself a class size, and the
+     store would read `cells` past the filled prefix into the class's uninitialised tail and write those
+     garbage rows into an arena other nodes read. The other `self.pool[..].length()` uses were audited
+     and are harmless: `Silu`/`Add`/`Mul`/`QkNorm` over-process their own output padding, and
+     `FusedQKV`/`FusedQkvNorm` slice to the rounded length but read only `p[0]` for the concat. Record:
+     the plan's #305 entry.
 6. **`gpu_abort` for configurations the GPU path cannot run** — dimension misalignment, device-limit
    overruns, kernel-array overflow: print the actual values and exit.
 7. **Recurrence playbook** — reproduce with one app and a bounded `-n`; bisect with `MINFER_GEMM=0`
