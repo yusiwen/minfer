@@ -846,7 +846,7 @@ The hard rules live in `docs/GPU_SAFETY.md` (CUDA section); this is how the back
    cleared (and reported) any latch that predates the launch. The sync poll is the backstop for a
    *missed* site, not the place to diagnose one; #147's `issue147_tests` gates inject a real failure
    at every one of the sites and assert the named report, the refusal and a clean latch.
-   **#162 states the per-op severity in the helper** (§7.9): `minfer_launch_ok` is required — it
+   **#162 states the per-op severity in the helper** (the plan's #162 record holds the site census): `minfer_launch_ok` is required — it
    records a sticky failure that `CudaBackend::execute_node` turns into an `Err` naming the site (one
    Rust-side check, not one per launcher, so the op never proceeds on a stale output) — while
    `minfer_launch_ok_opt` only names and clears for a path with a **documented fallback** (the MMQ
@@ -1061,9 +1061,9 @@ where it belongs, not here: the failure-injection seam in `docs/GATE-CONTRACT.md
 ([#171](https://github.com/yusiwen/minfer/issues/171)), the launch-return rules in §4.9, and the `q4_K`
 `dsc` admission in §2.3.
 
-The old §7.4–§7.7 headings were folded into this one; §7.8, §7.9 and §7.10 keep their numbers because
-their records are not wholly duplicated — they carry the norm-weight invariant, the launch-site census
-and the #189 value arm respectively.
+The old §7.4–§7.7 and §7.9 headings were folded into this one; §7.8 and §7.10 keep their numbers
+because their records are not wholly duplicated — they carry the norm-weight invariant and the
+#189 value arm respectively.
 
 ### 7.8 Issue #169 verification — the norm weight type is part of the rms_norm invariant (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-26)
 
@@ -1099,86 +1099,6 @@ of `docs/GPU_SAFETY.md`. The one lookup per norm node per execution was not benc
 timing claim is made.
 
 ---
-
-### 7.9 Issue #162 verification — every `<<<>>>` reads its own launch error (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-26)
-
-The wider #147: the **104** sites in the then-single TU `src/cuda_kernels.cu` (today `src/cuda/kernels/*.cu`) that enqueued a kernel and never read the
-launch's error (`grep -c '<<<'` is 122; two are `<<<>>>` in prose comments, so the audited surface is
-**120 sites in 76 `launch_*` owners at that revision** (the same audit reports **130** sites on
-`6b6d94f`; the wrappers plus the static `launch_gqa_attn_split_batched_kv` helper). Each is now preceded by `minfer_launch_prelude(site, kernel)` and
-followed by a `minfer_launch_ok` / `minfer_launch_ok_opt` read that names the `launch:` site, the
-kernel instantiation and `cudaGetErrorName`, and clears the latch it named. The report tag is
-`(#162/<site>)` (§4 rules 4–5).
-
-**The decision per launcher is severity in the helper.** `minfer_launch_ok` (required) records a
-sticky failure; `CudaState::take_launch_failure` drains it in `CudaBackend::execute_node` on **both**
-arms and returns `Err` naming the site and the node — one Rust-side check, not 104 signature changes
-— so the op never proceeds on a stale output. `minfer_launch_ok_opt` names and clears for a path with
-a documented fallback. Of the 120 sites, **107 are required → `Err`** and **13 are documented
-fallbacks**: `launch_fa_prefill_f16kv`'s three window modes (the launcher returns `-1` and the Rust
-caller falls back to the legacy attention kernel), the four `launch_mmq_raw_nb*` / `_wide_nt`
-launchers #147 already treated as clean fast-path fallbacks (including their k-split reduce sites,
-which got their own `launch:*_ksplit` tokens so they can be armed alone), and `launch_kv_move_rows`
-(whose non-zero return its `Result` caller already uses).
-
-**The injection lever is shared geometry.** `minfer_launch_block(site, dim3|unsigned)` wraps the
-block argument at every ordinary site; arming the site makes the block 4096 threads (over the
-1024/block limit), so `<<<>>>` returns `cudaErrorInvalidValue` for real and the kernel never runs
-(probed on sm_121 — both an over-limit block and an over-limit dynamic smem return
-`cudaErrorInvalidValue`). The dynamic-smem launchers keep `minfer_launch_smem`. Adding a site's
-coverage is therefore one string in the driver table.
-
-**Two gates, one source and one runtime.** `scripts/check_cuda_launch_returns.py` parses the source
-(comments and string/char literals blanked, so a commented-out occurrence is not a site) and, for
-every `<<<`, requires a `launch:`-prefixed prelude before it in the same function, a
-`minfer_launch_ok`/`_opt` after its statement naming the **same** token, and a real-failure lever in
-the geometry; it prints the offending lines and exits 1. It runs in the `check-docs` CI job with
-`--selftest` (five pass/fail cases) and `--check-fixture tests/fixtures/cuda_launch_sites.tsv` (the
-committed site list; line numbers are documentation, owner/site/fragment are identity). The runtime
-half is `cuda::issue162_tests` (`MINFER_TEST_ISSUE162=1`, five tests split by topic into
-`tests/{sites,severity,control,node}.rs`, [#267](https://github.com/yusiwen/minfer/issues/267)): the
-coverage test drives every audited site through the branches that reach it, asserts armed set ==
-observed set, the message names the site, the fixture's kernel fragment and
-`cudaErrorInvalidValue`, `cudaGetLastError() == 0` after every scenario, and the union of driven
-tokens equals the fixture; the severity test asserts a
-required site sets the sticky and an `_opt` site does not; the positive control (knob off) actually
-computes `1 + 2`; the node-level test makes a real `Op::Add` node fail with `Err` naming
-`launch:add_f32`; and the Err-arm test drives an f16 matmul whose Rust wrapper returns `Err` (so the
-sticky is pending when `execute_node_inner` errs) and asserts the drain still happened.
-
-**Acceptance results.**
-
-| check | before | after |
-|---|---|---|
-| `scripts/check_cuda_launch_returns.py` | **104** unchecked sites | **empty list** (120 / 120 at that revision; 130 / 130 on `6b6d94f`) |
-| CUDA serial unit suite | **531 / 0 / 37** (master `09406ce`; the recorded 526 predated #173's +3 and #98's +2) | **536 / 0 / 37** (+5 device/env-gated tests) |
-| `MINFER_TEST_ISSUE162=1 … issue162` | — | **5 / 0** |
-| `compute-sanitizer --tool memcheck` over the test binary | 0 errors | **0 errors** over 536 |
-| CUDA serial ignored, 0.5B / Qwen3-0.6B | 37 / 0 each | **37 / 0** each |
-
-The sanitizer command is `compute-sanitizer --tool memcheck --target-processes all
-target/release/deps/minfer-<hash> --test-threads=1` — wrapping the test binary, not `cargo` (wrapping
-the whole wrapper script lets the tree launcher follow every build process and the harness stalls).
-
-**Mutations (reverted; the then-single `src/cuda_kernels.cu` restored to `sha256 da2e00fb79442fcd03bd3618301b4014cd835f832bbafa4153b4af4283dcdbfb`; today the TUs live in `src/cuda/kernels/`).** Deleting the read at one single-site
-family (`launch:add_f32`), one `switch` case (`launch:embed_rows__q4_k`) and one templated branch
-(`launch:gqa_attn_split_f16kv__hybrid_causal`) each makes the audit exit 1 naming that line; making
-`minfer_launch_ok` report but admit the launch, removing the sticky, removing `execute_node`'s drain,
-and making `minfer_launch_block` a no-op each fail a device test rather than the audit (the
-mutation-proof half of the pair); disabling the audit's lever check fails its selftest; changing a
-fixture fragment fails `--check-fixture`. Transcripts in the closing comment on #162 and in
-`docs/ARCHITECTURE-EXECUTION-PLAN.md`.
-
-**Honest scope.** Nothing was failing on this device: the sanitizer was already 0, the production
-paths are latent, and the evidence is that every site *can* be driven into a real
-`cudaErrorInvalidValue` and then names itself. The source audit is static and cannot tell whether the
-read runs; the device gate compares **sets** of site tokens, so where two source sites share a token
-(the two `mmq_raw_nb_bt` kernel instantiations) it proves the token is reached, not both branches —
-the audit, not the gate, guarantees each source site has its own read. The parser resolves a site
-variable only through a plain `=` in the enclosing function, so `launch_gemm_f16`'s `launch_site`
-ternary resolves to its first arm (`launch:gemm_f16_a32`), which is what the driver arms. The
-sanitizer count and the device limit (101376 B) are dgxspark's; CI has no GPU, and its `check-docs`
-job enforces only the source half.
 
 ### 7.10 Issue #189 verification — the S4 map-window A/B is a paired sign test with a value arm (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-27)
 
