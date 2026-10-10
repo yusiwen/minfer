@@ -173,13 +173,29 @@ Qwen3-style `<think>…</think>` reasoning blocks are gray-highlighted
 Continuous batching (the worker composes one decode batch across the active slots
 instead of one forward per slot — Phase E / E2) is **on by default when the
 model's forwards run on CUDA or Metal, and off on CPU** (E6; Metal joined in
-[#44](https://github.com/yusiwen/minfer/issues/44) part (b), 2026-10-06). The reason is measured,
-not assumed: on this project's reference CPU batching is *slower* than serving
-requests one at a time (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0 with `--n-slots 4`
-— the CPU decode kernels gain nothing from `nt > 1`, and concurrency forfeits the
-cross-request prefix reuse each slot otherwise keeps), while on the GB10 it is
-**1.97x faster** (7B Q4_K_M, four identical prompts, equal work, `--n-slots 4`,
-default settings). The plan's E2 and E6 records have the tables.
+[#44](https://github.com/yusiwen/minfer/issues/44) part (b), 2026-10-06). The default was
+decided by measurement, not assumption: on this project's reference CPU batching measured
+*slower* than serving requests one at a time (0.49x on 7B Q4_K_M, 0.88x on 0.5B Q4_0,
+`--n-slots 4`), while on the GB10 it measured **1.97x faster** (7B Q4_K_M, four identical
+prompts, equal work, `--n-slots 4`, default settings).
+
+**Both readings are dated, and both are historical.** The CPU pair is the E2 record's step 3
+(**2026-09-17**); the GPU 1.97x is E6's re-fetch with the default and no environment variable
+(**2026-09-19**, matching E2's 1.9x of 2026-09-18 within noise). All three predate the
+cross-request prefix **sharing** described below (C8a/C8b, 2026-09-21/22), so the CPU figure
+prices a per-request prefill that sharing has since made avoidable, and the reason the E2
+record gave for it — concurrency forfeits the cross-request prefix reuse each slot otherwise
+keeps — no longer holds. They are history, not a current claim; the boxes, the workloads and
+the tables are in the E2 and E6 records of
+[`ARCHITECTURE-EXECUTION-PLAN.md`](./ARCHITECTURE-EXECUTION-PLAN.md) §5.
+
+**`--n-slots` does not cap a request.** The arena is divided among the slots as an *initial,
+elastic* share only: the server starts from `n_ctx / n_slots` per slot, but a request's real
+bound is the whole `n_ctx`. When a request needs more than its share, admission reclaims
+cells from idle slots (releasing their cached prefixes) and the allocator moves whatever runs
+are in the way, so a busy neighbour cannot block it (C7/C7b, the same plan §5). The serial
+path (`MINFER_BATCH=0`) is the exception: its per-slot graph region really is `n_ctx /
+n_slots` cells.
 
 - `--slots-file <PATH>` (batched engine only) — resume the server's slot contexts from
   `PATH` at startup and rewrite it after every completed request (C5 S2). A request whose
@@ -192,8 +208,10 @@ default settings). The plan's E2 and E6 records have the tables.
   experiments or for a machine where your own measurement says it wins).
 - `MINFER_BATCH=0` forces it off.
 - Any other value warns and uses the device default.
-- Metal is deliberately never auto-enabled: the batched path needs an explicit
-  attention span and Metal refuses that node, so it waits for Phase G.
+- Metal joined the default only once it could take the node the batched path needs: until
+  [#44](https://github.com/yusiwen/minfer/issues/44) part (b) (2026-10-06) `supports_attn_span()`
+  was false there, so batching would have failed loudly instead of serving and Metal stayed
+  opt-in. The explicit switch is no longer needed.
 - The server prints its choice at startup:
   `[server] batching: on (device cuda; MINFER_BATCH=1 forces it on, =0 forces it off)`.
 
@@ -223,10 +241,15 @@ Two environment switches around the GPU are easy to get wrong:
   `0` *disables* CUDA (and therefore also turns the batching default off, since
   the model then runs on CPU). To force the CPU path deliberately use
   `MINFER_DISABLE_CUDA=1`; to use the GPU, leave it unset.
-- On a device, batched *prefills* stay per request by construction (CUDA's
-  `fa_prefill` tiles one query tile against one KV window — E1b), so `--n-slots`
-  concurrency still pays one prefill per request, and prefix reuse across slots
-  needs a cell copy (C3/D1). The batched-decode win is unaffected.
+- On CUDA, batched *prefills* stay per request by construction (`fa_prefill` tiles one query
+  tile against one KV window — E1b), so `--n-slots` concurrency still pays one prefill per
+  request there. The batched-decode win is unaffected.
+- Prefix reuse across slots is a **share, not a copy**, wherever the attention kernel gathers a
+  `kv_map` (CPU, CUDA, and Metal since [#362](https://github.com/yusiwen/minfer/issues/362)):
+  admission points the arriving request at the donor slot's rows and no byte is copied. A
+  device that cannot gather, and any device at all under `MINFER_NO_KV_SHARE=1` (the A/B
+  switch), falls back to C8a's row copy — either way the arriving request prefills only its own
+  suffix.
 
 ### Slot saturation
 
