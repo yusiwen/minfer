@@ -565,7 +565,7 @@ The full per-module transcripts and the two worktrees' build logs are in the Ste
 | documents carrying a line anchor **into** one of them (`…:NNN`), measured on `6b6d94f` | **35** (401 anchors: cuda side 269, metal side 132) |
 | the anchor hot spots | `docs/cuda_tutorial/*` 180 (6 files), `docs/LLAMA_METAL_E2E.md` 50, `docs/inference_e2e_walkthrough/14-metal-backend.md` 35, `docs/LLAMA-CPP-MMQ-ANALYSIS.md` 18, `docs/METAL-OBJC2-MIGRATION-PLAN.md` 15, `docs/inference_e2e_walkthrough/15-cuda-backend.md` 10, `docs/metal-inference-analysis.md` 10, `docs/ARCHITECTURE-EXECUTION-PLAN.md` 11 |
 | documents that describe the **layout** and need rewriting, not sweeping | 18 (listed in §6.3) |
-| machine-checked today | `check_docs_links.py` (relative link targets only — it **cannot** see `path:NNN`), `check_status.py --check` (AGENTS.md prose ↔ `docs/status.toml`), `build_book.sh` (mdBook chapters from `docs/SUMMARY.md`) |
+| machine-checked today | `check_docs_links.py` (relative link targets only — it **cannot** see `path:NNN`), `check_status.py --check` (AGENTS.md prose ↔ `scripts/status.toml`), `build_book.sh` (mdBook chapters from `docs/SUMMARY.md`) |
 
 ### 6.2 Policy: live documents are edited, historical records are frozen
 
@@ -578,6 +578,10 @@ The full per-module transcripts and the two worktrees' build logs are in the Ste
   run records, which quote the `nvcc … ../../src/cuda_kernels.cu` command as it was run) keep
   their text — they record a measurement taken against a revision, and rewriting them would falsify the
   record. They are resolved through the **path mapping table** this document keeps (§6.4).
+- **The machine ledgers the step records name are of their day.** They moved beside their checkers on
+  2026-10-09/10 (ADR-0023, ADR-0024) and now live at `scripts/status.toml`, `scripts/test-baselines.toml`,
+  `scripts/dead-code-baseline.toml` and `tests/fixtures/f6-fixtures.json`. §6.1's "machine-checked
+  today" row names the current reader; the step text above keeps the paths it was written with.
 - **The checker must know about the freeze**: `scripts/check_doc_line_anchors.py` (ticket 6) carries a
   frozen-file set (the `GRANDFATHERED_BARE` pattern), so a frozen record does not fail CI, and the set
   can only shrink. This is the one design constraint the frozen policy puts on ticket 6.
