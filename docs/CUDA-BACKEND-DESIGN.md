@@ -1065,99 +1065,68 @@ The old §7.4–§7.7 and §7.9 headings were folded into this one; §7.8 and §
 because their records are not wholly duplicated — they carry the norm-weight invariant and the
 #189 value arm respectively.
 
-### 7.8 Issue #169 verification — the norm weight type is part of the rms_norm invariant (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-26)
+### 7.8 The norm weight type is part of the rms_norm invariant
 
-The issue recorded this as a **latent** hazard: `CudaBackend::norm_weight` resolved the weight by
-name and checked only that it was *registered*, not what it was. The CUDA `rms_norm` kernel indexes
-the weight as `d` f32 elements (`d*4` bytes) regardless, so an f16 norm weight (2 B/element) — which
-`minfer quantize --type f16` used to write for every 1-D tensor — would be read past its end. The CPU
-panic was reached first there, so the device behaviour was not observable at the time.
+`norm_weight(node, elems)` resolves `CudaState::weight_size(name)` (the registered raw length, the same
+convention `has_weight_of_size` uses for a padded Q6_K plane) and requires exactly `elems * 4`, returning
+`Err` that names the registered length, the length the kernel reads, the node and "f16-norm". Both callers
+pass the dim the kernel uses (`node.out_shape[0]` for `Op::RmsNorm`, `*hd` for `Op::QkNorm`), so the check
+is the kernel's own geometry, not a name heuristic. It exists because the CUDA `rms_norm` kernel indexes
+the weight as `d` f32 elements regardless, so an f16 (2 B/element) norm weight — which
+`minfer quantize --type f16` used to write for every 1-D tensor — would be read past its end.
 
-`norm_weight(node, elems)` now resolves `CudaState::weight_size(name)` (the registered raw length,
-the same convention `has_weight_of_size` uses for a padded Q6_K plane) and requires exactly
-`elems * 4`, returning `Err` that names the registered length, the length the kernel reads, the node
-and "f16-norm". Both callers pass the dim the kernel uses (`node.out_shape[0]` for `Op::RmsNorm`,
-`*hd` for `Op::QkNorm`), so the check is the kernel's own geometry, not a name heuristic.
-
-**Verified.** `cuda_norm_weight_size_is_part_of_the_invariant`: one 64-element norm graph, two
-registered names, both valid float4 dims — the f32 arm (control) executes, the f16-sized arm must
-`Err` and the test asserts the refusal names `128 B`, `256 B` and `f16-norm`. The mutation (check
-forced off) makes the f16 arm **execute** and, under `compute-sanitizer --tool memcheck`,
-`Invalid __global__ read of size 16 bytes` ×12 / `ERROR SUMMARY: 12 errors` — the read is real.
-The CUDA unit suite is **526 passed / 0 failed / 37 ignored** with the gate in place (baseline
-524 / 0 / 37, +1 CI tooling gate and +1 device gate), and `compute-sanitizer` over that suite reports
-**0 errors**. The end-to-end half is #169's acceptance run: `minfer quantize --type f16` of the
-cached `Qwen3-0.6B-Q8_0.gguf` now writes 1-D f32 / 2-D f16, the file is byte-identical to
-`llama-quantize … F16`, and it runs with all 28 blocks + embed/output on the device (1137.0 MiB);
-CPU-vs-CUDA argmax agrees at prefill and the two decode steps (max |Δlogit| 0.0178).
-
-**Honest scope.** The gate is device-only (CI has no GPU); its arithmetic has no CI-covered pure
-twin — it is one `usize` comparison against `elems * 4`, and the device arm is the gate. It does not
-make an f16-norm model *loadable* on CUDA; registration still admits an f16 1-D weight, and the
-refusal happens at execute time with the node named, which is the documented `Err`-not-fallback rule
-of `docs/GPU_SAFETY.md`. The one lookup per norm node per execution was not benchmarked and no
-timing claim is made.
+The gate is device-only (CI has no GPU) and its arithmetic has no CI-covered pure twin: it is one `usize`
+comparison against `elems * 4`. It does not make an f16-norm model *loadable* on CUDA — registration still
+admits an f16 1-D weight, and the refusal happens at execute time with the node named (the
+`Err`-not-fallback rule of `docs/GPU_SAFETY.md`). The verification record (the mutation that made the f16
+arm execute, the `compute-sanitizer` output, the suite counts and the #169 end-to-end acceptance run) is
+in the plan's #169 section.
 
 ---
 
-### 7.10 Issue #189 verification — the S4 map-window A/B is a paired sign test with a value arm (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-27)
 
-**The defect.** `graph::cuda_backend::tests::cuda_map_window_costs_no_more_than_the_span_it_replaces` was a pure stopwatch. It interleaved matched rounds of the *span* window (`row0 + i`) and the *map* window (row resolved through a run list) and asserted the **median of 9 per-round ratios** `<= 1.25x`. It failed once in the parallel `#[ignore]`d device run (GB10 sm_121, CUDA 13.0, driver 580.178.04, 2026-09-26) on the prefill phase:
+### 7.10 The S4 map-window A/B: a value arm and a paired sign test
 
-```text
-[s4-ab] prefill nt=512 nkv=512 hd=128: span 89.9 / map 125.1 us/launch (median of 9 interleaved
-rounds of 50); per-round ratios [0.632, 0.697, 0.989, 1.091, 1.398, 1.440, 1.466, 2.198, 6.695]
-— median 1.398x
-```
-
-A median of 9 flips once 5 pairs are disturbed, and that run had exactly 5 above the bar. The bar itself was justified by #123 as "16 CPU spinners plus two concurrent CUDA attention loops" (median 1.079–1.145 prefill); the parallel `#[ignore]`d suite is a far heavier co-tenant (~38 device tests, several capturing CUDA graphs, one GPU). The verdict was about how loaded the box was, not about the kernel — the #154 class, not the #185 SIGSEGV.
+**The defect.** The gate was a **pure stopwatch**: it interleaved matched rounds of the span window and
+the map window and asserted the **median of 9 per-round ratios** `<= 1.25x`, which flips once five pairs
+are disturbed — and one parallel `#[ignore]`d device run had exactly five above the bar. The verdict was
+about how loaded the box was, not about the kernel. The failing transcript, the co-tenant reading and the
+bar's #123 provenance are in the plan's #189 section.
 
 **The fix, two halves.**
 
 1. **A value arm first (gate contract rule 1).** Before any timing the gate asserts
-   - a **one-row** map window at cell 512 returns exactly that row's V — an absolute value computed on the host, not a relation between the two modes (softmax over one key is exactly 1.0, so the kernel is the identity on V);
-   - a **two-run** map window at cell 512 returns the span's bytes over the same rows, bit for bit — f32 KV at the decode shape (`nt = 1`), f16 KV at the FA-prefill shape (`nt = 512`). One run is indistinguishable to a resolver that reads `(cell, len)` as `(lo, hi)`; two runs, at a non-zero base, are not;
-   - the map instantiation actually ran, by counted observation rather than the dispatch's own report: `testfail::note_checked("cuda_attn_map_window")` is bumped in the launcher (`CudaState::gqa_attn_split` / `gqa_attn_kv_prefill`, `src/cuda.rs`), and the gate resets it, runs one span call (counter stays 0) and one map call (counter 1). The bitwise arms say *what* was computed; the counter says the map path was the thing that computed it.
-2. **A paired sign test (gate contract rule 4).** The timing verdict is the **count** of matched pairs whose map arm is above `1.25x` its own span arm, and the gate refuses only at **7 of 9** — the one-sided sign test at `alpha = 46/512 = 0.090`. A load spike that disturbs a minority (or even a bare majority) of pairs cannot decide it; the recorded failure's 5 does not; a doubled map cost moves all 9 and does. The bar is unchanged at 1.25x and the timed fixture is the pre-#189 one (constant K/V, one run at cell 0), so the recorded margins stay comparable; the round count is fixed in advance (`PAIRS = 9`) and every per-round ratio and the refusal count are printed.
+   - a **one-row** map window at cell 512 returns exactly that row's V — an absolute value computed on
+     the host, not a relation between the two modes (softmax over one key is exactly 1.0, so the kernel
+     is the identity on V);
+   - a **two-run** map window at cell 512 returns the span's bytes over the same rows, bit for bit — f32
+     KV at the decode shape (`nt = 1`), f16 KV at the FA-prefill shape (`nt = 512`). One run is
+     indistinguishable to a resolver that reads `(cell, len)` as `(lo, hi)`; two runs, at a non-zero
+     base, are not;
+   - the map instantiation actually ran, by counted observation rather than the dispatch's own report:
+     `testfail::note_checked("cuda_attn_map_window")` is bumped in the launcher
+     (`CudaState::gqa_attn_split` / `gqa_attn_kv_prefill`, `src/cuda.rs`), and the gate resets it, runs
+     one span call (counter stays 0) and one map call (counter 1). The bitwise arms say *what* was
+     computed; the counter says the map path was the thing that computed it.
+2. **A paired sign test (gate contract rule 4).** The timing verdict is the **count** of matched pairs
+   whose map arm is above `1.25x` its own span arm, and the gate refuses only at **7 of 9** — the
+   one-sided sign test at `alpha = 46/512 = 0.090`. A load spike that disturbs a minority (or even a bare
+   majority) of pairs cannot decide it; a doubled map cost moves all 9 and does. The bar is unchanged at
+   1.25x and the timed fixture is the pre-#189 one, so the recorded margins stay comparable; the round
+   count is fixed in advance (`PAIRS = 9`) and every per-round ratio and the refusal count are printed.
+   The reproducible mutation is `MINFER_S4_AB_MAP_REPS=2` (`src/cuda.rs::s4_ab_map_reps`), which issues
+   every **map-mode** attention launch twice — an implementation mutation, not a test edit.
 
-**Measured — the gate alone, idle (GB10 sm_121, CUDA 13.0, driver 580.178.04, 2026-09-27; `cargo test --release --features cuda --bin minfer cuda_map_window_costs_no_more_than_the_span_it_replaces -- --ignored --nocapture --test-threads=1`).**
+**Honest scope.** Every number is a local GB10 measurement; CI has no GPU, so its CUDA job only compiles
+the harness. The two-run value arms are the gate's *own* fixtures, not the graph path — the graph-path
+bitwise coverage stays with `cuda_map_window_matches_the_span_over_the_same_rows` (which sweeps
+f32/f16/q8_0 over one/two/three runs and both batch shapes). The `MINFER_S4_AB_MAP_REPS` seam is wired to
+the two launches this gate drives (`gqa_attn_split`, `gqa_attn_kv_prefill`), not to the batched split
+path. The bar 1.25x is inherited unchanged from #123; this ticket changed the statistic and added the
+value arm, and did not widen it. The measured tables — the idle gate and six parallel runs, with every
+per-round ratio — the mutation output, the suite counts and the superseded `src/device_entry.rs` guard
+note are in the plan's #189 section.
 
-| phase | span / map µs/launch | per-round ratios | refusals at 1.25x | verdict |
-|---|---|---|---|---|
-| decode (nkv 2048, nh 28, nk 4, hd 128) | 24.6 / 25.0 | [0.871, 1.007, 1.011, 1.013, 1.014, 1.017, 1.044, 1.050, 1.051] | **0 / 9** | pass |
-| prefill (nt 512, f16 KV) | 82.8 / 91.1 | [1.054, 1.089, 1.097, 1.099, 1.100, 1.100, 1.104, 1.104, 1.189] | **0 / 9** | pass |
-
-**Measured — the parallel `#[ignore]`d configuration (the one that produced the failure), six runs (GB10 sm_121, CUDA 13.0, driver 580.178.04, 2026-09-27; `cargo test --release --features cuda --bin minfer -- --ignored --nocapture`, default parallel harness).** The gate's refusal counts per run, and the whole set's result:
-
-| run | decode refusals | prefill refusals | worst per-round ratio seen | suite |
-|---|---|---|---|---|
-| 1 | 0 / 9 | 3 / 9 | 1.57 (prefill) | **39 passed / 0 failed / 0 ignored** |
-| 2 | 1 / 9 | 3 / 9 | 2.07 (prefill) | **39 / 0 / 0** |
-| 3 | 0 / 9 | 3 / 9 | 1.48 (prefill) | **39 / 0 / 0** |
-| 4 | 1 / 9 | 2 / 9 | 5.09 (decode) | **39 / 0 / 0** |
-| 5 | 0 / 9 | 0 / 9 | 1.15 (decode) | **39 / 0 / 0** |
-| 6 | 2 / 9 | 3 / 9 | 4.09 (decode) | **39 / 0 / 0** |
-
-The co-tenant moved up to 3 of 9 pairs above the bar (the recorded failure's 5 is inside the tolerance); a single disturbed pair reached **5.09x** in run 4 and the sign test still returned green. The whole set was **6 / 6 green**, including the `#154` batching gate that had also failed once in this configuration. Honest reading: in these six runs the co-tenant was lighter than in the recorded one — no run's *median* exceeded 1.25x — so they show the gate is not decided by the co-tenant, not that the new statistic rescued a median-red run. That case is the recorded distribution itself, replayed by the pure test `graph::cuda_backend::tests::the_s4_ab_statistic_absorbs_a_loaded_run_and_still_refuses_a_real_regression` (5 of 9 refusals pass at 7; the old median of the same ratios is 1.398x and red).
-
-The parallel configuration is reachable without removing anything: after #188 the `src/device_entry.rs` guard covers only `CudaState::layer_gpu` (`src/cuda.rs` ~line 6900, `#[allow(dead_code)]` legacy surface), and `BackendScheduler::execute` and `register_cuda_weight` no longer take it. No guard change is part of this ticket. *(Superseded 2026-10-01: [#241](https://github.com/yusiwen/minfer/issues/241) deleted `layer_gpu`, and the guard module with it, once the census showed `layer_gpu` had no caller at all — see the #240 record in the plan.)*
-
-**Mutation evidence (rule 3).** `MINFER_S4_AB_MAP_REPS=2` (`src/cuda.rs::s4_ab_map_reps`) issues every **map-mode** attention launch twice, so the gate's timed map arm pays twice the work — the reproducible form of #123's map-work doubling, and an implementation mutation rather than a test edit. With it armed, the same command on the same binary fails in the decode phase:
-
-```text
-[s4-ab] decode nkv=2048 nh=28 nk=4 hd=128: span 24.6 / map 51.7 us/launch (9 interleaved matched
-pairs of 100); per-round ratios [1.706, 1.745, 2.052, 2.091, 2.095, 2.100, 2.102, 2.136, 2.358]
-— 9/9 above 1.25x (sign test refuses at 7)
-thread '...cuda_map_window_costs_no_more_than_the_span_it_replaces' panicked at
-src/graph/cuda_backend.rs: the map window is above 1.25x the span in 9 of 9 matched pairs ...
-FAILED
-```
-
-The seam is an env switch, so the unmutated run is the same binary with the variable unset (no source revert to check); `git diff` on the tree contains only the #189 change, no mutation residue. The value arm, the counter arm and the timing arm all still run under the mutation.
-
-**The rest of the device suite (GB10 sm_121, CUDA 13.0, driver 580.178.04, 2026-09-27).** `scripts/cuda_test.sh` → **546 / 0 / 39** (was 545 / 0 / 39; +1 the pure statistic test `the_s4_ab_statistic_absorbs_a_loaded_run_and_still_refuses_a_real_regression`). `FEATURES=cuda scripts/real_model_gates.sh` → **39 / 0** for the 0.5B config and **39 / 0** for the Qwen3-0.6B config. `compute-sanitizer --tool memcheck --target-processes all <test binary> --test-threads=1` → **0 API errors** over 546 / 0 / 39. `cargo test --release` (CPU) → 465 / 0 / 33 unit + 10 / 0 / 6 integration, unchanged (the new test lives in the `cuda`-gated module). `python3 scripts/check_status.py --check` → exit 0.
-
-**Honest scope.** Every number here is a local GB10 measurement; CI has no GPU, so its CUDA job only compiles the harness. The two-run value arms are the gate's *own* fixtures, not the graph path — the graph-path bitwise coverage stays with `cuda_map_window_matches_the_span_over_the_same_rows` (which sweeps f32/f16/q8_0 over one/two/three runs and both batch shapes). The `MINFER_S4_AB_MAP_REPS` seam is wired to the two launches this gate drives (`gqa_attn_split`, `gqa_attn_kv_prefill`), not to the batched split path. The bar 1.25x is inherited unchanged from #123; this ticket changed the statistic and added the value arm, and did not widen it.
 
 ## 8. Out of Scope / Future
 
