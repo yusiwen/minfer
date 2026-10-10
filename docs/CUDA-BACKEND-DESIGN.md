@@ -1161,3 +1161,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0030](adr/0030-launch-severity-lives-in-the-helper.md) — Launch severity lives in the helper, not in 120 call sites
 - [ADR-0031](adr/0031-capture-runs-in-thread-local-mode.md) — Capture runs in thread-local mode, because Global lets a foreign thread's call join the window
 - [ADR-0033](adr/0033-the-cuda-pool-recycles-exact-byte-lengths.md) — The CUDA pool recycles exact byte lengths, never frees, and reports OOM as an error
+- [ADR-0034](adr/0034-the-smem-opt-in-is-an-eager-prewarm-by-construction.md) — The smem opt-in is an eager pre-warm by construction, with the lazy path as defence in depth
