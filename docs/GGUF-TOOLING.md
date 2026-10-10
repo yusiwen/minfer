@@ -125,6 +125,8 @@ The reader's convention, which the writer must satisfy:
   llama.cpp emits it, the reader ignores it.
 - File names: `{prefix}-NNNNN-of-MMMMM.gguf`, **1-based**, five digits;
   `resolve_splits` builds all `M` names from the entry point's name.
+- **The entry point is part 0** — the reader opens it, and builds the remaining
+  `M - 1` file names from it.
 
 `write_split`:
 
@@ -942,10 +944,6 @@ minfer /tmp/parts/model-q4_0-00001-of-00003.gguf "The capital of France is"
 # round-trip (rewrite with the writer), bit-exact
 minfer split /tmp/model-q4_0.gguf /tmp/rewrite --max-size 4G   # one part -> a plain file
 ```
-
-## Multi-part GGUF files (moved from `AGENTS.md`)
-
-Multi-part GGUF: written by `minfer split` (F6) as `{stem}-NNNNN-of-MMMMM.gguf` with `split.no`/`split.count`/`split.tensors.count`; entry is part 0, all parts parsed into one merged tensor index (part order preserved), and download resume is size-checked (`download::check_downloaded_size` refuses a wrong-length file and removes it).
 
 ## Decisions governing this document
 
