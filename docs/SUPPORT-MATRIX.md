@@ -352,3 +352,6 @@ should be relatively straightforward to port.
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32
 - [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32
+- [ADR-0005](adr/0005-metal-becomes-a-first-class-backend.md) — Metal becomes a first-class backend
+- [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — The KV storage format is a per-engine gate, not a process-wide global
+- [ADR-0020](adr/0020-a-quantized-file-is-byte-identical-or-wrong.md) — A quantized file is byte-identical to `llama-quantize`, or it is wrong

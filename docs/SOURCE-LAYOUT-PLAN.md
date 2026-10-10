@@ -910,3 +910,5 @@ Unit tests live beside their module as `<module>/tests.rs`, declared `#[cfg(test
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0012](adr/0012-device-first-layering-and-no-premature-common.md) — Device is the first axis, the layer the second — and no premature `common`
+- [ADR-0005](adr/0005-metal-becomes-a-first-class-backend.md) — Metal becomes a first-class backend
+- [ADR-0023](adr/0023-the-machine-ledgers-live-beside-their-checkers.md) — Each machine ledger lives beside its checker, one per prose target

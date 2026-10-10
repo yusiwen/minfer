@@ -952,3 +952,4 @@ Multi-part GGUF: written by `minfer split` (F6) as `{stem}-NNNNN-of-MMMMM.gguf` 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0020](adr/0020-a-quantized-file-is-byte-identical-or-wrong.md) — A quantized file is byte-identical to `llama-quantize`, or it is wrong
 - [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32
+- [ADR-0024](adr/0024-a-machine-read-record-is-not-book-content.md) — A machine-read record is not book content

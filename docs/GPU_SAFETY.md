@@ -245,3 +245,4 @@ Hard rules (mirror the Metal section; enforced in `graph/cuda_backend.rs` + `cud
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0008](adr/0008-gpu-safety-bounded-waits-and-runtime-limits.md) — GPU safety: bounded waits, no early return past a barrier, runtime device limits
+- [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md) — A failure is an error, never a silent fallback
