@@ -1160,3 +1160,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32
 - [ADR-0030](adr/0030-launch-severity-lives-in-the-helper.md) — Launch severity lives in the helper, not in 120 call sites
 - [ADR-0031](adr/0031-capture-runs-in-thread-local-mode.md) — Capture runs in thread-local mode, because Global lets a foreign thread's call join the window
+- [ADR-0033](adr/0033-the-cuda-pool-recycles-exact-byte-lengths.md) — The CUDA pool recycles exact byte lengths, never frees, and reports OOM as an error
