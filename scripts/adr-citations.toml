@@ -1,0 +1,108 @@
+# Unresolvable path citations in `docs/adr/`, and why each one stays (ADR-0027).
+#
+# `scripts/check_adr.py` walks every backticked repository-rooted path in every ADR
+# and tests it against the tree. An ADR is immutable, so a path cited at decision
+# time can legitimately stop existing — a file moves, a layout is split, a rejected
+# option was never created. This file is that set, so the checker can tell **history**
+# from **staleness**: without it, the 13 entries below would be 22 spurious failures
+# (ADR-0027, Alternatives considered).
+#
+# The checker enforces three things about this file:
+#   1. an unresolvable citation that is **not** listed here is a failure (a new one);
+#   2. an entry that **no ADR cites any more** is a failure (the ledger may not rot);
+#   3. `kind` must be one of the four below, and `reason` must be non-empty.
+#
+# Keys are `(adr, path)` and never a line number: a line number drifts on any edit
+# above it, which would churn this file on unrelated changes.
+#
+# Kinds — what makes an unresolvable citation legitimate:
+#   historical-before-state  the file as it was *before* the decision — often with the
+#                            size or count that was the problem being solved
+#   corrected-elsewhere      the path moved, and an errata ADR already says so
+#   named-in-the-move        this ADR (or the one it corrects) is the record of the
+#                            move, so it must name the location it moved away from
+#   rejected-alternative     a path that appears only inside a rejected option and was
+#                            never created
+#
+# Update rule. A new legitimate historical citation is added **in the same PR as the
+# migration that invalidates it** — that PR must also produce the errata ADR, because
+# ADR-0027 decision 5 puts the ledger update on the cause, not on the later PR that
+# trips over it. `check-docs` runs unconditionally, so the friction already lands there.
+
+[[citation]]
+adr = "0007"
+path = "docs/f6-fixtures.json"
+kind = "corrected-elsewhere"
+reason = "the manifest's old home; ADR-0024 moved it to tests/fixtures/ and corrects this ADR"
+
+[[citation]]
+adr = "0012"
+path = "src/cuda_kernels.cu"
+kind = "historical-before-state"
+reason = "the pre-split nvcc translation unit this ADR replaced, cited with its 10,215-line size as the problem"
+
+[[citation]]
+adr = "0012"
+path = "src/metal.metal"
+kind = "historical-before-state"
+reason = "the pre-split Metal kernel source this ADR replaced, cited with its 5,151-line size"
+
+[[citation]]
+adr = "0013"
+path = "src/avx2.rs"
+kind = "historical-before-state"
+reason = "where `dot_q4_0_q8_0` lived in the first commit (95fd5d1); the SIMD layer has since split into src/quants/"
+
+[[citation]]
+adr = "0013"
+path = "src/forward.rs"
+kind = "historical-before-state"
+reason = "the imperative forward loop of the first commit (95fd5d1), deleted by the graph rewrite"
+
+[[citation]]
+adr = "0020"
+path = "docs/f6-fixtures.json"
+kind = "corrected-elsewhere"
+reason = "the manifest's old home (cited twice — the gate inputs and the References); ADR-0024 moved it and corrects this ADR"
+
+[[citation]]
+adr = "0022"
+path = "docs/status.toml"
+kind = "corrected-elsewhere"
+reason = "the ledger's old path (cited twice); ADR-0023 split and moved it, and corrects this ADR"
+
+[[citation]]
+adr = "0022"
+path = "docs/adr/corrections.toml"
+kind = "rejected-alternative"
+reason = "a machine correction index that ADR-0022 considered and never created"
+
+[[citation]]
+adr = "0023"
+path = "docs/status.toml"
+kind = "named-in-the-move"
+reason = "this ADR is the record of the split, so it names the file it split (five mentions across Context, Decision and Consequences)"
+
+[[citation]]
+adr = "0024"
+path = "docs/f6-fixtures.json"
+kind = "named-in-the-move"
+reason = "this ADR is the record of the move out of the book tree (three mentions)"
+
+[[citation]]
+adr = "0024"
+path = "docs/status.toml"
+kind = "named-in-the-move"
+reason = "named only to contrast the two ledgers' homes"
+
+[[citation]]
+adr = "0025"
+path = "docs/dead-code-baseline.toml"
+kind = "corrected-elsewhere"
+reason = "the docs-class list this ADR introduced named the baseline's pre-#464 path (twice); ADR-0026 corrects this ADR"
+
+[[citation]]
+adr = "0026"
+path = "docs/dead-code-baseline.toml"
+kind = "named-in-the-move"
+reason = "quotes the old exception rule it corrects, which named the baseline's pre-#464 path"
