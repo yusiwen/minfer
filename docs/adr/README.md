@@ -105,6 +105,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0030](./0030-launch-severity-lives-in-the-helper.md) | 2026-10-10 | Launch severity lives in the helper, not in 120 call sites | Accepted |
 | [0031](./0031-capture-runs-in-thread-local-mode.md) | 2026-10-10 | Capture runs in thread-local mode, because Global lets a foreign thread's call join the window | Accepted |
 | [0032](./0032-the-packed-kv-staging-window-is-f32.md) | 2026-10-10 | The packed-KV staging window is f32, not f16 | Accepted |
+| [0033](./0033-the-cuda-pool-recycles-exact-byte-lengths.md) | 2026-10-10 | The CUDA pool recycles exact byte lengths, never frees, and reports OOM as an error | Accepted |
 
 ## The template
 
