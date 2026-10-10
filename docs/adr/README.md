@@ -24,7 +24,25 @@ it, or requires it); naming another document's decision is a cross-reference, wh
 prose and *not* in the map, so a document may legitimately mention an ADR its map omits
 ([ADR-0028](./0028-a-map-lists-what-the-contract-depends-on.md)).
 
-Three rules keep it that way. Both are about **kind**, not about banning a form:
+**Three kinds of page carry no map, and that is not an omission** — each is a place a fact *about* a
+decision lives, not a document whose contract depends on one:
+
+- a **record** page: the plan and its per-ticket history (`docs/ARCHITECTURE-EXECUTION-PLAN.md`), the
+  optimization records (`docs/CUDA_OPTIMIZATION.md`, `docs/METAL_OPTIMIZATIONS.md`), and a plan's own
+  root-cause notes (`docs/QWEN3-SUPPORT-PLAN.md`);
+- a **ledger** page: `docs/TEST-BASELINES.md`, whose numbers are machine-checked against
+  `scripts/test-baselines.toml`;
+- an **upstream comparison**: `docs/LLAMA-COMPUTE-GRAPH.md`, which is not this repository's contract.
+
+**And a map may omit an ADR that names the page, in two cases** — both are references *about* a document
+rather than a dependency of it:
+
+- a **correction reference**: ADR-0022 names the documents whose citations it fixes (ADR-0029 records the
+  class);
+- a **contrast reference**: ADR-0037 names `docs/CUDA-BACKEND-DESIGN.md` §4.3 as a different mechanism, not
+  as a dependency.
+
+Three rules keep it that way. All three are about **kind**, not about banning a form:
 
 - **A capability is a dated consequence, never a present-tense claim.** "At the `Date:` above, #310
   enabled X" is allowed; "X is now true" is not — that is the sentence that rots. The authority for
