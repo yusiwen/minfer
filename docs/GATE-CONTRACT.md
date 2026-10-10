@@ -608,3 +608,6 @@ answer from the PR, not as property tests.
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) — The identity gate: bitwise by default, a named tolerance class otherwise
+- [ADR-0023](adr/0023-the-machine-ledgers-live-beside-their-checkers.md) — The machine ledgers live beside their checkers
+- [ADR-0024](adr/0024-a-machine-read-record-is-not-book-content.md) — A machine-read record is not book content
+- [ADR-0025](adr/0025-a-docs-only-change-skips-the-compilers.md) — A docs-only change runs the docs gate, not the compilers
