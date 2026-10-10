@@ -1719,7 +1719,7 @@ on the tree is **122**; two of those are the `<<<>>>` in prose comments, so the 
 | check | before | after |
 |---|---|---|
 | `scripts/check_cuda_launch_returns.py` on `src/cuda_kernels.cu` | **104** unchecked sites | **empty list**: 120 / 120 sites read their own error and carry a lever |
-| CUDA serial unit suite (`scripts/cuda_test.sh`) | **531 / 0 / 37** (master; the recorded 526 predated #173's +3 and #98's +2) | **536 / 0 / 37** (+5 gates) |
+| CUDA serial unit suite (`scripts/cuda_test.sh`) | **531 / 0 / 37** (master `09406ce`; the recorded 526 predated #173's +3 and #98's +2) | **536 / 0 / 37** (+5 gates) |
 | `MINFER_TEST_ISSUE162=1` device gate: every audited site driven and named | — | **5 / 0** tests; the coverage test's driven set equals the 118-token fixture |
 | `compute-sanitizer --tool memcheck` over the serial CUDA unit suite | **0** API errors | **0** errors over 536 |
 | CUDA serial ignored, 0.5B config | 37 / 0 | **37 / 0** |
