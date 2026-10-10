@@ -1014,19 +1014,19 @@ impl GraphAllocator {
             // F4: the capability is the registry's answer (`BackendCaps::
             // reads_packed_kv`), the same field `KvFormat::supports` reads — the
             // pre-F4 `backend != Backend::CPU` hardcode and the C4 format gate
-            // can no longer disagree. C4 S2a gave the CPU the fused read and S2b
-            // the CUDA kernels, so today the registry says yes for CPU and CUDA
-            // and no for Metal (its packed path is implemented but not enabled —
-            // the fast families refuse packed and the classic fallback costs
-            // 4–17×; [#310]).
+            // can no longer disagree. C4 S2a gave the CPU the fused read, S2b the
+            // CUDA kernels and [#310] Metal's: a direct read where the shapes
+            // admit it, and an f32 staging window where the fast families refuse
+            // packed input and the classic fallback would otherwise cost 4–17×,
+            // which is why the capability was held back until that window landed.
             //
             // [#310]: https://github.com/yusiwen/minfer/issues/310
             if !super::registry::reads_packed_kv(backend) {
                 return Err(format!(
                     "KV region for layer {layer} would live on {backend:?}, which has no kernel \
-                     that reads a packed {} region (the CPU and CUDA attention kernels do; Metal's \
-                     packed path is implemented but not enabled — issue #310); refusing rather \
-                     than sizing a region its kernels would address as f32 rows",
+                     that reads a packed {} region; refusing rather than sizing a region \
+                     whose kernels would address it as f32 rows, which would corrupt the \
+                     cache silently",
                     format.name()
                 ));
             }
