@@ -100,7 +100,8 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0025](./0025-a-docs-only-change-skips-the-compilers.md) | 2026-10-09 | A docs-only change runs the docs gate, not the compilers | Accepted (corrected by ADR-0026) |
 | [0026](./0026-the-classifier-carries-no-docs-path-exception.md) | 2026-10-10 | The classifier carries no docs-path exception, and its list is ratcheted | Accepted |
 | [0027](./0027-a-citation-is-dated-too.md) | 2026-10-10 | A citation is dated too — paths, symbols and counts, not only capabilities | Accepted (corrects ADR-0022) |
-| [0028](./0028-a-map-lists-what-the-contract-depends-on.md) | 2026-10-10 | A document's ADR map lists what its contract depends on | Accepted |
+| [0028](./0028-a-map-lists-what-the-contract-depends-on.md) | 2026-10-10 | A document's ADR map lists what its contract depends on | Accepted (corrected by ADR-0029) |
+| [0029](./0029-an-adrs-prose-count-is-dated-and-its-references-are-map-evidence.md) | 2026-10-10 | An ADR's prose count is dated too, and its References are map evidence | Accepted (corrects ADR-0028) |
 
 ## The template
 
