@@ -106,6 +106,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0031](./0031-capture-runs-in-thread-local-mode.md) | 2026-10-10 | Capture runs in thread-local mode, because Global lets a foreign thread's call join the window | Accepted |
 | [0032](./0032-the-packed-kv-staging-window-is-f32.md) | 2026-10-10 | The packed-KV staging window is f32, not f16 | Accepted |
 | [0033](./0033-the-cuda-pool-recycles-exact-byte-lengths.md) | 2026-10-10 | The CUDA pool recycles exact byte lengths, never frees, and reports OOM as an error | Accepted |
+| [0034](./0034-the-smem-opt-in-is-an-eager-prewarm-by-construction.md) | 2026-10-10 | The smem opt-in is an eager pre-warm by construction, with the lazy path as defence in depth | Accepted |
 
 ## The template
 
