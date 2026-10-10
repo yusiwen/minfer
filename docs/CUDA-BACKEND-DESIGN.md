@@ -357,62 +357,14 @@ the detector for the mutation the #218 gates cannot see — a pre-warm that skip
 #218 arms run their fresh-process children with `MINFER_NO_GEMM_PREWARM=1`, the documented control, so
 their claims stay the lazy path's and the pre-warm cannot make them vacuous.
 
-**Cost, measured on the real binary (2026-09-29, GB10 sm_121, CUDA 13.0, driver 580.178.04,
-`MINFER_OP_TIMING=1 ./target/release/minfer bench -p 8 -n 1 -r 1` on the cached 0.5B q4_0).** The
-proxy in #223 used a synthetic kernel pair; the real prefill-GEMM fatbin is different, and the numbers
-differ by ~15×: a pre-warm that is admitted in full is silent, and with `MINFER_OP_TIMING=1` the loop
-reports **~2.2 ms** — the fatbin's one-time module load, not the 152.9 µs the synthetic first
-`cudaFuncSetAttribute` cost.
-
-| pre-warm loop's own duration | measured | reading |
-|---|---|---|
-| warm-clock, 25 fresh processes | **median 2249 µs** (range 2126–2448) | the figure this section first recorded; it is the **warm** measurement and **not** a bound |
-| first (**cold / idle-clock**) invocation, the same one-time work | **~14 526 µs** (~6× the warm median) | what an independent three-run check saw ([#225](https://github.com/yusiwen/minfer/issues/225)); the one-time module load is **clock/state dependent** |
-
-The three consecutive runs behind the cold row (same command, same binary, same box):
-
-```text
-MINFER_OP_TIMING=1 ./target/release/minfer bench -p 8 -n 1 -r 1 <cached 0.5B q4_0>
- CUDA: prefill-GEMM smem pre-warm (12 instantiation(s), 1 refused/skipped …) took 14526 µs   ← first run
- CUDA: prefill-GEMM smem pre-warm … took 2157 µs
- CUDA: prefill-GEMM smem pre-warm … took 2364 µs
-```
-
-So the recorded 2126–2448 range is **warm-clock only**, not the worst case: the cost is the fatbin's
-one-time **module load** (which the process pays before the first kernel from it can run either way),
-and on the first cold / idle-clock invocation of the same one-time work it measured ~14.5 ms. It is
-set-size independent: looping over just `(128,64,false)` costs the same ~2.2 ms as looping over all
-twelve, so it is one module finalization, not twelve.
-
-> **Step 5 re-measure (2026-10-05, `dgxspark (aarch64, GB10 sm_121)`, master `4900298`) — the fatbin is
-> 17 modules now, and in steady state the load costs the same.** The row above was taken when
-> `src/cuda_kernels.cu` was **one** 10,215-line translation unit; since [#263](https://github.com/yusiwen/minfer/issues/263)
-> `src/cuda/kernels/` is `common.cuh` + **17 TUs / 17 fatbin modules** (13 `-gencode` targets apiece).
-> Both binaries were rebuilt in worktrees and run with the same command of record
-> (`MINFER_OP_TIMING=1 target/release/minfer <cached 0.5B q4_0> "hello"`); `nvidia-smi` before the
-> warm runs: SM clock 2 411 MHz, 0 % util, no other compute process.
->
-> | build | modules the command forces | warm, fresh process | cold (page-cache-evicted) |
-> |---|---|---:|---:|
-> | pre-split (`bc30152`, the row above) | **1** (whole fatbin) | **2 300 µs** median (2 203–2 468, n=12) | **18 478 / 20 723 µs** |
-> | post-split (`4900298`), shipped binary | **1 of 17** (`gemm_wmma.cu`) | **350–590 µs** | **4 288 / 6 109 / 6 983 µs** |
-> | post-split, all 16 loadable TUs | **16 of 17** (temporary per-TU probe) | **≈ 2 370 µs** total | **42 671 / 44 416 / 47 412 µs** |
->
-> Per module warm: 40 µs (`gemm_fused_dequant.cu`) … 447 µs (`attention_prefill.cu`), median ≈ 150 µs —
-> the recorded ~2.2 ms was the **whole** pre-split module, not a per-module constant, and the
-> `MINFER_OP_TIMING` line reads 2.3 ms → 0.4 ms only because it now times one seventeenth of the work.
-> **Verdict: acceptable.** Warm steady state is unchanged; a *page-cache-cold* start pays ≈ +25 ms once
-> per process (each of the 16 registrations faults the fatbin's pages again — the 284-line
-> `gemm_fused_dequant.cu` still costs 975 µs cold), ≈ 1.8 % of this model's ~1.4 s cold start, so the
-> named mitigation (trimming `minfer_prewarm_kernels`) is deliberately not applied — it would move the
-> cost into the first forward's lazy loads, not remove it.
->
-> **Correction to the row above (same run).** The ~6× cold factor is **page-cache-cold**, not the GPU
-> clock: with a 40 s idle cooldown (SM clock back at 208 MHz) but resident pages the pre-split binary
-> reads 2 313–2 384 µs, while the same binary with its pages evicted by
-> `posix_fadvise(POSIX_FADV_DONTNEED)` reads 18 478 / 20 723 µs. "Idle-clock" was the correlation, not
-> the cause. Full per-module transcripts: the Step 5 record in `ARCHITECTURE-EXECUTION-PLAN.md`, and
-> `docs/SOURCE-LAYOUT-PLAN.md` §5.1.
+**Cost.** The pre-warm loop's own duration is the fatbin's **one-time module load** — which the process
+pays before the first kernel from it can run either way — so with `MINFER_OP_TIMING=1` the line reads
+~2.3 ms warm, and the pre-split/synthetic 152.9 µs proxy was not the cost. The full measurement is in
+[`docs/SOURCE-LAYOUT-PLAN.md`](SOURCE-LAYOUT-PLAN.md) §5.1:  the pre-split and post-split per-module
+transcripts (warm and *page-cache-cold* — the correction that the ~6× cold factor is page-cache, not the
+GPU clock), the 17-module split's effect on it, and the `MINFER_OP_TIMING` reading that only looks
+smaller because it now times one seventeenth of the work. The Step 5 record in
+[`docs/ARCHITECTURE-EXECUTION-PLAN.md`](ARCHITECTURE-EXECUTION-PLAN.md) holds the ticket-level entry.
 
 The **net** effect is still the proxy's conclusion: the module load **moves** rather than appears —
 but only because something later would pay it anyway. `prewarm_prefill()` (the r59 rider's
