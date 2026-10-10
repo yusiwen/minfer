@@ -31,3 +31,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — The KV storage format is a per-engine gate, not a process-wide global
 - [ADR-0014](adr/0014-a-kv-session-is-a-versioned-file.md) — A KV session is a versioned, checksummed file — never a memory dump
 - [ADR-0005](adr/0005-metal-becomes-a-first-class-backend.md) — Metal becomes a first-class backend
+- [ADR-0011](adr/0011-backend-ids-are-append-only.md) — Backend ids are a file-format contract: appended, never renumbered

@@ -768,3 +768,4 @@ The CPU path went from **1.1 tok/s decode (single-threaded scalar) to
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32
+- [ADR-0007](adr/0007-no-ml-frameworks-every-operator-is-hand-written.md) — No ML frameworks: every operator is hand-written
