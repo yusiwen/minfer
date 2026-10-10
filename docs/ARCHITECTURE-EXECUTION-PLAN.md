@@ -10118,6 +10118,27 @@ Five of the nine matched pairs were above the bar — exactly the count a median
 | `cargo test --release` (CPU, dgxspark) | **465 / 0 / 33** unit + **10 / 0 / 6** integration, unchanged |
 | `python3 scripts/check_status.py --check` | exit 0 |
 
+**Measured — the gate alone, idle (GB10 sm_121, CUDA 13.0, driver 580.178.04, 2026-09-27; `cargo test --release --features cuda --bin minfer cuda_map_window_costs_no_more_than_the_span_it_replaces -- --ignored --nocapture --test-threads=1`).**
+
+| phase | span / map µs/launch | per-round ratios | refusals at 1.25x | verdict |
+|---|---|---|---|---|
+| decode (nkv 2048, nh 28, nk 4, hd 128) | 24.6 / 25.0 | [0.871, 1.007, 1.011, 1.013, 1.014, 1.017, 1.044, 1.050, 1.051] | **0 / 9** | pass |
+| prefill (nt 512, f16 KV) | 82.8 / 91.1 | [1.054, 1.089, 1.097, 1.099, 1.100, 1.100, 1.104, 1.104, 1.189] | **0 / 9** | pass |
+
+**Measured — the parallel `#[ignore]`d configuration (the one that produced the failure), six runs (GB10 sm_121, CUDA 13.0, driver 580.178.04, 2026-09-27; `cargo test --release --features cuda --bin minfer -- --ignored --nocapture`, default parallel harness).** The gate's refusal counts per run, and the whole set's result:
+
+| run | decode refusals | prefill refusals | worst per-round ratio seen | suite |
+|---|---|---|---|---|
+| 1 | 0 / 9 | 3 / 9 | 1.57 (prefill) | **39 passed / 0 failed / 0 ignored** |
+| 2 | 1 / 9 | 3 / 9 | 2.07 (prefill) | **39 / 0 / 0** |
+| 3 | 0 / 9 | 3 / 9 | 1.48 (prefill) | **39 / 0 / 0** |
+| 4 | 1 / 9 | 2 / 9 | 5.09 (decode) | **39 / 0 / 0** |
+| 5 | 0 / 9 | 0 / 9 | 1.15 (decode) | **39 / 0 / 0** |
+| 6 | 2 / 9 | 3 / 9 | 4.09 (decode) | **39 / 0 / 0** |
+
+The co-tenant moved up to 3 of 9 pairs above the bar (the recorded failure's 5 is inside the tolerance); a single disturbed pair reached **5.09x** in run 4 and the sign test still returned green. The whole set was **6 / 6 green**, including the `#154` batching gate that had also failed once in this configuration. Honest reading: in these six runs the co-tenant was lighter than in the recorded one — no run's *median* exceeded 1.25x — so they show the gate is not decided by the co-tenant, not that the new statistic rescued a median-red run. That case is the recorded distribution itself, replayed by the pure test `graph::cuda_backend::tests::the_s4_ab_statistic_absorbs_a_loaded_run_and_still_refuses_a_real_regression` (5 of 9 refusals pass at 7; the old median of the same ratios is 1.398x and red).
+
+
 **Before/after on the parallel configuration.** The #188 record's post-fix state had 2 of 6 parallel `#[ignore]`d runs with one failure each — this gate once and `server_batch_matches_serial_and_is_faster` (#154) once. With this ticket's statistic the same configuration is **6 / 6 green** (39 / 0 each). Honest reading: in these six runs the co-tenant was lighter than in the recorded one — no run's *median* exceeded 1.25x — so the six runs prove the gate is not decided by the co-tenant, while the recorded distribution (5 of 9 above the bar, median 1.398x) is replayed by the new pure test `graph::cuda_backend::tests::the_s4_ab_statistic_absorbs_a_loaded_run_and_still_refuses_a_real_regression`, which asserts the sign test passes it **and** that the old median of the same ratios is red.
 
 **The stale #185 premise.** The ticket text says the parallel `--ignored` device run is "refused loudly (`src/device_entry.rs`)" and asks for the guard to be removed for the test session. After #188 (master `fe1b7cd`) that guard covers only the legacy unbound `CudaState::layer_gpu` path — `crate::device_entry::enter` has no other call site in `src/` (`grep -rn 'device_entry::enter' src/` names only `src/cuda.rs`, plus a doc-comment mention in `models/qwen2/graph.rs`) — and `BackendScheduler::execute` and `register_cuda_weight` no longer take it. The parallel configuration was therefore run **as-is, with no guard change**; it is the same narrowing #188's record already measured.
