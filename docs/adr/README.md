@@ -109,6 +109,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0034](./0034-the-smem-opt-in-is-an-eager-prewarm-by-construction.md) | 2026-10-10 | The smem opt-in is an eager pre-warm by construction, with the lazy path as defence in depth | Accepted |
 | [0035](./0035-the-q4k-dsc-plane-admission-is-two-gates.md) | 2026-10-10 | The q4_K dsc plane is admitted by two gates, and the payload test is equality | Accepted |
 | [0036](./0036-bf16-gets-its-own-device-kernels.md) | 2026-10-10 | bf16 weights get their own device kernels, not a dtype flag on the f16 ones | Accepted |
+| [0037](./0037-a-metal-weight-dtype-a-kernel-cannot-consume-is-refused.md) | 2026-10-10 | A Metal weight dtype a kernel cannot consume is refused, never run as a wrong kernel | Accepted |
 
 ## The template
 
