@@ -59,8 +59,8 @@ matmul and `kernel_get_rows_f16` the embedding gather, both selected by the
 width on the device — no registration-time f32 copy — and, like CUDA, an f16
 prefill runs the f32-activation kernel, not a simdgroup GEMM. Both loaders admit
 the type, so `weights_on_gpu`'s all-or-nothing check passes and the model is a
-Metal model; 1-D norms/biases stay f32 (the file contract above), so an f16 norm
-can never reach a `d*2` kernel buffer. Measured on `macbook (macOS 27.0.1, Apple
+Metal model; the file contract above means an f16 norm can never reach a `d*2`
+kernel buffer. Measured on `macbook (macOS 27.0.1, Apple
 M4 Pro)` (2026-10-06) against the same file's CPU logits: max |Δlogit| 2.4e-3 on
 the 0.5B and 7.9e-3 on Qwen3-0.6B (bar 0.05), with an identical greedy
 continuation (`[12095, 11, 323, 432]` for Qwen2, `[12095, 13, 576, 6722]` for
@@ -85,11 +85,12 @@ f32-activation kernel, not the int8 MMQ GEMM (MMQ streams quantized bytes and
 bf16 is not one of its formats). Both loaders admit the type through the shared
 `models::weight_reg::cuda_weight_reg` rule, so `weights_on_cuda`'s all-or-nothing
 check passes for **both** supported architectures and the graph's `BF16` matmul /
-embed nodes are assigned `Backend::CUDA`; 1-D norms/biases stay f32 (the file
-contract above). bf16 does not fuse: `cuda::concat_rows` has no 2 B/element arm,
+embed nodes are assigned `Backend::CUDA`; the 1-D side is the file contract above.
+bf16 does not fuse: `cuda::concat_rows` has no 2 B/element arm,
 so the `attn_qkv` / `ffn_gu` concat copies are not registered and the unfused
 matmul chain runs. Measured on a GB10 (2026-10-06, `dgxspark`): a 0.5B bf16 GGUF
-registers 942.4 MiB of device weights (the same number as its f16 twin, i.e. the
+registers the device-weight figure recorded in §"f16 and bf16 weights" (the same
+number as its f16 twin, i.e. the
 2 B/element claim is real), 169 bf16 matmul + 1 embed nodes on CUDA, device-vs-CPU
 max |Δlogit| **7.82e-5** absolute / **4.24e-6** relative (bar 0.01 / 1e-3) with an
 identical greedy continuation `[12095, 13, 1084, 374]`.
@@ -104,11 +105,11 @@ element in the hottest device kernel. The weights stay half width on the device
 — no registration-time f32 copy — and, like CUDA/f16, a bf16 prefill runs the
 f32-activation kernel, not a simdgroup GEMM. Both loaders' Metal arm
 (`matches!(ttype, F32 | F16 | BF16)`) admits the type, so `weights_on_gpu`'s
-all-or-nothing check passes and the model is a Metal model; 1-D norms/biases
-stay f32 (the file contract above). bf16 does not fuse (the fused device forms
+all-or-nothing check passes and the model is a Metal model; the file contract above
+covers the 1-D side. bf16 does not fuse (the fused device forms
 are CUDA-only). Measured on a Mac (2026-10-06, `macbook (macOS 27.0.1, Apple
 M4 Pro)`) against the same file's CPU logits: 169 bf16 matmul + 1 embed nodes
-all on `Backend::METAL`, 942.4 MiB of device weights, max |Δlogit| **1.889e-3**
+all on `Backend::METAL`, the same device-weight figure, max |Δlogit| **1.889e-3**
 absolute / **1.025e-4** relative (bar 0.05 / 5e-3), with an identical greedy
 continuation `[12095, 13, 1084, 374]`.
 
