@@ -107,6 +107,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0032](./0032-the-packed-kv-staging-window-is-f32.md) | 2026-10-10 | The packed-KV staging window is f32, not f16 | Accepted |
 | [0033](./0033-the-cuda-pool-recycles-exact-byte-lengths.md) | 2026-10-10 | The CUDA pool recycles exact byte lengths, never frees, and reports OOM as an error | Accepted |
 | [0034](./0034-the-smem-opt-in-is-an-eager-prewarm-by-construction.md) | 2026-10-10 | The smem opt-in is an eager pre-warm by construction, with the lazy path as defence in depth | Accepted |
+| [0035](./0035-the-q4k-dsc-plane-admission-is-two-gates.md) | 2026-10-10 | The q4_K dsc plane is admitted by two gates, and the payload test is equality | Accepted |
 
 ## The template
 
