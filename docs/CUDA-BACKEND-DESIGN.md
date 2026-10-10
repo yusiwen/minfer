@@ -1053,165 +1053,17 @@ CUDA 13.0, driver 580.178.04):
 replayed CUDA graph are traced as one graph and never appear individually, which silently hides the
 whole decode path).
 
-### 7.3 Issue #145 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
+### 7.3 Recorded verifications — #145, #147, #141, #165, #167
 
-`compute-sanitizer --tool memcheck` over the serial CUDA unit suite is the acceptance gate. Baseline
-(before the fix): **36 API errors** — 26 `cudaGraphDestroy` (the wrong destructor for an exec, from
-`graph_replay_step` and `Drop`), 9 `cudaGetLastError` observations, 1 `cudaFuncSetAttribute` — over
-**490 passed / 0 failed / 31 ignored**. After: **0 errors** over **495 passed / 0 failed / 31
-ignored** (the five new gates). `minfer bench` on the 0.5B Q4_K_M goes from printing
-`CUDA kernel launch error: 1` between its two loops to printing none, with the eager opt-in's one
-skipped instantiation named instead. The device limit the request had to fit is
-`cudaDevAttrMaxSharedMemoryPerBlockOptin = 101376 B`; the rejected pre-fix request was 131072 B for
-`gemm_f16_nt_kernel_t<256,64,true>` (the corrected request is 122880 B, still over the limit, hence
-the deliberate skip). The mutation checks are recorded in
-`docs/ARCHITECTURE-EXECUTION-PLAN.md` (C4 S2c).
+These five are per-ticket verification records, and their durable home is the plan's ticket section
+(`docs/ARCHITECTURE-EXECUTION-PLAN.md`, one section per ticket). What their gates *assert* is stated
+where it belongs, not here: the failure-injection seam in `docs/GATE-CONTRACT.md`
+([#171](https://github.com/yusiwen/minfer/issues/171)), the launch-return rules in §4.9, and the `q4_K`
+`dsc` admission in §2.3.
 
-### 7.4 Issue #147 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
-
-The follow-on to #145: the remaining CUDA calls that discarded a return value gating a later launch or
-allocation (the MMQ dynamic-smem opt-ins and the launches that follow them, the prefill-GEMM
-launcher's own launch, and `graph_end_capture_to_exec`'s `cudaGraphDestroy`). Latent on this device —
-the sanitizer was already clean — so the acceptance is that each site still cannot latch: **0 API
-errors** before and after, **508 passed / 0 failed / 32 ignored** after (503 before; five new gates:
-three pure, two device/env-gated), 0.5B and Qwen3-0.6B real-model sets **32 / 0** each, CPU suite
-440 / 0 / 29 + 10 / 0 / 6 and CPU serial ignored 29 / 0 unchanged.
-
-The deliberate-failure injection is `MINFER_TEST_CALL_FAIL` (site tokens, or `all`) plus
-`MINFER_TEST_ISSUE147=1` to enable the gates: a named site performs its **real** call with a value that
-fails — an attribute request one page over the queried device limit, a launch with 16 MiB more dynamic
-smem than was opted in, or `cudaGraphDestroy` on the exec — so the "latch cleared" half is exercised for
-real rather than through a synthetic return value. Both variables are unset in every default, bench and
-`compute-sanitizer` run. The two probes the injection relies on are recorded in `/tmp`:
-`fix147_attr_capture_probe.cu` (`cudaFuncSetAttribute` inside a Global capture window returns
-`cudaSuccess` on this runtime — see §2.4) and `fix147_launch_fail_probe2.cu` (an over-limit dynamic-smem
-launch is rejected by the launch call with `cudaErrorInvalidValue`, and the kernel never runs).
-Mutation checks: every hardening reverted one at a time (eight per-site attribute guards, the gemm
-opt-in guard, the shared launch check, the gemm message naming a wrong instantiation, the shared opt-in
-admitting a failure, the Rust destroy read, the Rust formatter, the injection matcher), each failing
-its gate, with both files restored byte-identically. The remaining 65 unchecked `<<<>>>` returns were
-[#162](https://github.com/yusiwen/minfer/issues/162), now closed by §7.9; the full #147 record is
-`docs/ARCHITECTURE-EXECUTION-PLAN.md` (C4 S2d).
-
----
-
-### 7.5 Issue #141 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
-
-f16 weights on the device, the third item F6 (#49) left: the loader registered f32 and the supported
-quants only, so an f16 GGUF fell to the CPU through the all-or-nothing `weights_on_cuda` gate even on
-a CUDA build. The change is the registration branch (`TensorType::F16` → `register_weight` raw; it is
-deliberately **not** folded into the quantized `matches!`, whose q4_K dsc-plane gate has no type
-check), `matmul_f32_ptr_layout`'s f16 arm, `embed_rows_on_gpu`'s f16 arm, and `weights_on_cuda`'s
-matmul/embed type sets.
-
-**Verified** (`f141_f16_weights_run_on_the_cuda_device`, `#[ignore]`d in the real-model set):
-`minfer convert` produced the file from the Qwen2.5-0.5B-Instruct HF checkpoint (994,156,352 B,
-948 MiB, 290 tensors, every 2-D tensor f16). The gate asserts, in order: the model's device is
-`Cuda`; the offload report says all 24 blocks + embed/output are on the device (942.4 MiB of device
-weights); the scheduler assigns **169 f16 matmul nodes + 1 f16 embed node** to `Backend::CUDA`
-(counted by walking the built graph's `CNode.backend`, so a silent CPU fallback fails here); then the
-device logits against the same file's `Layers(0)` CPU run — max |Δlogit| **7.34e-5** (mean 1.26e-5)
-against max |logit| 18.43, **4.0e-6** relative, greedy `[12095, 13, 1084, 374]` identical, asserted at
-|Δ| ≤ 0.01 and relative ≤ 1e-3 (the bound is stated and printed by the gate). llama.cpp on the same
-file (`--temp 0`) prints `Paris.`, the same continuation minfer gives on CPU and CUDA.
-
-**Mutations (reverted; files restored byte-identical).** (a) the loader's f16 registration gated off →
-the gate fails at `device()`: *left: Cpu, right: Cuda*; (b) the f16 arm removed from
-`matmul_f32_ptr_layout` → the gate panics on the loud `Err` *"cuda: weight type F16 has no
-f32-activation matmul kernel"*, not on a silent fallback; (c) the kernel's `__half22float2` replaced
-with zeros for half of each 8-element chunk → the gate fails on the greedy continuation (a value-level
-fault cannot pass the numeric comparison either). `compute-sanitizer --tool memcheck` over the CUDA
-unit suite stays at **0 API errors**. The full record is `docs/ARCHITECTURE-EXECUTION-PLAN.md` (#141).
-
----
-
-### 7.6 Issue #165 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
-
-The q4_K `W_dsc` plane's admission contract (§2.3 above). The defect was the qwen2 loader reaching
-`register_weight_q4k_dsc` for every non-Q6_K type in its quantized `matches!`; the surface was a
-plane built from another type's bytes that no kernel reads (the map is keyed on the q4_K weight's
-device pointer), plus a latent out-of-bounds read for a future smaller-ratio type.
-
-**Fixed** in `src/q4k_dsc.rs` (`q4k_dsc_plane_admitted` = type + exact payload; the qwen2 loader
-calls it; `register_weight_q4k_dsc` re-checks the payload before the budget query and before
-`expand_q4k_dsc`, which itself returns `None` for a payload it cannot index).
-
-**Measured** (`q4dsc_planes()`, registry-by-name; before = the two gate halves reverted):
-
-| Model | Before | After |
-|---|---|---|
-| cached 0.5B **q4_0** | 24 planes / 26 148 864 B | **0 / 0** |
-| `/tmp/fix165/qwen2.5-0.5b-instruct-q8_0.gguf` (`minfer quantize` of the q4_0 0.5B) | 24 / 26 148 864 B | **0 / 0** |
-| `Qwen3-0.6B-Q8_0.gguf` | 0 / 0 — the qwen3 loader never had the call | 0 / 0 |
-| cached 0.5B **q4_k_m** (positive control) | — | **12 / 13 074 432 B** (exactly the index's admissible q4_K set) |
-
-`cargo test --release --features cuda -- --test-threads=1`: **516 passed / 0 failed / 34 ignored**
-(baseline 513 / 0 / 33). `FEATURES=cuda scripts/real_model_gates.sh`: **34 / 0** at both the 0.5B and
-the Qwen3-0.6B-Q8_0 config. `compute-sanitizer --tool memcheck` over the serial unit suite **0 API
-errors**, before (514/2/34, the two new gates failing on the pre-fix path) and after (516/0/34).
-
-**Mutations (reverted; files restored byte-identical, `sha256sum`).** (a) type gate removed →
-the pure wrong-type assertion and the real-model q4_0 gate fail (**24 planes / 26 148 864 B** against
-0 expected); (b) exact payload equality weakened to `>=` → the pure *"one block long"* assertion and
-the device gate's *"a q8_0 payload must not register a __q4dsc plane"* fail; (c) the plane registered
-under a wrong name (`__q4dscX`) → the device gate fails at its **positive control**, proving the
-"nothing registered" arms observe the plane's real registry entry. The full record is
-`docs/ARCHITECTURE-EXECUTION-PLAN.md` (F6c).
-
-**Honest scope.** The model #165 names (`Qwen3-0.6B-Q8_0`) does **not** reproduce the defect — it is
-arch `qwen3`, whose loader has no `register_weight_q4k_dsc` call (0 planes before and after); the
-qwen2 q8_0 arm is measured on a q8_0 file built here. And the size check cannot tell a q4_K payload
-from another type's bytes of the same length (q4_0 shares q4_K's ratio exactly), which is why the
-type gate is not redundant.
-
----
-
-### 7.7 Issue #167 verification (GB10, sm_121, CUDA 13.0, driver 580.178.04)
-
-The qwen3 loader's registration block had drifted from qwen2's twice: it had no r59
-`register_weight_q4k_dsc` call (so a q4_K Qwen3 kept `mmq_raw_nb_bt`'s in-kernel scalar dsc decode)
-and no `TensorType::F16` branch (#141, so an f16 Qwen3 model was dropped to the CPU); the qwen3
-graph's `weights_on_cuda` was missing `F16` as well, so registering alone would not have been
-enough. Fixed by §2.3's shared rule (`src/models/weight_reg.rs`; both loaders call
-`register_cuda_weight`) plus `Qwen3Graph::weights_on_cuda`'s two F16 arms and
-`CudaState::q4dsc_plane_for` (the same pointer-keyed lookup `mmq_raw_nb_bt` performs).
-
-**Verified.** `f167_qwen3_q4k_registers_the_dsc_plane_exactly` loads a HuggingFace Q4_K_M
-Qwen3-0.6B and asserts the registered `*__q4dsc*` set **equals** the GGUF index's admissible q4_K
-set by name and count: **168 planes / 95 420 416 B** (168 q4_K among 29 other quantized 2-D
-tensors), each found by the kernel's own `q4dsc_plane_for`, each non-null and distinct; a q8_0 and a
-**q4_0** negative arm register **0** (q4_0 shares q4_K's bytes/element exactly, so it is the only
-negative that can catch a type-gate bypass). `f167_f16_qwen3_weights_run_on_the_cuda_device` shows
-28/28 blocks + embed/output on the device (1137.0 MiB), **197 f16 matmul + 1 f16 embed node**
-assigned `Backend::CUDA`, and device-vs-CPU max |Δlogit| **8.92e-3** (mean 1.25e-3) / **4.46e-4**
-relative at max |logit| 19.99, greedy `[12095, 13, 576, 6722]` identical — asserted at ≤ 0.05 and
-≤ 1e-3. Qwen3's spread is ~100× the 0.5B f16 gate's (7.34e-5 / 4.0e-6) because it runs four norms
-per layer and the CPU rms_norm (8-lane AVX2 FMA + f64 tail, `1/sqrt`) and the device rms_norm
-(warp-shuffle f32, `rsqrtf`) differ in reduction order and reciprocal-sqrt form.
-
-Suites: `cargo test --release --features cuda -- --test-threads=1` **521 passed / 0 failed / 36
-ignored** (baseline 516 / 0 / 34); `FEATURES=cuda scripts/real_model_gates.sh` **36 / 0** at both
-the 0.5B and the Qwen3-0.6B-Q8_0 config (baseline 34 / 0); `compute-sanitizer --tool memcheck` over
-the serial unit suite **0 errors** (521 / 0 / 36 in 353.44 s); CPU `cargo test --release` **452 / 0
-/ 32** unit + **10 / 0 / 6** integration, `PARALLEL=0 scripts/real_model_gates.sh` **32 / 0**.
-
-**Mutations (reverted; `sha256sum` byte-identical).** (a) the F16 arm removed from
-`cuda_weight_reg` → the pure f16 test fails and the device gate fails at *left: Cpu, right: Cuda*;
-(b) F16 removed from `Qwen3Graph::weights_on_cuda`'s `matmul_t_ok` → the same failure; (c) the q4_K
-admission bypassed (`q4k_dsc = gates && od % 2 == 0`) → the pure test fails and the real-model gate
-fails on its **q4_0** negative arm (the q8_0 arm alone cannot catch it: the registry re-checks the
-payload and refuses a longer one); (d) the plane forced off → the pure test fails and the gate
-fails at 0 planes against 168 expected.
-
-**Honest scope.** The r59 dsc **prefill win is not measured** — the gate proves the plane set is
-exactly right and the kernel finds it, not a Qwen3 prefill speedup. The q4_K model is a community
-Q4_K_M (the official Qwen Qwen3-0.6B GGUF repo ships only Q8_0) and the f16 model is
-`llama-quantize --allow-requantize … F16` of the cached Q8_0; `minfer quantize --type f16` was
-tried first and writes f16 **1-D norms**, which the engine cannot load (filed as
-[#169](https://github.com/yusiwen/minfer/issues/169)). The plane gate needs
-`/tmp/f167-work/qwen3-q4k.gguf` and skips (printing why) when it is absent.
-
----
+The old §7.4–§7.7 headings were folded into this one; §7.8, §7.9 and §7.10 keep their numbers because
+their records are not wholly duplicated — they carry the norm-weight invariant, the launch-site census
+and the #189 value arm respectively.
 
 ### 7.8 Issue #169 verification — the norm weight type is part of the rms_norm invariant (GB10, sm_121, CUDA 13.0, driver 580.178.04, 2026-09-26)
 
