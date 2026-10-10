@@ -103,6 +103,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0028](./0028-a-map-lists-what-the-contract-depends-on.md) | 2026-10-10 | A document's ADR map lists what its contract depends on | Accepted (corrected by ADR-0029) |
 | [0029](./0029-an-adrs-prose-count-is-dated-and-its-references-are-map-evidence.md) | 2026-10-10 | An ADR's prose count is dated too, and its References are map evidence | Accepted (corrects ADR-0028) |
 | [0030](./0030-launch-severity-lives-in-the-helper.md) | 2026-10-10 | Launch severity lives in the helper, not in 120 call sites | Accepted |
+| [0031](./0031-capture-runs-in-thread-local-mode.md) | 2026-10-10 | Capture runs in thread-local mode, because Global lets a foreign thread's call join the window | Accepted |
 
 ## The template
 
