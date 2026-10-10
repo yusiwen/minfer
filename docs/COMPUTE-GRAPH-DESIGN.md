@@ -1607,3 +1607,5 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md) — A failure is an error, never a silent fallback
 - [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) — The identity gate: bitwise by default, a named tolerance class otherwise
 - [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32
+- [ADR-0004](adr/0004-the-batching-default-follows-the-device.md) — The batching default follows the device
+- [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — The KV storage format is a per-engine gate, not a process-wide global

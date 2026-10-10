@@ -566,3 +566,8 @@ selected an f16 GPU cache (opt-in).
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0001](adr/0001-inference-runs-through-one-declarative-compute-graph.md) — Inference runs through one declarative compute graph
 - [ADR-0012](adr/0012-device-first-layering-and-no-premature-common.md) — Device is the first axis, the layer the second — and no premature `common`
+- [ADR-0002](adr/0002-topology-is-a-function-of-graph-params.md) — Topology is a function of `GraphParams` alone, so `positions` cannot be structure
+- [ADR-0007](adr/0007-no-ml-frameworks-every-operator-is-hand-written.md) — No ML frameworks: every operator is hand-written
+- [ADR-0008](adr/0008-gpu-safety-bounded-waits-and-runtime-limits.md) — GPU safety: bounded waits, no early return past a barrier, runtime device limits
+- [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md) — A failure is an error, never a silent fallback
+- [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32

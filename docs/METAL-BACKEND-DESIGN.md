@@ -1069,3 +1069,6 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32
 - [ADR-0014](adr/0014-a-kv-session-is-a-versioned-file.md) — A KV session is a versioned, checksummed file — never a memory dump
 - [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32
+- [ADR-0012](adr/0012-device-first-layering-and-no-premature-common.md) — Device is the first axis, the layer the second — and no premature `common`
+- [ADR-0015](adr/0015-the-offload-auto-fit-takes-a-prefix.md) — The offload `auto` fit takes a prefix, not a knapsack
+- [ADR-0016](adr/0016-a-failed-device-query-is-not-a-zero-budget.md) — A failed device-memory query is not a zero budget

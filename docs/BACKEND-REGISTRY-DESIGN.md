@@ -648,3 +648,6 @@ cargo test --release --bin minfer async_cross_copies_never_block_and_stay_bitwis
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0001](adr/0001-inference-runs-through-one-declarative-compute-graph.md) — Inference runs through one declarative compute graph
 - [ADR-0011](adr/0011-backend-ids-are-append-only.md) — Backend ids are a file-format contract: appended, never renumbered
+- [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — The KV storage format is a per-engine gate, not a process-wide global
+- [ADR-0008](adr/0008-gpu-safety-bounded-waits-and-runtime-limits.md) — GPU safety: bounded waits, no early return past a barrier, runtime device limits
+- [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md) — A failure is an error, never a silent fallback

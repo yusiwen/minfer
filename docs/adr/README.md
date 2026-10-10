@@ -18,6 +18,12 @@ has exactly one home:
 | Unresolvable path citations in this corpus, each with a reason | `scripts/adr-citations.toml`, beside its checker | Yes |
 | A machine-read record: fixture provenance, an accepted-annotation baseline | beside its readers, never in the book tree — `tests/fixtures/f6-fixtures.json`, `scripts/dead-code-baseline.toml` (ADR-0024) | Yes |
 
+**What a map lists.** A design document ends with `## Decisions governing this document` — its
+**map**. It lists the ADRs whose decision that document's current contract **depends on** (states
+it, or requires it); naming another document's decision is a cross-reference, which belongs in the
+prose and *not* in the map, so a document may legitimately mention an ADR its map omits
+([ADR-0028](./0028-a-map-lists-what-the-contract-depends-on.md)).
+
 Three rules keep it that way. Both are about **kind**, not about banning a form:
 
 - **A capability is a dated consequence, never a present-tense claim.** "At the `Date:` above, #310
@@ -94,6 +100,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0025](./0025-a-docs-only-change-skips-the-compilers.md) | 2026-10-09 | A docs-only change runs the docs gate, not the compilers | Accepted (corrected by ADR-0026) |
 | [0026](./0026-the-classifier-carries-no-docs-path-exception.md) | 2026-10-10 | The classifier carries no docs-path exception, and its list is ratcheted | Accepted |
 | [0027](./0027-a-citation-is-dated-too.md) | 2026-10-10 | A citation is dated too — paths, symbols and counts, not only capabilities | Accepted (corrects ADR-0022) |
+| [0028](./0028-a-map-lists-what-the-contract-depends-on.md) | 2026-10-10 | A document's ADR map lists what its contract depends on | Accepted |
 
 ## The template
 
