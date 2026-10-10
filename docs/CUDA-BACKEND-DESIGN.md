@@ -1164,3 +1164,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0034](adr/0034-the-smem-opt-in-is-an-eager-prewarm-by-construction.md) — The smem opt-in is an eager pre-warm by construction, with the lazy path as defence in depth
 - [ADR-0035](adr/0035-the-q4k-dsc-plane-admission-is-two-gates.md) — The q4_K dsc plane is admitted by two gates, and the payload test is equality
 - [ADR-0036](adr/0036-bf16-gets-its-own-device-kernels.md) — bf16 weights get their own device kernels, not a dtype flag on the f16 ones
+- [ADR-0038](adr/0038-the-per-tensor-registration-dispatch-is-one-shared-rule.md) — The per-tensor registration dispatch is one shared rule, not a copy per loader
