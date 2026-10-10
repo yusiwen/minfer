@@ -1027,3 +1027,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0012](adr/0012-device-first-layering-and-no-premature-common.md) — Device is the first axis, the layer the second — and no premature `common`
 - [ADR-0015](adr/0015-the-offload-auto-fit-takes-a-prefix.md) — The offload `auto` fit takes a prefix, not a knapsack
 - [ADR-0016](adr/0016-a-failed-device-query-is-not-a-zero-budget.md) — A failed device-memory query is not a zero budget
+- [ADR-0032](adr/0032-the-packed-kv-staging-window-is-f32.md) — The packed-KV staging window is f32, not f16
