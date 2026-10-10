@@ -575,8 +575,8 @@ Two layers of checks are deliberately *not* in `supports_op`:
   The launchers are their own (`launch_bf16_f32_matmul` / `launch_embed_rows_bf16`), each reading its
   own launch return through the #147 helpers, so a failed launch is an `Err` at the call site. The
   same two design decisions as f16 apply and for the same reasons: the weights stay 2 B/element on
-  the device (a 0.5B bf16 GGUF registers 942.4 MiB — the f16 twin's number — where a dequantized copy
-  would be ~1.9 GiB), and a bf16 prefill does **not** enter the int8 MMQ GEMM (its `matches!` list is
+  the device (the f16 bullet above carries the measured figure — the f16 twin's number — where a
+  dequantized copy would be ~1.9 GiB), and a bf16 prefill does **not** enter the int8 MMQ GEMM
   quantized types only; MMQ streams quantized bytes and bf16 is not a format). bf16 is registered by
   the shared `models::weight_reg::cuda_weight_reg` rule, so both architectures admit it in one place;
   `cuda::concat_rows` has **no** 2 B/element arm, so the `attn_qkv` / `ffn_gu` concat copies are not
