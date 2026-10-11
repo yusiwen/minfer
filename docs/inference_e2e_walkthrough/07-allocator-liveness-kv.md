@@ -679,9 +679,12 @@ let id = graph.inputs.iter().copied()
     .ok_or_else(|| format!("no input node named '{name}'"))?;
 let br = self.node_buffer(id)
     .ok_or_else(|| format!("input '{name}' has no buffer (not allocated)"))?;
-match br.backend {
-    Backend::CPU => self.cpu.write_host(br.id, data),
-    // … Metal / CUDA arms call the same write_host on their pools …
+// F4: the pool is looked up through the registry handle, not matched on a variant.
+let (backend, id, offset) = (br.backend, br.id, br.offset);
+match self.pool_mut(backend) {
+    Some(pool) => pool.write_host_window(id, offset, data),
+    None => Err(format!("{} is not usable on this allocator: {}", backend.name(), …)),
+}
 ```
 
 Inputs are found **by name**, not position — the graph is rebuilt between
@@ -692,20 +695,23 @@ prefill and decode, so node ids may shift, but the names `"token_ids"` /
 `copy_across`).
 
 ```rust
+// `copy_across_blocking` (the host leg), `alloc.rs:2546-2557`:
 let data = self
     .copy_to_cpu(node_id)
     .ok_or_else(|| format!("node {node_id} host read failed"))?;
-let new_id = self.alloc_fresh_in(dst_backend, data.len());
-// write into the destination backend pool
-match dst_backend {
-    Backend::CPU => self.cpu.write_host(new_id, &data)?,
-    // … Metal / CUDA arms identical …
+self.write_cross_staging(dst, &data)
+
+// `write_cross_staging` (`alloc.rs:2630`) → `write_pool` (`alloc.rs:2810`): one
+// registry lookup through the handle, never a `match` on a backend variant.
+match self.pool_mut(dst.backend) {
+    Some(pool) => pool.write_host(dst.id, data),
+    None => Err(…),
 }
-self.cross.insert(
-    node_id,
-    BufRef { backend: dst_backend, id: new_id },
-);
 ```
+
+The staging `BufRef` is minted by `cross_staging` (`alloc.rs:2499-2532`), which is also where
+the entry is inserted into `self.cross` — the destination buffer is allocated *fresh* there
+(`alloc_fresh_in`), so the copy never lands in recycled memory.
 
 `copy_to_cpu` is safe *here* — this code only runs at a split boundary,
 *i.e.* after the producing split was synchronized (§2.7). The same host copy

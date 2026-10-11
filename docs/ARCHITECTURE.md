@@ -97,7 +97,8 @@ layer:
 
 | File | Role |
 |------|------|
-| `mod.rs` | `ComputeGraph` (topo-validated node list + inputs/outputs), `CNode`, `DType`, `Backend`, `BufRef` |
+| `mod.rs` | `ComputeGraph` (topo-validated node list + inputs/outputs), `CNode`, `DType`, `BufRef`; re-exports the `Backend` **handle** from `registry.rs` |
+| `registry.rs` | The backend **registry** (F4): the fixed id space (`Backend::CPU`/`METAL`/`CUDA`), the name surface and its three startup refusals, each entry's priority + capability record + pool/host-I/O hooks, and the `--backend` / `MINFER_BACKENDS` filter. Contract: `docs/BACKEND-REGISTRY-DESIGN.md` |
 | `ops.rs` | `Op` enum (full payload `PartialEq`), `NodeMeta`, `AttnMode`, `FusedOp` |
 | `builder.rs` | `GraphBuilder` — declarative construction (embedding/rms_norm/matmul/rope/attn/kvcache/…) |
 | `alloc.rs` | Per-backend liveness allocator + persistent per-layer KV regions + `KvProvider` |
@@ -304,19 +305,31 @@ same backend by construction), so there is no per-token KV drain.
 
 ### 5.1 The `Backend` trait (`graph/backend.rs`)
 
+`Backend` (the thing the IR stores on a node) is **not** this trait: since F4 it is a `Copy`
+handle — an id into `src/graph/registry.rs` — and the trait below is implemented by the pools
+(CPU, Metal, CUDA) and held by the registry entry. The name, id, priority and capability record
+live on the handle/entry, not on the trait (`Backend::name()` is `registry.rs:105`):
+
 ```rust
 pub trait Backend: Send + Sync {
-    fn name(&self) -> &str;
+    fn kv_pair(&self, layer: usize) -> Option<(usize, usize)>;   // persistent per-layer K/V regions
     fn supports_op(&self, op: &Op, dtype: DType) -> bool;
     fn supports_fused(&self, fused: &FusedOp) -> bool;
-    fn alloc_buffer(&mut self, size: usize) -> usize;   // backend's own pool
+    fn supports_attn_span(&self) -> bool { false }       // E1: explicit attention windows (CPU/CUDA/Metal)
+    fn weights_bytes(&self) -> usize { 0 }               // E4: bytes the memory budget is charged for
+    fn alloc_buffer(&mut self, size: usize) -> usize;    // backend's own pool
     fn free_buffer(&mut self, id: usize);
-    fn alloc_fresh(&mut self, size: usize) -> usize;    // bypasses the recycle free list (split-boundary staging)
+    fn pool_len(&self) -> usize;
+    fn alloc_fresh(&mut self, size: usize) -> usize;     // bypasses the recycle free list (split-boundary staging)
     fn execute_node(&mut self, node: &CNode, in_bufs: &[usize],
                     out_buf: usize, kv_pair: Option<(usize, usize)>) -> Result<(), String>;
+    fn copy_cells(&mut self, dst: BufRef, src: BufRef, dst_row: usize, src_row: usize,
+                  rows: usize, elems_per_cell: usize) -> Result<(), String>;   // C3 compaction / C2 shift
     fn read_host(&self, id: usize) -> Option<&[f32]>;
     fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String>;
+    fn write_host_window(&mut self, id: usize, offset: usize, data: &[f32]) -> Result<(), String>;
     fn synchronize(&mut self);
+    fn retire(&mut self) { self.synchronize(); }         // release device objects for a dropped pool
     // CUDA only: try to replay a captured graph for (uid, range); capture is
     // gated to decode-shaped graphs. Default impl returns false.
     #[cfg(feature = "cuda")]
@@ -345,8 +358,22 @@ scheduler orchestrates assignment, cross-backend copies, and sync.
 
 ### 5.2 Selection rules
 
+Assignment asks each node in the registry's **priority** order — Metal 300, CUDA 200, CPU 100
+(`src/graph/registry.rs:72-75`) — for the first backend that has a pool, is not fenced off, and
+reports the op supported; the CPU is tried last and is always allowed, so the answer is total
+(`GraphAllocator::supports_for`, `src/graph/alloc.rs:403`). The fence is `--backend <name>` /
+`MINFER_BACKENDS=<csv>`, and an unknown name, a name this build does not contain and a name this
+machine cannot use are three distinct startup refusals. The two orders, the name surface and
+those refusals are `docs/BACKEND-REGISTRY-DESIGN.md`'s contract; the user-facing flags are
+`docs/USAGE.md`.
+
 - **Metal**: all graph weights must be GPU-registered (`Qwen2Graph::weights_on_gpu`
   mirrors the old per-layer check). `MINFER_DISABLE_MPS=1` forces CPU.
+- **CUDA**: feature-gated (`--features cuda`), and every graph weight must be
+  GPU-registered with a device present. A node whose block the E5 offload plan left
+  on the CPU never reaches the device (`supports_for` answers `CPU` for it, so a
+  partially offloaded model cannot run a block whose weights were never registered
+  there). `MINFER_DISABLE_CUDA=1` is presence-checked and forces the CPU.
 - **CPU**: always available; AVX2 dispatch via
   `is_x86_feature_detected!("avx2")` on x86, NEON+SDOT on aarch64, scalar
   fallback elsewhere (`MINFER_NO_NEON=1` forces scalar; the K-quant dots also have
