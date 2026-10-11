@@ -10,9 +10,10 @@ replaced reference was compared against silently and the gate stayed green.
 ``tests/fixtures/f6-fixtures.json`` is the record: one entry per **artifact content
 identity** — ``path``, ``bytes``, ``sha256`` (or a recorded ``sha256_prefix``
 where the 2026-10-07 table truncated it), the exact ``producer`` command, the
-producer's identity (``minfer_commit`` for a minfer-produced file, or
+producer's identity (``minfer_commit`` for a minfer-produced file,
 ``llamacpp_commit`` + ``compiler`` + ``ffp_contract`` + ``cflags`` for a
-llama-produced one), ``date`` and an **absolute** box label (gate contract rule
+``llama-quantize`` one, ``llamacpp_commit`` + ``torch`` + ``transformers`` for a
+``convert_hf_to_gguf.py`` one), ``date`` and an **absolute** box label (gate contract rule
 5). A path with more than one entry is a *recorded divergence*, and every such
 path must be explained by a ``divergence_notes`` entry — the two 2026-10-07
 divergences are why the manifest exists (a minfer producer-version difference on
@@ -189,6 +190,7 @@ DEFAULT_CACHE = "~/.cache/minfer/f6-src"
 REQUIRED_BY_KIND = {
     "minfer": ("minfer_commit",),
     "llama-quantize": ("llamacpp_commit", "compiler", "ffp_contract", "cflags"),
+    "convert-hf-to-gguf": ("llamacpp_commit", "torch", "transformers"),
     "hf-download": ("source",),
 }
 
@@ -203,6 +205,7 @@ FFP_CONTRACTS = ("fast", "off")
 PRODUCER_PROGRAM = {
     "minfer": ("minfer",),
     "llama-quantize": ("llama-quantize",),
+    "convert-hf-to-gguf": ("convert_hf_to_gguf.py",),
     "hf-download": ("curl",),
 }
 
@@ -216,7 +219,8 @@ ENTRY_KEYS = {
     "path", "bytes", "sha256", "sha256_prefix", "producer", "producer_kind",
     "producer_note", "digest_note", "date", "box", "also_on",
     "minfer_commit", "llamacpp_commit", "llamacpp_binary", "compiler",
-    "ffp_contract", "cflags", "source", "authoritative_reference",
+    "ffp_contract", "cflags", "torch", "transformers", "source",
+    "authoritative_reference",
 }
 
 #: A `box` label is absolute or it is a lie the next agent cannot read (gate
@@ -397,14 +401,20 @@ def output_path(argv: list[str]) -> str | None:
 
     The rules are per program, because the recorded shapes are
     ``minfer convert|quantize|split IN OUT [--flag VALUE]`` (the subcommand is not
-    a filename), ``llama-quantize [--pure] IN OUT TYPE`` and ``curl [-sL] -o OUT
-    URL``. A shape the rules do not cover returns ``None`` — never a guess.
+    a filename), ``llama-quantize [--pure] IN OUT TYPE`` and
+    ``curl [-sL] -o OUT URL`` plus ``convert_hf_to_gguf.py IN --outfile OUT``. A
+    shape the rules do not cover returns ``None`` — never a guess.
     """
     prog = os.path.basename(argv[0])
     args = argv[1:]
     if prog == "curl":
         for i, a in enumerate(args):
             if a == "-o" and i + 1 < len(args):
+                return args[i + 1]
+        return None
+    if prog == "convert_hf_to_gguf.py":
+        for i, a in enumerate(args):
+            if a == "--outfile" and i + 1 < len(args):
                 return args[i + 1]
         return None
     if prog == "minfer":
@@ -925,6 +935,15 @@ def regenerate(
                   "scope (docs/GGUF-TOOLING.md §4.2.2), because the byte-parity claim is about that "
                   "one compiler's build: re-run it on that box and record the digest by hand")
             continue
+        if kind == "convert-hf-to-gguf":
+            refusals += 1
+            print(f"REFUSED  {path}: the producer is llama.cpp's HF converter, which needs the "
+                  f"torch/transformers pair the entry records ({first.get('torch')} / "
+                  f"{first.get('transformers')}) — recorded on {first.get('box')}; regenerating it "
+                  "is out of scope here (docs/GGUF-TOOLING.md §4.1.1), because the record's "
+                  "identity is that environment plus the llama.cpp commit: re-run it there and "
+                  "record the digest by hand")
+            continue
 
         resolved = resolve_program(argv[0], repo_root)
         if resolved is None:
@@ -1062,6 +1081,35 @@ def _tiny_manifest(root: Path, sha: str, **over) -> dict:
         "cflags": "-O3 -DNDEBUG",
         "authoritative_reference": True,
         "date": "2026-10-07",
+        "box": "dgxspark (aarch64, GB10 sm_121)",
+    }
+    e.update(over)
+    return {
+        "schema": 1,
+        "cache_root": "~/.cache/minfer/f6-src",
+        "divergence_notes": [],
+        "entries": [e],
+    }
+
+
+def _tiny_converter_manifest(root: Path, sha: str, **over) -> dict:
+    """A one-entry manifest whose producer is llama.cpp's HF converter.
+
+    Its identity is the llama.cpp commit plus the torch/transformers pair, not the
+    compiler triple a `llama-quantize` build is pinned by: the converter's bf16 step
+    is an integer bit operation, so no `-ffp-contract` enters it.
+    """
+    e = {
+        "path": "ref/tiny.gguf",
+        "bytes": 4,
+        "sha256": sha,
+        "producer": "convert_hf_to_gguf.py ~/.cache/minfer/f6-src/hf/tiny --outtype bf16 "
+                    "--outfile ~/.cache/minfer/f6-src/ref/tiny.gguf",
+        "producer_kind": "convert-hf-to-gguf",
+        "llamacpp_commit": "050dde50c",
+        "torch": "2.14.0",
+        "transformers": "5.17.0",
+        "date": "2026-10-11",
         "box": "dgxspark (aarch64, GB10 sm_121)",
     }
     e.update(over)
@@ -1268,6 +1316,31 @@ def selftest() -> int:
         record("a command that runs another producer than its kind names is rejected",
                any("runs 'llama-quantize'" in p for p in check_manifest(manifest_path, bad)),
                str(check_manifest(manifest_path, bad)))
+
+        # A converter-produced reference is a kind of its own: identity is the
+        # llama.cpp commit plus torch/transformers, and it carries no compiler
+        # triple and no authoritative_reference (those are the build-pinned kind's).
+        conv = _tiny_converter_manifest(root, good)
+        manifest_path.write_text(json.dumps(conv), encoding="utf-8")
+        conv_problems = check_manifest(manifest_path, conv)
+        record("a well-formed convert-hf-to-gguf entry passes", not conv_problems,
+               str(conv_problems))
+        bad = _tiny_converter_manifest(root, good)
+        del bad["entries"][0]["torch"]
+        record("a converter entry without its torch version is a structural problem",
+               any("torch" in p for p in check_manifest(manifest_path, bad)),
+               str(check_manifest(manifest_path, bad)))
+        bad = _tiny_converter_manifest(root, good, authoritative_reference=True)
+        record("authoritative_reference on a converter entry is a structural problem",
+               any("only meaningful on a llama-quantize" in p
+                   for p in check_manifest(manifest_path, bad)))
+        bad = _tiny_converter_manifest(root, good)
+        bad["entries"][0]["producer"] = bad["entries"][0]["producer"].replace(
+            "convert_hf_to_gguf.py", "llama-quantize")
+        record("a converter-kind entry recording another program is rejected",
+               any("must run convert_hf_to_gguf.py" in p
+                   for p in check_manifest(manifest_path, bad)),
+               str(check_manifest(manifest_path, bad)))
         bad = _tiny_manifest(root, good)
         bad["entries"][0]["producer"] = bad["entries"][0]["producer"].replace(
             "ref/tiny.gguf", "ref/other.gguf")
@@ -1324,6 +1397,14 @@ def selftest() -> int:
         code, out = _regen(json.loads(manifest_path.read_text()), running_commit="abc1234")
         record("a second run the same day writes nothing (idempotent)",
                code == 0 and manifest_path.read_text() == after and "nothing written" in out, out)
+
+        # A converter target is refused by name before anything runs: its producer
+        # is llama.cpp's script plus the recorded torch/transformers pair, which is
+        # not this box's to re-create.
+        conv_doc = _tiny_converter_manifest(fake_cache, hashlib.sha256(content).hexdigest())
+        code, out = _regen(conv_doc)
+        record("a convert-hf-to-gguf target is refused, naming its environment",
+               code == 3 and "torch/transformers" in out, out)
 
         # A run that produces different bytes: a finding, the record untouched
         # and the fixture restored.

@@ -73,7 +73,10 @@ fn f6_hf_conversion_matches_the_llamacpp_reference() {
     ) else {
         return;
     };
-    let Some(ref_gguf) = env_path("MINFER_F6_LLAMACPP_GGUF", "/tmp/f6-work/ref-f16.gguf") else {
+    let Some(ref_gguf) = env_path(
+        "MINFER_F6_LLAMACPP_GGUF",
+        "~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-converter-f16.gguf",
+    ) else {
         return;
     };
     let out = work_dir("hf").join("minfer-f16.gguf");

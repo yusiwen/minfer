@@ -116,6 +116,15 @@ fn f142_bf16_conversion_is_byte_identical_to_the_reference() {
     ) else {
         return;
     };
+    // The second reference is the one the f16 conversion already had: llama.cpp's
+    // own converter, `convert_hf_to_gguf.py --outtype bf16`, which covers its
+    // naming/1-D/norm branch and metadata as well as the cast (issue #209).
+    let Some(ref_converter) = env_path(
+        "MINFER_F142_CONVERTER_BF16",
+        "~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-converter-bf16.gguf",
+    ) else {
+        return;
+    };
     let out = work_dir("f142").join("f142-bf16-ref.gguf");
     let _ = std::fs::remove_file(&out);
     let conv = crate::convert::Conversion::plan(&hf_dir, OutType::Bf16).expect("plan");
@@ -144,11 +153,15 @@ fn f142_bf16_conversion_is_byte_identical_to_the_reference() {
     }
     let n = assert_tensor_payloads_equal(&out, &ref_bf16);
     assert_eq!(n, conv.specs.len(), "tensor count");
+    let n_conv = assert_tensor_payloads_equal(&out, &ref_converter);
+    assert_eq!(n_conv, conv.specs.len(), "converter tensor count");
     eprintln!(
-        "f142 bf16 parity: {n}/{} tensors byte-identical to {} (2-D bf16 {n_2d}, \
-         1-D f32 {n_1d})",
+        "f142 bf16 parity: {n}/{} tensors byte-identical to {} and {n_conv}/{} to {} \
+         (2-D bf16 {n_2d}, 1-D f32 {n_1d})",
         conv.specs.len(),
         ref_bf16.display(),
+        conv.specs.len(),
+        ref_converter.display(),
     );
 }
 /// #142's real-model gate: a bf16-converted 0.5B loads, runs on the CPU
