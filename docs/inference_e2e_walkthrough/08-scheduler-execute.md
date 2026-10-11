@@ -10,7 +10,7 @@
 > `copy_across` L575); the three `execute_node` implementations in
 > `src/graph/cpu_backend.rs`, `src/graph/metal_backend.rs`,
 > `src/graph/cuda_backend.rs`. All line numbers verified against commit
-> `e7fa0da` (the current HEAD).
+> `e7fa0da` (2026-09-11, the HEAD at the time).
 
 ## 1. Background — where this stage sits
 

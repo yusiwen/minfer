@@ -52,8 +52,8 @@ answer one question — *who can call this function, from where?*
 - `__host__` — an ordinary CPU function (the default). Written explicitly only
   for functions that compile in *both* worlds — `__host__ __device__`.
 
-`src/cuda/kernels/*.cu` uses exactly this split: `__global__` for the 89 kernels (the count of the pre-#263 single TU; 102 today)
-(the count from `grep -c '__global__' src/cuda_kernels.cu` at that revision), plain
+`src/cuda/kernels/*.cu` uses exactly this split: `__global__` for the 99 kernels — 89 at the pre-#263 single TU
+(the count from `grep -c '__global__' src/cuda_kernels.cu` at that revision) — plain
 `__device__` helpers for shared math, and ordinary C++ for the host-side
 launcher functions below.
 
@@ -222,7 +222,7 @@ the token count) — leave this kind of comment on every launch geometry you
 write.
 
 **minfer's real elementwise family, side by side with the toy.** The kernel
-inventory (`grep -n '__global__' src/cuda/kernels/*.cu`) lists 102 kernels today (89 at the pre-#263 revision); the
+inventory (`grep -n '__global__ void' src/cuda/kernels/*.cu`) lists 99 kernels today (89 at the pre-#263 revision); the
 elementwise ones are the plainest and are all structured like your toy
 (global 1-D index, guard, one memory access per thread):
 
@@ -729,8 +729,8 @@ compilation) does the whole pipeline:
    `dlopen` declaration at the top of the `extern` block.
 
 For the knobs this section skipped (cross-compiling, `MINFER_CUDA_CCBIN` in
-full, distro-vs-toolkit layout quirks), `docs/BUILD.md` is the reference — 73
-lines, worth reading once before your first `--features cuda` build.
+full, distro-vs-toolkit layout quirks), `docs/BUILD.md` is the reference, worth
+reading once before your first `--features cuda` build.
 
 ## 3. In minfer's code — one op, end to end
 
@@ -854,7 +854,7 @@ discipline).
 **Thread-count arithmetic.** 4,864 threads is a *tiny* grid. The GB10's SM
 count is queried at runtime `get_attr` (`src/cuda/methods/init.rs:112`) reads
 `CUDA_DEV_ATTR_MULTIPROC_COUNT`); with a few dozen SMs each holding up to
-~2048 resident threads, one 4,864-thread kernel cannot come close to filling
+1536 resident threads, one 4,864-thread kernel cannot come close to filling
 the machine — most blocks run, finish, and leave SMs idle. That is fine for a
 2-µs, latency-bound kernel, and it is the quantitative reason decode kernels
 in minfer are judged on *bytes moved per second* rather than occupancy (how

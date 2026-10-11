@@ -39,7 +39,7 @@ the CPU counterpart from the
 | [02 · The minimal CUDA you actually need](02-minimal-cuda.md) | 2 — language surface | Kernel syntax & indexing, error checking & sync semantics, device memory & minfer's Rust/FFI wrapper, streams, the build system (Toys #2–#3) |
 | [03 · Reading minfer's kernels I](03-kernels-elementwise.md) | 3a — first real kernels | Elementwise (`add_f32`), quantized-weight dequant (`dequant_q4_0_f16`), embedding gather (`embed_rows_q4_0`) |
 | [04 · Reading minfer's kernels II](04-kernels-matmul.md) | 3b — the matmul ladder | Scalar GEMV → vectorized GEMV → tiled GEMM (`gemm_f16_nt_kernel_t`) → int8 MMQ pointer |
-| [05 · Reading minfer's kernels III](05-kernels-attention-host.md) | 3c — attention + host | Flash-attention-style prefill (`fa_prefill_f16kv`), fused decode tail (`attn_bias_rope_store_f32`), KV in device memory, the Rust `Backend` layer, CUDA Graph capture/replay |
+| [05 · Reading minfer's kernels III](05-kernels-attention-host.md) | 3c — attention + host | Flash-attention-style prefill (`fa_prefill_kv`), fused decode tail (`attn_bias_rope_store_f32`), KV in device memory, the Rust `Backend` layer, CUDA Graph capture/replay |
 | [06 · Optimization methods](06-optimization-methods.md) | 4 — from reading to changing | Profiling with ncu/nsys, the technique catalog (each anchored to the step that used it), the verification gate chain, three exercises |
 | [07 · Where to go next](07-where-next.md) | 5 — the map | Reading order for the reference docs, nvcc/ncu cheat sheet, pitfall list, toy index |
 

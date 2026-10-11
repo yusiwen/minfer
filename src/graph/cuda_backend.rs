@@ -1633,7 +1633,7 @@ impl CudaBackend {
                     .ok_or_else(|| format!("KV regions for layer {} not allocated", meta.layer))?;
                 let nt = node.out_shape[1];
                 // Issue #122: the prefill entries index `q` as `nt` token rows of
-                // `n_head * hd` (`fa_prefill_f16kv`: `q[t * nh * hd + h * hd + d]`), so a
+                // `n_head * hd` (`fa_prefill_kv`: `q[t * nh * hd + h * hd + d]`), so a
                 // q input shorter than that is an out-of-bounds device read. Refuse it
                 // loudly here instead of letting the kernel do it: the fixture that
                 // triggered #122 read ~7 MB past its q buffer and latched
@@ -2133,8 +2133,8 @@ impl Backend for CudaBackend {
         }
         // On OOM, cuda_malloc logs and returns null; the null buffer fails
         // cleanly (Err) at execute time via ptr_of — do NOT panic here: the
-        // backend may be holding the process-wide stream lock, and panicking
-        // under a mutex poisons it for every other user.
+        // failure is recoverable and the caller names it, while a panic would
+        // take the whole session down with it (no mutex is held: #188).
         let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
         self.pool.push(CudaBuf { ptr, bytes });
         self.pool_gen += 1;
@@ -2163,8 +2163,8 @@ impl Backend for CudaBackend {
         let bytes = size * 4;
         // On OOM, cuda_malloc logs and returns null; the null buffer fails
         // cleanly (Err) at execute time via ptr_of — do NOT panic here: the
-        // backend may be holding the process-wide stream lock, and panicking
-        // under a mutex poisons it for every other user.
+        // failure is recoverable and the caller names it, while a panic would
+        // take the whole session down with it (no mutex is held: #188).
         let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
         self.pool.push(CudaBuf { ptr, bytes });
         self.pool_gen += 1;

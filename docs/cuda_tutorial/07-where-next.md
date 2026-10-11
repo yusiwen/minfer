@@ -7,7 +7,7 @@
 
 You can now read every kernel in `src/cuda/kernels/*.cu`, you know how minfer's
 decode (GEMV + fused tail + CUDA Graph replay) and prefill (MMQ GEMM +
-`fa_prefill_f16kv`) paths are assembled, and you know the verification
+`fa_prefill_kv`) paths are assembled, and you know the verification
 discipline that keeps kernel changes honest. This chapter hands you to the
 deep references — the tutorial deliberately stopped where they begin.
 

@@ -320,7 +320,7 @@ picks one. Three sub-steps, all in `sample_temperature`
    (`src/sampler.rs:260-273`). The dart comes from `rng.gen()` — one
    uniform `f32` in [0, 1) per generated token — from a **seeded** random
    number generator: `StdRng::seed_from_u64(params.seed)`, default seed 42
-   (`src/main.rs:845`). A *seed* is the starting state of a pseudo-random
+   (`src/main.rs:1566`). A *seed* is the starting state of a pseudo-random
    generator: same seed in, same sequence of "random" numbers out — which
    is why the same command produces the same text even while sampling
    (§3.3's fourth design question covers why minfer wants that).
@@ -328,7 +328,7 @@ picks one. Three sub-steps, all in `sample_temperature`
 ### 2.7 Stopping: when does generation end?
 
 The sampler produces a token; the loop decides whether to keep going. Three
-gates, checked in this order each step (`src/main.rs:883-918`):
+gates, checked in this order each step (`src/main.rs:1749-1772`):
 
 1. **Stop tokens.** `is_stop_token(id, &special)` — true when the sampled id
    equals the model's **eos** (end of sequence) token or `<|im_end|>` (doc
@@ -389,33 +389,43 @@ into `full` → stop-string gate → stream newly finished bytes → next forwar
 
 #### The whole pipeline in one function
 
-`src/sampler.rs:280-307` — the complete sampler is eleven lines of calls;
-the order *is* the design:
+`src/sampler.rs:1066-1155` — the complete sampler is one function whose body is
+the stage order, elided only where a stage is long; the order *is* the design:
 
 ```rust
-// src/sampler.rs:283-307
-pub fn sample_with_penalties<R: Rng>(
-    logits: &mut [f32],
-    temp: f32,
-    top_k: usize,
-    top_p: f32,
-    repeat_penalty: f32,
-    frequency_penalty: f32,
-    presence_penalty: f32,
-    prev_tokens: &[u32],
-    rng: &mut R,
-) -> SampledToken {
-    apply_penalties(
-        logits, prev_tokens, repeat_penalty, frequency_penalty, presence_penalty,
-    );
-    if temp < 1e-6 {
-        return sample_greedy(logits);
+// src/sampler.rs:1066 — the pipeline; `sample_with_config` (:1181) is the
+// unconstrained wrapper the CLI calls (`src/main.rs:1619`)
+pub fn sample_with_config_grammar<R: Rng>(
+    logits: &mut [f32], cfg: &SamplerConfig, prev_tokens: &[u32],
+    mirostat: &mut MirostatState, grammar: &mut Option<GrammarState>,
+) -> Result<SampledToken, SampleError> {
+    apply_logit_bias(logits, &cfg.logit_bias);
+    apply_penalties(logits, prev_tokens, cfg.repeat_penalty, cfg.frequency_penalty,
+                    cfg.presence_penalty);
+    if cfg.dry_multiplier > 0.0 {
+        apply_dry(logits, prev_tokens, ...);
     }
-    apply_top_k(logits, top_k);
-    apply_top_p(logits, top_p);
-    sample_temperature(logits, temp, rng)
+    let constrained = match (cfg.grammar.as_ref(), grammar.as_mut()) {
+        (Some(g), Some(st)) => { apply_token_mask(logits, &mask); ... }   // F2
+        _ => false,
+    };
+    let sampled = if cfg.temp < 1e-6 {
+        sample_greedy(logits)                       // the greedy shortcut
+    } else {
+        apply_top_k(logits, cfg.top_k);
+        apply_typical(logits, cfg.typical_p);
+        apply_top_p(logits, cfg.top_p);
+        apply_min_p(logits, cfg.min_p);
+        apply_xtc(logits, cfg.xtc_probability, cfg.xtc_threshold, rng);
+        match cfg.mirostat { ... }                  // else sample_temperature(logits, cfg.temp, rng)
+    };
+    ...
+    Ok(sampled)
 }
 ```
+
+(`sample_with_penalties`, the eleven-line excerpt this section used to show, is
+`src/sampler/tests.rs:92` — test-only, per its own `#239` note.)
 
 Read the greedy early-return carefully: in greedy mode the **penalties still
 apply** (a repeated token can lose the argmax to a non-repeated one — that
@@ -677,15 +687,19 @@ fresh `Vec` (§3.1).
 The gates run immediately after sampling, before anything is appended:
 
 ```rust
-// src/main.rs:883-918 (condensed to the sampler-adjacent lines)
+// src/main.rs:1727-1743 (condensed to the sampler-adjacent lines)
     while generated.len() < params.n_predict {
-        let sampled = sampler::sample_with_penalties(
+        let sampled = match sampler::sample_with_config_grammar(
             &mut logits,
-            params.temp, params.top_k, params.top_p,
-            params.repeat_penalty, params.frequency_penalty, params.presence_penalty,
+            &sampler_cfg,
             &prev_tokens,
+            &mut mirostat,
+            &mut grammar_state,
             &mut rng,
-        );
+        ) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("\n[grammar] {e}"); break; }
+        };
 
         if is_stop_token(sampled.token_id, &special) {
             break;                                  // eos / <|im_end|>: silent stop
@@ -911,7 +925,7 @@ run even when the stochastic stages are skipped.
 - **The sampler destroys its input buffer** (it holds probabilities after
   `sample_temperature`). The caller-side invariant that makes this safe:
   `logits` is reassigned from the next forward before it is ever read
-  again (`src/main.rs:932`). Reading `logits` between sample and reassign
+  again (`src/main.rs:1782`). Reading `logits` between sample and reassign
   would read probabilities and call them logits.
 
 ## 4. Observe & verify

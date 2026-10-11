@@ -310,9 +310,10 @@ impl CudaState {
         // 8n: prefill (nt >= 64) runs the FA-style tiled attention. The
         // legacy kernel is one block per (token, head) — K re-read per token
         // per head (7B @2K: ~132 GB/layer) with a 128-register accumulator —
-        // and measured 176 ms/layer, 76% of the whole 2K prefill. hd % 16
-        // is hard-wired (FA_HQ = hd/4 = 32) and the shared-memory opt-in
-        // can fail on constrained devices, hence the rc fallback.
+        // and measured 176 ms/layer, 76% of the whole 2K prefill. The gate is
+        // `hd == 128` — the Qwen2/Qwen3 head dim the tile arithmetic and the
+        // shared-memory budget are computed for — and the smem opt-in can fail
+        // on constrained devices, hence the rc fallback.
         //
         // D5-R stage 4 (doc 86): the verify shapes (nt = d+1, i.e. 2..=9)
         // used to fall through to the legacy per-(token,head) kernel — the

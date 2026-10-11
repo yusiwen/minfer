@@ -110,5 +110,6 @@ stages) with one line on what each adds.
 - Backend assignment is a build-time decision (`supports_op`, priority
   Metal → CUDA → CPU); kernel-invariant violations return `Err` — never a
   silent CPU fallback.
-- `docs/ARCHITECTURE.md` is verified current (commit `e7fa0da`); line numbers
-  in these docs are accurate as of the same commit.
+- `docs/ARCHITECTURE.md` was verified current at commit `e7fa0da`; line numbers
+  in these docs are accurate as of the commit each chapter names (the newest is
+  `15fa45c`, 2026-10-08).

@@ -78,9 +78,11 @@ The policy that assigns backends is one line long (we'll read it in §3.2):
 
 `supports_op` is a **capability query**: a pure yes/no function from `(operation, data type)` to
 `bool`, implemented *by each backend about itself*. The scheduler never consults a master table
-of "which ops run where"; it just asks the engines in order. The **priority order is the order
-of the checks** inside the allocator's `supports` function — Metal is asked first because, when
-available, it is the fastest engine; CUDA second; CPU last, and CPU is also the landing pad
+of "which ops run where"; it just asks the engines in order. The **priority order is a number in
+the registry** (`src/graph/registry.rs:72-75`: Metal 300, CUDA 200, CPU 100), which the allocator
+walks through `supports_for` (`src/graph/alloc.rs:403`) — the `supports` helper beside it is
+`#[cfg(test)]` since F4 — Metal is asked first because, when available, it is the fastest engine;
+CUDA second; CPU last, and CPU is also the landing pad
 (`or(Some(CPU))`) when nothing else is enabled.
 
 `dtype` (**data type**) matters here: nodes carry `out_dtype` (f32 for activations; i32 inputs

@@ -183,7 +183,7 @@ problem bounded.
 ### 2.4 Why only the last token's logits (`n_out = 1`)
 
 The prefill forward's fourth argument is `n_out`, and the CLI passes `1`
-(`main.rs:757`). This is the tail-row optimization whose *topology* doc 05
+(`main.rs:1472`). This is the tail-row optimization whose *topology* doc 05
 §2.8 built; here is the *why*.
 
 A transformer is **causal**: token `t`'s hidden state is computed only from
@@ -226,8 +226,8 @@ let ctx = params.n_ctx.max(input_ids.len());
 ```
 
 and passes that single number to *every* forward of the run — prefill at
-`main.rs:757`, each decode step at `main.rs:932`. The comment above it (L744–748)
-records the three facts that make this the right shape:
+`main.rs:1472`, each decode step at `main.rs:1782`. The comment above it
+(`main.rs:1448-1452`) records the three facts that make this the right shape:
 
 1. `n_ctx` **sizes the graph's KV regions** — the allocator carves each
    layer's K and V regions as `n_kv_embd × n_ctx` f32 elements, once (doc 07
@@ -315,13 +315,13 @@ the value travels by **move**, Rust's zero-byte ownership transfer:
 
 ```rust
 let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx); // owned Vec
-let last_logits: Vec<f32> = logits;      // move, main.rs:758
+let last_logits: Vec<f32> = logits;      // move, main.rs:1474
 ...
-let mut logits = last_logits;            // move into the decode binding, main.rs:833
+let mut logits = last_logits;            // move into the decode binding, main.rs:1554
 ...
-let sampled = sampler::sample_with_penalties(&mut logits, ...); // borrow, mutate in place
+let sampled = sampler::sample_with_config(&mut logits, ...); // borrow, mutate in place
 ...
-logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:932
+logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:1782
 ```
 
 The decode loop's comment (`main.rs:924-925`) states the stakes: *forward()
@@ -705,7 +705,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
 - **`n_ctx` is a run-level constant.** Passing a different `n_ctx` to decode
   than to prefill breaks the run (§2.5, Q3): either silently (regions sized
   on first use) or loudly (the preflight assert). This is why the comment
-  says "computed ONCE" — and why `main.rs:932` passes the *same* `ctx`
+  says "computed ONCE" — and why `main.rs:1782` passes the *same* `ctx`
   binding, not a recomputation.
 - **The legacy `kv_cache` argument is gone (#252).** It was dead on this path
   from the start — nothing read it in `forward_cached` — and [#252] deleted it
@@ -738,11 +738,12 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   in the thousands of tok/s and decode in the hundreds — the compute-bound vs
   memory-bound split of §2.3, visible in two numbers.
 - **`MINFER_TIMING=1`** — decomposes the decode side one level further
-  (`main.rs:863-868`): per token it times the sampler call (`t_samp`,
-  around `sample_with_penalties`, L884–898) and the `forward` call
-  (`t_fwd`, L931–939 — "CPU encode + GPU exec + logits download" per the
-  comment), then prints one line, e.g. `[MINFER_TIMING] over 512 tokens:
-  sample 0.02 ms/tok (1.2%), forward 3.30 ms/tok (98.8%)` (L949–953). One
+  (`main.rs:1584-1589`): per token it times the sampler call (`t_samp`,
+  accumulated at `main.rs:1746`) and the `forward` call (`t_fwd`, `main.rs:1665`
+  on the speculative path and `main.rs:1787` on the plain one — "CPU encode + GPU
+  exec + logits download" per the comment), then prints one line
+  (`main.rs:1801-1803`), e.g. `[MINFER_TIMING] over 512 tokens:
+  sample 0.02 ms/tok (1.2%), forward 3.30 ms/tok (98.8%)`. One
   paragraph is all it needs: it exists to answer "is my decode time
   *inference* or *sampling/streaming*?" — on every model in the support
   matrix the answer is overwhelmingly forward, which is why the kernel docs
