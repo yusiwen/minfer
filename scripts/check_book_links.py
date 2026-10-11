@@ -164,13 +164,19 @@ def problems_in(book: Path, root: Path, src: str = "docs") -> list[Problem]:
                     Problem(page_rel, href, key, classify(root, book, src, resolved, path), doc)
                 )
                 continue
-            if fragment and resolved.suffix == ".html" and fragment not in ids_of(resolved, cache):
+            # The fragment is compared **decoded**: mdBook percent-encodes a
+            # non-ASCII href while the `id=` it generates stays raw (`#1-概述`
+            # becomes `#1-%E6%A6%82%E8%BF%B0`), and a browser matches the decoded
+            # fragment against the id. Comparing the raw strings reported nine
+            # working links in `docs/CLI-CONVERSATION-PLAN.md` as dead.
+            decoded = urllib.parse.unquote(fragment)
+            if fragment and resolved.suffix == ".html" and decoded not in ids_of(resolved, cache):
                 found.append(
                     Problem(
                         page_rel,
                         href,
-                        f"{key}#{fragment}",
-                        f"the page has no `id=\"{fragment}\"` (mdBook slugs a heading into its id)",
+                        f"{key}#{decoded}",
+                        f"the page has no `id=\"{decoded}\"` (mdBook slugs a heading into its id)",
                         doc,
                     )
                 )
@@ -336,6 +342,18 @@ def selftest() -> int:
             (
                 "a heading id present in the page passes",
                 run('<h1 id="top">t</h1>\n<a href="#top">x</a>') == 0,
+                "",
+            )
+        )
+        cases.append(
+            (
+                "a percent-encoded fragment matches its raw id",
+                run(
+                    '<a href="sub/index.html#caf%C3%A9">x</a>',
+                    "",
+                    {"sub/index.html": '<h1 id="café">s</h1>'},
+                )
+                == 0,
                 "",
             )
         )
