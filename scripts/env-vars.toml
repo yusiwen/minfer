@@ -1,0 +1,54 @@
+# Every production `MINFER_*` env var that is not documented for a user (#521).
+#
+# `scripts/check_env_vars.py` enumerates the `std::env::var("MINFER_…")` reads in the
+# non-test source and requires each name to be **documented**: named in
+# `docs/USAGE.md` (the manual) or in a live document under `docs/` (the design and
+# usage docs, `AGENTS.md`, `README.md`). The record documents — the ADR corpus, the
+# CUDA campaign records, the execution plan, the roadmap, the baselines, the three
+# `*_OPTIMIZATIONS.md` pages — are *dated history*, so a name that appears only there
+# is not documented for a reader who wants to turn a knob; it belongs in this file
+# with a reason.
+#
+# The checker enforces four things about this file:
+#   1. a name read in production that is neither documented nor listed here fails
+#      (that is the #521 class: `MINFER_N_BATCH` was read at every server start and
+#      named only in the plan and the roadmap);
+#   2. an entry whose name **is** documented fails, because the exemption is then
+#      unnecessary (the ledger may not rot);
+#   3. an entry whose name is **no longer read** fails (same reason);
+#   4. `reason` must be non-empty and must say what the knob is for and where its
+#      only record is.
+#
+# This is the *weak* half of the problem, stated on purpose: it proves the name is not
+# invisible, not that a reader can find it. The strong form — every knob documented in
+# `docs/USAGE.md` or listed here — would need ~65 curated entries today, because most
+# of these are per-kernel A/B switches whose home is a design document. The three knobs
+# #521 was filed for (`MINFER_N_BATCH`, `MINFER_BENCH_WARMUP_MS`,
+# `MINFER_SPECVERIFY_WARMUP_MS`) are in the manual now; the rest of the strong form is
+# [#531](https://github.com/yusiwen/minfer/issues/531).
+
+[internal]
+
+MINFER_A32_DEBUG = "prints the per-row sums of the CUDA A32 prefill path (`src/cuda/methods/prefill_f16.rs`); a debug print no document names"
+
+MINFER_FFNDEBUG = "prints the FFN node shapes from the Metal backend (`src/graph/metal_backend.rs`); a debug print no document names"
+
+MINFER_GEMM_A32 = "A/B switch for the smem-mirror A32 GEMM variant (`src/cuda/methods/prefill_f16.rs`); no document names it"
+
+MINFER_BATCH_TRACE = "per-slot trace of the server's batch composition (`src/server/batch.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
+
+MINFER_NO_F16_ROWB = "A/B control for the f16 row-block weight dot (`src/vec_ops/f16.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
+
+MINFER_NO_KV_DEFRAG = "presence-checked switch that disables KV defragmentation (`src/graph/alloc.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
+
+MINFER_NO_PREFIX_REUSE = "presence-checked switch that disables prefix reuse, the pre-B2 behaviour (`src/server/chat.rs`, `src/server/batch.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
+
+MINFER_TOKEN_TRACE = "writes the position-wise token trace the identity battery aligns on (`src/main.rs`); mentioned only by `docs/cuda_optimization_steps/95-adaptive-draft-depth.md`"
+
+MINFER_MMQ_KSPLIT_TARGET = "overrides the auto-ksplit SM-count target (`src/cuda/methods/prefill_mmq.rs`); documented in the CUDA campaign record `docs/CUDA_OPTIMIZATION.md`"
+
+MINFER_NO_DP4A_Q8_KV = "A/B switch that selects the incumbent packed-Q8_0 K dot over the dp4a one (`src/cuda.rs`); documented in `docs/CUDA_OPTIMIZATION.md` and its step record"
+
+MINFER_NO_Q8_KV_WIDE = "A/B switch that selects the incumbent four-byte packed-Q8_0 KV loads (`src/cuda.rs`); documented in `docs/CUDA_OPTIMIZATION.md` and its step record"
+
+MINFER_SPEC_DEBUG = "speculative-decoding debug output (`src/spec.rs`); documented in `docs/CUDA_OPTIMIZATION.md` and its step record"

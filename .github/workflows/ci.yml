@@ -388,6 +388,15 @@ jobs:
         run: python3 scripts/check_support_matrix.py
       - name: The support-matrix checker's own pass/fail cases
         run: python3 scripts/check_support_matrix.py --selftest
+      # #521: three runtime knobs changed behaviour while the docs described the old
+      # ones (`MINFER_N_BATCH` was read at every server start and named only in the
+      # plan and the roadmap), because nothing enumerated what the engine reads. This
+      # does: every production `MINFER_*` name must be in `docs/USAGE.md`, named in a
+      # live document, or in `scripts/env-vars.toml` with a reason.
+      - name: Every runtime environment variable must be documented
+        run: python3 scripts/check_env_vars.py
+      - name: The env-var checker's own pass/fail cases
+        run: python3 scripts/check_env_vars.py --selftest
       # #254 Layer 1: the shape of every `allow(dead_code)` — a bare annotation
       # is rejected (the 11 sites that predate the ratchet are grandfathered in
       # the script), a `cfg_attr` must name a cfg, and each annotation carries a
