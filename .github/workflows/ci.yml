@@ -9,7 +9,7 @@
 #                       graph/allocator/scheduler tests. This is the job that
 #                       must go red when a change breaks behaviour rather than
 #                       compilation. It tees its own log and
-#                       `scripts/check_status.py --check-live` compares the
+#                       `scripts/check_baselines.py --check-live` compares the
 #                       `x86_64 (CI runner)` suite counts against it (#94).
 #                       It also runs `cargo fmt --all --check` (#211) before the
 #                       suite: the toolchain step installs the `rustfmt` component
@@ -36,19 +36,29 @@
 #                       (#303). Link-only: a GitHub runner has no Metal device, so the
 #                       macOS-only assertions still need a Mac; the *compile* does not.
 # 4. check-docs       : the documentation gate (#63, #94). `mdbook build` proves the
-#                       book renders (a chapter missing from SUMMARY.md is a hard
-#                       error there, and the toolchain matches the one Docs deploys
-#                       with); `scripts/check_docs_links.py` proves every relative
-#                       link in the markdown resolves — `mdbook build` happily
-#                       renders a dead link into the HTML, which is how the docs
-#                       rotted before; `scripts/check_status.py --check` proves the
+#                       book builds with the toolchain Docs deploys with; it does
+#                       *not* prove a link resolves — mdBook publishes a `README.md`
+#                       chapter as `index.html` while rewriting the link to
+#                       `README.html`, silently drops a `docs/**.md` that
+#                       `SUMMARY.md` does not name, and silently renders an empty
+#                       draft page for a SUMMARY entry whose file is gone (all three
+#                       measured on 0.4.37, #515). So three checkers read the two
+#                       halves: `scripts/check_docs_links.py` proves every relative
+#                       link in the markdown resolves **in the checkout**,
+#                       `scripts/check_book_links.py` proves every link in the
+#                       *rendered* `book/` resolves (and every `#fragment` is an
+#                       `id=` in its target), and `scripts/check_book_coverage.py`
+#                       proves every `docs/**.md` is a chapter or a reasoned
+#                       exclusion; `scripts/check_status.py --check` proves the
 #                       plan's phase counters / `next:` sentence / baseline commits
 #                       and its §11 sequencing marks agree with `scripts/status.toml`,
 #                       and
 #                       `scripts/check_baselines.py --check` proves the suite
 #                       measurements agree with `scripts/test-baselines.toml`; each
 #                       binary's `--selftest` runs its own cases. Both ledgers live
-#                       beside the checker that reads them (#455), and each step
+#                       beside the checker that reads them (#455) — and so do the two
+#                       book ledgers (`scripts/book-links.toml`,
+#                       `scripts/book-coverage.toml`) — and each step
 #                       names its ledger, so a rename or a deletion fails the job
 #                       instead of silently disabling a gate. The ancestry test needs
 #                       history, so this job fetches with `fetch-depth: 0`.

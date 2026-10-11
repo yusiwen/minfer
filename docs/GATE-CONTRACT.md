@@ -530,8 +530,21 @@ file, line and both values — edit the ledger, not a counter. The suite ledger'
 is compared against the real `cargo test` log by `scripts/check_baselines.py --check-live` in
 `test-linux-cpu` — a job the change classifier keeps running whenever that ledger moves, while a
 docs-only change skips it (ADR-0025). The same job runs `scripts/build_book.sh`
-(pinned mdBook + a sha384-checked Mermaid download) and `scripts/check_docs_links.py`, which fails on
-a relative link whose target does not exist, and `scripts/check_doc_line_anchors.py` (#266), which
+(pinned mdBook + a sha384-checked Mermaid download), then three checkers that read the two halves of
+"the book is correct". `scripts/check_docs_links.py` fails on a relative link whose target does not
+exist **in the checkout** — and, deliberately, on nothing else. `scripts/check_book_links.py` (#515)
+reads the *rendered* `book/` instead: every relative `href`/`src` must resolve, every `#fragment` must
+be an `id=` in the page it points at, and a link the reader cannot follow is reported with the document
+it came from and why it died. The gap it closes is the one the build cannot: mdBook publishes a
+chapter named `README.md` as `index.html` while the `.md`→`.html` rewrite keeps the basename, drops a
+`docs/**.md` that `SUMMARY.md` does not name (no page, no copied source), and renders a SUMMARY entry
+whose file is gone as an empty *draft* page — all three exit 0, and all three were green here for
+315 links over 81 distinct targets. `scripts/check_book_coverage.py` (#515) closes the other direction,
+on the file set rather than the links: every `docs/**.md` is a chapter or an entry in
+`scripts/book-coverage.toml` with a reason, no entry covers nothing, and no SUMMARY entry names a file
+that is missing or lives outside the book's `src/`. Both book ledgers sit beside their checker
+(ADR-0023) and both are ratchets — an entry that stops covering something fails — so the known-dead
+set can only shrink. Then `scripts/check_doc_line_anchors.py` (#266), which
 fails on a `path:NNN` anchor whose file or line is gone — and, when the anchor names a backticked
 symbol, on a symbol that has left the file it points at; a bare `:NNN` continuation attaches to the
 nearest *preceding* `path:NNN` on its own doc line and is resolved and range-checked against that
