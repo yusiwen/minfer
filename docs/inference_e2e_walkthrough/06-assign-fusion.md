@@ -322,9 +322,10 @@ would be *wrong as a reference*.
 
 **In:** the freshly built `ComputeGraph` (doc 05) — every node carries `op` (with full payloads),
 `src` (input node ids), `out_shape`/`out_dtype`, and `backend: Option<Backend>` where `None`
-means "undecided" (`src/graph/mod.rs:92`). Plus the allocator's backend registry: which backends
-were *enabled* (Metal enabled on macOS when available and all weights registered; CUDA when the
-feature is on and a device exists).
+means "undecided" (`Backend` is a re-export of the registry handle — `src/graph/mod.rs:105`). Plus
+the **registry** (`src/graph/registry.rs`): which backends this build contains, their names,
+capability records and priority order — and, per allocator, which of them are *enabled* (Metal on
+macOS when available and all weights registered; CUDA when the feature is on and a device exists).
 
 **Out:** the same graph object, mutated in place:
 
@@ -340,13 +341,13 @@ splits and dispatch.
 **Where the stage physically runs:** inside the model's `forward_cached` — the first place a
 forward needs a graph. The sequence there is `try_reuse → build → register weights → enable
 backends → assign_backends → FusionPass → alloc_graph → replace_graph`
-(`src/models/qwen2/graph.rs:478-523`). Note the pipeline lives in *model* code, not the
+(`src/models/qwen2/graph.rs:611-650`). Note the pipeline lives in *model* code, not the
 scheduler: the scheduler provides `assign_backends`, but the model orchestrates, because only
 the model knows whether its weights made it onto the GPU.
 
 ### 3.2 Key code
 
-**The whole assignment policy** — `src/graph/scheduler.rs:58-69`:
+**The whole assignment policy** — `src/graph/scheduler.rs:68-83`:
 
 ```rust
 /// Assign every node to the best backend that supports it (capability
@@ -357,7 +358,7 @@ pub fn assign_backends(&self, graph: &mut ComputeGraph, alloc: &GraphAllocator) 
             continue; // keep explicit assignments
         }
         node.backend = alloc
-            .supports(&node.op, node.out_dtype)
+            .supports_for(&node.op, node.out_dtype, node.layer)
             .or(Some(BackendTag::CPU));
     }
 }
@@ -366,52 +367,76 @@ pub fn assign_backends(&self, graph: &mut ComputeGraph, alloc: &GraphAllocator) 
 Three lines of policy, each deliberate. The loop is order-independent — each node is asked on
 its own, so the result cannot depend on graph traversal order. The `continue` keeps any explicit
 assignment (tests use it; the production builder assigns none). The `.or(Some(CPU))` fallback
-makes the assignment *total*: every node leaves with a backend even if `supports` returned
+makes the assignment *total*: every node leaves with a backend even if `supports_for` returned
 `None`. That cannot hide an unsupported op — the CPU backend's `execute_node` has an explicit
 `Err` arm for ops it has no kernel for (§3.4) — it just guarantees the *abort names the right
 node* instead of crashing on an `Option` unwrap.
 
-**Where the priority actually lives** — `src/graph/alloc.rs:140-158`:
+**Where the priority actually lives** — `src/graph/alloc.rs:403-433`, trimmed:
 
 ```rust
-/// Which backend supports this op/dtype (highest priority first).
-pub fn supports(&self, op: &Op, dtype: crate::graph::DType) -> Option<Backend> {
-    #[cfg(target_os = "macos")]
-    if let Some(m) = &self.metal {
-        if m.supports_op(op, dtype) {
-            return Some(Backend::Metal);
+/// Which backend may take a node of `(op, dtype)` that belongs to `layer` — the
+/// assignment rule with the E5 offload policy and F4's backend fence applied.
+pub fn supports_for(&self, op: &Op, dtype: DType, layer: Option<usize>) -> Option<Backend> {
+    let eligible = |b: &dyn BackendTrait| super::backend_takes(b, op, dtype);
+    let device_ok = /* E5: is this node's block on the device? */;
+    if device_ok {
+        // F4: the registry's **priority** order, not a statement order here.
+        for &backend in super::registry::registry().by_priority() {
+            if backend == Backend::CPU {
+                continue; // the fallback, tried below even when device_ok is false
+            }
+            if !self.filter.allows(backend) {
+                continue; // `--backend` / `MINFER_BACKENDS` fenced it off
+            }
+            if let Some(pool) = self.pool(backend) {
+                if eligible(pool) {
+                    return Some(backend);
+                }
+            }
         }
     }
-    #[cfg(feature = "cuda")]
-    if let Some(c) = &self.cuda {
-        if c.supports_op(op, dtype) {
-            return Some(Backend::Cuda);
-        }
-    }
-    if self.cpu.supports_op(op, dtype) {
+    if self.filter.allows(Backend::CPU) && eligible(&self.cpu) {
         return Some(Backend::CPU);
     }
     None
 }
 ```
 
-The "registry" is just three `Option` fields on the allocator; `enable_metal()` / `enable_cuda()`
-populate them (model code calls them only when its own weight gates passed, §2.1). Priority is
-the *order of the if-blocks* — Metal first, CUDA second, CPU last. The `#[cfg]` gates mean a
-non-macOS build literally contains no Metal question to ask, and a non-CUDA build no CUDA one.
+**The order is data, not statement order.** `Backend` is a `Copy` handle into a fixed id space
+(`src/graph/registry.rs:85-87`: `CPU = 0`, `METAL = 1`, `CUDA = 2`) and the registry holds the
+entries in **priority** order — Metal 300, CUDA 200, CPU 100 (`PRIORITY_METAL` / `PRIORITY_CUDA` /
+`PRIORITY_CPU`, `src/graph/registry.rs:72-75`). `by_priority()` is that list, so the assignment
+preference is one table rather than the order of `if` blocks in this function.
 
-**The contract every backend implements** — `src/graph/backend.rs:21-30`:
+`enable_metal()` / `enable_cuda()` still populate the allocator's per-backend pools (model code
+calls them only when its own weight gates passed, §2.1); a backend with no pool is skipped, and
+`self.filter` is the F4 fence. A backend this build does not contain is not in the registry at
+all, so the old `#[cfg]`-gated questions are gone — but the **order and the answer are
+identical**, which is what the registry's own pinning test
+(`graph::registry::tests::the_registered_set_and_priority_order_are_pinned`) asserts. The
+contract — the two orders, the name surface and the three startup refusals — is
+`docs/BACKEND-REGISTRY-DESIGN.md`; this doc only shows how the assignment reads it.
+
+**The contract every backend implements** — `src/graph/backend.rs:21-191`. The full method list
+is `docs/ARCHITECTURE.md` §5.1, and the contract around it is
+`docs/BACKEND-REGISTRY-DESIGN.md`:
 
 ```rust
 pub trait Backend: Send + Sync {
-    fn name(&self) -> &str;
     /// Op support by (op, dtype). `supports_fused` gates the fusion pass
     /// (Phase 4) so fused IR nodes are only produced when a kernel exists.
     fn supports_op(&self, op: &Op, dtype: DType) -> bool;
     fn supports_fused(&self, fused: &FusedOp) -> bool;
-    // ... buffer pool, execute_node, host read/write, synchronize
+    fn supports_attn_span(&self) -> bool { false }   // E1: explicit attention windows
+    fn weights_bytes(&self) -> usize { 0 }           // E4: what the memory budget is charged
+    // ... buffer pool, copy_cells, execute_node, host read/write, synchronize, retire
 }
 ```
+
+The trait has no `name()`: since F4 a backend's identity, id, priority and names live on the
+registry's handle and entry (`src/graph/registry.rs`), which is what lets a backend be requested
+by name at all.
 
 **A backend's self-description, CPU** — `src/graph/cpu_backend.rs:73-105`:
 
@@ -623,7 +648,7 @@ because `SwiGLU`'s output shape equals the Mul's by definition.
 and its `FusedOp::BiasRope` capability tag were removed (§2.3): no backend claimed the capability,
 so the matcher was unreachable code. `run()` now composes exactly one rewrite.
 
-**The call site that wires it all together** — `src/models/qwen2/graph.rs:478-523`, trimmed:
+**The call site that wires it all together** — `src/models/qwen2/graph.rs:611-650`, trimmed:
 
 ```rust
 if !cache.try_reuse(&params) {
@@ -637,14 +662,16 @@ if !cache.try_reuse(&params) {
         #[cfg(feature = "cuda")]
         if cuda_on { alloc.enable_cuda(); }
         sched.assign_backends(&mut graph, alloc);
-        // fusion pass gated per node's assigned backend
-        let backends: Vec<&dyn Backend> = { /* [cpu] + maybe metal, maybe cuda */ };
-        let cuda_idx = backends.iter().position(|b| b.name() == "cuda");
-        FusionPass::new().run(&mut graph, &backends, &|g, id| match g.node(id).backend {
-            Some(crate::graph::Backend::CPU) => Some(0),
-            Some(crate::graph::Backend::Metal) => Some(1),
-            Some(crate::graph::Backend::Cuda) => cuda_idx,
-            _ => None,
+        // fusion pass gated per node's assigned backend.
+        //
+        // F4: the backend list and the node → index map come from the allocator's
+        // registry view (the enabled entries in identity order), replacing the
+        // hand-built vector and its `name() == "cuda"` position lookup.
+        let backends: Vec<&dyn Backend> = alloc.fusion_backends();
+        FusionPass::new().run(&mut graph, &backends, &|g, id| {
+            g.node(id)
+                .backend
+                .and_then(|b| alloc.fusion_backend_index(b))
         });
         alloc.alloc_graph(&graph).unwrap();
     }
@@ -655,7 +682,7 @@ if !cache.try_reuse(&params) {
 This is the stage's place in the pipeline, verbatim: reuse check → build → enable → **assign →
 fuse** → allocate → store. The whole block is skipped when `try_reuse` succeeds — assignment and
 fusion run *once* per `GraphParams`, which is why they can afford to be thorough. (`Qwen3Graph`
-mirrors this block at `src/models/qwen3/graph.rs:419-446`.)
+mirrors this block at `src/models/qwen3/graph.rs:521-548`.)
 
 **The reuse identity that makes toggles work** — `src/graph/params.rs:17-35`:
 
@@ -737,9 +764,10 @@ scheduler reads. It looks simpler and it rots faster: every new backend must be 
 the table, every new op must be threaded into the table, and the two edits happen in different
 files with no compiler help linking them. The trait inverts that: a **capability table is
 replaced by a type**. Adding the CUDA backend meant implementing `Backend` (including
-`supports_op`/`supports_fused`) and registering it in the allocator — the scheduler's
-assignment code has not changed for it (the CUDA enable call is cfg-gated model-side, and the
-`supports` function gained one symmetric if-block). The compiler enforces completeness: a
+`supports_op`/`supports_fused`) and writing its registry entry — the scheduler's assignment code
+and `supports_for` have not changed for it at all since F4 (the loop reads the registry's
+priority list; the CUDA enable call is cfg-gated model-side). The compiler enforces
+completeness: a
 backend that forgets to answer for an op answers `false` via its own `match` exhaustiveness
 (and the enum's missing-arm error), never "table out of date". It also lets capability be
 *stateful in a legitimate way* — Metal's yes depends on which kernels its GPU supports at
@@ -795,11 +823,14 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
 
 **Two smaller choices worth naming:**
 
-- *Why is priority hardcoded as if-block order instead of a sorted backend list?* With at most
-  three backends, an ordered list adds an indirection (sort keys, cfg-conditional membership)
-  to save nothing; the if-chain makes the priority readable at a glance and cfg-gates compile
-  away cleanly. The cost — a new backend edits `supports()` once — is the same edit the
-  registry needs anyway.
+- *Why is priority hardcoded as if-block order instead of a sorted backend list?* — **F4 reversed
+  this.** The ordered list is now the registry's `priority` field (`PRIORITY_METAL` 300 /
+  `PRIORITY_CUDA` 200 / `PRIORITY_CPU` 100, `src/graph/registry.rs:72-75`), for the reason the
+  old argument missed: once `Backend` is a *handle* rather than an enum variant, the order has
+  more than one reader — the assignment pass, the fusion pass's node → index map, and the
+  exporters — so one table is what keeps them from disagreeing. The if-chain was readable; it
+  was also the beginning of three copies. The contract is
+  `docs/BACKEND-REGISTRY-DESIGN.md`.
 - *Why does the pass keep orphans instead of removing them?* Removal renumbers node ids, which
   invalidates every stored `src`, every output id, the trace bookkeeping — all to save a
   skipped iteration at execution. Leaving them costs one `continue` per orphan (§3.2, last

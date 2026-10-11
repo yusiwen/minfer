@@ -646,9 +646,11 @@ CParams.gpu = metal_on || cuda_on
   class, CUDA-only) for decode QKV, and `FusedFFN` when `nf <= 16384`. Qwen3 builds `FusedFFN` but
   **not** its `FusedQkvNorm` on CUDA: that fused path is Metal-only (the Qwen3 concat probe has no
   CUDA arm), so CUDA Qwen3 runs the unfused `qk_norm` chain.
-- **FusionPass** receives the CUDA backend in its `Vec<&dyn Backend>` and `backend_of` maps
-  `Backend::Cuda` to the position found by name, so the SwiGLU rewrite is gated by CUDA's own
-  `supports_fused`.
+- **FusionPass** receives the enabled backends in its `Vec<&dyn Backend>` (F4:
+  `GraphAllocator::fusion_backends`) and its node → index map is
+  `GraphAllocator::fusion_backend_index`, so the SwiGLU rewrite is gated by CUDA's own
+  `supports_fused` and the two cannot drift apart. The pre-F4 hand-built vector and its
+  `b.name() == "cuda"` position lookup are gone.
 - The dump/debug tags in `forward_cached` are backend-agnostic (`MINFER_GRAPH_DUMP`;
   `MINFER_REBUILD_TRACE=1`, Qwen2 only). `MINFER_CUDA_DEBUG` was a device-layer trace on the legacy
   `layer_gpu` surface; [#240](https://github.com/yusiwen/minfer/issues/240)/[#241](https://github.com/yusiwen/minfer/issues/241) deleted that surface, so the knob and its per-node syncs
