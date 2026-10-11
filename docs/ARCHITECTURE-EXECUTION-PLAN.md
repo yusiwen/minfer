@@ -49,9 +49,11 @@ tickets below that *do* have one are exactly the open list in the
 [tracker](https://github.com/yusiwen/minfer/issues). Doc debt and test health are filed
 the same way: [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md`
 staleness) was one and is **closed** ([#506](https://github.com/yusiwen/minfer/issues/506)), as are
-the three follow-up tickets its audit filed ([#503](https://github.com/yusiwen/minfer/issues/503)–[#505](https://github.com/yusiwen/minfer/issues/505));
-the open one is [#510](https://github.com/yusiwen/minfer/issues/510) (two hand-copied `Backend`
-trait sketches). The docs build was [#63](https://github.com/yusiwen/minfer/issues/63) and is
+the three follow-up tickets its audit filed ([#503](https://github.com/yusiwen/minfer/issues/503)–[#505](https://github.com/yusiwen/minfer/issues/505))
+and [#510](https://github.com/yusiwen/minfer/issues/510) (two hand-copied `Backend` trait sketches,
+closed by [#514](https://github.com/yusiwen/minfer/pull/514)); the open set is the
+[`documentation` label](https://github.com/yusiwen/minfer/issues?q=is%3Aopen+label%3Adocumentation),
+never a list kept by hand here. The docs build was [#63](https://github.com/yusiwen/minfer/issues/63) and is
 **closed**: CI job `check-docs` builds the book with the same toolchain Docs deploys with
 and runs `scripts/check_docs_links.py`, so a renamed file now fails on the PR that renames
 it instead of rotting silently (it found four dead links the day it landed). Test health was [#82](https://github.com/yusiwen/minfer/issues/82) — the three
