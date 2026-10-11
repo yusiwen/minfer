@@ -24,32 +24,9 @@ The walk: §2 covers the principles — the trait contract, unified memory, the 
 
 ### 2.1 The contract: what a backend must provide
 
-The `Backend` trait (`src/graph/backend.rs`) is the seam between the graph machinery (docs 05–08, which know nothing about GPUs) and the hardware executors. Seven methods, each with one job:
+The `Backend` trait (`src/graph/backend.rs:21-191`) is the seam between the graph machinery (docs 05–08, which know nothing about GPUs) and the hardware executors. The signatures are written down in exactly one place — [`docs/ARCHITECTURE.md` §5.1](../ARCHITECTURE.md), with the registry side in [`docs/BACKEND-REGISTRY-DESIGN.md`](../BACKEND-REGISTRY-DESIGN.md) — and are not copied here; what matters for this chapter is the **shape** of the seam, because every design decision below comes out of the jobs it does.
 
-```rust
-// src/graph/backend.rs:21-45 (contract core; read_host/write_host/synchronize at :59-70)
-pub trait Backend: Send + Sync {
-    fn name(&self) -> &str;
-
-    /// Op support by (op, dtype). `supports_fused` gates the fusion pass
-    /// (Phase 4) so fused IR nodes are only produced when a kernel exists.
-    fn supports_op(&self, op: &Op, dtype: DType) -> bool;
-    fn supports_fused(&self, fused: &FusedOp) -> bool;
-
-    /// Buffer pool: allocate / release a buffer of `size` f32 elements.
-    fn alloc_buffer(&mut self, size: usize) -> usize;
-    fn free_buffer(&mut self, id: usize);
-
-    /// Allocate a buffer that bypasses the recycle free list. Split-boundary
-    /// staging needs this: at execute time the free list holds ids whose
-    /// physical contents are still referenced by node_to_buf and get
-    /// read/written later in the same execute — recycling one would clobber
-    /// in-flight data. Fresh buffers enter the normal free list on
-    /// free_buffer (at graph rebuild), where liveness recycling is safe.
-    fn alloc_fresh(&mut self, size: usize) -> usize;
-```
-
-Read the method list as a small operating system for one accelerator: **capability queries** (`supports_op`, `supports_fused` — "can you run this op at all?") are asked at *build* time, before any execution; **memory management** (`alloc_buffer`/`free_buffer`/`alloc_fresh`) is asked by the allocator of doc 07, once per graph build; **execution** (`execute_node`) is asked by the scheduler of doc 08, once per node per forward; and **data movement** (`read_host`/`write_host` — host↔buffer access for filling inputs and reading logits) plus **`synchronize`** (flush async work) are asked at split boundaries. The CPU backend implements all of these trivially — its buffers are `Vec<f32>`s, `execute_node` just calls the function, `synchronize` is a no-op. The Metal backend implements the same signatures with an asynchronous accelerator behind them, which is where every interesting design decision in this chapter comes from.
+Read the method list as a small operating system for one accelerator. **Capability queries** (`supports_op`, `supports_fused`, `supports_attn_span`, `weights_bytes` — "can you run this op, and what does it cost me?") are asked at *build* time, before any execution. **Memory management** (`alloc_buffer` / `free_buffer` / `alloc_fresh` / `pool_len`) is asked by the allocator of doc 07, once per graph build. **Execution** (`execute_node`, `copy_cells`, `graph_replay`) is asked by the scheduler of doc 08, once per node per forward. **Data movement** (`read_host` / `write_host` / `write_host_window` — host↔buffer access for filling inputs and reading logits) plus **`synchronize`** (flush async work) and **`retire`** (drop a pool's device objects) are asked at split boundaries. `kv_pair` is deliberately *not* on this trait: it is the separate `KvProvider` trait the executor reads to resolve a layer's sibling K/V region. The CPU backend implements all of these trivially — its buffers are `Vec<f32>`s, `execute_node` just calls the function, `synchronize` is a no-op. The Metal backend implements the same signatures with an asynchronous accelerator behind them, which is where every interesting design decision in this chapter comes from.
 
 Two contract details deserve a second look because the Metal backend leans on them hard. First, `execute_node` receives *buffer ids* into the backend's own pool, not raw pointers, and takes a `kv_pair` argument — the `(k_id, v_id)` ids of the layer's two persistent KV regions — because KV ops (store, attention) need to touch regions the allocator keeps alive across the whole session. Second, the trait doc for `execute_node` warns that the output buffer **may alias an input buffer** (liveness reuse, doc 07) — the backend must handle in-place execution. On the CPU that is automatic (same memory); on Metal it becomes a visible piece of code you will meet in §3.2 (`copy_in`).
 

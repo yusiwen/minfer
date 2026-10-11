@@ -306,13 +306,19 @@ same backend by construction), so there is no per-token KV drain.
 ### 5.1 The `Backend` trait (`graph/backend.rs`)
 
 `Backend` (the thing the IR stores on a node) is **not** this trait: since F4 it is a `Copy`
-handle — an id into `src/graph/registry.rs` — and the trait below is implemented by the pools
+handle — an id into `src/graph/registry.rs` — and the traits below are implemented by the pools
 (CPU, Metal, CUDA) and held by the registry entry. The name, id, priority and capability record
-live on the handle/entry, not on the trait (`Backend::name()` is `registry.rs:105`):
+live on the handle/entry, not on the trait (`Backend::name()` is `registry.rs:105`). This is the
+one place the signatures are written down, so the walkthroughs and the design docs can point here
+instead of copying them:
 
 ```rust
+/// KV-region access: each layer owns two persistent regions (K and V).
+pub trait KvProvider {
+    fn kv_pair(&self, layer: usize) -> Option<(usize, usize)>;   // (k_buf_id, v_buf_id)
+}
+
 pub trait Backend: Send + Sync {
-    fn kv_pair(&self, layer: usize) -> Option<(usize, usize)>;   // persistent per-layer K/V regions
     fn supports_op(&self, op: &Op, dtype: DType) -> bool;
     fn supports_fused(&self, fused: &FusedOp) -> bool;
     fn supports_attn_span(&self) -> bool { false }       // E1: explicit attention windows (CPU/CUDA/Metal)
@@ -336,6 +342,10 @@ pub trait Backend: Send + Sync {
     fn graph_replay(&mut self, uid: u64, range: (usize, usize), nt_hint: Option<usize>) -> bool;
 }
 ```
+
+The KV pair is **not** on `Backend`: it is the separate `KvProvider` trait above, which the
+executor reads to resolve a layer's sibling region. The number of methods is deliberately not
+written down here — a count in prose is one more thing to keep true, and the sketch is the list.
 
 - **CPU** (`cpu_backend.rs`): `Vec<f32>` pool; executes via `kernel.rs` +
   `vec_ops.rs`; F32 weights use a plain f32 matmul, quantized weights use
