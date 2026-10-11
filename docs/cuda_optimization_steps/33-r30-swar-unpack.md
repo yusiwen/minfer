@@ -247,6 +247,6 @@ unroll), the lever had to be re-valued — it could not be advanced on the old b
 4. **A REVERTED step's residual attribution is the next step's signpost**: r30's
 class list fed directly into r31.
 
-← [32-r29-nb-kd-loop-unroll](32-r29-nb-kd-loop-unroll.md) · [Index](./README.md) · [34-r31-qmajor-sda-repack](34-r31-qmajor-sda-repack.md) →
+← [32-r29-nb-kd-loop-unroll](32-r29-nb-kd-loop-unroll.md) · [Index](./index.md) · [34-r31-qmajor-sda-repack](34-r31-qmajor-sda-repack.md) →
 
 

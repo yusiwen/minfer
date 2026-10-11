@@ -269,5 +269,5 @@ must carry its version number.
    ms), and **decomposition tables have a shelf life** — together these are the complete
    answer to "why wall decompositions expire".
 
-← [39-r36-a-frag-wavefront](39-r36-a-frag-wavefront.md) · [Index](./README.md) · [41-r38-q6k-bt-rawbyte-mma](41-r38-q6k-bt-rawbyte-mma.md) →
+← [39-r36-a-frag-wavefront](39-r36-a-frag-wavefront.md) · [Index](./index.md) · [41-r38-q6k-bt-rawbyte-mma](41-r38-q6k-bt-rawbyte-mma.md) →
 

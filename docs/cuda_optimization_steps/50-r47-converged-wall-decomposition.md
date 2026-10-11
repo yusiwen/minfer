@@ -149,4 +149,4 @@ Equally worth recording is what r47 deliberately **did not** do: it did not subd
 4. **Read kernel-level ratios at the right shape**: the matched-nt dilution (1.17× @nt≈511 vs 1.06× @prefill nt) is a prologue-amortization shape artifact; not taking it seriously saves an entire wrong optimization line.
 
 ---
-← 49 · [Index](./README.md) · [51 →](./51-r48-fap2-register-softmax.md)
+← 49 · [Index](./index.md) · [51 →](./51-r48-fap2-register-softmax.md)

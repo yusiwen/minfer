@@ -287,4 +287,4 @@ concat; (4) riders (host-side small items like prewarm/pre-grow).
    attack rotation/reuse bugs with shapes spanning multiple rotations.
 
 ---
-← 60 · [Index](./README.md) · 62 →
+← 60 · [Index](./index.md) · 62 →

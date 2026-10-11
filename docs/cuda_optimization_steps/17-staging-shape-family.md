@@ -156,4 +156,4 @@ The family-closing verdict: after all three degrees of freedom (od split, A reus
 2. **Byte savings only cash under a byte bottleneck**: the 1-block/SM latency bottleneck (issue 0.22) ate j-tile's −163 MB; the L2 throughput ceiling ate cp.async-db's prefetch — confirm the bottleneck class before choosing the lever.
 3. **Negative results need a complete evidence chain too**: each of the three carries parity + interleaved A/B + an ncu triple; only then does a family verdict stand. Code in /tmp, records in docs — this campaign's fixed archival form for negative results.
 
-← 16 · [Index](./README.md) · 18 →
+← 16 · [Index](./index.md) · 18 →

@@ -84,4 +84,4 @@ REVERTED/CLOSED steps: state the measured numbers and the veto mechanism.
 6. A REVERTED step's "Results" section must state the veto mechanism (why it
    was reverted, and under what future conditions a retry is worthwhile).
 7. End every doc with the nav line: `← NN-1 · Index · NN+1 →` (omit at the
-   ends of the range; the index link is `./README.md`).
+   ends of the range; the index link is `./index.md`).

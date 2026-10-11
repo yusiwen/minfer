@@ -29,7 +29,7 @@ or a quantized matmul.
 # NN · <stage name>
 
 > **Stage**: prev stage → **this stage** → next stage (one line: where this
-> sits in the pipeline of README.md's master table).
+> sits in the pipeline of index.md's master table).
 > **Code**: primary files and entry functions (`src/...` — verified lines).
 
 ## 1. Background — where this stage sits
@@ -94,7 +94,7 @@ stages) with one line on what each adds.
    seen a KV cache must finish doc 11 knowing what one is and why decode is
    cheap because of it.
 7. End every doc with the nav line (omit an end link at the ends of the
-   range); the index link is `./README.md`.
+   range); the index link is `./index.md`.
 
 ## Series facts every author can rely on
 

@@ -167,4 +167,4 @@ A note on the "3 sites" wording in the record: the diff itself is a single epilo
 3. **When porting a numeric fold, re-derive the indices from the target kernel's C-fragment row mapping** — do not copy by textual similarity; the same math yields different index expressions under different warp tiles, and the failure symptom (term2 half wrong) is inconspicuous.
 
 ---
-← [20 · r15 f32-accumulate probe + rank-1 fold](./20-r15-f32-acc-mma-rank1.md) · [Index](./README.md) · [22 · r17 wide warp remap](./22-r17-wide-warp-remap.md) →
+← [20 · r15 f32-accumulate probe + rank-1 fold](./20-r15-f32-acc-mma-rank1.md) · [Index](./index.md) · [22 · r17 wide warp remap](./22-r17-wide-warp-remap.md) →

@@ -171,4 +171,4 @@ The bench path kernel's load traffic is **context-independent** (KV 1k or 3.3k a
 3. **A pre-registered bar is the NO-GO's talisman.** 41.07 µs was the sweep's best number; without a bar, "39% faster" would have tempted an integration doomed to fall below the integration line. Bar written first, numbers run after — only then can a NO-GO close cleanly.
 4. **Artifact identification needs a three-way evidence chain**: byte counts (ncu) + behavioral validation (recall A/B) + a physical ceiling (reductio) — any single piece of evidence can be "reinterpreted"; only three-way agreement is worth rewriting a conclusion over.
 
-← 74 · [Index](./README.md) · 76 →
+← 74 · [Index](./index.md) · 76 →

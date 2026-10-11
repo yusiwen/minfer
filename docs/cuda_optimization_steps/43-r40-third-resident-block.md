@@ -182,4 +182,4 @@ Three readings:
 4. **Before buying residency, confirm the kernel really is latency-dominated**: the No-Eligible/active-warps counters are the grounds for buying occupancy; on a kernel whose compute is already saturated, buying residency only dilutes each warp's smem/L1 quota.
 
 ---
-[← 42 · r39 q6_K KDR=2 double-buffer](42-r39-q6k-kdr2-double-buffer.md) · [Index](./README.md) · [44 · r41 q6_K B-expand uint4 widen](44-r41-q6k-bexpand-uint4.md) →
+[← 42 · r39 q6_K KDR=2 double-buffer](42-r39-q6k-kdr2-double-buffer.md) · [Index](./index.md) · [44 · r41 q6_K B-expand uint4 widen](44-r41-q6k-bexpand-uint4.md) →

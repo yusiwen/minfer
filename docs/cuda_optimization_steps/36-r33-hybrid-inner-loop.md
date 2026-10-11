@@ -209,4 +209,4 @@ The gates' execution order is itself part of the conclusion: SASS diff (~10 minu
 4. **The mapping table precedes the compiler**: in a loop-order experiment, the output-unit mapping check (0 mismatches) is the precondition for the SASS comparison to mean anything.
 5. **The scope caveat is a negative result's will**: the sentence in r33's record about "the deeper direction, and why it was not taken" became r34's work order directly — writing down clearly what was not done has more long-term value than one more measured number.
 
-← 35-r32-finite-lever-sweep · [Index](./README.md) · 37-r34-quantize-transpose-prepass →
+← 35-r32-finite-lever-sweep · [Index](./index.md) · 37-r34-quantize-transpose-prepass →

@@ -166,4 +166,4 @@ for (int g = 0; g < 8; g++)                   // 8×2 = 16 chains
 4. **A veto experiment's entire value is in the mechanism readings**: the wall clock says "useless"; ncu explains "why useless and when it is worth another try" — otherwise the revert is just a waste.
 
 ---
-← [21 · r16 narrow-kernel rank-1 fold](./21-r16-narrow-kernel-rank1-fold.md) · [Index](./README.md) · [23 · r18 load-time B pre-expansion](./23-r18-load-time-b-preexpansion.md) →
+← [21 · r16 narrow-kernel rank-1 fold](./21-r16-narrow-kernel-rank1-fold.md) · [Index](./index.md) · [23 · r18 load-time B pre-expansion](./23-r18-load-time-b-preexpansion.md) →

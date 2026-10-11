@@ -215,4 +215,4 @@ The gate chain's final form evolved with the campaign:
 
 ---
 
-← 76 · [Index](./README.md) →
+← 76 · [Index](./index.md) →

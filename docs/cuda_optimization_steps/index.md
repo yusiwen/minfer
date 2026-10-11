@@ -16,7 +16,7 @@ continuous.
 
 **Status legend**: 🟢 LANDED · 🔵 MEAS-ONLY · 🔴 REVERTED (with the veto mechanism) · ⚪ CLOSED (no code, or analytical conclusions)
 
-The writing contract is in [STYLE.md](STYLE.md).
+The writing contract is in [STYLE.md](https://github.com/yusiwen/minfer/blob/master/docs/cuda_optimization_steps/STYLE.md).
 
 ---
 

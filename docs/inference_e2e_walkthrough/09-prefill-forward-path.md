@@ -808,4 +808,4 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   this stage; [`docs/PERF-QWEN3-4B-VS-LLAMACPP.md`](../PERF-QWEN3-4B-VS-LLAMACPP.md)
   §2 — the `n_ctx` over-allocation measurement behind the main.rs comment.
 
-← [08 — The scheduler: splits, copies, execution](08-scheduler-execute.md) · [Index](./README.md) · [10 — CPU matmul: quantized weights × Q8_0 activations](10-cpu-matmul-kernels.md) →
+← [08 — The scheduler: splits, copies, execution](08-scheduler-execute.md) · [Index](./index.md) · [10 — CPU matmul: quantized weights × Q8_0 activations](10-cpu-matmul-kernels.md) →

@@ -218,4 +218,4 @@ Two follow-ons that show the switch's shape was right:
 4. **The exit valve's fallback path must be a first-class citizen**: EXP=false is not a degraded implementation but the in-service path since r41 preserved verbatim — which lets the verification budget go entirely into "the path really gets taken."
 
 ---
-← 56 · [Index](./README.md) · 58 →
+← 56 · [Index](./index.md) · 58 →

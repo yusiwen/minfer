@@ -209,4 +209,4 @@ Reading these numbers in the campaign's coordinates at the time: wide KD=8's 129
 
 ---
 
-← 19 · [Index](./README.md) · 21 →
+← 19 · [Index](./index.md) · 21 →

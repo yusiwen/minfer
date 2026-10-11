@@ -320,4 +320,4 @@ step's scope.
    no pretty tok/s number, but it is the switch for B's whole-graph capture.
 
 ---
-← [06 · decode MMVQ (8e)](./06-decode-mmvq-8e.md) · [Index](./README.md) · [08 →](./08-r1-int8-mmq-prefill-gemm.md)
+← [06 · decode MMVQ (8e)](./06-decode-mmvq-8e.md) · [Index](./index.md) · [08 →](./08-r1-int8-mmq-prefill-gemm.md)

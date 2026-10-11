@@ -357,4 +357,4 @@ Kernel level and wall-clock level (7B q4_k_m, DGX Spark GB10):
    the un-dissected structures in with it.
 
 ---
-← [07 · R3 small-model overhead](./07-r3-small-model-overhead.md) · [Index](./README.md) · [09 →](./09-r2-mmvq-weight-streaming.md)
+← [07 · R3 small-model overhead](./07-r3-small-model-overhead.md) · [Index](./index.md) · [09 →](./09-r2-mmvq-weight-streaming.md)

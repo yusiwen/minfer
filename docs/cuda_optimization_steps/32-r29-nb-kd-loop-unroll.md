@@ -244,6 +244,6 @@ census supported the unroll — every rejection has a concrete mechanism, not gu
 code signal.
 
 ---
-← [31-r28-nb-kernel-2blocks](31-r28-nb-kernel-2blocks.md) · [Index](./README.md) · [33-r30-swar-unpack](33-r30-swar-unpack.md) →
+← [31-r28-nb-kernel-2blocks](31-r28-nb-kernel-2blocks.md) · [Index](./index.md) · [33-r30-swar-unpack](33-r30-swar-unpack.md) →
 
 

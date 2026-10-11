@@ -175,4 +175,4 @@ that finally landed therefore changed lever class: r56's `W_dsc` f32 plane preco
    sampling (r43).
 
 ---
-← [44 · r41 q6_K B-expand uint4 widen](44-r41-q6k-bexpand-uint4.md) · [Index](./README.md) · [46 · r43 PC-sampling attribution](46-r43-pc-sampling-attribution.md) →
+← [44 · r41 q6_K B-expand uint4 widen](44-r41-q6k-bexpand-uint4.md) · [Index](./index.md) · [46 · r43 PC-sampling attribution](46-r43-pc-sampling-attribution.md) →

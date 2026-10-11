@@ -254,4 +254,4 @@ All guards hold (14B tg128 ≥ 22.7; 7B ≥ 49.0 / ≥ 47.9). Against the window
 4. **Settle steps that add tolerance freedom separately from bitwise steps.** 2b (tolerance-gated) and 2c (bitwise) landed in the same window, but the gates were read under strict isolation: with NO_KQ_MMVQ wrapping 2b on both sides, 2c must show zero diff — clean attribution is a low-cost gate to maintain.
 
 ---
-← 71 · [Index](./README.md) · 73 →
+← 71 · [Index](./index.md) · 73 →

@@ -340,4 +340,4 @@ Window anchors (this session's interleaved pre-binary medians): 14B tg128 22.80�
    math before writing code.
 
 ---
-← 66 · [Index](./README.md) · 68 →
+← 66 · [Index](./index.md) · 68 →

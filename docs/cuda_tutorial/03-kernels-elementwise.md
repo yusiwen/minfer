@@ -17,7 +17,7 @@ minfer's actual kernels**. We take the three easiest kernel families in the
 file — the elementwise add pair, the Q4_0 weight dequantizer, and the
 embedding gather — and read each one the way a contributor should: source
 excerpt, line by line, then the CPU counterpart from the
-[inference walkthrough](../inference_e2e_walkthrough/README.md), then the
+[inference walkthrough](../inference_e2e_walkthrough/index.md), then the
 performance arithmetic. These are not warm-ups chosen for cuteness. Every
 single forward pass of the graph executes them: the residual stream is a chain
 of `add_f32` calls, every quantized weight that feeds the f16 prefill GEMM was
@@ -688,6 +688,6 @@ CUDA Graph replay to per-kernel launches if you want launch-level visibility.
   which prefill/decode paths serve which types.
 - **[`docs/CUDA-TECH-PRIMER.md`](../CUDA-TECH-PRIMER.md)** — §6.1 weight
   residency (the why behind f16 caches), §6.4 the elementwise family map.
-- **[`viz/README.md`](../../viz/README.md)** — the trace format and viz page.
+- **[`viz/README.md`](https://github.com/yusiwen/minfer/blob/master/viz/README.md)** — the trace format and viz page.
 
-← [02 · The minimal CUDA you actually need](02-minimal-cuda.md) · [Index](./README.md) · [04 · Reading minfer's kernels II →](04-kernels-matmul.md)
+← [02 · The minimal CUDA you actually need](02-minimal-cuda.md) · [Index](./index.md) · [04 · Reading minfer's kernels II →](04-kernels-matmul.md)

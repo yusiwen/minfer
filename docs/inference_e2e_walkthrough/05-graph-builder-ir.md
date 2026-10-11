@@ -901,4 +901,4 @@ comment — and asserted by the unit test `kv_nodes_carry_layer_only`
   mirrors. `viz/README.md`: the visualizer data format; `docs/GLOSSARY.md`:
   backstop definitions (GQA, RoPE, SwiGLU, liveness…).
 
-← [04 — Tokenizer and chat template](04-tokenizer-template.md) · [Index](./README.md) · [06 — Backend assignment and fusion](06-assign-fusion.md) →
+← [04 — Tokenizer and chat template](04-tokenizer-template.md) · [Index](./index.md) · [06 — Backend assignment and fusion](06-assign-fusion.md) →

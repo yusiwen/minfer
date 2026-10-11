@@ -990,4 +990,4 @@ cargo test --release --features cuda cuda_graph_replay_bit_parity   -- --nocaptu
 - `docs/CUDA_OPTIMIZATION.md` (+ `docs/cuda_optimization_steps/`) — the
   measured campaign history for every number quoted from a step doc.
 
-← [04 · Reading minfer's kernels II](04-kernels-matmul.md) · [Index](./README.md) · [06 · Optimization methods](06-optimization-methods.md) →
+← [04 · Reading minfer's kernels II](04-kernels-matmul.md) · [Index](./index.md) · [06 · Optimization methods](06-optimization-methods.md) →

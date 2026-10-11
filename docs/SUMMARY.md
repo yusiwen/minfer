@@ -19,6 +19,44 @@
 # Decisions
 
 - [Architecture Decision Records — index](./adr/README.md)
+    - [0001. Inference runs through one declarative compute graph](./adr/0001-inference-runs-through-one-declarative-compute-graph.md)
+    - [0002. Topology is a function of GraphParams alone, so positions cannot be structure](./adr/0002-topology-is-a-function-of-graph-params.md)
+    - [0003. Metal is out of scope for this round](./adr/0003-metal-is-out-of-scope-for-this-round.md)
+    - [0004. The batching default follows the device](./adr/0004-the-batching-default-follows-the-device.md)
+    - [0005. Metal becomes a first-class backend](./adr/0005-metal-becomes-a-first-class-backend.md)
+    - [0006. The KV storage format is a per-engine gate, not a process-wide global](./adr/0006-kv-format-is-a-per-engine-gate.md)
+    - [0007. No ML frameworks: every operator is hand-written](./adr/0007-no-ml-frameworks-every-operator-is-hand-written.md)
+    - [0008. GPU safety: bounded waits, no early return past a barrier, runtime device limits](./adr/0008-gpu-safety-bounded-waits-and-runtime-limits.md)
+    - [0009. A failure is an error, never a silent fallback](./adr/0009-a-failure-is-an-error-never-a-silent-fallback.md)
+    - [0010. The identity gate: bitwise by default, a named tolerance class otherwise](./adr/0010-the-identity-gate-bitwise-by-default.md)
+    - [0011. Backend ids are a file-format contract: appended, never renumbered](./adr/0011-backend-ids-are-append-only.md)
+    - [0012. Device is the first axis, the layer the second — and no premature common](./adr/0012-device-first-layering-and-no-premature-common.md)
+    - [0013. The CPU quantizes activations to Q8_0; a device reads f32](./adr/0013-cpu-quantizes-activations-device-reads-f32.md)
+    - [0014. A KV session is a versioned, checksummed file — never a memory dump](./adr/0014-a-kv-session-is-a-versioned-file.md)
+    - [0015. The offload auto fit takes a prefix, not a knapsack](./adr/0015-the-offload-auto-fit-takes-a-prefix.md)
+    - [0016. A failed device-memory query is not a zero budget](./adr/0016-a-failed-device-query-is-not-a-zero-budget.md)
+    - [0017. Speculative decoding refuses the features its identity contract cannot carry](./adr/0017-speculative-decoding-refuses-what-it-cannot-carry.md)
+    - [0018. The grammar mask is one stage inside the single sampler pipeline](./adr/0018-the-grammar-mask-is-one-pipeline-stage.md)
+    - [0019. A chat template that cannot be rendered refuses the load](./adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md)
+    - [0020. A quantized file is byte-identical to llama-quantize, or it is wrong](./adr/0020-a-quantized-file-is-byte-identical-or-wrong.md)
+    - [0021. bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32](./adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md)
+    - [0022. A defect in a frozen ADR is corrected by a new ADR, not by editing it](./adr/0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md)
+    - [0023. Each machine ledger lives beside its checker, one per prose target](./adr/0023-the-machine-ledgers-live-beside-their-checkers.md)
+    - [0024. A machine-read record is not book content](./adr/0024-a-machine-read-record-is-not-book-content.md)
+    - [0025. A docs-only change runs the docs gate, not the compilers](./adr/0025-a-docs-only-change-skips-the-compilers.md)
+    - [0026. The classifier carries no docs-path exception, and its list is ratcheted](./adr/0026-the-classifier-carries-no-docs-path-exception.md)
+    - [0027. A citation is dated too — paths, symbols and counts, not only capabilities](./adr/0027-a-citation-is-dated-too.md)
+    - [0028. A document's ADR map lists what its contract depends on](./adr/0028-a-map-lists-what-the-contract-depends-on.md)
+    - [0029. An ADR's prose count is dated too, and its References are map evidence](./adr/0029-an-adrs-prose-count-is-dated-and-its-references-are-map-evidence.md)
+    - [0030. Launch severity lives in the helper, not in 120 call sites](./adr/0030-launch-severity-lives-in-the-helper.md)
+    - [0031. Capture runs in thread-local mode, because Global lets a foreign thread's call join the window](./adr/0031-capture-runs-in-thread-local-mode.md)
+    - [0032. The packed-KV staging window is f32, not f16](./adr/0032-the-packed-kv-staging-window-is-f32.md)
+    - [0033. The CUDA pool recycles exact byte lengths, never frees, and reports OOM as an error](./adr/0033-the-cuda-pool-recycles-exact-byte-lengths.md)
+    - [0034. The smem opt-in is an eager pre-warm by construction, with the lazy path as defence in depth](./adr/0034-the-smem-opt-in-is-an-eager-prewarm-by-construction.md)
+    - [0035. The q4_K dsc plane is admitted by two gates, and the payload test is equality](./adr/0035-the-q4k-dsc-plane-admission-is-two-gates.md)
+    - [0036. bf16 weights get their own device kernels, not a dtype flag on the f16 ones](./adr/0036-bf16-gets-its-own-device-kernels.md)
+    - [0037. A Metal weight dtype a kernel cannot consume is refused, never run as a wrong kernel](./adr/0037-a-metal-weight-dtype-a-kernel-cannot-consume-is-refused.md)
+    - [0038. The per-tensor registration dispatch is one shared rule, not a copy per loader](./adr/0038-the-per-tensor-registration-dispatch-is-one-shared-rule.md)
 
 # Model Support
 
@@ -28,7 +66,7 @@
 
 # Inference E2E Walkthrough
 
-- [Overview & Index](./inference_e2e_walkthrough/README.md)
+- [Overview & Index](./inference_e2e_walkthrough/index.md)
 - [Part I — From CLI to weights]()
     - [CLI args and model resolution](./inference_e2e_walkthrough/01-cli-args-model-resolution.md)
     - [GGUF load](./inference_e2e_walkthrough/02-gguf-load.md)
@@ -59,13 +97,14 @@
     - [GPU Safety](./GPU_SAFETY.md)
     - [Metal Backend Design](./METAL-BACKEND-DESIGN.md)
     - [CUDA Backend Design](./CUDA-BACKEND-DESIGN.md)
+    - [Device Adaptation Plan (T-series)](./DEVICE-ADAPTATION-PLAN.md)
 
 # Optimization
 
 - [CPU Optimization](./CPU_OPTIMIZATIONS.md)
 - [Metal Optimization](./METAL_OPTIMIZATIONS.md)
 - [CUDA Optimization](./CUDA_OPTIMIZATION.md)
-    - [Overview & Index](./cuda_optimization_steps/README.md)
+    - [Overview & Index](./cuda_optimization_steps/index.md)
     - [Verification Methodology (capstone)](./cuda_optimization_steps/77-verification-methodology.md)
     - [Part I — Era A: Phase 7/8 foundations]()
         - [Phase 7 — CUDA backend: raw FFI device layer + graph backend 7a–7e (LANDED)](./cuda_optimization_steps/01-phase7-cuda-backend.md)
@@ -151,10 +190,50 @@
         - [D4-3 — attention structure rewrite attempt 2 NO-GO + D4-1's llama target was a llama-bench artifact (CLOSED)](./cuda_optimization_steps/75-d4-3-attention-attempt2-artifact.md)
         - [D4-4 — the endgame kernel session: dpl dense split-plane q6_K decode MMVQ lands (bitwise); PDL and fused-FFN closed with mechanism (LANDED)](./cuda_optimization_steps/76-d4-4-dpl-q6k-final.md)
         - [D5-0 — speculative-decoding cost model: measured baseline, acceptance, and the d=2 gate (MEAS-ONLY)](./cuda_optimization_steps/80-d5-0-cost-model.md)
+        - [81 — D5-1a: the verify-batch gate measured end-to-end; D5 closed (gate FAIL)](./cuda_optimization_steps/81-d5-1a-verify-gate-measured.md)
+        - [82 — small-M dispatch: multi-token MMVQ + token-looped legacy kernels (LANDED)](./cuda_optimization_steps/82-small-m-multi-token-mmvq.md)
+    - [Part V-B — D5-R: speculative decoding reopened and closed]()
+        - [83 — D5-R stage 1: the speculative decode loop (LANDED)](./cuda_optimization_steps/83-d5-r-stage1-spec-loop.md)
+        - [84 — D5-R stage 2: same-window dual-engine battery (LANDED)](./cuda_optimization_steps/84-d5-r-stage2-dual-engine-battery.md)
+        - [85 — D5-R stage 3: the verify marginal priced per kernel (LANDED)](./cuda_optimization_steps/85-d5-r-stage3-verify-marginal-ledger.md)
+        - [86 — D5-R stage 4a: attention for the verify shapes (LANDED)](./cuda_optimization_steps/86-d5-r-stage4a-attention-verify-shapes.md)
+        - [87 — D5-R stage 4b: multi-MMVQ at nt 9–16 measured negative (CLOSED)](./cuda_optimization_steps/87-d5-r-stage4b-multi-mmvq-nt16-closed.md)
+        - [88 — D5-R stage 5: the final dual-engine battery and the campaign verdict (LANDED)](./cuda_optimization_steps/88-d5-r-stage5-final-battery.md)
+        - [89 — D5-R: where the verify row marginal actually lives (localized)](./cuda_optimization_steps/89-d5-r-row-marginal-localization.md)
+        - [90 — D5-R: R-rows-per-block implemented, measured, reverted (menu item closed)](./cuda_optimization_steps/90-d5-r-rrows-per-block-closed.md)
+        - [91 — the mma path was already there; the small-M floor is block starvation](./cuda_optimization_steps/91-mma-path-block-starvation.md)
+        - [92 — K-split shipped behind the gate; the flip condition resolved to "no"](./cuda_optimization_steps/92-ksplit-shipped-flip-resolved-no.md)
+        - [93 — draft-quant swap is a mixed knob; greedy identity does not hold](./cuda_optimization_steps/93-draft-quant-and-greedy-identity.md)
+        - [94 — greedy identity achieved; d=8 crosses with the q4_k_m draft (LANDED)](./cuda_optimization_steps/94-greedy-identity-and-d8-crossing.md)
+        - [95 — Adaptive Draft Depth (`--spec-draft-adaptive`)](./cuda_optimization_steps/95-adaptive-draft-depth.md)
+        - [96 — the nt=9 verify profile, Phase 0 (stop-gate measured)](./cuda_optimization_steps/96-nt9-profile-phase0.md)
+        - [97 — speculative decoding in `--cnv` and `serve` (LANDED)](./cuda_optimization_steps/97-spec-conversation-server.md)
+        - [98 — cp.async staging for the BT kernel: measured NULL; the campaign closes](./cuda_optimization_steps/98-bt-cpasync-null.md)
+        - [99 — fast-verify P0/P1: the stall root cause corrected; one bitwise fix landed](./cuda_optimization_steps/99-fastverify-p0-p1.md)
+        - [100 — the qs-plane repack lever measured NULL, and the drift that explains it](./cuda_optimization_steps/100-qs-plane-drift.md)
+        - [101 — steady-clock measurement method: warmup budgets landed](./cuda_optimization_steps/101-steady-state-method.md)
+        - [102 — draft-scale sweep: bigger drafts lose (plus a registration bug fixed)](./cuda_optimization_steps/102-draft-scale-sweep.md)
+        - [103 — q4_0 / q8_0 decode joins the MMVQ family (LANDED)](./cuda_optimization_steps/103-q40-q80-mmvq.md)
+        - [104 — q8_0 decode reaches llama.cpp parity at the decode ceiling (LANDED)](./cuda_optimization_steps/104-q80-p32-split-plane.md)
+        - [105 — device tier tables (T1: table + selector + MMQ gate)](./cuda_optimization_steps/105-device-tier-tables.md)
+        - [106 — query-driven formula gates (T2: ksplit × SM, smem, plane budgets)](./cuda_optimization_steps/106-query-formula-gates.md)
+        - [107 — C4: the packed Q8_0 KV routes on CUDA (#144)](./cuda_optimization_steps/107-c4-packed-q8-kv-cuda.md)
+        - [108 — #186: the dp4a packed Q8_0 K dot on CUDA (LANDED)](./cuda_optimization_steps/108-c4-dp4a-packed-q8-kv-cuda.md)
+        - [109 — #202: the packed Q8_0 KV cell's L1 request count (counter-only)](./cuda_optimization_steps/109-c4-packed-q8-kv-l1-request.md)
+
+# Sampling and Chat Templates
+
+- [Grammar and JSON-schema constrained decoding (F2)](./GRAMMAR-DESIGN.md)
+- [Chat-template fidelity and tokenizer generality (F7)](./CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md)
 
 # Speculative Decoding (D5)
 
 - [Plan — scope, mechanism, touch points, phases, risks](./SPECULATIVE-DECODING-PLAN.md)
+
+# Server and CLI
+
+- [CLI multi-turn conversation plan](./CLI-CONVERSATION-PLAN.md)
+- [OpenAI-compatible chat API plan](./OPENAI-CHAT-API-PLAN.md)
 
 # Tooling
 
@@ -169,7 +248,7 @@
 # Reference
 
 - [Parameter Audit](./PARAMETER_AUDIT.md)
-- [CUDA Tutorial](cuda_tutorial/README.md)
+- [CUDA Tutorial](cuda_tutorial/index.md)
     - [01 — What kind of machine is a GPU](cuda_tutorial/01-gpu-mental-model.md)
     - [02 — The minimal CUDA you actually need](cuda_tutorial/02-minimal-cuda.md)
     - [03 — Kernels I: elementwise, dequant, embedding](cuda_tutorial/03-kernels-elementwise.md)

@@ -174,4 +174,4 @@ Read the column map: `(lane & 3) * 2 + (l & 1)` — the same lane's `l=0/1` poin
 4. **A census's split dimension decides what it can see**: splitting by opcode (r25) finds instruction-type surplus; splitting by region (r32) finds frequency structure — the same 2,617 instructions, but only the second split exposes "21% in staging, 0.4% in epilogue".
 5. **A closing sweep's value is turning open questions into answered ones**: r32 spent a day fencing off two levers so r33's hypothesis could be tested single-variable — negative results queue into the record, and only then is the road clean for positive ones.
 
-← 34-r31-qmajor-sda-repack · [Index](./README.md) · 36-r33-hybrid-inner-loop →
+← 34-r31-qmajor-sda-repack · [Index](./index.md) · 36-r33-hybrid-inner-loop →

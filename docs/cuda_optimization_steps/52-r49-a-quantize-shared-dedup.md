@@ -244,4 +244,4 @@ A small change that began as "don't quantize the same A three times" eventually 
 4. **Launch count and duration are two different profit ledgers**: what gets deleted tends to be the smallest launches (shared narrow planes), and what stays tends to be the wide planes — weight estimates by bytes, not by launch counts.
 
 ---
-← [51 · r48 FAP2 register-resident softmax](./51-r48-fap2-register-softmax.md) · [Index](./README.md) · [53 →](./53-r50-fa-tkv-16.md)
+← [51 · r48 FAP2 register-resident softmax](./51-r48-fap2-register-softmax.md) · [Index](./index.md) · [53 →](./53-r50-fa-tkv-16.md)

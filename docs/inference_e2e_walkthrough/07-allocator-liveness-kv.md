@@ -998,4 +998,4 @@ longer matters.
 - [13 — Decode loop + graph reuse](13-decode-loop-graph-reuse.md) — the
   prefill→decode rebuild that the persistent regions are designed to survive.
 
-← [06 — Backend assignment and fusion](06-assign-fusion.md) · [Index](./README.md) · [08 — The scheduler: splits, copies, execution](08-scheduler-execute.md) →
+← [06 — Backend assignment and fusion](06-assign-fusion.md) · [Index](./index.md) · [08 — The scheduler: splits, copies, execution](08-scheduler-execute.md) →

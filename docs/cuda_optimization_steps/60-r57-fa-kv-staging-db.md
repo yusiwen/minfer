@@ -146,4 +146,4 @@ See §2.2 — the two excerpts of the in-service form (= the post-revert status 
 4. **Judge a revert by behavior, not md5**: nvcc builds are not bit-deterministic; the greedy stream + perf sanity are the evidence of "a clean revert."
 
 ---
-← 59 · [Index](./README.md) · 61 →
+← 59 · [Index](./index.md) · 61 →

@@ -15,9 +15,18 @@
 #   3. `glob` and `reason` must both be non-empty.
 #
 # `glob` is over the repository-relative path and is matched with `fnmatch`, so `*`
-# spans `/`. Unlike `scripts/book-links.toml` this ledger is **not** meant to empty:
-# some of these documents belong in the repository and not in the book. What it must
-# not do is grow by accident.
+# spans `/`.
+#
+# **These entries are decisions, not debts.** #516 settled the two questions this file
+# used to defer:
+#   - **In the book**: the ADR corpus, the CUDA campaign records 81-109, the sampling
+#     and template design docs, the server/CLI plans and the T-series device plan —
+#     they are the "why" the design documents link to, so they are chapters now;
+#   - **out of the book**: the writing contracts (`STYLE.md`), which are contributor
+#     material the book links by absolute URL, and the dated debugging/analysis
+#     records below, which are repository artifacts rather than book content.
+#
+# What it must not do is grow by accident.
 
 # Structural: the table of contents itself. mdBook consumes it and never publishes it,
 # so it can never be a chapter — not a decision anybody has to revisit.
@@ -25,100 +34,59 @@
 glob = "docs/SUMMARY.md"
 reason = "the book's table of contents; mdBook consumes it and publishes no page for it"
 
-# The ADR corpus: the index chapter links all 38 records, so the book 404s on them
-# today. #516 puts them in `SUMMARY.md` (or points the index at absolute URLs).
-[[exclude]]
-glob = "docs/adr/00[0-9][0-9]-*.md"
-reason = "the 38 ADRs: the index is a chapter and links every record, but SUMMARY.md lists none of them (#516)"
-
-# The CUDA campaign records: 01-80 are chapters, 81-109 were never added to the list.
-[[exclude]]
-glob = "docs/cuda_optimization_steps/8[1-9]-*.md"
-reason = "the campaign records 81-89: the SUMMARY list stops at 80 (#516)"
-
-[[exclude]]
-glob = "docs/cuda_optimization_steps/9[0-9]-*.md"
-reason = "the campaign records 90-99: the SUMMARY list stops at 80 (#516)"
-
-[[exclude]]
-glob = "docs/cuda_optimization_steps/10[0-9]-*.md"
-reason = "the campaign records 100-109: the SUMMARY list stops at 80 (#516)"
-
-# Writing contracts: each is linked from its tutorial's README, but none is a chapter.
+# Writing contracts: each is linked from its tutorial's index by an absolute URL, so
+# no reader of the book needs the page in the book.
 [[exclude]]
 glob = "docs/cuda_tutorial/STYLE.md"
-reason = "the tutorial's writing contract, linked from its README but not a chapter (#516)"
+reason = "the tutorial's writing contract: contributor material, linked by absolute URL (#516)"
 
 [[exclude]]
 glob = "docs/inference_e2e_walkthrough/STYLE.md"
-reason = "the walkthrough's writing contract, linked from its README but not a chapter (#516)"
+reason = "the walkthrough's writing contract: contributor material, linked by absolute URL (#516)"
 
 [[exclude]]
 glob = "docs/cuda_optimization_steps/STYLE.md"
-reason = "the campaign's writing contract, linked from its README but not a chapter (#516)"
+reason = "the campaign's writing contract: contributor material, linked by absolute URL (#516)"
 
-# Design and plan documents the book links by a relative path; #516 either promotes
-# them to chapters or links them by absolute URL.
-[[exclude]]
-glob = "docs/GRAMMAR-DESIGN.md"
-reason = "design document the book links but SUMMARY.md omits (#516)"
-
-[[exclude]]
-glob = "docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md"
-reason = "design document the book links but SUMMARY.md omits (#516)"
-
-[[exclude]]
-glob = "docs/CLI-CONVERSATION-PLAN.md"
-reason = "plan document the book links but SUMMARY.md omits (#516)"
-
-[[exclude]]
-glob = "docs/OPENAI-CHAT-API-PLAN.md"
-reason = "plan document the book links but SUMMARY.md omits (#516)"
-
-# Dated debugging and analysis records that no chapter links. Whether each joins the
-# book or stays a repository artifact is #516's call; today it is neither listed nor
-# reachable from the built site.
+# Dated records kept as repository artifacts: each records one debugging or analysis
+# session against the revision of its day, none is linked from the book, and the
+# book's "why" for the code they cover lives in the design documents and ADRs (#516).
 [[exclude]]
 glob = "docs/BUG-6-KV-CACHE-INDEXING.md"
-reason = "dated debugging record, unlinked; #516 decides chapter vs repository artifact"
+reason = "dated debugging record, kept as a repository artifact (#516)"
 
 [[exclude]]
 glob = "docs/DEBUGGING-PLAN.md"
-reason = "dated debugging plan, unlinked; #516 decides chapter vs repository artifact"
+reason = "dated debugging plan, kept as a repository artifact (#516)"
 
 [[exclude]]
 glob = "docs/DEBUGGING-SUMMARY.md"
-reason = "dated debugging record, unlinked; #516 decides chapter vs repository artifact"
+reason = "dated debugging record, kept as a repository artifact (#516)"
 
 [[exclude]]
 glob = "docs/KNOWN-CPU-ISSUES-2026-08-29.md"
-reason = "dated CPU-issue record, unlinked; #516 decides chapter vs repository artifact"
+reason = "dated CPU-issue record, kept as a repository artifact (#516)"
 
 [[exclude]]
 glob = "docs/QWEN2.5-1.5B-BUGS.md"
-reason = "dated Qwen2.5 bug record, unlinked; #516 decides chapter vs repository artifact"
+reason = "dated Qwen2.5 bug record, kept as a repository artifact (#516)"
 
 [[exclude]]
 glob = "docs/QWEN2.5-DEBUGGING-NOTES.md"
-reason = "dated Qwen2.5 debugging record, unlinked; #516 decides chapter vs repository artifact"
+reason = "dated Qwen2.5 debugging record, kept as a repository artifact (#516)"
 
 [[exclude]]
 glob = "docs/metal-inference-analysis.md"
-reason = "dated Metal analysis, unlinked; #516 decides chapter vs repository artifact"
+reason = "dated Metal analysis, kept as a repository artifact (#516)"
 
 [[exclude]]
 glob = "docs/multi-token-kernel-analysis.md"
-reason = "dated kernel analysis, unlinked; #516 decides chapter vs repository artifact"
-
-# Plan and survey documents the same way.
-[[exclude]]
-glob = "docs/DEVICE-ADAPTATION-PLAN.md"
-reason = "plan document, unlinked; #516 decides chapter vs repository artifact"
+reason = "dated kernel analysis, kept as a repository artifact (#516)"
 
 [[exclude]]
 glob = "docs/METAL-OBJC2-MIGRATION-PLAN.md"
-reason = "completed migration plan, unlinked; #516 decides chapter vs repository artifact"
+reason = "completed migration plan, kept as a repository artifact (#516)"
 
 [[exclude]]
 glob = "docs/METAL_OBJC-ECOSYSTEM.md"
-reason = "survey document, unlinked; #516 decides chapter vs repository artifact"
+reason = "survey document, kept as a repository artifact (#516)"

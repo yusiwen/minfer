@@ -966,4 +966,4 @@ $ ncu --kernel-name regex:silu --launch-count 3 --set basic \
 - [`docs/GLOSSARY.md`](../GLOSSARY.md) — the fallback for any term this
   chapter defined too briefly.
 
-← [01 · What kind of machine is a GPU](01-gpu-mental-model.md) · [Index](./README.md) · [03 · Reading minfer's kernels I →](03-kernels-elementwise.md)
+← [01 · What kind of machine is a GPU](01-gpu-mental-model.md) · [Index](./index.md) · [03 · Reading minfer's kernels I →](03-kernels-elementwise.md)

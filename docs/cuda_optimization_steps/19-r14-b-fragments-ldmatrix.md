@@ -325,4 +325,4 @@ kept stacking on this kernel; the A-side d/ssum epilogue was subsequently rewrit
 
 ---
 
-← 18 · [Index](./README.md) · 20 →
+← 18 · [Index](./index.md) · 20 →

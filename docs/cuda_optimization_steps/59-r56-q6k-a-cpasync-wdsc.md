@@ -227,4 +227,4 @@ This score also draws the boundary: basket logic is not a universal transplant t
 4. **A paired-staging validity gate must align pair-wise** (od even): the zero-fill granularity must equal the data structure's granularity; a half-valid boundary row silently loses data.
 
 ---
-← 58 · [Index](./README.md) · 60 →
+← 58 · [Index](./index.md) · 60 →

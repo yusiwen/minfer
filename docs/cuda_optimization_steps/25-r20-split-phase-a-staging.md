@@ -311,4 +311,4 @@ the split-phase structure itself became the wide kernel's permanent shape; later
 
 ---
 
-← 24-r19-weight-l2-residency · [Index](./README.md) · 26-r21-coalesced-block-linear-a →
+← 24-r19-weight-l2-residency · [Index](./index.md) · 26-r21-coalesced-block-linear-a →

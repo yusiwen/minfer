@@ -409,4 +409,4 @@ up-front gate:
    retries.
 
 ---
-← [30 · r25 SASS opcode census](30-r25-sass-opcode-census.md) · [Index](./README.md) · [32 · r29 NB kd-loop unroll](32-r29-nb-kd-loop-unroll.md) →
+← [30 · r25 SASS opcode census](30-r25-sass-opcode-census.md) · [Index](./index.md) · [32 · r29 NB kd-loop unroll](32-r29-nb-kd-loop-unroll.md) →

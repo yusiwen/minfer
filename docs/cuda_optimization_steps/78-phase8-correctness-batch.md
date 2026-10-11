@@ -204,4 +204,4 @@ foundation.
    three checks — but that verdict had to be *produced*, not inferred from
    "the change looked memory-only".
 
-← 77 · [Index](./README.md) · 79 →
+← 77 · [Index](./index.md) · 79 →

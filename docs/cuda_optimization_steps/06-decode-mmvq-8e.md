@@ -269,4 +269,4 @@ __device__ __forceinline__ void quantize_pad40_block(
    different ways.
 
 ---
-← [05 · persistent f16 weight cache (8p)](./05-persistent-f16-cache-8p.md) · [Index](./README.md) · [07 →](./07-r3-small-model-overhead.md)
+← [05 · persistent f16 weight cache (8p)](./05-persistent-f16-cache-8p.md) · [Index](./index.md) · [07 →](./07-r3-small-model-overhead.md)

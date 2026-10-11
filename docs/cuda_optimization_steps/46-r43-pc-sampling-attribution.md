@@ -249,4 +249,4 @@ over the wall merged" is the direct product of testing r43's list item by item.
 4. **MEAS-ONLY still counts as landing**: this round's instruction-level list directly fed r44/r45/r53's designs — one failure with clear attribution beats one success with a vague mechanism.
 
 ---
-← [45 · r42 stage-wide dsc scale read](45-r42-stage-wide-dsc-read.md) · [Index](./README.md) · [47 · r44 W_exp stride mismatch root cause](47-r44-wexp-stride-mismatch.md) →
+← [45 · r42 stage-wide dsc scale read](45-r42-stage-wide-dsc-read.md) · [Index](./index.md) · [47 · r44 W_exp stride mismatch root cause](47-r44-wexp-stride-mismatch.md) →

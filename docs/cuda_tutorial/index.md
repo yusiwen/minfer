@@ -7,7 +7,7 @@ CUDA backend safely, and follow the optimization records in
 measurement. It teaches by **reading minfer's real code**: each kernel chapter
 walks an actual `__global__` function from this repository, line by line, with
 the CPU counterpart from the
-[inference walkthrough](../inference_e2e_walkthrough/README.md) as the mirror.
+[inference walkthrough](../inference_e2e_walkthrough/index.md) as the mirror.
 
 > **Who this is for.** You can read Rust (minfer is pure Rust), you have read
 > walkthrough chapters [09](../inference_e2e_walkthrough/09-prefill-forward-path.md)–
@@ -67,7 +67,7 @@ flowchart LR
 ## Conventions
 
 - Prose in English; code, env vars and paths as-is. Writing contract:
-  [STYLE.md](STYLE.md) (same voice rules as the inference walkthrough).
+  [STYLE.md](https://github.com/yusiwen/minfer/blob/master/docs/cuda_tutorial/STYLE.md) (same voice rules as the inference walkthrough).
 - Line numbers were verified against the tree at the time each chapter was
   written; the function/kernel name is the stable address, the line number a
   convenience. Toy outputs are real runs on the GB10 with CUDA 13.0.

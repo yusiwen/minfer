@@ -875,4 +875,4 @@ Prompt: 23 tokens
 - **[12 — Sampler](12-sampler.md)** — the math behind the `GenParams`
   sampling defaults this stage collects.
 
-← [Index](./README.md) · [02 — GGUF load](02-gguf-load.md) →
+← [Index](./index.md) · [02 — GGUF load](02-gguf-load.md) →

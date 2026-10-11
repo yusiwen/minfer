@@ -240,4 +240,4 @@ In the campaign's gate numbering (the `ba977bf` commit message's own words): **G
 4. **ncu being unavailable does not block a landing**: the register audit, the prepass timing, and the wall clock are three independent pieces of evidence sufficient to corroborate the mechanism — a profiler is one source of evidence, not a precondition for landing.
 5. **Leave a SASS-identical control behind for the replaced thing**: the old kernel surviving intact = the A/B integrity gate gets its anchor for free; "new kernel + old kernel frozen" is the cheapest experimental design.
 
-← 36-r33-hybrid-inner-loop · [Index](./README.md) · 38-r35-scale-predecode →
+← 36-r33-hybrid-inner-loop · [Index](./index.md) · 38-r35-scale-predecode →

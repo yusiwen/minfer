@@ -178,4 +178,4 @@ The third item especially shows r10/r11's value: without r11 pinning `ne = 4`, "
 2. **A negative result's only vehicle is the record**: code can be swallowed by a hook, but interleaved A/B numbers written into a docs commit survive; commit the record first when a measurement session ends.
 3. **Read ISA details against the correct backend branch**: `I·J/64` (AMD MFMA) and `I·J/32` (NVIDIA) differ by 2×, and that decides whether "16 chains" — the whole next-step plan — stands; publicly suspending the contradiction and then verifying beats glossing forward.
 
-← 14 · [Index](./README.md) · 16 →
+← 14 · [Index](./index.md) · 16 →

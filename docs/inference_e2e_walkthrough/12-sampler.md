@@ -977,4 +977,4 @@ run even when the stochastic stages are skipped.
   [`docs/GLOSSARY.md`](../GLOSSARY.md) — backstop definitions (softmax,
   nucleus, temperature, multinomial).
 
-← [11 — Attention, vec ops, and the KV cache](11-attention-vecops-kv.md) · [Index](./README.md) · [13 — The decode loop and graph reuse](13-decode-loop-graph-reuse.md) →
+← [11 — Attention, vec ops, and the KV cache](11-attention-vecops-kv.md) · [Index](./index.md) · [13 — The decode loop and graph reuse](13-decode-loop-graph-reuse.md) →

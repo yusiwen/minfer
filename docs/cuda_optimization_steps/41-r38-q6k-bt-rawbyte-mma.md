@@ -273,4 +273,4 @@ This doc's 1.66× looks like the smallest win, but it established the kernel ske
 4. **The verifier's place is before integration**: a 0-mismatch standalone mapping verifier institutionalizes r28's lesson — a layout bug costs one minute in the verifier, an afternoon in the parity matrix.
 
 ---
-← 40 · [Index](./README.md) · [42 · r39 q6_K KDR=2 double-buffer](42-r39-q6k-kdr2-double-buffer.md) →
+← 40 · [Index](./index.md) · [42 · r39 q6_K KDR=2 double-buffer](42-r39-q6k-kdr2-double-buffer.md) →

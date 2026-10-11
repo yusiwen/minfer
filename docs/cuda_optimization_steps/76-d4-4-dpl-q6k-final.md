@@ -239,4 +239,4 @@ Each lever's archived state at the close, so the next session can pick up direct
 3. **Do not expect a negative probe signal to turn positive after integration.** PDL's +2.8% compute-chain warning and the post-integration −2.6%/−1.8% are the same mechanism (the co-residency tax); seeing the reversal in the probe should have been the stop — the integration cost (launch attributes + gating for 13 kernels) could have been saved.
 4. **The same-binary env-flip is the strongest A/B for isolating a mechanism's effect.** No code difference, no compile difference — what is measured is the mechanism itself; any optimization with an env switch should use this move as its deciding gate (L1's `MINFER_Q6K_DPL=0` can serve as the same-style recheck at any time).
 
-← 75 · [Index](./README.md) · [77](77-verification-methodology.md) →
+← 75 · [Index](./index.md) · [77](77-verification-methodology.md) →

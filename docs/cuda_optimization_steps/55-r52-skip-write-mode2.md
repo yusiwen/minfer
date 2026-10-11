@@ -219,4 +219,4 @@ Mode 2's enabling conditions (current tree `src/cuda.rs` `mmq_a_fuse_mode`; the 
 3. **Async CUDA errors change faces**: IllegalAddress can masquerade as OOM — the first response to an error should be checking the most recent kernel write boundary, not trusting the error's name.
 4. **Coalesced access beats register cleverness**: any remapping that costs a warp's 512 B coalesced shape should be costed at worst-case sector amplification before a line is written — r51's design veto and r52's measured retreat are the same physics.
 
-← 54-r51-producer-fused-a-quantize · [Index](./README.md) · 56-r53-q6k-wexp-cpasync-bundle →
+← 54-r51-producer-fused-a-quantize · [Index](./index.md) · 56-r53-q6k-wexp-cpasync-bundle →

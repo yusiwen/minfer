@@ -944,4 +944,4 @@ deletion, so keeping the parameter bought nothing.
   regions), 14/15 (the Metal and CUDA backends whose registries were filled
   here).
 
-← [02 — GGUF load](02-gguf-load.md) · [Index](./README.md) · [04 — Tokenizer and chat template](04-tokenizer-template.md) →
+← [02 — GGUF load](02-gguf-load.md) · [Index](./index.md) · [04 — Tokenizer and chat template](04-tokenizer-template.md) →

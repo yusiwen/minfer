@@ -283,4 +283,4 @@ gate wiring), the rest documentation.
    dispatch gate must check both premises — "id divisible" and "stride already padded".
 
 ---
-← [08 · R1 int8 MMQ prefill GEMM](./08-r1-int8-mmq-prefill-gemm.md) · [Index](./README.md) · [10 →](./10-r4-split-attention-dim-parallel.md)
+← [08 · R1 int8 MMQ prefill GEMM](./08-r1-int8-mmq-prefill-gemm.md) · [Index](./index.md) · [10 →](./10-r4-split-attention-dim-parallel.md)

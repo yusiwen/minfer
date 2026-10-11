@@ -318,4 +318,4 @@ this doc's methodology sample:
    "conservative old path" may be the aggressive one on memory.
 
 ---
-← 63 · [Index](./README.md) · 65 →
+← 63 · [Index](./index.md) · 65 →

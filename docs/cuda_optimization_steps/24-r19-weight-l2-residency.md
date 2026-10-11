@@ -246,4 +246,4 @@ residency" remains an unclosed road.
 
 ---
 
-← 23-r18-load-time-b-preexpansion · [Index](./README.md) · 25-r20-split-phase-a-staging →
+← 23-r18-load-time-b-preexpansion · [Index](./index.md) · 25-r20-split-phase-a-staging →

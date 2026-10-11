@@ -85,7 +85,7 @@ programming model; the walkthrough/GPU_SAFETY links go to the full stories.
 ## 6. Cross-references
 
 - [06 · Optimization methods](06-optimization-methods.md) — the chapter before this one: profiling and the gate chain.
-- [README](./README.md) — the ladder overview and the doc-relationship table.
+- [README](./index.md) — the ladder overview and the doc-relationship table.
 - [`docs/CUDA-TECH-PRIMER.md`](../CUDA-TECH-PRIMER.md) — your next full read.
 
 ← [06 · Optimization methods](06-optimization-methods.md) · Index

@@ -265,4 +265,4 @@ Judged as "REVERTED", this is the directory's densest-output doc: of five output
 3. **Check the launcher before any occupancy-class lever**: the smem request formula's equality with the real plane geometry holds only for certain tile combinations; change the tile without checking the launcher and the gain silently zeroes out with no error at all.
 4. **Audit before coding**: half an hour of structural audit closed an imagined 20× rewrite and pointed the budget at the FAP2 that actually worked.
 
-← 48-r45-cpasync-q6k-a-staging · [Index](./README.md) · 50-r47-converged-wall-decomposition →
+← 48-r45-cpasync-q6k-a-staging · [Index](./index.md) · 50-r47-converged-wall-decomposition →

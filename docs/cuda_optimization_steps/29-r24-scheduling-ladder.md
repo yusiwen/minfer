@@ -252,4 +252,4 @@ common yardstick used by the 30+ rounds since.**
    identity is an a priori fact — not one line of code should be written for it.
 
 ---
-← [28 · r23 f16 wall decomposition](28-r23-f16-wall-decomposition.md) · [Index](./README.md) · [30 · r25 SASS opcode census](30-r25-sass-opcode-census.md) →
+← [28 · r23 f16 wall decomposition](28-r23-f16-wall-decomposition.md) · [Index](./index.md) · [30 · r25 SASS opcode census](30-r25-sass-opcode-census.md) →

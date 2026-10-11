@@ -371,4 +371,4 @@ reference decode.
 
 ---
 
-← 12 · [Index](./README.md) · 14 →
+← 12 · [Index](./index.md) · 14 →

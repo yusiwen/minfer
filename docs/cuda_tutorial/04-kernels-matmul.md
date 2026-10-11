@@ -898,4 +898,4 @@ moves *prefill* pp tok/s (the f16 path streams ~3.6× the weight bytes,
 - **[`docs/GLOSSARY.md`](../GLOSSARY.md)** — AI, roofline, the 273 GB/s
   figure, "decode memory-bound / prefill compute-bound".
 
-← [03 · Reading minfer's kernels I](03-kernels-elementwise.md) · [Index](./README.md) · [05 · Reading minfer's kernels III](05-kernels-attention-host.md)
+← [03 · Reading minfer's kernels I](03-kernels-elementwise.md) · [Index](./index.md) · [05 · Reading minfer's kernels III](05-kernels-attention-host.md)

@@ -198,4 +198,4 @@ r48 FAP2 reached 2 blocks/SM by "deleting the S/P smem" and landed +5.6% — sam
    (r48), then talk tile size.
 
 ---
-← [27-r22-qa8-xor-swizzle](27-r22-qa8-xor-swizzle.md) · [Index](./README.md) · [29-r24-scheduling-ladder](29-r24-scheduling-ladder.md) →
+← [27-r22-qa8-xor-swizzle](27-r22-qa8-xor-swizzle.md) · [Index](./index.md) · [29-r24-scheduling-ladder](29-r24-scheduling-ladder.md) →

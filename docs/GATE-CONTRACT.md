@@ -4,7 +4,7 @@
 > campaign learned the hard way. A gate is any test whose verdict is a claim
 > about the engine — "this path ran", "this value is right", "this is not
 > slower" — as opposed to a test that pins a pure function's output. This
-> document is the **one home** for those rules: [`AGENTS.md`](../AGENTS.md)
+> document is the **one home** for those rules: [`AGENTS.md`](https://github.com/yusiwen/minfer/blob/master/AGENTS.md)
 > carries only the point-of-use facts (the command, the wrapper's default, the
 > current dated counts) and points here.
 >
@@ -271,7 +271,7 @@ vacuously.
 cannot run** ([#335]). `build-macos` compiles the crate and — since [#303] — the
 test target, but it has no Metal device, so on the macOS/Metal path the
 **Mac-local run is the evidence**. The template requires the section
-([`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md),
+([`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/yusiwen/minfer/blob/master/.github/PULL_REQUEST_TEMPLATE.md),
 enforced by the `check-pr-body` job and
 [`scripts/check_pr_body.py`](../scripts/check_pr_body.py)), and its content
 convention is the one stated above: `<box label> / <date> / <command>` with the
@@ -505,7 +505,7 @@ heading or a symbol is still the stable locator, and a bare range is still the f
 
 The facts rules 3 and 5 ask a PR to state in prose have a mechanical floor, and
 so does the Mac record of §5. The PR body is rendered from
-[`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md), and
+[`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/yusiwen/minfer/blob/master/.github/PULL_REQUEST_TEMPLATE.md), and
 [`scripts/check_pr_body.py`](../scripts/check_pr_body.py) refuses a body whose
 required headings are missing or whose three checked sections — `Bar named
 before measuring`, `Mutation evidence` and `Mac verification` — are empty or
@@ -539,7 +539,8 @@ it came from and why it died. The gap it closes is the one the build cannot: mdB
 chapter named `README.md` as `index.html` while the `.md`→`.html` rewrite keeps the basename, drops a
 `docs/**.md` that `SUMMARY.md` does not name (no page, no copied source), and renders a SUMMARY entry
 whose file is gone as an empty *draft* page — all three exit 0, and all three were green here for
-315 links over 81 distinct targets. `scripts/check_book_coverage.py` (#515) closes the other direction,
+315 links over 81 distinct targets before the gate found them — [#516](https://github.com/yusiwen/minfer/issues/516)
+re-pointed every one, and `scripts/book-links.toml` is empty again. `scripts/check_book_coverage.py` (#515) closes the other direction,
 on the file set rather than the links: every `docs/**.md` is a chapter or an entry in
 `scripts/book-coverage.toml` with a reason, no entry covers nothing, and no SUMMARY entry names a file
 that is missing or lives outside the book's `src/`. Both book ledgers sit beside their checker

@@ -201,4 +201,4 @@ touched. (Same root-cause family as 8p's latent `dequant_q5_0_f16` fix — doc
    split-K removed the warp-count bottleneck but kept a local-memory
    accumulator; each rewrite removed the bottleneck the previous one created.
 
-← 78 · [Index](./README.md)
+← 78 · [Index](./index.md)
