@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "note": "Provenance for every artifact under the F6 fixture cache (~/.cache/minfer/f6-src/). Verified by scripts/check_f6_fixtures.py and by the F6 gates' own fixture resolution (src/tooling/tests/f6_fixtures.rs). Keep in sync with docs/GGUF-TOOLING.md 4.2.1: the producer commands below are that recipe. A `sha256` entry is authoritative; a `sha256_prefix` entry is a recorded-but-truncated digest and never softens a full entry for the same path. `authoritative_reference: true` marks the one entry per llama-quantize path that the F6 byte-parity claim is asserted against — the dgxspark gcc 13.3.0 `-ffp-contract=fast` build. A recorded content that is not it is a different compiler's build of the same source: the K-quant search encoders are compiler-sensitive, so the parity gate names that build and skips loudly instead of reporting an encoder defect (issue #349).",
+  "note": "Provenance for every artifact under the F6 fixture cache (~/.cache/minfer/f6-src/). Verified by scripts/check_f6_fixtures.py and by the F6 gates' own fixture resolution (src/tooling/tests/f6_fixtures.rs). Keep in sync with docs/GGUF-TOOLING.md 4.1.1 and 4.2.1: the producer commands below are those recipes. A `sha256` entry is authoritative; a `sha256_prefix` entry is a recorded-but-truncated digest and never softens a full entry for the same path. `authoritative_reference: true` marks the one entry per llama-quantize path that the F6 byte-parity claim is asserted against — the dgxspark gcc 13.3.0 `-ffp-contract=fast` build. A recorded content that is not it is a different compiler's build of the same source: the K-quant search encoders are compiler-sensitive, so the parity gate names that build and skips loudly instead of reporting an encoder defect (issue #349).",
   "cache_root": "~/.cache/minfer/f6-src",
   "divergence_notes": [
     {
@@ -548,6 +548,32 @@
       "date": "2026-10-07",
       "box": "macbook (macOS 27.0.1, Apple M4 Pro)",
       "sha256": "1b4db4c831db5ca7af8c6be6ce38fc748fba7855639745bb30fa428a6f759253"
+    },
+    {
+      "path": "ref/qwen2.5-0.5b-converter-bf16.gguf",
+      "bytes": 994156480,
+      "producer": "convert_hf_to_gguf.py ~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct --outtype bf16 --outfile ~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-converter-bf16.gguf",
+      "producer_kind": "convert-hf-to-gguf",
+      "llamacpp_commit": "050dde50c (llama.cpp HEAD; the script and gguf-py are that checkout's)",
+      "torch": "2.14.0+cu130",
+      "transformers": "5.17.0",
+      "producer_note": "the direct converter reference for --outtype bf16 (issue #209), run with the checkout's own in-tree gguf-py, which is the encoder the script calls",
+      "date": "2026-10-11",
+      "box": "dgxspark (aarch64, GB10 sm_121)",
+      "sha256": "38c6fd845e61f195d0a2fd6e9e27b013fffff33574d85adc6fa7ef9ee4681c62"
+    },
+    {
+      "path": "ref/qwen2.5-0.5b-converter-f16.gguf",
+      "bytes": 994156480,
+      "producer": "convert_hf_to_gguf.py ~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct --outtype f16 --outfile ~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-converter-f16.gguf",
+      "producer_kind": "convert-hf-to-gguf",
+      "llamacpp_commit": "050dde50c (llama.cpp HEAD; the script and gguf-py are that checkout's)",
+      "torch": "2.14.0+cu130",
+      "transformers": "5.17.0",
+      "producer_note": "the converter f16 reference issue #428's row 1 needed; MINFER_F6_LLAMACPP_GGUF now defaults to this path instead of /tmp/f6-work/ref-f16.gguf",
+      "date": "2026-10-11",
+      "box": "dgxspark (aarch64, GB10 sm_121)",
+      "sha256": "6a6a25a27a87a9e382185d8c8c66203d676165f8f58eb2446da5b11f429abcb3"
     }
   ]
 }
