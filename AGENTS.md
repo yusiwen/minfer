@@ -173,11 +173,12 @@ an agent reaches for first.
 | **Architecture decision records — why, and what was rejected** | `docs/adr/` |
 
 **Doc gates.** The `check-docs` CI job runs `scripts/build_book.sh` (mdBook) and the checkers
-`check_docs_links.py`, `check_status.py --check` and `check_baselines.py --check`,
-`check_doc_line_anchors.py`, `check_anchor_drift.py`, `check_f6_fixtures.py` and `check_adr.py` (with
-`scripts/adr-citations.toml`, the pinned list of ADR path citations that no longer resolve); what
-each can and cannot prove is in its own `--help` and in
-[`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) ("the doc gates"). Edit `scripts/status.toml` or
-`scripts/test-baselines.toml`, never a counter.
+`check_docs_links.py` (the checkout's links), `check_book_links.py` + `check_book_coverage.py` (the
+rendered book's links, fragments and chapter set — mdBook proves none of them; each ledger sits beside
+its checker), `check_status.py --check` and `check_baselines.py --check` (`scripts/status.toml`,
+`scripts/test-baselines.toml` — edit those, never a counter), `check_doc_line_anchors.py`,
+`check_anchor_drift.py`, `check_f6_fixtures.py` and `check_adr.py` (with `scripts/adr-citations.toml`);
+what each can and cannot prove is in its own `--help` and in
+[`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) ("the doc gates").
 `check_agents_size.py` also caps **this file** — move a block to its topic doc rather than raise the cap.
 **Open doc debt:** [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md`).
