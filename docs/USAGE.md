@@ -245,6 +245,12 @@ n_slots` cells.
   experiments or for a machine where your own measurement says it wins).
 - `MINFER_BATCH=0` forces it off.
 - Any other value warns and uses the device default.
+- `MINFER_N_BATCH` sizes the **prefill chunk** (E3): default 2048 tokens, a no-op for a
+  prompt that fits, remainder-last so the final forward carries the tail row, and the
+  other slots take a decode step *between* chunks. `MINFER_N_BATCH=0` disables chunking
+  (one forward per prefill, the pre-E3 behaviour) and a non-numeric value falls back to
+  the default; the startup line prints what was resolved:
+  `[server] prefill chunks: 2048 tokens (default; MINFER_N_BATCH=0 disables chunking)`.
 - Metal joined the default only once it could take the node the batched path needs: until
   [#44](https://github.com/yusiwen/minfer/issues/44) part (b) (2026-10-06) `supports_attn_span()`
   was false there, so batching would have failed loudly instead of serving and Metal stayed
@@ -441,9 +447,15 @@ snapshot (written after every completed request) is unaffected.
 
 `pp<P>` ingests P prompt tokens (prefill-only, generate nothing); `tg<T>`
 prefills the context then decodes T tokens. `-p 0` / `-n 0` skip a test, `-r`
-sets the measured reps (1 untimed warmup each), `-o csv|json` emits the same
-fields machine-readable, `--n-ctx` only ever grows the auto KV sizing
-(`P+T+16`, clamped to the model's context length).
+sets the **measured** reps, `-o csv|json` emits the same fields machine-readable,
+`--n-ctx` only ever grows the auto KV sizing (`P+T+16`, clamped to the model's
+context length).
+
+Warmup is a steady-clock **budget**, not a fixed iteration count: the timed reps
+start once `MINFER_BENCH_WARMUP_MS` (**default 2000 ms**) has elapsed, with at
+least one warm pass. That is the doc-100/101 clock-ramp rule — an idle GPU sits
+at 208 MHz and one iteration ramps nothing — so a rep count quoted across boxes
+means nothing without its warmup budget.
 
 ## Verify-step gate bench (specverify)
 
@@ -454,10 +466,12 @@ fields machine-readable, `--n-ctx` only ever grows the auto KV sizing
 Measures the batched verify-step cost `C_T(nt)` (nt = 1, 3, 5 by default) at
 a fixed deep KV depth and reports the per-token amortization
 `nt·C_T(1)/C_T(nt)` — the D5 speculative-decoding gate instrument (step doc
-81). `-p` sets the depth, `-r` the timed reps (3 untimed warmups each),
-`MINFER_SPECVERIFY_NTS=1,3,16` overrides the phase list,
-`MINFER_SPECVERIFY_NOUT=1` forces prefill-style `n_out=1`. Exit code is 0
-whenever the measurement completes; the PASS/FAIL verdict is in the JSON.
+81). `-p` sets the depth, `-r` the timed reps, `MINFER_SPECVERIFY_NTS=1,3,16`
+overrides the phase list, `MINFER_SPECVERIFY_NOUT=1` forces prefill-style
+`n_out=1`. Warmup is `bench`'s steady-clock budget —
+`MINFER_SPECVERIFY_WARMUP_MS` (**default 2000 ms**) with a floor of 3 iterations
+for allocator/graph stability. Exit code is 0 whenever the measurement
+completes; the PASS/FAIL verdict is in the JSON.
 
 ## GGUF tooling — convert, quantize, split (F6)
 

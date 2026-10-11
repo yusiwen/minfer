@@ -172,14 +172,9 @@ an agent reaches for first.
 | The phase-by-phase plan and the per-ticket history | `docs/ARCHITECTURE-EXECUTION-PLAN.md` |
 | **Architecture decision records — why, and what was rejected** | `docs/adr/` |
 
-**Doc gates.** The `check-docs` CI job runs `scripts/build_book.sh` (mdBook) and the checkers
-`check_docs_links.py` (the checkout's links), `check_book_links.py` + `check_book_coverage.py` (the
-rendered book's links, fragments and chapter set — mdBook proves none of them; each ledger sits beside
-its checker), `check_status.py --check` and `check_baselines.py --check` (`scripts/status.toml`,
-`scripts/test-baselines.toml` — edit those, never a counter), `check_doc_line_anchors.py`,
-`check_anchor_drift.py`, `check_f6_fixtures.py`, `check_adr.py` (with `scripts/adr-citations.toml`) and
-`check_support_matrix.py`;
-what each can and cannot prove is in its own `--help` and in
-[`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) ("the doc gates").
+**Doc gates.** `check-docs` runs `scripts/build_book.sh` and the checkers that guard this
+documentation; the list, and what each can and cannot prove, is in
+[`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) ("the doc gates") — repeated here it would be a second
+copy of that section, and this file is an index.
 `check_agents_size.py` also caps **this file** — move a block to its topic doc rather than raise the cap.
 **Open doc debt:** the [open `documentation` issues](https://github.com/yusiwen/minfer/issues?q=is%3Aopen+label%3Adocumentation) — the label is the list, so a closed ticket cannot linger here.
