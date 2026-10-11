@@ -369,14 +369,21 @@ size mismatch for <path>: expected 1048576 bytes, got 1572864 bytes (the server
 ### 4.1 The reference the HF conversion was checked against
 
 Two independent references, both on the **same** `Qwen/Qwen2.5-0.5B-Instruct`
-checkpoint (bf16 safetensors downloaded to `/tmp/f6-work/hf-src`):
+checkpoint (bf16 safetensors at
+`~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct`, one manifest entry per file):
 
 1. **llama.cpp's converter** (`convert_hf_to_gguf.py --outtype f16` with
-   torch 2.14.0 / transformers 5.17.0) → `ref-f16.gguf`.
+   torch 2.14.0 / transformers 5.17.0, llama.cpp `050dde50c`) →
+   `~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-converter-f16.gguf`.
    **All 290 tensor payloads are byte-identical** to minfer's output
    (`sha256` per tensor, compared by name). Metadata is equivalent for every
-   value the loader reads; the only differences are key order and that llama.cpp
-   also writes the cosmetic `general.size_label`.
+   value the loader reads. The differences are the **three keys only the
+   converter writes** — `general.basename`, `general.finetune` and the cosmetic
+   `general.size_label` — one differing value, `general.name`
+   (`'Qwen2.5 0.5B Instruct'` against minfer's `'Qwen2.5 0.5b Instruct'`), and
+   key order. Measured 2026-10-11 against the file the manifest records; the
+   earlier wording here named `general.size_label` as the only extra key, which
+   the measurement does not support.
 2. **llama.cpp itself**, via `llama-cli`/the formula below, for the logits.
    Running the two *different files* through minfer gives **bitwise-identical**
    logits and an identical greedy continuation, which is the strong claim: the
@@ -418,16 +425,54 @@ f32→bf16 RNE projection of the checkpoint's own values. Result (measured
 type, and `llama-quantize`'s `tensor_allows_quantization` returns the source
 type for a 1-D tensor.
 
+**The direct converter reference (#209).** §4.1's Source A now exists for bf16
+too — the same checkpoint, the same torch 2.14.0 / transformers 5.17.0 pair and
+llama.cpp `050dde50c`, run as `convert_hf_to_gguf.py --outtype bf16` and recorded
+as `~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-converter-bf16.gguf`:
+
+```bash
+convert_hf_to_gguf.py ~/.cache/minfer/f6-src/hf/Qwen2.5-0.5B-Instruct --outtype bf16 \
+  --outfile ~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-converter-bf16.gguf
+```
+
+Result
+(measured 2026-10-11, `dgxspark`): **290/290 tensor payloads byte-identical** to
+minfer's `--outtype bf16` output (169 BF16 2-D, 121 F32 1-D), with the metadata
+relationship §4.1 records. The claim is gated, not just recorded:
+`f142_bf16_conversion_is_byte_identical_to_the_reference` asserts both references
+(`MINFER_F142_LLAMACPP_BF16` for the cast and `MINFER_F142_CONVERTER_BF16` for
+this one), and `f6_hf_conversion_matches_the_llamacpp_reference` resolves the f16
+reference from `MINFER_F6_LLAMACPP_GGUF`, whose default is now the recorded
+`ref/qwen2.5-0.5b-converter-f16.gguf` rather than a `/tmp` path (#428's row 1).
+
+What that reference settles, and what it does not — both read off the
+reference's own code rather than assumed:
+
+- **It does not test a second rounding policy.** `gguf-py/gguf/quants.py`'s
+  `BF16` encoder is `(n + (0x7fff + ((n >> 16) & 1))) >> 16` with the comment
+  *"same as ggml_compute_fp32_to_bf16 in ggml-impl.h"*, and the C function is
+  that expression plus a NaN→quiet branch (`ggml-impl.h:611-623`). minfer's
+  `convert::f32_to_bf16_bits` (`src/convert.rs:105`, whose comment reads
+  *"exactly `ggml_compute_fp32_to_bf16` (ggml-impl.h)"*) is that function by name
+  and by bit pattern. So the cast and the converter share one rule; what the direct
+  run adds is an independent **implementation** of it (numpy against Rust) and
+  the whole converter path — naming, the 1-D/norm branch, metadata — not a
+  different policy. A rounding-policy difference is not something this reference
+  could catch.
+- **The 1-D rule is the converter's, and it is exercised.** `conversion/base.py:1018`
+  is `if n_dims <= 1 or new_name.endswith("_norm.weight"): data_qtype = F32`.
+  The reference keeps exactly 121 tensors F32, and **72 of them are not
+  `_norm.weight`** — so it is the `n_dims <= 1` branch that does the work, and
+  the byte identity above is what confirms minfer's writer agrees with it.
+
 **Why not the f16 source.** #142's Source B (`llama-quantize --pure <f16>.gguf …
 BF16`) was tried first and is **not** byte-identical here: casting the f16 file
 cannot recover the 123 024 subnormal values that the f16 conversion already
 rounded, so 126 575 bytes across all 169 2-D tensors differ (measured
 2026-09-27, per-tensor byte diff). That is the reference's input, not minfer's
-writer — which is exactly what the f32-source reference isolates. The writer has
-no torch/transformers converter to check against on dgxspark
-(`convert_hf_to_gguf.py --outtype bf16` needs torch); the f32-source cast is the
-strongest available reference, and the missing direct converter reference is
-[#209](https://github.com/yusiwen/minfer/issues/209).
+writer — which is exactly what the f32-source reference isolates. Both references
+are kept: the f32-source cast is the cheapest one to re-run, and the direct
+converter run is the one that also covers the converter's own path.
 
 ### 4.2 The reference the encoders were checked against
 
@@ -639,7 +684,9 @@ green. `tests/fixtures/f6-fixtures.json` is the record — one entry per artifac
 identity**, carrying `path`, `bytes`, `sha256` (or a `sha256_prefix` where the
 2026-10-07 table truncated it), the exact `producer` command, the producer's
 identity (`minfer_commit` for a minfer-produced file; `llamacpp_commit` +
-`compiler` + `ffp_contract` + `cflags` for a llama-produced one), `date` and an
+`compiler` + `ffp_contract` + `cflags` for a `llama-quantize` one; `llamacpp_commit`
++ `torch` + `transformers` for a `convert_hf_to_gguf.py` one, whose bf16 step is
+an integer bit operation and so turns on no compiler flag), `date` and an
 **absolute** box label (gate contract rule 5). Two entries for one path are a
 *recorded divergence*, and each of them carries a `divergence_notes` entry
 explaining it: the f16 source and its bf16 cast differ by **minfer producer
