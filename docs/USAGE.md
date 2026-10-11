@@ -77,8 +77,31 @@ Sampling and runtime options:
 - `--stop <STR>` — stop generation at this string (repeatable)
 - `-n, --n-predict <N>` — max tokens to generate (default 512)
 - `--seed <N>` — RNG seed for sampling
+- Speculative decoding (D5-R, [ADR-0017](./adr/0017-speculative-decoding-refuses-what-it-cannot-carry.md)) —
+  a draft model proposes, the target verifies the proposals in one batched forward:
+  - `--spec-draft <model>` — the draft model (any supported GGUF)
+  - `--spec-draft-n <N>` — drafted tokens per round (default 2, so the verify batch is `N + 1`
+    rows)
+  - `--spec-draft-adaptive` — pick `d` per round from the per-depth acceptance and cost EWMA,
+    capped at 8 unless `--spec-draft-n` sets a smaller cap
+  `--spec-draft-n` and `--spec-draft-adaptive` are no-ops without `--spec-draft`. Speculative
+  decoding refuses mirostat and a grammar (both named above), because a verify round samples
+  several rows from one shared RNG, or from one automaton state.
 - `--n-ctx <N>` — sizes the KV cache (clamped to the model's max context)
 - `-t, --threads <N>` — CPU worker threads
+- `--gpu <N>` — CUDA device index; unset auto-selects the highest compute capability. Ignored on
+  CPU and Metal, where there is nothing to index.
+- `--backend <name>` — F4: fence the run to a set of backends. Repeatable, and both the
+  comma-separated (`--backend cpu,cuda`) and the `=`-joined (`--backend=cpu`) forms work; the
+  names `cpu`, `metal` and `cuda` are matched case-insensitively. `cpu` stays allowed whatever
+  is named — it is the fallback — so `--backend cpu` is how a run is forced onto the CPU. Unset =
+  every backend this build has; `MINFER_BACKENDS` is the environment form of the same surface,
+  and the flag wins when both are set. It is extracted before subcommand dispatch, so `serve`,
+  `viz`, `bench` and `specverify` honour it too. Three distinct refusals, each naming what it
+  rejected: an unknown name (`unknown backend 'nope'; known backends are: cpu, metal, cuda`), a
+  name this build does not contain (`backend 'cuda' is known but not compiled into this build:
+  the CUDA backend is compiled only with --features cuda`), and a name this machine cannot use
+  (`backend 'cuda' is compiled in but not available on this machine: <why>`).
 - `--gpu-layers <N|auto>` — E5: run the first `N` transformer blocks on the device and the rest
   on the CPU (`0` = CPU only; unset/`MINFER_GPU_LAYERS` = every block the device can hold, the
   pre-E5 behaviour; `auto` = as many as the budget allows). The placement is printed at load
@@ -91,6 +114,20 @@ Sampling and runtime options:
   (`offload: … auto: 5 of 24 blocks fit — weights budget 64 MiB, 16 MiB reserved for
   KV/activations; MINFER_GPU_MEM=64 MiB`). Without a device that reports free memory (Metal
   today) `auto` needs `MINFER_GPU_MEM`.
+
+Three flags describe the run instead of changing how it decodes:
+
+- `--meta` — dump the GGUF's metadata KV pairs and the key tensors (`token_embd`, the norms,
+  `lm_head`) — the same two dumps `minfer info <model>` prints. Unlike `info` it does **not**
+  stop there: the model still loads and generation proceeds, so it is the flag form for "show
+  me the file, then answer".
+- `--dump-graph <PATH>` — export the compute graph the run just built (build → assign → fusion,
+  with the real backend assignment and the same fusion environment toggles as the live path) as
+  Graphviz DOT. It runs **one prefill**, writes the file, prints `Graph DOT exported to <PATH>
+  (<n> nodes)` and exits before decoding.
+- `--dump-graph-json <PATH>` — the same graph as the JSON the `viz/` web visualizer reads. It
+  prints `Graph JSON exported to <PATH> (<n> nodes, <kind>)`, where `<kind>` names the phase the
+  graph was built for, and also exits before decoding.
 
 ## Chat templates and tokenizer
 
