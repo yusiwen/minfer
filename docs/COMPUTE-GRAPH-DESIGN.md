@@ -465,39 +465,17 @@ Diagnostics: `MINFER_GRAPH_TRACE=1` prints the split list and a per-op/per-backe
 The scheduler is also where the optional per-node data capture for the visualizer hooks in (§8.3) and
 where CUDA Graph replay short-circuits a split's node loop (§9.4).
 
-### 3.5 Backend trait (`graph/backend.rs`)
+### 3.5 The backend seam (`graph/backend.rs`)
 
-```rust
-pub trait KvProvider {
-    fn kv_pair(&self, layer: usize) -> Option<(usize, usize)>;   // (k_buf_id, v_buf_id)
-}
+Two traits make the seam. `KvProvider` declares one method — `kv_pair(layer) -> Option<(k_id,
+v_id)>` — which the executor uses to find a layer's sibling K/V region; `Backend` is the executor
+itself, and its methods are capability queries, pool management, `execute_node`, the KV row moves,
+host read/write and `synchronize`. The signatures are declared in exactly one place, the
+"`Backend` trait" section of [`ARCHITECTURE.md`](./ARCHITECTURE.md) §5.1, and are deliberately not
+copied here: a second copy is a second thing to drift. What belongs in *this* document is why the
+seam has the shape it has.
 
-pub trait Backend: Send + Sync {
-    fn name(&self) -> &str;                                       // diagnostics
-    fn supports_op(&self, op: &Op, dtype: DType) -> bool;
-    fn supports_fused(&self, fused: &FusedOp) -> bool;
-
-    fn alloc_buffer(&mut self, size: usize) -> usize;             // from the recycle free list
-    fn free_buffer(&mut self, id: usize);
-    fn alloc_fresh(&mut self, size: usize) -> usize;              // bypasses the free list
-    fn pool_len(&self) -> usize;                                  // E4: did the pool grow?
-
-    fn execute_node(&mut self, node: &CNode, in_bufs: &[BufRef], out_buf: BufRef,
-                    kv_pair: Option<(usize, usize)>) -> Result<(), String>;
-
-    fn read_host(&self, id: usize) -> Option<&[f32]>;
-    fn write_host(&mut self, id: usize, data: &[f32]) -> Result<(), String>;   // exact length
-    fn write_host_window(&mut self, id: usize, offset: usize, data: &[f32])    // E4 S2: a window of
-        -> Result<(), String>;                                                 // a class-sized buffer
-    fn synchronize(&mut self);
-
-    #[cfg(feature = "cuda")]
-    fn graph_replay(&mut self, uid: u64, range: (usize, usize),
-                    nt_hint: Option<usize>) -> bool { false }
-}
-```
-
-Three deviations from the plan's sketch are worth stating explicitly:
+Three deviations from the original design sketch are worth stating explicitly:
 
 - `execute_node` takes `&mut self` (the pool is mutated) and returns a `Result` (invariant 7).
 - `kv_pair` is passed in rather than looked up: the backend cannot see the allocator's KV map, and
