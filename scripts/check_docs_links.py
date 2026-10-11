@@ -12,22 +12,37 @@ reference-style definitions (`[label]: target`), in every `docs/**/*.md`,
 `AGENTS.md`, `README.md` and `viz/README.md`. Fenced code blocks are skipped — they
 hold examples, not links.
 
+**What this checker cannot see, and why it is not enough.** It resolves a target
+against *the checkout*, so it is blind to everything `mdbook build` decides: a
+chapter named `README.md` is published as `index.html` while the link text is
+rewritten to `README.html`, and a document that is not in `docs/SUMMARY.md` is not
+published at all — both were true, and green here, for 300 links on the site (see
+`scripts/check_book_links.py`, which reads the rendered `book/` instead).
+
 What it deliberately does not check:
 
 - **anchors** (`page.md#section`): the target file must exist, the fragment is not
-  resolved against its headings (that needs a slugifier per renderer);
+  resolved against its headings (that needs a slugifier per renderer; the rendered
+  ids are checked by `scripts/check_book_links.py`);
 - **site-absolute paths** (`/foo`): mdBook renders those against the site root, not
   this checkout;
 - **external URLs**: anything with a scheme (`https:`, `mailto:`, …) is out of scope.
 
-Usage: `python3 scripts/check_docs_links.py [repo-root]` (default: the repo this
-script lives in). Exits 0 when every relative target resolves, 1 otherwise.
+Usage:
+
+    python3 scripts/check_docs_links.py [--root .]
+    python3 scripts/check_docs_links.py --selftest
+
+Exit codes: 0 clean, 1 a link does not resolve, 2 usage or I/O error. Pure and
+offline: stdlib only, no build, no network.
 """
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
+import tempfile
 import urllib.parse
 from pathlib import Path
 
@@ -44,11 +59,17 @@ FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 CODE_SPAN = re.compile(r"(`+)(.+?)\1", re.DOTALL)
 SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
+#: Every file the gate covers. `docs/**` plus the three markdown files that live
+#: outside it and are read as documentation (a link inside `experiments/` is a lab
+#: note, not a contract — `docs/SOURCE-LAYOUT-PLAN.md` says which trees each gate
+#: owns).
+EXTRA_FILES = ("AGENTS.md", "README.md", "viz/README.md")
+
 
 def markdown_files(root: Path) -> list[Path]:
     """Every file the gate covers, in a stable order."""
     files = sorted((root / "docs").rglob("*.md"))
-    for extra in ("AGENTS.md", "README.md", "viz/README.md"):
+    for extra in EXTRA_FILES:
         p = root / extra
         if p.is_file():
             files.append(p)
@@ -93,7 +114,7 @@ def targets_in(path: Path):
             yield n, match.group(1)
 
 
-def resolvable(source: Path, target: str, root: Path) -> bool:
+def resolvable(source: Path, target: str) -> bool:
     """Whether `target`, written inside `source`, names something that exists."""
     if not target or target.startswith("#"):
         return True  # in-page anchor: the file itself is the target
@@ -112,13 +133,9 @@ def resolvable(source: Path, target: str, root: Path) -> bool:
     return False
 
 
-def main(argv: list[str]) -> int:
-    root = Path(argv[1]).resolve() if len(argv) > 1 else Path(__file__).resolve().parent.parent
+def scan(root: Path) -> tuple[list[str], int, int]:
+    """`(missing, checked, file_count)` for every covered file under `root`."""
     files = markdown_files(root)
-    if not files:
-        print(f"check_docs_links: no markdown found under {root}", file=sys.stderr)
-        return 1
-
     checked = 0
     missing: list[str] = []
     for path in files:
@@ -129,19 +146,125 @@ def main(argv: list[str]) -> int:
             if target.startswith("/"):
                 continue
             checked += 1
-            if not resolvable(path, target, root):
+            if not resolvable(path, target):
                 missing.append(f"{rel}:{line}: {target}")
+    return missing, checked, len(files)
+
+
+def check(root: Path) -> int:
+    """Print the verdict for `root`; return the exit code."""
+    if not (root / "docs").is_dir():
+        print(f"check_docs_links: no docs/ under {root}", file=sys.stderr)
+        return 2
+    missing, checked, files = scan(root)
+    if not files:
+        print(f"check_docs_links: no markdown found under {root}", file=sys.stderr)
+        return 2
     for line in missing:
         print(f"BROKEN LINK  {line}", file=sys.stderr)
     if missing:
         print(
             f"check_docs_links: {len(missing)} of {checked} relative links do not "
-            f"resolve (in {len(files)} markdown files)",
+            f"resolve (in {files} markdown files)",
             file=sys.stderr,
         )
         return 1
-    print(f"check_docs_links: {checked} relative links resolve in {len(files)} markdown files")
+    print(f"check_docs_links: {checked} relative links resolve in {files} markdown files")
     return 0
+
+
+def selftest() -> int:
+    """The checker's own pass/fail cases, in a temp tree."""
+    cases: list[tuple[str, bool, str]] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "docs").mkdir()
+        (root / "docs" / "target.md").write_text("# Target\n", encoding="utf-8")
+        (root / "docs" / "sub").mkdir()
+        (root / "docs" / "sub" / "README.md").write_text("# Sub\n", encoding="utf-8")
+
+        def run(body: str) -> int:
+            (root / "docs" / "page.md").write_text(body, encoding="utf-8")
+            return check(root)
+
+        cases.append(("a link to an existing file passes", run("see [t](./target.md)\n") == 0, ""))
+        cases.append(
+            ("a link to a missing file fails", run("see [gone](./nope.md)\n") == 1, "")
+        )
+        cases.append(
+            (
+                "a link inside a fenced code block is ignored",
+                run("```\n[gone](./nope.md)\n```\n") == 0,
+                "",
+            )
+        )
+        cases.append(
+            (
+                "a link inside an inline code span is ignored",
+                run("the shape `ne[1](attn_q)` is not a link\n") == 0,
+                "",
+            )
+        )
+        cases.append(
+            (
+                "a reference definition with a missing target fails",
+                run("see [t][gone]\n\n[gone]: ./nope.md\n") == 1,
+                "",
+            )
+        )
+        cases.append(
+            (
+                "an external URL is out of scope",
+                run("see [x](https://example.com/nope)\n") == 0,
+                "",
+            )
+        )
+        cases.append(("a site-absolute path is out of scope", run("see [x](/nope)\n") == 0, ""))
+        cases.append(("an in-page anchor stands alone", run("see [x](#section)\n") == 0, ""))
+        cases.append(
+            (
+                "`dir/` resolves through its README.md",
+                run("see [sub](./sub/)\n") == 0,
+                "",
+            )
+        )
+        # The boundary this checker owns: `README.md` *exists in the checkout* even
+        # though mdBook publishes it as `index.html`, so the link above is green
+        # here and dead on the site. `check_book_links.py` owns that half.
+        cases.append(
+            (
+                "a README.md target passes here (the book checker owns it)",
+                run("see [sub](./sub/README.md)\n") == 0,
+                "",
+            )
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        cases.append(("a tree without docs/ is an I/O error", check(Path(tmp)) == 2, ""))
+    failed = 0
+    for name, ok, note in cases:
+        print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  ({note})" if note and not ok else ""))
+        failed += 0 if ok else 1
+    print(f"check_docs_links --selftest: {len(cases) - failed}/{len(cases)} cases pass")
+    return 1 if failed else 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent,
+        help="the repository root (default: the repo this script lives in)",
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="run the built-in pass/fail cases in a temp tree and exit non-zero on a failure",
+    )
+    args = parser.parse_args(argv[1:])
+    if args.selftest:
+        return selftest()
+    return check(args.root.resolve())
 
 
 if __name__ == "__main__":
