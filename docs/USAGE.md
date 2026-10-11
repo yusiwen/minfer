@@ -464,7 +464,8 @@ whenever the measurement completes; the PASS/FAIL verdict is in the JSON.
 ```bash
 # HuggingFace Qwen2 checkpoint -> GGUF (f16, or f32 for a lossless archive)
 ./target/release/minfer convert /path/to/Qwen2.5-0.5B-Instruct out.gguf --outtype f16
-# quantize an existing single-file GGUF (q4_0, q4_1, q5_0, q5_1, q8_0, f16, f32)
+# quantize an existing single-file GGUF (--type q4_0, q4_1, q5_0, q5_1, q8_0,
+#                                             q4_K, q5_K, q6_K, f16, f32)
 ./target/release/minfer quantize out.gguf out-q4_0.gguf --type q4_0
 # split a single file into transport-sized parts (any type; tensor bytes copied verbatim)
 ./target/release/minfer split out-q4_0.gguf /tmp/parts --max-size 200M
@@ -480,9 +481,11 @@ f16` (llama.cpp's rule); `--outtype f32` is exact for bf16/f16 sources.
 
 `quantize` re-encodes 2-D float weights; 1-D norms/biases keep their source
 type, and on a tied model a sub-8-bit target quantizes the shared
-`token_embd.weight` at q8_0 (both are printed). K-quants and I-quants are
-refused by name — minfer can read them but has no encoder that has been
-verified against llama.cpp.
+`token_embd.weight` at q8_0 (both are printed). The encodable targets are
+`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q4_K`, `q5_K`, `q6_K`, `f16` and `f32`,
+and the K-quant encoders are byte-identical to `llama-quantize`'s on the same
+source ([`docs/SUPPORT-MATRIX.md`](./SUPPORT-MATRIX.md)). The K-quants with no
+encoder here (`q2_K`, `q3_K`, `q8_K`) and the I-quants are refused by name.
 
 `split` writes `{stem}-NNNNN-of-MMMMM.gguf` parts with
 `split.no`/`split.count`/`split.tensors.count`; the loader reads part 0 and

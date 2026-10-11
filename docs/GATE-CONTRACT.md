@@ -564,7 +564,11 @@ reported for a human instead of guessed, and the same `FROZEN` set exempts the s
 cross-checks every `~/.cache/minfer/f6-src/…` fixture the source tree names against it (and every `.gguf` path a
 recorded producer command names), pins each command's shape and classifies it with `--regenerate --dry-run`
 (#345 re-runs one and re-records what it produced), and whose `--selftest` proves a tampered copy is refused by
-name and digest; the byte half runs where the cache exists, in the F6 gates themselves. **Open doc
+name and digest; the byte half runs where the cache exists, in the F6 gates themselves. It also runs
+`scripts/check_support_matrix.py` (#519), which keeps the one *capability* table honest: it derives
+the AVX2 quant dots from `src/quants/` and fails when [`docs/SUPPORT-MATRIX.md`](./SUPPORT-MATRIX.md)'s
+AVX2 column disagrees either way — the column that had marked Q5_0 as SIMD while only Q4_0, Q8_0 and
+the three K-quants had kernels. **Open doc
 debt** is the [open `documentation`
 issues](https://github.com/yusiwen/minfer/issues?q=is%3Aopen+label%3Adocumentation) — the label is the
 list, so a closed ticket cannot linger here. [#62](https://github.com/yusiwen/minfer/issues/62)
