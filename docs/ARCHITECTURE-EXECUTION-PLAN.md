@@ -36,8 +36,10 @@ counter. The suite counts are the sibling ledger `scripts/test-baselines.toml`, 
 `scripts/check_baselines.py`: its `--check-live` compares the
 one CI-verifiable box against the `test-linux-cpu` log, while the CUDA / real-model /
 sanitizer rows are labelled *recorded measurements* because CI has no GPU. The
-per-ticket ✔ marks in the §11 diagram are **not** derivable from `(done, total)` and are
-deliberately out of scope for the checker.
+per-ticket ✔ marks in the §11 diagram are **derived too**, as *counts*: each phase line must draw
+that phase's `total` tickets and carry a mark on `done` of them, which the same checker asserts.
+Which ticket is unmarked while a phase is in progress stays the author's statement, because the
+ledger is phase-level — §11's note says so next to the diagram.
 
 **Issue links.** Work tracked on GitHub carries its issue link in its table row
 (prose sections carry it in the heading), and the record written when that work lands
@@ -46,7 +48,10 @@ C8a, D1–D3, E1/E1b/E2/E6 — have no issue, and their record here is the only 
 tickets below that *do* have one are exactly the open list in the
 [tracker](https://github.com/yusiwen/minfer/issues). Doc debt and test health are filed
 the same way: [#62](https://github.com/yusiwen/minfer/issues/62) (`docs/USAGE.md`
-staleness). The docs build was [#63](https://github.com/yusiwen/minfer/issues/63) and is
+staleness) was one and is **closed** ([#506](https://github.com/yusiwen/minfer/issues/506)), as are
+the three follow-up tickets its audit filed ([#503](https://github.com/yusiwen/minfer/issues/503)–[#505](https://github.com/yusiwen/minfer/issues/505));
+the open one is [#510](https://github.com/yusiwen/minfer/issues/510) (two hand-copied `Backend`
+trait sketches). The docs build was [#63](https://github.com/yusiwen/minfer/issues/63) and is
 **closed**: CI job `check-docs` builds the book with the same toolchain Docs deploys with
 and runs `scripts/check_docs_links.py`, so a renamed file now fails on the PR that renames
 it instead of rotting silently (it found four dead links the day it landed). Test health was [#82](https://github.com/yusiwen/minfer/issues/82) — the three
@@ -9485,15 +9490,23 @@ column matches `supports_op` on all three backends, with A1's matrix green.
 ## 11. Sequencing
 
 ```
-Phase A  ├─ A0 ─ A1 ─┬─ A3 ─ A4 ─ A5 ─ A6 ─ A7 ─ A8 ──────────►  (A8 CUDA half)
-         └─ A2 ──────┘
-Phase B  ├─ B1 ─ B2 ─ B3                          (starts once A0/A1 exist)
-Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C6 ✔ ─ C7 ✔ ─ C7b ✔ ─ C8a ✔ ─ C8b(S1a ✔ S1b ✔ S2 ✔ S3 ✔ S4 ✔ S5 ✔) ─ C4 ✔ (S1, CPU; S2 = #87) ─ C5 ✔   (C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
-Phase D  ├────────── D1 ─ D2 ─ D3 ──────────────►         (D unlocks MoE/MLA)
-Phase E  ├──────────────────── E1 ✔ ─ E2 ✔ ─ E3 ✔ ─ E4 ─ E5        (E1b ✔ device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
-Phase F  └─ F2 F3 F4 F5 F6 F7 (parallel)        F1 = waits for an x86 host
-Phase G  └─────────────────► G1 ─ G2 ─ G3 ─ G5 ─ G4 ─ G6 ─ G7   (after C8; G1–G3 compile-verified in CI; device claims need a Mac)
+Phase A  ├─ A0 ✔ ─ A1 ✔ ─ A2 ✔ ─ A3 ✔ ─ A4 ✔ ─ A5 ✔ ─ A6 ✔ ─ A7 ✔ ─ A8 ✔ ──────────►  (A1 branches to A2 and to A3–A8; A8 is the CUDA half)
+Phase B  ├─ B1 ✔ ─ B2 ✔ ─ B3 ✔                          (starts once A0/A1 exist)
+Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C4 ✔ ─ C5 ✔ ─ C6 ✔ ─ C7 ✔ ─ C8 ✔   (C8 covers C8a/C8b, and C8b's S1a–S5; C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
+Phase D  ├────────── D1 ✔ ─ D2 ✔ ─ D3 ✔ ──────────────►         (D unlocks MoE/MLA)
+Phase E  ├──────────────────── E1 ✔ ─ E1b ✔ ─ E2 ✔ ─ E3 ✔ ─ E4 ✔ ─ E5 ✔ ─ E6 ✔        (E1b device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
+Phase F  └─ F1 ─ F2 ✔ ─ F3 ✔ ─ F4 ✔ ─ F5 ✔ ─ F6 ✔ ─ F7 ✔ ─ F8 ✔        (F1 is the remaining weight-repacking increment and waits for an x86 host; its AVX2/AVX-512 dots landed as #56)
+Phase G  └─────────────────► G1 ✔ ─ G2 ✔ ─ G3 ✔ ─ G5 ✔ ─ G4 ✔ ─ G6 ✔ ─ G7 ✔   (after C8; G1–G3 compile-verified in CI; device claims need a Mac)
 ```
+
+Each phase line draws exactly that phase's `total` tickets, `done` of them carrying a check mark —
+**both numbers are derived from [`scripts/status.toml`](https://github.com/yusiwen/minfer/blob/master/scripts/status.toml)**, and
+`python3 scripts/check_status.py --check` (CI job `check-docs`) fails, naming this file, the line
+and both numbers, when a line draws the wrong number of tickets or marks the wrong number of them.
+The one thing that check cannot decide is *which* ticket an incomplete phase's missing mark
+belongs to — the ledger is phase-level, so while a phase is in progress the `✔` set is the
+author's statement and its **count** is the gate. (That is the check #94 left open and
+[#179](https://github.com/yusiwen/minfer/issues/179) closed.)
 
 **Critical path:** A0 → A1 → C1 → C2 → E1 → E2 → C3 → C6 → C7 → C8 → G5.
 **Deliberate exception to the roadmap's ordering:** A1/A2 run *before* the
