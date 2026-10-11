@@ -3,8 +3,9 @@
 
 `check-docs` builds the site with `scripts/build_book.sh` and then ran
 `scripts/check_docs_links.py`, which resolves a link against **the checkout**. Every
-step of the build was therefore green while the published book carried 300 dead
-links, because mdBook — not the checkout — decides what a link points at:
+step of the build was therefore green while the published book carried 315 dead
+links over 81 distinct targets, because mdBook — not the checkout — decides what a
+link points at:
 
 1. **A chapter named `README.md` is published as `index.html`**, but the `.md`→`.html`
    link rewrite keeps the basename, so every "back to the index" link 404s. Measured
