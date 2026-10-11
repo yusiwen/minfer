@@ -177,7 +177,8 @@ an agent reaches for first.
 rendered book's links, fragments and chapter set — mdBook proves none of them; each ledger sits beside
 its checker), `check_status.py --check` and `check_baselines.py --check` (`scripts/status.toml`,
 `scripts/test-baselines.toml` — edit those, never a counter), `check_doc_line_anchors.py`,
-`check_anchor_drift.py`, `check_f6_fixtures.py` and `check_adr.py` (with `scripts/adr-citations.toml`);
+`check_anchor_drift.py`, `check_f6_fixtures.py`, `check_adr.py` (with `scripts/adr-citations.toml`) and
+`check_support_matrix.py`;
 what each can and cannot prove is in its own `--help` and in
 [`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) ("the doc gates").
 `check_agents_size.py` also caps **this file** — move a block to its topic doc rather than raise the cap.

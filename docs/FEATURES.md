@@ -24,7 +24,7 @@ Loaded directly from GGUF metadata — no external dependency on tiktoken. `toke
 
 ### CPU — AVX2 / NEON+SDOT
 
-All 8 quantized dot products as SIMD kernels (AVX2 on x86, NEON+SDOT via inline asm on Apple Silicon), plus a persistent row-parallel thread pool (`-t/--threads`). Qwen3-4B CPU decode runs ~52–58 tok/s on M4 Pro (vs 1.1 before the pool).
+All 8 quantized dot products as SIMD kernels on NEON+SDOT (inline asm, Apple Silicon); on x86 AVX2 covers **Q4_0, Q8_0 and the three K-quants** — Q4_1, Q5_0 and Q5_1 fall to the scalar reference there. Plus a persistent row-parallel thread pool (`-t/--threads`). Qwen3-4B CPU decode runs ~52–58 tok/s on M4 Pro (vs 1.1 before the pool).
 
 ### GPU — Metal (Apple Silicon)
 
@@ -34,7 +34,7 @@ Flash attention (single fused kernel for decode + prefill), simdgroup GEMM prefi
 
 The performance headline of the project. The int8 tensor-core MMQ path is **default-on** in CUDA builds (opt-out per gate with `"0"`; `MINFER_MMQ=0` restores the legacy f16 path):
 
-- **Default prefill: ~3581 tok/s** (7B q4_K_m @3314-token prompt) = **1.080× llama.cpp** (llama-bench 3323.3 same shape) — from 441 tok/s when the path first landed, an 8.1× campaign documented step-by-step in [CUDA_OPTIMIZATION.md](./CUDA_OPTIMIZATION.md) (75-step history table).
+- **Default prefill: ~3581 tok/s** (7B q4_K_m @3314-token prompt) = **1.080× llama.cpp** (llama-bench 3323.3 same shape) — from 441 tok/s when the path first landed, an 8.1× campaign documented step-by-step in [CUDA_OPTIMIZATION.md](./CUDA_OPTIMIZATION.md) (109 numbered step records, indexed in [`cuda_optimization_steps/index.md`](./cuda_optimization_steps/index.md)).
 - Raw-nibble int8 `mma.m16n8k32` GEMMs for q4_K and q6_K with producer-fused activation quantization (rms-norm/swiglu emit the transposed q8 plane directly, skipping intermediate writes), registration-time weight-expansion planes (W_exp / W_dsc) staged by `cp.async`, and flash attention with register-resident softmax (2.43× kernel).
 - CUDA Graph capture/replay for repeated identical-length prefills; decode uses the MMVQ weight-streaming path.
 - Memory/speed knobs: the weight-expansion planes cost ~3.3 GB device for ~+6% prefill; `MINFER_MMQ_Q6K_EXP=0` / `MINFER_MMQ_Q4K_DSC=0` return the memory.
@@ -107,12 +107,15 @@ language.
 checkpoint with the metadata the strict tokenizer/template loader requires
 (`tokenizer.ggml.model`/`pre`, the 256 byte tokens, merges, special ids and
 `tokenizer.chat_template`); `minfer quantize in.gguf out.gguf --type …`
-re-encodes weights to q4_0/q4_1/q5_0/q5_1/q8_0 (byte-identical to
-`llama-quantize` on the same source) or f16/f32; `minfer split in.gguf dir
+re-encodes weights to q4_0/q4_1/q5_0/q5_1/q8_0, the K-quants q4_K/q5_K/q6_K
+(all byte-identical to `llama-quantize` on the same source) or f16/f32;
+`minfer split in.gguf dir
 --max-size N` writes `split.no`/`split.count` parts the loader merges back into
 one tensor index. Unsupported architectures, tensor names, dtypes and quant
-targets are refused by name. A converted f16 GGUF loads and runs (f16 weights
-are CPU-only). See [`GGUF-TOOLING.md`](./GGUF-TOOLING.md).
+targets are refused by name. A converted f16 GGUF loads and runs, and f16 (and
+bf16) weights run on **CPU, CUDA and Metal** — the per-device detail is
+[`SUPPORT-MATRIX.md`](./SUPPORT-MATRIX.md) ("f16 and bf16 weights"). See
+[`GGUF-TOOLING.md`](./GGUF-TOOLING.md).
 
 ## Philosophy
 

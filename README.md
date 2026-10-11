@@ -27,7 +27,7 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **Interactive graph visualization** — `minfer viz <model>`: live SSE inference, per-node stats/heatmaps in the browser
 - **GGUF v3 loader** — split multi-part, mmap'd weights shared zero-copy with the GPU
 - **Self-contained BPE tokenizer** — from GGUF metadata, no tiktoken; special-token templates match llama.cpp exactly
-- **CPU: AVX2 / NEON+SDOT** — all 8 quant dots SIMD'd + persistent thread pool
+- **CPU: AVX2 / NEON+SDOT** — all 8 quant dots SIMD'd on NEON+SDOT, 5 of 8 on AVX2 (Q4_0, Q8_0, Q4_K/Q5_K/Q6_K) + persistent thread pool
 - **GPU: Metal** — fused flash attention, simdgroup GEMM, precompiled `.metallib`, f16 KV cache
 - **GPU: CUDA** — default-on int8 tensor-core MMQ path: **~3581 tok/s @7B q4_K_m prefill = 1.080× llama.cpp**; CUDA Graph capture, flash attention, memory/speed opt-out gates
 - **Qwen2 / Qwen3** — GQA, SwiGLU, RoPE, RMSNorm; Qwen3 decoupled head dim + per-head Q/K norm
@@ -145,8 +145,8 @@ loader), `kernel.rs`/`quants.rs` (quantized matmul), `src/metal/`+`src/metal/ker
 per-device dispatch tiers), `sampler.rs`/`tokenizer.rs`/
 `template.rs` (sampling + tokenization + chat templates), `conversation.rs`
 (multi-turn sessions), `server/` (HTTP). Supported quants:
-Q4_0, Q4_1, Q8_0, Q4_K, Q6_K, Q5_0, Q5_1, Q5_K (CPU + Metal), F32/F16 norms &
-biases.
+Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K (CPU, CUDA and Metal), 2-D
+f16/bf16 weights, and F32/F16 norms & biases.
 
 ## Performance
 
@@ -250,7 +250,8 @@ Examples use the built binary (`cargo build --release` first — see
 ```
 
 The full CLI reference — model formats (local / `hf:` / `ollama:` / cached
-names), all subcommands (`info`, `download`, `list`, `viz`, `bench`), every
+names), all ten subcommands (`info`, `list`, `download`, `viz`, `serve`, `bench`,
+`specverify`, `convert`, `quantize`, `split`), every
 sampling and conversation option — lives in
 **[`docs/USAGE.md`](docs/USAGE.md)**.
 

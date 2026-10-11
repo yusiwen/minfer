@@ -380,6 +380,14 @@ jobs:
         run: python3 scripts/check_adr.py
       - name: The ADR checker's own pass/fail cases
         run: python3 scripts/check_adr.py --selftest
+      # #519: the capability matrix is prose about code, so its AVX2 column rotted
+      # silently — it marked Q5_0 as SIMD while `src/quants/` had no kernel for it.
+      # This derives the AVX2 quant dots from the source and compares the column in
+      # both directions. Pure and offline; its row-address note is in the script.
+      - name: The support matrix's AVX2 column must match the kernels
+        run: python3 scripts/check_support_matrix.py
+      - name: The support-matrix checker's own pass/fail cases
+        run: python3 scripts/check_support_matrix.py --selftest
       # #254 Layer 1: the shape of every `allow(dead_code)` — a bare annotation
       # is rejected (the 11 sites that predate the ratchet are grandfathered in
       # the script), a `cfg_attr` must name a cfg, and each annotation carries a

@@ -13,7 +13,7 @@ minfer supports GGUF v3 files with the following quantized weight types. The CPU
 | **Q4_0** | 4 | 18 B / 32 val | ✅ | ✅ | ✅ | ✅ |
 | **Q4_1** | 4 | 20 B / 32 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q4_K** | 4 | 144 B / 256 val | ✅ | ✅⁹ | ✅ | ✅¹ |
-| **Q5_0** | 5 | 22 B / 32 val | ✅ | ✅ | ✅ | ✅¹ |
+| **Q5_0** | 5 | 22 B / 32 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q5_1** | 5 | 24 B / 32 val | ✅ | ❌ | ✅ | ✅¹ |
 | **Q5_K** | 5 | 176 B / 256 val | ✅ | ✅⁹ | ✅ | ✅¹ |
 | **Q6_K** | 6 | 210 B / 256 val | ✅ | ✅⁹ | ✅ | ✅¹ |
