@@ -51,10 +51,12 @@ fn serve_on(
     text
 }
 /// C8a gate: a prompt served from *another* slot's rows must answer exactly as the
-/// same prompt served on a private run, and the rows must actually be copied rather
-/// than prefilled. The copy is what the counter proves; the equality is the whole
-/// point — C6 makes the donor's different run start arithmetic-free, so a copied
-/// prefix cannot change this slot's answer.
+/// same prompt served on a private run, and the rows must actually be **copied**
+/// rather than prefilled. The copy is requested explicitly (`MINFER_NO_KV_SHARE=1`)
+/// because every backend can read the donor's rows in place since #362 — the share
+/// arm is this file's `a_store_inside_a_shared_prefix_takes_a_private_row`. The
+/// equality is the whole point — C6 makes the donor's different run start
+/// arithmetic-free, so a reused prefix cannot change this slot's answer.
 #[test]
 #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
 fn a_prefix_copied_from_another_slot_answers_identically() {
@@ -68,6 +70,11 @@ fn a_prefix_copied_from_another_slot_answers_identically() {
     let prompt = tok.encode("The capital of France is");
     let n_ctx = prompt.len() + 64;
 
+    // Ask for the C8a copy: with the share available the admission would read the
+    // donor's rows in place, which is a different branch than this gate is named for.
+    let prev_share = std::env::var("MINFER_NO_KV_SHARE").ok();
+    std::env::set_var("MINFER_NO_KV_SHARE", "1");
+
     // Slot 0 computes the prompt; slot 1 must *copy* those rows.
     let mut engine = BatchEngine::new(&*model, 2, n_ctx).expect("engine");
     let first = serve_on(&mut engine, &*model, &tok, 0, prompt.clone(), 8);
@@ -78,6 +85,14 @@ fn a_prefix_copied_from_another_slot_answers_identically() {
         "slot 1 prefilled the prompt instead of copying slot 0's {} rows",
         prompt.len()
     );
+    // `prefix_rows_copied` counts the share arm too, so the counter alone cannot
+    // tell a copy from a share — the arena can, and this is the assertion that makes
+    // the gate's name true rather than merely appropriate.
+    assert_eq!(
+        engine.cache.alloc().kv_arena_stats().shared_cells,
+        0,
+        "the C8a gate must copy the prefix, not share it"
+    );
     assert_eq!(first, second, "a copied prefix must not change the answer");
 
     // And the same prompt on a single-slot engine, which has nothing to copy.
@@ -87,6 +102,11 @@ fn a_prefix_copied_from_another_slot_answers_identically() {
         second, solo,
         "the copied run must answer like a private one"
     );
+
+    match prev_share {
+        Some(v) => std::env::set_var("MINFER_NO_KV_SHARE", v),
+        None => std::env::remove_var("MINFER_NO_KV_SHARE"),
+    }
 }
 /// C8b S3 gate: a request that diverges **inside** a prefix another slot
 /// computed must take private rows there (copy-on-write) instead of storing

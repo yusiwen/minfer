@@ -887,9 +887,9 @@ fn support_table_matches_support_matrix_doc() {
         ),
         // E1's explicit-span row: CPU, Metal and CUDA all read a one-range
         // `attn_span` window now (Metal's windowed kernel landed in #44 part (a),
-        // G5a). Metal still refuses the other explicit layout — the `kv_map`
-        // `(cell, len)` runs — because `Device::gathers_attn_map` stays false
-        // there; that is a separate capability (C8b S4), not this op's.
+        // G5a). The other explicit layout, the `kv_map` `(cell, len)` runs, is a
+        // separate capability (C8b S4): `Device::gathers_attn_map` is true on all
+        // three since #362, and the window input's size selects the layout.
         (
             "Attn explicit-span",
             Op::Attn {
