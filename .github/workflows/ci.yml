@@ -452,6 +452,14 @@ jobs:
         run: python3 scripts/check_book_links.py
       - name: The book-link checker's own pass/fail cases
         run: python3 scripts/check_book_links.py --selftest
+      # #515, the other half: `SUMMARY.md` is mdBook's only list of chapters, so a
+      # `docs/**.md` it omits is never published (silently — exit 0), and a SUMMARY
+      # entry whose file is gone is silently rendered as an empty draft page. The
+      # documents that are deliberately not chapters are in a reasoned ledger.
+      - name: Every document must be a chapter or a reasoned exclusion
+        run: python3 scripts/check_book_coverage.py
+      - name: The book-coverage checker's own pass/fail cases
+        run: python3 scripts/check_book_coverage.py --selftest
       - name: The link checker's own pass/fail cases
         run: python3 scripts/check_docs_links.py --selftest
       - name: The staged Mermaid assets must not survive the build
