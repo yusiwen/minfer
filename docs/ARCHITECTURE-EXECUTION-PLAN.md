@@ -8,7 +8,8 @@ CPU)**, **C5 (session save/restore)**, **C6 (logical positions)**, **C7 (+C7b)**
 directions, so a busy neighbour above the slot no longer blocks it); **C8** split into
 **C8a** (shared prefill, duplicated rows: no IR change) and **C8b** (paged sharing: a
 block map and a gather in every attention kernel — S1a/S1b/S2/S3/S4/S5 landed, closed on
-CPU and CUDA, Metal's share path at G5); **C4** and **C5** landed 2026-09-22 (C4's fused
+all three backends: Metal's share path landed after the G5 port, in
+[#362](https://github.com/yusiwen/minfer/issues/362)); **C4** and **C5** landed 2026-09-22 (C4's fused
 dots and the CUDA kernels are [#87](https://github.com/yusiwen/minfer/issues/87), Metal's packed read [#310](https://github.com/yusiwen/minfer/issues/310);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **complete** (3/3) (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
@@ -2344,8 +2345,8 @@ this ticket, and it is why it was estimated L rather than M.
 
 | Step | Content | Benefit | Cost |
 |---|---|---|---|
-| **C8a** | *Shared prefill, duplicated rows*: a slot that matches another slot's prefix copies its K/V rows with `copy_cells` instead of re-running the forward, then diverges privately. | Removes the N× **prefill** for a shared system prompt — the latency that is actually paid on the first turn. No IR change, no read-path work, works on every backend that already copies cells (CPU, CUDA; Metal behind G5). | Memory stays N×: each slot holds its own copy. |
-| **C8b** | *True sharing*: `owner[cell]` becomes a refcount; the allocator resolves a per-sequence **block map** (64-cell blocks) into the per-token `cells` vector the write path already accepts; attention gains a block gather (`supports_attn_span()` is replaced by a block-map capability), CPU first, then CUDA; Metal stays behind its gate (G5). | The blocks are stored once, so memory follows the sharing, on top of C8a's prefill win. | Every kernel that reads a window needs the gather; `attn_span` is replaced (or supplemented) by the map; compaction and the arena counters must understand refcounts. |
+| **C8a** | *Shared prefill, duplicated rows*: a slot that matches another slot's prefix copies its K/V rows with `copy_cells` instead of re-running the forward, then diverges privately. | Removes the N× **prefill** for a shared system prompt — the latency that is actually paid on the first turn. No IR change, no read-path work, works on every backend that already copies cells (CPU, CUDA; Metal behind G5 — **all three since [#362](https://github.com/yusiwen/minfer/issues/362)**, see the S5 record's 2026-10-11 note). | Memory stays N×: each slot holds its own copy. |
+| **C8b** | *True sharing*: `owner[cell]` becomes a refcount; the allocator resolves a per-sequence **block map** (64-cell blocks) into the per-token `cells` vector the write path already accepts; attention gains a block gather (`supports_attn_span()` is replaced by a block-map capability), CPU first, then CUDA; Metal stays behind its gate (G5) — **landed on all three in [#362](https://github.com/yusiwen/minfer/issues/362)**. | The blocks are stored once, so memory follows the sharing, on top of C8a's prefill win. | Every kernel that reads a window needs the gather; `attn_span` is replaced (or supplemented) by the map; compaction and the arena counters must understand refcounts. |
 
 **Invariants / gates.**
 1. C8a: a prefix copied from another slot produces continuations **byte-identical** to the
@@ -2518,7 +2519,9 @@ across three backends, the models and the tests for no behavioural gain; the siz
 here, and every backend that cannot gather refuses loudly instead of misreading pairs.
 
 S3 then adds copy-on-write (`kv_private_row_for`) for a store that would land in a shared block; S4
-ports the gather to CUDA's `gqa_attn_*` loop; S5 is Metal behind G5.
+ports the gather to CUDA's `gqa_attn_*` loop; S5 is Metal behind G5 — **lifted later** by the G5
+port and Metal's `kv_map` kernel ([#362](https://github.com/yusiwen/minfer/issues/362)); see the S5
+record's 2026-10-11 note.
 
 **C8b S3 landed (2026-09-22) — a store inside a shared prefix copies the row first.**
 `KvCache::private_row_for(seq, t)` plans a **copy-on-write** and `apply_private_row` books it, with
@@ -2598,8 +2601,9 @@ keeps such a node off the backend at assignment time, and the `Op::Attn` arm of
 `execute_node` returns a loud `Err` if one ever arrives — the alternative would be
 computing a *causal* window from `positions` and attending to the wrong rows, which is
 the silent-wrong this project refuses. Nothing else changes for Metal: the models ask
-for a map only where `Device::gathers_attn_map()` says a kernel reads one (CPU, CUDA),
-so on a Mac the server keeps C8a's copy path — and since Metal's `copy_cells` is also
+for a map only where `Device::gathers_attn_map()` says a kernel reads one (CPU and CUDA
+then — Metal's share path landed later, see the 2026-10-11 note below), so on a Mac the
+server keeps C8a's copy path — and since Metal's `copy_cells` is also
 refused until G5, admission logs the failed copy and prefills, which is the same loud
 fallback it has always taken. S5's gate is the **compile check** (Metal is
 `cfg(target_os = "macos")`, so CI's `build-macos` is the only compile dgxspark cannot
@@ -2610,6 +2614,18 @@ the CPU gather), S3 (copy-on-write), S4 (the CUDA gather in every kernel) and S5
 (Metal's refusal). The ticket C8 itself is **closed on CPU and CUDA** — a prefix is
 stored once and shared, and a store into it never writes through — with Metal's share
 path moving to **G5**, where the cell store is ported.
+
+**Updated 2026-10-11 — Metal's share path landed, and C8 is closed on all three.** The
+paragraphs above are the 2026-09-22 state. Two later rounds removed S5's premise: G5
+ported the Metal cell store, the write/move side and the one-range `attn_span` read
+(2026-10-06, [#44](https://github.com/yusiwen/minfer/issues/44) parts (a)/(b)), and
+[#362](https://github.com/yusiwen/minfer/issues/362) added the set-valued `kv_map` read
+(`kernel_gqa_attn_map_f32/_f16/_q8_0` in `src/metal/kernels/attn_window.metal`).
+`Device::gathers_attn_map()` therefore answers **true for Metal**, admission shares a
+prefix in place there instead of copying, and the "CPU, CUDA" sets above and the "stays
+behind its gate (G5)" line in the C8 design table are history, not the current contract.
+`docs/SUPPORT-MATRIX.md`'s op row and `docs/METAL-BACKEND-DESIGN.md` §4.4 carry the
+current state.
 
 **C8b S4 landed (2026-09-22) — every CUDA attention path gathers the map.**
 `attn_span`'s single range became three *window modes* selected by the **size** of
@@ -2641,7 +2657,8 @@ skipped for a map, which the A/B priced at **170x** (301 ms of legacy per-token
 attention) — that number is why the FA port is part of this ticket rather than a
 follow-up.
 
-**Admission switches on one authority.** `Device::gathers_attn_map()` (CPU, CUDA) is
+**Admission switches on one authority.** `Device::gathers_attn_map()` (CPU, CUDA, Metal
+since [#362](https://github.com/yusiwen/minfer/issues/362)) is
 read by both the models' graph builders (which ask for the `kv_map` input) and the
 server's admission (which shares a prefix in place instead of copying it), so the
 share and the window layout cannot disagree; `MINFER_NO_KV_SHARE=1` forces the copy
@@ -2675,7 +2692,9 @@ server, and every CUDA gate ran on an f32-KV model.
 
 Suites: CPU 233 / CUDA 284, 0 failed, 9 ignored.
 
-S5 is Metal behind G5.
+S5 is Metal behind G5 — **lifted later** by the G5 port and Metal's `kv_map` kernel
+([#362](https://github.com/yusiwen/minfer/issues/362)); see the 2026-10-11 note at the end of
+this record.
 
 **Risks.** (1) The attention inner loop changes on every backend — correctness *and* timing, so each
 backend gets its own A/B. (2) The map must stay additive, or the `CAUSAL` path and Metal regress.
@@ -2688,7 +2707,7 @@ the stats gate watches exactly that.
 | S2 | Block-granular **refcounts** + `kv_seq_cp` (share a prefix) + the CPU attention gather | gate 2 on CPU |
 | S3 | Copy-on-write: `kv_private_row_for` at store resolution — **landed 2026-09-22**: the share shrinks to the first position this forward writes and the run's own rows shift up inside it (two spans, no arena space needed), the store resolver refuses a shared position, and a run without room is a loud `Err` | gate 3 on CPU + the real-model donor-byte check |
 | S4 | CUDA attention gather + device A/B — **landed 2026-09-22**: three window modes (causal / span / map) selected by the window input's size, the `MAP` flag threaded through every attention kernel including FA prefill, and the batch-level row resolution that makes the gather free | gate 2 on GB10 (bitwise, f32 *and* f16 KV) + the decode/prefill A/B |
-| S5 | Metal behind G5 — **landed 2026-09-22**: both explicit window layouts refused (`supports_attn_span` keeps them off the backend; the `Op::Attn` arm backstops with a loud `Err`), admission keeps C8a's copy, docs closed | compile check (CI `build-macos`) + G5 record |
+| S5 | Metal behind G5 — **landed 2026-09-22**: both explicit window layouts refused (`supports_attn_span` keeps them off the backend; the `Op::Attn` arm backstops with a loud `Err`), admission keeps C8a's copy, docs closed. **Superseded 2026-09-22 → 2026-10-06/[#362](https://github.com/yusiwen/minfer/issues/362)**: the G5 port and the Metal `kv_map` kernel lifted it — `gathers_attn_map` is true for Metal and admission shares in place (see the record's 2026-10-11 note) | compile check (CI `build-macos`) + G5 record |
 
 
 ## 6. Phase D — IR expressiveness (item 7)
@@ -5737,7 +5756,8 @@ which introduced the forwarder **and** that doc), `c9bbcbd` (C8b S3 3/4, the tes
 **The consumer class the doc named is served two other ways — neither needs position→cell.**
 (1) Reading a sharing sequence's rows **for attention** goes through *windows*:
 `GraphAllocator::fill_seq_ids` → `KvCache::attn_map` (`kvcache.rs:803`) → the `kv_map` input, which
-the CPU and CUDA attention kernels gather (C8b S2/S4). It returns **runs**, not per-position cells.
+all three backends' attention kernels gather (C8b S2/S4; Metal's since #362). It returns **runs**,
+not per-position cells.
 (2) Whole-run snapshots go through the C5 container: `BatchEngine::save_slots` (`server/batch.rs:442`)
 calls `kv_save_with_host` (`alloc.rs:2172`), which stores the **whole arena** with the slot table as
 its host section — no position→cell mapping anywhere. C8b is closed (S1a–S5 landed 2026-09-21/22),

@@ -1849,8 +1849,8 @@ impl GraphAllocator {
     ///
     /// **Test-only.** There is no production caller: production reads a sharing
     /// sequence's rows as **windows**, not per position — `KvCache::attn_map` →
-    /// the `kv_map` input, gathered by the CPU and CUDA attention kernels (C8b
-    /// S2/S4) — and a whole-run snapshot goes through the C5 container
+    /// the `kv_map` input, gathered by the attention kernel of every backend (C8b
+    /// S2/S4; Metal's since #362) — and a whole-run snapshot goes through the C5 container
     /// (`kv_save`/`kv_save_with_host`), which stores the **whole arena** and needs no
     /// position→cell mapping. The consumer is `kv_rows_of` in `server::batch::tests`,
     /// the observation instrument of

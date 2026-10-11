@@ -820,11 +820,11 @@ impl BatchEngine {
         }
     }
 
-    /// C8b S2/S4: whether this device's kernel gathers a `kv_map` — the CPU and CUDA
-    /// ones do (since S4), so a prefix another slot already computed is read in place
-    /// instead of copied. Metal keeps C8a's copy until G5. The answer comes from
-    /// `Device::gathers_attn_map`, the same authority the model's graph builder reads,
-    /// so the share and the window layout cannot disagree.
+    /// C8b S2/S4: whether this device's kernel gathers a `kv_map` — all three do now
+    /// (CPU and CUDA since S4, Metal's `kernel_gqa_attn_map_f32/_f16` since #362), so
+    /// a prefix another slot already computed is read in place instead of copied.
+    /// The answer comes from `Device::gathers_attn_map`, the same authority the
+    /// model's graph builder reads, so the share and the window layout cannot disagree.
     ///
     /// `MINFER_NO_KV_SHARE=1` (presence-checked) forces C8a's copy where the device
     /// could read in place: the A/B gate for the share itself, and the shape-matched
