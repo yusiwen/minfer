@@ -564,8 +564,15 @@ reported for a human instead of guessed, and the same `FROZEN` set exempts the s
 cross-checks every `~/.cache/minfer/f6-src/…` fixture the source tree names against it (and every `.gguf` path a
 recorded producer command names), pins each command's shape and classifies it with `--regenerate --dry-run`
 (#345 re-runs one and re-records what it produced), and whose `--selftest` proves a tampered copy is refused by
-name and digest; the byte half runs where the cache exists, in the F6 gates themselves. **Open doc debt:** [#62](https://github.com/yusiwen/minfer/issues/62)
-(`docs/USAGE.md` after the elastic partition). Test health was [#82](https://github.com/yusiwen/minfer/issues/82),
+name and digest; the byte half runs where the cache exists, in the F6 gates themselves. **Open doc
+debt** is the [open `documentation`
+issues](https://github.com/yusiwen/minfer/issues?q=is%3Aopen+label%3Adocumentation) — the label is the
+list, so a closed ticket cannot linger here. [#62](https://github.com/yusiwen/minfer/issues/62)
+(`docs/USAGE.md` after the elastic partition) is **closed** ([#506](https://github.com/yusiwen/minfer/issues/506)),
+and so are its three follow-ups ([#503](https://github.com/yusiwen/minfer/issues/503)–[#505](https://github.com/yusiwen/minfer/issues/505))
+and [#510](https://github.com/yusiwen/minfer/issues/510) (two hand-copied `Backend` trait sketches,
+closed by [#514](https://github.com/yusiwen/minfer/pull/514)); a number written here is a claim nothing
+re-checks, which is how all four outlived their tickets. Test health was [#82](https://github.com/yusiwen/minfer/issues/82),
 **closed**. A finding from a gate run belongs in the records too — a red baseline makes every later
 gate run ambiguous.
 
