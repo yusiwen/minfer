@@ -10,7 +10,7 @@
 //!
 //! **Contiguity.** A sequence's tokens must be contiguous in the batch. The CPU
 //! attention path could tolerate interleaving (E1's span is per token), but CUDA
-//! stages a query *tile* against one KV window (`fa_prefill_f16kv`, E1b), so an
+//! stages a query *tile* against one KV window (`fa_prefill_kv`, E1b), so an
 //! interleaved batch would be wrong there and right on CPU — the kind of silent
 //! divergence this project refuses. `Batch::check` therefore rejects it, and
 //! E2's composition (one decode token per sequence, in slot order) satisfies it

@@ -512,21 +512,12 @@ otherwise read garbage. The point for this doc: **registration is where
 per-backend representation is decided** — bytes for CPU, (buffer, offset)
 for Metal, device allocation (+optional repack) for CUDA.
 
-Excerpt 6 — two load-time side decisions: the KV element type, and the true
-KV width. (`src/models/qwen2/loader.rs:310-317` and `:495-498`; Qwen3's
-guarded version at `src/models/qwen3/loader.rs:311-331`)
+Excerpt 6 — two load-time side decisions: the true KV width, and the KV element
+type. (`src/models/qwen2/loader.rs:608-611`; Qwen3's guarded version at
+`src/models/qwen3/loader.rs:418-424`; the element type is resolved one level up,
+after the loader returns — `src/models/mod.rs:407-424`)
 
 ```rust
-    // KV cache element type (GPU path): auto-select f16 for the 7B class (KV
-    // bandwidth-bound decode) unless MINFER_CACHE_TYPE overrides. Must run
-    // before the first forward (kv_cache_is_f16 reads the OnceLock).
-    #[cfg(target_os = "macos")]
-    crate::metal::set_kv_cache_type(hparams.n_layer as usize, hparams.n_kv_embd as usize);
-    // 8b: CUDA side shares the same policy and MINFER_CACHE_TYPE override.
-    #[cfg(feature = "cuda")]
-    crate::cuda::set_kv_cache_type(hparams.n_layer as usize, hparams.n_kv_embd as usize);
-    ... // (later, after the per-layer weights are loaded:)
-
     // Override n_kv_embd from layer 0 K weight's actual output dimension
     if let Some((_, ti)) = tensor_map.get(&tn::attn_k(0)) {
         hparams.n_kv_embd = ti.ne[1];
@@ -534,7 +525,18 @@ guarded version at `src/models/qwen3/loader.rs:311-331`)
 ```
 
 ```rust
-    // qwen3/loader.rs — same override, resolved BEFORE the KV type pick, plus
+    // models/mod.rs — once the arch loader has returned, so `device()` is the
+    // same all-or-nothing answer every forward will use. One resolution, stored
+    // on the engine; there is no process-wide KV type to race with (#153).
+    let (n_layers, n_kv_embd) = (loaded.n_layer(), loaded.n_kv_embd());
+    match crate::graph::kvformat::resolve(loaded.device(), cache_type, n_layers, n_kv_embd) {
+        Ok(format) => loaded.set_kv_format(format),
+        Err(e) => { eprintln!("minfer: {e}"); ... } // a typo, or a layout this device cannot read
+    }
+```
+
+```rust
+    // qwen3/loader.rs — same override, resolved BEFORE the KV format is picked, plus
     // an assert that is only sound for Qwen3 (Qwen2's `n_kv_embd` may
     // legitimately differ from `n_head_kv × n_embd_head`, so it cannot assert):
     if let Some((_, ti)) = tensor_map.get(&tn::attn_k(0)) {
@@ -549,17 +551,19 @@ guarded version at `src/models/qwen3/loader.rs:311-331`)
 Annotations: the K projection is a real matrix sitting in the file — on the
 0.5B it is `[896 → 128]` — so its output width *is* the KV width, whatever
 the head-count metadata might imply; the loader trusts it over any derived
-value. The Qwen3 loader reads it *before* the KV type pick (its comment says
-why: the f16 auto-select multiplies `n_layers × n_kv_embd`), and its assert
+value. The Qwen3 loader reads it *before* the format is resolved (its comment
+says why: the f16 auto-select multiplies `n_layers × n_kv_embd`), and its assert
 turns a wrong `key_length` fallback into a load-time crash instead of
-silently corrupting attention. The policy `set_kv_cache_type` implements
-(`src/metal/policy.rs`): if `MINFER_CACHE_TYPE` says `f16`/`f32`, obey (since C4 the
-value is parsed strictly on every device — an unknown spelling, or `q8_0` on a
-backend whose attention kernel has no packed read, fails the load instead of quietly running f32);
-otherwise auto-select — f16 (half precision: 2 bytes per value instead of 4)
-when `n_layers × n_kv_embd ≥ 8192`, i.e. models big enough that decode is
-KV-bandwidth-bound (measured −1 ms/token on the 7B at 2K context), f32 for
-small models where f16 measured ~3% *slower*.
+silently corrupting attention. The policy `graph::kvformat::resolve` implements
+(`src/graph/kvformat.rs:196`) is pure, so CI covers the whole matrix: if
+`MINFER_CACHE_TYPE` says `f32`/`f16`/`q8_0`, obey (since C4 the value is parsed
+strictly on every device — an unknown spelling fails the load instead of quietly
+running f32, as does a packed format the device's attention kernel cannot read);
+`f16` on the CPU is mapped back to f32 (no CPU f16 KV kernel); otherwise
+auto-select — f16 (half precision: 2 bytes per value instead of 4) when the
+device is not the CPU and `n_layers × n_kv_embd ≥ 8192`, i.e. models big enough
+that decode is KV-bandwidth-bound (measured −1 ms/token on the 7B at 2K
+context), f32 for small models where f16 measured ~3% *slower*.
 
 Excerpt 7 — the merged tensor index and name lookup.
 (`src/models/qwen2/loader.rs:329-343`)
@@ -880,10 +884,12 @@ deletion, so keeping the parameter bought nothing.
   for the legacy path but have no graph kernel; the gate's type check is
   what keeps those on CPU. The embedding's Q4_1 exclusion is the standing
   example (`qwen2/graph.rs:685-693`).
-- **The KV element-type decision is write-once.** `set_kv_cache_type`
-  initializes a `OnceLock`; it must run before the first forward, which is
-  why the loaders do it mid-load — and why the Qwen3 loader resolves
-  `n_kv_embd` *before* calling it.
+- **The KV element-type decision is made once, per engine.** `kvformat::resolve`
+  runs after the loader returns and its answer is stored on the engine
+  (`set_kv_format`) — there is deliberately no process-wide tag (ADR-0006), so
+  two engines with different dims can hold different layouts in one process.
+  The Qwen3 loader still resolves `n_kv_embd` first, because the auto policy
+  multiplies it.
 - **`positions[i] < n_ctx` is a caller obligation.** The KV regions are
   sized `n_kv_embd × n_ctx` once; `forward_cached` asserts it loudly
   (`qwen2/graph.rs:421-426`) rather than corrupting a region.

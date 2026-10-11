@@ -98,7 +98,7 @@ Some terms we will use constantly:
 
 ### 2.2 The three data structures
 
-The whole IR lives in `src/graph/mod.rs` (273 lines including tests). You
+The whole IR lives in `src/graph/mod.rs` (289 lines including tests). You
 have met the `CNode` fields in §2.1; what `ComputeGraph` itself adds is the
 node list plus two id sets — `inputs` (the leaves filled with external data
 each step) and `outputs` (the logits) — and a `uid`, a monotonic id assigned
@@ -129,7 +129,7 @@ set — see the census in §2.5.
 
 ### 2.4 The builder: an append-only factory
 
-`GraphBuilder` (496 lines) is the only way to construct a graph. Its methods
+`GraphBuilder` (`src/graph/builder.rs`, 720 lines) is the only way to construct a graph. Its methods
 come in two kinds:
 
 - `input(name, shape, dtype)` — declare a leaf node whose data arrives from
@@ -214,11 +214,14 @@ unmistakable:
   replacing it; the add nodes are the only places the hidden state is
   rewritten.
 
-Nodes 4–21 are layer 0 (0–2 are the input leaves, 3 the embedding); layers 1
-through 22 repeat the same 18-node pattern (layer 23, with the two extra
-`get_rows` of §2.8, spans nodes 418–437); node 438 is the final norm and 439
-the lm_head. The full prefill graph is **440 nodes** (measured: `--dump-graph`
-on 0.5B, 30-token prompt, n_out = 1). The complete census:
+Nodes 0–2 are the input leaves, 3 the embedding, and 4–24 layer 0 — the only
+block that declares `cells`, `attn_span` and `seq_ids`, because they are per
+sequence and every later layer's store/load/attn node reuses them. Layers 1–23
+repeat the 18-node pattern, layer 23 carrying the two extra `get_rows` of §2.8 at
+431 and 432; 441 is the final norm and 442 the lm_head. The full prefill graph is
+**443 nodes**, and the count does not depend on the prompt length (positions are
+data, not structure — ADR-0002): `--dump-graph-json` on the 0.5B prints 443 for a
+1-token and a 29-token prompt alike. The complete census:
 
 | Op kind | Count | Where |
 |---|---|---|
@@ -231,7 +234,7 @@ on 0.5B, 30-token prompt, n_out = 1). The complete census:
 | `KvcacheStore` / `KvcacheLoad` | 24 / 24 | 1 each per layer |
 | `Attn` | 24 | 1 per layer |
 | `GetRows` | 3 | embed + 2 tail-row selects |
-| `Input` | 3 | token_ids, positions, tail_ids |
+| `Input` | 6 | token_ids, positions, tail_ids, cells, attn_span, seq_ids |
 
 A note on **GQA** — grouped-query attention, the Qwen2 trick visible in the
 shapes above. Full multi-head attention stores a key and a value per query
@@ -353,8 +356,8 @@ execution, not readability.
 
 **Out**:
 
-- A `ComputeGraph`: 440 nodes (0.5B prefill with n_out = 1), `inputs = [0, 1,
-  2]`, `outputs = [439]` (the lm_head matmul). No buffers, no backends, no
+- A `ComputeGraph`: 443 nodes (0.5B prefill with n_out = 1), `inputs = [0, 1, 2,
+  10, 13, 14]`, `outputs = [442]` (the lm_head matmul). No buffers, no backends, no
   numbers — nothing computed.
 
 Two layout conventions the shapes encode (from `docs/ARCHITECTURE.md` §4.5):
@@ -735,9 +738,9 @@ that, and it worked. Four things it could not do well:
    because the forward pass *is* data (dot.rs:13-55). The old loop had to be
    reverse-engineered from breakpoints.
 
-The cost is real but bounded: 273 + 322 + 496 lines of IR/builder, and every
-model expresses its forward as builder calls (Qwen2's build function is ~240
-of its 2244 lines). In exchange, the old `forward.rs` was deleted outright
+The cost is real but bounded: 289 + 369 + 720 lines of IR (`mod.rs` + `ops.rs` +
+`builder.rs`), against the models that use it — Qwen2's graph module alone is
+6078 lines (`graph.rs` 1031 plus its `graph/` submodules). In exchange, the old `forward.rs` was deleted outright
 once the graph path matched it bit-for-bit (Phase 6, plan §17: "after
 deletion full suite 78 pass; CLI default-path output consistent with the old
 implementation"). Nothing regression-tested was lost.

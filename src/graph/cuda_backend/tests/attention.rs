@@ -225,7 +225,7 @@ fn cuda_fa_prefill_attention_parity() {
         maxe = maxe.max((a - r).abs());
     }
     println!("fa prefill attention: max err {maxe:.6}");
-    assert_close("fa_prefill_f16kv", &agot, &aref, 5e-3);
+    assert_close("fa_prefill_kv", &agot, &aref, 5e-3);
 }
 /// #144 item 3: FA prefill over a **packed** cache. Same shape and reference as
 /// [`Self::cuda_fa_prefill_attention_parity`] — `nt = 100 > 16` and `hd = 128`,

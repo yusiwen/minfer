@@ -271,7 +271,7 @@ same accumulation order, only the memory map changed.
 
 ### 6.3 Attention kernels
 
-- **`fa_prefill_f16kv`** — the 8n **FlashAttention-style tiled prefill
+- **`fa_prefill_kv`** — the 8n **FlashAttention-style tiled prefill
   attention**: online softmax (rescaling the running max/sum instead of
   materializing the score matrix), the O accumulator held in registers, 256 B
   P-stride to avoid a score-clobber race. 20× over the naive path.

@@ -111,7 +111,7 @@ Neighboring chapters + linked reference docs, one line each.
 - Decode path: GEMV-style matvec + fused QKV/attention kernel + **CUDA Graph
   replay** (`MINFER_NO_CUDA_GRAPH=1` reverts to per-kernel launches).
 - Prefill path: **int8 MMQ GEMM** (weights stay quantized, activations
-  quantized on the fly) + `fa_prefill_f16kv` flash-attention-style kernel.
+  quantized on the fly) + `fa_prefill_kv` flash-attention-style kernel.
 - GPU activations are f32 (prefill MMQ internally int8); quantized weights are
   **dequantized to f16 on device** at load (`dequant_*_f16` kernels); KV is f16.
 - Supported quants: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K (no
@@ -122,7 +122,7 @@ Neighboring chapters + linked reference docs, one line each.
 - Verified kernel inventory includes (name → purpose):
   `add_f32`/`add_bias_f32` (elementwise), `dequant_q*_f16` (weight load),
   `embed_rows_q*` (embedding gather), `f32_f32_matmul_scalar`/`f32_f32_matmul_vec`
-  (decode matvec), `gemm_f16_nt_kernel_t` (prefill GEMM), `fa_prefill_f16kv`
+  (decode matvec), `gemm_f16_nt_kernel_t` (prefill GEMM), `fa_prefill_kv`
   (prefill attention), `attn_bias_rope_store_f32` (fused decode attention tail),
   `convert_f32_f16_kernel`, `f32_bits_to_i32`, `gather_rows_f32` — re-enumerate
   with grep before citing; more exist (rope/rmsnorm/silu/MMQ families).

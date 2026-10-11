@@ -271,7 +271,7 @@ SM's matrix-multiply hardware) provide. minfer's prefill path is an int8
 **MMQ** GEMM — matrix-matrix quantized: weights stay quantized, activations
 are quantized on the fly to 8-bit so the integer multiply hardware multiplies
 the throughput (walkthrough doc 09 for the pipeline, TECH-PRIMER §6.2 for the
-kernel families) — plus `fa_prefill_f16kv`, a FlashAttention-style tiled
+kernel families) — plus `fa_prefill_kv`, a FlashAttention-style tiled
 attention kernel. The record's headline of what "the GPU is good at this"
 means: swapping the transfer-dominated prefill for weight-resident tensor-core
 GEMMs took 7B prefill from 30.7 to 1204 tok/s (39×, TECH-PRIMER §6.2).

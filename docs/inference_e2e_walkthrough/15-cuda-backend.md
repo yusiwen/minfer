@@ -1,7 +1,7 @@
 # 15 · The CUDA backend
 
 > **Stage**: the Metal contrast (doc 14) → **this stage: the same compute graph on NVIDIA GPUs** → end of the series ([Index](./index.md)).
-> **Code**: `src/graph/cuda_backend.rs` (`CudaBackend`, `execute_node_inner`, `graph_replay_step`), `src/cuda.rs` (`CudaState` singleton, `register_weight`, `matmul_f32_ptr_layout`, `prefill_mmq`, `gqa_attn_split`), `src/cuda/kernels/*.cu` (the CUDA C++ kernels — `common.cuh` + 17 translation units, 9,996 lines, since [#263](https://github.com/yusiwen/minfer/issues/263)), `build.rs` (the nvcc build chain).
+> **Code**: `src/graph/cuda_backend.rs` (`CudaBackend`, `execute_node_inner`, `graph_replay_step`), `src/cuda.rs` (`CudaState` singleton, `register_weight`, `matmul_f32_ptr_layout`, `prefill_mmq`, `gqa_attn_split`), `src/cuda/kernels/*.cu` (the CUDA C++ kernels — `common.cuh` + 17 translation units, 10,656 lines, since [#263](https://github.com/yusiwen/minfer/issues/263)), `build.rs` (the nvcc build chain).
 
 ## 1. Background — where this stage sits
 
@@ -552,12 +552,13 @@ That one repack was a 3.1× decode win (8.4 → 26.4 tok/s on 7B — the 7e②
 record), and it made `has_weight_of_size` match padded entries by their
 *original raw* length so the participation gate (below) stays honest.
 
-Also at load, the loaders flip global policy switches that must be settled
-before the first forward: `set_kv_cache_type` auto-selects the f16 KV policy
-from model dims, and a non-q4_K/q6_K quantized weight (or any 2-D f32 matmul
-weight) clears the `nb_bt_only` flag, which degrades the skip-write fused
-producers of §3.2.6 to a safe mode — the flag exists so a mixed-quant model
-can never feed a dead buffer to a GEMM that reads f32 activations.
+Also at load, a switch that must be settled before the first forward: a
+non-q4_K/q6_K quantized weight (or any 2-D f32 matmul weight) clears the
+`nb_bt_only` flag, which degrades the skip-write fused producers of §3.2.6 to a
+safe mode — the flag exists so a mixed-quant model can never feed a dead buffer
+to a GEMM that reads f32 activations. The KV element type is deliberately *not*
+one of these globals any more: `kvformat::resolve` runs after the loader returns
+and stores its answer on the engine (#153, ADR-0006).
 
 #### 3.2.3 Build-time assignment: `supports_op` and the all-weights gate
 
@@ -832,7 +833,7 @@ correctness fallbacks are not, and the code keeps the distinction visible.
 
 #### 3.2.7 Split-KV attention, the kernel
 
-The host side (`gqa_attn_split`, `src/cuda/methods/attention.rs:397`) computes the partial-row
+The host side (`gqa_attn_split`, `src/cuda/methods/attention.rs:398`) computes the partial-row
 stride `pstr = (4 + hd + 3) & !3` (running max, running sum, then the
 `hd`-wide output accumulator, rounded to a 16-byte boundary for the `float4`
 writes), grows the partials scratch *once* (a fixed `[32][nh][pstr]` slab —
@@ -979,19 +980,16 @@ let runs = self.graph_runs.entry(key).or_insert(0);
 // that a deliberate opt-in after an audit caught unvalidated
 // capture; R3-B (2026-08-31) flips the default ON — the 3-run
 // protocol bounds the cost ...
-if *runs >= 3
+if *runs >= self.capture_warmup
     && self.capturing.is_none()
     && nt_hint.map_or(true, |nt| nt == 1 || self.prefill_capture)
 {
-    // Hold the process-wide stream lock across the capture window:
-    // any other backend's stream work would otherwise be recorded
-    // into this graph (capture is per-stream, not per-thread).
-    let guard = self.state.stream_lock().lock().unwrap();
+    // Issue #188: no stream lock. The capture window is opened on THIS
+    // backend's own stream, and the mode is thread-local, so no other
+    // backend's work can be recorded into this graph or invalidate it.
     if self.state.graph_begin_capture() {
         self.capturing = Some(key);
-        self.stream_guard = Some(guard);
     } else {
-        drop(guard);
         eprintln!("CUDA: stream capture unavailable; graphs disabled for this session");
         self.graphs_mode = GraphMode::Disabled;
     }
@@ -1007,22 +1005,23 @@ Every line answers a "what could go wrong":
   of §2.5 enforced mechanically.
 - **Replay failure**: logs, disables graphs for the session, returns
   `false` — the split then executes by direct launch, still correct.
-- **The 3-run protocol**: executions 1–2 direct-launch (llama.cpp's warmup
-  ×2), the 3rd opens the window. `nt_hint` (the first MatMul node's token
+- **The warmup protocol**: the first `capture_warmup` executions direct-launch
+  (llama.cpp's warmup ×2, and that is the default), the next opens the window.
+  `nt_hint` (the first MatMul node's token
   count, `graph/mod.rs:127`) distinguishes decode-shaped from
   prefill-shaped graphs so the prefill capture gate applies only where it
   was validated.
-- **The process-wide stream lock**: stream capture is per-stream; while one
-  backend holds an open window, *every other* backend's stream work (the
-  CPU-side fills of a mixed split boundary, another model slot's launches)
-  must block instead of being recorded into the graph. The capturing
-  backend holds the mutex across its window and its own enqueues skip
-  re-locking.
+- **No stream lock (#188)**: the window is opened on the backend's *own*
+  stream and capture runs in `cudaStreamCaptureModeThreadLocal`, so another
+  backend's stream work (the CPU-side fills of a mixed split boundary, another
+  model slot's launches) cannot be recorded into this graph. `stream_guard`
+  survives as a `None`-returning shim (`cuda_backend.rs:556`) so the historical
+  call sites read as the no-ops they now are.
 
 Closing the window happens in `synchronize` → `close_capture_or_sync`
 (`cuda_backend.rs:268`): end capture, **instantiate**, launch once so the
-step still produces output, cache the exec, and only then release the stream
-lock. If instantiate/launch fails, the recorded launches never executed —
+step still produces output, and cache the exec. If instantiate/launch fails, the
+recorded launches never executed —
 this step's outputs are undefined, and the code says so out loud (graphs
 disabled for the session; rerun with `MINFER_NO_CUDA_GRAPH=1`), instead of
 pretending the step succeeded.
@@ -1053,8 +1052,8 @@ fn alloc_buffer(&mut self, size: usize) -> usize {
     }
     // On OOM, cuda_malloc logs and returns null; the null buffer fails
     // cleanly (Err) at execute time via ptr_of — do NOT panic here: the
-    // backend may be holding the process-wide stream lock, and panicking
-    // under a mutex poisons it for every other user.
+    // failure is recoverable and the caller names it, while a panic would
+    // take the whole session down with it (no mutex is held: #188).
     let ptr = <crate::cuda::CudaState>::cuda_malloc(bytes);
     self.pool.push(CudaBuf { ptr, bytes });
     self.pool_gen += 1;
@@ -1065,10 +1064,10 @@ fn alloc_buffer(&mut self, size: usize) -> usize {
 Both the free-list reuse and the fresh `cudaMalloc` bump `pool_gen` — the
 replay-invalidations trigger of §3.2.8. `free_buffer` *recycles* (never
 `cudaFree`s) so persistent KV regions survive rebuilds, and teardown is
-`Drop`'s job. And the OOM comment is worth a second read: allocating under
-the stream lock means panicking would poison the mutex for every other
-backend user, so OOM is carried as a null pointer and converted to `Err` at
-first use.
+`Drop`'s job. And the OOM comment is worth a second read: the failure is
+carried as a null pointer and converted to `Err` at first use, because a panic
+inside the backend would take the session down for a condition the caller can
+still report (since #188 there is no mutex to poison).
 
 Host transfers avoid the pageable-memory penalty with **pinned staging**.
 Input fills (`write_host`) copy into a slot of a lazily-allocated ring of

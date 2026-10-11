@@ -236,7 +236,9 @@ covers. Everything above it in `main()` is this stage.
 
 #### The parameter struct and its llama.cpp defaults
 
-`src/main.rs:50-78` — ten fields, each default annotated with its origin:
+`src/main.rs:73-107` — 26 fields. The excerpt keeps the ten this chapter works with; the sampler
+additions (min-p, typical, XTC, DRY, mirostat, logit bias, and the F2 grammar source) are
+`12-sampler.md`'s subject:
 
 ```rust
 struct GenParams {
@@ -717,7 +719,7 @@ graph with different KV geometry mid-generation.
 **Hand-rolled parsing instead of `clap`.** The core engine pins itself to 5
 crates (`rand`, `regex`, `half`, `serde`/`serde_json`, `minijinja` —
 `Cargo.toml`). A parser crate would be the least painful dependency, but
-the flag set is small enough (~25 arms) that the loop is shorter than the
+the flag set is small enough that the loop is shorter than the
 `clap` derive boilerplate, and total control over the error text is worth
 real money in a teaching tool: every error above ends in a hint
 (`minfer list`, candidates, usage). The cost — hand-maintaining
@@ -839,11 +841,11 @@ What you should see for the doc-02 handoff on a real run:
 ```text
 $ ./target/release/minfer qwen2.5-0.5b-instruct-q4_0 "Why is the sky blue?" -n 8
 Loading model: /home/you/.cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf ...
-File: 407676704 bytes (388.8 MB) in 1 part(s)
-GGUF: 31 KV, 168 tensors
+File: 428730208 bytes (408.9 MB) in 1 part(s)
+GGUF: 26 KV, 291 tensors
 Model loaded.
 Vocabulary: 151936 tokens
-Prompt: 23 tokens
+Prompt: 35 tokens
 ...   ← doc 02 takes over at "Loading model"
 ```
 

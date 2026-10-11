@@ -347,7 +347,8 @@ if nt >= 2 && hd == 128 && !Self::no_fa_prefill() && layout != crate::cuda::KV_L
 
 `gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:261`.) Four conditions, each with a reason: `nt >= 2`
 (doc 86 lowered the gate from `nt >= 64`, since the kernel masks causally from the positions
-array, so verify-shaped short batches are safe); `hd == 128` (FA_HQ is hard-wired to `hd/4 = 32`);
+array, so verify-shaped short batches are safe); `hd == 128` (the Qwen2/Qwen3 head dim the kernel's
+tile arithmetic and shared-memory budget are computed for);
 `MINFER_NO_FA_PREFILL=1` `no_fa_prefill` (`src/cuda/methods.rs:281`) as the A/B escape hatch; and
 `layout != KV_LAYOUT_F32` (the FA tile is `__half`, and the launcher is instantiated only for the f16
 and packed layouts, so a f32 cache keeps the general kernel). If the shared-memory opt-in fails at
@@ -856,7 +857,7 @@ silent CPU fallback; backend assignment is decided at build time"
 (`docs/CUDA-TECH-PRIMER.md:312-314` (§7 "Synchronization discipline (GPU Safety, `docs/GP")); the design record states
 the rule (`docs/COMPUTE-GRAPH-DESIGN.md:1080-1082` (§9.2 "Eligibility") ); the assignment walkthrough gives the
 reason — a quiet fallback would mask the bug the guard exists to catch
-(`docs/inference_e2e_walkthrough/06-assign-fusion.md:111-112`).
+(`docs/inference_e2e_walkthrough/06-assign-fusion.md:113-114`).
 
 ## 4. Performance intuition
 

@@ -11,9 +11,10 @@ point, and the reasoning behind every design choice.
 > compressed version first, read [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md);
 > this series is the long version.
 
-> **Version skew.** Line numbers were verified against commit `e7fa0da`
-> (2026-09-11). Functions move; the file + function name is the stable address,
-> the line number is a convenience.
+> **Version skew.** Each chapter names the commit its line numbers were verified
+> against, and in this set that ranges from `e7fa0da` (2026-09-11) to `15fa45c`
+> (2026-10-08), so treat every line number as dated. Functions move; the file +
+> function name is the stable address, the line number is a convenience.
 
 ## The run in one paragraph
 
@@ -80,7 +81,7 @@ flowchart LR
 
 ## Master table — stage → document → code
 
-| Stage | Doc | Entry code (verified `e7fa0da`) | What happens |
+| Stage | Doc | Entry code (each chapter names its commit) | What happens |
 |---|---|---|---|
 | CLI parse + model resolution | [01](01-cli-args-model-resolution.md) | `main.rs` (`main`, subcommand dispatch, `GenParams`), `download/mod.rs::resolve` | Flags → defaults; local path / `hf:` / `ollama:` / cached name → a GGUF path; mode branches (`--cnv`, `serve`, `viz`) |
 | GGUF load | [02](02-gguf-load.md) | `gguf.rs::load_gguf_model`, `MmapFile` | Parse GGUF v3 (header, metadata KV, tensor table), mmap the data blob zero-copy, merge multi-part splits |
@@ -93,7 +94,7 @@ flowchart LR
 | Prefill forward | [09](09-prefill-forward-path.md) | `main.rs` (prefill block), `models/mod.rs::forward` → `forward_graph_cached` | All prompt tokens through the graph; positions drive KV writes and causal masking; last-token logits out; timing calibers |
 | CPU matmul kernels | [10](10-cpu-matmul-kernels.md) | `kernel.rs`, `quants.rs`, `block.rs` | Quantized weight × on-the-fly Q8_0 activations; AVX2 / NEON+SDOT dots; persistent thread pool; `repr(C)` block layouts |
 | Attention + vec ops + KV | [11](11-attention-vecops-kv.md) | `vec_ops.rs`, `graph/cpu_backend.rs` | RMSNorm, RoPE (two styles), softmax, SiLU; GQA attention; `kvcache_store/load` — positions are data, not structure |
-| Sampler | [12](12-sampler.md) | `sampler.rs::sample_with_penalties` | Penalties (repeat/frequency/presence, last-64 window) → top-k → top-p → temperature → seeded sample; stop-string byte matching |
+| Sampler | [12](12-sampler.md) | `sampler.rs::sample_with_config_grammar` | Penalties (repeat/frequency/presence, last-64 window) → top-k → top-p → temperature → seeded sample; stop-string byte matching |
 | Decode loop + reuse | [13](13-decode-loop-graph-reuse.md) | `main.rs` (decode loop), `graph/cache.rs::try_reuse`, `conversation.rs` | One token per step: only input *data* changes; first decode step rebuilds the graph, KV survives; multi-turn append-only prefill |
 | Metal backend | [14](14-metal-backend.md) | `src/metal/` (`MpsState`), `graph/metal_backend.rs`, `src/metal/kernels/` | Same graph on Apple GPU: zero-copy weight buffers, per-op shaders, one command buffer per split, fused decode kernels, flash attention |
 | CUDA backend | [15](15-cuda-backend.md) | `graph/cuda_backend.rs`, `cuda.rs`, `cuda/kernels/*.cu` | Same graph on NVIDIA: resident weights, int8 MMQ prefill / MMVQ decode, split-KV attention, CUDA Graph capture/replay, pinned async staging |

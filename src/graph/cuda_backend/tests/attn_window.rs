@@ -853,7 +853,7 @@ fn cuda_map_window_costs_no_more_than_the_span_it_replaces() {
     let (reps, warmup) = (100usize, 3usize);
     let (preps, pwarm) = (50usize, 3usize);
     // The prefill fixture's `nt`. `q` is read as `nt` token rows of
-    // `nh * hd` floats (`fa_prefill_f16kv`: `q[t * nh * hd + h * hd + d]`,
+    // `nh * hd` floats (`fa_prefill_kv`: `q[t * nh * hd + h * hd + d]`,
     // `t < nt`), so it needs its own `nt`-row q buffer. Reusing the decode
     // phase's single-row `qb` here made the kernel read ~7 MB past it: a
     // silent read of whatever device memory followed when those pages were

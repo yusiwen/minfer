@@ -32,10 +32,11 @@ but are just as load-bearing:
   runs.
 
 Why not just give every node its own fresh buffer and be done? Arithmetic
-makes the naive version ugly fast. The 0.5B decode graph has **437 nodes**
-(recorded in `docs/COMPUTE-GRAPH-DESIGN.md` Phase 8), so naive allocation means
-437 separate memory regions per backend — and for the GPU that is 437 driver
-buffer objects to create, register, and keep alive. Worse, the two persistent
+makes the naive version ugly fast. The 0.5B decode graph has **440 nodes**
+(measured: `--dump-graph-json`; `docs/COMPUTE-GRAPH-DESIGN.md`'s Phase-8 row
+records the 437-node DOT that revision exported), so naive allocation means 440
+separate memory regions per backend — and for the GPU that is 440 driver buffer
+objects to create, register, and keep alive. Worse, the two persistent
 things (KV regions) must be sized *once* and survive; a throwaway
 allocate-per-node scheme has no place to put them.
 
@@ -895,7 +896,7 @@ recorded fix (`COMPUTE-GRAPH-DESIGN.md` deviation 18; ARCHITECTURE.md invariant
 happen inside the same command buffer, in kernel order, so coherence is
 guaranteed by the GPU's own queue), and cross-backend inputs get a **fresh
 buffer** — safe, because the producer split was synchronized at the boundary
-before any copy runs (excerpt 7). After the fix, all 437 nodes of the 0.5B
+before any copy runs (excerpt 7). After the fix, all 440 nodes of the 0.5B
 graph ran correct on a single command buffer. The invariant, verbatim from
 the architecture doc: *"Never host-copy a GPU-pending buffer: a host `copy_in`
 of a producer that is encoded but not submitted reads stale data."*
