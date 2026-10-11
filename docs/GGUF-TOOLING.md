@@ -152,9 +152,9 @@ filename count that disagrees with `split.count` all fail the load.
 ## 2. The subcommands
 
 ```text
-minfer convert  <hf-model-dir> <out.gguf> [--outtype f16|bf16|f32] [--split-max-size N]
-minfer quantize <in.gguf> <out.gguf> --type <target> [--split-max-size N]
-minfer split    <in.gguf> <out-dir> --max-size N [--stem NAME]
+minfer convert  <hf-model-dir> <out.gguf> [--outtype f16|bf16|f32] [--split-max-size BYTES]
+minfer quantize <in.gguf> <out.gguf> --type <target> [--split-max-size BYTES]
+minfer split    <in.gguf> <out-dir> --max-size BYTES [--stem NAME]
 ```
 
 All three are dispatched before the global option parser (like `bench` /

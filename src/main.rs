@@ -256,10 +256,10 @@ fn print_usage(prog: &str) {
         "  {prog} specverify [-p N] [-r N] [-o json|md] <model>   # D5-1a C_T(nt) gate bench"
     );
     eprintln!(
-        "  {prog} convert <hf-model-dir> <out.gguf> [--outtype f16|f32] [--split-max-size N]"
+        "  {prog} convert <hf-model-dir> <out.gguf> [--outtype f16|bf16|f32] [--split-max-size BYTES]"
     );
-    eprintln!("  {prog} quantize <in.gguf> <out.gguf> --type <target> [--split-max-size N]");
-    eprintln!("  {prog} split <in.gguf> <out-dir> --max-size N [--stem NAME]");
+    eprintln!("  {prog} quantize <in.gguf> <out.gguf> --type <target> [--split-max-size BYTES]");
+    eprintln!("  {prog} split <in.gguf> <out-dir> --max-size BYTES [--stem NAME]");
     eprintln!("    (F6 tooling; see `{prog} convert --help`, `quantize --help`, `split --help`)");
     eprintln!();
     eprintln!("MODEL — <model> may be any of:");
@@ -347,7 +347,7 @@ fn print_usage(prog: &str) {
     );
     eprintln!("  --port <N>           server port (default 8080; used by `serve`)");
     eprintln!(
-        "  --n-ctx <N>          context size (default 4096; server: total, divided among slots)"
+        "  --n-ctx <N>          context size (default 4096; server: the total, an elastic share per slot)"
     );
     eprintln!(
         "                       single-shot / --cnv: sizes the KV cache, clamped to the model's"
