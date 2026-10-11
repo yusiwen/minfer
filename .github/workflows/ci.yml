@@ -441,6 +441,19 @@ jobs:
       # stages it inside the book, builds, and removes it again — see scripts/build_book.sh.
       - name: Build the book
         run: scripts/build_book.sh
+      # #515: the build above cannot fail on the two ways a link dies in the *rendered*
+      # book, because both are mdBook's normal behaviour — a chapter named `README.md`
+      # is published as `index.html` while the link text is rewritten to `README.html`,
+      # and a document that is not in `docs/SUMMARY.md` is not published at all (a
+      # source file with no SUMMARY entry is dropped silently; a SUMMARY entry with no
+      # file is silently rendered as an empty draft page). `check_docs_links.py`
+      # resolves against the checkout, so it is green either way. This reads `book/`.
+      - name: Every link in the rendered book must resolve
+        run: python3 scripts/check_book_links.py
+      - name: The book-link checker's own pass/fail cases
+        run: python3 scripts/check_book_links.py --selftest
+      - name: The link checker's own pass/fail cases
+        run: python3 scripts/check_docs_links.py --selftest
       - name: The staged Mermaid assets must not survive the build
         run: |
           test ! -e docs/assets/mermaid.min.js

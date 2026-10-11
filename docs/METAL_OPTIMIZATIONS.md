@@ -333,8 +333,8 @@ Until then this is a decision, not an oversight.
 [§3.2 CPU sampler](#32-cpu-sampler-2026-08-06) ·
 [§3.3 Decode optimizations](#33-decode-optimizations-gpu) ·
 [§3.4 Prefill optimizations](#34-prefill-optimizations) ·
-[§3.5 KV / long context](#35-kv-long-context) ·
-[§3.6 Prefill GEMM gap investigation (resolved)](#36-prefill-gemm-gap-investigation-resolved-2026-08-14-08-20-decided-not-to-change)
+[§3.5 KV / long context](#35-kv--long-context) ·
+[§3.6 Prefill GEMM gap investigation (resolved)](#36-prefill-gemm-gap-investigation--resolved-2026-08-14--08-20-decided-not-to-change)
 
 ### 🔜 To-do (required path to match llama.cpp)
 
