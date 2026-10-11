@@ -65,6 +65,21 @@ regex = 'master =\s*(?P<value>[0-9a-f]{7,40})'
 file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
 regex = 'Next: (?P<value>[^\n]+?)\.\*\*'
 
+# --- the §11 sequencing diagram --------------------------------------------
+# The diagram's per-ticket check marks are the phase counters written out one
+# line at a time: a phase line must draw exactly `total` ticket nodes and mark
+# `done` of them — both already declared by the `[[phase]]` rows below. That is
+# the gap #94 left and #179 closed: the marks were a second, hand-maintained
+# status surface. Which ticket is unmarked while a phase is in progress is still
+# the author's statement (the ledger is phase-level), but the counts are gated.
+#
+# One regex covers all seven lines: `phase` keys a line to its `[[phase]]` row,
+# and `body` is the node list with the trailing parenthetical note cut off (the
+# note is prose, and it may name tickets the line deliberately does not draw).
+[diagram]
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = '^Phase (?P<phase>[A-G])  (?P<body>.*?)(?:\s{2,}\(.*)?$'
+
 # --- phase counters ---------------------------------------------------------
 # `done`/`total` are the preamble's `(done/total)`; `state` is its completion
 # word. Phase G is **complete** (7/7, 2026-10-06); the rows past G7 are the gaps

@@ -73,13 +73,26 @@ REQUIRED_SCALARS = ("baseline_commit", "refreshed_against")
 
 #: The honest limit `--help` must state (also asserted by `--selftest`).
 HELP_LIMIT = (
-    "What it proves: the plan's prose agrees with scripts/status.toml. What it cannot "
-    "prove: that a measurement was real. The plan's §11 sequencing diagram's per-ticket "
-    "check marks are deliberately out of scope — they are not derivable from (done, total)."
+    "What it proves: the plan's prose agrees with scripts/status.toml — the phase "
+    "counters, the next: sentence, the baseline/refreshed commit ids and the §11 "
+    "sequencing diagram's ticket marks. What it cannot prove: that a measurement was "
+    "real, or — while a phase is in progress — *which* of its tickets an unmarked node "
+    "belongs to: the diagram is compared against a phase-level (done, total), so only "
+    "the counts are gated."
 )
 
 #: Fields a phase regex may capture and the manifest stores.
 PHASE_FIELDS = ("state", "done", "total")
+
+#: The manifest table naming the §11 sequencing diagram's prose target. It sits
+#: outside `[prose.*]` on purpose: those entries are keyed by a top-level scalar of
+#: the same name, and the diagram is a per-phase surface rather than a scalar. Its
+#: regex captures `phase` (which `[[phase]]` row the line belongs to) and `body`
+#: (the node list, with the trailing parenthetical note cut off).
+DIAGRAM_SECTION = "diagram"
+
+#: How a done ticket is written on a diagram line.
+CHECK_MARK = "\u2714"
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +237,78 @@ def compare_phases(
     return checked
 
 
+def compare_diagram(
+    root: Path, manifest: dict, label: str, problems: list[str]
+) -> int:
+    """Compare the §11 diagram's per-phase ticket counts against the `[[phase]]` rows.
+
+    Every phase line must draw exactly `total` ticket nodes and put a check mark on
+    exactly `done` of them. Both numbers already live in the `[[phase]]` rows, so no
+    value is written twice; the one regex locates every phase's line and its `phase`
+    group keys the line to those rows. What this cannot decide is *which* ticket an
+    in-progress phase's missing mark belongs to — the ledger is phase-level.
+
+    Returns the number of phase lines compared.
+    """
+    target = manifest.get(DIAGRAM_SECTION)
+    if not target:
+        problems.append(
+            f"{label}: no [{DIAGRAM_SECTION}] table — a ledger that lost its "
+            "declaration must not read as 'nothing to check'"
+        )
+        return 0
+    text = read_text(root / target["file"])
+    lines: dict[str, re.Match] = {}
+    for match in re.finditer(target["regex"], text, re.MULTILINE):
+        groups = match.groupdict()
+        if "phase" in groups and "body" in groups:
+            lines[groups["phase"]] = match
+    if not lines:
+        problems.append(
+            f'{target["file"]}: no prose match for the {DIAGRAM_SECTION} '
+            f"(the ledger declares {len(manifest.get('phase', []))} phase line(s))"
+        )
+        return 0
+
+    checked = 0
+    for phase in manifest.get("phase", []):
+        pid = phase["id"]
+        match = lines.get(pid)
+        if match is None:
+            problems.append(
+                f'{target["file"]}: no {DIAGRAM_SECTION} line for phase {pid} '
+                f"(the ledger says {phase['done']}/{phase['total']})"
+            )
+            continue
+        checked += 1
+        body = match.group("body")
+        # A ticket node is the phase letter plus its number, optionally carrying a
+        # mark; everything else in the node part is tree art.
+        found = re.findall(
+            rf"\b{re.escape(pid)}[0-9]+[a-z]*\b(\s*{CHECK_MARK})?", body
+        )
+        nodes = len(found)
+        marks = sum(1 for mark in found if mark)
+        line = line_of(text, match.start("body"))
+        if nodes != phase["total"]:
+            problems.append(
+                f'{target["file"]}:{line}: phase {pid} diagram: {nodes} ticket '
+                f'node(s) drawn, the ledger says total {phase["total"]}'
+            )
+        if marks != phase["done"]:
+            problems.append(
+                f'{target["file"]}:{line}: phase {pid} diagram: {marks} check '
+                f'mark(s), the ledger says done {phase["done"]}'
+            )
+        orphans = body.count(CHECK_MARK) - marks
+        if orphans:
+            problems.append(
+                f'{target["file"]}:{line}: phase {pid} diagram: {orphans} check '
+                "mark(s) follow no ticket"
+            )
+    return checked
+
+
 def check_manifest(root: Path, status_path: Path) -> tuple[list[str], dict]:
     """Every prose/source problem for `status_path` under `root`, plus a summary.
 
@@ -234,7 +319,7 @@ def check_manifest(root: Path, status_path: Path) -> tuple[list[str], dict]:
     manifest = tomllib.loads(read_text(status_path))
     problems: list[str] = []
     if not require_kind(manifest, label, KIND, problems):
-        return problems, {"phases": 0, "scalars": 0}
+        return problems, {"phases": 0, "scalars": 0, "diagrams": 0}
 
     for field in REQUIRED_SCALARS:
         if not manifest.get(field):
@@ -246,6 +331,7 @@ def check_manifest(root: Path, status_path: Path) -> tuple[list[str], dict]:
 
     scalars = compare_scalars(root, manifest, label, problems)
     phases = compare_phases(root, manifest, label, problems)
+    diagrams = compare_diagram(root, manifest, label, problems)
 
     for field in REQUIRED_SCALARS:
         commit = manifest.get(field)
@@ -263,7 +349,11 @@ def check_manifest(root: Path, status_path: Path) -> tuple[list[str], dict]:
             f"(git merge-base --is-ancestor exited {code}){detail}"
         )
 
-    return problems, {"phases": phases, "scalars": len(scalars)}
+    return problems, {
+        "phases": phases,
+        "scalars": len(scalars),
+        "diagrams": diagrams,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -282,6 +372,13 @@ FIXTURE_PLAN = r"""# Fixture plan
 
 **Baseline:** `HEAD = __BASE__` (2026-09-01). This status was refreshed against `master =
 __REFRESH__` (2026-09-02); it is refreshed with every PR.
+
+## 11. Sequencing
+
+```
+Phase A  ├─ A0 ✔ ─ A1 ✔ ─ A2 ✔ ─ A3 ✔ ─ A4 ✔ ─ A5 ✔ ─ A6 ✔ ─ A7 ✔ ─ A8 ✔  (nine)
+Phase G  └─ G1 ─ G2 ─ G3 ─ G4 ─ G5 ─ G6 ─ G7  (scheduled)
+```
 """
 
 FIXTURE_STATUS = r"""schema = 1
@@ -301,6 +398,10 @@ regex = 'master =\s*(?P<value>[0-9a-f]{7,40})'
 [prose.next]
 file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
 regex = 'Next: (?P<value>[^\n]+?)\.\*\*'
+
+[diagram]
+file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
+regex = '^Phase (?P<phase>[A-G])  (?P<body>.*?)(?:\s{2,}\(.*)?$'
 
 [[phase]]
 id = "A"
@@ -488,6 +589,60 @@ def run_selftest() -> int:
             "",
         )
 
+        # 9. A complete phase whose diagram drops a mark: the ledger says done 9,
+        #    the line carries 8.
+        write_fixture(root, c1, plan=default_plan(c1).replace("A7 ✔", "A7", 1))
+        problems, _ = check_manifest(root, status)
+        record(
+            "a diagram that drops a mark from a complete phase fails with file, line and both numbers",
+            has_problem(
+                problems,
+                "ARCHITECTURE-EXECUTION-PLAN.md",
+                "phase A diagram",
+                "8 check mark(s)",
+                "done 9",
+            ),
+            str(problems),
+        )
+
+        # 10. The other direction: a mark on a ticket the ledger calls not-done.
+        write_fixture(root, c1, plan=default_plan(c1).replace("G1 ─", "G1 ✔ ─", 1))
+        problems, _ = check_manifest(root, status)
+        record(
+            "a diagram that marks a ticket the ledger says is not done fails",
+            has_problem(problems, "phase G diagram", "1 check mark(s)", "done 0"),
+            str(problems),
+        )
+
+        # 11. A ticket node the ledger has no room for: 10 drawn, total 9, with the
+        #     mark count left correct, so the control differs in one property only.
+        write_fixture(root, c1, plan=default_plan(c1).replace("A8 ✔", "A8 ✔ ─ A9", 1))
+        problems, _ = check_manifest(root, status)
+        record(
+            "a diagram that draws more tickets than the ledger's total fails",
+            has_problem(problems, "phase A diagram", "10 ticket node(s)", "total 9")
+            and not has_problem(problems, "phase A diagram", "check mark(s)"),
+            str(problems),
+        )
+
+        # 12. A mark that follows no ticket at all.
+        write_fixture(root, c1, plan=default_plan(c1).replace("Phase G  └─", "Phase G  ✔ └─", 1))
+        problems, _ = check_manifest(root, status)
+        record(
+            "a check mark that follows no ticket fails",
+            has_problem(problems, "phase G diagram", "1 check mark(s) follow no ticket"),
+            str(problems),
+        )
+
+        # 13. A diagram line the ledger declares but the prose does not carry.
+        write_fixture(root, c1, plan=default_plan(c1).replace("Phase G  └─", "Phase Z  └─", 1))
+        problems, _ = check_manifest(root, status)
+        record(
+            "a phase with no diagram line fails by phase id",
+            has_problem(problems, "no diagram line for phase G"),
+            str(problems),
+        )
+
     failures = 0
     for name, ok, detail in results:
         print(f"{'PASS' if ok else 'FAIL'}  {name}")
@@ -504,8 +659,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="check_status.py",
         description=(
             "Check that the execution plan's status prose agrees with "
-            "scripts/status.toml (the phase counters, the next: sentence and the "
-            "baseline/refreshed commit ids). The suite counts are the sibling "
+            "scripts/status.toml (the phase counters, the next: sentence, the "
+            "baseline/refreshed commit ids and the §11 sequencing diagram's marks). "
+            "The suite counts are the sibling "
             "ledger scripts/test-baselines.toml, checked by check_baselines.py. "
             + HELP_LIMIT
         ),
@@ -569,7 +725,8 @@ def main(argv: list[str]) -> int:
         return 1
     print(
         f"check_status: prose agrees with {status} "
-        f"({summary['phases']} phases, {summary['scalars']} scalars); "
+        f"({summary['phases']} phases, {summary['scalars']} scalars, "
+        f"{summary['diagrams']} sequencing lines); "
         f"baseline/refreshed commits are ancestors of HEAD"
     )
     return 0

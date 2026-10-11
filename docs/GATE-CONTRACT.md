@@ -521,7 +521,8 @@ Moved here from `AGENTS.md`, which keeps the two-line pointer.
 
 **Doc status is machine-checked.** Two ledgers, each beside the checker that reads it
 (ADR-0023): [`scripts/status.toml`](https://github.com/yusiwen/minfer/blob/master/scripts/status.toml)
-is the source of truth for the plan's phase counters / `next:` sentence / baseline commits, and
+is the source of truth for the plan's phase counters / `next:` sentence / baseline commits / §11
+sequencing marks, and
 [`scripts/test-baselines.toml`](https://github.com/yusiwen/minfer/blob/master/scripts/test-baselines.toml)
 for the suite counts in [`TEST-BASELINES.md`](./TEST-BASELINES.md). `scripts/check_status.py --check`
 and `scripts/check_baselines.py --check` (CI `check-docs`) fail when the prose disagrees, naming the

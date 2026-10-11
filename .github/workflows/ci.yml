@@ -43,7 +43,8 @@
 #                       renders a dead link into the HTML, which is how the docs
 #                       rotted before; `scripts/check_status.py --check` proves the
 #                       plan's phase counters / `next:` sentence / baseline commits
-#                       agree with `scripts/status.toml`, and
+#                       and its §11 sequencing marks agree with `scripts/status.toml`,
+#                       and
 #                       `scripts/check_baselines.py --check` proves the suite
 #                       measurements agree with `scripts/test-baselines.toml`; each
 #                       binary's `--selftest` runs its own cases. Both ledgers live
