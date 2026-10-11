@@ -284,6 +284,12 @@ Verbatim tensor copy (no re-encoding) under `{out-dir}`, using the source's own
 alignment and metadata. A multi-part input, an already-split-looking filename,
 and a model with no tensors are refused.
 
+`--max-size N` is required — there is no silent default part size. `--stem NAME`
+names the output: the parts are written as `{stem}-NNNNN-of-MMMMM.gguf`, or as
+`{stem}.gguf` when everything fits in a single part (which then carries no
+`split.*` keys at all). Without `--stem` the stem is the input file's own name
+minus `.gguf`, or `model` when it has none.
+
 ---
 
 ## 3. Supported / refused sets and the exact refusal texts
