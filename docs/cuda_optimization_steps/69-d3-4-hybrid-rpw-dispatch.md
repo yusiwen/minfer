@@ -294,4 +294,4 @@ register-free staging is found.
    — gate only on the phase proven deterministic.
 
 ---
-← 68 · [Index](./README.md) · 70 →
+← 68 · [Index](./index.md) · 70 →

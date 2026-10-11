@@ -235,4 +235,4 @@ assert_eq!(dmis, 0, "device W_exp vs mirror ({od}x{id})");
 3. **Do the full account before trading memory for speed**: a plane's cost = the sum of `od×id` over all target tensors; single-instance extrapolation is off by two orders of magnitude.
 4. **Template the two forms**: the fast path and the fallback compile from one source (`EXP=false` SASS = r41), byte identity is guaranteed by construction, and the fallback's cost reduces to one lookup.
 
-← 55-r52-skip-write-mode2 · [Index](./README.md) · 57-r54-q6k-exp-optout →
+← 55-r52-skip-write-mode2 · [Index](./index.md) · 57-r54-q6k-exp-optout →

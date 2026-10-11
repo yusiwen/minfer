@@ -1,6 +1,6 @@
 # 15 · The CUDA backend
 
-> **Stage**: the Metal contrast (doc 14) → **this stage: the same compute graph on NVIDIA GPUs** → end of the series ([Index](./README.md)).
+> **Stage**: the Metal contrast (doc 14) → **this stage: the same compute graph on NVIDIA GPUs** → end of the series ([Index](./index.md)).
 > **Code**: `src/graph/cuda_backend.rs` (`CudaBackend`, `execute_node_inner`, `graph_replay_step`), `src/cuda.rs` (`CudaState` singleton, `register_weight`, `matmul_f32_ptr_layout`, `prefill_mmq`, `gqa_attn_split`), `src/cuda/kernels/*.cu` (the CUDA C++ kernels — `common.cuh` + 17 translation units, 9,996 lines, since [#263](https://github.com/yusiwen/minfer/issues/263)), `build.rs` (the nvcc build chain).
 
 ## 1. Background — where this stage sits
@@ -1331,4 +1331,4 @@ story of §3.2.1.
 - `docs/GLOSSARY.md` — the campaign glossary if a term (NB-BT, KDR, W_dsc,
   rpw...) from the records above needs its formula.
 
-← [14 — The Metal backend](14-metal-backend.md) · [Index](./README.md) →
+← [14 — The Metal backend](14-metal-backend.md) · [Index](./index.md) →

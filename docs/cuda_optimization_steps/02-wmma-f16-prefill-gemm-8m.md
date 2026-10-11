@@ -288,4 +288,4 @@ void launch_gemm_f16(const __half* a, const __half* b, float* c,
 4. **Kernels needing >48 KB smem must opt in before capture**; setting the attribute inside a running capture window silently fails and poisons the first captured launch.
 
 ---
-← [01](./01-phase7-cuda-backend.md) · [Index](./README.md) · [03 →](./03-fa-tiled-prefill-attention-8n.md)
+← [01](./01-phase7-cuda-backend.md) · [Index](./index.md) · [03 →](./03-fa-tiled-prefill-attention-8n.md)

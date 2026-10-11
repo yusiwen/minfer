@@ -221,5 +221,5 @@ conclusion with that nt clause attached.
    a whole** — the wall-clock gap must live outside the kernel or in other kernels,
    which is exactly where r37's whole-wall attribution starts.
 
-← [38-r35-scale-predecode](38-r35-scale-predecode.md) · [Index](./README.md) · [40-r37-post-parity-attribution](40-r37-post-parity-attribution.md) →
+← [38-r35-scale-predecode](38-r35-scale-predecode.md) · [Index](./index.md) · [40-r37-post-parity-attribution](40-r37-post-parity-attribution.md) →
 

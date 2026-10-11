@@ -1073,4 +1073,4 @@ redundancy is an assertion.
   numbers throughout (e.g. lines 334, 600, 851) — the parser is a readable
   diff against upstream.
 
-← [01 — CLI args and model resolution](01-cli-args-model-resolution.md) · [Index](./README.md) · [03 — Model dispatch and weights](03-model-dispatch-weights.md) →
+← [01 — CLI args and model resolution](01-cli-args-model-resolution.md) · [Index](./index.md) · [03 — Model dispatch and weights](03-model-dispatch-weights.md) →

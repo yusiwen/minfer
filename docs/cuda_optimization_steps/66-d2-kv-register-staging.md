@@ -332,4 +332,4 @@ empty-split reads (~90 µs/step) were left for later (D3-7 2c / D3b-2).
    probe divergence are the same species).
 
 ---
-← 65 · [Index](./README.md) · 67 →
+← 65 · [Index](./index.md) · 67 →

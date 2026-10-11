@@ -231,4 +231,4 @@ Three readings:
 4. **Porting an existing scheme beats inventing one**: the `mmq_nt<7,2>` pipeline skeleton was reused as-is, concentrating correctness risk on a single fence accounting.
 
 ---
-[← 41 · r38 q6_K BT-style raw-byte mma](41-r38-q6k-bt-rawbyte-mma.md) · [Index](./README.md) · [43 · r40 third resident block](43-r40-third-resident-block.md) →
+[← 41 · r38 q6_K BT-style raw-byte mma](41-r38-q6k-bt-rawbyte-mma.md) · [Index](./index.md) · [43 · r40 third resident block](43-r40-third-resident-block.md) →

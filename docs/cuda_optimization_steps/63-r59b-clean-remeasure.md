@@ -202,4 +202,4 @@ delta −12.6%. A −12% denominator defect amplifies a true +11.1% into +26% �
    rebuilt outright before use.
 
 ---
-← 62 · [Index](./README.md) · 64 →
+← 62 · [Index](./index.md) · 64 →

@@ -272,4 +272,4 @@ comparable — read only same-window deltas.)
    before it can be broken down further (r43).
 
 ---
-← [43 · r40 third resident block](43-r40-third-resident-block.md) · [Index](./README.md) · [45 · r42 stage-wide dsc scale read](45-r42-stage-wide-dsc-read.md) →
+← [43 · r40 third resident block](43-r40-third-resident-block.md) · [Index](./index.md) · [45 · r42 stage-wide dsc scale read](45-r42-stage-wide-dsc-read.md) →

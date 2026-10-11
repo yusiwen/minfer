@@ -213,4 +213,4 @@ the premise of "per-token 40B scattered source" — and the premise itself was l
    where i0=0; the byte-exact simulator and the shape sweep are two gates, both indispensable.
 
 ---
-← [25-r20-split-phase-a-staging](25-r20-split-phase-a-staging.md) · [Index](./README.md) · [27-r22-qa8-xor-swizzle](27-r22-qa8-xor-swizzle.md) →
+← [25-r20-split-phase-a-staging](25-r20-split-phase-a-staging.md) · [Index](./index.md) · [27-r22-qa8-xor-swizzle](27-r22-qa8-xor-swizzle.md) →

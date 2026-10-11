@@ -198,4 +198,4 @@ r45's own words were "**Not dead, WAITING**", and r53/r56 proved the second half
 3. **Grep SASS with the real mnemonics**: cp.async is called `LDGSTS.E.BYPASS.128` in SASS — get the search keyword wrong and every conclusion is wrong.
 4. **Pin a convergence verdict with two independent mechanism lines**: deleting work does not move the wall + hiding waits does not move the wall is far stronger than a single piece of evidence; only then is the post-convergence budget migration (q6_K → FA/prepass) justified.
 
-← 47-r44-wexp-stride-mismatch · [Index](./README.md) · 49-r46-fap1-fa-audit →
+← 47-r44-wexp-stride-mismatch · [Index](./index.md) · 49-r46-fap1-fa-audit →

@@ -357,4 +357,4 @@ long-prompt greedy gates).
    building another kernel.
 
 ---
-← 69 · [Index](./README.md) · 71 →
+← 69 · [Index](./index.md) · 71 →

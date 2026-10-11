@@ -243,4 +243,4 @@ Follow-on coordinates: r49 trimmed the prepass further (+2.32%); the FA line was
 4. **Halving threads requires auditing every loop unrolled by thread count**: constants that "follow the launch geometry" like staging strides, once hardcoded, turn a thread reduction into silently dropping half the data.
 
 ---
-← [50 · r47 converged-regime wall decomposition](./50-r47-converged-wall-decomposition.md) · [Index](./README.md) · [52 →](./52-r49-a-quantize-shared-dedup.md)
+← [50 · r47 converged-regime wall decomposition](./50-r47-converged-wall-decomposition.md) · [Index](./index.md) · [52 →](./52-r49-a-quantize-shared-dedup.md)

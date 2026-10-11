@@ -195,4 +195,4 @@ Retry conditions (otherwise these two skips would be re-proposed forever): swigl
 4. **A documented skip is a deliverable**: numbers + veto mechanism + retry conditions in the record — only then is a lever truly closed.
 
 ---
-← 57 · [Index](./README.md) · 59 →
+← 57 · [Index](./index.md) · 59 →

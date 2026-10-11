@@ -247,4 +247,4 @@ if dim > 0 && n == dim * rows && rows >= 16 && dim % 256 == 0 {
 3. **Fusion gains concentrate where the production body is large**: reconcile launch by launch (swiglu −25%, rms a wash) and "where mode 2 is worth doing" becomes a reading, not a guess.
 4. **AND the gate with the full set**: writing a fused plane for a GEMM that would re-quantize natively is correct waste — the fusion gate must be jointly true with the consumer path's gate set.
 
-← 53-r50-fa-tkv-16 · [Index](./README.md) · 55-r52-skip-write-mode2 →
+← 53-r50-fa-tkv-16 · [Index](./index.md) · 55-r52-skip-write-mode2 →

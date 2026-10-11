@@ -299,4 +299,4 @@ precondition for fused passing the bitparity gate.
    test suite as probabilistic OOM, which is harder to attribute than numeric errors.
 
 ---
-← [04 · decode-start CPU stalls (8o)](./04-decode-start-stall-8o.md) · [Index](./README.md) · [06 · decode MMVQ (8e)](./06-decode-mmvq-8e.md)
+← [04 · decode-start CPU stalls (8o)](./04-decode-start-stall-8o.md) · [Index](./index.md) · [06 · decode MMVQ (8e)](./06-decode-mmvq-8e.md)

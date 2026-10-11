@@ -243,4 +243,4 @@ naturally.
    fold; reporting them as one "round" misleads both reuse and revert.
 
 ---
-← [26-r21-coalesced-block-linear-a](26-r21-coalesced-block-linear-a.md) · [Index](./README.md) · [28-r23-f16-wall-decomposition](28-r23-f16-wall-decomposition.md) →
+← [26-r21-coalesced-block-linear-a](26-r21-coalesced-block-linear-a.md) · [Index](./index.md) · [28-r23-f16-wall-decomposition](28-r23-f16-wall-decomposition.md) →

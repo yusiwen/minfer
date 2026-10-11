@@ -253,4 +253,4 @@ but only under issue-stall constraints), or when L2 bandwidth itself becomes the
 
 ---
 
-← 17 · [Index](./README.md) · 19 →
+← 17 · [Index](./index.md) · 19 →

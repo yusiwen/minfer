@@ -344,4 +344,4 @@ context).
    values — the structural constraint for every decode kernel in the CUDA Graph replay era.
 
 ---
-← [09 · R2 MMVQ weight-streaming](./09-r2-mmvq-weight-streaming.md) · [Index](./README.md) · [11 →](./11-p5-gemm-tiles-fa-rewrite.md)
+← [09 · R2 MMVQ weight-streaming](./09-r2-mmvq-weight-streaming.md) · [Index](./index.md) · [11 →](./11-p5-gemm-tiles-fa-rewrite.md)

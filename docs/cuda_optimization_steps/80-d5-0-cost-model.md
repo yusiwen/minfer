@@ -163,4 +163,4 @@ on success: **~1.05–1.2×** decode tok/s — the risk the plan pre-registered.
   (aggregate 58.8% → 25.0% from d=2 to d=8), which is why deeper drafts lose
   twice: more draft steps AND a worse mix.
 
-← 79 · [Index](./README.md)
+← 79 · [Index](./index.md)

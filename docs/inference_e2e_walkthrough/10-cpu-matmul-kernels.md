@@ -489,4 +489,4 @@ This is the `GetRows` node of doc 05 made concrete — "the embedding table is a
 - [14](14-metal-backend.md) / [15](15-cuda-backend.md) — the same math with GPU execution models (f32 activations on Metal; int8 MMQ tensor-core GEMM on CUDA).
 - `docs/CPU_OPTIMIZATIONS.md`, `docs/SUPPORT-MATRIX.md` — the optimization history and the authoritative quant-format matrix.
 
-← [09 — Prefill: the first forward](09-prefill-forward-path.md) · [Index](./README.md) · [11 — Attention, vec ops, and the KV cache](11-attention-vecops-kv.md) →
+← [09 — Prefill: the first forward](09-prefill-forward-path.md) · [Index](./index.md) · [11 — Attention, vec ops, and the KV cache](11-attention-vecops-kv.md) →

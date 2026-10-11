@@ -252,4 +252,4 @@ a dense-plane stride mismatch along the way — a story for later, see docs 46/4
 
 ---
 
-← 22-r17-wide-warp-remap · [Index](./README.md) · 24-r19-weight-l2-residency →
+← 22-r17-wide-warp-remap · [Index](./index.md) · 24-r19-weight-l2-residency →

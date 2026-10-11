@@ -2,7 +2,7 @@
 
 > **Stage**: [05 — Graph build: the IR and the builder](05-graph-builder-ir.md) → **assign
 > backends + fuse op patterns** → [07 — Memory allocation: liveness and the KV regions](07-allocator-liveness-kv.md)
-> (row 6 of the README master table: the graph leaves its "pure IR" form here and becomes
+> (row 6 of the index master table: the graph leaves its "pure IR" form here and becomes
 > executable, but nothing has been allocated or run yet).
 > **Code**: `src/graph/scheduler.rs::assign_backends` (line 60) · `src/graph/alloc.rs::supports`
 > (line 140) · `src/graph/backend.rs` (the `Backend` trait) ·
@@ -928,4 +928,4 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
   assignment makes deterministic) · doc 13 (decode loop: why assign+fuse run once, not per
   token) · doc 14/15 (Metal/CUDA: the kernels behind the capability tables).
 
-← [05 — Graph build: the IR and the builder](05-graph-builder-ir.md) · [Index](./README.md) · [07 — Memory allocation: liveness and the KV regions](07-allocator-liveness-kv.md) →
+← [05 — Graph build: the IR and the builder](05-graph-builder-ir.md) · [Index](./index.md) · [07 — Memory allocation: liveness and the KV regions](07-allocator-liveness-kv.md) →

@@ -247,4 +247,4 @@ The ledger at session close: one correctness fix landed (7B is trustworthy from 
 3. **After a correctness fix, anchors must be re-set.** A guard set on a wrong engine is a negative asset (the old 7B guards flattered dropped work as speed); the −2.7% re-anchor is correctness's price and belongs in the record, not hidden.
 4. **Grep the master table's mechanism keywords before writing kernel code.** B2's prior art sat in the table for two sessions; pre-build arithmetic (Lever A's approach) is an order of magnitude cheaper than post-build measurement.
 
-← 73 · [Index](./README.md) · 75 →
+← 73 · [Index](./index.md) · 75 →

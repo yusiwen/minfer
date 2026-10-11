@@ -384,4 +384,4 @@ D3-7 2b.
    thresholds on continuous quantities.
 
 ---
-← 67 · [Index](./README.md) · 69 →
+← 67 · [Index](./index.md) · 69 →

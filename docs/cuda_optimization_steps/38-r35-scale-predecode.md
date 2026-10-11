@@ -211,5 +211,5 @@ cp.async pipeline and the B-side decode genuinely competed with the mma — the 
    composition residual to the LDSM/IMMA + fp-rescale body itself, directly framing
    r36's wavefront-economics question.
 
-← [37-r34-quantize-transpose-prepass](37-r34-quantize-transpose-prepass.md) · [Index](./README.md) · [39-r36-a-frag-wavefront](39-r36-a-frag-wavefront.md) →
+← [37-r34-quantize-transpose-prepass](37-r34-quantize-transpose-prepass.md) · [Index](./index.md) · [39-r36-a-frag-wavefront](39-r36-a-frag-wavefront.md) →
 

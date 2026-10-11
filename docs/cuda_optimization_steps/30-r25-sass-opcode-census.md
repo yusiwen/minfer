@@ -206,4 +206,4 @@ wall clock             = +0.37 / +0.49%        <  +1.5% bar       ⇒ REVERTED
    §8/§9's design comparisons; its compound interest exceeds most landed patches.
 
 ---
-← [29 · r24 scheduling-structure ladder](29-r24-scheduling-ladder.md) · [Index](./README.md) · [31 · r28 raw-nibble NB kernel](31-r28-nb-kernel-2blocks.md) →
+← [29 · r24 scheduling-structure ladder](29-r24-scheduling-ladder.md) · [Index](./index.md) · [31 · r28 raw-nibble NB kernel](31-r28-nb-kernel-2blocks.md) →

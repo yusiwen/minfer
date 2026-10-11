@@ -235,4 +235,4 @@ separate binary built from master `85c712e`.
    only the store kind could ever run packed; the first packed fused graph found that out at load,
    with the region refusing rather than corrupting.
 
-← [106 · query-formula gates](./106-query-formula-gates.md) · [Index](./README.md)
+← [106 · query-formula gates](./106-query-formula-gates.md) · [Index](./index.md)

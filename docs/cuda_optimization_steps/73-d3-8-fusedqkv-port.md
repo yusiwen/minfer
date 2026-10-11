@@ -303,4 +303,4 @@ Guards all hold with margin (14B tg128 ≥ 22.7, @3254 ≥ 21.5; 7B ≥ 49.0 / �
 4. **Informational dumps do not enter gates.** Diagnostic output reading recycled pool slots is inherently binary-layout dependent; gates only trust semantically stable artifacts like logits/KV/DOT, and diffs of diagnostic output are calibrated with "same-binary self-diff" before being interpreted.
 
 ---
-← 72 · [Index](./README.md) · 74 →
+← 72 · [Index](./index.md) · 74 →

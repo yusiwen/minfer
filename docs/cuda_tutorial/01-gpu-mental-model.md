@@ -598,4 +598,4 @@ sharedMemPerBlock=48 KiB L2=24 MiB globalMem=121.6 GiB
 - **[docs/GLOSSARY.md](../GLOSSARY.md)** — the campaign glossary, for any term
   this chapter defines only in passing (sm_121, LPDDR5x, roofline).
 
-← [Index](./README.md) · [02 · The minimal CUDA you actually need](02-minimal-cuda.md) →
+← [Index](./index.md) · [02 · The minimal CUDA you actually need](02-minimal-cuda.md) →

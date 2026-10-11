@@ -233,4 +233,4 @@ Campaign coordinates: this is the largest structural landing of P6 before r34 (q
 3. **One-variable slicing makes ratios attributable**: with the B side and rescale untouched by a single character, the 2.3× lands cleanly on "chain depth + A-fragment LDSM", and r14's follow-on stacking had a stable baseline.
 4. **Ratios must carry their basis**: 2.3× (in-band vs narrow) and 1.44× (cross-state vs old wide) are both correct; mixing them misleads — draw the interleaved window's boundary first, then the ratio means something.
 
-← 15 · [Index](./README.md) · 17 →
+← 15 · [Index](./index.md) · 17 →

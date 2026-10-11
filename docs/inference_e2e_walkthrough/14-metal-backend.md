@@ -810,4 +810,4 @@ With 256 threads (8 simdgroups), one `simd_sum` is no longer enough: each simdgr
 - `docs/METAL_OBJC-ECOSYSTEM.md` — why objc2, what the 2026-08-25 migration changed, and the nix/Xcode toolchain gotchas (§3.2.6's metallib story).
 - `docs/metal-inference-analysis.md`, `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` — deeper per-kernel analyses and the Qwen3-4B llama-parity A/B.
 
-← [13 — The decode loop and graph reuse](13-decode-loop-graph-reuse.md) · [Index](./README.md) · [15 — The CUDA backend](15-cuda-backend.md) →
+← [13 — The decode loop and graph reuse](13-decode-loop-graph-reuse.md) · [Index](./index.md) · [15 — The CUDA backend](15-cuda-backend.md) →

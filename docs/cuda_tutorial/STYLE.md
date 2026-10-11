@@ -98,7 +98,7 @@ Neighboring chapters + linked reference docs, one line each.
 6. Beginner definitions are mandatory, not decorative: a reader who has never
    written a kernel must finish `01` able to predict what a kernel launch
    does; must finish `04` able to explain why decode is memory-bound.
-7. End every doc with the nav line; the index link is `./README.md`.
+7. End every doc with the nav line; the index link is `./index.md`.
 8. At most one small diagram (ascii or mermaid) per chapter where it clearly
    helps; mermaid must render under mdbook-mermaid (plain ` ```mermaid `).
 

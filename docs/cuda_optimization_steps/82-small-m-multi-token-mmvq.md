@@ -251,4 +251,4 @@ Artifacts: `/tmp/d82/*.json`, `/tmp/d82/minfer-pre`, `/tmp/d82/minfer-post`
   refactors: they catch a wrong loop bound (q6_K's `v < 4`, not `v < 8`) on the
   first run, where tolerance-based tests would pass.
 
-← 81 · [Index](./README.md)
+← 81 · [Index](./index.md)

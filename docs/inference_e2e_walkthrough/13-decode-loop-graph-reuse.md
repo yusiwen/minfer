@@ -1391,5 +1391,5 @@ in the output and watch the trace stop mid-stream without a final forward.
 - [GLOSSARY](../GLOSSARY.md) — autoregressive, KV cache, nkv, prefill,
   decode, and the rest of the series' vocabulary in one place.
 
-← [12 — The sampler: from logits to a token](12-sampler.md) · [Index](./README.md) · [14 — The Metal backend](14-metal-backend.md) →
+← [12 — The sampler: from logits to a token](12-sampler.md) · [Index](./index.md) · [14 — The Metal backend](14-metal-backend.md) →
 

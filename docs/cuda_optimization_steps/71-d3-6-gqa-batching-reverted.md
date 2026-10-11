@@ -274,4 +274,4 @@ The window anchors are the same as D3-5 (14B tg128 23.35 / @3254 21.68; 7B tg128
 4. **Keep the test shapes of negative results.** The gqa=5/7 geometries + the 2808 shape + the rpw boundary were kept intact after the revert, going from "the batched shape's gates" to "permanent coverage of the live h4w" — the next person touching attention will not have to rediscover these shapes.
 
 ---
-← 70 · [Index](./README.md) · 72 →
+← 70 · [Index](./index.md) · 72 →

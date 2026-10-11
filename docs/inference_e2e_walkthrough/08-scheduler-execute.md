@@ -807,7 +807,7 @@ input/output vectors.
   [15 — CUDA backend](15-cuda-backend.md): the full story of the
   one-command-buffer-per-split discipline and CUDA Graph capture/replay that
   this doc only hooks into.
-- [`viz/README.md`](../../viz/README.md): the trace format, the live SSE view,
+- [`viz/README.md`](https://github.com/yusiwen/minfer/blob/master/viz/README.md): the trace format, the live SSE view,
   and how to load a run into the graph visualizer.
 
-← [07 — Memory allocation: liveness and the KV regions](07-allocator-liveness-kv.md) · [Index](./README.md) · [09 — Prefill: the first forward](09-prefill-forward-path.md) →
+← [07 — Memory allocation: liveness and the KV regions](07-allocator-liveness-kv.md) · [Index](./index.md) · [09 — Prefill: the first forward](09-prefill-forward-path.md) →

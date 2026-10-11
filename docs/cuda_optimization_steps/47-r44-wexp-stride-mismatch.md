@@ -262,4 +262,4 @@ The cash-in ledger of the r44/r45 "WAITING" pair (two same-day vetoes, both flip
 3. **A bit-identical failure across variants is the fingerprint of shared address arithmetic** — contract to the shared part before acting; the control experiment (in-kernel expansion of raw W passing) is the key contracting step.
 4. **On the converged line, kernel-level wins cannot reach the wall**: mechanism confirmed ≠ wall-clock value; a "correct but wall-neutral" change should be recorded with its mechanism and annotated with retry conditions, not discarded (r53 cashed in r44, r56 cashed in r45 — "not dead, WAITING" is a discipline this campaign has verified repeatedly).
 
-← 46-r43-pc-sampling-attribution · [Index](./README.md) · 48-r45-cpasync-q6k-a-staging →
+← 46-r43-pc-sampling-attribution · [Index](./index.md) · 48-r45-cpasync-q6k-a-staging →

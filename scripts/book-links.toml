@@ -15,93 +15,18 @@
 # `target` is a glob over the **book-relative** target: the page's directory joined
 # with the `href` and normalised, so the several spellings of one target collapse
 # (`./README.html` from a chapter and `cuda_optimization_steps/README.html` from its
-# parent are one key). A `#fragment` problem has the key `<page>#<fragment>`.
+# parent are one key). A `#fragment` problem has the key `<page>#<fragment>`, with the
+# fragment percent-decoded — mdBook encodes a non-ASCII href while the `id=` it
+# generates stays raw, and the browser matches the decoded one.
 #
-# This ledger is a **ratchet downwards**: it exists so the gate could land before the
-# links were re-pointed, and it is meant to become empty. Two causes account for
-# every entry, and both are fixed by
-# [#516](https://github.com/yusiwen/minfer/issues/516):
+# **The ledger is empty, and that is the point.** It carried the 315 dead links the
+# site had when this gate landed (#515), each with the cause and the fix; #516
+# re-pointed every one of them — the three chapter `README.md` files became
+# `index.md`, the ADR corpus and the campaign records 81-109 became chapters, and the
+# links out of the book (the root `README.md`, `AGENTS.md`, the PR template, the
+# `viz/` guide and the three `STYLE.md` contracts) became absolute `github.com` URLs.
+# It stays empty; a new entry here is a debt, not a policy.
 #
-#   chapter-not-rendered  mdBook renames a `README.md` chapter to `index.html` but
-#                         rewrites the link to `README.html` — one rename per
-#                         directory, or a link spelled `index.md`
-#   not-a-chapter         the document is not in `docs/SUMMARY.md`, so mdBook
-#                         publishes no page for it at all while the book links it
-#                         relatively — #516 lists it or links it by absolute URL
-#
-# The two fragment failures this checker found are **not** recorded here: they were
-# two slug typos in `docs/METAL_OPTIMIZATIONS.md`'s own table of contents, fixed in
-# the commit that added this checker (mutation evidence: reverting them fails the
-# checker).
-
-[[known_dead]]
-target = "cuda_tutorial/README.html"
-reason = "chapter-not-rendered: docs/cuda_tutorial/README.md has 7 inbound links that spell it README (#516)"
-
-[[known_dead]]
-target = "cuda_optimization_steps/README.html"
-reason = "chapter-not-rendered: 81 links from the step records back to docs/cuda_optimization_steps/README.md (#516)"
-
-[[known_dead]]
-target = "inference_e2e_walkthrough/README.html"
-reason = "chapter-not-rendered: 18 links from the walkthrough chapters back to its README (#516)"
-
-[[known_dead]]
-target = "../README.html"
-reason = "not-a-chapter: the repository README is outside the book's source tree; the book should link it by absolute URL (#516)"
-
-[[known_dead]]
-target = "../viz/README.html"
-reason = "not-a-chapter: viz/README.md is outside the book's source tree; the book should link it by absolute URL (#516)"
-
-[[known_dead]]
-target = "../AGENTS.html"
-reason = "not-a-chapter: AGENTS.md is a root instruction file, not book content; the citer should use an absolute URL (#516)"
-
-[[known_dead]]
-target = "../.github/PULL_REQUEST_TEMPLATE.html"
-reason = "not-a-chapter: the PR template is not book content; the citer should use an absolute URL (#516)"
-
-[[known_dead]]
-target = "adr/00[0-9][0-9]-*.html"
-reason = "not-a-chapter: the 38 ADRs are not in docs/SUMMARY.md, so mdBook publishes none of them while the design documents link all 38 (#516)"
-
-[[known_dead]]
-target = "cuda_optimization_steps/8[1-9]-*.html"
-reason = "not-a-chapter: the campaign records stop at 80 in docs/SUMMARY.md; 81-89 were never listed (#516)"
-
-[[known_dead]]
-target = "cuda_optimization_steps/9[0-9]-*.html"
-reason = "not-a-chapter: 90-99 were never listed in docs/SUMMARY.md (#516)"
-
-[[known_dead]]
-target = "cuda_optimization_steps/10[0-9]-*.html"
-reason = "not-a-chapter: 100-109 were never listed in docs/SUMMARY.md (#516)"
-
-[[known_dead]]
-target = "cuda_tutorial/STYLE.html"
-reason = "not-a-chapter: the tutorial's writing contract is linked from its README but is not a chapter (#516)"
-
-[[known_dead]]
-target = "inference_e2e_walkthrough/STYLE.html"
-reason = "not-a-chapter: the walkthrough's writing contract is linked from its README but is not a chapter (#516)"
-
-[[known_dead]]
-target = "cuda_optimization_steps/STYLE.html"
-reason = "not-a-chapter: the campaign's writing contract is linked from its README but is not a chapter (#516)"
-
-[[known_dead]]
-target = "GRAMMAR-DESIGN.html"
-reason = "not-a-chapter: a design document newer than its SUMMARY section, linked from the book (#516)"
-
-[[known_dead]]
-target = "CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.html"
-reason = "not-a-chapter: a design document newer than its SUMMARY section, linked from the book (#516)"
-
-[[known_dead]]
-target = "CLI-CONVERSATION-PLAN.html"
-reason = "not-a-chapter: a plan document newer than its SUMMARY section, linked from the book (#516)"
-
-[[known_dead]]
-target = "OPENAI-CHAT-API-PLAN.html"
-reason = "not-a-chapter: a plan document newer than its SUMMARY section, linked from the book (#516)"
+# The two fragment failures the checker found on its first run are not recorded here
+# either: they were two slug typos in `docs/METAL_OPTIMIZATIONS.md`'s own table of
+# contents, fixed in the commit that added the checker.

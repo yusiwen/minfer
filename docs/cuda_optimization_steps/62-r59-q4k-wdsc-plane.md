@@ -271,4 +271,4 @@ End-of-doc state: default 7B pp3314 ~3581 tok/s = **1.080×** vs llama-bench 332
    exist", then ask "can it be hidden".
 
 ---
-← 61 · [Index](./README.md) · 63 →
+← 61 · [Index](./index.md) · 63 →

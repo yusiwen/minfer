@@ -111,7 +111,7 @@ flowchart LR
 
 ## Conventions
 
-- Docs follow [`STYLE.md`](STYLE.md) (structure, voice, forensics protocol).
+- Docs follow [`STYLE.md`](https://github.com/yusiwen/minfer/blob/master/docs/inference_e2e_walkthrough/STYLE.md) (structure, voice, forensics protocol).
 - Cross-refs use repo-relative links; env-var behavior is stated where it
   matters and collected per doc in §4 (Observe & verify).
 - The series mirrors `docs/cuda_optimization_steps/` in form: numbered

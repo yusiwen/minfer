@@ -303,4 +303,4 @@ the D3b-2 analysis as bitwise-unreachable, see doc 67).
    output is often not numbers but the freedom map.
 
 ---
-← 64 · [Index](./README.md) · 66 →
+← 64 · [Index](./index.md) · 66 →

@@ -327,4 +327,4 @@ bumped, and the counter assertion fails. The A/B runs above use exactly that lev
    instruction count would have predicted a larger win than the hardware gave — the
    ncu pair is what names the remaining term.
 
-← [107 · C4 packed Q8_0 KV on CUDA](./107-c4-packed-q8-kv-cuda.md) · [Index](./README.md)
+← [107 · C4 packed Q8_0 KV on CUDA](./107-c4-packed-q8-kv-cuda.md) · [Index](./index.md)

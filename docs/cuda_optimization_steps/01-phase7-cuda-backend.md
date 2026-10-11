@@ -178,4 +178,4 @@ The gates, set per phase — each defends against one class of regression:
 4. Raw FFI is enough: a dozen runtime functions + kernel wrappers, no bindgen and no third-party crate — the dependency red line and engineering cost can both be had.
 
 ---
-← [Index](./README.md) · [02 →](./02-wmma-f16-prefill-gemm-8m.md)
+← [Index](./index.md) · [02 →](./02-wmma-f16-prefill-gemm-8m.md)

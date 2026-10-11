@@ -366,4 +366,4 @@ was in the instruction model.
 
 ---
 
-← 13 · [Index](./README.md) · 15 →
+← 13 · [Index](./index.md) · 15 →

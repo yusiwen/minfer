@@ -253,4 +253,4 @@ __global__ void fa_prefill_f16kv(
 4. **Moving the O accumulator into registers was a two-step walk**: 8n first made O register-resident (the alpha rescale with zero smem round trips), while softmax itself only entered registers at FAP2 — change one data path at a time, each step measurable.
 
 ---
-← [02](./02-wmma-f16-prefill-gemm-8m.md) · [Index](./README.md) · [04 →](./04-decode-start-stall-8o.md)
+← [02](./02-wmma-f16-prefill-gemm-8m.md) · [Index](./index.md) · [04 →](./04-decode-start-stall-8o.md)

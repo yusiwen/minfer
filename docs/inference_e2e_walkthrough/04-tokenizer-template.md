@@ -810,4 +810,4 @@ duplicates history) does not just slow prefill — it changes the allocation.
 - [`ARCHITECTURE.md`](../ARCHITECTURE.md) §3: the flowchart rows this doc
   expands (template render → tokenize → prefill).
 
-← [03 — Model dispatch and weights](03-model-dispatch-weights.md) · [Index](./README.md) · [05 — Graph build: the IR and the builder](05-graph-builder-ir.md) →
+← [03 — Model dispatch and weights](03-model-dispatch-weights.md) · [Index](./index.md) · [05 — Graph build: the IR and the builder](05-graph-builder-ir.md) →

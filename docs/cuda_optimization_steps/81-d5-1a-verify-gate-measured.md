@@ -329,4 +329,4 @@ worth ≈ +34% today.
 
 Artifacts: `/tmp/d51a/*.json` (ephemeral; key numbers inlined above).
 
-← 80 · [Index](./README.md)
+← 80 · [Index](./index.md)

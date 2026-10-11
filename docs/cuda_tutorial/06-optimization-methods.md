@@ -796,4 +796,4 @@ whole gate chain; doc
   [05 · Reading minfer's kernels III](05-kernels-attention-host.md) — the
   kernels this chapter's catalog points into, taught line by line.
 
-← [05 · Reading minfer's kernels III](05-kernels-attention-host.md) · [Index](./README.md) · [07 →](07-where-next.md)
+← [05 · Reading minfer's kernels III](05-kernels-attention-host.md) · [Index](./index.md) · [07 →](07-where-next.md)

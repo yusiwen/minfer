@@ -338,4 +338,4 @@ That budget table then became Era C's (the MMQ campaign's) starting coordinates.
    building can veto an entire route up front.
 
 ---
-← 10 · [Index](./README.md) · 12 →
+← 10 · [Index](./index.md) · 12 →

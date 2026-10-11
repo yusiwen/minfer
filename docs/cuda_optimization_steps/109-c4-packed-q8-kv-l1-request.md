@@ -351,4 +351,4 @@ is exactly the one the mutation touches, not a shared path.)
    then showed the layout alternatives would have moved the same counter and the
    same (zero) throughput, at a much higher cost.
 
-← [108 · #186: the dp4a packed Q8_0 K dot on CUDA](./108-c4-dp4a-packed-q8-kv-cuda.md) · [Index](./README.md)
+← [108 · #186: the dp4a packed Q8_0 K dot on CUDA](./108-c4-dp4a-packed-q8-kv-cuda.md) · [Index](./index.md)

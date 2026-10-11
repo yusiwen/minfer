@@ -266,5 +266,5 @@ sub-bar positive gain should be reverted.
 unresolvable inside the 5-pair protocol's noise band; a 45-sample median + range is the right
 measuring instrument for this class of lever.
 
-← [33-r30-swar-unpack](33-r30-swar-unpack.md) · [Index](./README.md) · [35-r32-finite-lever-sweep](35-r32-finite-lever-sweep.md) →
+← [33-r30-swar-unpack](33-r30-swar-unpack.md) · [Index](./index.md) · [35-r32-finite-lever-sweep](35-r32-finite-lever-sweep.md) →
 

@@ -227,4 +227,4 @@ sets up no dedicated bitwise-dump gate for it. Its gates are behavioral-equivale
    when it moves, always check the host side first, not the kernels.
 
 ---
-← [03](./03-fa-tiled-prefill-attention-8n.md) · [Index](./README.md) · [05 →](./05-persistent-f16-cache-8p.md)
+← [03](./03-fa-tiled-prefill-attention-8n.md) · [Index](./index.md) · [05 →](./05-persistent-f16-cache-8p.md)
