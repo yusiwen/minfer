@@ -80,7 +80,9 @@
 #                       shape half — CI has no fixture cache — and the byte half
 #                       runs inside the F6 gates, which verify the file they
 #                       resolve before comparing against it.
-#                       It also runs `scripts/check_doc_line_anchors.py` (#266):
+#                       It also runs `scripts/docset.py` (#522): the file set every
+#                       doc gate reads — every tracked `*.md` minus a reasoned,
+#                       ratcheted ledger — and `scripts/check_doc_line_anchors.py` (#266):
 #                       `check_docs_links.py` sees link *targets*, not the
 #                       `path:NNN` line anchors the docs cite code by, so a moved
 #                       line rots silently — and the source-layout campaign moves
@@ -411,6 +413,14 @@ jobs:
       # those to be noticed.
       - name: The dead-code oracle's own pass/fail cases
         run: python3 scripts/check_dead_code_oracle.py --selftest
+      # #522: which markdown those gates read is discoverable — every tracked `*.md`,
+      # minus `scripts/markdown-scope.toml`'s reasoned file-level exclusions — and the
+      # walk must account for every tracked file. Before this, the set was `docs/**`
+      # plus `AGENTS.md`, and four anchors citing the deleted
+      # `src/models/qwen2/forward.rs` sat unread in `experiments/`. The scope layer's
+      # own cases run first so a broken ledger is named before a checker reports on it.
+      - name: The doc-scope layer's own pass/fail cases
+        run: python3 scripts/docset.py --selftest
       # #266: a `path:NNN` anchor must name a file of this tree *and* a real line of
       # it, and — when the anchor names a symbol — that symbol must be in the file
       # the anchor points at. The historical records whose anchors cite a pre-split

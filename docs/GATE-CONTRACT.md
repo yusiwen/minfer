@@ -320,6 +320,21 @@ that one *was* a real drift, which is the point: the detectable subset is a
 coincidence, not a rule. Rule E is the *symbol* half of that question, where the
 adjacent token is mechanical; the non-symbol half stays a convention.
 
+**Which documents this reads** is discoverable since [#522]: every tracked `*.md` in the
+repository, minus the entries in `scripts/markdown-scope.toml` — a ledger beside
+`scripts/docset.py` that excuses a whole *document* with a reason (today the four
+`experiments/**` records, whose probe-run citations a maintainer keeps as written;
+`docs/SOURCE-LAYOUT-PLAN.md` §6.4 owns that classification). The checker's in-script
+`FROZEN` is the other shape: it exempts a single *anchor* in a document that is otherwise
+read. Both ratchet — a ledger pattern matching no file fails, and a `FROZEN` pattern that
+covers no current failure fails — and every run prints the census (`N scanned + M excluded
+= T file(s)`) and fails when the walk cannot account for every tracked `*.md`. Before
+#522 the set was `docs/**` plus `AGENTS.md`, which is how four anchors citing the
+*deleted* `src/models/qwen2/forward.rs` sat unread in
+`experiments/cuda/CUDA_GRAPH_PROGRESS.md`, one directory above the gate. The same scope
+drives `check_docs_links.py`, so a dead relative link in `.github/`, `viz/` or the root
+`README.md` fails too.
+
 So the convention is:
 
 - **A prose anchor points at a section heading.** Cite the heading by name and

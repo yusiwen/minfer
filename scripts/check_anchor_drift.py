@@ -117,6 +117,7 @@ from pathlib import Path
 # checker's, imported rather than restated (see the module docstring).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_doc_line_anchors as anchors  # noqa: E402
+import docset  # noqa: E402
 
 
 class DriftError(Exception):
@@ -449,6 +450,11 @@ def check(
 
     base_root = extract_rev(root, rev)
     head_root = Path(root) if head is None else extract_rev(root, head)
+    # A document the head side's ledger excuses is out of the gates: its anchors are not
+    # "removed", they are outside the question (#522).
+    head_scope = docset.select(head_root)
+    print(docset.summary(head_scope))
+    head_excluded = {rel: reason for rel, reason in head_scope.excluded}
     try:
         base_checker = anchors.Checker(base_root, frozen)
         head_checker = anchors.Checker(head_root, frozen)
@@ -465,6 +471,8 @@ def check(
                 continue  # the doc itself is gone from the head tree
             if base_checker.frozen_reason(doc) is not None:
                 continue  # FROZEN, by the existing checker's own lookup
+            if doc in head_excluded:
+                continue  # out of the gates on the head side (scripts/markdown-scope.toml)
             pairs, unpaired = _pair(
                 sorted(base_by_doc[doc], key=lambda a: a.line),
                 sorted(head_by_doc.get(doc, []), key=lambda a: a.line),
@@ -605,6 +613,9 @@ def main(argv: list[str]) -> int:
     except DriftError as error:
         print(f"check_anchor_drift: {error}", file=sys.stderr)
         return 2
+    except docset.ScopeError as error:
+        print(f"check_anchor_drift: {error}", file=sys.stderr)
+        return 1
     print_report(report, args.rev, args.head or "the working tree", args.list)
     code = report.worst(args.strict)
     if code == 1:

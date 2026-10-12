@@ -178,6 +178,8 @@ import io
 import re
 import sys
 import tempfile
+
+import docset
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -375,12 +377,14 @@ class Report:
 
 
 def doc_files(root: Path) -> list[Path]:
-    """Every file the gate covers, in a stable order."""
-    files = sorted((root / "docs").rglob("*.md"))
-    agents = root / "AGENTS.md"
-    if agents.is_file():
-        files.append(agents)
-    return sorted(files)
+    """Every file the gate covers, in a stable order.
+
+    Discoverable (every tracked `*.md`, `scripts/docset.py`) minus the ledger's reasoned
+    exclusions — `docs/**` plus `AGENTS.md` was the whole set until #522, which is how
+    four anchors citing the deleted `src/models/qwen2/forward.rs` survived one directory
+    up in `experiments/cuda/CUDA_GRAPH_PROGRESS.md`.
+    """
+    return docset.scanned(root)
 
 
 def build_index(root: Path) -> tuple[list[str], dict[str, list[str]]]:
@@ -812,7 +816,12 @@ def main(argv: list[str]) -> int:
         print(f"check_doc_line_anchors: no docs/ under {root}", file=sys.stderr)
         return 2
 
-    report = Checker(root).run()
+    try:
+        scope = docset.announce(root)
+    except docset.ScopeError as error:
+        print(f"check_doc_line_anchors: {error}", file=sys.stderr)
+        return 1
+    report = Checker(root).run(files=scope.scanned)
     if args.list:
         print_list(report)
     summarize(report, args.strict_symbols)
@@ -962,6 +971,14 @@ def selftest() -> int:
         "a symbol in the file but outside the window must be a note",
     )
     expect(not report.violations(False), "no fixture anchor is a violation by default")
+
+    # 1b. The scope is discoverable (#522): markdown outside `docs/` is scanned, which is
+    #     how the four deleted-file anchors in `experiments/` slipped past the gate.
+    report = _run_case({"viz/note.md": "See `src/thing.rs:999`.\n"})
+    expect(
+        _verdicts(report, "viz/note.md") == ["out-of-range"],
+        "markdown outside `docs/` must be scanned",
+    )
 
     # 2. The synthetic stale anchor: out of range, both ends of a range, reversed.
     report = _run_case({"docs/bad.md": f"See `src/thing.rs:999`.\n"})

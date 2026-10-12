@@ -566,7 +566,7 @@ The full per-module transcripts and the two worktrees' build logs are in the Ste
 | documents carrying a line anchor **into** one of them (`…:NNN`), measured on `6b6d94f` | **35** (401 anchors: cuda side 269, metal side 132) |
 | the anchor hot spots | `docs/cuda_tutorial/*` 180 (6 files), `docs/LLAMA_METAL_E2E.md` 50, `docs/inference_e2e_walkthrough/14-metal-backend.md` 35, `docs/LLAMA-CPP-MMQ-ANALYSIS.md` 18, `docs/METAL-OBJC2-MIGRATION-PLAN.md` 15, `docs/inference_e2e_walkthrough/15-cuda-backend.md` 10, `docs/metal-inference-analysis.md` 10, `docs/ARCHITECTURE-EXECUTION-PLAN.md` 11 |
 | documents that describe the **layout** and need rewriting, not sweeping | 18 (listed in §6.3) |
-| machine-checked today | `check_docs_links.py` (relative link targets only — it **cannot** see `path:NNN`), `check_book_links.py` (every relative link and `#fragment` in the rendered `book/` must resolve), `check_book_coverage.py` (`docs/**.md` is a chapter or a reasoned exclusion), `check_status.py --check` (AGENTS.md prose ↔ `scripts/status.toml`). `build_book.sh` builds the book and proves nothing about its links: mdBook renames a `README.md` chapter to `index.html`, drops a document `SUMMARY.md` does not name, and drafts one whose file is gone — all three with exit 0 (#515) |
+| machine-checked today | `check_docs_links.py` (relative link targets only — it **cannot** see `path:NNN` — over every tracked `*.md`, minus the file-level ledger `scripts/markdown-scope.toml` and the anchor-level `FROZEN` list, both reasoned and both ratcheted, #522), `check_book_links.py` (every relative link and `#fragment` in the rendered `book/` must resolve), `check_book_coverage.py` (`docs/**.md` is a chapter or a reasoned exclusion), `check_status.py --check` (AGENTS.md prose ↔ `scripts/status.toml`). `build_book.sh` builds the book and proves nothing about its links: mdBook renames a `README.md` chapter to `index.html`, drops a document `SUMMARY.md` does not name, and drafts one whose file is gone — all three with exit 0 (#515) |
 
 ### 6.2 Policy: live documents are edited, historical records are frozen
 
@@ -576,7 +576,8 @@ The full per-module transcripts and the two worktrees' build logs are in the Ste
 - **Historical records** (`docs/cuda_optimization_steps/*.md`, `docs/QWEN2.5-*.md`,
   `docs/DEBUGGING-*.md`, `docs/KNOWN-CPU-ISSUES-*.md`, `docs/PARAMETER_AUDIT.md`'s older tables,
   `docs/ARCHITECTURE-EXECUTION-PLAN.md`'s per-ticket entries, and `experiments/cuda/*.md` — the probe
-  run records, which quote the `nvcc … ../../src/cuda_kernels.cu` command as it was run) keep
+  run records, which quote the `nvcc … ../../src/cuda_kernels.cu` command as it was run; their machine
+  half is `scripts/markdown-scope.toml`, which says the same thing to the doc gates) keep
   their text — they record a measurement taken against a revision, and rewriting them would falsify the
   record. They are resolved through the **path mapping table** this document keeps (§6.4).
 - **The machine ledgers the step records name are of their day.** They moved beside their checkers on
