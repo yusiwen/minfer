@@ -1,0 +1,29 @@
+# The markdown the doc gates do not read, and why (#522).
+#
+# `scripts/docset.py` gives every gate its file set: **every tracked `*.md`**, minus an
+# entry below. The default is "scanned", so a document outside `docs/` is now read by
+# `check_docs_links.py`, `check_doc_line_anchors.py` and `check_anchor_drift.py` — before
+# #522 the set was `docs/**` plus `AGENTS.md`, and four anchors citing the *deleted*
+# `src/models/qwen2/forward.rs` sat unread one directory up in `experiments/`.
+#
+# Two kinds of reasoned exclusion exist, and they answer different questions:
+#
+#   * this ledger removes a whole **document** (the file is a record, and its citations
+#     are kept as they were written);
+#   * `FROZEN` inside `check_doc_line_anchors.py` exempts a single **anchor** in a live
+#     document (the rest of that file is still checked).
+#
+# Both ratchet: a pattern here that matches no file fails, and a `FROZEN` pattern that
+# covers no current failure fails. `docs/SOURCE-LAYOUT-PLAN.md` §6.4 lists the trees it
+# calls historical records and keeps the path mapping table that resolves their stale
+# references; these entries are the machine half of that decision.
+
+[exclude]
+
+"experiments/cuda/CUDA_GRAPH_PROGRESS.md" = "the CUDA-graph capture probe record (2026-08): it cites the deleted `src/models/qwen2/forward.rs` at `:35`, `:136`, `:138` and `:122-131`, and pre-split `src/cuda.rs` at `:487-495`, `:497-524` and `:173-211` (the split is #262/#263) — a probe run's log, which `docs/SOURCE-LAYOUT-PLAN.md` §6.4 keeps as written"
+
+"experiments/cuda/README.md" = "the index of the CUDA-graph probe suite: its command table names the pre-split `src/cuda_kernels.cu`, and the suite's point is the measurement it recorded, not the current path"
+
+"experiments/cuda/cuda_graph_rust/README.md" = "the Rust↔FFI graph-capture probe record; it names the same pre-split `src/cuda_kernels.cu` as the command it ran"
+
+"experiments/logical-positions/README.md" = "the pre-C6 attribution record — its own header says it is kept as the record of that attribution, not as live gates, because C6 (merged as `001b8cc`) removed the coupling it diagnoses"

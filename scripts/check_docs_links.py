@@ -42,6 +42,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+
+import docset
 import tempfile
 import urllib.parse
 from pathlib import Path
@@ -59,21 +61,15 @@ FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 CODE_SPAN = re.compile(r"(`+)(.+?)\1", re.DOTALL)
 SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
-#: Every file the gate covers. `docs/**` plus the three markdown files that live
-#: outside it and are read as documentation (a link inside `experiments/` is a lab
-#: note, not a contract — `docs/SOURCE-LAYOUT-PLAN.md` says which trees each gate
-#: owns).
-EXTRA_FILES = ("AGENTS.md", "README.md", "viz/README.md")
-
-
 def markdown_files(root: Path) -> list[Path]:
-    """Every file the gate covers, in a stable order."""
-    files = sorted((root / "docs").rglob("*.md"))
-    for extra in EXTRA_FILES:
-        p = root / extra
-        if p.is_file():
-            files.append(p)
-    return sorted(set(files))
+    """Every markdown file the gate covers, in a stable order.
+
+    The set is discoverable — every tracked `*.md` — minus the files `scripts/docset.py`'s
+    ledger excuses with a reason (#522). It used to be `docs/**` plus a hand-kept list of
+    three outside files, which is how a dead link in `.github/`, `viz/` or at the root
+    stayed unread.
+    """
+    return docset.scanned(root)
 
 
 def without_code_spans(text: str) -> str:
@@ -133,9 +129,10 @@ def resolvable(source: Path, target: str) -> bool:
     return False
 
 
-def scan(root: Path) -> tuple[list[str], int, int]:
+def scan(root: Path, files: list[Path] | None = None) -> tuple[list[str], int, int]:
     """`(missing, checked, file_count)` for every covered file under `root`."""
-    files = markdown_files(root)
+    if files is None:
+        files = markdown_files(root)
     checked = 0
     missing: list[str] = []
     for path in files:
@@ -151,13 +148,13 @@ def scan(root: Path) -> tuple[list[str], int, int]:
     return missing, checked, len(files)
 
 
-def check(root: Path) -> int:
+def check(root: Path, files: list[Path] | None = None) -> int:
     """Print the verdict for `root`; return the exit code."""
     if not (root / "docs").is_dir():
         print(f"check_docs_links: no docs/ under {root}", file=sys.stderr)
         return 2
-    missing, checked, files = scan(root)
-    if not files:
+    missing, checked, count = scan(root, files)
+    if not count:
         print(f"check_docs_links: no markdown found under {root}", file=sys.stderr)
         return 2
     for line in missing:
@@ -165,11 +162,11 @@ def check(root: Path) -> int:
     if missing:
         print(
             f"check_docs_links: {len(missing)} of {checked} relative links do not "
-            f"resolve (in {files} markdown files)",
+            f"resolve (in {count} markdown files)",
             file=sys.stderr,
         )
         return 1
-    print(f"check_docs_links: {checked} relative links resolve in {files} markdown files")
+    print(f"check_docs_links: {checked} relative links resolve in {count} markdown files")
     return 0
 
 
@@ -245,6 +242,22 @@ def selftest() -> int:
         print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  ({note})" if note and not ok else ""))
         failed += 0 if ok else 1
     print(f"check_docs_links --selftest: {len(cases) - failed}/{len(cases)} cases pass")
+    # 12. The scope is discoverable (#522): markdown outside `docs/` is read too.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "docs").mkdir()
+        (root / "docs" / "target.md").write_text("# Target\n", encoding="utf-8")
+        (root / ".github").mkdir()
+        (root / ".github" / "note.md").write_text("[dead](./nope.md)\n", encoding="utf-8")
+        cases.append(("a dead link outside docs/ fails", check(root) == 1, ""))
+        (root / ".github" / "note.md").write_text("[live](../docs/target.md)\n", encoding="utf-8")
+        cases.append(("a link outside docs/ resolves against the root", check(root) == 0, ""))
+
+    failed = 0
+    for name, ok, note in cases:
+        print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  ({note})" if note and not ok else ""))
+        failed += 0 if ok else 1
+    print(f"check_docs_links --selftest: {len(cases) - failed}/{len(cases)} cases pass")
     return 1 if failed else 0
 
 
@@ -264,7 +277,13 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv[1:])
     if args.selftest:
         return selftest()
-    return check(args.root.resolve())
+    root = args.root.resolve()
+    try:
+        scope = docset.announce(root)
+    except docset.ScopeError as error:
+        print(f"check_docs_links: {error}", file=sys.stderr)
+        return 1
+    return check(root, files=scope.scanned)
 
 
 if __name__ == "__main__":
