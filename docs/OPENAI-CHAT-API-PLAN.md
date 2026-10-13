@@ -162,7 +162,7 @@ Add an OpenAI-compatible HTTP server to minfer, enabling integration with existi
 | Component | Location | Status |
 |-----------|----------|--------|
 | Chat template rendering | `src/template.rs` | `render_messages` (multi-message + ChatML fallback) — **done (rev 5)** |
-| ChatML formatting | `src/models/qwen2/mod.rs:66` | Ready (multi-message) |
+| ChatML formatting | `src/template.rs` | Ready (multi-message) |
 | Model inference | `src/models/qwen2/graph.rs` | Ready; `forward_cached` (per-slot cache + explicit n_ctx) |
 | Sampler | `src/sampler.rs` | `apply_penalties`, `sample_with_penalties`, `recent_window`, `match_stop_suffix` — done (rev 4) |
 | Tokenizer | `src/tokenizer.rs` | `decode_bytes` + `complete_utf8_prefix_len` + `bos_text` |

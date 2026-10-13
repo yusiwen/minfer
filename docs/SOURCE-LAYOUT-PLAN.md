@@ -167,8 +167,9 @@ Two honest wrinkles:
 - Fold the stale facts found while measuring into
   [#219](https://github.com/yusiwen/minfer/issues/219) (it already owns two of them):
   `AGENTS.md:3` `~4400 LOC` (production code is 55,529 lines),
-  `inference_e2e_walkthrough/15-cuda-backend.md:29/36` line counts (its `:4`
-  kernel-tree count was fixed in [#523](https://github.com/yusiwen/minfer/issues/523)),
+  `inference_e2e_walkthrough/15-cuda-backend.md:30/38` line counts — `src/cuda.rs` 1,014 and
+  `src/graph/cuda_backend.rs` 2,351 today, so those two are **current**; the banner's `:4`
+  kernel-tree count was fixed in [#523](https://github.com/yusiwen/minfer/issues/523),
   `CUDA-BACKEND-DESIGN.md` §"the gates" — `120 sites / 120 / 120` (the count at that revision;
   130 on `6b6d94f`). The banner naming the deleted `CudaCommandBuffer` was rewritten to
   `src/cuda/methods/dispatch.rs:124` by Step 1 ([#262](https://github.com/yusiwen/minfer/issues/262)),

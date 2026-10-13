@@ -408,7 +408,7 @@ server rejects any prompt longer than the slot context (`chat.rs:118-124`);
 `new_slots` (`slot.rs:33-36`) divides `n_ctx_total` equally per slot.
 `worker_loop` drains the queue **serially, one slot at a time** (`chat.rs:452-518`),
 and every request starts from a fresh `GraphCache` (`chat.rs:77`). Default `--n-slots` is
-1 (`main.rs:211`), so the default server is strictly serial with a cold KV per
+1 (`main.rs:492`), so the default server is strictly serial with a cold KV per
 request.
 
 **Gap.** 🔴 This is the largest capability difference between what minfer does

@@ -896,7 +896,7 @@ price even one wasted launch at "~1-2 us/layer" (`attention_decode.cu:930`, the 
 stores `nkt` elements per position. Qwen2.5-0.5B: `nkt = 2·64 = 128` elements
 → one f32 K row is 512 B, K + V together **1 KB per token per layer** (the
 walkthrough's number: 24 KB/token across 24 layers,
-`docs/inference_e2e_walkthrough/09-prefill-forward-path.md:253` (§2 "Sizing the context once for both phases") . With f16 KV
+`docs/inference_e2e_walkthrough/09-prefill-forward-path.md:254` (§2 "Sizing the context once for both phases") . With f16 KV
 each row is 256 B → **512 B per token per layer, 12 KB/token** model-wide.
 Decode attention at context length `p` reads `2 · p` such rows per layer, so
 the halving directly halves the attention kernel's KV traffic; at Qwen3-4B

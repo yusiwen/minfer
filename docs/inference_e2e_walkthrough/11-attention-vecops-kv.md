@@ -1,7 +1,7 @@
 # 11 · Attention, vec ops, and the KV cache
 
 > **Stage**: CPU matmul kernels (doc 10) → **this stage: every non-matmul op of the layer** → the sampler (doc 12).
-> **Code**: `src/vec_ops.rs` (`rms_norm_f32`, `vec_soft_max_f32`, `vec_silu_f32`, `mat_mul_f32`), `src/graph/cpu_backend.rs` (`cpu_rope`:469, the `KvcacheStore`/`KvcacheLoad`/`Attn` arms, `cpu_gqa_attn`:503, `attn_heads`:572), `src/graph/builder.rs:323` (the `attn` node contract).
+> **Code**: `src/vec_ops.rs` (`rms_norm_f32`, `vec_soft_max_f32`, `vec_silu_f32`, `mat_mul_f32`), `src/graph/cpu_backend.rs` (`cpu_rope`:857, the `KvcacheStore`/`KvcacheLoad`/`Attn` arms, `cpu_gqa_attn`:980, `attn_heads`:1101), `src/graph/builder.rs:601` (the `attn` node builder).
 
 ## 1. Background — where this stage sits
 
@@ -151,7 +151,7 @@ Design notes a beginner should keep:
 
 Worked example: `x = [1, 2, 3, 4]`, `eps ≈ 0`. `mean(x²) = (1+4+9+16)/4 = 7.5`; `scale = 1/√7.5 ≈ 0.365`; normalized `x ≈ [0.365, 0.730, 1.095, 1.461]`, then element-wise multiplied by the learned gains.
 
-#### 3.2.2 RoPE — the node arm (`cpu_backend.rs:343`) and `cpu_rope` (`:469`)
+#### 3.2.2 RoPE — the node arm (`cpu_backend.rs:343`) and `cpu_rope` (`:857`)
 
 The `RoPE` node arm shows the two conventions this series keeps meeting — positions decoded from f32 bits, and in-place execution:
 
@@ -260,7 +260,7 @@ Op::Attn { .. } => {
 }
 ```
 
-① is the causal mask in data form: the attention window is `max(positions) + 1` — during prefill of 100 tokens that is 100; during decode at position 100 it is 101. There is no mask tensor anywhere; the window *is* the mask, derived from the same positions input the store used. (builder.rs:323-325 documents the contract: `vl = pos[t]+1`.)
+① is the causal mask in data form: the attention window is `max(positions) + 1` — during prefill of 100 tokens that is 100; during decode at position 100 it is 101. There is no mask tensor anywhere; the window *is* the mask, derived from the same positions input the store used. (builder.rs:592-600 documents the contract: `vl = pos[t]+1`.)
 
 `cpu_gqa_attn` (`:503`) validates the head geometry (`hd < hd_kv` → `Err` — the Qwen3 decoupled-dims guard from §1), then farms head ranges to the same thread pool as the matmuls (`kernel::par_for`, doc 10), each worker with a private scores buffer. Heads never reduce against each other → bit-identical at any thread count, the same invariant as doc 10's row ownership. Single-threaded fallback when `--threads 1` or `n_head < 2`.
 

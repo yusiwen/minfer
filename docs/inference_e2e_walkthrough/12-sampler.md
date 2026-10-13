@@ -498,12 +498,12 @@ pub fn recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
     tokens[start..].to_vec()
 }
 
-// src/main.rs:842-847 — seeded once, window seeded from the PROMPT tail
+// src/main.rs:1563-1568 — seeded once, window seeded from the PROMPT tail
     let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
     const REPEAT_LAST_N: usize = 64;
     let mut prev_tokens = sampler::recent_window(&input_ids, REPEAT_LAST_N);
 
-// src/main.rs:903-907 — every sampled token enters the window
+// src/main.rs:1754-1757 — every sampled token enters the window
         generated.push(sampled.token_id);
         prev_tokens.push(sampled.token_id);
         if prev_tokens.len() > REPEAT_LAST_N {

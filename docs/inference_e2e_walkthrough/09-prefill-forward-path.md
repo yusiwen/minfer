@@ -9,8 +9,9 @@
 > **Code**: `src/main.rs` prefill block (L1441–1485, timing prints L1480–1485 and
 > L1848–1865), the call chain `src/models/mod.rs::forward` (L222) →
 > `src/models/qwen2/mod.rs::forward` (L55) → `src/models/qwen2/graph.rs::forward`
-> (L432) → `forward_cached` (L450), `src/graph/params.rs` (`GraphParams` L88),
-> `src/trace.rs::begin_phase` (L70) — lines verified at commit `15fa45c`.
+> (L438) → `forward_cached` (L456, a wrapper) → `forward_batch` (L480),
+> `src/graph/params.rs` (`GraphParams` L88), `src/trace.rs::begin_phase` (L70)
+> — lines verified at commit `15fa45c`.
 
 ## 1. Background — where this stage sits
 
@@ -213,8 +214,8 @@ Worth pausing on why `n_out = 1` is *safe* here and not a general-purpose
 setting: it is a property of the **single-sequence CLI**. The engine keeps
 `n_out` as a `GraphParams` field precisely because other callers want more —
 a trainer computing loss over all positions would pass `n_out = nt` (and the
-graph would keep every row), and the graph's own fallback (`forward_cached`,
-`graph.rs:613-626`) handles the `n_out == nt` case with the same code path.
+graph would keep every row), and the graph's own fallback (`forward_batch`,
+`graph.rs:757-758`) handles the `n_out == nt` case with the same code path.
 The CLI's choice is the degenerate, cheapest corner of a general mechanism.
 
 ### 2.5 Sizing the context once for both phases
@@ -270,7 +271,7 @@ recomputed with some other value. Two failure modes, both bad:
   shape `[n_kv_embd, n_ctx]`) but write into the small ones — an
   out-of-bounds write waiting for a long generation.
 - **A smaller decode `n_ctx` would trip the pre-flight assert** —
-  `forward_cached` asserts `max(positions) < n_ctx` (`graph.rs:415-420`) —
+  `forward_batch` asserts `max(positions) < n_ctx` (`graph.rs:515-521`) —
   after the prefill already filled positions `0..512`. Loud, but a crash the
   design made unnecessary.
 
@@ -293,7 +294,7 @@ comment says "607 KB"; 151,936 × 4 = 607,744 bytes — same number, rounding
 choice.)
 
 Where the bytes travel is worth tracing, because it explains the *owned*
-return type. Inside `forward_cached`, after `execute` returns, the logits
+return type. Inside `forward_batch`, after `execute` returns, the logits
 live in the graph's output buffer — a pool buffer owned by the allocator
 (doc 07). The engine copies them out exactly once:
 
@@ -426,41 +427,55 @@ caliber.
 
 #### The call chain — four hops, one delegation each
 
-`main.rs:757` calls through the architecture-agnostic trait object
+`main.rs:1472` calls through the architecture-agnostic trait object
 (`Box<dyn ModelDef>`), so the static type knows nothing about Qwen. Each hop
 adds exactly one concern:
 
 ```
-main.rs:757   model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx)
-  │           trait method (models/mod.rs:26-33): the architecture-agnostic
-  │           signature; doc comment: "the legacy `kv` arg is ignored" on the
-  ▼           graph path; callers must guarantee positions[i] < n_ctx
-qwen2/mod.rs:33-42   impl ModelDef for Qwen2Model
-  │           one line: graph::Qwen2Graph::forward(self, tokens, positions, kv, n_out, n_ctx)
+main.rs:1472  model.forward(&input_ids, &positions, 1, ctx)
+  │           trait method (models/mod.rs:222): the architecture-agnostic
+  ▼           signature; callers must guarantee positions[i] < n_ctx
+qwen2/mod.rs:54-57   impl ModelDef for Qwen2Model
+  │           one line: graph::Qwen2Graph::forward(self, tokens, positions, n_out, n_ctx)
   ▼           (qwen3/mod.rs mirrors this identically for Qwen3)
-qwen2/graph.rs:390-401   Qwen2Graph::forward
+qwen2/graph.rs:438-448   Qwen2Graph::forward
   │           n_ctx = n_ctx.min(model.hparams.max_seq_len)  ← 2nd clamp
   │           locks the process-global GraphCache (graph_cache())
-  ▼           delegates to forward_cached — the CLI wrapper; server code
-              calls forward_cached directly with a slot-scoped cache
-qwen2/graph.rs:409-632   forward_cached — the real work (below)
+  ▼           delegates to forward_cached; server code calls that directly
+              with a slot-scoped cache
+qwen2/graph.rs:456-472   forward_cached — a 17-line wrapper: one sequence *is* a
+  │           one-sequence batch, so it builds `Batch::single(tokens, positions)`
+  ▼           and delegates
+qwen2/graph.rs:480-765   forward_batch — the real work (below), 286 lines
 ```
 
 The two trait-level aliases on the way are worth one glance
-(`models/mod.rs:262-298`): `forward_graph` and `forward_graph_cached` expose
+(`models/mod.rs:272-298`): `forward_graph` and `forward_graph_cached` expose
 the same two implementations at trait level — `forward_graph_cached` is the
 server/multi-slot entry point (it takes an explicit `&mut GraphCache`
 instead of using the process-global one). The CLI goes through plain
-`forward` and lands in the same `forward_cached`; there is one forward-pass
-implementation, not one per caller.
+`forward` and lands in the same `forward_batch`; there is one forward-pass
+implementation, not one per caller. (Before E2 this was `forward_cached`
+alone; the wrapper is what is left when the batch path took over, and the
+chapters of 05–08 that name `forward_cached` mean this pipeline.)
 
-#### `forward_cached`: the build → fill → execute → read pipeline
-(`src/models/qwen2/graph.rs:409-476`, `520-550`, `617-625` — abridged)
+#### `forward_batch`: the build → fill → execute → read pipeline
+(`src/models/qwen2/graph.rs:480-765` — the condensation below keeps the
+pipeline order and elides the batch bookkeeping with `/* … */`)
 
 ```rust
-    pub fn forward_cached(model: &Qwen2Model, tokens: &[u32], positions: &[usize],
-                          n_out: usize, n_ctx: usize, cache: &mut GraphCache) -> Vec<f32> {
-        let nt = tokens.len();
+    pub fn forward_batch(model: &Qwen2Model, batch: &Batch, n_out: usize,
+                         n_ctx: usize, cache: &mut GraphCache) -> Vec<f32> {
+        if let Err(e) = batch.check() { panic!("forward_batch: {e}"); }
+        let (tokens, positions) = (&batch.tokens, &batch.positions);
+        let nt = batch.len();
+        let out_rows = batch.out_rows(n_out);      // one row per sequence
+        let n_out = out_rows.len();
+        /* explicit_span: is causal `positions` exact for this batch? Read from the
+           KV reservations — a second sequence, or a non-zero start, needs the
+           explicit span; kv_map: does this device gather cell runs? Both come from
+           the *batch*, never GraphParams: the sequence count is data (A7/E2), so it
+           is not part of the reuse identity */
         debug_assert!(n_out <= nt);
         // Out-of-range positions would write past the KV regions (which are
         // sized n_kv_embd * n_ctx): fail loudly instead of corrupting memory.
@@ -468,28 +483,37 @@ implementation, not one per caller.
             assert!(maxp < n_ctx, "position {maxp} exceeds n_ctx {n_ctx} ...");
         }
         /* metal_on / cuda_on: device present AND every weight registered —
-           all-or-nothing GPU participation (docs 03/14/15) */
+           all-or-nothing GPU participation (docs 03/14/15), from Self::device so
+           the builder and the server's batching default cannot disagree */
         let params = GraphParams {
             n_tokens: nt,
             n_out,
             gtype: if nt == 1 { GraphType::Decode } else { GraphType::Prefill },
-            cparams: CParams { n_ctx, flash_attn: false,
+            cparams: CParams { n_ctx, flash_attn: false, explicit_span, kv_map,
                                gpu: metal_on || cuda_on,
-                               fuse_qkv: nt == 1 && (metal_on || cuda_on) && ...,
-                               fuse_ffn: nt == 1 && (metal_on || cuda_on) && ... },
+                               gpu_layers: if gpu { model.offload.plan.gpu_layers } else { 0 },
+                               fuse_qkv: nt == 1 && gpu && (cuda_on || !explicit_span) && ...,
+                               fuse_ffn: nt == 1 && gpu && ...,
+                               kv_format: model.kv_format },
             weights_version: 1,
         };
-        if !cache.try_reuse(&params) {
-            /* build → register weights → assign_backends → FusionPass →
-               alloc_graph → cache.replace_graph (docs 05-08) */
+        // hand this engine's resolved format to the allocator's CPU kernels (C4)
+        cache.alloc().set_kv_format(model.kv_format);
+        if !cache.try_reuse(&params).expect("re-map onto a cached graph") {
+            /* Self::build → register weights → assign_backends → FusionPass →
+               alloc_graph → cache.replace_graph (docs 05-08).
+               MINFER_REBUILD_TRACE=1 prints the rebuild cost */
         }
         let (graph, alloc) = cache.current().unwrap();
         // refresh input data (positions/ids are data, not topology)
         alloc.fill_input_i32(graph, "token_ids", &ids).unwrap();
         alloc.fill_input_i32(graph, "positions", &pos).unwrap();
+        /* fill_batch_inputs(graph, batch): one call that marks each sequence's
+           written rows, fills the sequence ids and resolves every query's
+           attention span from the cell store — so the ids and the kernels'
+           windows cannot disagree (C2/E1/E2) */
         if graph.inputs.iter().any(|&i| graph.node(i).name == "tail_ids") {
-            let tail = ((nt - n_out)..nt).collect::<Vec<u32>>();
-            alloc.fill_input_i32(graph, "tail_ids", &tail).unwrap();
+            alloc.fill_input_i32(graph, "tail_ids", &out_rows).unwrap();
         }
         let sched = BackendScheduler::new();
         sched.execute(graph, alloc).unwrap();
@@ -502,32 +526,43 @@ implementation, not one per caller.
 This is the whole "call side of the graph machinery" in one function, and it
 is worth reading as five beats:
 
-1. **Pre-flight assert** (L415–420): every position must be `< n_ctx` — the
-   loud version of the KV-overflow check that the store kernel also enforces
-   (doc 07 §3.2, excerpt 8).
-2. **GraphParams construction** (L438–470): every field derived from the
+1. **Pre-flight: the batch, then the window** (L489–539): `batch.check()`
+   refuses an inconsistent composition, `explicit_span` and `kv_map` are read
+   from the KV reservations rather than guessed from the params, and every
+   position must be `< n_ctx` (L515–521) — the loud version of the KV-overflow
+   check that the store kernel also enforces (doc 07 §3.2, excerpt 8). The
+   sequence count is *data*: a second sequence changes no topology, which is
+   what lets one graph serve a single prompt and a batch (A7/E2).
+2. **GraphParams construction** (L541–597): every field derived from the
    call's arguments plus device availability. This is the prefill graph's
    birth certificate — for a 512-token CPU prompt: `n_tokens = 512`,
    `n_out = 1`, `gtype = Prefill`, `cparams = { n_ctx: 4096,
-   flash_attn: false, gpu: false, fuse_qkv: false,
-   fuse_ffn: false }`. Note the fusion flags are `nt == 1 && gpu`: the
-   decode fusions of doc 05 §2.6 are **off** during prefill by construction —
-   they pay off at `nt = 1` only, and their being params-derived is what
-   keeps fused and unfused graphs reproducible (and A/B-able via
-   `MINFER_NO_FUSE_QKV=1`).
-3. **Reuse-or-build** (L472–518): `try_reuse` compares the six fields
-   against the cached graph (doc 05 §2.7); on mismatch — which for the CLI
-   happens exactly twice, at the prefill call and at the first decode call —
-   the full build → assign → fuse → allocate pipeline runs, and
+   flash_attn: false, explicit_span: false, kv_map: false, gpu: false,
+   gpu_layers: 0, fuse_qkv: false, fuse_ffn: false, kv_format: <this
+   engine's> }`. Note the fusion flags are `nt == 1 && gpu`: the decode
+   fusions of doc 05 §2.6 are **off** during prefill by construction — they
+   pay off at `nt = 1` only, and their being params-derived is what keeps
+   fused and unfused graphs reproducible (and A/B-able via
+   `MINFER_NO_FUSE_QKV=1`). `fuse_qkv` carries one condition `fuse_ffn` does
+   not (`cuda_on || !explicit_span`, C6/S3): the fused epilogue stores K/V at
+   the allocator-resolved cell, which Metal's single-host-`pos` store cannot
+   do yet.
+3. **Reuse-or-build** (L600–655): `try_reuse` compares the params against the
+   cached graph (doc 05 §2.7); on mismatch — which for the CLI happens exactly
+   twice, at the prefill call and at the first decode call — `Self::build`
+   runs the full build → assign → fuse → allocate pipeline, and
    `replace_graph` swaps the graph in *keeping the allocator* (hence the KV
    regions).
-4. **Fill inputs, execute** (L520–550): the three input buffers are
-   overwritten with this step's data (by *name* — node ids shift between
-   rebuilds, names do not), then the scheduler walks the nodes (doc 08).
-   `execute` returning `Ok(())` is the guarantee that every buffer — logits
-   included — holds its final value (doc 08 §2.4).
-5. **Read the output** (L617–625): one `copy_to_cpu` of the output buffer,
-   returned as an owned `Vec` (§2.6).
+4. **Fill inputs, execute** (L657–692): the input buffers are overwritten with
+   this step's data (by *name* — node ids shift between rebuilds, names do
+   not), `fill_batch_inputs` writes the per-sequence ids and resolves each
+   query's attention window in the same call, `tail_ids` carries the output
+   rows, and then the scheduler walks the nodes (doc 08). `execute` returning
+   `Ok(())` is the guarantee that every buffer — logits included — holds its
+   final value (doc 08 §2.4).
+5. **Read the output** (L757–758): one `copy_to_cpu` of the output buffer,
+   returned as an owned `Vec` (§2.6). For a batch it holds one row per
+   sequence, in batch order (`Batch::out_rows`, `src/graph/batch.rs:84-95`).
 
 #### `GraphParams` → topology: what each field changes
 
@@ -540,13 +575,18 @@ the field's home in `params.rs`:
 | `n_out` | 1 | tail `get_rows` pair after the last attention projection (§2.8); the whole output stack runs on 1 row |
 | `gtype` | `Prefill` | part of the reuse identity; with `nt` it names the graph class (§2.6) |
 | `cparams.n_ctx` | `max(--n-ctx, prompt)` | KV store/load node shape `[n_kv_embd, n_ctx]` → region size (doc 07 §2.5) |
+| `cparams.explicit_span` / `kv_map` | false (one sequence, starting at cell 0) | causal `positions` vs. the explicit `[lo, hi)` span vs. a list of cell runs — the read-window shape (doc 07 §1; C8b) |
 | `cparams.gpu` | false (CPU) / true | backend-assignment eligibility — `Cuda`/`Metal` claim nodes only when every weight is registered |
+| `cparams.gpu_layers` | 0 / the load's offload plan | which blocks the device holds; the assignment is topology, so the plan is a param (E5, `docs/MEMORY-POLICY-DESIGN.md` §2) |
+| `cparams.kv_format` | this engine's resolved `KvFormat` | every KV node's cell width and the store/attention dispatch, so a graph built for one format is never reused for another (C4, ADR-0006) |
 | `cparams.fuse_qkv` / `fuse_ffn` | false (`nt > 1`) | decode-only fused topologies; prefill builds the plain matmul+rope+store skeleton |
 | `weights_version` | 1 | invalidates reuse if weights change (future LoRA/reload hook) |
 
-(`src/graph/params.rs:10-63`; `GraphType` L10–15, `CParams` L22–48,
-`GraphParams` L50–63. The module doc's first line is the invariant: these
-are "the ONLY inputs to graph reuse".)
+(`src/graph/params.rs`; `GraphType` L19, `CParams` L30, `GraphParams` L88,
+98 lines total. The module doc's first line is the invariant: these are "the
+ONLY inputs to graph reuse". The batch's composition — sequence count, cell
+rows, attention windows — is deliberately *not* here: it is data, refilled
+per forward (A7/E2).)
 
 #### The trace phase boundary (`src/trace.rs:70-80`, CLI at `main.rs:753-761`)
 
@@ -708,10 +748,10 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   says "computed ONCE" — and why `main.rs:1782` passes the *same* `ctx`
   binding, not a recomputation.
 - **The legacy `kv_cache` argument is gone (#252).** It was dead on this path
-  from the start — nothing read it in `forward_cached` — and [#252] deleted it
+  from the start — nothing read it in `forward_batch` — and [#252] deleted it
   (with the `KVCache` type and the `main.rs` construction) once the storage
-  had already gone in [#244]. `forward_cached`'s signature never took it; the
-  server's `GraphCache`/`forward_batch` surface is unchanged.
+  had already gone in [#244]. `forward_batch`'s signature never took it; its
+  `&mut GraphCache` argument is the graph *reuse* cache, not a KV binding.
 
 [#244]: https://github.com/yusiwen/minfer/issues/244
 [#252]: https://github.com/yusiwen/minfer/issues/252
@@ -787,10 +827,10 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   §2.8 the `n_out` tail rows.
 - [06 — Backend assignment and fusion](06-assign-fusion.md) and
   [07 — Allocator, liveness, KV regions](07-allocator-liveness-kv.md) — the
-  two middle steps `forward_cached` runs on a cache miss; §2.5 of 07 is the
+  two middle steps `forward_batch` runs on a cache miss; §2.5 of 07 is the
   KV-region sizing this doc's `ctx` controls.
 - [08 — The scheduler: splits, copies, execution](08-scheduler-execute.md) —
-  the `execute` call inside `forward_cached`, and the sync guarantee that
+  the `execute` call inside `forward_batch`, and the sync guarantee that
   makes the immediately-following `copy_to_cpu` safe.
 - [10 — CPU matmul kernels](10-cpu-matmul-kernels.md) — inside the
   compute-bound side: quantized weight × Q8_0 activations, the GEMM shape

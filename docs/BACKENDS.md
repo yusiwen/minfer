@@ -72,7 +72,7 @@ Because assignment is per *node*, one forward pass can mix backends. The
 scheduler cuts the node list into **splits** — maximal runs of the same
 backend — and at every split boundary it synchronizes the previous backend and
 copies split inputs across (`copy_across`, a host round trip through shared
-memory; `src/graph/scheduler.rs:176`). Metal encodes one
+memory; `src/graph/alloc.rs:2449`). Metal encodes one
 `MpsCommandBuffer` per split and submits it at `synchronize`. Mechanically
 this is
 [walkthrough 08](./inference_e2e_walkthrough/08-scheduler-execute.md) §3.
