@@ -421,3 +421,6 @@ fn json_err(msg: impl Into<String>) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests;
