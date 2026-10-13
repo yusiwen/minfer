@@ -106,8 +106,13 @@
 #                       computed shapes to equal the ones the engine actually
 #                       exported (the layer the animation plays); the render check
 #                       boots viz/e2e.js on a stubbed DOM/canvas and plays every
-#                       step, so a crash in the render path fails here. Both are
-#                       dependency-free Node, so the job needs no setup step.
+#                       step, so a crash in the render path fails here. The third
+#                       checker, `scripts/check_viz_assets.mjs`, evaluates each
+#                       page's asset loader and requires its requests to equal the
+#                       `viz/*.css` + `viz/*.js` file set, with no literal
+#                       `href=`/`src=` bypass (#103) — the hand-bumped `?v=N` it
+#                       replaced had no check at all. All three are dependency-free
+#                       Node, so the job needs no setup step.
 # 6. lint-workflows   : the workflow gate (#178). `scripts/lint_workflows.sh`
 #                       downloads a pinned actionlint release tarball, verifies
 #                       its per-architecture sha256, and refuses to lint with
@@ -516,9 +521,10 @@ jobs:
           test ! -e docs/assets/mermaid-init.js
 
   # The viz gate: the shape-flow model must agree with the engine's own export,
-  # and the render path must survive a full timeline. `node` is preinstalled on
-  # the runner image; adding `actions/setup-node@v4` would drag in the Node.js 20
-  # runtime the header comment warns about.
+  # the render path must survive a full timeline, and every asset a page loads
+  # must go through the page's own stamped loader (#103). `node` is preinstalled
+  # on the runner image; adding `actions/setup-node@v4` would drag in the Node.js
+  # 20 runtime the header comment warns about.
   check-viz:
     if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
@@ -528,6 +534,10 @@ jobs:
         run: node scripts/check_viz_e2e.mjs
       - name: The animation must boot and play every step headlessly
         run: node scripts/check_viz_e2e_render.mjs
+      - name: The asset-vs-page checker's own pass/fail cases
+        run: node scripts/check_viz_assets.mjs --selftest
+      - name: Every page asset must be requested through the stamped loader
+        run: node scripts/check_viz_assets.mjs
 
   # The workflow gate (#178). `scripts/lint_workflows.sh` pins actionlint 1.7.12
   # by release tarball *and* per-architecture sha256 (the `scripts/build_book.sh`
