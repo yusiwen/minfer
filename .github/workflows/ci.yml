@@ -575,11 +575,20 @@ jobs:
           OUT=$(python3 scripts/classify_changes.py --base "origin/$BASE_REF" --head "$SHA") \
             || OUT="decision_surface=true"
           SURFACE=$(printf '%s\n' "$OUT" | sed -n 's/^decision_surface=//p')
-          echo "surface=${SURFACE:-true}" >> "$GITHUB_OUTPUT"
+          # The decisions the range answers to, so the checker's failure names them
+          # (#541). One line, and empty when the range touches no governed surface.
+          QUESTION=$(printf '%s\n' "$OUT" | sed -n 's/^adr_question=//p')
+          {
+            echo "surface=${SURFACE:-true}"
+            echo "question=$QUESTION"
+          } >> "$GITHUB_OUTPUT"
       - name: The checker's own pass/fail cases
         run: python3 scripts/check_pr_body.py --selftest
       - name: The PR body must carry both gate sections, filled
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
           DECISION_SURFACE: ${{ steps.decision.outputs.surface }}
-        run: python3 scripts/check_pr_body.py --body-env PR_BODY --decision-surface "$DECISION_SURFACE"
+          ADR_QUESTION: ${{ steps.decision.outputs.question }}
+        run: |
+          python3 scripts/check_pr_body.py --body-env PR_BODY \
+            --decision-surface "$DECISION_SURFACE" --adr-question "$ADR_QUESTION"

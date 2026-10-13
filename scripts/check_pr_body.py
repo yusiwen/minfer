@@ -175,13 +175,15 @@ def section_state(text: str) -> str:
     return "filled"
 
 
-def check_body(body: str, decision_surface: bool = False) -> list[str]:
+def check_body(body: str, decision_surface: bool = False, adr_question: str = "") -> list[str]:
     """Every problem with `body`, in template order; empty means it passes.
 
     ``decision_surface`` is the classifier's answer for the *range*: true when it
     touched a path an ADR governs (or added a design document). The body then has to
     answer the question on one line — which ADR this implements, which it supersedes,
-    or ``none — <reason>``.
+    or ``none — <reason>``. ``adr_question`` is the classifier's own line, naming the
+    decisions the range answers to (#541); it is quoted back in the failure so the
+    message says *which* ADR is at stake instead of only that one is.
     """
     found = sections(body)
     problems: list[str] = []
@@ -215,11 +217,12 @@ def check_body(body: str, decision_surface: bool = False) -> list[str]:
     if decision_surface:
         match = ADR_LINE.search(body)
         if match is None:
+            governed = f" — {adr_question}" if adr_question else ""
             problems.append(
-                "this range touches a path an ADR governs (see the `changes` job's "
-                "`ADR question` lines), and the body has no `ADR:` line — write "
-                "`ADR: NNNN` (the decision this implements), `ADR: supersedes NNNN`, "
-                "or `ADR: none — <reason>`"
+                f"this range touches a surface an ADR governs{governed}, and the body "
+                "has no `ADR:` line — write `ADR: NNNN` (the decision this implements "
+                "or continues), `ADR: supersedes NNNN`, or `ADR: none — <why this "
+                "change does not move that decision>`"
             )
         else:
             answer = match.group(1).strip().strip("*_`").strip()
@@ -317,6 +320,17 @@ def adr_selftest_cases() -> list[tuple[str, bool, str]]:
             "no ADR line is required when the range has no decision surface",
             not check_body(body, decision_surface=False),
             "",
+        )
+    )
+    # #541: a missing answer names the decision the range touches
+    problems = check_body(
+        complete_body(), decision_surface=True, adr_question="ADR-0011 governs src/graph/registry.rs"
+    )
+    out.append(
+        (
+            "the failure names the ADR the range answers to",
+            any("ADR-0011" in p for p in problems),
+            "; ".join(problems),
         )
     )
     return out
@@ -483,6 +497,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="read the body from environment variable VAR (the CI-safe form)",
     )
     parser.add_argument(
+        "--adr-question",
+        metavar="TEXT",
+        default="",
+        help=(
+            "the classifier's `adr_question=…` line: the ADRs the range answers to, "
+            "quoted back in the failure message"
+        ),
+    )
+    parser.add_argument(
         "--decision-surface",
         metavar="true|false",
         default="",
@@ -509,7 +532,9 @@ def main(argv: list[str]) -> int:
 
     body = read_body(args)
     decision_surface = args.decision_surface.strip().casefold() == "true"
-    problems = check_body(body, decision_surface=decision_surface)
+    problems = check_body(
+        body, decision_surface=decision_surface, adr_question=args.adr_question.strip()
+    )
     if problems:
         for problem in problems:
             print(f"check_pr_body: {problem}", file=sys.stderr)

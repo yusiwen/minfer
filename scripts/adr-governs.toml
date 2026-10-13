@@ -1,0 +1,208 @@
+# Which ADR governs which code surface, and what it fixes there (#541).
+#
+# `scripts/check_adr.py` maps, `scripts/adr-citations.toml` and the corpus's shape
+# answer "is the record well formed?" and "which document's contract depends on it?".
+# Neither answers the question a person changing code actually has: **which decision is
+# at stake on this line?** This ledger answers it, one surface at a time, and
+# `scripts/classify_changes.py` reads it to make the PR-time question name the decision
+# instead of asking "is this an ADR matter?".
+#
+# A surface is a **path** (the file itself) or a **symbol**, and exactly one of the two
+# per entry. The symbol form means "the **definition sites** of this identifier under
+# `src/**/*.rs`" — a `fn`/`struct`/`enum`/`trait`/`const`/`static`/`type`/`impl`/`mod`
+# that defines it. Merely mentioning the name does not count, and that is measured, not
+# assumed: the first draft bound `MINFER_CACHE_TYPE` and `MINFER_PACKED_KV_STAGE` as
+# symbols, and a change to one Metal file then matched **eight** bindings, because those
+# tokens appear in comments all over the device layer. A name this tree does not *define*
+# (a knob, an FFI constant, a kernel symbol) is bound by the file that implements the
+# mechanism instead — the weaker form, chosen deliberately over a noisy one.
+#
+# `scripts/check_adr.py` enforces four things about this file:
+#   1. `adr` must exist in the corpus; `what` must be non-empty;
+#   2. exactly one of `path` / `symbol` must be present — a binding that names both is
+#      ambiguous about which one it means;
+#   3. a `path` must exist at the repository root, and a `symbol` must occur in at least
+#      one file under `src/` — the ledger may not rot into a list of names nothing holds;
+#   4. an entry whose ADR is `Superseded by ADR-NNNN` fails, naming the successor: a
+#      superseded decision governs nothing, and the entry must move to the successor.
+#
+# Coverage is deliberately partial, and the checker prints both numbers. An ADR with no
+# code surface is not an omission: a process decision (the corpus, the gates), a scope
+# decision (what a round includes) or an upstream decision (the identity gate) is not
+# something a diff can violate in a way a binding would catch. What matters is that a
+# *code* change to a governed shape names the decision.
+
+[[governs]]
+adr = "0002"
+what = "topology is a function of `GraphParams` alone, so `positions` cannot be structure"
+path = "src/graph/params.rs"
+
+[[governs]]
+adr = "0002"
+what = "graph reuse compares `GraphParams` only — the invariant above, enforced here"
+path = "src/graph/cache.rs"
+
+[[governs]]
+adr = "0006"
+what = "the KV storage format is a per-engine gate, resolved once per load, never a process-wide global"
+path = "src/graph/kvformat.rs"
+
+[[governs]]
+adr = "0007"
+what = "no ML frameworks: every operator is hand-written, so a dependency change is the decision"
+path = "Cargo.toml"
+
+[[governs]]
+adr = "0008"
+what = "a device `submit()` waits bounded and checks its status, and a guard failure aborts with the actual values"
+path = "src/metal/runtime.rs"
+
+[[governs]]
+adr = "0008"
+what = "the failure-injection seam every bounded device wait has to keep"
+path = "src/metal/encode.rs"
+
+[[governs]]
+adr = "0009"
+what = "a failure is an error, never a silent fallback — and assignment is decided at build time"
+symbol = "supports_op"
+
+[[governs]]
+adr = "0011"
+what = "backend ids and priorities are appended, never renumbered: the id is a file-format contract"
+path = "src/graph/registry.rs"
+
+[[governs]]
+adr = "0011"
+what = "the KV-session reader depends on the id space above, so it moves with it"
+path = "src/graph/kvsession.rs"
+
+[[governs]]
+adr = "0013"
+what = "the CPU quantizes activations to Q8_0 on the fly; a device reads f32"
+symbol = "quantize_row_q8_0"
+
+[[governs]]
+adr = "0014"
+what = "a KV session is a versioned, checksummed file — verified whole, never a memory dump"
+path = "src/graph/kvsession.rs"
+
+[[governs]]
+adr = "0015"
+what = "the offload `auto` fit takes the largest prefix, never a knapsack"
+path = "src/graph/offload.rs"
+
+[[governs]]
+adr = "0016"
+what = "a failed device-memory query is not a zero budget"
+path = "src/graph/allocplan.rs"
+
+[[governs]]
+adr = "0016"
+what = "memory is accounted before it is allocated, and the refusal names the numbers"
+path = "src/graph/alloc.rs"
+
+[[governs]]
+adr = "0017"
+what = "speculative decoding refuses the features its identity contract cannot carry"
+path = "src/spec.rs"
+
+[[governs]]
+adr = "0018"
+what = "the grammar mask is one stage inside the single sampler pipeline"
+path = "src/sampler.rs"
+
+[[governs]]
+adr = "0018"
+what = "the mask's pushdown automaton is that stage's mechanism"
+path = "src/grammar.rs"
+
+[[governs]]
+adr = "0019"
+what = "a chat template that cannot be rendered refuses the load — there is no fallback"
+path = "src/template.rs"
+
+[[governs]]
+adr = "0020"
+what = "a quantized file is byte-identical to `llama-quantize`, or it is wrong"
+path = "src/quantize.rs"
+
+[[governs]]
+adr = "0020"
+what = "the on-disk quantized block layout is the byte contract's other end"
+path = "src/block.rs"
+
+[[governs]]
+adr = "0020"
+what = "the writer's bytes are the contract the identity is checked against"
+path = "src/gguf_write.rs"
+
+[[governs]]
+adr = "0021"
+what = "bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32"
+path = "src/convert.rs"
+
+[[governs]]
+adr = "0021"
+what = "the same conversion rule on the CPU dot path"
+path = "src/vec_ops/bf16.rs"
+
+[[governs]]
+adr = "0030"
+what = "launch severity lives in the helper, not repeated at 120 call sites"
+path = "src/cuda/kernels/guard.cu"
+
+[[governs]]
+adr = "0031"
+what = "capture runs in thread-local mode, because Global lets a foreign thread's call join the window"
+path = "src/cuda.rs"
+
+[[governs]]
+adr = "0031"
+what = "the same capture window, seen from the graph executor"
+path = "src/graph/cuda_backend.rs"
+
+[[governs]]
+adr = "0032"
+what = "the packed-KV staging window is f32, not f16"
+path = "src/graph/metal_backend.rs"
+
+[[governs]]
+adr = "0033"
+what = "the CUDA pool recycles exact byte lengths, never frees, and reports OOM as an error"
+path = "src/graph/cuda_backend.rs"
+
+[[governs]]
+adr = "0034"
+what = "the smem opt-in is an eager pre-warm by construction, with the lazy path as defence in depth"
+path = "src/cuda.rs"
+
+[[governs]]
+adr = "0035"
+what = "the q4_K dsc plane is admitted by two gates, and the payload test is equality"
+path = "src/models/weight_reg.rs"
+
+[[governs]]
+adr = "0035"
+what = "the same admission, at the prefill MMQ dispatch"
+path = "src/cuda/methods/prefill_mmq.rs"
+
+[[governs]]
+adr = "0036"
+what = "bf16 weights get their own device kernels, not a dtype flag on the f16 ones"
+path = "src/metal/kernels/bf16.metal"
+
+[[governs]]
+adr = "0036"
+what = "the same decision on the CUDA activation path"
+path = "src/cuda/methods/gpu_act.rs"
+
+[[governs]]
+adr = "0037"
+what = "a Metal weight dtype a kernel cannot consume is refused, never run as a wrong kernel"
+path = "src/metal/ops.rs"
+
+[[governs]]
+adr = "0038"
+what = "the per-tensor registration dispatch is one shared rule, not a copy per loader"
+path = "src/models/weight_reg.rs"

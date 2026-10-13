@@ -540,10 +540,16 @@ the body through `env:`, so it needs no token and works on a fork PR ([#175],
 [#335]). This is the shape, not the rules: the rules stay stated once, above.
 
 **The ADR question rides the same body, and it is the one section whose *need* is
-computed.** `scripts/classify_changes.py` carries `DECISION_PATHS` — the small set of files
-whose subject is an ADR's subject (a file format, an id space, an op vocabulary, a
-byte-identity promise) — and reports `decision_surface` for the range, plus an
-`ADR question` line on stderr naming the ADRs the touched path answers to. When it is
+computed.** `scripts/adr-governs.toml` binds each ADR to the surfaces it governs — a `path`, or a
+`symbol` meaning the identifier's **definition sites** under `src/` — and
+`scripts/classify_changes.py` reads it: a range that touches a governed surface reports
+`decision_surface=true`, an `ADR question` line on stderr and an `adr_question=` line on stdout,
+naming the decision (`ADR-0011 governs src/graph/registry.rs — backend ids are appended, never
+renumbered`). The body checker quotes that line into its failure, so the message says which decision
+is at stake instead of that one might be. `check_adr.py` validates the ledger — the ADR exists and is
+not superseded, exactly one of `path`/`symbol`, a path exists, a symbol is defined somewhere — and
+prints how many ADRs bind no code surface, because partial coverage is a fact, not an omission
+(ADR-0040). When it is
 true, the body must answer on one line: `ADR: NNNN` (this implements that decision),
 `ADR: supersedes NNNN`, or `ADR: none — <reason>`; `check-pr-body` refuses a missing line,
 a bare `none` and a bare word. The trigger list is short on purpose ([ADR-0023](adr/0023-the-machine-ledgers-live-beside-their-checkers.md)) — a
@@ -695,3 +701,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0024](adr/0024-a-machine-read-record-is-not-book-content.md) — A machine-read record is not book content
 - [ADR-0025](adr/0025-a-docs-only-change-skips-the-compilers.md) — A docs-only change runs the docs gate, not the compilers
 - [ADR-0039](adr/0039-the-corpus-is-entered-through-a-question-at-pr-time.md) — The corpus is entered through a question at PR time, and its maps are checked
+- [ADR-0040](adr/0040-a-decision-is-bound-to-the-surfaces-it-governs.md) — A decision is bound to the surfaces it governs, so the question names it

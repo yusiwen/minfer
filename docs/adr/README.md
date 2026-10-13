@@ -30,9 +30,9 @@ question at PR time. The test is **not** "is this change important?":
 | chooses between alternatives a reader would otherwise re-litigate | fixes a bug, a typo, a count or a broken citation |
 | makes a mechanism's contract that a design document will then describe | measures something (that is a record, not a decision) |
 
-`scripts/classify_changes.py` carries the mechanical half — `DECISION_PATHS`, the small
-set of files whose *subject is an ADR's subject* — and a PR touching one of them, or
-adding a `docs/*-DESIGN.md`, must answer on one line, in the body:
+`scripts/adr-governs.toml` carries the mechanical half — the binding from each ADR to the
+surfaces it governs (a file, or an identifier's *definition sites*, so the binding survives a move) —
+and a PR touching one of them, or adding a `docs/*-DESIGN.md`, must answer on one line, in the body:
 
 ```
 ADR: 0011                                          # this implements that decision
@@ -41,7 +41,9 @@ ADR: none — a comment-only edit to the gate table  # not a decision, and here 
 ```
 
 `check_pr_body.py` enforces the *presence* of that line and the shape of its answer, never
-its truth — the same limit every other prose gate has. The trigger list is deliberately
+its truth — the same limit every other prose gate has. The failure quotes the binding, so it reads
+*"`src/graph/registry.rs` is governed by ADR-0011 …"* rather than asking whether an ADR is involved
+(ADR-0040). The trigger list is deliberately
 short (ADR-0023: a gate earns its keep), because a question asked on routine work is
 answered with a reflex, and a reflex is not a decision.
 
@@ -156,7 +158,8 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0036](./0036-bf16-gets-its-own-device-kernels.md) | 2026-10-10 | bf16 weights get their own device kernels, not a dtype flag on the f16 ones | Accepted |
 | [0037](./0037-a-metal-weight-dtype-a-kernel-cannot-consume-is-refused.md) | 2026-10-10 | A Metal weight dtype a kernel cannot consume is refused, never run as a wrong kernel | Accepted |
 | [0038](./0038-the-per-tensor-registration-dispatch-is-one-shared-rule.md) | 2026-10-10 | The per-tensor registration dispatch is one shared rule, not a copy per loader | Accepted |
-| [0039](./0039-the-corpus-is-entered-through-a-question-at-pr-time.md) | 2026-10-11 | The corpus is entered through a question at PR time, and its maps are checked | Accepted |
+| [0039](./0039-the-corpus-is-entered-through-a-question-at-pr-time.md) | 2026-10-11 | The corpus is entered through a question at PR time, and its maps are checked | Accepted (corrected by ADR-0040) |
+| [0040](./0040-a-decision-is-bound-to-the-surfaces-it-governs.md) | 2026-10-11 | A decision is bound to the surfaces it governs, so the question names it | Accepted (corrects ADR-0039) |
 
 ## The template
 
