@@ -1154,30 +1154,43 @@ impl QuantizePlan {
                 // the row-length rule below.
                 let mut tied_kept = !keep && tied_embed;
                 if !keep && !row_ok {
-                    if let Some(fb) = asked.row_len_fallback() {
-                        // llama.cpp's `tensor_type_fallback`: a 256-block
-                        // target whose row is not a multiple of 256 demotes to
-                        // a legacy 32-block type, a legacy target demotes to
-                        // F16, and either demotes to F16 anyway when even the
-                        // 32-element block does not divide the row.
-                        tied_kept = false;
-                        if ti.ne[0] % fb.blck_size() as i64 == 0 {
-                            tgt = fb.ggml_type();
-                            retarget = Some(fb);
-                            demoted.push(format!(
-                                "{} -> {} (row % {} != 0)",
-                                ti.name,
-                                fb.name(),
-                                asked.blck_size()
-                            ));
-                        } else {
-                            tgt = crate::gguf::GgmlType::F16;
-                            retarget = Some(QT::F16);
-                            demoted.push(format!(
-                                "{} -> f16 (no encoder block size divides the row)",
-                                ti.name
-                            ));
-                        }
+                    // `asked` is a quant target whenever `!row_ok` (F16/F32 have
+                    // a 1-element block, so no row can fail), and every quant
+                    // target has a fallback — but a future target added without
+                    // one must refuse here, not fall through to an encoder whose
+                    // `chunks_exact` would drop the tail of the row.
+                    let fb = asked.row_len_fallback().ok_or_else(|| {
+                        format!(
+                            "minfer quantize: tensor '{}' has a row of {} elements that {}-element \
+                             blocks cannot divide, and {} has no fallback type",
+                            ti.name,
+                            ti.ne[0],
+                            asked.blck_size(),
+                            asked.name()
+                        )
+                    })?;
+                    // llama.cpp's `tensor_type_fallback`: a 256-block
+                    // target whose row is not a multiple of 256 demotes to
+                    // a legacy 32-block type, a legacy target demotes to
+                    // F16, and either demotes to F16 anyway when even the
+                    // 32-element block does not divide the row.
+                    tied_kept = false;
+                    if ti.ne[0] % fb.blck_size() as i64 == 0 {
+                        tgt = fb.ggml_type();
+                        retarget = Some(fb);
+                        demoted.push(format!(
+                            "{} -> {} (row % {} != 0)",
+                            ti.name,
+                            fb.name(),
+                            asked.blck_size()
+                        ));
+                    } else {
+                        tgt = crate::gguf::GgmlType::F16;
+                        retarget = Some(QT::F16);
+                        demoted.push(format!(
+                            "{} -> f16 (no encoder block size divides the row)",
+                            ti.name
+                        ));
                     }
                 }
                 if tied_kept {
