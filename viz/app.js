@@ -1523,7 +1523,11 @@ async function connectLive() {
   if (!base) return;
   liveState.base = base;
   try {
-    const res = await fetch(base + "/viz/graph");
+    // Every runtime data request in this file revalidates (#546): a plain static
+    // server sends no `Cache-Control`, only `Last-Modified`, so a browser may reuse
+    // a *regenerated* sample or manifest from its cache rather than the file on
+    // disk. `no-cache` keeps the stored body and asks the server to confirm it.
+    const res = await fetch(base + "/viz/graph", { cache: "no-cache" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const doc = await res.json();
     state.live = true;
@@ -1647,7 +1651,7 @@ function stopPlayback() { setPlaying(false); }
 
 async function loadManifest() {
   try {
-    const res = await fetch("samples/manifest.json");
+    const res = await fetch("samples/manifest.json", { cache: "no-cache" });
     if (!res.ok) throw new Error("no manifest");
     const m = await res.json();
     const sel = document.getElementById("model-select");
@@ -1659,7 +1663,7 @@ async function loadManifest() {
     }
     sel.addEventListener("change", () => {
       const v = sel.value;
-      if (v) fetch(v).then(r => r.json()).then(loadDoc).catch(err => console.error(err));
+      if (v) fetch(v, { cache: "no-cache" }).then(r => r.json()).then(loadDoc).catch(err => console.error(err));
     });
   } catch (e) {
     // file:// 下无法 fetch：保留「打开文件」路径
@@ -1800,7 +1804,7 @@ function init() {
   loadManifest();
 
   // 若本页由 minfer --viz 伺服（同源 /viz/graph 可达），自动填充直播地址并连接
-  fetch("/viz/graph").then(r => {
+  fetch("/viz/graph", { cache: "no-cache" }).then(r => {
     if (r.ok) {
       document.getElementById("live-url").value = location.origin;
       document.getElementById("live-panel").hidden = false;
@@ -1811,7 +1815,7 @@ function init() {
   // ?file= 直接加载
   const params = new URLSearchParams(location.search);
   const file = params.get("file");
-  if (file) fetch(file).then(r => r.json()).then(loadDoc).catch(e => console.error("loadDoc:", e));
+  if (file) fetch(file, { cache: "no-cache" }).then(r => r.json()).then(loadDoc).catch(e => console.error("loadDoc:", e));
 
   // With no graph loaded yet, nothing is playable — gray out the playback and
   // load-graph controls until a graph/trace is actually loaded (or live connects).

@@ -260,14 +260,32 @@ fn html(body: String) -> Response {
 
 /// Serve samples/ from disk (`MINFER_VIZ_DIR` or `viz` relative to CWD).
 async fn sample_asset(Path(name): Path<String>) -> Response {
+    let dir = std::env::var("MINFER_VIZ_DIR").unwrap_or_else(|_| "viz".to_string());
+    sample_response(std::path::Path::new(&dir), &name)
+}
+
+/// The body of [`sample_asset`], with the directory passed in so the JSON contract
+/// is testable without the process-wide `MINFER_VIZ_DIR` (#546).
+///
+/// Samples are data, not code: one may be regenerated in place under the same name,
+/// and a browser holding a copy has no way to know. `no-cache` says *revalidate* —
+/// a client that asks gets the file on disk — where `no-store` (the code assets'
+/// rule, [`asset`]) would forbid keeping the copy at all. Nothing here is a
+/// validator yet, so a revalidation costs the whole body; adding one is filed on
+/// #546. The `viz/` pages ask for exactly this themselves (`cache: 'no-cache'` on
+/// every runtime fetch), which is what covers a plain static server too — that
+/// server is not ours and sends no `Cache-Control` at all.
+fn sample_response(dir: &std::path::Path, name: &str) -> Response {
     if name.contains('/') || name.contains("..") {
         return (StatusCode::BAD_REQUEST, "bad path").into_response();
     }
-    let dir = std::env::var("MINFER_VIZ_DIR").unwrap_or_else(|_| "viz".to_string());
-    let path = std::path::Path::new(&dir).join("samples").join(&name);
+    let path = dir.join("samples").join(name);
     match std::fs::read(&path) {
         Ok(bytes) => (
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            [
+                (axum::http::header::CONTENT_TYPE, "application/json"),
+                (axum::http::header::CACHE_CONTROL, "no-cache"),
+            ],
             bytes,
         )
             .into_response(),
