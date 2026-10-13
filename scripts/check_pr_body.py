@@ -99,6 +99,15 @@ WHITESPACE_RE = re.compile(r"\s+")
 REQUIRED_NORMS = {h.casefold(): h for h in REQUIRED_HEADINGS}
 CONTENT_NORMS = {h.casefold() for h in CONTENT_HEADINGS}
 
+#: The line the ADR question is answered on, when the change classifier says the range
+#: touches a path an ADR governs (#539). One line, three legitimate answers, and the
+#: point is that silence is none of them.
+ADR_LINE = re.compile(r"^\s*ADR\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+#: `none — <reason>`: the change is not a decision, and the reason says why.
+ADR_NONE = re.compile(r"^none\s*[—-]\s*(\S.*)$", re.IGNORECASE)
+#: An ADR reference: `0011`, `ADR-0011` or `0011-backend-ids-are-append-only`.
+ADR_REF = re.compile(r"^(?:ADR-)?\d{4}(?:-[a-z0-9][a-z0-9-]*)?$", re.IGNORECASE)
+
 
 def normalize_heading(text: str) -> str:
     """A heading text reduced to its comparable form.
@@ -166,8 +175,14 @@ def section_state(text: str) -> str:
     return "filled"
 
 
-def check_body(body: str) -> list[str]:
-    """Every problem with `body`, in template order; empty means it passes."""
+def check_body(body: str, decision_surface: bool = False) -> list[str]:
+    """Every problem with `body`, in template order; empty means it passes.
+
+    ``decision_surface`` is the classifier's answer for the *range*: true when it
+    touched a path an ADR governs (or added a design document). The body then has to
+    answer the question on one line — which ADR this implements, which it supersedes,
+    or ``none — <reason>``.
+    """
     found = sections(body)
     problems: list[str] = []
     for position, heading in enumerate(REQUIRED_HEADINGS, start=1):
@@ -197,6 +212,32 @@ def check_body(body: str) -> list[str]:
                 f'"## {heading}" (line {line}) still holds only the template '
                 f'placeholder ("{PLACEHOLDER_PREFIX} ...")'
             )
+    if decision_surface:
+        match = ADR_LINE.search(body)
+        if match is None:
+            problems.append(
+                "this range touches a path an ADR governs (see the `changes` job's "
+                "`ADR question` lines), and the body has no `ADR:` line — write "
+                "`ADR: NNNN` (the decision this implements), `ADR: supersedes NNNN`, "
+                "or `ADR: none — <reason>`"
+            )
+        else:
+            answer = match.group(1).strip().strip("*_`").strip()
+            if ADR_NONE.match(answer):
+                reason = ADR_NONE.match(answer).group(1).strip()
+                if not reason or reason.casefold().startswith(PLACEHOLDER_PREFIX.casefold()):
+                    problems.append(
+                        f"the `ADR: none` line needs a reason — `ADR: none — <why this "
+                        f"change is not a decision>`, not {answer!r}"
+                    )
+            elif ADR_REF.match(answer) or answer.casefold().startswith("supersedes "):
+                pass
+            else:
+                problems.append(
+                    f"the `ADR:` line reads {answer!r}; use an ADR reference "
+                    "(`0011` / `ADR-0011` / `0011-slug`), `supersedes NNNN`, or "
+                    "`none — <reason>`"
+                )
     return problems
 
 
@@ -246,6 +287,39 @@ def complete_body(
         "N/A — none\n"
         f"## Mac verification\n{mac}\n"
     )
+
+
+ADR_CASES: list[tuple[str, str, bool]] = (
+    ("an `ADR: NNNN` line answers the question", "ADR: 0011\n", True),
+    ("an `ADR: ADR-NNNN` line answers it", "ADR: ADR-0011\n", True),
+    ("an `ADR: NNNN-slug` line answers it", "ADR: 0011-backend-ids-are-append-only\n", True),
+    ("`ADR: supersedes NNNN` answers it", "ADR: supersedes 0011\n", True),
+    ("`ADR: none — <reason>` answers it", "ADR: none — a comment-only edit\n", True),
+    ("`ADR: none` without a reason does not", "ADR: none\n", False),
+    ("an empty `ADR:` line does not", "ADR:\n", False),
+    ("a bare word does not", "ADR: probably fine\n", False),
+    ("an unrelated line does not", "no ADR mentioned here\n", False),
+)
+
+
+def adr_selftest_cases() -> list[tuple[str, bool, str]]:
+    """`(name, should_pass, detail)` for the ADR-question rule (#539)."""
+    out: list[tuple[str, bool, str]] = []
+    for name, line, should_pass in ADR_CASES:
+        body = complete_body().replace("presence is checkable\n", f"presence is checkable\n{line}")
+        problems = check_body(body, decision_surface=True)
+        adr_problems = [p for p in problems if "ADR:" in p or "ADR question" in p]
+        out.append((name, (not adr_problems) == should_pass, "; ".join(adr_problems)))
+    # the same body passes when the range contains no decision surface
+    body = complete_body()
+    out.append(
+        (
+            "no ADR line is required when the range has no decision surface",
+            not check_body(body, decision_surface=False),
+            "",
+        )
+    )
+    return out
 
 
 def selftest_cases() -> list[tuple[str, str, bool, str | None]]:
@@ -366,12 +440,20 @@ def run_selftest() -> int:
             failures += 1
             print(f"      expected {'pass' if should_pass else f'a failure naming {expected!r}'}")
             print(f"      got: {problems or 'pass'}")
+    # The ADR question (#539): one case per answer form it accepts and per form it
+    # refuses, each driven through `check_body` with the classifier's answer set.
+    adr_cases = adr_selftest_cases()
+    for name, ok, detail in adr_cases:
+        print(f"{'PASS' if ok else 'FAIL'}  {name}")
+        if not ok:
+            failures += 1
+            print(f"      got: {detail or 'no detail'}")
     # The help text must state the limit (issue #175 acceptance).
     help_ok = HELP_LIMIT in build_parser().description
     print(f"{'PASS' if help_ok else 'FAIL'}  --help states the presence/truth limit")
     if not help_ok:
         failures += 1
-    total = len(selftest_cases()) + 1
+    total = len(selftest_cases()) + len(adr_cases) + 1
     print(f"check_pr_body selftest: {total - failures}/{total} cases pass")
     return 1 if failures else 0
 
@@ -401,6 +483,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="read the body from environment variable VAR (the CI-safe form)",
     )
     parser.add_argument(
+        "--decision-surface",
+        metavar="true|false",
+        default="",
+        help=(
+            "the `changes` job's answer for this range: when true, the body must carry "
+            "an `ADR:` line (`NNNN`, `supersedes NNNN`, or `none — <reason>`)"
+        ),
+    )
+    parser.add_argument(
         "--selftest",
         action="store_true",
         help="run the built-in pass/fail cases in-process and exit non-zero on a failure",
@@ -417,7 +508,8 @@ def main(argv: list[str]) -> int:
         return run_selftest()
 
     body = read_body(args)
-    problems = check_body(body)
+    decision_surface = args.decision_surface.strip().casefold() == "true"
+    problems = check_body(body, decision_surface=decision_surface)
     if problems:
         for problem in problems:
             print(f"check_pr_body: {problem}", file=sys.stderr)
@@ -427,9 +519,15 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+    adr = (
+        " · the ADR question is answered"
+        if decision_surface
+        else " · no decision surface in this range (the ADR question is not asked)"
+    )
     print(
         f"check_pr_body: all {len(REQUIRED_HEADINGS)} required headings present and the "
         f"{len(CONTENT_HEADINGS)} checked sections filled (presence only, not truth)"
+        + adr
     )
     return 0
 

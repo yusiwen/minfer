@@ -53,6 +53,13 @@ STATUS = re.compile(r"^(Proposed|Accepted|Rejected|Superseded by ADR-(\d{4}))$")
 DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 REF = re.compile(r"ADR-(\d{4})")
 REQUIRED_SECTIONS = ("## Context", "## Decision", "## Alternatives considered", "## Consequences")
+#: The heading a design document uses to declare which ADRs its contract depends on
+#: (ADR-0028). It is the only index from a contract back to the decision behind it.
+MAP_HEADING = "## Decisions governing this document"
+#: A map entry: `- [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — <title>`.
+MAP_LINK = re.compile(r"\[ADR-(\d{4})\]\(([^)]+)\)")
+#: The ledger naming the ADRs that govern no document's contract, beside this checker.
+MAP_LEDGER = "scripts/adr-map-exclusions.toml"
 
 #: Repository-rooted path shapes an ADR may cite. A token carrying a wildcard, a
 #: placeholder or a trailing `/` is a pattern or a directory, not a citation.
@@ -131,6 +138,28 @@ def load_citation_ledger(root: Path) -> tuple[dict[tuple[str, str], str], list[s
             problems.append(f"{rel}: {adr} {token} is pinned twice")
         entries[key] = kind
     return entries, problems
+
+
+def map_section(text: str) -> str | None:
+    """A document's `## Decisions governing this document` body, or `None` without one."""
+    match = re.search(
+        rf"^{re.escape(MAP_HEADING)}\s*$(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL
+    )
+    return match.group(1) if match else None
+
+
+def load_map_ledger(root: Path) -> dict[str, str]:
+    """`{adr number: reason}` from the map-exclusion ledger; `ValueError` on an empty reason."""
+    path = root / MAP_LEDGER
+    if not path.is_file():
+        return {}
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    out: dict[str, str] = {}
+    for number, reason in data.get("exclude", {}).items():
+        if not reason or not str(reason).strip():
+            raise ValueError(f"{MAP_LEDGER}: `{number}` needs a non-empty reason")
+        out[number] = str(reason)
+    return out
 
 
 def index_table_row(index_text: str, name: str) -> str | None:
@@ -258,6 +287,60 @@ def check(root: Path) -> int:
                 "book is an index nobody reads"
             )
 
+    # a design document's map lists the decisions its contract depends on (ADR-0028),
+    # and every ADR is either mapped or recorded as governing no document's contract
+    # (#539). The map is the only index from a contract back to its decision, and
+    # nothing checked it: a typo'd number, a link to a renamed file and a decision no
+    # document claims all read exactly like a maintained map.
+    try:
+        excluded = load_map_ledger(root)
+    except (ValueError, tomllib.TOMLDecodeError) as exc:
+        problems.append(str(exc))
+        excluded = {}
+    listed: dict[str, list[str]] = {}
+    maps = 0
+    for page in sorted((root / "docs").rglob("*.md")):
+        section = map_section(read(page))
+        if section is None:
+            continue
+        maps += 1
+        rel = page.relative_to(root)
+        entries = MAP_LINK.findall(section)
+        if not entries:
+            problems.append(
+                f"{rel}: `{MAP_HEADING}` carries no `[ADR-NNNN](adr/…)` entry — a document "
+                "whose contract depends on no decision should not have the heading"
+            )
+        for number, link in entries:
+            adr = seen.get(number)
+            if adr is None:
+                problems.append(
+                    f"{rel}: the map lists ADR-{number}, which is not an ADR of this corpus"
+                )
+                continue
+            listed.setdefault(number, []).append(rel.as_posix())
+            expected = f"adr/{adr.path.name}"
+            if link != expected:
+                problems.append(
+                    f"{rel}: the map links ADR-{number} at `{link}`, but that ADR is `{expected}`"
+                )
+    for number, adr in sorted(seen.items()):
+        if number in listed or number in excluded:
+            continue
+        problems.append(
+            f"docs/adr/{adr.path.name}: no document's `{MAP_HEADING}` map lists it, and "
+            f"{MAP_LEDGER} does not record why — add it to the map of the document whose "
+            "contract it governs, or record that it governs none"
+        )
+    for number in sorted(excluded):
+        if number not in seen:
+            problems.append(f"{MAP_LEDGER}: `{number}` is not an ADR of this corpus")
+        elif number in listed:
+            problems.append(
+                f"{MAP_LEDGER}: `{number}` is listed in {listed[number][0]}; the exclusion "
+                "is unnecessary"
+            )
+
     # a correction is forward-only and visible from the corrected ADR's index row
     for adr in adrs:
         rel = adr.path.relative_to(root)
@@ -305,8 +388,11 @@ def check(root: Path) -> int:
             print(f"check_adr: {p}")
         print(f"check_adr: {len(problems)} problem(s) across {len(adrs)} ADR(s)")
         return 1
-    print(f"check_adr: {len(adrs)} ADR(s) numbered 0001-{adrs[-1].file_number if adrs else '????'}, "
-          f"indexed, supersession consistent")
+    print(
+        f"check_adr: {len(adrs)} ADR(s) numbered 0001-{adrs[-1].file_number if adrs else '????'}, "
+        f"indexed, supersession consistent · {maps} map(s), {len(listed)} ADR(s) mapped, "
+        f"{len(excluded)} recorded as governing none"
+    )
     return 0
 
 
@@ -347,12 +433,27 @@ def _write(root: Path, name: str, text: str) -> None:
 
 def _fixture(root: Path, adrs: dict[str, str], readme: str = FIXTURE_README,
              summary: str = "# Summary\n\n- [ADR index](./adr/README.md)\n",
-             citations: str = "") -> None:
+             citations: str = "", maps: dict[str, str] | None = None,
+             map_ledger: str = "") -> None:
     for name, text in adrs.items():
         _write(root, name, text)
     _write(root, "README.md", readme)
     (root / "scripts").mkdir(parents=True, exist_ok=True)
     (root / "scripts" / "adr-citations.toml").write_text(citations, encoding="utf-8")
+    (root / "scripts" / "adr-map-exclusions.toml").write_text(map_ledger, encoding="utf-8")
+    if maps is None:
+        # Every fixture ADR is mapped by a fixture contract, so a case that is about
+        # another rule is not also a case about an unmapped decision (#539). A case
+        # that *is* about the map passes `maps={}` or its own section.
+        maps = {
+            "docs/FIXTURE-CONTRACT.md": "\n".join(
+                f"- [ADR-{name[:4]}](adr/{name}) — a fixture decision" for name in adrs
+            )
+        }
+    for rel, section in maps.items():
+        page = root / rel
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(f"# A design document\n\n{MAP_HEADING}\n\n{section}\n", encoding="utf-8")
     (root / "docs" / "SUMMARY.md").write_text(summary, encoding="utf-8")
 
 
@@ -500,6 +601,53 @@ def selftest() -> int:
         _fixture(root, {"0001-first-decision.md": cited_adr("docs/gone.md")},
                  citations=pinned("0001", "docs/gone.md", kind="because"))
         expect("an unknown citation kind fails", check(root) == 1)
+
+    # --- the map of a document's decisions (#539) -----------------------------
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR}, maps={})
+        expect("an ADR no map lists fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 maps={"docs/CONTRACT.md": "- [ADR-0002](adr/0002-nope.md) — a missing one"})
+        expect("a map naming an ADR that does not exist fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 maps={"docs/CONTRACT.md": "- [ADR-0001](adr/0001-renamed.md) — a bad link"})
+        expect("a map linking an ADR at the wrong filename fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR}, maps={"docs/CONTRACT.md": ""})
+        expect("a map with the heading and no entry fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR}, maps={},
+                 map_ledger='[exclude]\n0001 = "a process decision about the machinery"\n')
+        expect("an ADR recorded as governing no contract passes", check(root) == 0)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 map_ledger='[exclude]\n0001 = "unnecessary, it is mapped"\n')
+        expect("an exclusion whose ADR a map lists fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR}, maps={},
+                 map_ledger='[exclude]\n0002 = "not an ADR of this corpus"\n')
+        expect("an exclusion that is not an ADR fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR}, maps={},
+                 map_ledger='[exclude]\n0001 = ""\n')
+        expect("an empty map-exclusion reason fails", check(root) == 1)
 
     with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
         root = Path(tmp)

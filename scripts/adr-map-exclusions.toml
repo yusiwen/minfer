@@ -1,0 +1,41 @@
+# The ADRs that govern no document's contract, and why each is still a real decision
+# (#539).
+#
+# `scripts/check_adr.py` reads every design document's `## Decisions governing this
+# document` map (ADR-0028) and requires each ADR to be either **mapped** — listed by
+# the document whose contract it fixes — or **recorded here**. The map is the only
+# index from a contract back to the decision behind it; before this check a typo'd
+# number, a link to a renamed ADR and a decision no document claims all read exactly
+# like a maintained map.
+#
+# The checker enforces three things about this file:
+#   1. an ADR that no map lists and that is not recorded here is a failure (a new
+#      decision nobody can find from the contract it governs);
+#   2. an entry whose ADR **is** listed in some map is a failure (the exclusion has
+#      become unnecessary — delete it, the map is the better home);
+#   3. an entry that is not an ADR of this corpus is a failure, and `reason` must be
+#      non-empty.
+#
+# Two kinds are recorded here, and both are decisions a reader still needs:
+#
+#   process-decision  a decision about *this repository's machinery* — the corpus, the
+#                     classifier, the gates — rather than about a document's contract.
+#                     ADR-0028 already reasons that three kinds of page carry no map
+#                     because a fact *about* a decision is not a contract that depends
+#                     on one; the same argument applies to these ADRs themselves.
+#   superseded        the decision no longer holds, so no current contract can depend
+#                     on it. The successor is the ADR a map would list.
+
+[exclude]
+
+0003 = "superseded: ADR-0005 made Metal a first-class backend, so 'Metal is out of scope for this round' governs no current contract — a map that needs this decision lists ADR-0005 instead"
+
+0022 = "process-decision: how a defect in a frozen ADR is corrected (a new ADR plus a two-way `Corrects:` link), which is a rule about the corpus itself; its home is `docs/adr/README.md`, whose contract is the index, not a design document"
+
+0026 = "process-decision: the change classifier carries no docs-path exception — ADR-0025's follow-through, about `scripts/classify_changes.py`, not about a design document's contract"
+
+0027 = "process-decision: a citation is dated too, a rule about what may be written *inside* an ADR; the document that enforces it is `scripts/adr-citations.toml` and `docs/GATE-CONTRACT.md`'s anchor section, which lists the ADRs its contract depends on"
+
+0028 = "process-decision: a document's map lists what its contract depends on — a rule about the maps themselves, so it cannot be an entry in one without circularity"
+
+0029 = "process-decision: an ADR's prose count is dated and its References are map evidence — like ADR-0028, a rule about how the corpus is written; it corrects ADR-0028 rather than governing a document's contract"

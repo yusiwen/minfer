@@ -18,6 +18,33 @@ has exactly one home:
 | Unresolvable path citations in this corpus, each with a reason | `scripts/adr-citations.toml`, beside its checker | Yes |
 | A machine-read record: fixture provenance, an accepted-annotation baseline | beside its readers, never in the book tree — `tests/fixtures/f6-fixtures.json`, `scripts/dead-code-baseline.toml` (ADR-0024) | Yes |
 
+## When an ADR is required
+
+The corpus cannot enforce its own use — `scripts/check_adr.py` can force a shape, not a
+habit — so the trigger is written here, and the `changes`/`check-pr-body` jobs ask the
+question at PR time. The test is **not** "is this change important?":
+
+| Write an ADR when the change… | Do **not** when it… |
+|---|---|
+| picks or moves a shape that later work must obey: a file format, an id space, an op vocabulary, a byte-identity promise, a refusal rule, a new design contract | implements a decision already recorded — cite it, do not restate it |
+| chooses between alternatives a reader would otherwise re-litigate | fixes a bug, a typo, a count or a broken citation |
+| makes a mechanism's contract that a design document will then describe | measures something (that is a record, not a decision) |
+
+`scripts/classify_changes.py` carries the mechanical half — `DECISION_PATHS`, the small
+set of files whose *subject is an ADR's subject* — and a PR touching one of them, or
+adding a `docs/*-DESIGN.md`, must answer on one line, in the body:
+
+```
+ADR: 0011                                          # this implements that decision
+ADR: supersedes 0011                               # this replaces it (new ADR + Status)
+ADR: none — a comment-only edit to the gate table  # not a decision, and here is why
+```
+
+`check_pr_body.py` enforces the *presence* of that line and the shape of its answer, never
+its truth — the same limit every other prose gate has. The trigger list is deliberately
+short (ADR-0023: a gate earns its keep), because a question asked on routine work is
+answered with a reflex, and a reflex is not a decision.
+
 **What a map lists.** A design document ends with `## Decisions governing this document` — its
 **map**. It lists the ADRs whose decision that document's current contract **depends on** (states
 it, or requires it); naming another document's decision is a cross-reference, which belongs in the
@@ -129,6 +156,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0036](./0036-bf16-gets-its-own-device-kernels.md) | 2026-10-10 | bf16 weights get their own device kernels, not a dtype flag on the f16 ones | Accepted |
 | [0037](./0037-a-metal-weight-dtype-a-kernel-cannot-consume-is-refused.md) | 2026-10-10 | A Metal weight dtype a kernel cannot consume is refused, never run as a wrong kernel | Accepted |
 | [0038](./0038-the-per-tensor-registration-dispatch-is-one-shared-rule.md) | 2026-10-10 | The per-tensor registration dispatch is one shared rule, not a copy per loader | Accepted |
+| [0039](./0039-the-corpus-is-entered-through-a-question-at-pr-time.md) | 2026-10-11 | The corpus is entered through a question at PR time, and its maps are checked | Accepted |
 
 ## The template
 

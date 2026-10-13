@@ -84,7 +84,35 @@ HELP_LIMIT = (
     "path, an empty range and an unreadable one all count as `rust`, and the jobs run."
 )
 
-CLASSES = ("docs", "plan", "baselines", "rust")
+#: The counts `classify` returns. `decision` is not a fourth class of *path* — it is a
+#: second question about the same range, counted here so the summary can print it.
+CLASSES = ("docs", "plan", "baselines", "rust", "decision")
+
+#: The source files whose **subject is an ADR's subject**: a change here picks or moves
+#: a shape another document or a later PR must obey — a file format, an id space, an op
+#: vocabulary, a byte-identity promise. That is what an ADR records, so the PR body must
+#: answer the question: which ADR does this implement, which does it supersede, or why
+#: is this change none of those (#539).
+#:
+#: The list is **derived from the corpus**, not invented: each entry names the ADRs whose
+#: decision it carries. It is deliberately short — ADR-0023's rule is that a gate earns
+#: its keep, and a trigger that fires on ordinary work trains its readers to paste the
+#: waiver, which is how a signal dies. `--selftest` fails when an entry stops existing.
+DECISION_PATHS: dict[str, str] = {
+    "src/graph/ops.rs": "the op vocabulary (ADR-0001, ADR-0002, ADR-0009)",
+    "src/graph/registry.rs": "backend ids and the capability seam (ADR-0011, ADR-0012)",
+    "src/graph/backend.rs": "the `Backend` trait's contract (ADR-0009, ADR-0012)",
+    "src/graph/kvformat.rs": "the KV storage-format gate (ADR-0006)",
+    "src/graph/kvsession.rs": "the KV session file format (ADR-0014)",
+    "src/block.rs": "the on-disk quantized block layout (ADR-0020)",
+    "src/gguf_write.rs": "the GGUF writer's byte contract (ADR-0020)",
+    "src/convert.rs": "the HF→GGUF conversion contract (ADR-0020, ADR-0021)",
+    "src/quantize.rs": "the byte-identity promise of the quantizers (ADR-0020)",
+}
+
+#: A **new** design document is a new contract, so it is a decision surface too. Only an
+#: *added* one: editing a design doc is how the contract is kept true, which is routine.
+DESIGN_DOC = re.compile(r"\Adocs/[A-Z0-9][A-Za-z0-9-]*-DESIGN\.md\Z")
 
 
 def classify(paths: list[str]) -> dict[str, int]:
@@ -96,7 +124,10 @@ def classify(paths: list[str]) -> dict[str, int]:
             continue
         while path.startswith("./"):
             path = path[2:]
-        if path == BASELINES_LEDGER:
+        if path in DECISION_PATHS:
+            counts["decision"] += 1
+            counts["rust"] += 1
+        elif path == BASELINES_LEDGER:
             counts["baselines"] += 1
         elif path == PLAN_LEDGER:
             counts["plan"] += 1
@@ -109,9 +140,24 @@ def classify(paths: list[str]) -> dict[str, int]:
     return counts
 
 
-def decide(counts: dict[str, int]) -> dict[str, bool]:
-    """The two job predicates: the Rust jobs run, and the suite job's own reason."""
-    return {"rust": counts["rust"] > 0, "baselines": counts["baselines"] > 0}
+def decide(counts: dict[str, int], added: tuple[str, ...] = ()) -> dict[str, bool]:
+    """The three predicates: the Rust jobs, the suite job's reason, and the ADR question."""
+    return {
+        "rust": counts["rust"] > 0,
+        "baselines": counts["baselines"] > 0,
+        "decision_surface": counts["decision"] > 0 or any(DESIGN_DOC.match(p) for p in added),
+    }
+
+
+def decision_reasons(paths: list[str], added: tuple[str, ...] = ()) -> list[str]:
+    """The ADRs a range has to answer for, one line each — the classifier's own evidence."""
+    out = [
+        f"{path} — {DECISION_PATHS[path]}"
+        for path in sorted({p.lstrip('./') for p in paths})
+        if path in DECISION_PATHS
+    ]
+    out += [f"{path} (new) — a new design contract" for path in sorted(added) if DESIGN_DOC.match(path)]
+    return out
 
 
 def git_paths(root: Path, base: str, head: str) -> tuple[list[str] | None, str]:
@@ -141,6 +187,31 @@ def git_paths(root: Path, base: str, head: str) -> tuple[list[str] | None, str]:
         last = detail[-1] if detail else f"exit {proc.returncode}"
         return None, f"git diff {base}...{head} failed ({last})"
     return [line for line in proc.stdout.splitlines() if line.strip()], ""
+
+
+def git_added(root: Path, base: str, head: str) -> list[str]:
+    """The paths the range **added** — the one status the decision question needs.
+
+    A *new* design document is a new contract; editing one is not. Read separately from
+    ``git_paths`` so the classifier's main call stays a `--name-only` list.
+    """
+    proc = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=A",
+            f"{base}...{head}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    return [line for line in proc.stdout.splitlines() if line.strip()]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -179,6 +250,7 @@ def emit(decision: dict[str, bool]) -> None:
     """The GitHub-output lines, and only those, on stdout."""
     print(f"rust={'true' if decision['rust'] else 'false'}")
     print(f"baselines={'true' if decision['baselines'] else 'false'}")
+    print(f"decision_surface={'true' if decision['decision_surface'] else 'false'}")
 
 
 # --------------------------------------------------------------------------
@@ -193,6 +265,23 @@ def emit(decision: dict[str, bool]) -> None:
 #: `./`-normalisation one — so a misspelled constant passes every case while the real
 #: file silently changes class (#466). Written out here, renaming a ledger fails a
 #: named case until this table is updated deliberately.
+#: `(name, changed paths, added paths, decision_surface)` for the ADR question. Kept
+#: apart from `FIXTURE_CASES` because it needs the *added* list, which the job guards do
+#: not read. Every entry is a claim about which ADR a path would have to answer to.
+DECISION_CASES = (
+    ("an op-vocabulary change asks the ADR question", ["src/graph/ops.rs"], [], True),
+    ("a backend-id change asks it", ["src/graph/registry.rs"], [], True),
+    ("a KV-format change asks it", ["src/graph/kvformat.rs"], [], True),
+    ("an on-disk layout change asks it", ["src/block.rs"], [], True),
+    ("a quantizer change asks it", ["src/quantize.rs"], [], True),
+    ("a routine source change does not", ["src/main.rs"], [], False),
+    ("a test change does not", ["src/graph/ops/tests.rs"], [], False),
+    ("a documentation change does not", ["docs/USAGE.md"], [], False),
+    ("a *new* design document does", [], ["docs/FOO-DESIGN.md"], True),
+    ("editing an existing design document does not", ["docs/KV-CACHE-DESIGN.md"], [], False),
+    ("a new design document in another tree does not", [], ["notes/FOO-DESIGN.md"], False),
+)
+
 FIXTURE_CASES = (
     ("a docs chapter alone", ["docs/ARCHITECTURE.md"], False, False),
     ("README.md and AGENTS.md", ["README.md", "AGENTS.md"], False, False),
@@ -350,10 +439,30 @@ def run_selftest() -> int:
             "",
         )
         record(
-            "a docs range prints rust=false and baselines=false",
-            run_main("--base", c1, "--head", c2) == "rust=false\nbaselines=false\n",
+            "a docs range prints all three predicates false",
+            run_main("--base", c1, "--head", c2)
+            == "rust=false\nbaselines=false\ndecision_surface=false\n",
             run_main("--base", c1, "--head", c2),
         )
+
+    # The ADR question, one case per trigger class.
+    for name, paths, added, expected in DECISION_CASES:
+        counts = classify(list(paths))
+        got = decide(counts, tuple(added))["decision_surface"]
+        record(name, got == expected, f"expected {expected}, got {got}")
+
+    # The trigger table may not rot: every path it names must still exist. Skipped when
+    # the selftest runs outside a checkout (it is a claim about *this* repository).
+    root = Path.cwd()
+    if (root / "src").is_dir():
+        missing = sorted(p for p in DECISION_PATHS if not (root / p).is_file())
+        record(
+            "every decision path still exists",
+            not missing,
+            f"no longer in the tree: {', '.join(missing)} — update DECISION_PATHS",
+        )
+    else:
+        print("SKIP  every decision path still exists (not run from a checkout)")
 
     # `--help` states the honest limit.
     record("--help states the honest limit", HELP_LIMIT in build_parser().description, "")
@@ -397,18 +506,24 @@ def main(argv: list[str]) -> int:
 
     if paths is None:
         print(f"classify_changes: {reason} — running every code job", file=sys.stderr)
-        emit({"rust": True, "baselines": False})
+        # The fail-safe asks the ADR question too: a range nobody could read is not
+        # evidence that no decision was taken.
+        emit({"rust": True, "baselines": False, "decision_surface": True})
         return 0
 
     counts = classify(paths)
-    decision = decide(counts)
+    added = tuple(git_added(root, base, head))
+    decision = decide(counts, added)
     summary = ", ".join(f"{name}={counts[name]}" for name in CLASSES)
     print(
         f"classify_changes: {len(paths)} changed path(s) over {base}...{head} ({summary}) "
         f"→ rust={'true' if decision['rust'] else 'false'} "
-        f"baselines={'true' if decision['baselines'] else 'false'}",
+        f"baselines={'true' if decision['baselines'] else 'false'} "
+        f"decision_surface={'true' if decision['decision_surface'] else 'false'}",
         file=sys.stderr,
     )
+    for line in decision_reasons(paths, added):
+        print(f"classify_changes: ADR question — {line}", file=sys.stderr)
     emit(decision)
     return 0
 
