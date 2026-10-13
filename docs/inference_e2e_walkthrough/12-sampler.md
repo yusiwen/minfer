@@ -437,11 +437,11 @@ identical result.
 
 #### Penalties: one pass, one HashMap, llama.cpp semantics
 
-`src/sampler.rs:47-79` (doc comment :31-46 spells out the semantics). First
+`src/sampler.rs:71-102` (its doc comment `:46-70` spells out the semantics). First
 the counting — note the early-out when every penalty is at its "off" value:
 
 ```rust
-// src/sampler.rs:54-60
+// src/sampler.rs:78-82
     if (repeat - 1.0).abs() < 1e-6 && frequency.abs() < 1e-6 && presence.abs() < 1e-6 {
         return;
     }
@@ -457,7 +457,7 @@ not 10 times) and the counts for frequency penalty. Then the combined
 mutation per distinct token:
 
 ```rust
-// src/sampler.rs:61-78 (loop body)
+// src/sampler.rs:85-102 (loop body)
     for (&t, &c) in &counts {
         let idx = t as usize;
         if idx >= logits.len() {
@@ -488,11 +488,11 @@ test `test_freq_presence_then_repeat_penalty` pins with the comment
 
 #### The window, and how the loop keeps it sliding
 
-`src/sampler.rs:92-98` is trivial — the interesting part is the call-site
+`src/sampler.rs:108-111` is trivial — the interesting part is the call-site
 choreography in `main.rs`:
 
 ```rust
-// src/sampler.rs:95-98
+// src/sampler.rs:108-111
 pub fn recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
     let start = tokens.len().saturating_sub(last_n);
     tokens[start..].to_vec()
@@ -522,10 +522,10 @@ text.
 
 #### Top-k: O(n) threshold, mask in place
 
-`src/sampler.rs:128-140`:
+`src/sampler.rs:141-153`:
 
 ```rust
-// src/sampler.rs:128-140
+// src/sampler.rs:141-153
 pub fn apply_top_k(logits: &mut [f32], k: usize) {
     if k == 0 || k >= logits.len() {
         return;
@@ -563,7 +563,7 @@ design record. First the fast path — after top-k, at most k entries are
 finite:
 
 ```rust
-// src/sampler.rs:156-168
+// src/sampler.rs:169-175
     let survivors: Vec<(usize, f32)> = logits
         .iter()
         .enumerate()
@@ -659,7 +659,7 @@ Then normalization and the draw (`:253-277`): divide by the sum in place,
 draw one uniform `f32` via `rng.gen()`, and walk the buffer accumulating:
 
 ```rust
-// src/sampler.rs:260-277
+// src/sampler.rs:265-277
     let r: f32 = rng.gen();
     let mut cumulative = 0.0f32;
     for (i, &v) in logits.iter().enumerate() {
@@ -732,10 +732,10 @@ fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
 }
 ```
 
-and `match_stop_suffix` is the byte-level tail check (`src/sampler.rs:107-119`):
+and `match_stop_suffix` is the byte-level tail check (`src/sampler.rs:120-132`):
 
 ```rust
-// src/sampler.rs:107-118
+// src/sampler.rs:120-132
 pub fn match_stop_suffix(buf: &[u8], stops: &[&[u8]]) -> Option<usize> {
     let mut best: Option<usize> = None;
     for s in stops {

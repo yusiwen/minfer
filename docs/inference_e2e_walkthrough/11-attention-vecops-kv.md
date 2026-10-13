@@ -151,12 +151,12 @@ Design notes a beginner should keep:
 
 Worked example: `x = [1, 2, 3, 4]`, `eps ≈ 0`. `mean(x²) = (1+4+9+16)/4 = 7.5`; `scale = 1/√7.5 ≈ 0.365`; normalized `x ≈ [0.365, 0.730, 1.095, 1.461]`, then element-wise multiplied by the learned gains.
 
-#### 3.2.2 RoPE — the node arm (`cpu_backend.rs:343`) and `cpu_rope` (`:857`)
+#### 3.2.2 RoPE — the node arm (`cpu_backend.rs:592`) and `cpu_rope` (`:857`)
 
 The `RoPE` node arm shows the two conventions this series keeps meeting — positions decoded from f32 bits, and in-place execution:
 
 ```rust
-// src/graph/cpu_backend.rs:343-356 (abridged)
+// src/graph/cpu_backend.rs:592-636 (abridged)
 Op::RoPE { style } => {
     let meta = match &node.meta { NodeMeta::Rope(m) => m, ... };
     let nh = meta.n_head;
@@ -173,7 +173,7 @@ Op::RoPE { style } => {
 `cpu_rope` then does the rotation of §2.3:
 
 ```rust
-// src/graph/cpu_backend.rs:469-501 (core loop, abridged)
+// src/graph/cpu_backend.rs:857-895 (core loop, abridged)
 pub(crate) fn cpu_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize,
                        freq_base: f32, freq_scale: f32, style: RopeStyle) {
     let half = hd / 2;
@@ -213,7 +213,7 @@ Worked example: `hd = 4` (`half = 2`), `base = 10⁴` → `freqs = [1.0, 10⁻¹
 The store arm is where "KV positions are data" becomes memory writes:
 
 ```rust
-// src/graph/cpu_backend.rs:143-176 (core, abridged)
+// src/graph/cpu_backend.rs:318-382 (core, abridged)
 if let Op::KvcacheStore { layer } = &node.op {
     let (k_id, v_id) = kv_pair.ok_or_else(...)?;          // doc 07's persistent regions
     if k_id != out_buf { return Err("KV store out buffer must be the K region".into()); }
@@ -246,7 +246,7 @@ Two things to internalize:
 The node arm resolves the regions and computes one derived quantity — the *current* KV length:
 
 ```rust
-// src/graph/cpu_backend.rs:388-428 (core, abridged)
+// src/graph/cpu_backend.rs:655-755 (core, abridged)
 Op::Attn { .. } => {
     let meta = ...;                                        // AttnMeta: n_head, hd, nkt, scale, layer
     let (k_id, v_id) = kv_pair.ok_or_else(...)?;           // this layer's K and V regions
@@ -267,7 +267,7 @@ Op::Attn { .. } => {
 The per-head worker does the math of §2.1:
 
 ```rust
-// src/graph/cpu_backend.rs:572-625 (core loop, abridged; runs per head range via par_for)
+// src/graph/cpu_backend.rs:1101-1162 (core loop, abridged; runs per head range via par_for)
 let gqa = c.nh / c.hk;                                     // e.g. 14/2 = 7
 for h in h0..h1 {                                          // this worker's query heads
     let hk = h / gqa;                                      // ① my shared kv head
