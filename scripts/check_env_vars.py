@@ -1,43 +1,37 @@
 #!/usr/bin/env python3
-"""Fail on a production `MINFER_*` env var that no document names.
+"""Require a documentation home for every production `MINFER_*` env var.
 
-#521 was filed because three knobs changed behaviour and were invisible: `-r`'s
-warmup was described as "1 untimed warmup each" long after it became a
-steady-clock budget (`MINFER_BENCH_WARMUP_MS`), and `MINFER_N_BATCH` — read and
-printed at *every* server start, default 2048 — had no home outside the plan and
-the roadmap. A knob a user cannot find is a knob that does not exist; the failure
-is silent in both directions, because nothing enumerates what the engine reads.
+#521 was filed because three knobs changed behaviour and were invisible, and the gate it
+added settled for the *weak* form: a name that some live document mentions somewhere
+passes. This is the strong form that ticket left open (#531): every production read has a
+**named, verified** home.
 
-So this checker enumerates it. It walks `src/**/*.rs`, takes every
-`std::env::var("MINFER_…")` / `var_os` literal, and skips the test files by the
-repository's own layout conventions (`tests.rs`, `<module>/tests/…`, `*_tests.rs`,
-`*_test.rs` — the rule `check_source_layout.py` enforces). Each remaining name
-must be **documented** — named in `docs/USAGE.md`, or in a live document under
-`docs/` (plus `AGENTS.md` and `README.md`) — or listed in
-`scripts/env-vars.toml` beside this checker with a reason.
+`scripts/env-vars.toml` is the index. Each knob is in exactly one table:
 
-What counts as *documented* excludes the dated records (`docs/adr/`,
-`docs/cuda_optimization_steps/`, the execution plan, the roadmap, the baselines
-and the three `*_OPTIMIZATIONS.md` pages): a name that appears only there is not
-findable by a reader who wants to turn a knob, which is exactly why the ledger
-exists. The alternative — requiring `docs/USAGE.md` for all 84 of today's names —
-would need ~65 curated entries, because most are per-kernel A/B switches whose
-home is a design doc; that stronger form is
-[#531](https://github.com/yusiwen/minfer/issues/531).
+- `[documented] name = "<file>"` — the checker verifies the file exists, is a *live*
+  document (not one of the dated records listed below; those are history, not a place a
+  reader looks up a knob), and actually names the knob. So "this file documents it" is
+  checked, not asserted.
+- `[internal] name = "<reason>"` — no live document names it, and the reason says what it
+  does and where its only record is. The checker fails when a live document *does* name a
+  knob the ledger calls internal: the exemption has to stay necessary.
 
-The ledger is a ratchet: an entry whose name is documented fails (the exemption is
-unnecessary), an entry whose name is no longer read fails, and a reason is
-required. The checker's own cases cover both directions and the enumeration rule.
+The enumeration is the read itself: `std::env::var("MINFER_…")` / `var_os` in
+`src/**/*.rs`, skipping the test files by the layout rule `check_source_layout.py`
+already holds (`tests.rs`, `<module>/tests/…`, `*_tests.rs`, `*_test.rs`). Both tables
+ratchet — an entry whose knob is no longer read fails, a `[documented]` home that does not
+contain the name fails — and a knob in neither table fails with the file that reads it,
+which is the #521 class exactly (`MINFER_N_BATCH` was read and printed at every server
+start while nothing a user reads named it).
 
 Usage:
 
     python3 scripts/check_env_vars.py [--root .] [--list]
     python3 scripts/check_env_vars.py --selftest
 
-Exit codes: 0 clean, 1 a violation, 2 usage or I/O error. Pure and offline: stdlib
-only, no build, no network.
+Exit codes: 0 clean, 1 a violation, 2 usage or I/O error. Pure and offline: stdlib only,
+no build, no network.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -103,16 +97,24 @@ def documents(root: Path) -> dict[str, str]:
     return docs
 
 
-def load_ledger(path: Path) -> dict[str, str]:
-    """`{name: reason}` for every internal-only knob."""
+def load_ledger(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """`({name: documentation home}, {name: reason})` from the ledger's two tables."""
     with path.open("rb") as fh:
         data = tomllib.load(fh)
-    out: dict[str, str] = {}
+    documented: dict[str, str] = {}
+    internal: dict[str, str] = {}
+    for name, home in data.get("documented", {}).items():
+        if not home or not str(home).strip():
+            raise ValueError(f"{path}: `{name}` needs a documentation home")
+        documented[name] = str(home)
     for name, reason in data.get("internal", {}).items():
         if not reason or not str(reason).strip():
             raise ValueError(f"{path}: `{name}` needs a non-empty reason")
-        out[name] = str(reason)
-    return out
+        internal[name] = str(reason)
+    both = sorted(set(documented) & set(internal))
+    if both:
+        raise ValueError(f"{path}: {', '.join(both)} is in both tables")
+    return documented, internal
 
 
 def check(root: Path, list_all: bool = False) -> int:
@@ -122,7 +124,7 @@ def check(root: Path, list_all: bool = False) -> int:
         print(f"check_env_vars: {ledger_path} is missing", file=sys.stderr)
         return 2
     try:
-        ledger = load_ledger(ledger_path)
+        documented, internal = load_ledger(ledger_path)
     except (ValueError, tomllib.TOMLDecodeError) as exc:
         print(f"check_env_vars: {exc}", file=sys.stderr)
         return 2
@@ -131,41 +133,50 @@ def check(root: Path, list_all: bool = False) -> int:
         return 2
 
     reads = production_reads(root)
-    docs = documents(root)
-    usage = docs.get(USAGE, "")
+    live = documents(root)
     problems: list[str] = []
-    where: dict[str, str] = {}
-    in_usage = 0
-    documented = 0
-    for name in sorted(reads):
-        if name in usage:
-            where[name] = USAGE
-            in_usage += 1
-            continue
-        home = next((path for path, text in docs.items() if name in text), None)
-        if home:
-            where[name] = home
-            documented += 1
-            continue
-        if name not in ledger:
-            problems.append(
-                f"{LEDGER}: `{name}` is read in production ({', '.join(sorted(set(reads[name])))}) "
-                "but no live document names it — document it, or add it to the ledger with a reason"
-            )
-        else:
-            where[name] = "(internal)"
 
-    for name, reason in sorted(ledger.items()):
-        if name in where and where[name] != "(internal)":
+    # Every knob's home, and the file that reads it — the two facts a reader wants.
+    where: dict[str, str] = {}
+    for name in sorted(reads):
+        source = ", ".join(sorted(set(reads[name])))
+        if name in documented:
+            home = documented[name]
+            where[name] = home
+            path = root / home
+            if any(record in home for record in RECORDS):
+                problems.append(
+                    f"{LEDGER}: `{name}` names `{home}`, which is a dated record, not a "
+                    "document a reader looks up a knob in"
+                )
+            elif not path.is_file():
+                problems.append(f"{LEDGER}: `{name}` names `{home}`, which does not exist")
+            elif name not in path.read_text(encoding="utf-8", errors="replace"):
+                problems.append(
+                    f"{LEDGER}: `{name}` claims `{home}`, but that file does not name it"
+                )
+        elif name in internal:
+            where[name] = "(internal)"
+            home_names = [d for d, text in live.items() if name in text]
+            if home_names:
+                problems.append(
+                    f"{LEDGER}: `{name}` is marked internal, but {home_names[0]} documents it "
+                    "— move it to [documented]"
+                )
+        else:
             problems.append(
-                f"{LEDGER}: `{name}` is documented at {where[name]}; the exemption is unnecessary"
+                f"{LEDGER}: `{name}` is read in production ({source}) and has no entry — "
+                "add it to [documented] with the file that documents it, or to [internal] "
+                "with a reason"
             )
-        elif name not in reads:
+
+    for name in sorted(set(documented) | set(internal)):
+        if name not in reads:
             problems.append(f"{LEDGER}: `{name}` is no longer read anywhere in src/")
 
     if list_all:
         for name in sorted(reads):
-            print(f"{name:34s} {where.get(name, '(undocumented)')}")
+            print(f"{name:34s} {where.get(name, '(no entry)')}")
 
     for message in problems:
         print(f"ENV VAR  {message}", file=sys.stderr)
@@ -177,19 +188,20 @@ def check(root: Path, list_all: bool = False) -> int:
         )
         return 1
     print(
-        f"check_env_vars: {len(reads)} production `MINFER_*` read(s) — {in_usage} in {USAGE}, "
-        f"{documented} in another live document, {len(ledger)} internal with a reason"
+        f"check_env_vars: {len(reads)} production `MINFER_*` read(s), every one with a home "
+        f"— {len(documented)} in a named document, {len(internal)} internal with a reason"
     )
     return 0
 
 
 def selftest() -> int:
-    """The checker's own pass/fail cases, in a temp tree."""
-    cases: list[tuple[str, bool, str]] = []
-    LEDGER_BODY = '[internal]\n{name} = "{reason}"\n'
+    """The index's own pass/fail cases, in a temp tree."""
+    cases: list[tuple[str, bool]] = []
+    V = "MINFER_TEST_KNOB"
+    DESIGN = "The knob `MINFER_TEST_KNOB` gates the thing."
 
-    def tree(tmp: str, read: str, usage: str = "", design: str = "", record: str = "",
-             ledger: str = "") -> Path:
+    def build(tmp: str, read: str, ledger: str, design: str = "", usage: str = "",
+              record: str = "", files: dict[str, str] | None = None) -> Path:
         root = Path(tmp)
         (root / "src").mkdir(parents=True, exist_ok=True)
         (root / "src" / "engine.rs").write_text(f'let x = env::var("{read}");\n', encoding="utf-8")
@@ -198,83 +210,96 @@ def selftest() -> int:
         (root / "docs" / "design.md").write_text(design, encoding="utf-8")
         (root / "docs" / "adr").mkdir(exist_ok=True)
         (root / "docs" / "adr" / "0001-x.md").write_text(record, encoding="utf-8")
+        for rel, text in (files or {}).items():
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
         path = root / LEDGER
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(ledger, encoding="utf-8")
         return root
 
-    def run(**kw) -> int:
+    def run(ledger: str, **kw) -> int:
         with tempfile.TemporaryDirectory() as tmp:
-            return check(tree(tmp, **kw))
+            return check(build(tmp, ledger=ledger, **kw))
 
-    V = "MINFER_TEST_KNOB"
-    cases.append(("a name in the manual passes", run(read=V, usage=f"`{V}=1` turns it on") == 0, ""))
-    cases.append(("a name in a live design doc passes", run(read=V, design=f"`{V}` gates it") == 0, ""))
+    def tab(kind: str, name: str, value: str) -> str:
+        return f'[{kind}]\n{name} = "{value}"\n'
+
+    cases.append(
+        ("a documented knob passes", run(tab("documented", V, "docs/design.md"), read=V, design=DESIGN) == 0)
+    )
+    cases.append(
+        ("the manual is a valid home", run(tab("documented", V, USAGE), read=V, usage=DESIGN) == 0)
+    )
     cases.append(
         (
-            "a name only in a record needs a ledger entry",
-            run(read=V, record=f"`{V}` was measured") == 1,
-            "",
+            "a home that does not name the knob fails",
+            run(tab("documented", V, "docs/design.md"), read=V, design="something else") == 1,
         )
     )
     cases.append(
         (
-            "that same name passes once ledgered",
-            run(read=V, record=f"`{V}` was measured", ledger=LEDGER_BODY.format(name=V, reason="an A/B switch")) == 0,
-            "",
+            "a home that does not exist fails",
+            run(tab("documented", V, "docs/missing.md"), read=V) == 1,
         )
     )
     cases.append(
         (
-            "a name no document names fails",
-            run(read=V) == 1,
-            "",
+            "a dated record is not a home",
+            run(tab("documented", V, "docs/adr/0001-x.md"), read=V, record=DESIGN) == 1,
+        )
+    )
+    cases.append(
+        ("an internal knob with a reason passes", run(tab("internal", V, "an A/B switch"), read=V) == 0)
+    )
+    cases.append(
+        (
+            "an internal knob whose name a live doc has fails",
+            run(tab("internal", V, "reason"), read=V, design=DESIGN) == 1,
         )
     )
     cases.append(
         (
-            "a ledger entry that is documented fails",
-            run(read=V, usage=f"`{V}` is in the manual", ledger=LEDGER_BODY.format(name=V, reason="reason")) == 1,
-            "",
+            "an internal knob mentioned only by a record passes",
+            run(tab("internal", V, "reason"), read=V, record=DESIGN) == 0,
+        )
+    )
+    cases.append(("a knob with no entry fails", run("", read=V) == 1))
+    cases.append(
+        (
+            "a knob in both tables is a usage error",
+            run(tab("documented", V, "docs/design.md") + tab("internal", V, "x"), read=V, design=DESIGN) == 2,
         )
     )
     cases.append(
         (
-            "a ledger entry that is no longer read fails",
-            run(read="MINFER_OTHER", usage="`MINFER_OTHER` is in the manual", ledger=LEDGER_BODY.format(name=V, reason="reason")) == 1,
-            "",
+            "an entry whose knob is no longer read fails",
+            run(tab("internal", "MINFER_GONE", "reason"), read="MINFER_OTHER") == 1,
         )
     )
-    cases.append(
-        (
-            "an empty reason is a usage error",
-            run(read=V, ledger=f'[internal]\n{V} = ""\n') == 2,
-            "",
-        )
-    )
+    cases.append(("an empty reason is a usage error", run(tab("internal", V, ""), read=V) == 2))
+    cases.append(("an empty home is a usage error", run(tab("documented", V, ""), read=V) == 2))
     with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        (root / "src").mkdir()
+        root = build(tmp, read="MINFER_ONLY_IN_TESTS", ledger="")
+        (root / "src" / "engine.rs").write_text("// no reads here\n", encoding="utf-8")
         (root / "src" / "tests.rs").write_text('env::var("MINFER_ONLY_IN_TESTS");\n', encoding="utf-8")
-        (root / "docs").mkdir()
-        (root / "docs" / "design.md").write_text("nothing", encoding="utf-8")
-        ledger = root / LEDGER
-        ledger.parent.mkdir(parents=True, exist_ok=True)
-        ledger.write_text("[internal]\n", encoding="utf-8")
-        cases.append(("a test-file read is not enumerated", check(root) == 0, ""))
+        cases.append(("a test-file read is not enumerated", check(root) == 0))
+    with tempfile.TemporaryDirectory() as tmp:
+        root = build(tmp, read="MINFER_OTHER", ledger="")
+        (root / "src" / "engine.rs").write_text('env::var_os("MINFER_VAR_OS");\n', encoding="utf-8")
+        cases.append(("`env::var_os` needs an entry too", check(root) == 1))
+        (root / LEDGER).write_text(tab("internal", "MINFER_VAR_OS", "reason"), encoding="utf-8")
+        cases.append(("and passes once the entry exists", check(root) == 0))
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "src").mkdir()
         (root / "docs").mkdir()
-        cases.append(("a missing ledger is an I/O error", check(root) == 2, ""))
-    with tempfile.TemporaryDirectory() as tmp:
-        root = tree(tmp, "MINFER_VAR_OS", design="`MINFER_VAR_OS` gates it")
-        (root / "src" / "engine.rs").write_text('env::var_os("MINFER_VAR_OS");\n', encoding="utf-8")
-        cases.append(("`env::var_os` counts", check(root) == 0, ""))
-    failed = 0
-    for name, ok, note in cases:
-        print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  ({note})" if note and not ok else ""))
-        failed += 0 if ok else 1
+        cases.append(("a missing ledger is an I/O error", check(root) == 2))
+
+    failed = sum(1 for _, ok in cases if not ok)
+    for name, ok in cases:
+        print(f"{'PASS' if ok else 'FAIL'}  {name}")
     print(f"check_env_vars --selftest: {len(cases) - failed}/{len(cases)} cases pass")
     return 1 if failed else 0
 
