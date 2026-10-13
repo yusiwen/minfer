@@ -14,6 +14,8 @@ mod f6_fixtures;
 mod f6_roundtrip;
 mod parse;
 mod quantize_bounds;
+mod quantize_legacy_row_parity;
+mod quantize_row_fallback;
 // === F6 real-model gates (#[ignore]: CI has no checkpoint/model) ===
 
 /// The prompt every F6 logit gate uses. Short enough to prefill quickly on

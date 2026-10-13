@@ -1044,8 +1044,8 @@ pub struct QuantizePlan {
     pub preserved: Vec<String>,
     /// Tensors deliberately encoded at another type (tied embedding → q8_0).
     pub retargeted: Vec<String>,
-    /// Tensors a K-quant target could not encode because their row length is
-    /// not a multiple of the 256-element K block, demoted to llama.cpp's
+    /// Tensors a quant target could not encode because their row length is not
+    /// a multiple of that target's block size, demoted to llama.cpp's
     /// `tensor_type_fallback` type.
     pub demoted: Vec<String>,
 }
@@ -1055,17 +1055,17 @@ impl QuantizePlan {
     ///
     /// llama.cpp's "except 1d tensors" rule, one statement per target:
     ///
-    /// * **quant** — a 1-D tensor (norm, bias) and a tensor whose row length is
-    ///   not a multiple of the target block size are **copied verbatim**, i.e.
-    ///   keep their source type;
-    /// * **K-quant** (`q4_K`/`q5_K`/`q6_K`) — a 1-D tensor keeps its source
+    /// * **every quant target** — a 1-D tensor (norm, bias) keeps its source
     ///   type, and a 2-D tensor whose row length is not a multiple of the
-    ///   256-element `QK_K` block is **demoted** to llama.cpp's
-    ///   `tensor_type_fallback` type (Q4_K→Q5_0, Q5_K→Q5_1, Q6_K→Q8_0, and F16
-    ///   if even a 32-element block does not divide the row). This is not
-    ///   cosmetic: the 0.5B's hidden size is 896, so 145 of its 290 tensors take
-    ///   the demotion and the per-tensor byte-parity gate compares the demoted
-    ///   encoders too. Reported through `demoted`;
+    ///   target's block size is **demoted** the way llama.cpp's
+    ///   `tensor_type_fallback` does it ([`crate::quantize::QuantTarget::row_len_fallback`]):
+    ///   a K-quant (`q4_K`/`q5_K`/`q6_K`) to a legacy 32-block type
+    ///   (Q4_K→Q5_0, Q5_K→Q5_1, Q6_K→Q8_0), a legacy target
+    ///   (`q4_0`/`q4_1`/`q5_0`/`q5_1`/`q8_0`) straight to F16 because it has no
+    ///   smaller block to demote to, and F16 either way when even a 32-element
+    ///   block does not divide the row. A demotion is never a copy of the source
+    ///   type: on a non-block-aligned row an f32 source is *not* written f32.
+    ///   Reported through `demoted`;
     /// * **f16** — a 1-D tensor keeps its source type too
     ///   (`tensor_allows_quantization` is false below 2 dims, and both
     ///   `minfer convert --outtype f16` and `llama-quantize … F16` write those
@@ -1074,6 +1074,18 @@ impl QuantizePlan {
     ///   `Tensor::data_f32` (which asserts `F32`) and neither `mat_mul_f16` nor
     ///   the f16 embedding decode has an f16-norm sibling (issue #169);
     /// * **f32** — every tensor, 1-D included, becomes f32.
+    ///
+    /// The row-length rule is applied to the type a tensor is actually *asked*
+    /// for, not always to the requested target: on a tied model a sub-8-bit
+    /// target's shared `token_embd.weight` is asked for **q8_0** (llama.cpp's
+    /// mixture), so `q4_0` on a tied embedding whose row is not a multiple of 32
+    /// demotes *that* to F16 — llama.cpp runs its mixture first and the
+    /// fallback second, and this must agree with it. Such a tensor is reported
+    /// as demoted, never as the tied-embedding retarget it did not get.
+    ///
+    /// The demotion is not cosmetic: the 0.5B's hidden size is 896, so 145 of
+    /// its 290 tensors are not a multiple of 256 and take the K path, and the
+    /// per-tensor byte-parity gate compares the demoted encoders too.
     ///
     /// The tensors left in their source type are reported through `preserved`,
     /// never silent.
@@ -1086,7 +1098,6 @@ impl QuantizePlan {
         target: crate::quantize::QuantTarget,
     ) -> Result<Self, String> {
         use crate::quantize::QuantTarget as QT;
-        let bs = target.blck_size();
         // llama.cpp's tied-embedding outcome: when `output.weight` is absent the
         // output projection *is* the token embedding, and llama.cpp's mixture
         // sends that shared tensor through its OUTPUT branch to Q6_K; the
@@ -1118,48 +1129,47 @@ impl QuantizePlan {
                         ti.type_.type_name()
                     ));
                 }
-                let row_ok = ti.ne[0] % bs as i64 == 0;
-                // The 1-D rule per target (see the `plan` doc comment): a 1-D
-                // tensor is preserved for the quant targets and for f16, and
-                // f32 converts everything. A 2-D row that is not a multiple of
-                // the target's block size is preserved for the legacy targets
-                // (block size 32), but for a K-quant it is demoted to
-                // llama.cpp's `tensor_type_fallback` type instead — a K-quant
-                // block is 256 elements and this model's hidden size (896) is
-                // not a multiple of it, so 145 of the 0.5B's 290 tensors take
-                // that path. See the `demoted` report and GGUF-TOOLING §2.2.
-                let keep = match target {
-                    QT::F32 => false,
-                    QT::F16 => ti.ne[1] <= 1,
-                    _ if target.row_len_fallback().is_some() => ti.ne[1] <= 1,
-                    _ => ti.ne[1] <= 1 || !row_ok,
-                };
+                // The type this tensor is *asked* for. On a tied model a
+                // sub-8-bit target's shared embedding is asked for q8_0
+                // (llama.cpp's mixture), and the row-length rule below is
+                // applied to that — llama.cpp resolves the mixture first and
+                // demotes second.
+                let tied_embed = tied && sub_8bit && ti.name == "token_embd.weight";
+                let asked = if tied_embed { QT::Q8_0 } else { target };
+                let row_ok = ti.ne[0] % asked.blck_size() as i64 == 0;
+                // The 1-D rule (see the `plan` doc comment): a 1-D tensor keeps
+                // its source type for every target but f32, and f32 converts
+                // everything. A 2-D row that is not a multiple of the asked-for
+                // type's block size is never preserved — it is demoted, for the
+                // legacy targets (block size 32) as much as for a K-quant. See
+                // the `demoted` report and GGUF-TOOLING §2.2.
+                let keep = !matches!(target, QT::F32) && ti.ne[1] <= 1;
                 if keep {
                     preserved_push(&mut preserved, ti);
                 }
-                let tied_embed = tied && sub_8bit && ti.name == "token_embd.weight";
-                if tied_embed {
-                    retargeted.push(format!("{} -> q8_0 (tied embedding)", ti.name));
-                }
-                let mut tgt = if keep {
-                    ti.type_
-                } else if tied_embed {
-                    crate::gguf::GgmlType::Q8_0
-                } else {
-                    target.ggml_type()
-                };
+                let mut tgt = if keep { ti.type_ } else { asked.ggml_type() };
                 let mut retarget: Option<crate::quantize::QuantTarget> =
-                    tied_embed.then_some(QT::Q8_0);
-                if !keep && !tied_embed && !row_ok {
-                    if let Some(fb) = target.row_len_fallback() {
+                    (!keep && tied_embed).then_some(QT::Q8_0);
+                // The tied-embedding retarget is reported only if it survived
+                // the row-length rule below.
+                let mut tied_kept = !keep && tied_embed;
+                if !keep && !row_ok {
+                    if let Some(fb) = asked.row_len_fallback() {
                         // llama.cpp's `tensor_type_fallback`: a 256-block
                         // target whose row is not a multiple of 256 demotes to
-                        // a legacy 32-block type, and to F16 when even that
-                        // block size does not divide the row.
+                        // a legacy 32-block type, a legacy target demotes to
+                        // F16, and either demotes to F16 anyway when even the
+                        // 32-element block does not divide the row.
+                        tied_kept = false;
                         if ti.ne[0] % fb.blck_size() as i64 == 0 {
                             tgt = fb.ggml_type();
                             retarget = Some(fb);
-                            demoted.push(format!("{} -> {} (row % 256 != 0)", ti.name, fb.name()));
+                            demoted.push(format!(
+                                "{} -> {} (row % {} != 0)",
+                                ti.name,
+                                fb.name(),
+                                asked.blck_size()
+                            ));
                         } else {
                             tgt = crate::gguf::GgmlType::F16;
                             retarget = Some(QT::F16);
@@ -1169,6 +1179,9 @@ impl QuantizePlan {
                             ));
                         }
                     }
+                }
+                if tied_kept {
+                    retargeted.push(format!("{} -> q8_0 (tied embedding)", ti.name));
                 }
                 let spec = TensorSpec::new(ti.name.clone(), ti.ne, tgt);
                 sources.push(SourceTensor {

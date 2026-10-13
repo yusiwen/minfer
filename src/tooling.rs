@@ -49,9 +49,11 @@ fn usage_quantize(prog: &str) -> String {
          \n\
          Re-encodes a single-file GGUF's 2-D float weights to <target>. One-dimensional\n\
          tensors (norms, biases) keep their source type. A 2-D tensor whose row length\n\
-         is not a multiple of a K-quant's 256-element block (q4_K/q5_K/q6_K) is demoted\n\
-         the way llama.cpp's tensor_type_fallback does it (q4_K->q5_0, q5_K->q5_1,\n\
-         q6_K->q8_0, or f16 when even a 32-element block does not divide the row).\n\
+         is not a multiple of the target's block is demoted the way llama.cpp's\n\
+         tensor_type_fallback does it: a K-quant (q4_K/q5_K/q6_K, 256-element block)\n\
+         to q5_0/q5_1/q8_0, a legacy target (q4_0/q4_1/q5_0/q5_1/q8_0, 32-element\n\
+         block) to f16, and f16 either way when even a 32-element block does not\n\
+         divide the row.\n\
          The K-quant targets write ONE uniform type (`llama-quantize --pure`); they are\n\
          not llama.cpp's `Q4_K_M`/`Q5_K_M` mixtures. Supported targets: {}.",
         crate::quantize::SUPPORTED_TARGETS
@@ -292,18 +294,11 @@ pub fn run_quantize(prog: &str, args: &[String]) -> i32 {
         }
     };
     if !plan.preserved.is_empty() {
-        // The reason differs per target: a legacy quant target also preserves
-        // a 2-D tensor whose row length is not block-aligned, while f16 and
-        // the K-quants preserve 1-D tensors only (f16's block size is 1, so the
-        // row-length clause would be meaningless; a K-quant's unaligned rows
-        // are *demoted*, not preserved — see `plan.demoted`). #169, #140.
-        let why = if target == QuantTarget::F16 || target.row_len_fallback().is_some() {
-            "1-D".to_string()
-        } else {
-            format!("1-D or row length not a multiple of {}", target.blck_size())
-        };
+        // Only 1-D tensors are ever preserved: every quant target demotes a
+        // non-block-aligned 2-D row instead of copying it (see `plan.demoted`),
+        // f16's block size is 1, and f32 converts everything. #169, #140, #204.
         eprintln!(
-            "quantize: {} tensor(s) keep their source type ({why}): {}",
+            "quantize: {} tensor(s) keep their source type (1-D norms/biases): {}",
             plan.preserved.len(),
             plan.preserved.join(", ")
         );
