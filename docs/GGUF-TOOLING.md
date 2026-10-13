@@ -229,8 +229,7 @@ Targets with an implemented and byte-verified encoder:
 `f16` / `f32` element casts.
 
 - For a **quant** target only 2-D float tensors are quantized. 1-D tensors (norms,
-  biases) and any tensor whose row length is not a multiple of the target block
-  size keep their source type, and the CLI prints the list — llama.cpp's rule, not
+  biases) keep their source type, and the CLI prints the list — llama.cpp's rule, not
   a silent choice.
 - **The K-quant targets write one uniform type — they are not llama.cpp's
   `_M` mixtures.** `q4_K`/`q5_K` are the *CLI aliases* for `LLAMA_FTYPE_MOSTLY_Q4_K_M`
@@ -242,25 +241,29 @@ Targets with an implemented and byte-verified encoder:
   implemented — [#203](https://github.com/yusiwen/minfer/issues/203). A file from
   `llama-quantize … q4_K` without `--pure` is therefore *not* what this command
   produces.
-- **A K-quant row must be a multiple of 256.** `QK_K` is 256, and a 2-D tensor
-  whose `ne[0]` is not a multiple of it cannot be encoded at the requested type;
-  minfer **demotes** it exactly the way llama.cpp's `tensor_type_fallback` does:
+- **A row that cannot take the target's block is demoted, never copied.** A 2-D
+  tensor whose `ne[0]` is not a multiple of the target's block size cannot be
+  encoded at the requested type, and minfer **demotes** it exactly the way
+  llama.cpp's `tensor_type_fallback` does ([ADR-0041](adr/0041-a-row-that-cannot-take-the-targets-block-is-demoted.md)):
 
-  | requested | demoted to |
+  | requested (block) | demoted to |
   |---|---|
-  | `q4_K` | `q5_0` |
-  | `q5_K` | `q5_1` |
-  | `q6_K` | `q8_0` |
+  | `q4_K`, `q5_K`, `q6_K` (256) | `q5_0`, `q5_1`, `q8_0` |
+  | `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0` (32) | `f16` |
 
-  and to `f16` when even a 32-element block does not divide the row. The CLI
-  prints the demoted list (`quantize: N tensor(s) demoted from q4_K (row length
-  not a multiple of 256; llama.cpp's tensor_type_fallback): …`). This is not
-  cosmetic: the 0.5B's hidden size is 896 = 3.5 × 256, so **145 of its 290
-  tensors take the demotion** and only the 24 `ffn_down` tensors (`ne[0] = 4864 =
-  19 × 256`) reach the `q4_K`/`q5_K`/`q6_K` encoder. §4.2 gates a second source
-  (hidden 1024) where every 2-D tensor does.
-  For the **legacy** targets (block size 32) the plan is unchanged: a 2-D row
-  that is not a multiple of 32 keeps its source type, exactly as before #140.
+  and to `f16` either way when even a 32-element block does not divide the row. A
+  demotion is never a copy of the source type: an f32 or bf16 source with such a row
+  comes back `f16`. The rule is applied to the type the tensor is *asked* for, so on a
+  tied model a sub-8-bit target's shared `token_embd.weight` is asked for `q8_0` and a
+  non-32-divisible row demotes *that* to `f16` — llama.cpp resolves its mixture first
+  and applies the row-length rule second. The CLI prints the demoted list
+  (`quantize: N tensor(s) demoted from q4_K (row length not a multiple of 256;
+  llama.cpp's tensor_type_fallback): …`). This is not cosmetic: the 0.5B's hidden size
+  is 896 = 3.5 × 256, so **145 of its 290 tensors take the K-quant demotion** and only
+  the 24 `ffn_down` tensors (`ne[0] = 4864 = 19 × 256`) reach the `q4_K`/`q5_K`/`q6_K`
+  encoder. §4.2 gates a second source (hidden 1024) where every 2-D tensor does. No
+  supported architecture has a 2-D row that is not a multiple of 32, so the legacy arm
+  is gated on a shape-edited source (§4.2.4).
 - The `f16` cast follows the same "except 1d tensors" rule: 2-D tensors become
   **f16**, 1-D tensors (norms, biases) keep their source type — **f32** in every
   file `minfer convert --outtype f16` or `llama-quantize … F16` writes, and the
@@ -832,6 +835,42 @@ the recorded digest and size — so the only manifest change was the `date`
 The eleven `ref/…` entries refuse by name: the Mac's `build-fpc` binary is not on
 this box, and the `dgxspark` one is refused as out of scope even though it is.
 
+#### 4.2.4 The shape-edited source (#204)
+
+No supported architecture has a 2-D row that is not a multiple of 32, so the
+legacy arm of the demotion rule (§2.2) has nothing in the cache to run on. The
+gate therefore **derives** a source from a recorded fixture instead of recording
+a second 1.9 GB copy of it:
+
+- parent: `qwen2.5-0.5b-instruct-f32.gguf` (`6894f9ea3eb79e29…`, 1 982 078 784 B
+  — the recorded fixture of §4.2.2);
+- edit: `blk.0.ffn_down.weight`'s `ne[0]` 4864 → 4863 — a multiple of neither
+  256 nor 32 — with every later tensor's data offset shifted down by the same
+  3584 B so the data section stays contiguous. Both loaders refuse a gap
+  (`tensor '…' has offset N, expected M`), which is how the first attempt — a
+  rewrite of `ne[0]` alone — failed in **both** tools;
+- the derived file's sha256 (`fbd63b28d16347fe…`) is pinned in the gate, so a
+  derivation that drifts is named as a changed *input*, not attributed to the
+  encoder;
+- the shift does not preserve the following tensors' original bytes (they now
+  read from 3584 B earlier in the file), which is why the references below were
+  produced from the derived file and not from the parent.
+
+`f6_a_row_no_block_divides_is_demoted_like_llamacpp`
+(`src/tooling/tests/quantize_legacy_row_parity.rs`) compares per tensor against
+two hand-recorded references made from that derived file:
+
+| reference | producer | what it pins |
+|---|---|---|
+| `ref/qwen2.5-0.5b-q4_0-row4863.gguf` | `llama-quantize /tmp/f204-row4863.gguf <out> q4_0` | the legacy endpoint: a 32-block target has no smaller block, so `f16` |
+| `ref/qwen2.5-0.5b-q6_K-row4863.gguf` | `llama-quantize --pure /tmp/f204-row4863.gguf <out> q6_K` | the K-quant chain's second step (`Q6_K → q8_0 → f16`), which no other fixture reaches — every real non-256-aligned row is still a multiple of 32 |
+
+The derived file is not itself a cache fixture: it is a pure function of one, and
+the gate re-creates it (the copy at `/tmp/f204-row4863.gguf` is where the
+recording runs were made from). Like every `llama-quantize` reference these are
+recorded **by hand** — `--regenerate` refuses such an entry by design (§4.2.3) —
+and each entry's `producer_note` carries the parent and the edit.
+
 ### 4.3 Tolerances
 
 | Comparison | Tolerance | Measured |
@@ -890,13 +929,6 @@ network is used.
   `use_more_bits` Q6_K bumps for `attn_v` and `ffn_down`, the fused-QKV rule — is
   not implemented, so `llama-quantize … q4_K` (no `--pure`) is not reproduced.
   Tracked as [#203](https://github.com/yusiwen/minfer/issues/203).
-- **The legacy targets keep `tensor_type_fallback`'s first step only by
-  accident.** For a 2-D tensor whose row length is not a multiple of the target's
-  block size, minfer keeps the source type; llama.cpp demotes it (`q4_0` →
-  `F16`) and, for the K targets, to a smaller-block type (implemented here in
-  §2.2). For the f16 sources every gate uses the two agree, because the source
-  type already *is* F16. An f32 source with such a row would differ. Filed as
-  [#204](https://github.com/yusiwen/minfer/issues/204).
 - **The byte-parity chain is a recipe, not a script.** The f16 sources and the
   `llama-quantize` references live in `~/.cache/minfer/f6-src/` and are
   regenerated by the recipe in §4.2.1; nothing checks that they are the ones the
@@ -1001,6 +1033,7 @@ minfer split /tmp/model-q4_0.gguf /tmp/rewrite --max-size 4G   # one part -> a p
 ## Decisions governing this document
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0041](adr/0041-a-row-that-cannot-take-the-targets-block-is-demoted.md) — A row that cannot take the target's block is demoted, the legacy targets included
 - [ADR-0020](adr/0020-a-quantized-file-is-byte-identical-or-wrong.md) — A quantized file is byte-identical to `llama-quantize`, or it is wrong
 - [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32
 - [ADR-0024](adr/0024-a-machine-read-record-is-not-book-content.md) — A machine-read record is not book content

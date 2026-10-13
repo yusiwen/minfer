@@ -148,6 +148,11 @@ what = "the same conversion rule on the CPU dot path"
 path = "src/vec_ops/bf16.rs"
 
 [[governs]]
+adr = "0041"
+what = "a row that cannot take the target's block is demoted, never copied, for the legacy targets as much as the K-quants"
+symbol = "row_len_fallback"
+
+[[governs]]
 adr = "0030"
 what = "launch severity lives in the helper, not repeated at 120 call sites"
 path = "src/cuda/kernels/guard.cu"
