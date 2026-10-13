@@ -174,6 +174,7 @@ Two behaviours it surfaces instead of smoothing over:
 ```bash
 node scripts/check_viz_e2e.mjs          # stage shapes vs every exported sample graph
 node scripts/check_viz_e2e_render.mjs   # boot + play every step on a stubbed DOM/canvas
+node scripts/check_viz_app.mjs          # boot the operator/pipeline page and render a sample
 node scripts/check_viz_assets.mjs       # each page's asset requests vs the viz/ file set
 ```
 
@@ -183,23 +184,33 @@ the attention internals, the KV region, and that decode is the same graph with `
 one cell longer. Both engine behaviours above were caught by it, so a wrong assumption fails the
 gate instead of shipping a plausible-looking animation. The second boots the real `viz/e2e.js`
 against a stubbed DOM and canvas, plays every step of every mode, switches samples and checks the
-panel is never empty — it catches crashes in the render path, not visual regressions. The third is
-about both pages, not the shape flow: see [Asset freshness](#asset-freshness).
+panel is never empty — it catches crashes in the render path, not visual regressions. The third does
+the same for the *other* page: `viz/app.js` boots on a stubbed DOM and SVG, loads a real sample
+through the documented `?file=` deep link, and then the gate counts what the export implies — one
+node group per node, one path per edge, the status line's node/edge/layer numbers, the dropdown's
+manifest entries, a node click filling the inspector, and the Operators ↔ Pipeline switch (including
+the ×N layers box expanding into one row per block). Its expected counts are read from the sample
+JSON, not from the page. The fourth is about both pages' external inputs, not their render paths:
+see [Asset freshness](#asset-freshness).
 
-All three run in the `check-viz` CI job and need no dependencies (plain Node, no browser).
+All four run in the `check-viz` CI job and need no dependencies (plain Node, no browser). None of
+them judges pixels: they assert the structure the export implies and that nothing threw while it was
+built.
 
 ### Files
 
 | File | What it is |
 |---|---|
+| `viz/index.html`, `viz/app.js`, `viz/style.css` | The operator / pipeline page: SVG graph, node inspector, sample dropdown, live panel |
 | `viz/e2e.html` | The page: toolbar, canvas, side panel, text strip, footer |
 | `viz/e2e.css` | Styles (palette shared with `style.css`) |
 | `viz/e2e-model.js` | The data layer: export → stage script with shape math. No DOM, so it is testable in Node |
 | `viz/e2e.js` | The canvas renderer, animation and UI wiring |
 | `scripts/check_viz_e2e.mjs` | Shape agreement with every sample (the gate above) |
 | `scripts/check_viz_e2e_render.mjs` | Headless boot + full-timeline playthrough |
+| `scripts/check_viz_app.mjs` | Headless boot + render of the operator/pipeline page |
 | `scripts/check_viz_assets.mjs` | The pages' asset requests vs the `viz/` file set ([Asset freshness](#asset-freshness)) |
-| `src/server/viz.rs` | The `minfer viz` routes for the pages and their assets (`no-store`, so a fresh page never pairs with a stale script) |
+| `src/server/viz.rs` | The `minfer viz` routes for the pages and their assets (`no-store`, so a fresh page never pairs with a stale script; `no-cache` + `ETag` for `samples/`) |
 
 ## Quick start
 
