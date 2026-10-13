@@ -58,6 +58,7 @@
     - [0037. A Metal weight dtype a kernel cannot consume is refused, never run as a wrong kernel](./adr/0037-a-metal-weight-dtype-a-kernel-cannot-consume-is-refused.md)
     - [0038. The per-tensor registration dispatch is one shared rule, not a copy per loader](./adr/0038-the-per-tensor-registration-dispatch-is-one-shared-rule.md)
     - [0039. The corpus is entered through a question at PR time, and its maps are checked](./adr/0039-the-corpus-is-entered-through-a-question-at-pr-time.md)
+    - [0040. A decision is bound to the surfaces it governs, so the question names it](./adr/0040-a-decision-is-bound-to-the-surfaces-it-governs.md)
 
 # Model Support
 

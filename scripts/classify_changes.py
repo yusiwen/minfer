@@ -54,6 +54,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 #: Paths only the documentation gates read.
@@ -84,31 +85,19 @@ HELP_LIMIT = (
     "path, an empty range and an unreadable one all count as `rust`, and the jobs run."
 )
 
-#: The counts `classify` returns. `decision` is not a fourth class of *path* — it is a
-#: second question about the same range, counted here so the summary can print it.
-CLASSES = ("docs", "plan", "baselines", "rust", "decision")
+#: The counts `classify` returns — the four *classes of path* the job guards read.
+CLASSES = ("docs", "plan", "baselines", "rust")
 
-#: The source files whose **subject is an ADR's subject**: a change here picks or moves
-#: a shape another document or a later PR must obey — a file format, an id space, an op
-#: vocabulary, a byte-identity promise. That is what an ADR records, so the PR body must
-#: answer the question: which ADR does this implement, which does it supersede, or why
-#: is this change none of those (#539).
+#: The bindings: which ADR governs which code surface (#541). Validated by
+#: `scripts/check_adr.py` (which owns the ledger's ratchets); read here so the PR-time
+#: question can **name the decision** instead of asking "is this an ADR matter?".
 #:
-#: The list is **derived from the corpus**, not invented: each entry names the ADRs whose
-#: decision it carries. It is deliberately short — ADR-0023's rule is that a gate earns
-#: its keep, and a trigger that fires on ordinary work trains its readers to paste the
-#: waiver, which is how a signal dies. `--selftest` fails when an entry stops existing.
-DECISION_PATHS: dict[str, str] = {
-    "src/graph/ops.rs": "the op vocabulary (ADR-0001, ADR-0002, ADR-0009)",
-    "src/graph/registry.rs": "backend ids and the capability seam (ADR-0011, ADR-0012)",
-    "src/graph/backend.rs": "the `Backend` trait's contract (ADR-0009, ADR-0012)",
-    "src/graph/kvformat.rs": "the KV storage-format gate (ADR-0006)",
-    "src/graph/kvsession.rs": "the KV session file format (ADR-0014)",
-    "src/block.rs": "the on-disk quantized block layout (ADR-0020)",
-    "src/gguf_write.rs": "the GGUF writer's byte contract (ADR-0020)",
-    "src/convert.rs": "the HF→GGUF conversion contract (ADR-0020, ADR-0021)",
-    "src/quantize.rs": "the byte-identity promise of the quantizers (ADR-0020)",
-}
+#: A binding is a `path` (a file) or a `symbol` (everywhere the token occurs under
+#: `src/`, so it survives a file move). Both kinds make the same claim — "this surface's
+#: shape is fixed by that ADR" — and the reader is deliberately permissive: a malformed
+#: ledger yields no bindings rather than an exception, because this script's contract is
+#: to classify, and `check-docs` is where a broken ledger fails.
+GOVERNS_LEDGER = "scripts/adr-governs.toml"
 
 #: A **new** design document is a new contract, so it is a decision surface too. Only an
 #: *added* one: editing a design doc is how the contract is kept true, which is routine.
@@ -124,10 +113,7 @@ def classify(paths: list[str]) -> dict[str, int]:
             continue
         while path.startswith("./"):
             path = path[2:]
-        if path in DECISION_PATHS:
-            counts["decision"] += 1
-            counts["rust"] += 1
-        elif path == BASELINES_LEDGER:
+        if path == BASELINES_LEDGER:
             counts["baselines"] += 1
         elif path == PLAN_LEDGER:
             counts["plan"] += 1
@@ -140,22 +126,79 @@ def classify(paths: list[str]) -> dict[str, int]:
     return counts
 
 
-def decide(counts: dict[str, int], added: tuple[str, ...] = ()) -> dict[str, bool]:
+def load_governs(root: Path) -> list[dict[str, str]]:
+    """The ADR↔surface bindings, read permissively — `check_adr.py` validates the file."""
+    path = root / GOVERNS_LEDGER
+    if not path.is_file():
+        return []
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    entries = data.get("governs", [])
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
+
+#: A `symbol` binding names an identifier's **definition sites**, not the places the
+#: name is mentioned (#541): a knob or an FFI constant that this tree does not define is
+#: bound by the file that implements the mechanism instead. `check_adr.py` enforces the
+#: same rule when it validates the ledger.
+SYMBOL_DEFINES = (
+    r"^\s*(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?(?:async\s+)?"
+    r"(?:fn|struct|enum|trait|const|static|type|impl|mod)\s+{symbol}\b"
+)
+
+
+def symbol_files(root: Path, symbol: str) -> set[str]:
+    """Every `src/**/*.rs` that **defines** `symbol`, repository-relative."""
+    pattern = re.compile(SYMBOL_DEFINES.format(symbol=re.escape(symbol)), re.MULTILINE)
+    return {
+        p.relative_to(root).as_posix()
+        for p in (root / "src").rglob("*.rs")
+        if pattern.search(p.read_text(encoding="utf-8", errors="replace"))
+    }
+
+
+def governed(root: Path, paths: list[str]) -> list[tuple[str, str, str]]:
+    """`[(adr, shown surface, what)]` for the bindings this range touches, in ledger order.
+
+    A `path` binding matches the changed file itself; a `symbol` binding matches any file
+    that holds the symbol *at head*, which is what lets the binding survive a move.
+    """
+    changed = {p.strip().lstrip("./") for p in paths}
+    out: list[tuple[str, str, str]] = []
+    cache: dict[str, set[str]] = {}
+    for entry in load_governs(root):
+        adr, what = str(entry.get("adr", "")), str(entry.get("what", ""))
+        target = entry.get("path")
+        if target:
+            if str(target) in changed:
+                out.append((adr, str(target), what))
+        elif entry.get("symbol"):
+            symbol = str(entry["symbol"])
+            holders = cache.setdefault(symbol, symbol_files(root, symbol))
+            hit = sorted(holders & changed)
+            if hit:
+                out.append((adr, f"`{symbol}` (in {hit[0]})", what))
+    return out
+
+
+def decide(
+    counts: dict[str, int], added: tuple[str, ...] = (), touched: int = 0
+) -> dict[str, bool]:
     """The three predicates: the Rust jobs, the suite job's reason, and the ADR question."""
     return {
         "rust": counts["rust"] > 0,
         "baselines": counts["baselines"] > 0,
-        "decision_surface": counts["decision"] > 0 or any(DESIGN_DOC.match(p) for p in added),
+        "decision_surface": touched > 0 or any(DESIGN_DOC.match(p) for p in added),
     }
 
 
-def decision_reasons(paths: list[str], added: tuple[str, ...] = ()) -> list[str]:
-    """The ADRs a range has to answer for, one line each — the classifier's own evidence."""
-    out = [
-        f"{path} — {DECISION_PATHS[path]}"
-        for path in sorted({p.lstrip('./') for p in paths})
-        if path in DECISION_PATHS
-    ]
+def decision_reasons(touched: list[tuple[str, str, str]], added: tuple[str, ...] = ()) -> list[str]:
+    """The decisions a range has to answer for, one line each — the classifier's evidence."""
+    out = [f"ADR-{adr} governs {shown} — {what}" for adr, shown, what in touched]
     out += [f"{path} (new) — a new design contract" for path in sorted(added) if DESIGN_DOC.match(path)]
     return out
 
@@ -265,21 +308,23 @@ def emit(decision: dict[str, bool]) -> None:
 #: `./`-normalisation one — so a misspelled constant passes every case while the real
 #: file silently changes class (#466). Written out here, renaming a ledger fails a
 #: named case until this table is updated deliberately.
-#: `(name, changed paths, added paths, decision_surface)` for the ADR question. Kept
-#: apart from `FIXTURE_CASES` because it needs the *added* list, which the job guards do
-#: not read. Every entry is a claim about which ADR a path would have to answer to.
-DECISION_CASES = (
-    ("an op-vocabulary change asks the ADR question", ["src/graph/ops.rs"], [], True),
-    ("a backend-id change asks it", ["src/graph/registry.rs"], [], True),
-    ("a KV-format change asks it", ["src/graph/kvformat.rs"], [], True),
-    ("an on-disk layout change asks it", ["src/block.rs"], [], True),
-    ("a quantizer change asks it", ["src/quantize.rs"], [], True),
-    ("a routine source change does not", ["src/main.rs"], [], False),
-    ("a test change does not", ["src/graph/ops/tests.rs"], [], False),
-    ("a documentation change does not", ["docs/USAGE.md"], [], False),
-    ("a *new* design document does", [], ["docs/FOO-DESIGN.md"], True),
-    ("editing an existing design document does not", ["docs/KV-CACHE-DESIGN.md"], [], False),
-    ("a new design document in another tree does not", [], ["notes/FOO-DESIGN.md"], False),
+#: `(name, changed paths, added paths, expected ADR or None)` for the governance binding.
+#: Driven through `governed()` against the **real** ledger and the **real** tree, because
+#: that is the claim under test: "a change here answers to that decision". A rename that
+#: breaks a `path` binding or a move that breaks a `symbol` binding fails `check_adr.py`,
+#: which owns the ledger's ratchets; these cases pin the *matching* semantics.
+GOVERNANCE_CASES = (
+    ("a backend-id change is governed by ADR-0011", ["src/graph/registry.rs"], [], "0011"),
+    ("a KV-format change is governed by ADR-0006", ["src/graph/kvformat.rs"], [], "0006"),
+    ("a quantizer change is governed by ADR-0020", ["src/quantize.rs"], [], "0020"),
+    ("a template change is governed by ADR-0019", ["src/template.rs"], [], "0019"),
+    ("a dependency change is governed by ADR-0007", ["Cargo.toml"], [], "0007"),
+    ("a KV-session change is governed by ADR-0011 and ADR-0014", ["src/graph/kvsession.rs"], [], "0011"),
+    ("a symbol binding matches a file the symbol lives in", ["src/graph/backend.rs"], [], "0009"),
+    ("a routine source change is governed by nothing", ["src/main.rs"], [], None),
+    ("a documentation change is governed by nothing", ["docs/USAGE.md"], [], None),
+    ("a test-file change alone is governed by nothing", ["src/rendering_tests.rs"], [], None),
+    ("a *new* design document asks the question", [], ["docs/FOO-DESIGN.md"], None),
 )
 
 FIXTURE_CASES = (
@@ -441,28 +486,32 @@ def run_selftest() -> int:
         record(
             "a docs range prints all three predicates false",
             run_main("--base", c1, "--head", c2)
-            == "rust=false\nbaselines=false\ndecision_surface=false\n",
+            == "rust=false\nbaselines=false\ndecision_surface=false\nadr_question=\n",
             run_main("--base", c1, "--head", c2),
         )
 
-    # The ADR question, one case per trigger class.
-    for name, paths, added, expected in DECISION_CASES:
-        counts = classify(list(paths))
-        got = decide(counts, tuple(added))["decision_surface"]
-        record(name, got == expected, f"expected {expected}, got {got}")
-
-    # The trigger table may not rot: every path it names must still exist. Skipped when
-    # the selftest runs outside a checkout (it is a claim about *this* repository).
+    # The governance bindings, one case per shape of match: which ADR the range answers
+    # to, and that `decision_surface` follows it. Driven against the real ledger and the
+    # real tree — that is the claim under test. The ledger's own ratchets (a path must
+    # exist, a symbol must occur, a superseded ADR fails) belong to `check_adr.py`, which
+    # owns the file; a broken ledger yields no bindings here rather than an exception.
     root = Path.cwd()
     if (root / "src").is_dir():
-        missing = sorted(p for p in DECISION_PATHS if not (root / p).is_file())
-        record(
-            "every decision path still exists",
-            not missing,
-            f"no longer in the tree: {', '.join(missing)} — update DECISION_PATHS",
-        )
+        empty = {name: 0 for name in CLASSES}
+        for name, paths, added, expected in GOVERNANCE_CASES:
+            found = governed(root, list(paths))
+            adrs = sorted({adr for adr, _shown, _what in found})
+            surface = decide(empty, tuple(added), len(found))["decision_surface"]
+            want = bool(expected) or bool(added)
+            ok = surface == want and (expected in adrs if expected else not adrs)
+            record(
+                name,
+                ok,
+                f"expected {expected or 'no binding'} (decision_surface={want}), "
+                f"got {adrs or 'none'} (decision_surface={surface})",
+            )
     else:
-        print("SKIP  every decision path still exists (not run from a checkout)")
+        print("SKIP  the governance cases (not run from a checkout)")
 
     # `--help` states the honest limit.
     record("--help states the honest limit", HELP_LIMIT in build_parser().description, "")
@@ -509,11 +558,14 @@ def main(argv: list[str]) -> int:
         # The fail-safe asks the ADR question too: a range nobody could read is not
         # evidence that no decision was taken.
         emit({"rust": True, "baselines": False, "decision_surface": True})
+        print("adr_question=")
         return 0
 
     counts = classify(paths)
     added = tuple(git_added(root, base, head))
-    decision = decide(counts, added)
+    touched = governed(root, paths)
+    decision = decide(counts, added, len(touched))
+    reasons = decision_reasons(touched, added)
     summary = ", ".join(f"{name}={counts[name]}" for name in CLASSES)
     print(
         f"classify_changes: {len(paths)} changed path(s) over {base}...{head} ({summary}) "
@@ -522,9 +574,12 @@ def main(argv: list[str]) -> int:
         f"decision_surface={'true' if decision['decision_surface'] else 'false'}",
         file=sys.stderr,
     )
-    for line in decision_reasons(paths, added):
+    for line in reasons:
         print(f"classify_changes: ADR question — {line}", file=sys.stderr)
     emit(decision)
+    # The answer, on one GITHUB_OUTPUT-safe line, so `check-pr-body` can quote it in the
+    # message it fails with — the point of the binding is that the message names the ADR.
+    print("adr_question=" + " | ".join(reasons))
     return 0
 
 

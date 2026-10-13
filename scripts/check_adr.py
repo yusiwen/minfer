@@ -60,6 +60,17 @@ MAP_HEADING = "## Decisions governing this document"
 MAP_LINK = re.compile(r"\[ADR-(\d{4})\]\(([^)]+)\)")
 #: The ledger naming the ADRs that govern no document's contract, beside this checker.
 MAP_LEDGER = "scripts/adr-map-exclusions.toml"
+#: The ledger binding each ADR to the code surfaces it governs (#541), read here for
+#: validation and by `scripts/classify_changes.py` to name the decision at PR time.
+GOVERNS_LEDGER = "scripts/adr-governs.toml"
+#: A `symbol` binding means the identifier's **definition sites** — a mention is not a
+#: surface (measured: binding env-var names as symbols matched eight bindings for one
+#: file change, because the tokens appear in comments across the device layer).
+DEFINES = re.compile(
+    r"^\s*(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?(?:async\s+)?"
+    r"(?:fn|struct|enum|trait|const|static|type|impl|mod)\s+"
+    r"{symbol}\b"
+)
 
 #: Repository-rooted path shapes an ADR may cite. A token carrying a wildcard, a
 #: placeholder or a trailing `/` is a pattern or a directory, not a citation.
@@ -159,6 +170,76 @@ def load_map_ledger(root: Path) -> dict[str, str]:
         if not reason or not str(reason).strip():
             raise ValueError(f"{MAP_LEDGER}: `{number}` needs a non-empty reason")
         out[number] = str(reason)
+    return out
+
+
+def load_governs(root: Path) -> tuple[list[dict[str, str]], list[str]]:
+    """`([binding], problems)` for `scripts/adr-governs.toml`.
+
+    A binding names a `path` (the file) or a `symbol` (everywhere the token occurs under
+    `src/`), never both and never neither. Validation is here rather than in the reader so
+    the ledger cannot rot into a list of names nothing holds.
+    """
+    path = root / GOVERNS_LEDGER
+    if not path.is_file():
+        return [], [f"{GOVERNS_LEDGER}: missing — the ADR↔surface bindings live here"]
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    entries = data.get("governs", [])
+    if not isinstance(entries, list):
+        return [], [f"{GOVERNS_LEDGER}: `governs` must be an array of tables"]
+    problems: list[str] = []
+    corpus = seen_adr_numbers(root)
+    for index, entry in enumerate(entries, 1):
+        where = f"{GOVERNS_LEDGER}: entry {index}"
+        adr, what = str(entry.get("adr", "")), str(entry.get("what", "")).strip()
+        target, symbol = entry.get("path"), entry.get("symbol")
+        if not what:
+            problems.append(f"{where}: `what` is empty — say what the decision fixes here")
+        if bool(target) == bool(symbol):
+            problems.append(
+                f"{where}: exactly one of `path` or `symbol` — a path is a file, a symbol is "
+                "everywhere the token occurs under `src/`"
+            )
+            continue
+        if target:
+            if not (root / str(target)).exists():
+                problems.append(f"{where}: `path = \"{target}\"` does not exist")
+        else:
+            pattern = re.compile(DEFINES.pattern.format(symbol=re.escape(str(symbol))), re.M)
+            holders = sorted(
+                p.relative_to(root).as_posix()
+                for p in (root / "src").rglob("*.rs")
+                if pattern.search(p.read_text(encoding="utf-8", errors="replace"))
+            )
+            if not holders:
+                problems.append(
+                    f"{where}: `symbol = \"{symbol}\"` is defined in no `src/**/*.rs` — "
+                    "either the identifier moved, or it has no definition here and the "
+                    "binding belongs on the file that implements the mechanism"
+                )
+        status = corpus.get(adr, "")
+        if adr and not status:
+            problems.append(f"{where}: ADR-{adr} is not an ADR of this corpus")
+        elif status.startswith("Superseded by ADR-"):
+            successor = status.rsplit("ADR-", 1)[1]
+            problems.append(
+                f"{where}: ADR-{adr} is superseded by ADR-{successor} — a superseded decision "
+                f"governs nothing, so the binding belongs on ADR-{successor}"
+            )
+    return entries, problems
+
+
+def seen_adr_numbers(root: Path) -> dict[str, str]:
+    """`{number: status}` for the corpus — a small read, so the loader stands alone."""
+    out: dict[str, str] = {}
+    for p in sorted((root / "docs" / "adr").glob("[0-9]*.md")):
+        text = read(p)
+        status = ""
+        for line in text.splitlines():
+            if line.startswith("- Status:"):
+                status = line.split(":", 1)[1].strip()
+                break
+        out[p.name[:4]] = status
     return out
 
 
@@ -360,6 +441,13 @@ def check(root: Path) -> int:
                     f"`ADR-{adr.file_number}` — a correction is visible from both ends"
                 )
 
+    # the ADR↔surface bindings (#541): validated here, and read by the classifier to
+    # name the decision at PR time — the ledger is one file with two readers on purpose
+    governs, governs_problems = load_governs(root)
+    problems.extend(governs_problems)
+    bound = {str(e.get("adr", "")) for e in governs}
+    bound.discard("")
+
     # every path citation resolves, or is pinned in the ledger with a reason (ADR-0027)
     ledger, ledger_problems = load_citation_ledger(root)
     problems.extend(ledger_problems)
@@ -391,7 +479,8 @@ def check(root: Path) -> int:
     print(
         f"check_adr: {len(adrs)} ADR(s) numbered 0001-{adrs[-1].file_number if adrs else '????'}, "
         f"indexed, supersession consistent · {maps} map(s), {len(listed)} ADR(s) mapped, "
-        f"{len(excluded)} recorded as governing none"
+        f"{len(excluded)} recorded as governing none · {len(governs)} binding(s) over "
+        f"{len(bound)} ADR(s), {len(seen) - len(bound)} binding no code surface"
     )
     return 0
 
@@ -434,13 +523,14 @@ def _write(root: Path, name: str, text: str) -> None:
 def _fixture(root: Path, adrs: dict[str, str], readme: str = FIXTURE_README,
              summary: str = "# Summary\n\n- [ADR index](./adr/README.md)\n",
              citations: str = "", maps: dict[str, str] | None = None,
-             map_ledger: str = "") -> None:
+             map_ledger: str = "", governs: str = "") -> None:
     for name, text in adrs.items():
         _write(root, name, text)
     _write(root, "README.md", readme)
     (root / "scripts").mkdir(parents=True, exist_ok=True)
     (root / "scripts" / "adr-citations.toml").write_text(citations, encoding="utf-8")
     (root / "scripts" / "adr-map-exclusions.toml").write_text(map_ledger, encoding="utf-8")
+    (root / "scripts" / "adr-governs.toml").write_text(governs, encoding="utf-8")
     if maps is None:
         # Every fixture ADR is mapped by a fixture contract, so a case that is about
         # another rule is not also a case about an unmapped decision (#539). A case
@@ -648,6 +738,74 @@ def selftest() -> int:
         _fixture(root, {"0001-first-decision.md": FIXTURE_ADR}, maps={},
                  map_ledger='[exclude]\n0001 = ""\n')
         expect("an empty map-exclusion reason fails", check(root) == 1)
+
+    # --- the ADR↔surface bindings (#541) ---------------------------------------
+    GOverns = '[[governs]]\nadr = "0001"\nwhat = "the thing this record fixes"\n'
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 governs=GOverns + 'path = "src/gone.rs"\n')
+        expect("a binding whose path is gone fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR}, governs=GOverns + 'path = "Cargo.toml"\n')
+        (root / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+        expect("a binding whose path exists passes", check(root) == 0)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 governs=GOverns + 'symbol = "thing"\n')
+        (root / "src").mkdir()
+        (root / "src" / "thing.rs").write_text("pub fn thing() {}\n", encoding="utf-8")
+        expect("a symbol binding defined in src/ passes", check(root) == 0)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 governs=GOverns + 'symbol = "nothing_defines_this"\n')
+        (root / "src").mkdir()
+        (root / "src" / "thing.rs").write_text("pub fn thing() {}\n", encoding="utf-8")
+        expect("a symbol binding nothing defines fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 governs=GOverns + 'path = "Cargo.toml"\nsymbol = "thing"\n')
+        (root / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+        expect("a binding with both path and symbol fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 governs='[[governs]]\nadr = "0001"\nwhat = ""\npath = "Cargo.toml"\n')
+        (root / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+        expect("a binding with an empty `what` fails", check(root) == 1)
+
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        _fixture(root, {"0001-first-decision.md": FIXTURE_ADR},
+                 governs=GOverns + 'path = "Cargo.toml"\n')
+        (root / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+        (root / "scripts" / "adr-governs.toml").unlink()
+        expect("a missing governance ledger fails", check(root) == 1)
+
+    # a superseded decision governs nothing: the entry must move to its successor
+    with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
+        root = Path(tmp)
+        successor = FIXTURE_ADR.replace("# 0001.", "# 0002.").replace("0001", "0002").replace(
+            "- Status: Accepted", "- Status: Accepted\n- Supersedes: ADR-0001"
+        )
+        old = FIXTURE_ADR.replace("- Status: Accepted", "- Status: Superseded by ADR-0002")
+        _fixture(
+            root,
+            {"0001-first-decision.md": old, "0002-second.md": successor},
+            readme=FIXTURE_README + "| [0002](./0002-second.md) | 2026-01-02 | Second | Accepted |\n",
+            governs='[[governs]]\nadr = "0001"\nwhat = "a decision that has moved on"\npath = "Cargo.toml"\n',
+        )
+        (root / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+        expect("a binding on a superseded ADR fails", check(root) == 1)
 
     with tempfile.TemporaryDirectory(prefix="check_adr_selftest_") as tmp:
         root = Path(tmp)
