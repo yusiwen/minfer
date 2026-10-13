@@ -280,16 +280,8 @@ fn f6_a_row_no_block_divides_is_demoted_like_llamacpp() {
             plan.demoted
         );
         plan.write_single(&model, &out).expect("write");
-        let n = tensor_payloads_equal(&out, &reff).unwrap_or_else(|e| {
-            panic!(
-                "{}: minfer's file differs from the recorded llama-quantize reference \
-                 ({reff:?}): {e}",
-                target.name(),
-                reff = reff.display()
-            )
-        });
-        // The comparison above is the claim; this names the tensor it is about,
-        // so a failure of the *type* rule cannot hide behind a byte diff.
+        // The type rule first: it names the tensor, so a type bug cannot hide
+        // behind a byte diff (and vice versa).
         let written = crate::gguf::load_gguf_model(&out).expect("output parses");
         assert_eq!(
             declared_type(&written, EDIT_TENSOR),
@@ -298,13 +290,68 @@ fn f6_a_row_no_block_divides_is_demoted_like_llamacpp() {
             target.name(),
             want_demoted.type_name()
         );
-        eprintln!(
-            "f6 legacy-row parity: {} == llama-quantize on {n} tensors \
-             [{EDIT_TENSOR} ne[0] = {EDIT_NE0}, {delta} B shift, {} demoted] \
-             [reference {}]",
-            target.name(),
-            plan.demoted.len(),
-            reff.display()
-        );
+        match tensor_payloads_equal(&out, &reff) {
+            Ok(n) => eprintln!(
+                "f6 legacy-row parity: {} == llama-quantize on {n} tensors \
+                 [{EDIT_TENSOR} ne[0] = {EDIT_NE0}, {delta} B shift, {} demoted] \
+                 [reference {}]",
+                target.name(),
+                plan.demoted.len(),
+                reff.display()
+            ),
+            Err(primary) => {
+                // Not necessarily an encoder defect: the claim is about one
+                // build of `llama-quantize` (ADR-0020), so ask the same question
+                // the recorded parity gate asks (#349) — does the *uncontracted*
+                // model reproduce it, and is this reference a recorded foreign
+                // build? A Mac asked to compare against a dgxspark reference
+                // reaches this path with the K-quant search encoders, which are
+                // compiler-sensitive (docs/GGUF-TOOLING.md §4.2.1).
+                let alt = dir.join(format!("{}-uncontracted.gguf", target.name()));
+                let _ = std::fs::remove_file(&alt);
+                let off_matches = plan
+                    .write_single_with_contract(&model, &alt, crate::quantize::FmaContract::Off)
+                    .is_ok()
+                    && tensor_payloads_equal(&alt, &reff).is_ok();
+                let record = f6_fixtures::reference_record(&reff);
+                match f6_fixtures::ParityVerdict::classify(false, off_matches, &record) {
+                    f6_fixtures::ParityVerdict::Reproduces => {
+                        unreachable!("the `Fast` comparison already failed")
+                    }
+                    f6_fixtures::ParityVerdict::FlagMismatch => panic!(
+                        "f6 legacy-row parity: {}: {} is a build without cross-statement FMA \
+                         contraction (`-ffp-contract=off`), not the documented `fast` build; the \
+                         two differ at exact rounding boundaries (docs/GGUF-TOOLING.md §4.2). \
+                         {primary}",
+                        target.name(),
+                        reff.display()
+                    ),
+                    f6_fixtures::ParityVerdict::RecordedForeignBuild => eprintln!(
+                        "[f6 legacy-row parity] SKIP {}: {} matches neither minfer's \
+                         `FmaContract::Fast` model nor its uncontracted model ({primary}), and \
+                         the manifest records its content as a different build of the same source, \
+                         not the authoritative reference — a compiler difference, not an encoder \
+                         defect (issue #349). Parity here is asserted only against the recorded \
+                         compiler.",
+                        target.name(),
+                        reff.display()
+                    ),
+                    f6_fixtures::ParityVerdict::AuthoritativeNotReproduced => panic!(
+                        "f6 legacy-row parity: {}: {primary} — and {} IS the authoritative \
+                         recorded content for this path, so the encoder no longer reproduces the \
+                         reference this claim is asserted against (issue #349)",
+                        target.name(),
+                        reff.display()
+                    ),
+                    f6_fixtures::ParityVerdict::Unattributable => panic!(
+                        "f6 legacy-row parity: {}: {primary}, and {} matches no recorded content in \
+                         tests/fixtures/f6-fixtures.json — a corrupted or replaced reference looks \
+                         exactly like this, so nothing may be blamed on a compiler (issue #349)",
+                        target.name(),
+                        reff.display()
+                    ),
+                }
+            }
+        }
     }
 }
