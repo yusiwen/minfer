@@ -4,9 +4,18 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>minfer · Inference Graph Demo</title>
-<link rel="stylesheet" href="style.css?v=2">
-<!-- Asset versions: bump `?v=` on the file you changed. A fresh page must never
-     pair with a stale stylesheet or script from a caching static server. -->
+<script>
+  /* Asset freshness (#103). These pages are edited in place and served by a plain
+     static server, which sends no `Cache-Control`: the browser may then reuse a
+     stylesheet or script for a heuristic freshness window and pair a *fresh page
+     with a stale asset* — that is how the "Shape flow" jump broke. So every asset
+     URL is stamped at load time instead of carrying a hand-bumped `?v=N`: nothing
+     to remember, and no server-side rewrite is needed. `minfer viz` keeps its own
+     `no-store` (src/server/viz.rs); the stamp only has to survive that router.
+     Written while the parser is still running, so the stylesheet still blocks
+     first paint. Keep this loader in sync with the one in viz/e2e.html. */
+  document.write('<link rel="stylesheet" href="style.css?t=' + Date.now() + '">');
+</script>
 <style>
   /* The toolbar jump to the other view is inlined on purpose: it must look right
      even when the browser still holds a stale style.css (that happened), and the
@@ -127,6 +136,11 @@
   <button id="btn-legend" title="Operator legend">Legend</button>
 </div>
 
-<script src="app.js?v=2"></script>
+<script>
+  /* The same per-load stamp as the loader in <head>: an edited app.js is never
+     served from cache beside a fresh page. A script the parser inserts here still
+     runs before `DOMContentLoaded`, which is what app.js boots on. */
+  document.write('<script src="app.js?t=' + Date.now() + '"><\/script>');
+</script>
 </body>
 </html>
