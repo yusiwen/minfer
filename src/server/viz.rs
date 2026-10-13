@@ -12,11 +12,13 @@
 //! connected, so idle viz servers pay nothing.
 
 use std::convert::Infallible;
+use std::io::Read;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -259,38 +261,89 @@ fn html(body: String) -> Response {
 }
 
 /// Serve samples/ from disk (`MINFER_VIZ_DIR` or `viz` relative to CWD).
-async fn sample_asset(Path(name): Path<String>) -> Response {
+async fn sample_asset(Path(name): Path<String>, headers: HeaderMap) -> Response {
     let dir = std::env::var("MINFER_VIZ_DIR").unwrap_or_else(|_| "viz".to_string());
-    sample_response(std::path::Path::new(&dir), &name)
+    let if_none_match = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok());
+    sample_response(std::path::Path::new(&dir), &name, if_none_match)
 }
 
-/// The body of [`sample_asset`], with the directory passed in so the JSON contract
-/// is testable without the process-wide `MINFER_VIZ_DIR` (#546).
+/// A strong validator for one sample: its length and modification time.
+///
+/// `If-None-Match` needs no HTTP-date formatting, so this is a few lines of `fstat`
+/// rather than a date library — and a browser that holds the tag revalidates with it
+/// in preference to any `If-Modified-Since` it was given (RFC 9110 §13.1.3). A
+/// platform that cannot report a modification time falls back to the length alone.
+fn etag_of(metadata: &std::fs::Metadata) -> String {
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("\"{}-{}\"", metadata.len(), mtime)
+}
+
+/// Whether an `If-None-Match` value names `etag`, by *weak* comparison over the
+/// comma-separated list a browser, a proxy or `curl` may send (RFC 9110 §13.1.2).
+/// `*` matches any current representation; a missing or unparsable value matches
+/// nothing, so a garbage header is a `200`, never a `304`.
+fn etag_matches(if_none_match: Option<&str>, etag: &str) -> bool {
+    let Some(value) = if_none_match else {
+        return false;
+    };
+    let wanted = etag.strip_prefix("W/").unwrap_or(etag);
+    value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == wanted
+    })
+}
+
+/// The body of [`sample_asset`], with the directory and the client's validator passed
+/// in, so the JSON contract and the `304` arm are testable without the process-wide
+/// `MINFER_VIZ_DIR` (#546, #548).
 ///
 /// Samples are data, not code: one may be regenerated in place under the same name,
 /// and a browser holding a copy has no way to know. `no-cache` says *revalidate* —
 /// a client that asks gets the file on disk — where `no-store` (the code assets'
-/// rule, [`asset`]) would forbid keeping the copy at all. Nothing here is a
-/// validator yet, so a revalidation costs the whole body; adding one is filed on
-/// #546. The `viz/` pages ask for exactly this themselves (`cache: 'no-cache'` on
-/// every runtime fetch), which is what covers a plain static server too — that
-/// server is not ours and sends no `Cache-Control` at all.
-fn sample_response(dir: &std::path::Path, name: &str) -> Response {
+/// rule, [`asset`]) would forbid keeping the copy at all. The `ETag` is what makes
+/// that revalidation cheap: a matching `If-None-Match` is answered from the file's
+/// metadata, without reading the body. The `viz/` pages ask for the revalidation
+/// themselves (`cache: 'no-cache'` on every runtime fetch), which is what covers a
+/// plain static server too — that server is not ours and sends no `Cache-Control`.
+fn sample_response(dir: &std::path::Path, name: &str, if_none_match: Option<&str>) -> Response {
     if name.contains('/') || name.contains("..") {
         return (StatusCode::BAD_REQUEST, "bad path").into_response();
     }
-    let path = dir.join("samples").join(name);
-    match std::fs::read(&path) {
-        Ok(bytes) => (
-            [
-                (axum::http::header::CONTENT_TYPE, "application/json"),
-                (axum::http::header::CACHE_CONTROL, "no-cache"),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "sample not found").into_response(),
+    let mut file = match std::fs::File::open(dir.join("samples").join(name)) {
+        Ok(file) => file,
+        Err(_) => return (StatusCode::NOT_FOUND, "sample not found").into_response(),
+    };
+    // `fstat` on the handle that would be read, so the tag and the bytes describe
+    // one file rather than two lookups of it.
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return (StatusCode::NOT_FOUND, "sample not found").into_response(),
+    };
+    let etag = etag_of(&metadata);
+    let headers = [
+        (
+            axum::http::header::CONTENT_TYPE,
+            "application/json".to_string(),
+        ),
+        (axum::http::header::CACHE_CONTROL, "no-cache".to_string()),
+        (axum::http::header::ETAG, etag.clone()),
+    ];
+    if etag_matches(if_none_match, &etag) {
+        // RFC 9110 §15.4.5: a `304` repeats the validators its `200` would have sent.
+        return (StatusCode::NOT_MODIFIED, headers, Vec::new()).into_response();
     }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return (StatusCode::NOT_FOUND, "sample not found").into_response();
+    }
+    (headers, bytes).into_response()
 }
 
 // === live endpoints ===

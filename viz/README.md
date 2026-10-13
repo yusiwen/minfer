@@ -265,9 +265,17 @@ The engine's own half is `src/server/viz.rs`'s `sample_asset`, which serves
 `Cache-Control: no-cache` rather than the `no-store` the code assets get. The difference is the
 intent: the pages and their assets are *code*, edited in place, so a rebuilt `minfer viz` must not
 be viewed through the previous build's cache entry; the samples are *data*, and keeping the copy
-around while asking the server to confirm it is exactly what a client wants. That response carries
-no validator yet, so a revalidation costs the whole body — the cheap `304` the static server gives
-needs `Last-Modified`/`ETag` from the engine too, which is [#548](https://github.com/yusiwen/minfer/issues/548).
+around while asking the server to confirm it is exactly what a client wants.
+
+The response carries an `ETag` — the file's length and modification time — so the confirmation it
+asks for costs headers, not bytes: a matching `If-None-Match` is answered from the file's metadata
+with `304 Not Modified` and no body, and the body is read only when the file is new or has changed.
+Measured on both servers (2026-10-13, `dgxspark`): `GET /samples/manifest.json` is 768 B on the
+first request, `304` with 0 B on the next, and a rewritten sample is `200` with the new bytes and a
+new tag. `ETag` rather than `Last-Modified` because it needs no HTTP-date formatting (no date
+dependency), and a browser that holds the tag revalidates with `If-None-Match` in preference to any
+`If-Modified-Since` it was given (RFC 9110 §13.1.3). A rewrite that changes neither the length nor
+the filesystem timestamp would not move it.
 
 `scripts/check_viz_assets.mjs` audits this half as well: it scans every `viz/*.js` for `fetch(...)`
 call sites (strings and comments skipped) and fails one that could be served from a heuristic
