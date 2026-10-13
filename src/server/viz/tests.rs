@@ -149,18 +149,69 @@ async fn the_router_serves_the_asset_urls_the_loader_composes() {
     assert_eq!(body, E2E_JS);
 }
 
-/// `GET /samples/:name` reads a file under a directory named by `MINFER_VIZ_DIR`,
-/// so the name is a path a stranger supplies. The handler refuses a separator or a
-/// `..` outright, which is the property — not axum's decoding, so the guard is
-/// exercised directly here.
+/// A throwaway `viz/` directory with the named files under `samples/`, removed when
+/// it drops (`server::viz::sample_response` takes the directory as an argument, so no
+/// test has to set the process-wide `MINFER_VIZ_DIR`).
+struct SampleDir(std::path::PathBuf);
+
+impl SampleDir {
+    fn new(tag: &str, files: &[(&str, &str)]) -> Self {
+        let root = std::env::temp_dir().join(format!("minfer-viz-{tag}-{}", std::process::id()));
+        let samples = root.join("samples");
+        std::fs::create_dir_all(&samples).unwrap();
+        for (name, body) in files {
+            std::fs::write(samples.join(name), body).unwrap();
+        }
+        SampleDir(root)
+    }
+}
+
+impl Drop for SampleDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The sample contract: JSON, the file on disk, and `no-cache` — a client may keep
+/// the copy but must confirm it before using it (#546). The pages ask for the same
+/// on every fetch; this is the engine's half, for a client that does not (`curl`, a
+/// deep link opened directly).
 #[tokio::test]
-async fn a_sample_name_cannot_escape_the_samples_directory() {
+async fn a_sample_is_served_as_json_that_must_be_revalidated() {
+    let dir = SampleDir::new("sample-ok", &[("one.json", r#"{"samples":[]}"#)]);
+    let response = super::sample_response(&dir.0, "one.json");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap(),
+        "application/json"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .unwrap(),
+        "no-cache"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], br#"{"samples":[]}"#);
+}
+
+/// `GET /samples/:name` reads a file under a directory named by `MINFER_VIZ_DIR`, so
+/// the name is a path a stranger supplies. The handler refuses a separator or a `..`
+/// outright, which is the property — not axum's decoding, so the guard is exercised
+/// directly here.
+#[test]
+fn a_sample_name_cannot_escape_the_samples_directory() {
+    let dir = SampleDir::new("sample-traversal", &[("one.json", "{}")]);
     for name in ["..", "../Cargo.toml", "samples/../../Cargo.toml", "a/b"] {
-        let status = super::sample_asset(Path(name.to_string())).await.status();
+        let status = super::sample_response(&dir.0, name).status();
         assert_eq!(status, StatusCode::BAD_REQUEST, "name {name:?}");
     }
-    let status = super::sample_asset(Path("does-not-exist.json".to_string()))
-        .await
-        .status();
+    let status = super::sample_response(&dir.0, "does-not-exist.json").status();
     assert_eq!(status, StatusCode::NOT_FOUND);
 }

@@ -243,6 +243,36 @@ page's loader with a stubbed `document.write`, and requires the composed request
 or a literal `<link href>`/`<script src>` that bypasses the loader all fail. The engine side is
 pinned by `cargo test --release --bin minfer -- viz`.
 
+### The data the pages fetch
+
+The same window applies to the JSON the pages load at runtime, and there the names are *stable*:
+`samples/manifest.json` and `samples/<file>.json` are regenerated in place, so a cached copy is a
+sample list (or a sample) that no longer matches the disk. Every runtime request therefore
+revalidates:
+
+```js
+fetch('samples/manifest.json', { cache: 'no-cache' })
+```
+
+`no-cache` means "keep the stored body, but confirm it before using it" (RFC 9111 §4.3) — not
+"never store". On a plain static server the confirmation is cheap: `python3 -m http.server` answers
+`If-Modified-Since` with a `304`, so an unchanged sample costs headers only, and a regenerated one
+is downloaded because its `Last-Modified` moved. The rule covers the live endpoints too
+(`/viz/graph` is a GET whose response carries no cache headers), and the one POST (`/viz/run`) is
+exempt — HTTP does not cache those.
+
+The engine's own half is `src/server/viz.rs`'s `sample_asset`, which serves
+`Cache-Control: no-cache` rather than the `no-store` the code assets get. The difference is the
+intent: the pages and their assets are *code*, edited in place, so a rebuilt `minfer viz` must not
+be viewed through the previous build's cache entry; the samples are *data*, and keeping the copy
+around while asking the server to confirm it is exactly what a client wants. That response carries
+no validator yet, so a revalidation costs the whole body — the cheap `304` the static server gives
+needs `Last-Modified`/`ETag` from the engine too, which is [#548](https://github.com/yusiwen/minfer/issues/548).
+
+`scripts/check_viz_assets.mjs` audits this half as well: it scans every `viz/*.js` for `fetch(...)`
+call sites (strings and comments skipped) and fails one that could be served from a heuristic
+cache, naming its file and line. It is an audit of the source, not of a browser.
+
 ## Generating your own samples
 
 ### Structure graph (--dump-graph-json)

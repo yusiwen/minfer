@@ -1202,7 +1202,12 @@
     $('sample').addEventListener('change', function () {
       if (!this.value) return;
       var opt = this.options[this.selectedIndex];
-      fetch('samples/' + this.value)
+      // Every runtime data request in this file revalidates (#546): a plain static
+      // server sends no `Cache-Control`, only `Last-Modified`, so a browser may
+      // reuse a *regenerated* sample or manifest from its cache rather than the
+      // file on disk. `no-cache` keeps the stored body and asks the server to
+      // confirm it.
+      fetch('samples/' + this.value, { cache: 'no-cache' })
         .then(function (r) { return r.json(); })
         .then(function (j) { applyJson(j, opt.textContent); })
         .catch(function (err) { $('src').textContent = 'load failed: ' + err.message; });
@@ -1227,7 +1232,7 @@
 
   function loadManifest() {
     var sel = $('sample');
-    fetch('samples/manifest.json')
+    fetch('samples/manifest.json', { cache: 'no-cache' })
       .then(function (r) { return r.json(); })
       .then(function (m) {
         (m.samples || []).forEach(function (s) {
@@ -1239,7 +1244,7 @@
         var first = (m.samples || [])[0];
         if (first) {
           sel.value = first.file;
-          return fetch('samples/' + first.file).then(function (r) { return r.json(); })
+          return fetch('samples/' + first.file, { cache: 'no-cache' }).then(function (r) { return r.json(); })
             .then(function (j) { applyJson(j, first.label); });
         }
       })
