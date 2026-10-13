@@ -583,11 +583,14 @@ name and digest; the byte half runs where the cache exists, in the F6 gates them
 `scripts/check_support_matrix.py` (#519), which keeps the one *capability* table honest: it derives
 the AVX2 quant dots from `src/quants/` and fails when [`docs/SUPPORT-MATRIX.md`](./SUPPORT-MATRIX.md)'s
 AVX2 column disagrees either way — the column that had marked Q5_0 as SIMD while only Q4_0, Q8_0 and
-the three K-quants had kernels. `scripts/check_env_vars.py` (#521) enumerates what the engine reads:
-every `MINFER_*` name passed to `env::var` in the non-test source must be in `docs/USAGE.md`, named in
-a live document, or listed in `scripts/env-vars.toml` beside it with a reason — the dated records do
-not count as documentation, which is how `MINFER_N_BATCH` (read and printed at every server start) was
-found. And the job also runs three audits that are pure and offline like the rest:
+the three K-quants had kernels. `scripts/check_env_vars.py` (#521, strengthened by #531)
+enumerates what the engine reads and requires a **home** for each: `scripts/env-vars.toml` maps every
+`MINFER_*` name passed to `env::var` in the non-test source either to the file that documents it —
+which the checker opens, requires to be a live document rather than one of the dated records, and
+requires to *name* the knob — or to `[internal]` with a reason, where the checker fails if any live
+document does name it (the exemption must stay necessary). Both tables ratchet, and a knob in neither
+is reported with the source file that reads it, which is how `MINFER_N_BATCH` (read and printed at
+every server start) was found. And the job also runs three audits that are pure and offline like the rest:
 `scripts/check_agents_size.py` (the cap on `AGENTS.md`), `scripts/check_source_layout.py` (the test-file
 and module-declaration rules) and `scripts/check_cuda_launch_returns.py` (every CUDA launch reads its
 own error and carries an injection lever, #162). **Open doc

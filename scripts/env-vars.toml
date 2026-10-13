@@ -1,54 +1,120 @@
-# Every production `MINFER_*` env var that is not documented for a user (#521).
+# Where every production `MINFER_*` environment variable is documented (#531).
 #
 # `scripts/check_env_vars.py` enumerates the `std::env::var("MINFER_…")` reads in the
-# non-test source and requires each name to be **documented**: named in
-# `docs/USAGE.md` (the manual) or in a live document under `docs/` (the design and
-# usage docs, `AGENTS.md`, `README.md`). The record documents — the ADR corpus, the
-# CUDA campaign records, the execution plan, the roadmap, the baselines, the three
-# `*_OPTIMIZATIONS.md` pages — are *dated history*, so a name that appears only there
-# is not documented for a reader who wants to turn a knob; it belongs in this file
-# with a reason.
+# non-test source (test files excluded by the layout rule `check_source_layout.py`
+# already holds) and requires **every** name to appear in exactly one of two tables:
 #
-# The checker enforces four things about this file:
-#   1. a name read in production that is neither documented nor listed here fails
-#      (that is the #521 class: `MINFER_N_BATCH` was read at every server start and
-#      named only in the plan and the roadmap);
-#   2. an entry whose name **is** documented fails, because the exemption is then
-#      unnecessary (the ledger may not rot);
-#   3. an entry whose name is **no longer read** fails (same reason);
-#   4. `reason` must be non-empty and must say what the knob is for and where its
-#      only record is.
+#   `[documented]`  name = "<file>"   the file that documents the knob. The checker
+#                                     verifies that the file exists, is a live document
+#                                     (not one of the dated records listed in the
+#                                     script), and actually names the knob — so the
+#                                     claim "this is where it is documented" is checked,
+#                                     not asserted.
+#   `[internal]`    name = "<reason>" no document a reader would find names it, and the
+#                                     reason says what it does and where its only
+#                                     record is. The checker fails if a live document
+#                                     *does* name the knob: the exemption must stay
+#                                     necessary.
 #
-# This is the *weak* half of the problem, stated on purpose: it proves the name is not
-# invisible, not that a reader can find it. The strong form — every knob documented in
-# `docs/USAGE.md` or listed here — would need ~65 curated entries today, because most
-# of these are per-kernel A/B switches whose home is a design document. The three knobs
-# #521 was filed for (`MINFER_N_BATCH`, `MINFER_BENCH_WARMUP_MS`,
-# `MINFER_SPECVERIFY_WARMUP_MS`) are in the manual now; the rest of the strong form is
-# [#531](https://github.com/yusiwen/minfer/issues/531).
+# Both tables ratchet: an entry whose knob is no longer read fails, a `[documented]`
+# home that does not contain the name fails, and a knob in neither table fails (the
+# #521 class: `MINFER_N_BATCH` was read and printed at every server start while only
+# the plan and the roadmap named it).
+#
+# Prefer `docs/USAGE.md` for a knob a user sets, and the design contract that owns the
+# mechanism otherwise (`docs/CUDA-BACKEND-DESIGN.md`, `docs/METAL-BACKEND-DESIGN.md`,
+# `docs/COMPUTE-GRAPH-DESIGN.md`, `docs/BACKEND-REGISTRY-DESIGN.md`, …); the walkthrough
+# chapters and the tutorials are homes too, and `AGENTS.md`/`README.md` carry the
+# build-and-run examples.
+#
+# Measured 2026-10-11: 84 production reads — 72 documented, 12 internal.
+
+[documented]
+
+MINFER_ATTN_CHUNKS = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_BACKENDS = "docs/USAGE.md"
+MINFER_BATCH = "docs/USAGE.md"
+MINFER_BENCH_WARMUP_MS = "docs/USAGE.md"
+MINFER_CACHE_TYPE = "docs/USAGE.md"
+MINFER_COLOR = "docs/USAGE.md"
+MINFER_CUDA_CAPTURE_MODE = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_DEVICE_TIER = "docs/DEVICE-ADAPTATION-PLAN.md"
+MINFER_DISABLE_CUDA = "docs/USAGE.md"
+MINFER_DISABLE_MPS = "docs/inference_e2e_walkthrough/14-metal-backend.md"
+MINFER_DRAIN_MS = "docs/USAGE.md"
+MINFER_DUMP_DIR = "docs/debug-dump.md"
+MINFER_FFN_COMPOSITION = "docs/USAGE.md"
+MINFER_FUSED_B = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_GEMM = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_GPU_LAYERS = "docs/USAGE.md"
+MINFER_GPU_MEM = "docs/USAGE.md"
+MINFER_GRAPH_DUMP = "AGENTS.md"
+MINFER_GRAPH_TRACE = "docs/COMPUTE-GRAPH-DESIGN.md"
+MINFER_METALLIB_FILE = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_METAL_CAPTURE = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_MMQ_A_FUSE = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_MMQ_Q4K_DSC = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
+MINFER_MMQ_Q6K_EXP = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
+MINFER_MMQ_RAW_KD = "docs/LLAMA-CPP-MMQ-ANALYSIS.md"
+MINFER_MMQ_RAW_NB_DEBUG = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
+MINFER_MMQ_RAW_WIDE = "docs/LLAMA-CPP-MMQ-ANALYSIS.md"
+MINFER_MMVQ_V1 = "docs/cuda_tutorial/04-kernels-matmul.md"
+MINFER_MODEL_DIR = "docs/inference_e2e_walkthrough/01-cli-args-model-resolution.md"
+MINFER_NO_AVX2 = "docs/SUPPORT-MATRIX.md"
+MINFER_NO_AVX512 = "docs/SUPPORT-MATRIX.md"
+MINFER_NO_CONTEXT_SHIFT = "docs/USAGE.md"
+MINFER_NO_CUDA_GRAPH = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
+MINFER_NO_DECODE_A_FUSE = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_NO_FA_PREFILL = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_NO_FLASH = "docs/inference_e2e_walkthrough/14-metal-backend.md"
+MINFER_NO_FUSED_Q8_KV = "docs/USAGE.md"
+MINFER_NO_FUSE_FFN = "docs/USAGE.md"
+MINFER_NO_FUSE_QKV = "docs/USAGE.md"
+MINFER_NO_GEMM_PREWARM = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_NO_KQ_MMVQ = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
+MINFER_NO_KV_SHARE = "docs/USAGE.md"
+MINFER_NO_MATMUL_ATTN = "docs/inference_e2e_walkthrough/14-metal-backend.md"
+MINFER_NO_NEON = "docs/SUPPORT-MATRIX.md"
+MINFER_NO_PINNED_READBACK = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_NO_PREFILL_CAPTURE = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_NO_PREFILL_FLASH = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_NO_PREFILL_GEMM = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_NO_Q40_MMVQ = "docs/cuda_tutorial/04-kernels-matmul.md"
+MINFER_NO_Q80_MMVQ = "README.md"
+MINFER_NO_Q80_P32 = "README.md"
+MINFER_NO_RMS_256 = "docs/COMPUTE-GRAPH-DESIGN.md"
+MINFER_NO_SPLIT_ATTN = "docs/COMPUTE-GRAPH-DESIGN.md"
+MINFER_NO_W16CACHE = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_NO_WINDOW_FLASH = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_N_BATCH = "docs/USAGE.md"
+MINFER_OP_PROFILE = "docs/SUPPORT-MATRIX.md"
+MINFER_OP_TIMING = "docs/USAGE.md"
+MINFER_PACKED_KV_STAGE = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_Q6K_PF = "docs/CUDA-TECH-PRIMER.md"
+MINFER_REBUILD_TRACE = "docs/COMPUTE-GRAPH-DESIGN.md"
+MINFER_S4_AB_MAP_REPS = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_SMALL_M_GEMM = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_SPECVERIFY_NOUT = "docs/USAGE.md"
+MINFER_SPECVERIFY_NTS = "docs/USAGE.md"
+MINFER_SPECVERIFY_WARMUP_MS = "docs/USAGE.md"
+MINFER_SYNC_COPIES = "docs/BACKEND-REGISTRY-DESIGN.md"
+MINFER_TEST_CAPTURE_WARMUP = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_TIMING = "docs/inference_e2e_walkthrough/09-prefill-forward-path.md"
+MINFER_TRACE = "docs/FEATURES.md"
+MINFER_VIZ_DIR = "docs/COMPUTE-GRAPH-DESIGN.md"
+MINFER_WEIGHT_COPY = "docs/COMPUTE-GRAPH-DESIGN.md"
 
 [internal]
 
 MINFER_A32_DEBUG = "prints the per-row sums of the CUDA A32 prefill path (`src/cuda/methods/prefill_f16.rs`); a debug print no document names"
-
-MINFER_FFNDEBUG = "prints the FFN node shapes from the Metal backend (`src/graph/metal_backend.rs`); a debug print no document names"
-
-MINFER_GEMM_A32 = "A/B switch for the smem-mirror A32 GEMM variant (`src/cuda/methods/prefill_f16.rs`); no document names it"
-
 MINFER_BATCH_TRACE = "per-slot trace of the server's batch composition (`src/server/batch.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
-
-MINFER_NO_F16_ROWB = "A/B control for the f16 row-block weight dot (`src/vec_ops/f16.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
-
-MINFER_NO_KV_DEFRAG = "presence-checked switch that disables KV defragmentation (`src/graph/alloc.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
-
-MINFER_NO_PREFIX_REUSE = "presence-checked switch that disables prefix reuse, the pre-B2 behaviour (`src/server/chat.rs`, `src/server/batch.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
-
-MINFER_TOKEN_TRACE = "writes the position-wise token trace the identity battery aligns on (`src/main.rs`); mentioned only by `docs/cuda_optimization_steps/95-adaptive-draft-depth.md`"
-
+MINFER_FFNDEBUG = "prints the FFN node shapes from the Metal backend (`src/graph/metal_backend.rs`); a debug print no document names"
+MINFER_GEMM_A32 = "A/B switch for the smem-mirror A32 GEMM variant (`src/cuda/methods/prefill_f16.rs`); no document names it"
 MINFER_MMQ_KSPLIT_TARGET = "overrides the auto-ksplit SM-count target (`src/cuda/methods/prefill_mmq.rs`); documented in the CUDA campaign record `docs/CUDA_OPTIMIZATION.md`"
-
 MINFER_NO_DP4A_Q8_KV = "A/B switch that selects the incumbent packed-Q8_0 K dot over the dp4a one (`src/cuda.rs`); documented in `docs/CUDA_OPTIMIZATION.md` and its step record"
-
+MINFER_NO_F16_ROWB = "A/B control for the f16 row-block weight dot (`src/vec_ops/f16.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
+MINFER_NO_KV_DEFRAG = "presence-checked switch that disables KV defragmentation (`src/graph/alloc.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
+MINFER_NO_PREFIX_REUSE = "presence-checked switch that disables prefix reuse, the pre-B2 behaviour (`src/server/chat.rs`, `src/server/batch.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
 MINFER_NO_Q8_KV_WIDE = "A/B switch that selects the incumbent four-byte packed-Q8_0 KV loads (`src/cuda.rs`); documented in `docs/CUDA_OPTIMIZATION.md` and its step record"
-
 MINFER_SPEC_DEBUG = "speculative-decoding debug output (`src/spec.rs`); documented in `docs/CUDA_OPTIMIZATION.md` and its step record"
+MINFER_TOKEN_TRACE = "writes the position-wise token trace the identity battery aligns on (`src/main.rs`); mentioned only by `docs/cuda_optimization_steps/95-adaptive-draft-depth.md`"
