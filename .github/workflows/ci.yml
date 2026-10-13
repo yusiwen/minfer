@@ -277,6 +277,12 @@ jobs:
       # cannot bootstrap rustup (it failed with "curl: command not found").
       # build-essential also gives nvcc its host compiler and the linker.
       - name: Install build prerequisites
+        # `python3` pulls in `tzdata`, whose postinst asks for a geographic area.
+        # Without this the debconf frontend falls back to Teletype and the step
+        # waits forever instead of failing — `-y` answers apt's questions, not
+        # debconf's (issue #544: 23m 7s stuck before a hand cancellation).
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
           apt-get install -y --no-install-recommends curl ca-certificates build-essential python3

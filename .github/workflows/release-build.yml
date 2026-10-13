@@ -171,6 +171,10 @@ jobs:
       # glibc 2.39 / gcc 13), printed so a log reader does not have to take the
       # tag on trust.
       - name: Install build prerequisites
+        # Keep the install non-interactive: a package added to this line that asks
+        # a debconf question would hang the job instead of failing (issue #544).
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
           apt-get install -y --no-install-recommends curl ca-certificates build-essential gh
@@ -283,6 +287,10 @@ jobs:
 
       # Same set as the x64 job — see the note there for why each one is needed.
       - name: Install build prerequisites
+        # Keep the install non-interactive: a package added to this line that asks
+        # a debconf question would hang the job instead of failing (issue #544).
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
           apt-get install -y --no-install-recommends curl ca-certificates build-essential gh
