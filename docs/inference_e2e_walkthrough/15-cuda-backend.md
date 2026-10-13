@@ -1019,7 +1019,7 @@ Every line answers a "what could go wrong":
   call sites read as the no-ops they now are.
 
 Closing the window happens in `synchronize` → `close_capture_or_sync`
-(`cuda_backend.rs:268`): end capture, **instantiate**, launch once so the
+(`cuda_backend.rs:560`): end capture, **instantiate**, launch once so the
 step still produces output, and cache the exec. If instantiate/launch fails, the
 recorded launches never executed —
 this step's outputs are undefined, and the code says so out loud (graphs

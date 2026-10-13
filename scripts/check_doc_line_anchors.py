@@ -84,6 +84,16 @@ stays silent; a continuation whose path anchor is itself external, ambiguous or 
 is classified the same way. This closes issue #355: the bare form was invisible, so a
 re-point that fixed the visible `path:NNN` left its continuation behind.
 
+``F`` **the range holds code at all** — a *note*, promoted by ``--strict-symbols``
+([#528]). A locator whose cited lines are all blank or carry only closing punctuation
+(`}`, `);`) cannot be pointing at the code its sentence describes: the number slid past
+the end of a block. It is a note rather than a failure because the heuristic has honest
+false positives (a sentence may cite a block's closing brace on purpose) and because the
+hard half — the path and line must exist, and rule E's symbol must be inside the range —
+already fails. Measured on the day it landed: **26** anchors were bare, 15 of them in
+frozen records (which the exemption covers whole, so rule F does not judge them) and 11
+in live documents, all re-pointed in the same change.
+
 ``E`` **the range holds the symbol too** — a *failure* since [#371]; it was a *note*
 from [#339] until that sweep landed. Rule C's window is deliberately loose (±25 lines),
 so an anchor like `` `metal_available()` (`metal_backend.rs:1054-1056`) `` passes while
@@ -264,6 +274,10 @@ SYMBOL_WINDOW = 25
 #: Characters allowed between the symbol and the anchor for the two to be adjacent.
 ADJACENT_GAP = 6
 GAP_FILLER = re.compile(r"^[\s`()\[\]*,;:.–—-]*$")
+#: Rule F (#528): a line that carries no code a sentence could be describing — empty,
+#: or only closing punctuation. `}` alone is the classic slid-past-the-end locator; the
+#: set is deliberately small so the note stays a signal.
+BARE_LINE = re.compile(r"[\s})\];,.]*")
 
 #: The frozen historical records, ``pattern`` → one-line reason. Rewriting these would
 #: falsify a measurement taken against the revision named in the record
@@ -341,6 +355,11 @@ class Anchor:
     #: not in the file at all (that case is ``symbol-moved`` / ``symbol-foreign``
     #: already). Excluded from ``compare`` so equality is unchanged by judging.
     range_miss: int | None = field(default=None, compare=False)
+    #: Rule F (#528): every cited line of the range is blank or carries only closing
+    #: punctuation, so the anchor cannot be pointing at the code its sentence
+    #: describes. A note by default (`--strict-symbols` promotes it); excluded from
+    #: ``compare`` so equality is unchanged by judging.
+    bare_range: bool = field(default=False, compare=False)
 
     def where(self) -> str:
         return f"{self.doc}:{self.line}"
@@ -357,7 +376,9 @@ class Anchor:
         # `--strict-symbols` is left to promote the two heuristic classes.
         if self.range_miss is not None:
             return True
-        return strict_symbols and self.verdict in ("symbol-far", "symbol-foreign")
+        return strict_symbols and (
+            self.verdict in ("symbol-far", "symbol-foreign") or self.bare_range
+        )
 
 
 @dataclass
@@ -667,8 +688,10 @@ class Checker:
                     anchor.verdict = "frozen"
                     anchor.detail = reason
                     # The exemption covers the whole anchor: a record frozen against a
-                    # past revision is not a rule-E miss either.
+                    # past revision is not a rule-E miss either, and rule F is a
+                    # judgement about a *live* citation, which this is not (#528).
                     anchor.range_miss = None
+                    anchor.bare_range = False
             report.anchors.extend(here)
         report.unattached = self._unattached
         # The ratchet. An entry whose files no longer carry a single anchor names a
@@ -711,6 +734,15 @@ class Checker:
             anchor.verdict = "out-of-range"
             anchor.detail = f"{target} has {len(lines)} lines"
             return
+        # Rule F (#528): a range that resolves to nothing but blank lines and closing
+        # punctuation is not the code the citing sentence describes — the number slid
+        # past the end of a block. A note, not a failure: `MISSING` and rule E are the
+        # hard half, and this heuristic has false positives (a sentence may cite a
+        # block's closing brace on purpose).
+        end_line = anchor.end if anchor.end is not None else anchor.start
+        cited = lines[anchor.start - 1 : end_line]
+        if cited and all(BARE_LINE.fullmatch(text.strip()) for text in cited):
+            anchor.bare_range = True
         if not anchor.symbol:
             anchor.verdict = "ok"
             return
@@ -751,13 +783,17 @@ def print_list(report: Report) -> None:
         rng = f"{anchor.start}-{anchor.end}" if anchor.end is not None else str(anchor.start)
         symbol = f" `{anchor.symbol}`" if anchor.symbol else ""
         bare = " (bare continuation)" if anchor.continuation else ""
+        bare_range = " [bare-range: the cited lines hold no code]" if anchor.bare_range else ""
         miss = (
             f" [range-miss: `{anchor.symbol}` is not inside {anchor.shown()}, "
             f"it is at {target}:{anchor.range_miss}]"
             if anchor.range_miss is not None
             else ""
         )
-        print(f"{anchor.where()} → {target}:{rng} [{anchor.verdict}]{symbol}{bare}{miss}")
+        print(
+            f"{anchor.where()} → {target}:{rng} [{anchor.verdict}]{symbol}{bare}"
+            f"{bare_range}{miss}"
+        )
 
 
 def summarize(report: Report, strict_symbols: bool) -> None:
@@ -767,13 +803,14 @@ def summarize(report: Report, strict_symbols: bool) -> None:
     ambiguous = report.count("ambiguous")
     checked = total - frozen - external - ambiguous
     notes = report.count("symbol-far") + report.count("symbol-foreign")
+    bare = sum(1 for a in report.anchors if a.bare_range)
     misses = sum(1 for a in report.anchors if a.range_miss is not None)
     continuations = sum(1 for a in report.anchors if a.continuation)
     print(
         f"check_doc_line_anchors: {total} anchors ({continuations} bare continuations, "
         f"{report.unattached} unattached) · {frozen} frozen · {external} external · "
         f"{ambiguous} ambiguous · {checked} checked · {notes} symbol notes · "
-        f"{misses} range misses"
+        f"{bare} bare ranges · {misses} range misses"
     )
     for pattern, reason in report.stale_frozen:
         print(
@@ -801,8 +838,9 @@ def main(argv: list[str]) -> int:
         "--strict-symbols",
         action="store_true",
         help=(
-            "promote the two heuristic symbol notes (symbol-far / symbol-foreign) to "
-            "failures; a rule-E range miss fails without this flag since #371"
+            "promote the three heuristic notes (symbol-far / symbol-foreign, and a "
+            "bare range of blank or punctuation-only lines) to failures; a rule-E "
+            "range miss fails without this flag since #371"
         ),
     )
     parser.add_argument("--selftest", action="store_true", help="run the checker's own cases")
@@ -978,6 +1016,33 @@ def selftest() -> int:
     expect(
         _verdicts(report, "viz/note.md") == ["out-of-range"],
         "markdown outside `docs/` must be scanned",
+    )
+
+    # 1c. Rule F (#528): a range that cites only a blank line or a closing brace is a
+    #     note, not a failure — and `--strict-symbols` promotes it.
+    report = _run_case({"docs/bare.md": "See `src/thing.rs:22` for the thing.\n"})
+    expect(_verdicts(report, "docs/bare.md") == ["ok"], "a blank cited line is not a failure")
+    expect(
+        [a.bare_range for a in report.anchors if a.doc == "docs/bare.md"] == [True],
+        "a blank cited line is reported as a bare range",
+    )
+    expect(
+        not any(a.doc == "docs/bare.md" for a in report.violations(False)),
+        "the bare range is not a violation by default",
+    )
+    expect(
+        any(a.doc == "docs/bare.md" for a in report.violations(True)),
+        "--strict-symbols promotes a bare range to a failure",
+    )
+    report = _run_case({"docs/brace.md": "See `src/caller.rs:34` for the thing.\n"})
+    expect(
+        [a.bare_range for a in report.anchors if a.doc == "docs/brace.md"] == [True],
+        "a `}`-only cited line is a bare range",
+    )
+    report = _run_case({"docs/ok2.md": "See `src/thing.rs:21` for the thing.\n"})
+    expect(
+        [a.bare_range for a in report.anchors if a.doc == "docs/ok2.md"] == [False],
+        "a line that holds code is not a bare range",
     )
 
     # 2. The synthetic stale anchor: out of range, both ends of a range, reversed.

@@ -308,6 +308,15 @@ separately: a symbol that is *in the file but not in the cited range* fails, rep
 `range-miss` in the summary and by `--list` with `[range-miss: …]`. A call-site citation
 is not a miss: if the range names the symbol where it is *called*, the identifier is
 inside the range and the anchor passes.
+A third question is asked, as a **note** (`--strict-symbols` promotes it): does the
+cited range hold any **code** at all? A locator whose lines are all blank or closing
+punctuation (`}`, `);`) slid past the end of a block, which is how a citation such as
+`cuda_backend.rs` line 268 (now re-pointed to 560) came to name a lone `}`. It is a note because the heuristic has
+honest false positives — a sentence may cite a block's closing brace on purpose — and
+because the hard half (the path and line exist; rule E's symbol is inside the range)
+already fails. The frozen records are exempt whole, so the note only ever describes a
+*live* citation; [#528] swept its population to zero.
+
 Neither test can see a range that still *resolves* but no longer holds the **text** the
 citing sentence describes, and that is not a bug to fix with a further rule: measured
 for [#327], **173** anchors carry an adjacent backticked **non-symbol** token, and
