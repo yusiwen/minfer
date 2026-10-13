@@ -4,9 +4,18 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>minfer · end-to-end shape flow</title>
-<link rel="stylesheet" href="e2e.css?v=2">
-<!-- Asset versions: bump `?v=` on the file you changed. A fresh page must never
-     pair with a stale stylesheet or script from a caching static server. -->
+<script>
+  /* Asset freshness (#103). These pages are edited in place and served by a plain
+     static server, which sends no `Cache-Control`: the browser may then reuse a
+     stylesheet or script for a heuristic freshness window and pair a *fresh page
+     with a stale asset* — that is how the "Shape flow" jump broke. So every asset
+     URL is stamped at load time instead of carrying a hand-bumped `?v=N`: nothing
+     to remember, and no server-side rewrite is needed. `minfer viz` keeps its own
+     `no-store` (src/server/viz.rs); the stamp only has to survive that router.
+     Written while the parser is still running, so the stylesheet still blocks
+     first paint. Keep this loader in sync with the one in viz/index.html. */
+  document.write('<link rel="stylesheet" href="e2e.css?t=' + Date.now() + '">');
+</script>
 <style>
   /* The toolbar jump to the other view is inlined on purpose: it must look right
      even when the browser still holds a stale style.css (that happened), and the
@@ -80,7 +89,13 @@
   <div id="chips" title="Click any step to jump to it"></div>
 </footer>
 
-<script src="e2e-model.js?v=4"></script>
-<script src="e2e.js?v=6"></script>
+<script>
+  /* The same per-load stamp as the loader in <head>, and both tags are written
+     here in order: a script the parser inserts runs before the next one is
+     inserted, so e2e-model.js still defines E2EModel before e2e.js runs. */
+  var assetStamp = '?t=' + Date.now();
+  document.write('<script src="e2e-model.js' + assetStamp + '"><\/script>');
+  document.write('<script src="e2e.js' + assetStamp + '"><\/script>');
+</script>
 </body>
 </html>

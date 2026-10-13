@@ -174,6 +174,7 @@ Two behaviours it surfaces instead of smoothing over:
 ```bash
 node scripts/check_viz_e2e.mjs          # stage shapes vs every exported sample graph
 node scripts/check_viz_e2e_render.mjs   # boot + play every step on a stubbed DOM/canvas
+node scripts/check_viz_assets.mjs       # each page's asset requests vs the viz/ file set
 ```
 
 The first is the valuable one: it requires the template's computed shape at every stage to equal the
@@ -182,9 +183,10 @@ the attention internals, the KV region, and that decode is the same graph with `
 one cell longer. Both engine behaviours above were caught by it, so a wrong assumption fails the
 gate instead of shipping a plausible-looking animation. The second boots the real `viz/e2e.js`
 against a stubbed DOM and canvas, plays every step of every mode, switches samples and checks the
-panel is never empty — it catches crashes in the render path, not visual regressions.
+panel is never empty — it catches crashes in the render path, not visual regressions. The third is
+about both pages, not the shape flow: see [Asset freshness](#asset-freshness).
 
-Both run in the `check-viz` CI job and need no dependencies (plain Node, no browser).
+All three run in the `check-viz` CI job and need no dependencies (plain Node, no browser).
 
 ### Files
 
@@ -196,7 +198,8 @@ Both run in the `check-viz` CI job and need no dependencies (plain Node, no brow
 | `viz/e2e.js` | The canvas renderer, animation and UI wiring |
 | `scripts/check_viz_e2e.mjs` | Shape agreement with every sample (the gate above) |
 | `scripts/check_viz_e2e_render.mjs` | Headless boot + full-timeline playthrough |
-| `src/server/viz.rs` | The `minfer viz` routes for the four assets above (`no-store`, so a fresh page never pairs with a stale script) |
+| `scripts/check_viz_assets.mjs` | The pages' asset requests vs the `viz/` file set ([Asset freshness](#asset-freshness)) |
+| `src/server/viz.rs` | The `minfer viz` routes for the pages and their assets (`no-store`, so a fresh page never pairs with a stale script) |
 
 ## Quick start
 
@@ -210,6 +213,35 @@ open http://127.0.0.1:8080/index.html
 
 The page auto-loads the pre-generated samples in `samples/manifest.json` (including a real 0.5B
 trace), or you can click "Open File…" to load any exported graph.
+
+## Asset freshness
+
+Both pages (`index.html`, `e2e.html`) stamp their own asset URLs at load time:
+
+```html
+<script>
+  document.write('<link rel="stylesheet" href="style.css?t=' + Date.now() + '">');
+</script>
+```
+
+A plain static server sends no `Cache-Control`, only `Last-Modified` — so a browser may reuse a
+cached stylesheet or script for a heuristic freshness window (RFC 9111 §4.2.2: 10% of the time since
+the file changed) and pair a **fresh page with a stale asset**. That is not hypothetical here: it is
+how the "Shape flow" jump first went dead (its listener lived in the stale `app.js`) and then lost
+its styling (stale `style.css`).
+
+The pages used to carry a hand-bumped `?v=N` for that, which worked only as long as whoever edited
+an asset remembered to bump the number — and nothing checked that they did. The loader above removes
+the bookkeeping: every load composes a URL no cache has seen, so an edited asset is picked up by a
+plain reload, with no hard refresh and no edit to any HTML file. The engine's own copy is also
+served `Cache-Control: no-store` (`src/server/viz.rs`), which covers the other half: a **rebuilt**
+`minfer viz` binary being viewed through a browser cache entry from the previous one.
+
+The mechanism is checked by `scripts/check_viz_assets.mjs` (CI job `check-viz`): it evaluates each
+page's loader with a stubbed `document.write`, and requires the composed requests to equal the
+`viz/*.css` + `viz/*.js` file set — an asset no page loads, a request for a file that is not there,
+or a literal `<link href>`/`<script src>` that bypasses the loader all fail. The engine side is
+pinned by `cargo test --release --bin minfer -- viz`.
 
 ## Generating your own samples
 
