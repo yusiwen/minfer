@@ -48,17 +48,25 @@ async fn serve(app: Router) -> SocketAddr {
     addr
 }
 
-/// One real HTTP/1.1 exchange, read to EOF (`Connection: close` makes the server
-/// close, so `read_to_end` terminates). Returns `(head, body)`.
-async fn get(addr: SocketAddr, path: &str) -> (String, String) {
+/// One real HTTP/1.1 exchange with a caller-supplied request line and headers, read
+/// to EOF (`Connection: close` makes the server close, so `read_to_end` terminates).
+/// Returns `(head, body)`.
+async fn request(addr: SocketAddr, extra_headers: &str) -> (String, String) {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: minfer\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.write_all(extra_headers.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf).into_owned();
     let (head, body) = text.split_once("\r\n\r\n").expect("response headers");
     (head.to_string(), body.to_string())
+}
+
+async fn get(addr: SocketAddr, path: &str) -> (String, String) {
+    request(
+        addr,
+        &format!("GET {path} HTTP/1.1\r\nHost: minfer\r\nConnection: close\r\n\r\n"),
+    )
+    .await
 }
 
 fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
@@ -172,14 +180,14 @@ impl Drop for SampleDir {
     }
 }
 
-/// The sample contract: JSON, the file on disk, and `no-cache` — a client may keep
-/// the copy but must confirm it before using it (#546). The pages ask for the same
-/// on every fetch; this is the engine's half, for a client that does not (`curl`, a
-/// deep link opened directly).
+/// The sample contract: JSON, the file on disk, a validator, and `no-cache` — a
+/// client may keep the copy but must confirm it before using it (#546, #548). The
+/// pages ask for the same on every fetch; this is the engine's half, for a client
+/// that does not (`curl`, a deep link opened directly).
 #[tokio::test]
 async fn a_sample_is_served_as_json_that_must_be_revalidated() {
     let dir = SampleDir::new("sample-ok", &[("one.json", r#"{"samples":[]}"#)]);
-    let response = super::sample_response(&dir.0, "one.json");
+    let response = super::sample_response(&dir.0, "one.json", None);
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response
@@ -195,10 +203,120 @@ async fn a_sample_is_served_as_json_that_must_be_revalidated() {
             .unwrap(),
         "no-cache"
     );
+    assert!(
+        response
+            .headers()
+            .get(axum::http::header::ETAG)
+            .is_some_and(|tag| tag.to_str().unwrap().starts_with('"')),
+        "a revalidating client needs a validator to send back"
+    );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     assert_eq!(&body[..], br#"{"samples":[]}"#);
+}
+
+/// #548: the validator makes the revalidation cheap, and a rewrite moves it. The
+/// three arms are one test on purpose — a `304` is only correct next to the `200`
+/// that a changed file produces (gate contract rule 2).
+#[tokio::test]
+async fn a_sample_that_matches_its_etag_is_not_sent_again() {
+    let file = "one.json";
+    let dir = SampleDir::new("sample-etag", &[(file, r#"{"samples":["a"]}"#)]);
+    let sample = dir.0.join("samples").join(file);
+
+    let first = super::sample_response(&dir.0, file, None);
+    assert_eq!(first.status(), StatusCode::OK);
+    let tag = first
+        .headers()
+        .get(axum::http::header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let unchanged = super::sample_response(&dir.0, file, Some(&tag));
+    assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        unchanged
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        tag,
+        "a 304 repeats the validator its 200 would have sent"
+    );
+    let body = axum::body::to_bytes(unchanged.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty(), "a 304 carries no body");
+
+    // The control arm: a rewrite that changes the length moves the tag, so the very
+    // same conditional request gets the new bytes instead of a 304.
+    std::fs::write(&sample, r#"{"samples":["a","b"]}"#).unwrap();
+    let changed = super::sample_response(&dir.0, file, Some(&tag));
+    assert_eq!(changed.status(), StatusCode::OK);
+    assert_ne!(
+        changed
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        tag
+    );
+    let body = axum::body::to_bytes(changed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], br#"{"samples":["a","b"]}"#);
+}
+
+/// The `If-None-Match` forms a browser, a proxy or `curl` can send, and the values
+/// that must never produce a `304`.
+#[test]
+fn an_if_none_match_value_is_matched_weakly_and_by_list() {
+    let tag = "\"12-345\"";
+    assert!(super::etag_matches(Some(tag), tag));
+    assert!(super::etag_matches(Some("*"), tag));
+    assert!(super::etag_matches(Some("W/\"12-345\""), tag));
+    assert!(super::etag_matches(Some("\"other\", \"12-345\""), tag));
+    assert!(super::etag_matches(Some(" \"12-345\" "), tag));
+    assert!(!super::etag_matches(None, tag));
+    assert!(!super::etag_matches(Some("\"other\""), tag));
+    assert!(!super::etag_matches(Some(""), tag));
+    assert!(!super::etag_matches(Some("garbage"), tag));
+    assert!(!super::etag_matches(Some("\"12-345\""), "\"12-346\""));
+}
+
+/// The engine half over a real socket: the handler reads `If-None-Match` (the
+/// `HeaderMap` extraction the direct calls above cannot show) and answers `304` with
+/// no body. It reads the checkout's own `viz/samples/manifest.json`, so a missing
+/// sample file fails here too.
+#[tokio::test]
+async fn a_conditional_sample_request_is_answered_with_304_over_http() {
+    let (state, _jobs) = state();
+    let addr = serve(viz_router(state)).await;
+
+    let (head, body) = get(addr, "/samples/manifest.json").await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "status line: {head}");
+    assert_eq!(header(&head, "cache-control"), Some("no-cache"));
+    let etag = header(&head, "etag")
+        .expect("an ETag on the 200")
+        .to_string();
+    assert!(!body.is_empty(), "the first request carries the sample");
+
+    let (head, body) = request(
+        addr,
+        &format!(
+            "GET /samples/manifest.json HTTP/1.1\r\nHost: minfer\r\n\
+             If-None-Match: {etag}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 304"), "status line: {head}");
+    assert_eq!(header(&head, "etag"), Some(etag.as_str()));
+    assert!(body.is_empty(), "a 304 carries no body: {body:?}");
 }
 
 /// `GET /samples/:name` reads a file under a directory named by `MINFER_VIZ_DIR`, so
@@ -209,9 +327,9 @@ async fn a_sample_is_served_as_json_that_must_be_revalidated() {
 fn a_sample_name_cannot_escape_the_samples_directory() {
     let dir = SampleDir::new("sample-traversal", &[("one.json", "{}")]);
     for name in ["..", "../Cargo.toml", "samples/../../Cargo.toml", "a/b"] {
-        let status = super::sample_response(&dir.0, name).status();
+        let status = super::sample_response(&dir.0, name, None).status();
         assert_eq!(status, StatusCode::BAD_REQUEST, "name {name:?}");
     }
-    let status = super::sample_response(&dir.0, "does-not-exist.json").status();
+    let status = super::sample_response(&dir.0, "does-not-exist.json", None).status();
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
