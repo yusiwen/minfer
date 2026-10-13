@@ -101,20 +101,23 @@
 #                       hand-written map, not by CI. Anchors whose cited line was
 #                       removed are reported for a human; the same FROZEN set
 #                       exempts the same records.
-# 5. check-viz        : the shape-flow gate. `scripts/check_viz_e2e.mjs` replays the
+# 5. check-viz        : the visualizer gate. `scripts/check_viz_e2e.mjs` replays the
 #                       stage template against every exported sample and requires the
 #                       computed shapes to equal the ones the engine actually
-#                       exported (the layer the animation plays); the render check
+#                       exported (the layer the animation plays); `check_viz_e2e_render.mjs`
 #                       boots viz/e2e.js on a stubbed DOM/canvas and plays every
-#                       step, so a crash in the render path fails here. The third
-#                       checker, `scripts/check_viz_assets.mjs`, covers what the pages
-#                       pull in from outside: it evaluates each page's asset loader
-#                       and requires its requests to equal the `viz/*.css` +
+#                       step, and `check_viz_app.mjs` boots viz/app.js the same way
+#                       (the operator/pipeline page: the `?file=` deep link, the grid
+#                       and pipeline builds, a node click, the ×N layer expansion),
+#                       counting what the export implies rather than what the page
+#                       says (#549). `scripts/check_viz_assets.mjs` covers what the
+#                       pages pull in from outside: it evaluates each page's asset
+#                       loader and requires its requests to equal the `viz/*.css` +
 #                       `viz/*.js` file set, with no literal `href=`/`src=` bypass
 #                       (#103, which replaced a hand-bumped `?v=N` that had no check
 #                       at all), and it audits every `fetch(...)` in those scripts
 #                       for the `cache: 'no-cache'` that makes a regenerated sample
-#                       visible on a reload (#546). All three are dependency-free
+#                       visible on a reload (#546). All four are dependency-free
 #                       Node, so the job needs no setup step.
 # 6. lint-workflows   : the workflow gate (#178). `scripts/lint_workflows.sh`
 #                       downloads a pinned actionlint release tarball, verifies
@@ -523,12 +526,12 @@ jobs:
           test ! -e docs/assets/mermaid.min.js
           test ! -e docs/assets/mermaid-init.js
 
-  # The viz gate: the shape-flow model must agree with the engine's own export,
-  # the render path must survive a full timeline, and everything the pages pull in
-  # from outside must be fresh — assets through the page's own stamped loader
-  # (#103), runtime JSON through a revalidating fetch (#546). `node` is preinstalled
-  # on the runner image; adding `actions/setup-node@v4` would drag in the Node.js
-  # 20 runtime the header comment warns about.
+  # The viz gate: the shape-flow model must agree with the engine's own export, both
+  # render paths must survive a headless boot (e2e.js and app.js), and everything the
+  # pages pull in from outside must be fresh — assets through the page's own stamped
+  # loader (#103), runtime JSON through a revalidating fetch (#546). `node` is
+  # preinstalled on the runner image; adding `actions/setup-node@v4` would drag in the
+  # Node.js 20 runtime the header comment warns about.
   check-viz:
     if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
@@ -538,6 +541,8 @@ jobs:
         run: node scripts/check_viz_e2e.mjs
       - name: The animation must boot and play every step headlessly
         run: node scripts/check_viz_e2e_render.mjs
+      - name: The operator view must boot and render a sample headlessly
+        run: node scripts/check_viz_app.mjs
       - name: The freshness checker's own pass/fail cases
         run: node scripts/check_viz_assets.mjs --selftest
       - name: Assets must use the stamped loader, and runtime fetches must revalidate

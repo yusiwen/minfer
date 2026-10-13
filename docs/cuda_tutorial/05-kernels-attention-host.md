@@ -949,7 +949,7 @@ Expect the replayed runs to win on decode tok/s (the launch tax of §4); expect
 
 **Per-node timing and values:** `MINFER_TRACE` records every node's real
 output stats (decode steps included; KV regions are skipped on Metal, captured in full on CPU) for the
-viz page — see `viz/README.md` ("Real trace", `viz/README.md:294`; the serve-it line is at `:44`).
+viz page — see `viz/README.md` ("Real trace", `viz/README.md:305`; the serve-it line is at `:44`).
 
 ```bash
 MINFER_TRACE=/tmp/t.json ./target/release/minfer <model.gguf> "Hello!" -n 5
