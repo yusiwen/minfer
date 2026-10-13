@@ -518,10 +518,10 @@ fn a_zero_k_block_is_all_zero_bytes() {
 
 /// `q4_K`/`q5_K` are the `_M` mixtures in llama.cpp's *CLI* vocabulary, but
 /// `minfer quantize --type q4_K` writes one uniform type. The `file_type`
-/// metadata number is the ftype llama.cpp records for the same number, and
-/// the row-length fallback is llama.cpp's `tensor_type_fallback`.
+/// metadata number is the ftype llama.cpp records for the same number, and the
+/// row-length fallback is llama.cpp's `tensor_type_fallback`.
 #[test]
-fn k_quant_file_types_and_row_length_fallbacks_match_llama_cpp() {
+fn file_types_and_row_length_fallbacks_match_llama_cpp() {
     assert_eq!(QuantTarget::Q4_K.file_type(), 15); // LLAMA_FTYPE_MOSTLY_Q4_K_M
     assert_eq!(QuantTarget::Q5_K.file_type(), 17); // LLAMA_FTYPE_MOSTLY_Q5_K_M
     assert_eq!(QuantTarget::Q6_K.file_type(), 18); // LLAMA_FTYPE_MOSTLY_Q6_K
@@ -537,18 +537,24 @@ fn k_quant_file_types_and_row_length_fallbacks_match_llama_cpp() {
         QuantTarget::Q6_K.row_len_fallback(),
         Some(QuantTarget::Q8_0)
     );
-    // The legacy targets have no fallback in this module: a 2-D tensor whose
-    // row is not a multiple of 32 keeps its source type (llama.cpp demotes
-    // it to F16, which is the same file for the f16 sources the gate uses).
+    // #204: a legacy 32-block target has no smaller block to demote to, so it
+    // routes straight to F16 — llama.cpp spells that as `default: if (qk_k <=
+    // 32) return_type = target_type;` followed by its `ncols % block != 0`
+    // check. Before #204 this module returned `None` for them and the plan
+    // *preserved* the source type, which differed from llama.cpp for any
+    // source that was not already f16.
     for t in [
         QuantTarget::Q4_0,
         QuantTarget::Q4_1,
         QuantTarget::Q5_0,
         QuantTarget::Q5_1,
         QuantTarget::Q8_0,
-        QuantTarget::F16,
-        QuantTarget::F32,
     ] {
+        assert_eq!(t.row_len_fallback(), Some(QuantTarget::F16), "{}", t.name());
+    }
+    // A 1-element block can never fail to divide a row, and llama.cpp gates
+    // the whole fallback on `ggml_is_quantized`.
+    for t in [QuantTarget::F16, QuantTarget::F32] {
         assert_eq!(t.row_len_fallback(), None, "{}", t.name());
     }
     assert_eq!(

@@ -1,0 +1,247 @@
+//! #204: a 2-D row that is not a multiple of the target's block size is
+//! **demoted**, never copied — the rule llama.cpp's `tensor_type_fallback`
+//! applies to every quant target, the legacy 32-block ones included.
+//!
+//! The fixtures are written here rather than taken from the F6 cache, because
+//! the property needs a row length no supported architecture has (every Qwen2 /
+//! Qwen3 2-D row in `~/.cache/minfer/f6-src/` is a multiple of 32, so no gate
+//! could see the divergence), and because the rule is the *planner's*: a
+//! miniature GGUF pins it in CI, where the byte-parity arm cannot run.
+//!
+//! Split out of `src/tooling/tests.rs` (issue #267): the fixtures live in the
+//! parent module and are reached through `use super::*;`.
+
+use super::*;
+
+/// One file that exercises every arm of the rule at once, on a tied model (no
+/// `output.weight`):
+///
+/// * `token_embd.weight` [60,4] — the shared embedding, asked for q8_0 by a
+///   sub-8-bit target, with a row q8_0 cannot encode: it demotes to F16 and is
+///   **not** reported as the tied-embedding retarget it did not get;
+/// * `blk.0.attn_q.weight` [64,2] — a multiple of 32 but not of 256: the
+///   target's own type for a legacy target, and the 32-block fallback for a
+///   K-quant;
+/// * `blk.0.ffn_down.weight` [60,3] — not a multiple of 32 either: F16 for
+///   *every* quant target, legacy and K-quant alike;
+/// * `blk.0.ffn_up.weight` [256,2] — reaches the K-quant encoder itself;
+/// * two 1-D norms, the only tensors any target preserves.
+fn unaligned_specs() -> Vec<gguf_write::TensorSpec> {
+    vec![
+        gguf_write::TensorSpec::new("token_embd.weight", [60, 4, 1, 1], GgmlType::F32),
+        gguf_write::TensorSpec::new("blk.0.attn_q.weight", [64, 2, 1, 1], GgmlType::F32),
+        gguf_write::TensorSpec::new("blk.0.ffn_down.weight", [60, 3, 1, 1], GgmlType::F32),
+        gguf_write::TensorSpec::new("blk.0.ffn_up.weight", [256, 2, 1, 1], GgmlType::F32),
+        gguf_write::TensorSpec::new("blk.0.attn_norm.weight", [64, 1, 1, 1], GgmlType::F32),
+        gguf_write::TensorSpec::new("output_norm.weight", [64, 1, 1, 1], GgmlType::F32),
+    ]
+}
+
+/// Write one miniature source into the test work dir and return its path.
+fn write_source(dir: &Path, tag: &str, specs: &[gguf_write::TensorSpec]) -> PathBuf {
+    let path = dir.join(format!("src-{tag}.gguf"));
+    let _ = std::fs::remove_file(&path);
+    let kv = vec![
+        crate::gguf::GgufKv::new_string("general.architecture".into(), "qwen2".into()),
+        crate::gguf::GgufKv::new_u32("general.file_type".into(), 1),
+    ];
+    gguf_write::write_single(&path, &kv, specs.to_vec(), 32, |i, w| {
+        // A distinct non-zero payload per tensor: an encoder that wrote the
+        // wrong tensor's bytes at the right type would still be caught.
+        w.write_all(&vec![0x20 + i as u8; specs[i].nbytes()])
+    })
+    .expect("write the miniature source");
+    path
+}
+
+/// The type a written file declares for `name`.
+fn type_of(model: &crate::gguf::GgufModel, name: &str) -> GgmlType {
+    model.parts[0]
+        .ctx
+        .info
+        .iter()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("tensor {name} missing"))
+        .type_
+}
+
+/// #204's rule, read back from the written **file** (not from the plan), for a
+/// legacy target and a K-quant: an unrepresentable 2-D row is demoted on every
+/// arm, and the only tensors left in their source type are the 1-D ones.
+///
+/// Mutation evidence: with `row_len_fallback()` returning `None` for the legacy
+/// targets (the pre-#204 code), the f32 source's 60-wide rows come back **F32**
+/// and `preserved` grows to four entries — the assertion on the *file's* type
+/// is what fails, not the plan's own report.
+#[test]
+fn a_non_block_aligned_2d_row_is_demoted_for_every_quant_target() {
+    let dir = work_dir("quantize-row-fallback");
+    let src = write_source(&dir, "unaligned", &unaligned_specs());
+    let model = crate::gguf::load_gguf_model(&src).expect("source parses");
+
+    // (target, the type every tensor must come back as, the exact demotion
+    // report). The demotion report is asserted verbatim: its per-tensor text
+    // names the block size the row missed, and that text used to say 256 for a
+    // 32-block target.
+    let cases = [
+        (
+            QuantTarget::Q4_0,
+            [
+                GgmlType::F16,  // token_embd.weight  — q8_0 asked, row % 32 != 0
+                GgmlType::Q4_0, // blk.0.attn_q.weight — 64 % 32 == 0
+                GgmlType::F16,  // blk.0.ffn_down.weight — row % 32 != 0
+                GgmlType::Q4_0, // blk.0.ffn_up.weight — 256 % 32 == 0
+                GgmlType::F32,  // blk.0.attn_norm.weight — 1-D
+                GgmlType::F32,  // output_norm.weight — 1-D
+            ],
+            vec![
+                "token_embd.weight -> f16 (row % 32 != 0)".to_string(),
+                "blk.0.ffn_down.weight -> f16 (row % 32 != 0)".to_string(),
+            ],
+        ),
+        (
+            QuantTarget::Q6_K,
+            [
+                GgmlType::F16,  // token_embd.weight — Q6_K -> q8_0 -> f16
+                GgmlType::Q8_0, // blk.0.attn_q.weight — Q6_K -> q8_0 (64 % 32 == 0)
+                GgmlType::F16,  // blk.0.ffn_down.weight — no block divides 60
+                GgmlType::Q6_K, // blk.0.ffn_up.weight — 256 % 256 == 0
+                GgmlType::F32,  // blk.0.attn_norm.weight — 1-D
+                GgmlType::F32,  // output_norm.weight — 1-D
+            ],
+            vec![
+                "token_embd.weight -> f16 (no encoder block size divides the row)".to_string(),
+                "blk.0.attn_q.weight -> q8_0 (row % 256 != 0)".to_string(),
+                "blk.0.ffn_down.weight -> f16 (no encoder block size divides the row)".to_string(),
+            ],
+        ),
+    ];
+
+    for (target, want, want_demoted) in cases {
+        let out = dir.join(format!("out-{}.gguf", target.name()));
+        let _ = std::fs::remove_file(&out);
+        let plan = QuantizePlan::plan(&model, target).expect("plan");
+        plan.write_single(&model, &out).expect("write");
+        let got = crate::gguf::load_gguf_model(&out).expect("output parses");
+
+        for (spec, want) in unaligned_specs().iter().zip(want) {
+            assert_eq!(
+                type_of(&got, &spec.name),
+                want,
+                "{} at {}: a 2-D row that is not a multiple of the block must be demoted, \
+                 and a demotion is never a copy of the source type",
+                spec.name,
+                target.name()
+            );
+        }
+        assert_eq!(plan.demoted, want_demoted, "{}", target.name());
+        // Only the two 1-D norms (the rule is asserted on the file above).
+        assert_eq!(
+            plan.preserved,
+            vec![
+                "blk.0.attn_norm.weight (f32)".to_string(),
+                "output_norm.weight (f32)".to_string()
+            ],
+            "{}: only 1-D tensors may be preserved",
+            target.name()
+        );
+        // The tied embedding was asked for q8_0 and then demoted, so the run
+        // must not claim the tied-embedding retarget happened (it did not).
+        assert!(
+            plan.retargeted.is_empty(),
+            "{}: a demoted tied embedding is not a q8_0 retarget: {:?}",
+            target.name(),
+            plan.retargeted
+        );
+    }
+}
+
+/// The tied-embedding retarget is reported only when it survived the row-length
+/// rule: [64,4] fits q8_0 and is retargeted, [60,4] does not and is demoted.
+///
+/// Before #204 the unaligned case was *preserved* (so the file held f32) while
+/// the CLI still printed it under "tied embedding quantized at q8_0" — the
+/// report and the bytes disagreed.
+#[test]
+fn a_tied_embedding_is_retargeted_to_q8_0_only_when_its_row_fits() {
+    let dir = work_dir("quantize-row-tied");
+    let kv = vec![
+        crate::gguf::GgufKv::new_string("general.architecture".into(), "qwen2".into()),
+        crate::gguf::GgufKv::new_u32("general.file_type".into(), 1),
+    ];
+
+    for (tag, row, want_type, want_retargeted, want_demoted) in [
+        ("aligned", 64i64, GgmlType::Q8_0, 1usize, 0usize),
+        ("unaligned", 60, GgmlType::F16, 0, 1),
+    ] {
+        let specs = vec![
+            gguf_write::TensorSpec::new("token_embd.weight", [row, 4, 1, 1], GgmlType::F32),
+            gguf_write::TensorSpec::new("blk.0.attn_q.weight", [64, 2, 1, 1], GgmlType::F32),
+        ];
+        let src = dir.join(format!("src-tied-{tag}.gguf"));
+        let _ = std::fs::remove_file(&src);
+        gguf_write::write_single(&src, &kv, specs.clone(), 32, |i, w| {
+            w.write_all(&vec![0x30 + i as u8; specs[i].nbytes()])
+        })
+        .expect("write");
+        let model = crate::gguf::load_gguf_model(&src).expect("source parses");
+        let out = dir.join(format!("out-tied-{tag}.gguf"));
+        let _ = std::fs::remove_file(&out);
+        let plan = QuantizePlan::plan(&model, QuantTarget::Q4_0).expect("plan");
+        plan.write_single(&model, &out).expect("write");
+        let got = crate::gguf::load_gguf_model(&out).expect("output parses");
+
+        assert_eq!(type_of(&got, "token_embd.weight"), want_type, "{tag}");
+        assert_eq!(
+            plan.retargeted.len(),
+            want_retargeted,
+            "{tag}: {:?}",
+            plan.retargeted
+        );
+        assert_eq!(
+            plan.demoted.len(),
+            want_demoted,
+            "{tag}: {:?}",
+            plan.demoted
+        );
+    }
+}
+
+/// A target whose block size is 1 has nothing to demote: `f16` still writes
+/// every 2-D row as f16 and keeps 1-D f32, and `f32` converts everything —
+/// neither reports a demotion, and neither copies a 2-D source type.
+#[test]
+fn f16_and_f32_targets_never_demote() {
+    let dir = work_dir("quantize-row-casts");
+    let src = write_source(&dir, "unaligned-cast", &unaligned_specs());
+    let model = crate::gguf::load_gguf_model(&src).expect("source parses");
+
+    for (target, want_2d, want_1d, want_preserved) in [
+        (QuantTarget::F16, GgmlType::F16, GgmlType::F32, 2usize),
+        (QuantTarget::F32, GgmlType::F32, GgmlType::F32, 0usize),
+    ] {
+        let out = dir.join(format!("out-cast-{}.gguf", target.name()));
+        let _ = std::fs::remove_file(&out);
+        let plan = QuantizePlan::plan(&model, target).expect("plan");
+        plan.write_single(&model, &out).expect("write");
+        let got = crate::gguf::load_gguf_model(&out).expect("output parses");
+
+        for spec in unaligned_specs() {
+            let want = if spec.ne[1] <= 1 { want_1d } else { want_2d };
+            assert_eq!(
+                type_of(&got, &spec.name),
+                want,
+                "{} at {}",
+                spec.name,
+                target.name()
+            );
+        }
+        assert!(
+            plan.demoted.is_empty(),
+            "{}: {:?}",
+            target.name(),
+            plan.demoted
+        );
+        assert_eq!(plan.preserved.len(), want_preserved, "{}", target.name());
+    }
+}

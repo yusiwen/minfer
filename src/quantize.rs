@@ -143,14 +143,30 @@ impl QuantTarget {
     }
 
     /// The type llama.cpp's `tensor_type_fallback` demotes this one to when a
-    /// 2-D tensor's row length is not a multiple of the target's block size
-    /// (`GGML_TYPE_QK_K`-block types demote to a legacy 32-block type).
+    /// 2-D tensor's row length is not a multiple of the target's block size.
+    ///
+    /// This is the *whole* of llama.cpp's first step, for every target this
+    /// engine can write: a 256-element K-quant demotes to a legacy 32-block
+    /// type (`Q4_K → Q5_0`, `Q5_K → Q5_1`, `Q6_K → Q8_0`), and a legacy
+    /// 32-block type — having no smaller block to demote to — routes straight
+    /// to `F16`. llama.cpp spells the legacy case as `default: if (qk_k <= 32)
+    /// return_type = target_type;` followed by its `ncols % block != 0 → F16`
+    /// check, which is the same answer this returns in one step.
+    ///
+    /// `F16`/`F32` have a 1-element block, so no row can be unrepresentable to
+    /// them and there is nothing to demote to (llama.cpp never calls the
+    /// fallback for them: it is gated on `ggml_is_quantized`).
     pub fn row_len_fallback(self) -> Option<QuantTarget> {
         match self {
             QuantTarget::Q4_K => Some(QuantTarget::Q5_0),
             QuantTarget::Q5_K => Some(QuantTarget::Q5_1),
             QuantTarget::Q6_K => Some(QuantTarget::Q8_0),
-            _ => None,
+            QuantTarget::Q4_0
+            | QuantTarget::Q4_1
+            | QuantTarget::Q5_0
+            | QuantTarget::Q5_1
+            | QuantTarget::Q8_0 => Some(QuantTarget::F16),
+            QuantTarget::F16 | QuantTarget::F32 => None,
         }
     }
 }
