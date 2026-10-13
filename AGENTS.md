@@ -172,6 +172,10 @@ an agent reaches for first.
 | The phase-by-phase plan and the per-ticket history | `docs/ARCHITECTURE-EXECUTION-PLAN.md` |
 | **Architecture decision records — why, and what was rejected** | `docs/adr/` |
 
+**A decision, not a change.** A change that picks or moves a shape later work must obey (a file
+format, an id, an op vocabulary, a byte-identity promise, a new design contract) carries an ADR;
+a PR touching a path an ADR governs answers `ADR: NNNN` or `ADR: none — <reason>`, which
+`check-pr-body` enforces. See [`docs/adr/README.md`](docs/adr/README.md) ("When an ADR is required").
 **Doc gates.** `check-docs` runs `scripts/build_book.sh` and the checkers that guard this
 documentation; the list, and what each can and cannot prove, is in
 [`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) ("the doc gates") — repeated here it would be a second

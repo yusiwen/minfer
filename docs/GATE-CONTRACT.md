@@ -539,6 +539,19 @@ left at their template placeholder (a stated `N/A — <reason>` is filled). The
 the body through `env:`, so it needs no token and works on a fork PR ([#175],
 [#335]). This is the shape, not the rules: the rules stay stated once, above.
 
+**The ADR question rides the same body, and it is the one section whose *need* is
+computed.** `scripts/classify_changes.py` carries `DECISION_PATHS` — the small set of files
+whose subject is an ADR's subject (a file format, an id space, an op vocabulary, a
+byte-identity promise) — and reports `decision_surface` for the range, plus an
+`ADR question` line on stderr naming the ADRs the touched path answers to. When it is
+true, the body must answer on one line: `ADR: NNNN` (this implements that decision),
+`ADR: supersedes NNNN`, or `ADR: none — <reason>`; `check-pr-body` refuses a missing line,
+a bare `none` and a bare word. The trigger list is short on purpose ([ADR-0023](adr/0023-the-machine-ledgers-live-beside-their-checkers.md)) — a
+question asked of routine work is answered with a reflex, and a reflex is not a decision —
+and the fail-safe asks it too: a range the classifier cannot read counts as a decision
+surface, exactly as it counts as `rust`. Presence, not truth, holds here as everywhere:
+the checker can force the sentence, never its contents.
+
 ### The doc gates (`check-docs`)
 
 Moved here from `AGENTS.md`, which keeps the two-line pointer.
@@ -592,7 +605,17 @@ name and digest; the byte half runs where the cache exists, in the F6 gates them
 `scripts/check_support_matrix.py` (#519), which keeps the one *capability* table honest: it derives
 the AVX2 quant dots from `src/quants/` and fails when [`docs/SUPPORT-MATRIX.md`](./SUPPORT-MATRIX.md)'s
 AVX2 column disagrees either way — the column that had marked Q5_0 as SIMD while only Q4_0, Q8_0 and
-the three K-quants had kernels. `scripts/check_env_vars.py` (#521, strengthened by #531)
+the three K-quants had kernels. `scripts/check_adr.py` also reads the **maps** (#539): every design document's
+`## Decisions governing this document` ([ADR-0028](adr/0028-a-map-lists-what-the-contract-depends-on.md)) must list ADRs that exist, link them at
+their real filenames, and carry at least one entry; and every ADR must be listed by some
+document's map or recorded in `scripts/adr-map-exclusions.toml` with a reason — the ledger
+that currently holds the six ADRs which govern no document's contract (five process
+decisions about the machinery, and one superseded). Both directions ratchet: an exclusion
+whose ADR *is* mapped fails, an entry that is not an ADR fails, and a map entry naming a
+missing or renamed ADR fails. The map is the only index from a contract back to the
+decision behind it, and until #539 nothing checked it.
+
+`scripts/check_env_vars.py` (#521, strengthened by #531)
 enumerates what the engine reads and requires a **home** for each: `scripts/env-vars.toml` maps every
 `MINFER_*` name passed to `env::var` in the non-test source either to the file that documents it —
 which the checker opens, requires to be a live document rather than one of the dated records, and
@@ -671,3 +694,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0023](adr/0023-the-machine-ledgers-live-beside-their-checkers.md) — The machine ledgers live beside their checkers
 - [ADR-0024](adr/0024-a-machine-read-record-is-not-book-content.md) — A machine-read record is not book content
 - [ADR-0025](adr/0025-a-docs-only-change-skips-the-compilers.md) — A docs-only change runs the docs gate, not the compilers
+- [ADR-0039](adr/0039-the-corpus-is-entered-through-a-question-at-pr-time.md) — The corpus is entered through a question at PR time, and its maps are checked

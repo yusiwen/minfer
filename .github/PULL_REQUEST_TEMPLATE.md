@@ -16,6 +16,13 @@ exist, never to be true.
 
 <!-- The decision, and the alternative that was rejected. -->
 
+<!-- When the `changes` job flags a decision surface, the `ADR:` line below must answer
+     it: `ADR: 0011` (this implements that decision), `ADR: supersedes 0011`, or
+     `ADR: none — <why this change is not a decision>`. See docs/adr/README.md ("When an
+     ADR is required"). The checker enforces the line's presence and shape, never its
+     truth. -->
+ADR: none — FILL-ME: why this change is not a decision
+
 ## Verification
 
 <!-- One line per command: the exact command → its count. -->
