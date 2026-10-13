@@ -145,7 +145,7 @@ Three fields carry the design. `state` is a `&'static MpsState` — the device l
 The command buffer is created lazily on the first op of a split:
 
 ```rust
-// src/graph/metal_backend.rs:175-186
+// src/graph/metal_backend.rs:438 (`cb`)
     /// The current split's command buffer (created on first op of a split).
     /// The box is leaked, so the returned reference is 'static and does not
     /// borrow `self` — callers can freely touch the pool afterwards.
@@ -165,7 +165,7 @@ The command buffer is created lazily on the first op of a split:
 #### 3.2.2 Capability table: `supports_op` and `supports_fused`
 
 ```rust
-// src/graph/metal_backend.rs:294-319 (abridged to the shape; full match in tree)
+// src/graph/metal_backend.rs:885 (`supports_op`) (abridged to the shape; full match in tree)
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         match op {
             Op::Input => true,
@@ -200,7 +200,7 @@ Two things to notice. The `dtype` checks are almost tautological — the graph's
 #### 3.2.3 The buffer pool: recycle vs fresh
 
 ```rust
-// src/graph/metal_backend.rs:321-343
+// src/graph/metal_backend.rs:919 (`alloc_fresh`)
     fn alloc_buffer(&mut self, size: usize) -> usize {
         if let Some(idx) = self
             .free
@@ -233,7 +233,7 @@ The recycle logic is an exact-size free-list search: reuse any dead buffer whose
 `execute_node` (`metal_backend.rs:925-1967`) is a 782-line `match &node.op` (the `match` opens at `:941`), and every arm follows the same rhythm: resolve metadata → look up weights by name → **encode** one or two kernel launches into `cb` → `Ok(())`. Nothing waits; the submit happens at the split boundary. The `MatMul` arm is the cleanest example:
 
 ```rust
-// src/graph/metal_backend.rs:561-590
+// src/graph/metal_backend.rs:1038 (`MatMul`)
             Op::MatMul { .. } => {
                 let meta = match &node.meta {
                     NodeMeta::MatMul(m) => m,
@@ -311,7 +311,7 @@ The guard is audit finding **M1** from `GPU_SAFETY.md` §3: the K-quant shaders 
 The **attention arm** (`metal_backend.rs:684-836`) is the largest, and its opening is the safety story:
 
 ```rust
-// src/graph/metal_backend.rs:689-709 (guards; dispatch decision follows)
+// src/graph/metal_backend.rs:1203 (`nkt`) (guards; dispatch decision follows)
                 // GPU safety (H1): kernel_gqa_attn strides KV by nk*hd
                 if meta.nkt != meta.n_head_kv * meta.hd {
                     return Err(format!(
@@ -341,7 +341,7 @@ These are audit findings **H1** (`GPU_SAFETY.md` §3): the attention kernels str
 The decode-fusion arms show why the graph's fused nodes exist. `Op::FusedQKV` (`metal_backend.rs:1727-1816`) is two encodes for what unfused would be ten:
 
 ```rust
-// src/graph/metal_backend.rs:894-917 (head of the FusedQKV arm)
+// src/graph/metal_backend.rs:1727 (`FusedQKV`) (head of the arm)
             Op::FusedQKV { layer } => {
                 let meta = match &node.meta {
                     NodeMeta::FusedQkv(m) => m,
@@ -416,7 +416,7 @@ Finally the state is built with the device, the **runtime-queried limits**, and 
 The registration chain starts in the loader (doc 03). `load_tensor` (`models/qwen2/loader.rs:177-184`) hands every weight tensor's raw bytes to the Metal registry as it is parsed:
 
 ```rust
-// src/models/qwen2/loader.rs:202-220
+// src/models/qwen2/loader.rs:177 (`load_tensor`)
     // Register weight tensors with GPU backends.
     #[cfg(target_os = "macos")]
     if let Some(mps) = crate::metal::MpsState::get() {
@@ -477,10 +477,10 @@ The same loader file also pre-builds the **fusion weights**: when `wq/wk/wv` sha
 
 #### 3.2.8 The all-weights-registered gate and `CParams.gpu`
 
-At forward time, before the graph is built or reused, the model asks a yes/no question (`models/qwen2/graph.rs:427-439`):
+At forward time, before the graph is built or reused, the model asks a yes/no question (`models/qwen2/graph.rs:776`, `device`):
 
 ```rust
-// src/models/qwen2/graph.rs:427-439
+// src/models/qwen2/graph.rs:776 (`device`)
         // GPU availability is part of the reuse identity (backend assignment
         // lives in the built graph, not in the params' other fields). Uses
         // attributes rather than `cfg!()` so the `metal_backend` path is not
@@ -503,7 +503,7 @@ At forward time, before the graph is built or reused, the model asks a yes/no qu
 `metal_available()` (`metal_backend.rs:2098-2100`) is just `MpsState::get().is_some()` — device present, not disabled. `weights_on_gpu` (`:721-777`) is the gate itself: it enumerates *every* tensor name the graph will read (embedding, output norm, lm_head, output bias, then per layer the norm, `wq/bq/wk/bk/wv/bv/wo`, the FFN norm, `ffn_gate/ffn_up/ffn_down`) and requires all of them in the Metal registry:
 
 ```rust
-// src/models/qwen2/graph.rs:671-677 (tail of weights_on_gpu)
+// src/models/qwen2/graph.rs:813 (`weights_on_gpu`) (tail of weights_on_gpu)
         #[cfg(target_os = "macos")]
         {
             let Some(mps) = crate::metal::MpsState::get() else {
@@ -518,7 +518,7 @@ One `false` ⇒ `metal_on = false` ⇒ the whole model on CPU. Why all-or-nothin
 The result flows into `CParams` (`:447-468`): `gpu: metal_on || cuda_on`, plus `fuse_qkv`/`fuse_ffn` gated on `nt == 1 && (metal_on || cuda_on)` — on the GPU the fusions are always shape-eligible at decode, on CPU they are not built (the CPU prefers the batched-quantization shape of doc 10). From there, if `try_reuse` fails, the rebuild path enables the backend and assigns:
 
 ```rust
-// src/models/qwen2/graph.rs:478-492 (rebuild: register → enable → assign)
+// src/models/qwen2/graph.rs:480 (`forward_batch`) (rebuild: register → enable → assign)
         if !cache.try_reuse(&params) {
             let mut graph = Self::build(model, &params);
             let sched = BackendScheduler::new();
@@ -543,7 +543,7 @@ The result flows into `CParams` (`:447-468`): `gpu: metal_on || cuda_on`, plus `
 Now assemble §2.4's rhythm from both sides. The scheduler's `execute` (`scheduler.rs:123-354`) walks splits; at every backend change it flushes and copies:
 
 ```rust
-// src/graph/scheduler.rs:176-189
+// src/graph/scheduler.rs:137 (`execute`)
         for split in &splits {
             if let Some(pb) = prev_backend {
                 if pb != split.backend {
@@ -616,7 +616,7 @@ Walk it as three defenses. **(1) A completion handler on a semaphore**: `addComp
 #### 3.2.11 Host read/write: views, plus the readback that feeds the sampler
 
 ```rust
-// src/graph/metal_backend.rs:1104-1127
+// src/graph/metal_backend.rs:2027 (`read_host`)
     fn read_host(&self, id: usize) -> Option<&[f32]> {
         let buf = self.pool.get(id)?;
         let len = (buf.length() as usize) / 4;
@@ -750,7 +750,7 @@ no f16 KV kernel).
 - **Never host-copy a GPU-pending buffer.** Shared memory makes every pool byte look readable at all times — but between `execute_node` and the split's submit, a buffer's *future* contents are still in flight. The Phase-3 KV-corruption bug (recorded in AGENTS.md core rule 5) came from exactly this: an in-place op's input was host-copied while the GPU had pending writes to it. The invariants that make the current code safe: inputs are host-written before their split encodes; outputs are read only after `synchronize`; and in-place GPU ops snapshot their input inside the backend when aliasing is not already guaranteed:
 
 ```rust
-// src/graph/metal_backend.rs:239-251
+// src/graph/metal_backend.rs:620 (`copy_in`)
     fn copy_in(&self, dst: usize, src: usize) {
         // in-place-ish ops (silu/rope) may alias; snapshot to dst first
         let src_buf = self.buf(src);

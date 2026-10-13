@@ -391,7 +391,7 @@ missing toolkit is a hard error rather than a silent CPU-only binary, because
 archive can satisfy.
 
 ```rust
-// build.rs:182-241 (abridged)
+// build.rs:171 (`main`) (abridged)
 let nvcc = match find_nvcc() {
     Some(n) => n,
     None => panic!(
@@ -533,7 +533,7 @@ capped 7B decode near ~38 GB/s, so the loader repacks each block into a
 `uint4` loads:
 
 ```rust
-// src/models/qwen2/loader.rs:234-244
+// src/models/qwen2/loader.rs:318 (`load`)
 if ttype == TensorType::Q6_K {
     // 7e②: register Q6_K in the padded 224-byte block layout so
     // the matmul kernel can use aligned uint4 weight loads
@@ -567,7 +567,7 @@ the ops it has no kernel for (a standalone `Softmax` node; the `Scale` node)
 and RoPE in a layout it does not implement:
 
 ```rust
-// src/graph/cuda_backend.rs:1259-1300 (abridged to the decision arms)
+// src/graph/cuda_backend.rs:2104 (`supports_op`) (abridged to the decision arms)
 fn supports_op(&self, op: &Op, dtype: DType) -> bool {
     if dtype != DType::F32 {
         return false;
@@ -603,7 +603,7 @@ persistent KV regions. So the model wiring applies an **all-or-nothing
 gate** before the graph is even built:
 
 ```rust
-// src/models/qwen2/graph.rs:436-457 (abridged)
+// src/models/qwen2/graph.rs:776 (`device`) (abridged)
 // CUDA participation (Phase 7): requires a usable device AND every
 // matmul weight registered on the CUDA registry in a kernel-supported
 // type (all-or-nothing; 7e③ moved the embedding gather on device, so
@@ -640,7 +640,7 @@ kernel's structural invariants, and launches. The wrapper adds one
 capture-window duty:
 
 ```rust
-// src/graph/cuda_backend.rs:1354-1375
+// src/graph/cuda_backend.rs:2174 (`execute_node`)
 fn execute_node(
     &mut self,
     node: &CNode,
@@ -706,7 +706,7 @@ GEMM). What falls through is the decode-side dispatch, and reading one arm
 teaches you the shape of all of them:
 
 ```rust
-// src/cuda/methods/dispatch.rs:312 (Q4_K arm; abridged comment)
+// src/cuda/methods/dispatch.rs:323 (Q4_K arm; abridged comment)
 TensorType::Q4_K => {
     // 8e-reversal: decode (nt == 1) runs the MMVQ structure
     // (dp4a over q8 activations, one row per 256-thread block) —
@@ -805,7 +805,7 @@ fail — which is how the ladder degrades to the generic `launch_mmq_nt`
 fallback at the bottom:
 
 ```rust
-// src/cuda/methods/prefill_mmq.rs:466 (generic tail)
+// src/cuda/methods/prefill_mmq.rs:133 (`prefill_mmq`) (generic tail)
 unsafe {
     let q8 = self.mmq_quantize_native(x as *const f32, id as i32, nt as i32, stream);
     if q8 == 0 {
@@ -951,7 +951,7 @@ counter per key), and `capturing` (an open capture window, closed by
 `synchronize`):
 
 ```rust
-// src/graph/cuda_backend.rs:199-250 (abridged)
+// src/graph/cuda_backend.rs:459 (`graph_replay_step`) (abridged)
 let key = (uid, range);
 if let Some(pos) = self.graph_execs
     .iter().position(|g| g.uid == uid && g.range == range)
@@ -1039,7 +1039,7 @@ The pool mirrors Metal's (doc 14): a `Vec<CudaBuf>` plus a byte-length-matched
 free list. Two details are CUDA-specific:
 
 ```rust
-// src/graph/cuda_backend.rs:1307-1327 (alloc_buffer)
+// src/graph/cuda_backend.rs:2121 (`alloc_buffer`) (alloc_buffer)
 fn alloc_buffer(&mut self, size: usize) -> usize {
     let _sg = self.stream_guard(); // cudaMalloc syncs the device
     let bytes = size * 4;
