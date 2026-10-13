@@ -138,7 +138,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0018](./0018-the-grammar-mask-is-one-pipeline-stage.md) | 2026-09-24 | The grammar mask is one stage inside the single sampler pipeline | Accepted |
 | [0019](./0019-a-chat-template-that-cannot-render-refuses-the-load.md) | 2026-09-24 | A chat template that cannot be rendered refuses the load | Accepted |
 | [0006](./0006-kv-format-is-a-per-engine-gate.md) | 2026-09-25 | The KV storage format is a per-engine gate, not a process-wide global | Accepted |
-| [0020](./0020-a-quantized-file-is-byte-identical-or-wrong.md) | 2026-09-27 | A quantized file is byte-identical to `llama-quantize`, or it is wrong | Accepted (citation corrected by ADR-0024) |
+| [0020](./0020-a-quantized-file-is-byte-identical-or-wrong.md) | 2026-09-27 | A quantized file is byte-identical to `llama-quantize`, or it is wrong | Accepted (citation corrected by ADR-0024; corrected by ADR-0041) |
 | [0021](./0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) | 2026-09-27 | bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32 | Accepted |
 | [0012](./0012-device-first-layering-and-no-premature-common.md) | 2026-10-04 | Device is the first axis, the layer the second — and no premature `common` | Accepted |
 | [0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md) | 2026-10-09 | A defect in a frozen ADR is corrected by a new ADR, not by editing it | Accepted (corrected by ADR-0023 and ADR-0027) |
@@ -160,6 +160,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0038](./0038-the-per-tensor-registration-dispatch-is-one-shared-rule.md) | 2026-10-10 | The per-tensor registration dispatch is one shared rule, not a copy per loader | Accepted |
 | [0039](./0039-the-corpus-is-entered-through-a-question-at-pr-time.md) | 2026-10-11 | The corpus is entered through a question at PR time, and its maps are checked | Accepted (corrected by ADR-0040) |
 | [0040](./0040-a-decision-is-bound-to-the-surfaces-it-governs.md) | 2026-10-11 | A decision is bound to the surfaces it governs, so the question names it | Accepted (corrects ADR-0039) |
+| [0041](./0041-a-row-that-cannot-take-the-targets-block-is-demoted.md) | 2026-10-13 | A row that cannot take the target's block is demoted, the legacy targets included | Accepted (corrects ADR-0020) |
 
 ## The template
 

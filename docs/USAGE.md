@@ -495,7 +495,10 @@ f16` (llama.cpp's rule); `--outtype f32` is exact for bf16/f16 sources.
 
 `quantize` re-encodes 2-D float weights; 1-D norms/biases keep their source
 type, and on a tied model a sub-8-bit target quantizes the shared
-`token_embd.weight` at q8_0 (both are printed). The encodable targets are
+`token_embd.weight` at q8_0 (both are printed). A 2-D row that is not a multiple
+of the target's block is **demoted** the way llama.cpp's `tensor_type_fallback`
+does it — a K-quant to `q5_0`/`q5_1`/`q8_0`, a legacy target to `f16` — never
+copied, so an f32 source with such a row comes back f16. The encodable targets are
 `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q4_K`, `q5_K`, `q6_K`, `f16` and `f32`,
 and the K-quant encoders are byte-identical to `llama-quantize`'s on the same
 source ([`docs/SUPPORT-MATRIX.md`](./SUPPORT-MATRIX.md)). The K-quants with no
