@@ -315,7 +315,7 @@ G3-reduced path; the comment records its removal as R3-A2), and from there
 the value travels by **move**, Rust's zero-byte ownership transfer:
 
 ```rust
-let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx); // owned Vec
+let logits = model.forward(&input_ids, &positions, 1, ctx);  // owned Vec, main.rs:1472
 let last_logits: Vec<f32> = logits;      // move, main.rs:1474
 ...
 let mut logits = last_logits;            // move into the decode binding, main.rs:1554
@@ -325,7 +325,7 @@ let sampled = sampler::sample_with_config(&mut logits, ...); // borrow, mutate i
 logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:1782
 ```
 
-The decode loop's comment (`main.rs:924-925`) states the stakes: *forward()
+The decode loop's comment (`main.rs:1774-1775`) states the stakes: *forward()
 returns n_out\*nv logits (n_out=1 for single-token decode, exactly n_vocab),
 so move the Vec in place instead of copying 607 KB/token.* At ~300 decode
 tokens/second, an extra 608 KB copy per token would be ~180 MB/s of pure
@@ -399,7 +399,7 @@ from the decode side.
     if trace_on {
         crate::trace::begin_phase("prefill");
     }
-    let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx);
+    let logits = model.forward(&input_ids, &positions, 1, ctx);
     let last_logits: Vec<f32> = logits;
     if trace_on {
         crate::trace::attach_step(&last_logits);
