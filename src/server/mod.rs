@@ -411,6 +411,12 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
     if let Err(e) = params.validate(state.tokenizer.vocab_size()) {
         return error_response(&e);
     }
+    // #118: resolve the string-form DRY breakers against the vocabulary, which
+    // is per server rather than per request. A breaker that matches no token is
+    // a 400 here, like every other sampler-configuration refusal.
+    if let Err(e) = params.resolve_dry_breakers(&state.tokenizer) {
+        return error_response(&e);
+    }
     // F2 (#47): compile the grammar/schema now (the vocabulary is here), so an
     // unsupported construct is a 400 before the job is queued. Speculative
     // decoding samples several rows from one automaton state, so a grammar and

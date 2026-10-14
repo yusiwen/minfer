@@ -3,7 +3,7 @@
 > **Stage**: GGUF parsed (02) → **this stage: the file becomes a runnable
 > model, with weights wired into every backend** → tokenizer + template (04).
 > **Code**: `models/mod.rs::load_model` (dispatch), `models/qwen2/loader.rs::load`
-> and `models/qwen3/loader.rs::load` (the two implementations), `main.rs:637-657`
+> and `models/qwen3/loader.rs::load` (the two implementations), `main.rs:652-672`
 > (GPU init + legacy KV cache), `tensor.rs` (`Cow<'static,[u8]>` weight bytes),
 > `graph/alloc.rs::register_weight`, `src/metal/::register_weight` /
 > `cuda.rs::register_weight` (per-backend registries),
@@ -311,7 +311,7 @@ fewer bits, grouped into blocks that share a scale factor.
 ### 3.2 Key code
 
 Excerpt 1 — the startup order in `main.rs`: GPU init, dispatch, legacy KV
-cache. (`src/main.rs:637-657`; the KV block below is **historical** — see the
+cache. (`src/main.rs:652-672`; the KV block below is **historical** — see the
 forward note under the annotations)
 
 ```rust
@@ -421,7 +421,7 @@ not know which architecture it is talking to.
 | `n_layer` | loader-loop sizing here, the graph builder's per-layer loop (doc 05), the legacy KV cache above |
 | `n_head_kv`, `n_embd_head`, `n_kv_embd` | GQA (grouped-query attention: fewer K/V heads than query heads) head mapping and strides (doc 11), and the KV region width `n_kv_embd × n_ctx` (doc 07) |
 | `n_vocab` | logits width — the sampler's input size (doc 12) |
-| `special_tokens` | the sampler's stop condition: `main.rs` fetches `eos`/`im_end` ids once and checks every sampled token against them (`main.rs:839,900,1020`) |
+| `special_tokens` | the sampler's stop condition: `main.rs` fetches `eos`/`im_end` ids once and checks every sampled token against them (`main.rs:867,900,1020`) |
 | `rope_style` | doc 11: RoPE (rotary positional encoding) has two layout styles — Qwen's non-interleaved vs Llama's interleaved — and the vec-op must be told which |
 | `as_any` | lets graph code downcast to the concrete model when it needs specifics |
 | `Send + Sync` | the HTTP server shares the model across threads (`Arc<dyn ModelDef>`) |

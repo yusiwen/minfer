@@ -25,7 +25,7 @@ depends on the model, the quantization, even the layer's final RMSNorm gain).
 For the Qwen family the vocabulary has **151,936** entries, so what this
 stage receives is a `Vec<f32>` with 151,936 elements — 151,936 × 4 bytes =
 607,744 bytes ≈ **0.6 MB** of scores (the `607 KB` the code comment at
-`src/main.rs:924-925` refers to).
+`src/main.rs:952-953` refers to).
 
 The sampler's whole job is to turn that list into one `u32` token id. That
 sounds trivially small next to the transformer's billions of multiplies, and
@@ -45,7 +45,7 @@ Three quiet facts shape the design:
    penalties need to know which tokens appeared recently. That means the
    decode loop keeps a sliding window of the last 64 token ids — seeded from
    the prompt's tail — and passes it in alongside the logits
-   (`src/main.rs:842-847`).
+   (`src/main.rs:870-875`).
 3. **"Stop generating" is a sampling-adjacent concern.** After a token is
    chosen, three gates decide whether generation ends: the token is the
    end-of-text sentinel (eos or `<|im_end|>`, doc 04), the generated *byte
@@ -154,7 +154,7 @@ sometimes wins, which is exactly the escape hatch that breaks loops and
 gives the model its range of phrasing. The trade is coherence for diversity;
 **temperature** (§2.6) is the dial between the two, and the dial's zero stop
 is greedy itself — `--greedy` in the CLI is literally `--temp 0`
-(`src/main.rs:312-314`), and `sample_temperature` returns the argmax when
+(`src/main.rs:327-329`), and `sample_temperature` returns the argmax when
 `temp < 1e-6` (`src/sampler.rs:230-232`). Greedy is not a different
 algorithm here; it is a degenerate temperature.
 
@@ -320,7 +320,7 @@ picks one. Three sub-steps, all in `sample_temperature`
    (`src/sampler.rs:260-273`). The dart comes from `rng.gen()` — one
    uniform `f32` in [0, 1) per generated token — from a **seeded** random
    number generator: `StdRng::seed_from_u64(params.seed)`, default seed 42
-   (`src/main.rs:1566`). A *seed* is the starting state of a pseudo-random
+   (`src/main.rs:1622`). A *seed* is the starting state of a pseudo-random
    generator: same seed in, same sequence of "random" numbers out — which
    is why the same command produces the same text even while sampling
    (§3.3's fourth design question covers why minfer wants that).
@@ -328,7 +328,7 @@ picks one. Three sub-steps, all in `sample_temperature`
 ### 2.7 Stopping: when does generation end?
 
 The sampler produces a token; the loop decides whether to keep going. Three
-gates, checked in this order each step (`src/main.rs:1749-1772`):
+gates, checked in this order each step (`src/main.rs:1805-1828`):
 
 1. **Stop tokens.** `is_stop_token(id, &special)` — true when the sampled id
    equals the model's **eos** (end of sequence) token or `<|im_end|>` (doc
@@ -381,7 +381,7 @@ struct — no full-vocab copy crosses the sampler boundary, and no second
 buffer needs to stay alive per token. Why that shape matters is design
 question 5 in §3.3.
 
-**After the call** (still inside one loop iteration, `src/main.rs:900-922`):
+**After the call** (still inside one loop iteration, `src/main.rs:928-950`):
 stop-token gate → `generated.push(id)` + window update → decode to bytes
 into `full` → stop-string gate → stream newly finished bytes → next forward.
 
@@ -389,12 +389,12 @@ into `full` → stop-string gate → stream newly finished bytes → next forwar
 
 #### The whole pipeline in one function
 
-`src/sampler.rs:1066-1155` — the complete sampler is one function whose body is
+`src/sampler.rs:1067-1156` — the complete sampler is one function whose body is
 the stage order, elided only where a stage is long; the order *is* the design:
 
 ```rust
-// src/sampler.rs:1066 — the pipeline; `sample_with_config` (:1181) is the
-// unconstrained wrapper the CLI calls (`src/main.rs:1619`)
+// src/sampler.rs:1067 — the pipeline; `sample_with_config` (:1181) is the
+// unconstrained wrapper the CLI calls (`src/main.rs:1675`)
 pub fn sample_with_config_grammar<R: Rng>(
     logits: &mut [f32], cfg: &SamplerConfig, prev_tokens: &[u32],
     mirostat: &mut MirostatState, grammar: &mut Option<GrammarState>,
@@ -498,12 +498,12 @@ pub fn recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
     tokens[start..].to_vec()
 }
 
-// src/main.rs:1563-1568 — seeded once, window seeded from the PROMPT tail
+// src/main.rs:1619-1624 — seeded once, window seeded from the PROMPT tail
     let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
     const REPEAT_LAST_N: usize = 64;
     let mut prev_tokens = sampler::recent_window(&input_ids, REPEAT_LAST_N);
 
-// src/main.rs:1754-1757 — every sampled token enters the window
+// src/main.rs:1810-1813 — every sampled token enters the window
         generated.push(sampled.token_id);
         prev_tokens.push(sampled.token_id);
         if prev_tokens.len() > REPEAT_LAST_N {
@@ -687,7 +687,7 @@ fresh `Vec` (§3.1).
 The gates run immediately after sampling, before anything is appended:
 
 ```rust
-// src/main.rs:1727-1743 (condensed to the sampler-adjacent lines)
+// src/main.rs:1783-1799 (condensed to the sampler-adjacent lines)
     while generated.len() < params.n_predict {
         let sampled = match sampler::sample_with_config_grammar(
             &mut logits,
@@ -724,7 +724,7 @@ The gates run immediately after sampling, before anything is appended:
         }
 ```
 
-`is_stop_token` is the two-line sentinel (`src/main.rs:1020-1022`):
+`is_stop_token` is the two-line sentinel (`src/main.rs:1048-1050`):
 
 ```rust
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
@@ -754,7 +754,7 @@ pub fn match_stop_suffix(buf: &[u8], stops: &[&[u8]]) -> Option<usize> {
 "Earliest start wins" means the *longest* applicable stop string decides
 where to cut (a later start truncates less text). The bytes already flushed
 to the terminal before the match completed are not un-printed — that is the
-llama.cpp antiprompt behavior the comment at `src/main.rs:849-853` describes,
+llama.cpp antiprompt behavior the comment at `src/main.rs:877-881` describes,
 and it is why `full` (everything generated) and `emitted` (everything
 streamed) are tracked as separate cursors.
 
@@ -768,7 +768,7 @@ self-reinforcing basin where the most likely token after a repetition is
 the same repetition. Multinomial sampling injects exactly enough noise to
 escape those basins while staying biased toward good tokens (a 0.73-likely
 token still wins 73% of the time); temperature is the coherence-vs-diversity
-dial and greedy its zero point (`--greedy`, `src/main.rs:312-314`). The
+dial and greedy its zero point (`--greedy`, `src/main.rs:327-329`). The
 composition minfer chose matters as much as the mechanism: penalties apply
 in *both* modes (a repeated token can lose the argmax), so even greedy
 output is loop-resistant — the default 1.1 penalty does real work in every
@@ -854,7 +854,7 @@ parity tests rather than trusting either alone.)
 obvious alternative — `let probs = sampler::sample(logits.clone(), …)` or
 returning a new `Vec` — buys a full-vocab copy per token for zero benefit.
 The arithmetic: 151,936 × 4 B = 607,744 B ≈ 0.6 MB per generated token,
-which is precisely the copy the call-site comment at `src/main.rs:924-925`
+which is precisely the copy the call-site comment at `src/main.rs:952-953`
 brags about not making ("move the Vec in place instead of copying 607
 KB/token") for the *forward* boundary — the sampler boundary gets the same
 treatment. The ownership dance that makes it work: `logits` starts as the
@@ -925,7 +925,7 @@ run even when the stochastic stages are skipped.
 - **The sampler destroys its input buffer** (it holds probabilities after
   `sample_temperature`). The caller-side invariant that makes this safe:
   `logits` is reassigned from the next forward before it is ever read
-  again (`src/main.rs:1782`). Reading `logits` between sample and reassign
+  again (`src/main.rs:1838`). Reading `logits` between sample and reassign
   would read probabilities and call them logits.
 
 ## 4. Observe & verify
@@ -936,7 +936,7 @@ run even when the stochastic stages are skipped.
   selection, a ≤40-entry softmax, and one draw.
 - **`MINFER_TRACE=<path>`** — the decode loop attaches each sampled token's
   id and decoded text to the trace (`crate::trace::set_token`,
-  `src/main.rs:926-930`); the viz page shows the token stream the sampler
+  `src/main.rs:954-958`); the viz page shows the token stream the sampler
   produced.
 - **The reproducibility experiment** — run the same command twice, e.g.
   `./target/release/minfer qwen2.5-0.5b-instruct-q4_0 "Tell me a story" -n 24`:

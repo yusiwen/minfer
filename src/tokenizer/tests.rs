@@ -447,3 +447,227 @@ impl Tokenizer {
         String::from_utf8_lossy(&self.decode_bytes(ids)).into_owned()
     }
 }
+
+// === #118: DRY sequence breakers as strings =================================
+//
+// The breaKer resolver's contract: llama.cpp's `get_overlapping_token_sequences`
+// with the two branches (whole token → empty tail; breaker starting inside a
+// token and continuing past it), byte-based matching, raw-BPE tails, and the
+// refusals minfer adds where llama.cpp truncates or skips.
+
+/// The synthetic vocabulary the breaker tests use: byte-level complete (via
+/// [`Tokenizer::byte_level_for_tests`]) plus four entries that let a breaker
+/// overlap a token boundary.
+fn breaker_tokenizer() -> Tokenizer {
+    let mut t = Tokenizer::byte_level_for_tests();
+    // A dedicated single-character token (id 300), like a real vocabulary's
+    // punctuation token: one breaker string then resolves through two tokens.
+    t.vocab.insert(":".to_string(), 300);
+    t.id_to_token[300] = ":".to_string();
+    // "ab" (id 400): makes "abc" start inside a token and continue past it.
+    t.vocab.insert("ab".to_string(), 400);
+    t.id_to_token[400] = "ab".to_string();
+    t.merges.insert(("a".to_string(), "b".to_string()), 0);
+    // "aaa" (id 600): one token in which the breaker "aaaa" starts three times,
+    // each leaving a different remainder (the "matching tail" list).
+    t.vocab.insert("aaa".to_string(), 600);
+    t.id_to_token[600] = "aaa".to_string();
+    t.merges.insert(("a".to_string(), "a".to_string()), 1);
+    t.merges.insert(("aa".to_string(), "a".to_string()), 2);
+    // "ac" (id 800): starts with the breaker's first byte but diverges at the
+    // second, so it is *not* an overlap. It is the only token that distinguishes
+    // "the match must reach the token's end" from "any position counts", which
+    // is why it is here.
+    t.vocab.insert("ac".to_string(), 800);
+    t.id_to_token[800] = "ac".to_string();
+    t.merges.insert(("a".to_string(), "c".to_string()), 4);
+    t
+}
+
+#[test]
+fn dry_breaker_whole_token_resolves_to_a_length_one_sequence() {
+    let t = breaker_tokenizer();
+    // "\n" is representable only by its byte token, so the resolved set is
+    // exactly the token-id spelling — and it must be *length 1*: `apply_dry`'s
+    // single-token-breaker exemption reads `b.len() == 1`, and an appended
+    // empty tail would silently disable it.
+    assert_eq!(
+        t.overlapping_token_sequences("\n").unwrap(),
+        vec![vec![1010u32]]
+    );
+    assert_eq!(
+        t.resolve_sequence_breakers(&["\n".to_string()]).unwrap(),
+        vec![vec![1010u32]]
+    );
+
+    // ':' exists both as a dedicated token and as the byte token: llama.cpp
+    // reports every overlapping sequence, and each of them is still length 1.
+    let seqs = t.overlapping_token_sequences(":").unwrap();
+    assert!(seqs.iter().all(|s| s.len() == 1), "{seqs:?}");
+    assert!(seqs.contains(&vec![300u32]), "{seqs:?}");
+    assert!(seqs.contains(&vec![1058u32]), "{seqs:?}");
+}
+
+#[test]
+fn dry_breaker_requires_the_match_to_reach_the_token_end() {
+    let t = breaker_tokenizer();
+    // "ac" (800) starts with the breaker's first byte and diverges at its
+    // second, so it is not an overlap: the tail would have to start immediately
+    // after a match that never completed. Every other token that starts this
+    // breaker does match, and the 'a' byte token's tail is the whole "bX" rest.
+    let mut got = t.overlapping_token_sequences("abX").unwrap();
+    got.sort();
+    let mut want = vec![
+        vec![400u32, 1088],     // "ab" holds "ab", tail "X"
+        vec![600, 1098, 1088],  // "aaa" ends at the breaker's first byte
+        vec![1097, 1098, 1088], // 'a' byte token, tail "bX"
+    ];
+    want.sort();
+    assert_eq!(got, want);
+    assert!(
+        !got.iter().any(|s| s.first() == Some(&800u32)),
+        "a token that diverges mid-breaker must not be a head: {got:?}"
+    );
+}
+
+#[test]
+fn dry_breaker_contained_in_one_token_suppresses_its_overlapping_tails() {
+    let mut t = breaker_tokenizer();
+    // "aba" (id 700) *contains* "ab", so llama.cpp's first branch applies: the
+    // token alone is the whole occurrence. The second position (2) would leave a
+    // non-empty tail ("b") — dropping the first branch adds [700, 1098] here,
+    // which is exactly the mutation this test pins.
+    t.vocab.insert("aba".to_string(), 700);
+    t.id_to_token[700] = "aba".to_string();
+    t.merges.insert(("ab".to_string(), "a".to_string()), 3);
+
+    let seqs = t.overlapping_token_sequences("ab").unwrap();
+    assert!(seqs.contains(&vec![700u32]), "{seqs:?}");
+    assert!(!seqs.contains(&vec![700u32, 1098]), "{seqs:?}");
+    assert_eq!(
+        seqs.iter().filter(|s| s.first() == Some(&700u32)).count(),
+        1,
+        "{seqs:?}"
+    );
+}
+
+#[test]
+fn dry_breaker_crossing_a_token_boundary_carries_the_remainder_as_its_tail() {
+    let t = breaker_tokenizer();
+    let mut got = t.overlapping_token_sequences("abc").unwrap();
+    got.sort();
+    let mut want = vec![
+        // "ab" (400) holds "ab", so the tail is the rest of the breaker, "c".
+        vec![400u32, 1099],
+        // "aaa" (600) ends with the breaker's first byte; same tail as below.
+        vec![600, 1098, 1099],
+        // The 'a' byte token holds only "a", so the tail is "bc".
+        vec![1097, 1098, 1099],
+    ];
+    want.sort();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn dry_breaker_reports_every_tail_for_one_head_token() {
+    let t = breaker_tokenizer();
+    // "aaaa" starts at all three positions of the token "aaa" (600), and each
+    // position leaves a different remainder: "a", "aa", "aaa". One head, three
+    // sequences.
+    let mut got = t.overlapping_token_sequences("aaaa").unwrap();
+    got.sort();
+    let mut want = vec![
+        vec![600u32, 600],     // tail "aaa" tokenizes back to 600
+        vec![600, 1097],       // tail "a"
+        vec![600, 1097, 1097], // tail "aa": no "aa" token, so per byte
+        vec![1097, 600],       // head 'a', tail "aaa"
+    ];
+    want.sort();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn dry_breaker_tail_does_not_absorb_a_special_token() {
+    let mut t = breaker_tokenizer();
+    t.special_tokens.insert("<|im_end|>".to_string(), 7);
+    t.id_to_token[7] = "<|im_end|>".to_string();
+    t.im_end = 7;
+    rebuild_special_index(&mut t);
+
+    // The special-token pre-scan does collapse the text to the special id ...
+    assert_eq!(t.encode("<|im_end|>"), vec![7u32]);
+    // ... and the raw path a breaker tail uses does not, so a tail can never
+    // name a token the sampler could not have produced as ordinary text.
+    let raw = t.encode_raw("<|im_end|>");
+    assert_ne!(raw, vec![7u32]);
+    assert!(!raw.contains(&7u32), "{raw:?}");
+    // ... and the raw path really does cover the whole text, as ordinary
+    // byte-level tokens that decode back to it (not an empty vector).
+    assert_eq!(t.decode_bytes(&raw), b"<|im_end|>");
+
+    let seqs = t.overlapping_token_sequences("a<|im_end|>").unwrap();
+    assert!(seqs.iter().all(|s| !s.contains(&7u32)), "{seqs:?}");
+    let head_a = seqs
+        .iter()
+        .find(|s| s.first() == Some(&1097u32))
+        .expect("the 'a' byte token matches");
+    assert_eq!(&head_a[1..], &raw[..], "{head_a:?}");
+}
+
+#[test]
+fn dry_breaker_refuses_what_it_cannot_carry() {
+    let t = breaker_tokenizer();
+
+    let err = t.overlapping_token_sequences("").unwrap_err();
+    assert!(err.contains("must not be empty"), "{err}");
+
+    // llama.cpp truncates to MAX_CHAR_LEN; minfer names the value and refuses.
+    let long = "a".repeat(MAX_BREAKER_CHARS + 1);
+    let err = t.overlapping_token_sequences(&long).unwrap_err();
+    assert!(err.contains("41") && err.contains("40"), "{err}");
+
+    // Same for a tail over MAX_SEQ_LEN: 'a' + 21 byte tokens needs a 21-token
+    // tail after the 'a' byte token.
+    let long_tail = format!("a{}", "b".repeat(MAX_BREAKER_TAIL_TOKENS + 1));
+    let err = t.overlapping_token_sequences(&long_tail).unwrap_err();
+    assert!(
+        err.contains(&format!("{MAX_BREAKER_TAIL_TOKENS}-token limit")),
+        "{err}"
+    );
+
+    // A breaker that matches nothing is refused, never ignored. Every byte token
+    // exists in a real vocabulary, so this is a defensive gate — it fires on a
+    // vocabulary that is not byte-level complete.
+    let err = Tokenizer::empty()
+        .overlapping_token_sequences("x")
+        .unwrap_err();
+    assert!(err.contains("overlaps no token"), "{err}");
+}
+
+#[test]
+fn dry_breaker_string_form_never_reinterprets_digits_as_token_ids() {
+    let t = breaker_tokenizer();
+    // "1" is a breaker *string*: it is matched as text, so it resolves to the
+    // byte token for '1' (1049) — never to the token whose *id* is 1.
+    let seqs = t.resolve_sequence_breakers(&["1".to_string()]).unwrap();
+    assert!(seqs.contains(&vec![1049u32]), "{seqs:?}");
+    assert!(!seqs.contains(&vec![1u32]), "{seqs:?}");
+}
+
+#[test]
+fn dry_breaker_strings_deduplicate_and_keep_every_distinct_sequence() {
+    let t = breaker_tokenizer();
+    let one = t.resolve_sequence_breakers(&["\n".to_string()]).unwrap();
+    let twice = t
+        .resolve_sequence_breakers(&["\n".to_string(), "\n".to_string()])
+        .unwrap();
+    assert_eq!(one, twice, "a repeated breaker adds no sequence");
+
+    // Two different breakers that overlap each other keep both of their
+    // sequences (this is what "overlapping" means).
+    let both = t
+        .resolve_sequence_breakers(&["ab".to_string(), ":".to_string()])
+        .unwrap();
+    assert!(both.contains(&vec![1097u32, 1098]), "{both:?}");
+    assert!(both.contains(&vec![300u32]), "{both:?}");
+}

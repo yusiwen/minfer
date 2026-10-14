@@ -255,6 +255,21 @@ fn byte_encode(text: &str, byte_to_unicode: &HashMap<u8, char>) -> String {
     result
 }
 
+/// llama.cpp's `MAX_CHAR_LEN` for a DRY sequence breaker (`llama-sampler.cpp`).
+///
+/// llama.cpp *truncates* a longer breaker with a warning; minfer refuses it by
+/// name instead (a refusal is the house rule for an input this engine cannot
+/// carry faithfully — ADR-0009). The limit is counted in Unicode scalar values
+/// here, which agrees with llama.cpp's byte count for the ASCII breakers this
+/// feature exists for (`\n`, `:`, `"`, `*`).
+pub const MAX_BREAKER_CHARS: usize = 40;
+
+/// llama.cpp's `MAX_SEQ_LEN` for the tail of an overlapping token sequence.
+///
+/// Same story as [`MAX_BREAKER_CHARS`]: llama.cpp truncates the tail
+/// tokenization to this many tokens, minfer refuses it.
+pub const MAX_BREAKER_TAIL_TOKENS: usize = 20;
+
 #[derive(Clone)]
 pub struct Tokenizer {
     pub id_to_token: Vec<String>,
@@ -330,6 +345,44 @@ impl Tokenizer {
             merges: HashMap::new(),
             byte_to_unicode: HashMap::new(),
             unicode_to_byte: HashMap::new(),
+            special_tokens: HashMap::new(),
+            pre: PreTokenizer::Qwen2,
+            special_by_first: HashMap::new(),
+            bos_token: 0,
+            eos_token: 0,
+            im_start: 0,
+            im_end: 0,
+        }
+    }
+
+    /// A byte-level-complete vocabulary and nothing else: the 256 byte tokens
+    /// at id `1000 + byte`, the `qwen2` pre-tokenizer, no merges.
+    ///
+    /// Test-only, alongside [`Tokenizer::empty`]. The DRY breaker resolver needs
+    /// a vocabulary whose tokenization is fully known and model-independent, and
+    /// the server's request tests need one to resolve a breaker string without a
+    /// GGUF on disk. Ids below 1000 are empty tokens, exactly like the pad /
+    /// unused slots a real vocabulary has.
+    #[cfg(test)]
+    pub(crate) fn byte_level_for_tests() -> Self {
+        const BASE: u32 = 1000;
+        let byte_to_unicode = build_byte_to_unicode();
+        let unicode_to_byte = byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();
+        let mut vocab = HashMap::new();
+        let mut id_to_token = vec![String::new(); (BASE + 256) as usize];
+        for (&b, &c) in &byte_to_unicode {
+            vocab.insert(c.to_string(), BASE + b as u32);
+            id_to_token[(BASE + b as u32) as usize] = c.to_string();
+        }
+        let n = id_to_token.len();
+        Self {
+            id_to_token,
+            id_to_score: vec![0.0; n],
+            id_to_type: vec![1; n],
+            vocab,
+            merges: HashMap::new(),
+            byte_to_unicode,
+            unicode_to_byte,
             special_tokens: HashMap::new(),
             pre: PreTokenizer::Qwen2,
             special_by_first: HashMap::new(),
@@ -650,6 +703,146 @@ impl Tokenizer {
         }
 
         result
+    }
+
+    /// Tokenize text as pure byte-level BPE, *without* the special-token
+    /// pre-scan [`Tokenizer::encode`] performs.
+    ///
+    /// This is llama.cpp's `tokenize(text, /*add_special*/ false,
+    /// /*parse_special*/ false)`: a special token's **text** is split by the
+    /// pre-tokenizer and BPE like any other text, and never collapses to the
+    /// special token's id. DRY breaker tails need this — a tail is a fragment
+    /// of a breaker string, not a prompt, so absorbing a special token there
+    /// would produce a sequence the engine could never actually emit.
+    pub fn encode_raw(&self, text: &str) -> Vec<u32> {
+        self.encode_bpe(text)
+    }
+
+    /// Every token sequence that *overlaps* `breaker` — llama.cpp's
+    /// `get_overlapping_token_sequences` (`src/llama-sampler.cpp`).
+    ///
+    /// For each token whose text overlaps the breaker, the result holds
+    /// `[head, tail...]`: `head` is the token in whose text the breaker
+    /// *starts*, and the tail is the tokenization of the breaker's remaining
+    /// text (which continues in the tokens that follow `head`). Two branches,
+    /// both from llama.cpp:
+    ///
+    /// 1. the breaker occurs **anywhere** inside the token's text — the token
+    ///    alone is the whole occurrence, so the entry is `[head]` (an empty
+    ///    tail). This is the case `apply_dry`'s single-token-breaker exemption
+    ///    reads, which is why the entry must stay length 1 and must not gain a
+    ///    trailing empty element.
+    /// 2. otherwise, for **every** byte position where the breaker's first byte
+    ///    occurs in the token's text, match the breaker from that position —
+    ///    the match is allowed to run *past the end* of the token — and
+    ///    tokenize the rest of the breaker string as the tail. A position whose
+    ///    match does not reach the token's end is not a match.
+    ///
+    /// Matching is on **bytes** (a token's detokenized form is bytes), and the
+    /// tails are tokenized with [`Tokenizer::encode_raw`].
+    ///
+    /// Refusals, each naming the value (llama.cpp warns and skips or truncates
+    /// instead — minfer never silently drops or cuts a requested breaker):
+    /// an empty breaker, one longer than [`MAX_BREAKER_CHARS`], a tail longer
+    /// than [`MAX_BREAKER_TAIL_TOKENS`], a breaker that matches no token at
+    /// all, and a match that would have to split a UTF-8 character to form its
+    /// tail (llama.cpp slices the bytes and tokenizes the invalid result).
+    pub fn overlapping_token_sequences(&self, breaker: &str) -> Result<Vec<Vec<u32>>, String> {
+        if breaker.is_empty() {
+            return Err(
+                "a DRY sequence breaker must not be empty (an empty breaker cannot be matched)"
+                    .to_string(),
+            );
+        }
+        let n_chars = breaker.chars().count();
+        if n_chars > MAX_BREAKER_CHARS {
+            return Err(format!(
+                "the DRY sequence breaker {breaker:?} is {n_chars} characters long, over the \
+                 {MAX_BREAKER_CHARS}-character limit (llama.cpp truncates it silently; minfer \
+                 refuses rather than sampling with a breaker you did not ask for)"
+            ));
+        }
+
+        let needle = breaker.as_bytes();
+        let mut out: Vec<Vec<u32>> = Vec::new();
+        for id in 0..self.id_to_token.len() as u32 {
+            let word = self.decode_bytes(&[id]);
+            if word.is_empty() {
+                continue; // a token with no text cannot overlap anything
+            }
+            if word.windows(needle.len()).any(|w| w == needle) {
+                // Branch 1: the whole breaker sits inside this token.
+                out.push(vec![id]);
+                continue;
+            }
+            // Branch 2: the breaker may *start* inside this token and continue
+            // in the tokens that follow it. Only a match that reaches the end
+            // of this token's text can continue into the next token.
+            let mut from = 0usize;
+            while let Some(pos) = word[from..]
+                .iter()
+                .position(|&b| b == needle[0])
+                .map(|p| p + from)
+            {
+                from = pos + 1;
+                let mut i = 1usize;
+                while i < needle.len() && pos + i < word.len() && word[pos + i] == needle[i] {
+                    i += 1;
+                }
+                if i != needle.len() && pos + i != word.len() {
+                    continue; // stopped on a mismatch, not at the token's end
+                }
+                let tail = std::str::from_utf8(&needle[i..]).map_err(|_| {
+                    format!(
+                        "the DRY sequence breaker {breaker:?} can only overlap the vocabulary by \
+                         splitting a UTF-8 character (llama.cpp would slice the raw bytes here); \
+                         refusing to resolve it"
+                    )
+                })?;
+                let tail_ids = self.encode_raw(tail);
+                if tail_ids.len() > MAX_BREAKER_TAIL_TOKENS {
+                    return Err(format!(
+                        "the DRY sequence breaker {breaker:?} needs a {} token tail after token \
+                         {id}, over the {MAX_BREAKER_TAIL_TOKENS}-token limit (llama.cpp truncates \
+                         the tail silently; minfer refuses)",
+                        tail_ids.len()
+                    ));
+                }
+                let mut seq = Vec::with_capacity(tail_ids.len() + 1);
+                seq.push(id);
+                seq.extend(tail_ids);
+                if !out.contains(&seq) {
+                    out.push(seq);
+                }
+            }
+        }
+
+        if out.is_empty() {
+            return Err(format!(
+                "the DRY sequence breaker {breaker:?} overlaps no token in this vocabulary, so it \
+                 could never be matched; refusing it rather than ignoring it"
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Resolve a list of DRY breaker **strings** into the token sequences
+    /// `SamplerConfig::dry_breakers` takes, preserving first-seen order and
+    /// dropping duplicates (two breakers can resolve to the same sequence).
+    ///
+    /// Every refusal in [`Tokenizer::overlapping_token_sequences`] propagates,
+    /// so a breaker that matches nothing is an error at the boundary rather
+    /// than an ignored option.
+    pub fn resolve_sequence_breakers(&self, breakers: &[String]) -> Result<Vec<Vec<u32>>, String> {
+        let mut out: Vec<Vec<u32>> = Vec::new();
+        for breaker in breakers {
+            for seq in self.overlapping_token_sequences(breaker)? {
+                if !out.contains(&seq) {
+                    out.push(seq);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Decode token IDs to raw bytes (reverse byte-level encoding).

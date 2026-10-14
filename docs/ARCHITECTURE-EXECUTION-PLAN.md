@@ -7431,7 +7431,7 @@ degenerate `s_hat = 1` rule), and `apply_logit_bias` (positive and negative).
 
 **Surface.** `--min-p --typical --xtc-probability --xtc-threshold
 --dry-multiplier --dry-base --dry-allowed-length --dry-penalty-last-n
---dry-sequence-breakers --mirostat --mirostat-tau --mirostat-eta --mirostat-m
+--dry-sequence-breakers --dry-sequence-breaker --mirostat --mirostat-tau --mirostat-eta --mirostat-m
 --logit-bias` on the CLI; the matching optional fields on the OpenAI request
 (`min_p`, `typical_p`, `xtc_probability`, `xtc_threshold`, `dry_*`,
 `dry_sequence_breakers`, `mirostat`, `mirostat_tau`, `mirostat_eta`,
@@ -7450,11 +7450,20 @@ change (`[5, 54, 21, 54, 105, …]`, seed 42). A mutation check (forcing
 it pass — so the gate can fail. Full-suite counts are in the F3 record commit /
 PR (unit + integration lines).
 
-**Honest scope.** (a) DRY sequence breakers are token-id sequences
-(`--dry-sequence-breakers 198;13,2`), not llama.cpp's strings: mapping a string
-breaker to the overlapping token sequences needs
-`get_overlapping_token_sequences` against the vocabulary, a tokenizer port left
-as a follow-up. (b) Speculative decoding (`--spec-draft`) carries the pure F3
+**Honest scope.** (a) DRY sequence breakers: the token-id list
+(`--dry-sequence-breakers 198;13,2`) and llama.cpp's repeatable string form
+(`--dry-sequence-breaker ':'`, and the request field `dry_sequence_breakers` in
+either shape) are both ported ([#118](https://github.com/yusiwen/minfer/issues/118));
+the string form is resolved through `Tokenizer::overlapping_token_sequences`, a
+port of `get_overlapping_token_sequences` with **both** of its branches — a
+breaker contained in one token resolves to an empty tail (the length-1 sequence
+`apply_dry`'s single-token exemption reads), and a breaker that starts inside a
+token carries the remainder of the string as its tail. minfer refuses what
+llama.cpp truncates or skips: a breaker over 40 characters, a tail over 20
+tokens, a breaker that matches no token. It keeps **no** default breakers, where
+llama.cpp's CLI carries four (`\n`, `:`, `"`, `*`) and clears them on the first
+use of the flag — adopting them would change the token stream of an existing
+DRY-enabled run, so that stays a separate decision. (b) Speculative decoding (`--spec-draft`) carries the pure F3
 filters but **not** mirostat — a verify round samples several rows from one
 shared RNG, so `mu` has no faithful home there; the CLI and the server refuse
 the combination loudly. (c) In mirostat mode the temperature is ignored
