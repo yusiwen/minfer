@@ -7573,8 +7573,9 @@ integer-valued numeric bounds are compiled (`number` + bounds is refused);
 `multipleOf` is refused, and `pattern` is a named regex subset (**landed
 2026-10-14 as #125's slice 3, with `minLength`/`maxLength` and the four `format`
 validators in slice 2 and the class shorthands `\d`/`\w`/`\s` in slice 1 — the
-issue is the record; a negated class, a negated shorthand and any class member
-above U+00FF are still refused, because they need the escape-aware complement**). The mask is
+issue is the record; the escape-aware automaton makes negated classes,
+negated shorthands and class ranges above U+00FF work too, with backreferences,
+lookaround and the rest still refused by name**). The mask is
 O(vocabulary) per new state — 5.4 ms on a 151k vocabulary, cached per state — so
 a long constrained generation still pays it once per unseen state (**narrowed by
 [#126](https://github.com/yusiwen/minfer/issues/126) on 2026-10-14: the record is
@@ -7585,8 +7586,7 @@ the change but no device run exercises it. Two follow-up issues carry what was
 deliberately left out: [#125](https://github.com/yusiwen/minfer/issues/125) (the
 GBNF/JSON-Schema constructs the compiler refuses: `format` outside the four,
 real-valued numeric bounds and `multipleOf`, property permutations,
-an exact `oneOf`, `allOf`/`not`, `\p{...}`, and the `pattern` constructs slice 3
-left out) and
+an exact `oneOf`, `allOf`/`not`, and `\p{...}`) and
 [#126](https://github.com/yusiwen/minfer/issues/126) (index the vocabulary by
 first codepoint to cut the residual mask cost — **DONE 2026-10-14**, below).
 

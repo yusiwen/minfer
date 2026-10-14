@@ -606,14 +606,15 @@ shortcut; CLI `--grammar`/`--json-schema`, server `response_format`
 (`json_object` / `json_schema`) plus a `grammar` field. Design and the exact
 accepted subset: `docs/GRAMMAR-DESIGN.md`. What it deliberately does not do
 (and refuses loudly rather than guessing): `format` outside the four validators,
-`multipleOf`, real-valued numeric bounds, object property permutations, a negated
-regex class or shorthand, and a
+`multipleOf`, real-valued numeric bounds, object property permutations,
+backreferences and lookaround inside a regex `pattern`, and a
 device-side mask — the mask is host work before any backend runs. Three slices of
 [#125](https://github.com/yusiwen/minfer/issues/125) landed on 2026-10-14: the
 GBNF class shorthands `\d`/`\w`/`\s`; JSON-Schema `minLength`/`maxLength` plus
 `date`/`time`/`date-time`/`uuid` formats; and `pattern`, compiled from a named
-ECMA-262 subset with an escape-aware character automaton (none of the three is a
-llama.cpp port — the reference has no shorthand, refuses those format spellings,
+ECMA-262 subset with an escape-aware character automaton that also covers negated
+classes, negated shorthands and every codepoint above U+FFFF (none of the three is
+a llama.cpp port — the reference has no shorthand, refuses those format spellings,
 and *widens an unanchored pattern to any string with a warning* where minfer
 either compiles it exactly or refuses it). The mask's own
 cost was cut on 2026-10-14 (**#126**): token ids are indexed by the first

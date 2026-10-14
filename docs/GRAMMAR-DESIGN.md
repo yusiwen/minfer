@@ -88,7 +88,7 @@ rules and compiled once, on demand.
 | `string` | a JSON string: `[^"\\\u0000-\u001f]*` plus `\" \\ \/ \b \f \n \r \t` and `\uXXXX` escapes; `minLength`/`maxLength` count **characters** (one escape is one character), and `format` narrows it to one of the validators below |
 | `string`: `minLength`, `maxLength` | exact character bounds (`minLength` may not exceed `maxLength`); the encoded string is `"\"" j-char{m,n} "\""` |
 | `string`: `format` | `date`, `time`, `date-time`, `uuid`, `uuid1`..`uuid5` — the four rules the reference implements (the uuid version digit is not checked, as there) |
-| `string`: `pattern` | a regex over the **decoded** characters, escape-aware: the subset below. Unanchored, it matches a substring (ECMA-262); a leading `^` and a trailing `$` are each optional and make it a whole-string match. Matched against the JSON text, where a character may be spelled literally or as an escape — both are accepted, and `.` refuses exactly the four line terminators (`\n`, `\r`, `\u2028`, `\u2029`) in either spelling |
+| `string`: `pattern` | a regex over the **decoded** characters, escape-aware: literals (any codepoint), `.`, positive and **negated** classes `[...]`/`[^...]` over the whole codepoint space with `\d`/`\w`/`\s` and `\D`/`\W`/`\S`, groups (capturing or not), alternation, `*` `+` `?` `{m}` `{m,}` `{m,n}` (lazy `?` accepted), and `^`/`$` at the two ends. Unanchored, it matches a substring (ECMA-262); each anchor is optional and independent. The JSON text may spell a character literally or as an escape — both are accepted, including the surrogate pair that spells a character above U+FFFF — and `.` refuses exactly the four line terminators in either spelling |
 | `integer`: `minimum`, `maximum` | inclusive bounds, integer-valued (see below) |
 | `integer`: `exclusiveMinimum`, `exclusiveMaximum` | integer-valued; folded into the inclusive range |
 | `number` | the general JSON number grammar (`-?int(.frac)?([eE]exp)?`) when unbounded |
@@ -114,12 +114,9 @@ rules and compiled once, on demand.
   backreference (`\1`, `\k<...>`), lookaround or any group other than `(?:...)`
   (`(?=`, `(?!`, `(?<=`, `(?<!`, `(?<name>`, `(?>` …), a word-boundary assertion
   (`\b`, `\B`), a Unicode property escape (`\p{...}`), a control or octal escape,
-  the `\u{...}` form, a possessive quantifier (`*+`, `++`, `?+`), a **negated**
-  class or negated shorthand (`[^...]`, `\D`, `\W`, `\S`) — which need the
-  escape-aware complement over the whole codepoint space — a class member above
-  U+00FF (which needs the general four-hex-digit automaton), a class shorthand as
-  a range endpoint, a misplaced anchor (`^`/`$` anywhere but the two ends, or
-  combined with a top-level `|`), and a malformed quantifier or class;
+  the `\u{...}` form, a possessive quantifier (`*+`, `++`, `?+`), a class
+  shorthand as a range endpoint, a misplaced anchor (`^`/`$` anywhere but the two
+  ends, or combined with a top-level `|`), and a malformed quantifier or class;
 * `multipleOf` and non-integer `minimum`/`maximum`/`exclusiveMinimum`/
   `exclusiveMaximum` on numbers (integer bounds are supported; a real-valued
   bound is a named refusal, see the follow-ups — narrowing a `number` to its
@@ -392,16 +389,19 @@ lives), before the job occupies a worker slot.
   bounds are compiled.
 * **`pattern` is a named regex subset, matched against the decoded characters.**
   It landed on 2026-10-14 (#125's slice 3) and is the largest single piece of the
-  compiler: literals, `.`, positive classes over U+0000..=U+00FF with
-  `\d`/`\w`/`\s`, groups (capturing or not), alternation, the quantifiers
-  `*` `+` `?` `{m}` `{m,}` `{m,n}` (a lazy `?` suffix is accepted — it changes
-  matching, not the language), and the two anchors. A **negated** class or
-  shorthand is refused rather than approximated, because it is the complement over
-  the whole codepoint space and the JSON text may spell a character either
-  literally or as an escape: getting that wrong would accept a string the schema
-  rejects, which is the one thing this compiler never does. Every other refusal
-  (backreferences, lookaround, `\p{...}`, possessive quantifiers, a misplaced
-  anchor, a class member above U+00FF) names the construct, and §3 lists them.
+  compiler: literals at any codepoint, `.`, positive and negated classes over the
+  whole codepoint space (`[...]`, `[^...]`, `\d` `\w` `\s` `\D` `\W` `\S`),
+  groups (capturing or not), alternation, the quantifiers `*` `+` `?` `{m}`
+  `{m,}` `{m,n}` (a lazy `?` suffix is accepted — it changes matching, not the
+  language), and the two anchors. A character is compiled **escape-aware**: the
+  JSON text may spell it literally, as a short escape (`\n`, `\"`, …), as
+  `\uXXXX`, or — above U+FFFF — as a surrogate pair, and every spelling that
+  decodes into the set is accepted. That is what lets a negated class be exact
+  rather than approximated: the complement is enumerated, both in the literal
+  alphabet and in the four-hex-digit automaton, instead of being matched against
+  the raw text (which would accept strings the schema rejects). The refusals that
+  remain (backreferences, lookaround, `\p{...}`, possessive quantifiers, a
+  misplaced anchor) each name the construct, and §3 lists them.
   The reference is *not* a model here: it requires both anchors and, when either
   is missing, **widens to any string with a warning** — minfer either compiles the
   pattern exactly or refuses it.
