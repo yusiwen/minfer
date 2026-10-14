@@ -79,7 +79,7 @@ rules and compiled once, on demand.
 | `type` | `"object" "array" "string" "number" "integer" "boolean" "null"`, or an array of those (compiled as a union) |
 | `enum` | union of the listed values; every value type is supported |
 | `const` | exactly that value |
-| `object`: `properties` | declared properties, emitted **in declaration order** (see the scope note below) |
+| `object`: `properties` | declared properties, emitted in **the order the compiler sees them** — `serde_json`'s map order (see the scope note below) |
 | `object`: `required` | a required declared property must appear; a required name that is not declared is refused |
 | `object`: `additionalProperties` | `false` (closed), `true`/absent (extra `"key": value` entries after the declared ones), or a schema (extra values compiled from it) |
 | `array`: `items` | one schema for every element |
@@ -154,16 +154,22 @@ rules and compiled once, on demand.
 
 ### Scope note: object property order
 
-Object entries are emitted **in `properties` declaration order**: required
-properties must appear, optional ones may be skipped, and an extra entry (when
-`additionalProperties` allows one) may be interleaved at any position where no
-required declared property is still pending. This is a *subset* of the schema's
-language — a model cannot produce `{"b":1,"a":2}` for a schema that declares `a`
-then `b`, nor may an extra precede a required first property. It never accepts
-an object the schema rejects, which is what the acceptance line ("constrained
-output always parses under the given schema") requires. llama.cpp generates
-permutations up to a size cap; that is a follow-up (§8), not a silent guess: the
-behaviour is stated here and in `docs/USAGE.md`.
+Object entries are emitted in **the order the compiler sees the keys**, and that
+order is `serde_json`'s: `minfer` builds with `serde_json = "1"` and *without* the
+`preserve_order` feature, so a `Map` is a `BTreeMap` and the keys arrive
+**alphabetically sorted**, not in the order they appear in the schema text.
+(Enabling `preserve_order` would make it the text's order; nothing else would
+change.) A `properties` object is therefore compiled as if it were written in
+that order, for a schema read from a file, from the CLI or from a request body
+alike.
+
+Within that order: required properties must appear, optional ones may be skipped,
+and an extra entry (when `additionalProperties` allows one) may be interleaved at
+any position where no required declared property is still pending. This is a
+*subset* of the schema's language — the schema itself does not order keys at all,
+so the compiled language cannot accept an object the schema rejects. The
+behaviour is stated here and in `docs/USAGE.md`, and a test pins it
+(`json_object_properties_compile_in_the_order_the_compiler_sees`).
 
 ### Scope note: `oneOf`
 
@@ -388,8 +394,14 @@ lives), before the job occupies a worker slot.
 
 ## 8. Honest scope and follow-ups
 
-* **Object property order** is declaration order (subset of the schema's
-  language), not the permutation set llama.cpp generates.
+* **Object property order is `serde_json`'s map order**, which is alphabetical
+  while the `preserve_order` feature is off (it is). The compiler emits the
+  required members in that order and interleaves the optional ones; since a JSON
+  object is unordered, this is a subset of the schema's language, never a
+  superset. It is deliberately not compared to llama.cpp, whose object builder
+  emits its required members in the order it walks its own property map — neither
+  implementation generates permutation sets (measured: `grep -c "permut"` over its
+  C++, Python and test grammar files is 0/0/0).
 * **`oneOf`** is compiled as `anyOf` (superset for overlapping branches).
 * **`allOf` is merged, not intersected in general.** For object schemas the merge
   *is* the exact intersection, which is why it is supported; for a scalar, an

@@ -80,7 +80,9 @@ Sampling and runtime options:
   `--spec-draft` cannot be combined with a grammar (a verify round samples several rows from one
   automaton state). The accepted GBNF and JSON-Schema subsets, and every construct that is
   refused, are catalogued in [GRAMMAR-DESIGN.md](./GRAMMAR-DESIGN.md); the honest narrowing to
-  know about is that object properties are accepted in **declaration order** and `oneOf` is
+  know about is that object properties are accepted in the order the compiler sees
+  the keys — `serde_json`'s map order, alphabetical unless `preserve_order` is
+  enabled — and `oneOf` is
   compiled as `anyOf`. Example:
   ```bash
   minfer model.gguf "Give me a person" --json-schema-str \

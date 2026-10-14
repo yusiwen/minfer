@@ -7566,9 +7566,11 @@ gates and each made one fail: an off-by-one in the sampler's mask index, a
 disabled partial-completion check, an ignored `minItems`, and a disabled EOG
 allowance.
 
-**Honest scope.** Object properties are accepted in *declaration order* (a
-subset of the schema's language: extras may be interleaved only where no
-required property is pending); `oneOf` is compiled as `anyOf`; only
+**Honest scope.** Object properties are accepted in the order the compiler sees
+the keys — `serde_json`'s map order, alphabetical while `preserve_order` is off (a
+subset of the schema's language: extras may be interleaved only where no required
+property is pending; [#554](https://github.com/yusiwen/minfer/issues/554) corrected
+this record on 2026-10-14); `oneOf` is compiled as `anyOf`; only
 integer-valued numeric bounds are compiled (`number` + bounds is refused);
 `multipleOf` is refused, `allOf` is merged for object schemas, and `pattern` is
 a named regex subset (**landed
@@ -7586,7 +7588,7 @@ host-side, before any device work), so the CUDA `build-linux-cuda` job compiles
 the change but no device run exercises it. Two follow-up issues carry what was
 deliberately left out: [#125](https://github.com/yusiwen/minfer/issues/125) (the
 GBNF/JSON-Schema constructs the compiler refuses: `format` outside the four,
-real-valued numeric bounds and `multipleOf`, property permutations,
+real-valued numeric bounds and `multipleOf`, a canonical property order,
 an exact `oneOf`, `not`/`if`-`then`-`else`, the `allOf` shapes a merge cannot
 express, and `\p{...}`) and
 [#126](https://github.com/yusiwen/minfer/issues/126) (index the vocabulary by
