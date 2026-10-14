@@ -1503,8 +1503,8 @@ impl<'a> GbnfParser<'a> {
             other => {
                 return Err(format!(
                     "grammar: unsupported escape `\\{other}` at byte {} (supported: \\n \\r \\t \
-                     \\\\ \\\" \\' \\[ \\] \\- \\^ \\/ \\xNN \\uNNNN; character classes such as \
-                     \\d/\\w/\\p{{...}} are not supported — write [0-9], [A-Za-z0-9_], ...)",
+                     \\\\ \\\" \\' \\[ \\] \\- \\^ \\/ \\xNN \\uNNNN; the class shorthands \
+                     \\d/\\w/\\s are only valid inside `[...]`, and \\p{{...}} is not supported)",
                     self.i
                 ))
             }
@@ -1532,6 +1532,42 @@ impl<'a> GbnfParser<'a> {
             .map_err(|_| format!("grammar: bad hex escape `{}`", &self.s[start..self.i]))
     }
 
+    /// A class shorthand (`\d`, `\w`, `\s`) as ranges, if the next escape is one.
+    /// The caller has already consumed the backslash.
+    ///
+    /// These are **sets**, not codepoints, so they are only legal inside a
+    /// character class: `"\d"` has no single character it could mean. The
+    /// definitions are ECMA-262's `\d`/`\w`/`\s` over ASCII — `\s` is the ASCII
+    /// whitespace set (space and U+0009..U+000D), not the Unicode space
+    /// separators, and `\w` includes `_`.
+    fn class_shorthand(&mut self) -> Result<Option<Vec<(u32, u32)>>, String> {
+        let ranges: Vec<(u32, u32)> = match self.peek() {
+            Some('d') => vec![('0' as u32, '9' as u32)],
+            Some('w') => vec![
+                ('0' as u32, '9' as u32),
+                ('A' as u32, 'Z' as u32),
+                ('_' as u32, '_' as u32),
+                ('a' as u32, 'z' as u32),
+            ],
+            Some('s') => vec![('\t' as u32, '\r' as u32), (' ' as u32, ' ' as u32)],
+            _ => return Ok(None),
+        };
+        self.bump();
+        // A set cannot be a range endpoint: `[\d-x]` would otherwise read as the
+        // set plus a `-`..`x` range, accepting far more than was written.
+        // `[\d-]` stays a literal minus, as everywhere else in a class.
+        if self.peek() == Some('-')
+            && !matches!(self.s[self.i + 1..].chars().next(), Some(']') | None)
+        {
+            return Err(format!(
+                "grammar: a class shorthand cannot be a range endpoint at byte {} (near `{}`)",
+                self.i,
+                self.snippet()
+            ));
+        }
+        Ok(Some(ranges))
+    }
+
     fn char_class(&mut self) -> Result<Node, String> {
         let negated = if self.peek() == Some('^') {
             self.bump();
@@ -1549,6 +1585,10 @@ impl<'a> GbnfParser<'a> {
                 }
                 Some('\\') => {
                     self.bump();
+                    if let Some(short) = self.class_shorthand()? {
+                        ranges.extend(short);
+                        continue;
+                    }
                     let lo = self.escape()?;
                     self.push_class_item(&mut ranges, lo)?;
                 }

@@ -159,8 +159,10 @@ fn gbnf_escapes() {
 fn gbnf_refuses_unsupported_or_malformed_constructs() {
     let (pieces, eog) = byte_vocab();
     let cases: &[(&str, &str)] = &[
-        (r#"root ::= [\d]"#, "unsupported escape"),
         (r#"root ::= "\p{L}""#, "unsupported escape"),
+        (r#"root ::= [\p{L}]"#, "unsupported escape"),
+        (r#"root ::= "\d""#, "only valid inside"),
+        (r#"root ::= [\d-x]"#, "cannot be a range endpoint"),
         (r#"root ::= "a" "unterminated"#, "unterminated string"),
         (r#"root ::= []"#, "empty character class"),
         (r#"root ::= [z-a]"#, "reversed"),
@@ -188,6 +190,89 @@ fn gbnf_refuses_unsupported_or_malformed_constructs() {
     }
     // Trailing whitespace/comments after the last rule are not a rule.
     assert!(Grammar::from_gbnf("root ::= \"a\"\n# done\n", pieces, eog).is_ok());
+}
+
+#[test]
+fn gbnf_class_shorthands_expand_to_their_ecma_sets() {
+    // `\d`. The witnesses are both sides of every boundary of `[0-9]`.
+    let digits = gbnf(r"root ::= [\d]");
+    for (cp, want) in [(0x2Fu32, false), (0x30, true), (0x39, true), (0x3A, false)] {
+        let c = char::from_u32(cp).unwrap();
+        assert_eq!(
+            digits.accepts(c.to_string().as_bytes()),
+            want,
+            "\\d at U+{cp:04X}"
+        );
+    }
+    assert!(gbnf(r"root ::= [\d]+").accepts(b"2026"));
+    assert!(!gbnf(r"root ::= [\d]+").accepts(b"20a6"));
+
+    // `\w` = `[0-9A-Za-z_]`, with the underscore's neighbours on both sides.
+    let word = gbnf(r"root ::= [\w]");
+    for (cp, want) in [
+        (0x2Fu32, false),
+        (0x30, true),
+        (0x39, true),
+        (0x3A, false),
+        (0x40, false),
+        (0x41, true),
+        (0x5A, true),
+        (0x5B, false),
+        (0x5E, false),
+        (0x5F, true),
+        (0x60, false),
+        (0x61, true),
+        (0x7A, true),
+        (0x7B, false),
+    ] {
+        let c = char::from_u32(cp).unwrap();
+        assert_eq!(
+            word.accepts(c.to_string().as_bytes()),
+            want,
+            "\\w at U+{cp:04X}"
+        );
+    }
+    assert!(gbnf(r"root ::= [\w]+").accepts(b"a_9"));
+    assert!(!gbnf(r"root ::= [\w]+").accepts(b"a-9"));
+
+    // `\s` = ASCII whitespace, U+0009..U+000D plus the space.
+    let space = gbnf(r"root ::= [\s]");
+    for (cp, want) in [
+        (0x08u32, false),
+        (0x09, true),
+        (0x0B, true),
+        (0x0D, true),
+        (0x0E, false),
+        (0x1F, false),
+        (0x20, true),
+        (0x21, false),
+    ] {
+        let c = char::from_u32(cp).unwrap();
+        assert_eq!(
+            space.accepts(c.to_string().as_bytes()),
+            want,
+            "\\s at U+{cp:04X}"
+        );
+    }
+    assert!(gbnf(r"root ::= [\s]+").accepts(b" \t\r\n"));
+    assert!(!gbnf(r"root ::= [\s]+").accepts(b" a "));
+
+    // The shorthands compose with the rest of a class, including negation and a
+    // literal minus, and a shorthand does not swallow a following range.
+    assert!(gbnf(r"root ::= [^\d]").accepts(b"a"));
+    assert!(!gbnf(r"root ::= [^\d]").accepts(b"5"));
+    assert!(gbnf(r"root ::= [\d\-\w]+").accepts(b"a-1"));
+    assert!(gbnf(r"root ::= [\d-]+").accepts(b"1-2"));
+    assert!(!gbnf(r"root ::= [\d-]+").accepts(b"x"));
+
+    // The mask agrees with the language: the token for `5` is allowed by `[\d]`
+    // and the token for `a` is not.
+    let (pieces, _) = byte_vocab();
+    let g = gbnf(r"root ::= [\d]");
+    let mut st = g.state();
+    let mask = mask_of(&g, &mut st);
+    assert!(allowed(&mask, id_of(&pieces, b"5")));
+    assert!(!allowed(&mask, id_of(&pieces, b"a")));
 }
 
 #[test]
