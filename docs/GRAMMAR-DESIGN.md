@@ -40,6 +40,7 @@ JSON Schema (JSON) ────┘        (compiled once per request)           
 | rule references | `name` | undefined names are a compile error |
 | string literals | `"text"` | UTF-8; escapes `\" \\ \n \t \r \xNN \uNNNN` |
 | char classes | `[abc]`, `[a-z0-9]`, `[^"]` | codepoint ranges; `^` negates over all of Unicode |
+| class shorthands | `[\d]`, `[\w]`, `[\s]` | ECMA-262 sets over ASCII: `\d` = `[0-9]`, `\w` = `[0-9A-Za-z_]`, `\s` = space and U+0009..U+000D. **Inside a class only** — they are sets, so `"\d"` has no single character to mean |
 | any char | `.` | any single codepoint (newline included) |
 | grouping | `( ... )` | |
 | alternation | `a \| b \| c` | |
@@ -49,8 +50,13 @@ JSON Schema (JSON) ────┘        (compiled once per request)           
 
 **Refused loudly (parse error, with the offending token):**
 
-* an escape other than the list above — in particular `\d`, `\w`, `\s`, `\p{...}`
-  (llama.cpp does not support them either; write `[0-9]`, `[A-Za-z0-9_]`, …);
+* an escape other than the list above — in particular `\p{...}` (llama.cpp does
+  not support it either; write `[\p{...}]`'s intended ranges explicitly), and
+  `\d`/`\w`/`\s` **outside** a character class, where a set has no single
+  character to mean;
+* a class shorthand used as a range endpoint (`[\d-x]`): it would otherwise read
+  as the set plus a `-`..`x` range, accepting far more than was written (`[\d-]`
+  is still a literal minus, as everywhere else in a class);
 * `\x` with a malformed body, `\u` without exactly four hex digits;
 * an empty char class `[]`, an unterminated class/literal/group, a stray `)` or
   `|` with an empty operand, a trailing `::=` without a body;
@@ -367,6 +373,11 @@ lives), before the job occupies a worker slot.
   engine in GBNF; `minLength`/`maxLength` need counting rules).
 * **Left recursion** is detected at parse time and refused; right recursion
   (the `$ref` cycle shape JSON uses) works.
+* **The class shorthands `\d`/`\w`/`\s` are minfer's, not llama.cpp's.** The
+  reference rejects every shorthand (`parse_char` in `src/llama-grammar.cpp` has
+  no `d`/`w`/`s` case), so a grammar written for minfer may not compile there.
+  That is a deliberate divergence — the definitions are ECMA-262's over ASCII,
+  written down in §2 — and `\p{...}` stays refused on both sides.
 * **Per-request compile cost** is O(vocabulary) for the token pieces plus the
   grammar size, and the first-codepoint index (#126) adds one more O(vocabulary)
   pass at compile time; it is measured in the record and is the reason the mask
