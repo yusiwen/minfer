@@ -1796,7 +1796,6 @@ const GENERIC_RULES: &[(&str, &str)] = &[
 /// Keywords that change the accepted language but are not implemented: each one
 /// is a named refusal (design §3).
 const REFUSED_KEYWORDS: &[&str] = &[
-    "pattern",
     "contentEncoding",
     "contentMediaType",
     "multipleOf",
@@ -1822,7 +1821,7 @@ const REFUSED_KEYWORDS: &[&str] = &[
 /// Keywords that narrow `type: "string"` and are implemented only there. On any
 /// other type the constraint would be silently dropped, which this compiler
 /// refuses rather than ignores.
-const STRING_ONLY_KEYWORDS: &[&str] = &["format", "minLength", "maxLength"];
+const STRING_ONLY_KEYWORDS: &[&str] = &["format", "minLength", "maxLength", "pattern"];
 
 /// The three `format` bodies the reference also implements. `date` and `time`
 /// are `STRING_FORMAT_RULES` in llama.cpp's `json-schema-to-grammar.cpp`; the
@@ -2110,6 +2109,7 @@ impl JsonCompiler {
     /// `"\A"` would be. A surrogate pair written as two escapes counts as two.
     fn compile_string(&mut self, obj: &serde_json::Map<String, Value>) -> Result<String, String> {
         let format = obj.get("format");
+        let pattern = obj.get("pattern");
         let min = get_count(obj, "minLength")?;
         let max = get_count(obj, "maxLength")?;
         if let Some(hi) = max {
@@ -2121,12 +2121,23 @@ impl JsonCompiler {
                 ));
             }
         }
-        if format.is_some() && (min.is_some() || max.is_some()) {
-            return Err(
-                "json-schema: `format` combined with `minLength`/`maxLength` is not supported \
-                 (the two constraints would have to be intersected); keep one of them"
-                    .to_string(),
-            );
+        // Any two of these three would have to be intersected, which a GBNF
+        // alternation cannot express.
+        let given: Vec<&str> = [
+            ("pattern", pattern.is_some()),
+            ("format", format.is_some()),
+            ("minLength/maxLength", min.is_some() || max.is_some()),
+        ]
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+        if given.len() > 1 {
+            return Err(format!(
+                "json-schema: {} combined on one string is not supported (the constraints would \
+                 have to be intersected); keep one of them",
+                given.join(" + ")
+            ));
         }
         if let Some(f) = format {
             let name = f.as_str().ok_or_else(|| {
@@ -2136,6 +2147,15 @@ impl JsonCompiler {
                 )
             })?;
             return format_rule(name);
+        }
+        if let Some(p) = pattern {
+            let text = p.as_str().ok_or_else(|| {
+                format!(
+                    "json-schema: `pattern` must be a string, got {}",
+                    json_type_name(p)
+                )
+            })?;
+            return pattern_rule(text);
         }
         match (min.unwrap_or(0), max) {
             (0, None) => Ok("j-string".to_string()),
@@ -2545,6 +2565,683 @@ fn get_count(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u
             json_type_name(other)
         )),
     }
+}
+
+/// The GBNF for the empty string, used for an empty regex branch or group.
+const GBNF_EMPTY: &str = r#""""#;
+
+/// ECMA-262's `.`: one decoded character that is **not** a line terminator.
+///
+/// A pattern is matched against the *decoded* string, but the grammar runs over
+/// the JSON *text*, where a character may be spelled literally or as an escape.
+/// The plain branch is therefore a class over the text (which can never hold a
+/// raw control character), and the escape branch spells out exactly the four
+/// characters `.` must reject — `\n`, `\r`, `\u2028`, `\u2029` — as a
+/// four-hex-digit automaton. Anything looser would accept a string the schema
+/// rejects, which is the one thing this compiler never does.
+const GBNF_ANY_CHAR: &str = r#"[^"\\\u0000-\u001f] | "\\" (["\\/bft] | "u" ([13-9a-fA-F] [0-9a-fA-F]{3} | "2" [1-9a-fA-F] [0-9a-fA-F]{2} | "20" [013-9a-fA-F] [0-9a-fA-F] | "202" [0-7a-fA-F] | "0" [1-9a-fA-F] [0-9a-fA-F]{2} | "00" [1-9a-fA-F] [0-9a-fA-F] | "000" [0-9b-cB-Ce-fE-F]))"#;
+
+/// One positive shorthand a pattern may name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shorthand {
+    Digit,
+    Word,
+    Space,
+}
+
+impl Shorthand {
+    /// The ECMA-262 ASCII set.
+    fn ranges(self) -> &'static [(u32, u32)] {
+        match self {
+            Shorthand::Digit => &[(0x30, 0x39)],
+            Shorthand::Word => &[(0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A)],
+            Shorthand::Space => &[(0x09, 0x0D), (0x20, 0x20)],
+        }
+    }
+}
+
+/// A compiler for the subset of ECMA-262 `pattern` syntax
+/// `docs/GRAMMAR-DESIGN.md` §3 names. It emits GBNF text, which the GBNF parser
+/// then compiles — the same two-stage shape the rest of the JSON compiler uses.
+///
+/// Supported: literals (ASCII and non-ASCII), `.`, positive classes `[...]` over
+/// U+0000..=U+00FF with `\d`/`\w`/`\s`, `|`, `(...)`/`(?:...)`, the quantifiers
+/// `*` `+` `?` `{m}` `{m,}` `{m,n}` (with the lazy `?` suffix, which does not
+/// change the accepted language), and `^`/`$` at the very start/end. Everything
+/// else is a named refusal — never a widened language.
+struct RegexParser<'a> {
+    s: &'a [char],
+    i: usize,
+}
+
+impl<'a> RegexParser<'a> {
+    fn peek(&self) -> Option<char> {
+        self.s.get(self.i).copied()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.i += 1;
+        Some(c)
+    }
+
+    fn eat(&mut self, c: char) -> bool {
+        if self.peek() == Some(c) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn err(&self, what: impl std::fmt::Display) -> String {
+        format!("json-schema: pattern: {what} (at offset {})", self.i)
+    }
+
+    /// `alternation := sequence ('|' sequence)*`
+    fn alternation(&mut self, depth: usize) -> Result<String, String> {
+        let mut branches = vec![self.sequence(depth)?];
+        while self.eat('|') {
+            branches.push(self.sequence(depth)?);
+        }
+        if branches.len() == 1 {
+            Ok(branches.pop().unwrap())
+        } else {
+            Ok(format!("({})", branches.join(" | ")))
+        }
+    }
+
+    /// `sequence := term*`
+    fn sequence(&mut self, depth: usize) -> Result<String, String> {
+        let mut parts: Vec<String> = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some('|') | Some(')') => break,
+                Some('*') | Some('+') | Some('?') => {
+                    return Err(self.err("a quantifier with nothing to repeat"))
+                }
+                _ => {}
+            }
+            let atom = self.atom(depth)?;
+            parts.push(match self.quantifier()? {
+                Some(q) => format!("({atom}){q}"),
+                None => atom,
+            });
+        }
+        if parts.is_empty() {
+            Ok(GBNF_EMPTY.to_string())
+        } else {
+            Ok(parts.join(" "))
+        }
+    }
+
+    /// `atom := group | class | '.' | escape | literal`
+    ///
+    /// `^` and `$` never reach here as anchors: the caller strips a leading `^`
+    /// and a trailing `$`, so any that remain are misplaced.
+    fn atom(&mut self, depth: usize) -> Result<String, String> {
+        let c = self
+            .peek()
+            .ok_or_else(|| self.err("expected an expression"))?;
+        match c {
+            '(' => {
+                self.bump();
+                if self.eat('?') && !self.eat(':') {
+                    return Err(self.err(
+                        "only the non-capturing group `(?:...)` is supported (lookaround, named \
+                         groups, flags and atomic groups are not)",
+                    ));
+                }
+                let body = self.alternation(depth + 1)?;
+                if !self.eat(')') {
+                    return Err(self.err("unmatched `(`"));
+                }
+                Ok(format!("({body})"))
+            }
+            '[' => {
+                self.bump();
+                self.class()
+            }
+            '.' => {
+                self.bump();
+                Ok(format!("({GBNF_ANY_CHAR})"))
+            }
+            '^' | '$' => Err(self.err(
+                "an anchor is only supported as a leading `^` or a trailing `$` (an anchor \
+                 combined with a top-level `|` is not)",
+            )),
+            '*' | '+' | '?' => Err(self.err("a quantifier with nothing to repeat")),
+            ')' => Err(self.err("unmatched `)`")),
+            '\\' => {
+                self.bump();
+                self.escape()
+            }
+            other => {
+                self.bump();
+                char_expr(other)
+            }
+        }
+    }
+
+    /// `quantifier := ('*' | '+' | '?' | '{' m (',' n?)? '}') '?'?`
+    ///
+    /// A trailing `?` is the lazy form, which accepts exactly the same language
+    /// and is therefore free to accept; a trailing `+` is possessive and does
+    /// change the language, so it is refused.
+    fn quantifier(&mut self) -> Result<Option<String>, String> {
+        let q = match self.peek() {
+            Some('*') | Some('+') | Some('?') => self.bump().unwrap().to_string(),
+            Some('{') => {
+                self.bump();
+                let start = self.i;
+                let mut m = String::new();
+                while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+                    m.push(self.bump().unwrap());
+                }
+                if m.is_empty() {
+                    return Err(self.err("a `{` quantifier needs at least one digit"));
+                }
+                if self.eat('}') {
+                    format!("{{{m}}}")
+                } else if self.eat(',') {
+                    let mut n = String::new();
+                    while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+                        n.push(self.bump().unwrap());
+                    }
+                    if !self.eat('}') {
+                        self.i = start;
+                        return Err(self.err("unterminated `{...}` quantifier"));
+                    }
+                    if n.is_empty() {
+                        format!("{{{m},}}")
+                    } else {
+                        format!("{{{m},{n}}}")
+                    }
+                } else {
+                    self.i = start;
+                    return Err(self.err("a `{` quantifier needs `}`, or `,n}`"));
+                }
+            }
+            _ => return Ok(None),
+        };
+        if self.peek() == Some('?') {
+            self.bump();
+        } else if self.peek() == Some('+') {
+            return Err(self.err("a possessive quantifier (`*+`, `++`, `?+`) is not supported"));
+        }
+        Ok(Some(q))
+    }
+
+    /// One escape, after the backslash was consumed.
+    fn escape(&mut self) -> Result<String, String> {
+        let c = self
+            .bump()
+            .ok_or_else(|| self.err("a trailing backslash"))?;
+        let shorthand = match c {
+            'd' => Some(Shorthand::Digit),
+            'w' => Some(Shorthand::Word),
+            's' => Some(Shorthand::Space),
+            _ => None,
+        };
+        if let Some(sh) = shorthand {
+            return class_rule(sh.ranges());
+        }
+        match c {
+            'D' | 'W' | 'S' => {
+                return Err(self.err(format!(
+                    "the negated shorthand `\\{c}` is not supported yet (it is the complement \
+                     over the whole codepoint space; `\\d`, `\\w` and `\\s` are)"
+                )))
+            }
+            'b' | 'B' => {
+                return Err(self.err("a word-boundary assertion (`\\b`, `\\B`) is not supported"))
+            }
+            'p' | 'P' => {
+                return Err(
+                    self.err("a Unicode property escape (`\\p{...}`, `\\P{...}`) is not supported")
+                )
+            }
+            'k' => return Err(self.err("a named backreference (`\\k<...>`) is not supported")),
+            'c' => return Err(self.err("a control escape (`\\cX`) is not supported")),
+            '1'..='9' => return Err(self.err("a backreference (`\\1`..`\\9`) is not supported")),
+            '0' => {
+                if matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+                    return Err(self.err("an octal escape is not supported"));
+                }
+                return char_expr('\0');
+            }
+            'n' => return char_expr('\n'),
+            'r' => return char_expr('\r'),
+            't' => return char_expr('\t'),
+            'f' => return char_expr('\u{0C}'),
+            'v' => return char_expr('\u{0B}'),
+            'x' => return Ok(char_expr(self.hex_char(2)?)?),
+            'u' => {
+                if self.peek() == Some('{') {
+                    return Err(
+                        self.err("the `\\u{...}` escape is not supported (write `\\uXXXX`)")
+                    );
+                }
+                return Ok(char_expr(self.hex_char(4)?)?);
+            }
+            // An identity escape: any non-alphanumeric character stands for itself.
+            other if !other.is_ascii_alphanumeric() => return Ok(char_expr(other)?),
+            other => return Err(self.err(format!("unsupported escape `\\{other}`"))),
+        }
+    }
+
+    /// `n` hex digits as a character. A lone surrogate is not encodable, so it is
+    /// refused rather than silently dropped.
+    fn hex_char(&mut self, n: usize) -> Result<char, String> {
+        let mut value: u32 = 0;
+        for _ in 0..n {
+            let d = self
+                .peek()
+                .filter(char::is_ascii_hexdigit)
+                .ok_or_else(|| self.err(format!("`\\x`/`\\u` needs {n} hex digits")))?;
+            self.bump();
+            value = value * 16 + d.to_digit(16).unwrap();
+        }
+        char::from_u32(value).ok_or_else(|| {
+            self.err(format!(
+                "U+{value:04X} is a lone surrogate, which no JSON string can encode"
+            ))
+        })
+    }
+
+    /// A positive `[...]` class, with `[` already consumed.
+    fn class(&mut self) -> Result<String, String> {
+        if self.peek() == Some('^') {
+            return Err(self.err(
+                "a negated class `[^...]` is not supported yet (it needs the escape-aware \
+                 complement over the whole codepoint space; a positive class over \
+                 U+0000..=U+00FF is)",
+            ));
+        }
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        loop {
+            let c = self
+                .peek()
+                .ok_or_else(|| self.err("unterminated character class"))?;
+            if c == ']' {
+                self.bump();
+                break;
+            }
+            if let Some(lo) = self.class_member(&mut ranges)? {
+                self.maybe_range(lo, &mut ranges)?;
+            }
+        }
+        if ranges.is_empty() {
+            return Err(self.err("an empty character class `[]`"));
+        }
+        class_rule(&ranges)
+    }
+
+    /// One class member: a shorthand set (expanded into `ranges`), or a codepoint
+    /// that may start a range. A shorthand is a whole set, so it cannot be a
+    /// range endpoint — `[\d-x]` would otherwise read as the set plus a `-`..`x`
+    /// range.
+    fn class_member(&mut self, ranges: &mut Vec<(u32, u32)>) -> Result<Option<u32>, String> {
+        if self.peek() != Some('\\') {
+            return Ok(Some(self.class_char()?));
+        }
+        let save = self.i;
+        self.bump();
+        let shorthand = match self.peek() {
+            Some('d') => Some(Shorthand::Digit),
+            Some('w') => Some(Shorthand::Word),
+            Some('s') => Some(Shorthand::Space),
+            _ => None,
+        };
+        let Some(sh) = shorthand else {
+            self.i = save;
+            return Ok(Some(self.class_char()?));
+        };
+        self.bump();
+        if self.peek() == Some('-') && !matches!(self.s.get(self.i + 1).copied(), Some(']') | None)
+        {
+            return Err(self.err("a class shorthand cannot be a range endpoint"));
+        }
+        ranges.extend_from_slice(sh.ranges());
+        Ok(None)
+    }
+
+    /// One class member character (an escape or a literal), as a codepoint.
+    fn class_char(&mut self) -> Result<u32, String> {
+        match self.bump() {
+            None => Err(self.err("unterminated character class")),
+            Some('\\') => {
+                let c = self
+                    .bump()
+                    .ok_or_else(|| self.err("a trailing backslash"))?;
+                match c {
+                    'n' => Ok('\n' as u32),
+                    'r' => Ok('\r' as u32),
+                    't' => Ok('\t' as u32),
+                    'f' => Ok(0x0C),
+                    'v' => Ok(0x0B),
+                    'x' => Ok(self.hex_char(2)? as u32),
+                    'u' => Ok(self.hex_char(4)? as u32),
+                    'b' => Err(self.err("`\\b` inside a class is not supported")),
+                    'd' | 'w' | 's' => Err(self.err("a class shorthand is not a single character")),
+                    'D' | 'W' | 'S' => Err(self.err(format!(
+                        "the negated shorthand `\\{c}` is not supported yet"
+                    ))),
+                    '1'..='9' => Err(self.err("a backreference is not supported")),
+                    other if !other.is_ascii_alphanumeric() => Ok(other as u32),
+                    other => Err(self.err(format!("unsupported escape `\\{other}` in a class"))),
+                }
+            }
+            Some(c) => Ok(c as u32),
+        }
+    }
+
+    /// Extend `lo` into `hi` when a `-` follows, else push it as a single member.
+    fn maybe_range(&mut self, lo: u32, ranges: &mut Vec<(u32, u32)>) -> Result<(), String> {
+        if self.peek() == Some('-') && !matches!(self.s.get(self.i + 1).copied(), Some(']') | None)
+        {
+            self.bump();
+            let hi = self.class_char()?;
+            if hi < lo {
+                return Err(self.err(format!(
+                    "the character class range U+{lo:04X}-U+{hi:04X} is reversed"
+                )));
+            }
+            ranges.push((lo, hi));
+        } else {
+            ranges.push((lo, lo));
+        }
+        Ok(())
+    }
+}
+
+/// One decoded character as a GBNF expression, escape-aware: the literal spelling
+/// plus every escape spelling that decodes to it. Up to U+00FF that is
+/// [`class_rule`]; above it the
+/// JSON text has exactly two spellings (the character itself, and `\uXXXX` or a
+/// surrogate pair).
+fn char_expr(c: char) -> Result<String, String> {
+    let cp = c as u32;
+    if cp <= 0xFF {
+        return class_rule(&[(cp, cp)]);
+    }
+    Ok(format!(
+        "({} | {})",
+        gbnf_string(&c.to_string()),
+        gbnf_u_escape(cp)
+    ))
+}
+
+/// The `\uXXXX` spelling of a codepoint as GBNF: each digit is a class so either
+/// hex case matches, and a non-BMP codepoint becomes its surrogate pair.
+fn gbnf_u_escape(cp: u32) -> String {
+    let digits = |value: u32| -> String {
+        let mut out = String::from(r#""\\u""#);
+        for shift in [12u32, 8, 4, 0] {
+            let nibble = (value >> shift) & 0xF;
+            let c = char::from_digit(nibble, 16).expect("a nibble is a hex digit");
+            if nibble >= 10 {
+                out.push_str(&format!(" [{c}{}]", c.to_ascii_uppercase()));
+            } else {
+                out.push_str(&format!(" [{c}]"));
+            }
+        }
+        out
+    };
+    if cp <= 0xFFFF {
+        return digits(cp);
+    }
+    let v = cp - 0x10000;
+    format!(
+        "{} {}",
+        digits(0xD800 + (v >> 10)),
+        digits(0xDC00 + (v & 0x3FF))
+    )
+}
+
+/// A GBNF string literal for `text`.
+fn gbnf_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One codepoint as a GBNF class member, for a class over the *text*.
+fn gbnf_class_char(cp: u32) -> Result<String, String> {
+    let c = char::from_u32(cp).ok_or_else(|| {
+        format!("json-schema: pattern: U+{cp:04X} is a lone surrogate and cannot appear in a class")
+    })?;
+    Ok(match c {
+        '\\' | ']' | '-' | '^' | '[' => format!("\\{c}"),
+        c if (c as u32) < 0x20 || c as u32 == 0x7F => format!("\\u{:04X}", c as u32),
+        c => c.to_string(),
+    })
+}
+
+/// A GBNF expression matching **one decoded character** from `ranges`.
+///
+/// The text may spell that character literally or as an escape, so both spellings
+/// are accepted: the literal branch is a class over the text (minus `"` and `\`,
+/// which JSON forbids raw), and the escape branch is the short escapes plus the
+/// `\uXXXX` form for every value in the set. Only U+0000..=U+00FF is supported;
+/// a wider class needs the general four-digit automaton (§8).
+fn class_rule(ranges: &[(u32, u32)]) -> Result<String, String> {
+    if let Some(&(_, hi)) = ranges.iter().find(|&&(_, hi)| hi > 0xFF) {
+        return Err(format!(
+            "json-schema: pattern: a class member above U+00FF (U+{hi:04X}) is not supported yet \
+             — it needs the general four-hex-digit automaton, and matching the literal bytes \
+             would accept what the schema rejects (docs/GRAMMAR-DESIGN.md §3)"
+        ));
+    }
+    let set = merge_ranges(ranges.to_vec());
+    let mut alts: Vec<String> = Vec::new();
+    let plain = set_subtract(&set, &[(0x00, 0x1F), (0x22, 0x22), (0x5C, 0x5C)]);
+    if !plain.is_empty() {
+        let body: String = plain
+            .iter()
+            .map(|&(a, b)| {
+                let lo = gbnf_class_char(a).expect("ASCII is never a surrogate");
+                if a == b {
+                    lo
+                } else {
+                    format!(
+                        "{lo}-{}",
+                        gbnf_class_char(b).expect("ASCII is never a surrogate")
+                    )
+                }
+            })
+            .collect();
+        alts.push(format!("[{body}]"));
+    }
+    let mut escapes: Vec<String> = Vec::new();
+    for (value, spelling) in [
+        (0x22u32, r#""\\\"""#),
+        (0x5C, r#""\\\\""#),
+        (0x2F, r#""\\/""#),
+        (0x08, r#""\\b""#),
+        (0x0C, r#""\\f""#),
+        (0x0A, r#""\\n""#),
+        (0x0D, r#""\\r""#),
+        (0x09, r#""\\t""#),
+    ] {
+        if set_contains(&set, value) {
+            escapes.push(spelling.to_string());
+        }
+    }
+    // `\uXXXX` for a value below U+0100 always has the `00` prefix. Each entry
+    // is a *whole* escape spelling, introducer included, so the group is joined
+    // without another one.
+    escapes.push(format!(r#""\\u" "00" {}"#, hex_pairs(&set)));
+    alts.push(format!("({})", escapes.join(" | ")));
+    Ok(format!("({})", alts.join(" | ")))
+}
+
+/// A GBNF class of hex-digit characters for the nibble values in `values`.
+fn hex_class(values: &[u32]) -> String {
+    if values.len() == 16 {
+        return "[0-9a-fA-F]".to_string();
+    }
+    let mut body = String::new();
+    for &v in values {
+        let c = char::from_digit(v, 16).expect("a nibble is a hex digit");
+        body.push(c);
+        if v >= 10 {
+            body.push(c.to_ascii_uppercase());
+        }
+    }
+    format!("[{body}]")
+}
+
+/// Two hex digits whose value (0..=255) is in `set`, as a GBNF expression.
+fn hex_pairs(set: &[(u32, u32)]) -> String {
+    let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
+    for hi in 0u32..16 {
+        let lo: Vec<u32> = (0..16)
+            .filter(|&l| set_contains(set, hi * 16 + l))
+            .collect();
+        if lo.is_empty() {
+            continue;
+        }
+        let expr = hex_class(&lo);
+        match groups.iter_mut().find(|(e, _)| *e == expr) {
+            Some((_, his)) => his.push(hi),
+            None => groups.push((expr, vec![hi])),
+        }
+    }
+    let alts: Vec<String> = groups
+        .into_iter()
+        .map(|(lo, hi)| format!("{} {lo}", hex_class(&hi)))
+        .collect();
+    format!("({})", alts.join(" | "))
+}
+
+/// Is `value` covered by the ascending, disjoint `ranges`?
+fn set_contains(ranges: &[(u32, u32)], value: u32) -> bool {
+    let i = ranges.partition_point(|&(a, _)| a <= value);
+    i > 0 && ranges[i - 1].1 >= value
+}
+
+/// `ranges` minus `holes`, both ascending and disjoint.
+fn set_subtract(ranges: &[(u32, u32)], holes: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for &(a, b) in ranges {
+        let mut cursor = a;
+        for &(hlo, hhi) in holes {
+            if hhi < cursor {
+                continue;
+            }
+            if hlo > b {
+                break;
+            }
+            if hlo > cursor {
+                out.push((cursor, hlo - 1));
+            }
+            if hhi >= b {
+                cursor = b + 1;
+                break;
+            }
+            cursor = hhi + 1;
+        }
+        if cursor <= b {
+            out.push((cursor, b));
+        }
+    }
+    out
+}
+
+/// Compile a `pattern` into the GBNF for a JSON string whose content matches it.
+///
+/// Following ECMA-262, the pattern matches a **substring** unless it is anchored:
+/// `^` at the very start and `$` at the very end turn it into a whole-string
+/// match. Both anchors are optional and independent. The reference instead
+/// requires both and widens to "any string" with a warning when they are absent —
+/// a silent superset this compiler never produces (§8).
+fn pattern_rule(pattern: &str) -> Result<String, String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    // A top-level `|` makes a leading/trailing anchor apply to one branch only,
+    // which this emitter cannot express; refuse rather than widen.
+    let top_level_alternation = has_top_level_alternation(&chars);
+    let mut start = 0usize;
+    let mut end = chars.len();
+    let mut anchored_start = false;
+    let mut anchored_end = false;
+    if !top_level_alternation {
+        if chars.first() == Some(&'^') {
+            anchored_start = true;
+            start = 1;
+        }
+        if end > start && chars[end - 1] == '$' && !is_escaped(&chars, end - 1) {
+            anchored_end = true;
+            end -= 1;
+        }
+    }
+    let mut parser = RegexParser {
+        s: &chars[start..end],
+        i: 0,
+    };
+    let body = parser.alternation(0)?;
+    if parser.i != parser.s.len() {
+        return Err(parser.err(if parser.peek() == Some(')') {
+            "unmatched `)`"
+        } else {
+            "unexpected trailing input"
+        }));
+    }
+    let expr = match (anchored_start, anchored_end) {
+        (true, true) => body,
+        (true, false) => format!("({body}) j-char*"),
+        (false, true) => format!("j-char* ({body})"),
+        (false, false) => {
+            if body == GBNF_EMPTY {
+                // An empty pattern matches every string.
+                return Ok("j-string".to_string());
+            }
+            format!("j-char* ({body}) j-char*")
+        }
+    };
+    Ok(format!(r#""\"" {expr} "\"""#))
+}
+
+/// Is there a `|` outside every group, class and escape?
+fn has_top_level_alternation(chars: &[char]) -> bool {
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    let mut in_class = false;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => depth += 1,
+            ')' if !in_class => depth = depth.saturating_sub(1),
+            '|' if !in_class && depth == 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Is the character at `at` escaped by an odd number of backslashes?
+fn is_escaped(chars: &[char], at: usize) -> bool {
+    let mut backslashes = 0usize;
+    let mut i = at;
+    while i > 0 && chars[i - 1] == '\\' {
+        backslashes += 1;
+        i -= 1;
+    }
+    backslashes % 2 == 1
 }
 
 /// The quoted GBNF for one supported `format`, or a refusal that names it.
