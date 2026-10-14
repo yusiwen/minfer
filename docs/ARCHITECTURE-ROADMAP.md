@@ -606,7 +606,7 @@ shortcut; CLI `--grammar`/`--json-schema`, server `response_format`
 (`json_object` / `json_schema`) plus a `grammar` field. Design and the exact
 accepted subset: `docs/GRAMMAR-DESIGN.md`. What it deliberately does not do
 (and refuses loudly rather than guessing): `format` outside the four validators,
-`multipleOf`, real-valued numeric bounds, object property permutations,
+`multipleOf`, real-valued numeric bounds, a canonical object property order,
 backreferences and lookaround inside a regex `pattern`, and a
 device-side mask — the mask is host work before any backend runs. Three slices of
 [#125](https://github.com/yusiwen/minfer/issues/125) landed on 2026-10-14: the

@@ -921,6 +921,34 @@ fn json_schema_all_of_refusals_are_named() {
     }
 }
 
+/// Pins the order `docs/GRAMMAR-DESIGN.md` §2 records: the keys reach the compiler
+/// in `serde_json`'s map order, which is **alphabetical** while `preserve_order` is
+/// off (it is). The schema below declares `name` before `age`, and the compiled
+/// language accepts `age` first — so a change that imposes a canonical order (or
+/// enables `preserve_order`) has to update the record, not just the code.
+#[test]
+fn json_object_properties_compile_in_the_order_the_compiler_sees() {
+    let g = schema(json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "age": {"type": "integer"}
+        },
+        "required": ["name", "age"],
+        "additionalProperties": false
+    }));
+    assert!(
+        g.accepts(br#"{"age":7,"name":"x"}"#),
+        "the map order is alphabetical, so `age` comes first\ngrammar:\n{}",
+        g.source()
+    );
+    assert!(
+        !g.accepts(br#"{"name":"x","age":7}"#),
+        "the declared order is not the compiled order\ngrammar:\n{}",
+        g.source()
+    );
+}
+
 #[test]
 fn json_schema_refusals_are_named() {
     let cases: &[(Value, &str)] = &[
