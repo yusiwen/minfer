@@ -277,23 +277,73 @@ fn real_model_json_schema_generation_parses() {
     );
     // The mask's own cost on the real vocabulary: drive the emitted text
     // token by token and time `mask` at each step (state-cached, so a
-    // repeated state is a hash lookup).
+    // repeated state is a hash lookup). The pieces walked per new state is the
+    // work the first-codepoint index (#126) does, which does not depend on how
+    // fast the box is.
     let ids = tok.encode(&text);
     let mut st = grammar.state();
-    let t2 = std::time::Instant::now();
+    let mut new_states = 0usize;
+    let mut walked_min = usize::MAX;
+    let mut walked_max = 0usize;
+    let mut walked_total = 0usize;
+    let mut narrowest = (usize::MAX, std::time::Duration::ZERO);
+    let mut widest = (0usize, std::time::Duration::ZERO);
+    let mut walked_each: Vec<usize> = Vec::new();
+    let mut mask_total = std::time::Duration::ZERO;
     for id in &ids {
-        let _ = grammar.mask(&mut st).expect("mask");
+        let cached_before = st.cached_states();
+        let t_step = std::time::Instant::now();
+        let indexed = grammar.mask(&mut st).expect("mask");
+        let elapsed = t_step.elapsed();
+        mask_total += elapsed;
+        // The indexed mask must equal the whole-vocabulary walk on the *real*
+        // 151,936-token vocabulary, state by state — the synthetic-vocabulary
+        // gate in `grammar::tests` cannot see a token class that only a real
+        // vocabulary has.
+        assert_eq!(
+            indexed.as_ref(),
+            grammar.mask_whole_for_tests(&st).as_ref(),
+            "the indexed mask differs from the whole walk on the real vocabulary"
+        );
+        if st.cached_states() > cached_before {
+            new_states += 1;
+            let walked = st.pieces_walked();
+            walked_min = walked_min.min(walked);
+            walked_max = walked_max.max(walked);
+            walked_total += walked;
+            walked_each.push(walked);
+            if walked < narrowest.0 {
+                narrowest = (walked, elapsed);
+            }
+            if walked > widest.0 {
+                widest = (walked, elapsed);
+            }
+        }
         grammar.accept_token(&mut st, *id).expect("accept");
     }
-    let mask_total = t2.elapsed();
     eprintln!(
-        "[f2] mask: {} step(s) over {}-token vocab in {:?} ({:?}/step), cached states {}",
+        "[f2] mask: {} step(s) over {}-token vocab in {:?} ({:?}/step, {:?}/new state), \
+         cached states {}, pieces walked per new state {}-{} (mean {} of {})",
         ids.len(),
         grammar.n_vocab(),
         mask_total,
         mask_total / ids.len().max(1) as u32,
-        st.cached_states()
+        mask_total / new_states.max(1) as u32,
+        st.cached_states(),
+        if walked_min == usize::MAX {
+            0
+        } else {
+            walked_min
+        },
+        walked_max,
+        walked_total / new_states.max(1),
+        grammar.n_vocab(),
     );
+    eprintln!(
+        "[f2] mask per new state: narrowest {} piece(s) in {:?}, widest {} piece(s) in {:?}",
+        narrowest.0, narrowest.1, widest.0, widest.1
+    );
+    eprintln!("[f2] mask work per new state, in visit order: {walked_each:?}");
     eprintln!(
         "[f2] same prompt unconstrained: {:.2}s ({}) -> {plain_text:.60?}",
         plain_elapsed.as_secs_f64(),

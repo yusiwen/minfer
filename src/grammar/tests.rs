@@ -799,3 +799,210 @@ impl GrammarState {
         self.inner.partial.len()
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// #126: the first-codepoint index.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The whole-vocabulary walk for one state, plus the number of pieces it
+/// examined. It is the production path for a wide frontier (`Grammar::plan`)
+/// and the reference the indexed walk has to reproduce.
+fn whole_walk(g: &Grammar, key: &StateKey, accepting: bool) -> (Arc<[u64]>, usize) {
+    g.mask_whole(key, accepting).expect("mask")
+}
+
+/// Drive `text` one byte at a time and compare the indexed mask against the
+/// whole-vocabulary walk at **every** state, asserting both the bitset and the
+/// work done. Returns how many states took the indexed path (walked fewer pieces
+/// than the whole walk did).
+///
+/// The comparison is available because `inner` is private to the parent module:
+/// both arms are evaluated on the *same* state rather than on two runs that only
+/// a bug could keep in step (GATE-CONTRACT §1 — this is the fast arm; the
+/// independent value arms are the two `..._exactly_...` tests below).
+fn index_matches_whole_at_every_step(g: &Grammar, text: &str) -> usize {
+    let (pieces, _) = byte_vocab();
+    let mut st = g.state();
+    let mut indexed_states = 0usize;
+    for (step, byte) in text.bytes().enumerate() {
+        let key = st.inner.clone();
+        let accepting = st.is_accepting();
+        let indexed = g.mask(&mut st).expect("mask");
+        let (whole, whole_walked) = whole_walk(g, &key, accepting);
+        assert_eq!(
+            indexed.as_ref(),
+            whole.as_ref(),
+            "step {step}: the indexed mask differs from the whole walk"
+        );
+        assert!(
+            st.pieces_walked() <= whole_walked,
+            "step {step}: the index walked {} pieces, the whole walk {whole_walked}",
+            st.pieces_walked()
+        );
+        if st.pieces_walked() < whole_walked {
+            indexed_states += 1;
+        }
+        let id = id_of(&pieces, &[byte]);
+        g.accept_token(&mut st, id)
+            .unwrap_or_else(|e| panic!("step {step}: {e}"));
+    }
+    indexed_states
+}
+
+/// Every taxonomy of frontier, and the answer `plan` must give for each:
+/// literals, a positive class and a repetition take the indexed path; a negated
+/// class and `.` accept nearly every codepoint and keep the whole walk. A
+/// multi-byte literal is driven **byte by byte**, so the carried-partial state
+/// (which must also keep the whole walk) is visited.
+#[test]
+fn the_indexed_mask_is_bitwise_equal_to_the_whole_vocabulary_walk() {
+    let indexed_grammars = [
+        (r#"root ::= "hello""#, "hello"),
+        (r#"root ::= [a-c]+ "!""#, "abc!"),
+        (r#"root ::= "中""#, "\u{4e2d}"),
+        (r#"root ::= "中" "中""#, "\u{4e2d}\u{4e2d}"),
+        // A positive class wider than the bucket count: this frontier takes the
+        // range-scan arm of `mask_buckets`, the only arm that reads
+        // `Accepted::contains`. Its last codepoint (U+4E2D) is a real bucket in
+        // this vocabulary, which is what the mutation record for #126 uses to
+        // show the arm catches an off-by-one in the range test.
+        (r"root ::= [\u0020-\u007f\u4e00-\u4e2d]+", "a\u{4e2d}"),
+    ];
+    for (source, text) in indexed_grammars {
+        let steps = text.len();
+        let indexed = index_matches_whole_at_every_step(&gbnf(source), text);
+        assert!(
+            indexed > 0,
+            "`{source}` must exercise the indexed path ({steps} step(s))"
+        );
+    }
+
+    // The control arm (GATE-CONTRACT §2): these frontiers accept nearly every
+    // codepoint, so the index cannot differ from the whole walk — it must not
+    // even be attempted.
+    let whole_grammars = [(r"root ::= [^x]*", "hi"), ("root ::= . . .", "abc")];
+    for (source, text) in whole_grammars {
+        assert_eq!(
+            index_matches_whole_at_every_step(&gbnf(source), text),
+            0,
+            "`{source}` accepts nearly every codepoint and must keep the whole walk"
+        );
+    }
+
+    // A JSON schema: structural states are narrow, string bodies are not. The
+    // required members come out in `serde_json`'s map order — `age` before
+    // `name` — because a `Map` is a `BTreeMap` unless `preserve_order` is on.
+    let object = json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "age": {"type": "integer", "minimum": 0, "maximum": 150}
+        },
+        "required": ["name", "age"],
+        "additionalProperties": false
+    });
+    assert!(
+        index_matches_whole_at_every_step(&schema(object), r#"{"age":7,"name":"Bob"}"#) > 0,
+        "a JSON object's structural states must take the indexed path"
+    );
+    let array = json!({
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 2
+    });
+    assert!(
+        index_matches_whole_at_every_step(&schema(array), r#"["a","b"]"#) > 0,
+        "a JSON array's structural states must take the indexed path"
+    );
+}
+
+/// The value arm for the indexed path, computed from the language rather than
+/// from either walk: at the start of `root ::= "ab"` the only pieces that can be
+/// consumed are a **non-empty prefix** of `ab` that is itself in the
+/// vocabulary — the byte `a` and the piece `ab`. A token that starts with `a`
+/// and overshoots (`abc`, `ac`) is out, and so is everything else in the
+/// synthetic vocabulary (including a lone `b`, which is a valid piece but not a
+/// legal start).
+#[test]
+fn a_narrow_frontier_allows_exactly_the_pieces_that_can_begin_it() {
+    let (pieces, _) = byte_vocab();
+    let g = gbnf(r#"root ::= "ab""#);
+    let mut st = g.state();
+    let mask = mask_of(&g, &mut st);
+    let mut want = vec![id_of(&pieces, b"a"), id_of(&pieces, b"ab")];
+    let mut got: Vec<u32> = (0..g.n_vocab() as u32)
+        .filter(|&id| allowed(&mask, id))
+        .collect();
+    got.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "the allowed set must be exactly the prefixes of `ab`"
+    );
+}
+
+/// The value arm for the bucket a first-codepoint index cannot describe: a piece
+/// that is an **incomplete** UTF-8 sequence. `root ::= "\u4e40"` can complete the
+/// single byte `0xE4` to U+4E40, so it must be allowed; `[0xE4, 0xB8]` completes
+/// only to U+4E00..=U+4E3F, which does not contain U+4E40, so it must not be —
+/// and neither may any piece start with a byte that cannot lead there.
+#[test]
+fn a_narrow_frontier_allows_a_leading_partial_utf8_piece_it_can_complete() {
+    let (pieces, _) = byte_vocab();
+    let g = gbnf("root ::= \"\u{4e40}\"");
+    let mut st = g.state();
+    let mask = mask_of(&g, &mut st);
+    let want = vec![id_of(&pieces, &[0xE4])];
+    let mut got: Vec<u32> = (0..g.n_vocab() as u32)
+        .filter(|&id| allowed(&mask, id))
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got, want,
+        "only the byte 0xE4 can start U+4E40 in this vocabulary"
+    );
+    // The prefix that cannot complete to U+4E40 is the control (GATE-CONTRACT §2):
+    // it is a valid incomplete sequence, so only the frontier's exact range can
+    // refuse it.
+    assert!(!got.contains(&id_of(&pieces, &[0xE4, 0xB8])));
+}
+
+/// #126's work bound (GATE-CONTRACT §4): the win is asserted as **work** — the
+/// number of pieces the mask examines — never as a clock. A narrow frontier must
+/// walk a small fraction of the vocabulary, and a `.` frontier must walk all of
+/// it, which is the honest ceiling of the index.
+#[test]
+fn the_index_walks_only_the_pieces_a_narrow_frontier_can_begin() {
+    let (pieces, _) = byte_vocab();
+    let n = pieces.len();
+
+    // At the start of `root ::= "{" [a-z]* "}"` the frontier accepts exactly the
+    // codepoint `{`, so only its bucket (a handful of pieces) plus the pieces
+    // with no first codepoint are walked.
+    let g = gbnf(r#"root ::= "{" [a-z]* "}""#);
+    let mut st = g.state();
+    let _ = mask_of(&g, &mut st);
+    let narrow = st.pieces_walked();
+    assert!(
+        narrow * 2 < n,
+        "a one-codepoint frontier walked {narrow} of {n} pieces"
+    );
+
+    // The control: `.` accepts every codepoint, so no filter can pay and the
+    // whole vocabulary is the answer.
+    let g = gbnf("root ::= .");
+    let mut st = g.state();
+    let _ = mask_of(&g, &mut st);
+    let (_, whole_walked) = whole_walk(&g, &st.inner.clone(), st.is_accepting());
+    assert_eq!(
+        st.pieces_walked(),
+        whole_walked,
+        "a `.` frontier must walk exactly what the whole walk walks"
+    );
+    assert_eq!(
+        whole_walked,
+        n - 2 - 1,
+        "{n} pieces minus the two EOG ids and the empty piece"
+    );
+}

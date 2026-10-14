@@ -94,8 +94,10 @@ language.
   allowed" stops with a printed reason instead of emitting an arbitrary token.
 - Surfaces: CLI `--grammar`/`--grammar-str`/`--json-schema`/`--json-schema-str`; the server's
   `response_format` (`json_object` / `json_schema`) and a `grammar` extension field. The mask is
-  cached per automaton state and computed with a DFA-style transition memo (measured 5.4 ms per
-  new state on a 151,936-token vocabulary).
+  cached per automaton state, computed with a DFA-style transition memo, and filtered by a
+  first-codepoint token index whenever the automaton's frontier is narrow (measured 2026-10-14:
+  49.5 ms for the 13 new states of a JSON response on a 151,936-token vocabulary, down from
+  90.4 ms; a JSON string body still walks every token).
 
 ### Performance benchmark (`bench`)
 

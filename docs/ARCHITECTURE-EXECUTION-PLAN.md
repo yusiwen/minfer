@@ -7356,7 +7356,7 @@ Can run in parallel with A–E by a different workstream.
 | ID | Item | Title | Effort | Box needed |
 |---|---|---|---|---|
 | F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) — **dots landed 2026-10-08 on an x86 host** (bitwise gates; AVX-512/VNNI selected at runtime), **weight repacking is the remaining increment** | L | x86 |
-| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost) | M | dgxspark |
+| F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost — **DONE 2026-10-14**) | M | dgxspark |
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | dgxspark |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
@@ -7549,6 +7549,11 @@ Q8_0 (f16 KV), schema `{name: string, age: integer 0..150}`:
 | mask cost per **new state** (151,936-token vocab) | 5.4 ms (16 states, 86 ms) | 5.4 ms |
 | bitwise no-grammar path | pinned 64-token sequence, `test_default_pipeline_matches_the_pinned_pre_f2_sequence` | same |
 
+> The mask-cost row is F2's own measurement of 2026-09-24.
+> [#126](https://github.com/yusiwen/minfer/issues/126) superseded it on
+> 2026-10-14 — 49.5 ms for the same response, 28 % of the vocabulary walked on
+> average — and that record is below, after this section's honest scope.
+
 The two defects the gates found are recorded in `GRAMMAR-DESIGN.md` §9: a
 partial-UTF-8 token accepted where the automaton could never finish it (found by
 the real-model parse gate, reproduced over HTTP as `"a\uFFFD"` for
@@ -7564,7 +7569,9 @@ required property is pending); `oneOf` is compiled as `anyOf`; only
 integer-valued numeric bounds are compiled (`number` + bounds is refused);
 `pattern`/`minLength`/`maxLength` and `multipleOf` are refused. The mask is
 O(vocabulary) per new state — 5.4 ms on a 151k vocabulary, cached per state — so
-a long constrained generation still pays it once per unseen state. All
+a long constrained generation still pays it once per unseen state (**narrowed by
+[#126](https://github.com/yusiwen/minfer/issues/126) on 2026-10-14: the record is
+below**). All
 acceptance is CPU-only: CUDA/Metal are not touched by this ticket (the mask is
 host-side, before any device work), so the CUDA `build-linux-cuda` job compiles
 the change but no device run exercises it. Two follow-up issues carry what was
@@ -7573,7 +7580,57 @@ GBNF/JSON-Schema constructs the compiler refuses: `pattern`/`minLength`/
 `maxLength`, real-valued numeric bounds and `multipleOf`, property permutations,
 an exact `oneOf`, `allOf`/`not`, `\d`/`\w`/`\p{...}`) and
 [#126](https://github.com/yusiwen/minfer/issues/126) (index the vocabulary by
-first codepoint to cut the residual mask cost).
+first codepoint to cut the residual mask cost — **DONE 2026-10-14**, below).
+
+### F2 follow-up — the first-codepoint token index ([#126](https://github.com/yusiwen/minfer/issues/126)) — **DONE 2026-10-14**
+
+**What landed.** `Grammar` indexes its token ids by the first codepoint of their
+piece once, at compile time, and `Grammar::plan` picks per state between the
+whole-vocabulary walk and the accepted buckets. A frontier that is a `.` or a
+negated class, or whose accepted set is at least as wide as the vocabulary, keeps
+the whole walk; a piece whose leading bytes are an incomplete UTF-8 sequence is
+always walked; a piece starting with an invalid byte, or an empty piece, is never
+indexed. The bitset is unchanged by construction, and that is asserted, not
+assumed.
+
+**Measured (dgxspark, aarch64, 2026-10-14).** Command: `cargo test --release --bin
+minfer real_model_json_schema_generation_parses -- --ignored --nocapture`, median
+of three, Qwen2.5-0.5B-Instruct q4_0 (151,936-token vocabulary), schema
+`{name: string, age: integer 0..150}`:
+
+| | before (`a133140`) | after |
+|---|---|---|
+| mask over a 17-step response (13 new states) | **90.4 ms** (5.32 ms/step) | **49.5 ms** (2.91 ms/step) |
+| pieces walked per new state | 151,935 at every state | 42,329 mean (28 %), 1,049 narrowest (0.7 %) |
+| narrowest structural state | whole walk | 1,049 pieces in 0.15 ms |
+| a JSON string body (wild frontier) | 33.7 ms | 33.7 ms — unchanged, by design |
+
+**Bars, named before measuring.** (1) the indexed mask is bitwise equal to the
+whole-vocabulary walk on both vocabularies; (2) the mean pieces walked per new
+state is at most 30 % of the vocabulary; (3) the total mask cost falls by at least
+25 % against the 90.4 ms baseline. The run above met all three (27.9 % and 45 %).
+
+**Gates and mutations.** Bitwise comparison on the synthetic vocabulary
+(`grammar::tests::the_indexed_mask_is_bitwise_equal_to_the_whole_vocabulary_walk`),
+two exact-set value arms computed from the language rather than from either walk,
+a work bound (`the_index_walks_only_the_pieces_a_narrow_frontier_can_begin`), and
+the same bitwise comparison on the real 151,936-token vocabulary inside
+`real_model_json_schema_generation_parses`. Seven mutations were run and each made
+a gate fail: the range test made exclusive, a carried partial sequence routed to
+the buckets, the headless bucket dropped, a negated class treated as empty, the
+frontier always declared wide, an incomplete UTF-8 piece not indexed, and the EOG
+bits dropped from the indexed path. The first run of that script reported a false
+"restore failed": restoring a snapshot with `shutil.copy2` restores the *original
+mtime*, so cargo reused the binary that still held the mutation and reported the
+mutation's own failure. A restored tree that is not rebuilt is not evidence.
+
+**Honest scope.** The wild frontier is untouched: a state inside a JSON string body
+accepts nearly every codepoint, so `plan` keeps the whole walk and that one state
+is 33.7 ms of the 49.5 ms. The index costs one extra O(vocabulary) pass per
+compiled `Grammar` — the same order as the token-piece build `compile_source`
+already does per request — and that compile cost is not measured separately. The
+mask is host-side, so no device run exercises the change: `build-linux-cuda` and
+`build-macos` compile it and the CPU jobs test it.
 
 ### F7 — Chat-template fidelity and tokenizer generality (#50) — **DONE 2026-09-24**
 
