@@ -94,6 +94,7 @@ rules and compiled once, on demand.
 | `number` | the general JSON number grammar (`-?int(.frac)?([eE]exp)?`) when unbounded |
 | `boolean`, `null` | `true` / `false` / `null` |
 | `anyOf`, `oneOf` | union of the branches |
+| `allOf` | the **intersection** of the branches, compiled by merging them: only object schemas, only `properties`/`required`/`additionalProperties`, the union of the declared properties restricted to what every closed branch allows, the union of `required`, and `additionalProperties: false` as soon as one branch closes. Anything that would need a real intersection — the same property declared twice with different schemas, two different open `additionalProperties` schemas, a `required` name a closed branch forbids, a non-object branch — is refused by name |
 | `$defs` / `definitions`, `$ref` | `#/$defs/NAME` and `#/definitions/NAME` only; recursive references work because the rule is registered before it is compiled |
 | `$schema`, `title`, `description`, `name`, `strict`, `default`, `examples` | accepted and ignored (they do not change the accepted language) |
 
@@ -124,8 +125,13 @@ rules and compiled once, on demand.
 * `minProperties`, `maxProperties`, `propertyNames`, `patternProperties`,
   `dependentRequired`, `dependentSchemas`;
 * `uniqueItems`, `contains`, `minContains`, `maxContains` on arrays;
-* `allOf`, `not`, `if`/`then`/`else`, `unevaluatedProperties`,
-  `unevaluatedItems`;
+* an `allOf` outside the merge subset above: a branch that is not an object
+  schema, a branch keyword other than `properties`/`required`/
+  `additionalProperties`, two branches that declare one property differently, two
+  branches that disagree on an open `additionalProperties`, a sibling constraint
+  next to `allOf`, an `allOf` with no branches, or a `$ref` chain that does not
+  resolve;
+* `not`, `if`/`then`/`else`, `unevaluatedProperties`, `unevaluatedItems`;
 * an unknown keyword that changes the accepted language is *not* silently
   dropped: the compiler walks the schema and refuses any key outside the list
   above except the pure annotations;
@@ -385,6 +391,12 @@ lives), before the job occupies a worker slot.
 * **Object property order** is declaration order (subset of the schema's
   language), not the permutation set llama.cpp generates.
 * **`oneOf`** is compiled as `anyOf` (superset for overlapping branches).
+* **`allOf` is merged, not intersected in general.** For object schemas the merge
+  *is* the exact intersection, which is why it is supported; for a scalar, an
+  array, an enum or any branch keyword outside the merge set it is refused by
+  name, because a guess would silently widen or narrow the language. The reference
+  takes the same object-merging shape and additionally intersects `enum`s, which
+  minfer does not attempt.
 * **Real-valued numeric bounds** and `multipleOf` are refused; only integer
   bounds are compiled.
 * **`pattern` is a named regex subset, matched against the decoded characters.**
