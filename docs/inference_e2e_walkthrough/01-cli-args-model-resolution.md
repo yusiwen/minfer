@@ -184,7 +184,7 @@ arrives in two steps:
   of headroom costs 36 × 2 × 1024 × 4 B = **288 KB**, so the default 4096
   reserves ≈ 1.2 GB while the model's maximum (40960 tokens) would reserve
   ≈ 11.8 GB — the "12 GB+" the code comment warns about
-  (`src/main.rs:744-748`, citing `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §2).
+  (`src/main.rs:759-763`, citing `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §2).
 - **And it is clamped twice, defensively.** In `main.rs` the effective
   context is `params.n_ctx.max(input_ids.len())` — a long prompt must never
   overflow the notepad — and the model's forward pass clamps again with
@@ -201,14 +201,14 @@ number consistent for the whole run.
 ### 2.5 Modes: where the same parsed data goes
 
 The parsed state fans out into mode-specific structs, and each mode takes a
-different subset. In `run_conversation` (`src/main.rs:2008`), the
+different subset. In `run_conversation` (`src/main.rs:2064`), the
 conversation gets a `ConversationSpec` (template, special tokens, `seed`,
 `n_ctx`, system prompt) plus a `TurnParams` (all the sampling knobs *plus*
 `stop_strings`) — every field is copied out of `GenParams`, so the
 conversation REPL and the single-shot loop sample identically given the
 same flags. The server instead receives `n_ctx` as the **total across all
 slots** (each slot's conversation gets a slice of it — usage text,
-`src/main.rs:128-133`), because the server holds several independent KV
+`src/main.rs:137-142`), because the server holds several independent KV
 sets at once.
 
 ## 3. Implementation
@@ -236,7 +236,7 @@ covers. Everything above it in `main()` is this stage.
 
 #### The parameter struct and its llama.cpp defaults
 
-`src/main.rs:73-107` — 26 fields. The excerpt keeps the ten this chapter works with; the sampler
+`src/main.rs:73-115` — 26 fields. The excerpt keeps the ten this chapter works with; the sampler
 additions (min-p, typical, XTC, DRY, mirostat, logit bias, and the F2 grammar source) are
 `12-sampler.md`'s subject:
 
@@ -282,7 +282,7 @@ repeatable).
 
 #### Subcommand dispatch: `bench` and `specverify` leave early
 
-`src/main.rs:145-162` — the very first thing `main` does:
+`src/main.rs:154-171` — the very first thing `main` does:
 
 ```rust
 fn main() {
@@ -320,7 +320,7 @@ process::exit(code)` then means the two paths never share state.
 
 #### The parse loop: flags, values, and the unknown-flag rejection
 
-The loop is ~220 lines of one `match` (`src/main.rs:194-420`); the shapes
+The loop is ~220 lines of one `match` (`src/main.rs:208-435`); the shapes
 worth seeing are the value-taking flag, the seed/greedy pair, and the
 fallback:
 
@@ -357,9 +357,9 @@ fallback:
         }
 ```
 
-(`src/main.rs:204-419`, condensed.) Three details carry the design:
+(`src/main.rs:218-434`, condensed.) Three details carry the design:
 
-- **`next_val`** (`src/main.rs:517`) is a closure that peeks at
+- **`next_val`** (`src/main.rs:532`) is a closure that peeks at
   `raw_args[i+1]` and records `parse_err = Some("missing value for …")` if
   it is absent — the error is *remembered* and reported after the whole
   parse, so the user sees one clean message, not an early exit mid-list.
@@ -374,7 +374,7 @@ fallback:
 
 #### Subcommands that stay: `download`, `list`, `info`, `serve`, `viz`
 
-`src/main.rs:433-524` (condensed; `positional[0]` decides):
+`src/main.rs:448-539` (condensed; `positional[0]` decides):
 
 ```rust
     match positional[0].as_str() {
@@ -395,14 +395,14 @@ The split is by *side effects*: `download`, `list`, `info` finish and
 only *set a mode flag and remove their own token*, so positional[0] becomes
 the model and the normal load path continues — the model must be loaded
 before a server can serve it. The branches themselves are far down the same
-`main` (server: `src/main.rs:663-686`, viz: `688-696`, conversation:
+`main` (server: `src/main.rs:678-701`, viz: `688-696`, conversation:
 `698-713`), each taking the already-loaded `model` + `tokenizer`. This is
 why a wrong flag in `serve` mode is still caught by the same global parser
 — only `bench`/`specverify` opted out.
 
 #### Resolution call site in `main`
 
-`src/main.rs:538-555` — right before the prompt logic, and before any load:
+`src/main.rs:553-570` — right before the prompt logic, and before any load:
 
 ```rust
     // Resolve paths, hf:/ollama: URIs, and cached model names.
@@ -613,7 +613,7 @@ directly usable as the model argument. That is the whole point of source
 
 Resolution can reject a path ("File not found") but it cannot detect every
 failure — the decisive check is the first read, which is the GGUF loader.
-`src/main.rs:579-620` turns that failure into three distinct diagnoses
+`src/main.rs:594-635` turns that failure into three distinct diagnoses
 (condensed):
 
 ```rust
@@ -652,7 +652,7 @@ exists to prevent.
 
 #### Where the prompt comes from
 
-`src/main.rs:556-575` — after resolution, before loading:
+`src/main.rs:571-590` — after resolution, before loading:
 
 ```rust
     // Conversation mode: the positional prompt is the FIRST user turn; stdin
@@ -684,11 +684,11 @@ while the server-like modes explicitly take an *empty* prompt — they would
 otherwise hang waiting on a stdin that nobody will write. Conversation mode
 splits the difference: an optional positional becomes the first turn, and
 further turns come from the REPL's own reader (`read_user_input`,
-`src/main.rs:1133`), never from this one-shot read.
+`src/main.rs:1161`), never from this one-shot read.
 
 #### `--n-ctx` at the moment it starts to matter
 
-The first consumer of `params.n_ctx` after load (`src/main.rs:744-757`):
+The first consumer of `params.n_ctx` after load (`src/main.rs:759-772`):
 
 ```rust
     // n_ctx (--n-ctx, default 4096) sizes the graph KV regions — NOT the
@@ -777,13 +777,13 @@ because the seed is stable.
   call site pass a different value would change KV geometry mid-run — the
   graph-reuse identity (doc 13) treats KV size as a rebuild trigger, so a
   mismatched `n_ctx` would silently reallocate and discard accumulated KV.
-- **`--cnv` rejects `--no-template` up front** (`src/main.rs:530-536`),
+- **`--cnv` rejects `--no-template` up front** (`src/main.rs:545-551`),
   before resolution: conversation history is rendered through the chat
   template, so a template-less conversation would corrupt the KV with
   un-formatted turns. Failing at parse time (not first-turn time) keeps
   the error message adjacent to the mistake.
 - **Unknown flags die loudly; flag words never become the model path.** The
-  `starts_with('-')` rejection (`src/main.rs:410-415`) protects the
+  `starts_with('-')` rejection (`src/main.rs:425-430`) protects the
   positional contract. A flag missing its value is remembered in
   `parse_err` and reported after the full parse — one error, at the end,
   with usage.
@@ -805,13 +805,13 @@ because the seed is stable.
   the loader co-own that convention.
 - **Server-like modes never consume stdin.** `serve`/`viz`/`--cnv` read
   prompts from requests or the REPL; the single-shot stdin read
-  (`src/main.rs:572-574`) would otherwise block startup on an empty pipe —
+  (`src/main.rs:587-589`) would otherwise block startup on an empty pipe —
   the exact hang the code comment describes for `minfer viz model`.
 
 ## 4. Observe & verify
 
 - **`minfer --help`** — prints the usage block (`print_usage`,
-  `src/main.rs:80-143`): the four MODEL forms and every option with its
+  `src/main.rs:80-152`): the four MODEL forms and every option with its
   default, which is this stage's contract in readable form.
 - **`minfer list`** — runs `list_local`: the cache tree with sizes; every
   printed name is directly runnable as the model argument. With an empty
@@ -822,7 +822,7 @@ because the seed is stable.
   inference — a dry run of stages 01+02.
 - **`--meta`** — with single-shot inference, replaces the one-line GGUF
   summary with the full metadata dump and still continues to generate
-  (`src/main.rs:630-652`).
+  (`src/main.rs:645-667`).
 - **`minfer download hf Qwen/Qwen2.5-0.5B-Instruct-GGUF q4_0`** — shows the
   whole download path: API listing, quant match, curl progress bar, and on
   a second run the `Already cached: …` line proving the size check passed.

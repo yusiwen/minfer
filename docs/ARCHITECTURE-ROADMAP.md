@@ -402,13 +402,13 @@ reintroduce it with its real semantics. Attention derives its causal bound from
 the per-token positions input (`cpu_backend.rs:411-416`, `cuda_backend.rs:1100-1102`), so two
 sequences in one batch would attend to each other.
 
-The prefill is one graph covering the entire prompt (`main.rs:862-890`):
+The prefill is one graph covering the entire prompt (`main.rs:890-918`):
 `n_ctx = max(--n-ctx, prompt_len)`, one forward with `nt = prompt_len`. The
 server rejects any prompt longer than the slot context (`chat.rs:118-124`);
 `new_slots` (`slot.rs:33-36`) divides `n_ctx_total` equally per slot.
 `worker_loop` drains the queue **serially, one slot at a time** (`chat.rs:452-518`),
 and every request starts from a fresh `GraphCache` (`chat.rs:77`). Default `--n-slots` is
-1 (`main.rs:492`), so the default server is strictly serial with a cold KV per
+1 (`main.rs:507`), so the default server is strictly serial with a cold KV per
 request.
 
 **Gap.** 🔴 This is the largest capability difference between what minfer does

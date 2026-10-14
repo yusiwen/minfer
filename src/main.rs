@@ -89,6 +89,14 @@ struct GenParams {
     dry_penalty_last_n: usize,
     /// Restart sequences as token-id sequences (`--dry-sequence-breakers`).
     dry_breakers: Vec<Vec<u32>>,
+    /// Restart sequences as breaker **strings** (`--dry-sequence-breaker`,
+    /// llama.cpp's spelling: singular and repeatable, `none` clears).
+    ///
+    /// Kept unresolved until the tokenizer exists — a breaker string can only
+    /// be matched through the vocabulary's own tokenization — and then folded
+    /// into [`Self::dry_breakers`]. One flag, one interpretation: this never
+    /// reinterprets a numeric string as a token id.
+    dry_breaker_strings: Vec<String>,
     mirostat: sampler::MirostatMode,
     mirostat_tau: f32,
     mirostat_eta: f32,
@@ -125,6 +133,7 @@ impl Default for GenParams {
             dry_allowed_length: 2,  // F3: llama.cpp default
             dry_penalty_last_n: 64, // F3: llama.cpp default
             dry_breakers: Vec::new(),
+            dry_breaker_strings: Vec::new(),
             mirostat: sampler::MirostatMode::Off,
             mirostat_tau: 5.0, // F3: llama.cpp default
             mirostat_eta: 0.1, // F3: llama.cpp default
@@ -172,6 +181,11 @@ impl GenParams {
 /// Parse `--dry-sequence-breakers`: `;`-separated restart sequences, each a
 /// `,`-separated token-id list (`198;13,2`). Every entry must be a valid token
 /// id — a non-numeric spelling is a loud parse error, never silently dropped.
+///
+/// This is the **token-id** spelling only. Breaker *strings* go through the
+/// singular `--dry-sequence-breaker`, which resolves them against the
+/// vocabulary after the tokenizer loads (#118); the two are never guessed from
+/// each other's characters.
 fn parse_dry_breakers(spec: &str) -> Result<Vec<Vec<u32>>, String> {
     let mut out = Vec::new();
     for breaker in spec.split(';').filter(|b| !b.trim().is_empty()) {
@@ -182,8 +196,8 @@ fn parse_dry_breakers(spec: &str) -> Result<Vec<Vec<u32>>, String> {
                 Ok(v) => ids.push(v),
                 Err(_) => {
                     return Err(format!(
-                        "invalid --dry-sequence-breakers entry '{id}' (a token id is required; \
-                         llama.cpp's string breakers need a tokenizer port, see #48)"
+                        "invalid --dry-sequence-breakers entry '{id}' (this flag takes token ids \
+                         only; for a breaker *string* use --dry-sequence-breaker, see #118)"
                     ))
                 }
             }
@@ -304,6 +318,7 @@ fn print_usage(prog: &str) {
     eprintln!("  --dry-allowed-length <N>  shortest repeated suffix DRY reacts to (default 2)");
     eprintln!("  --dry-penalty-last-n <N>  DRY penalty window (default 64)");
     eprintln!("  --dry-sequence-breakers <L>  DRY restart sequences as token ids, e.g. '198;13,2'");
+    eprintln!("  --dry-sequence-breaker <S>   DRY restart sequence as a string, repeatable ('none' clears), e.g. ':'");
     eprintln!("  --mirostat <0|1|2>   mirostat off / v1 / v2 (default 0)");
     eprintln!("  --mirostat-tau <N>   mirostat target surprise in bits (default 5.0)");
     eprintln!("  --mirostat-eta <N>   mirostat learning rate (default 0.1)");
@@ -812,6 +827,19 @@ fn main() {
                 }
                 i += 2;
             }
+            // #118: llama.cpp's spelling — singular and repeatable, one breaker
+            // per flag, `none` clearing the list. The string stays unresolved
+            // until the tokenizer is loaded.
+            "--dry-sequence-breaker" => {
+                if let Some(v) = next_val(a) {
+                    if v == "none" {
+                        params.dry_breaker_strings.clear();
+                    } else {
+                        params.dry_breaker_strings.push(v);
+                    }
+                }
+                i += 2;
+            }
             "--mirostat" => {
                 if let Some(v) = next_val(a) {
                     match v
@@ -1241,6 +1269,34 @@ fn main() {
     {
         eprintln!("Error: {e}");
         std::process::exit(1);
+    }
+    // F3 (#118): resolve the `--dry-sequence-breaker` *strings* against the
+    // vocabulary, which only exists now. A breaker that matches no token, one
+    // over llama.cpp's length limit, or a tail over its token limit is refused
+    // here — llama.cpp truncates or skips, minfer does not. The numeric
+    // `--dry-sequence-breakers` form is already resolved at parse time and is
+    // merged in, so the two spellings share one deduplicated sequence list.
+    if !params.dry_breaker_strings.is_empty() {
+        match tokenizer.resolve_sequence_breakers(&params.dry_breaker_strings) {
+            Ok(seqs) => {
+                let resolved = seqs.len();
+                for seq in seqs {
+                    if !params.dry_breakers.contains(&seq) {
+                        params.dry_breakers.push(seq);
+                    }
+                }
+                eprintln!(
+                    "[dry] {} breaker string(s) resolved to {resolved} overlapping token \
+                     sequence(s) ({} sequence(s) configured in total)",
+                    params.dry_breaker_strings.len(),
+                    params.dry_breakers.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     // F2: compile the requested grammar/schema once, now that the vocabulary (and
     // with it every token piece and the EOG ids) is known. An unsupported
@@ -2457,5 +2513,7 @@ fn get_chat_template(data: &[u8]) -> Option<String> {
     None
 }
 
+#[cfg(test)]
+mod arg_parse_tests;
 #[cfg(test)]
 mod think_highlighter_tests;

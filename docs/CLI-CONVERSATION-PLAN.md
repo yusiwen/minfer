@@ -199,7 +199,7 @@ if add_ass && fmt_past 以 '\n' 结尾: delta = "\n" + delta   // 尾部换行�
 | `GraphCache::new()` | `src/graph/cache.rs` | 每会话独立 cache（server `slot.rs` 同款用法） |
 | `sampler::{sample_with_penalties, recent_window, match_stop_suffix}` | `src/sampler.rs` | 采样链 / 惩罚窗口 / stop 串后缀匹配 |
 | `Tokenizer::{encode, decode_bytes, complete_utf8_prefix_len}` | `src/tokenizer.rs` | 字节级解码，UTF-8 安全输出 |
-| `is_stop_token`（eos / im_end） | `src/main.rs:530` | EOG 检测 |
+| `is_stop_token`（eos / im_end） | `src/main.rs:545` | EOG 检测 |
 | server 解码循环模式 | `src/server/chat.rs` | penalties/stop/UTF-8 处理的参考实现（rev-5 修正：stop 匹配跑**全量**字节流） |
 
 ### 4.3 缺口

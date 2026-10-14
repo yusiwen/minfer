@@ -35,9 +35,12 @@ pub struct ChatCompletionRequest {
     pub dry_base: Option<f32>,
     pub dry_allowed_length: Option<usize>,
     pub dry_penalty_last_n: Option<usize>,
-    /// DRY restart sequences as token-id sequences (llama.cpp's string form
-    /// needs a tokenizer port — see the F3 record and #48).
-    pub dry_sequence_breakers: Option<Vec<Vec<u32>>>,
+    /// DRY restart sequences. Both spellings are accepted and are never guessed
+    /// from each other's characters (#118): an array of **strings** is
+    /// llama.cpp's OpenAI-compatible form and is resolved against the vocabulary
+    /// per request, while the array of **token-id arrays** is minfer's original
+    /// form and is used as given. An empty array is a `400` in either shape.
+    pub dry_sequence_breakers: Option<DrySequenceBreakers>,
     /// 0 = off, 1 = mirostat v1, 2 = mirostat v2.
     pub mirostat: Option<i64>,
     pub mirostat_tau: Option<f32>,
@@ -94,6 +97,27 @@ pub enum StopCondition {
     Array(Vec<String>),
 }
 
+/// The two `dry_sequence_breakers` shapes, told apart by JSON type — never by
+/// looking at a string's characters (#118).
+///
+/// * [`Self::Strings`] — `["\n", ":"]`, llama.cpp's OpenAI-compatible shape.
+///   Each breaker is matched through the vocabulary when the request is handled
+///   (the tokenizer is per server, not per request), and a breaker that matches
+///   nothing is a `400`.
+/// * [`Self::Ids`] — `[[198],[13,2]]`, minfer's original shape: the token
+///   sequences are already resolved, so no tokenizer is involved.
+///
+/// A mixed array (`["\n", [198]]`) matches neither variant and fails to
+/// deserialize, which the request path reports as an invalid body.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DrySequenceBreakers {
+    /// Breaker strings (llama.cpp's form).
+    Strings(Vec<String>),
+    /// Resolved token-id sequences (minfer's form).
+    Ids(Vec<Vec<u32>>),
+}
+
 /// Concrete sampling parameters, resolved once per request.
 #[derive(Clone, Debug)]
 pub struct SamplingParams {
@@ -113,6 +137,10 @@ pub struct SamplingParams {
     pub dry_allowed_length: usize,
     pub dry_penalty_last_n: usize,
     pub dry_breakers: Vec<Vec<u32>>,
+    /// #118: the `dry_sequence_breakers` **string** form, kept unresolved until
+    /// [`Self::resolve_dry_breakers`] runs where the tokenizer lives. Empty when
+    /// the request used the token-id form or omitted the field.
+    pub dry_breaker_strings: Vec<String>,
     pub mirostat: crate::sampler::MirostatMode,
     pub mirostat_tau: f32,
     pub mirostat_eta: f32,
@@ -156,6 +184,33 @@ impl SamplingParams {
             logit_bias: self.logit_bias.clone(),
             grammar: self.grammar.clone(),
         }
+    }
+
+    /// #118: resolve the request's `dry_sequence_breakers` **string** form into
+    /// token sequences, now that the vocabulary is available.
+    ///
+    /// Called on the handler side, like [`Self::compile_grammar`], so a breaker
+    /// that matches no token (or exceeds `Tokenizer`'s length limits) is a `400`
+    /// before the job is queued. The token-id form is already resolved and needs
+    /// no tokenizer; a request that used it returns here immediately. Sequences
+    /// are deduplicated against the token-id ones, so a request that sends both
+    /// shapes never doubles a breaker.
+    pub fn resolve_dry_breakers(
+        &mut self,
+        tokenizer: &crate::tokenizer::Tokenizer,
+    ) -> Result<(), ApiError> {
+        if self.dry_breaker_strings.is_empty() {
+            return Ok(());
+        }
+        let seqs = tokenizer
+            .resolve_sequence_breakers(&self.dry_breaker_strings)
+            .map_err(ApiError::invalid_request)?;
+        for seq in seqs {
+            if !self.dry_breakers.contains(&seq) {
+                self.dry_breakers.push(seq);
+            }
+        }
+        Ok(())
     }
 
     /// F2 (#47): compile the request's grammar/schema against the vocabulary.
@@ -269,6 +324,32 @@ impl ChatCompletionRequest {
             ),
             (None, Some(ResponseFormat::Text)) | (None, None) => None,
         };
+        // #118: the two `dry_sequence_breakers` shapes, told apart by JSON type.
+        // The string form stays unresolved until `resolve_dry_breakers` runs
+        // where the tokenizer lives. An explicitly empty array is a `400` in
+        // either shape (llama.cpp refuses it too) — "no breakers" is expressed
+        // by omitting the field.
+        let (dry_breakers, dry_breaker_strings) = match &self.dry_sequence_breakers {
+            None => (Vec::new(), Vec::new()),
+            Some(DrySequenceBreakers::Ids(v)) => {
+                if v.is_empty() {
+                    return Err(ApiError::invalid_request(
+                        "dry_sequence_breakers must not be empty; omit the field to use none"
+                            .to_string(),
+                    ));
+                }
+                (v.clone(), Vec::new())
+            }
+            Some(DrySequenceBreakers::Strings(v)) => {
+                if v.is_empty() {
+                    return Err(ApiError::invalid_request(
+                        "dry_sequence_breakers must not be empty; omit the field to use none"
+                            .to_string(),
+                    ));
+                }
+                (Vec::new(), v.clone())
+            }
+        };
         Ok(SamplingParams {
             temp: self.temperature.unwrap_or(DEFAULT_TEMP),
             top_k: self.top_k.map(|k| k as usize).unwrap_or(DEFAULT_TOP_K),
@@ -284,7 +365,8 @@ impl ChatCompletionRequest {
             dry_base: self.dry_base.unwrap_or(1.75),
             dry_allowed_length: self.dry_allowed_length.unwrap_or(2),
             dry_penalty_last_n: self.dry_penalty_last_n.unwrap_or(64),
-            dry_breakers: self.dry_sequence_breakers.clone().unwrap_or_default(),
+            dry_breakers,
+            dry_breaker_strings,
             mirostat,
             mirostat_tau: self.mirostat_tau.unwrap_or(5.0),
             mirostat_eta: self.mirostat_eta.unwrap_or(0.1),

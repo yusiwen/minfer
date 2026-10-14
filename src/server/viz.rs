@@ -432,6 +432,7 @@ async fn viz_run(State(state): State<Arc<VizState>>, body: String) -> Response {
         dry_allowed_length: 2,
         dry_penalty_last_n: 64,
         dry_breakers: Vec::new(),
+        dry_breaker_strings: Vec::new(),
         mirostat: crate::sampler::MirostatMode::Off,
         mirostat_tau: 5.0,
         mirostat_eta: 0.1,

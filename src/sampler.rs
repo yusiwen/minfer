@@ -394,11 +394,12 @@ pub struct SamplerConfig {
     /// DRY's penalty window; `0` disables a configured DRY loudly (refused by
     /// [`SamplerConfig::validate`] rather than silently ignored).
     pub dry_penalty_last_n: usize,
-    /// DRY restart sequences as token-id sequences (head token first). llama.cpp
-    /// maps a breaker *string* to overlapping token sequences through the
-    /// vocabulary; that port needs the tokenizer and is a follow-up (see the F3
-    /// record) — here a breaker is given as its token ids, and a non-numeric
-    /// spelling is a loud parse error at the CLI/server boundary.
+    /// DRY restart sequences as token-id sequences (head token first). A
+    /// *string* breaker is resolved into these by
+    /// [`crate::tokenizer::Tokenizer::resolve_sequence_breakers`] at the CLI and
+    /// server boundaries (#118), where the vocabulary is known; a non-numeric
+    /// spelling of the token-id form is a loud parse error there, and the two
+    /// spellings are never guessed from each other's characters.
     pub dry_breakers: Vec<Vec<u32>>,
     /// XTC: probability of applying the exclusion on a given step (`0.0`
     /// disables). Each application consumes exactly one RNG draw, so a disabled
