@@ -274,7 +274,7 @@ fn compile_grammar_turns_an_unsupported_schema_into_a_400() {
     let req = ChatCompletionRequest::parse(
         br#"{"messages":[{"role":"user","content":"hi"}],
              "response_format":{"type":"json_schema","json_schema":
-               {"name":"x","schema":{"type":"string","pattern":"^a"}}}}"#,
+               {"name":"x","schema":{"type":"string","pattern":"^a\\1"}}}}"#,
     )
     .unwrap();
     let mut p = req.resolve(0).unwrap();

@@ -88,6 +88,7 @@ rules and compiled once, on demand.
 | `string` | a JSON string: `[^"\\\u0000-\u001f]*` plus `\" \\ \/ \b \f \n \r \t` and `\uXXXX` escapes; `minLength`/`maxLength` count **characters** (one escape is one character), and `format` narrows it to one of the validators below |
 | `string`: `minLength`, `maxLength` | exact character bounds (`minLength` may not exceed `maxLength`); the encoded string is `"\"" j-char{m,n} "\""` |
 | `string`: `format` | `date`, `time`, `date-time`, `uuid`, `uuid1`..`uuid5` — the four rules the reference implements (the uuid version digit is not checked, as there) |
+| `string`: `pattern` | a regex over the **decoded** characters, escape-aware: the subset below. Unanchored, it matches a substring (ECMA-262); a leading `^` and a trailing `$` are each optional and make it a whole-string match. Matched against the JSON text, where a character may be spelled literally or as an escape — both are accepted, and `.` refuses exactly the four line terminators (`\n`, `\r`, `\u2028`, `\u2029`) in either spelling |
 | `integer`: `minimum`, `maximum` | inclusive bounds, integer-valued (see below) |
 | `integer`: `exclusiveMinimum`, `exclusiveMaximum` | integer-valued; folded into the inclusive range |
 | `number` | the general JSON number grammar (`-?int(.frac)?([eE]exp)?`) when unbounded |
@@ -100,14 +101,25 @@ rules and compiled once, on demand.
 
 * any `$ref` that is not a local `#/$defs/...` or `#/definitions/...` pointer —
   in particular remote URLs and nested JSON pointers (`#/$defs/a/properties/b`);
-* `pattern`, `contentEncoding`, `contentMediaType` on strings — and every
+* `contentEncoding`, `contentMediaType` on strings — and every
   `format` outside the four above (`email`, `uri`, `hostname`, `ipv4`, `ipv6`),
   refused **by name**: a loose rule would accept instances the schema rejects;
-* a string keyword (`format`, `minLength`, `maxLength`) on any single type other
-  than `"string"`, with no type at all, or on a union — the constraint would be
-  silently dropped, and a union would have to be split into `anyOf` branches;
-* `format` **combined with** `minLength`/`maxLength` (the two would have to be
-  intersected);
+* a string keyword (`format`, `minLength`, `maxLength`, `pattern`) on any single
+  type other than `"string"`, with no type at all, or on a union — the constraint
+  would be silently dropped, and a union would have to be split into `anyOf`
+  branches;
+* **two of** `pattern` / `format` / `minLength`-`maxLength` on one string (they
+  would have to be intersected);
+* a `pattern` outside its subset, each refusal naming the construct: a
+  backreference (`\1`, `\k<...>`), lookaround or any group other than `(?:...)`
+  (`(?=`, `(?!`, `(?<=`, `(?<!`, `(?<name>`, `(?>` …), a word-boundary assertion
+  (`\b`, `\B`), a Unicode property escape (`\p{...}`), a control or octal escape,
+  the `\u{...}` form, a possessive quantifier (`*+`, `++`, `?+`), a **negated**
+  class or negated shorthand (`[^...]`, `\D`, `\W`, `\S`) — which need the
+  escape-aware complement over the whole codepoint space — a class member above
+  U+00FF (which needs the general four-hex-digit automaton), a class shorthand as
+  a range endpoint, a misplaced anchor (`^`/`$` anywhere but the two ends, or
+  combined with a top-level `|`), and a malformed quantifier or class;
 * `multipleOf` and non-integer `minimum`/`maximum`/`exclusiveMinimum`/
   `exclusiveMaximum` on numbers (integer bounds are supported; a real-valued
   bound is a named refusal, see the follow-ups — narrowing a `number` to its
@@ -378,13 +390,27 @@ lives), before the job occupies a worker slot.
 * **`oneOf`** is compiled as `anyOf` (superset for overlapping branches).
 * **Real-valued numeric bounds** and `multipleOf` are refused; only integer
   bounds are compiled.
-* **`pattern` is still refused** (it needs a regex engine in GBNF; #125's slice 3).
-  `minLength`/`maxLength` landed on 2026-10-14 as counting rules over `j-char`,
-  which makes them character counts rather than byte counts: one escape is one
-  character, and a surrogate pair written as two `\uXXXX` escapes is two. A
-  string keyword is accepted only on `type: "string"` itself — on another type,
-  with no type, or on a union, the constraint would be dropped or need
-  intersection, so it is refused by name.
+* **`pattern` is a named regex subset, matched against the decoded characters.**
+  It landed on 2026-10-14 (#125's slice 3) and is the largest single piece of the
+  compiler: literals, `.`, positive classes over U+0000..=U+00FF with
+  `\d`/`\w`/`\s`, groups (capturing or not), alternation, the quantifiers
+  `*` `+` `?` `{m}` `{m,}` `{m,n}` (a lazy `?` suffix is accepted — it changes
+  matching, not the language), and the two anchors. A **negated** class or
+  shorthand is refused rather than approximated, because it is the complement over
+  the whole codepoint space and the JSON text may spell a character either
+  literally or as an escape: getting that wrong would accept a string the schema
+  rejects, which is the one thing this compiler never does. Every other refusal
+  (backreferences, lookaround, `\p{...}`, possessive quantifiers, a misplaced
+  anchor, a class member above U+00FF) names the construct, and §3 lists them.
+  The reference is *not* a model here: it requires both anchors and, when either
+  is missing, **widens to any string with a warning** — minfer either compiles the
+  pattern exactly or refuses it.
+* **`minLength`/`maxLength` count characters.** Counting rules over `j-char` make
+  the count character-based rather than byte-based: one escape is one character,
+  and a surrogate pair written as two `\uXXXX` escapes is two. A string keyword is
+  accepted only on `type: "string"` itself — on another type, with no type, or on
+  a union, the constraint would be dropped or need intersection, so it is refused
+  by name.
 * **`format` implements four validators, not a format library.** `date`, `time`,
   `date-time` and `uuid`/`uuid1`..`uuid5`, byte for byte the rules the reference
   implements; `email`, `uri`, `hostname`, `ipv4` and `ipv6` are refused rather

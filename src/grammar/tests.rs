@@ -603,9 +603,138 @@ fn json_schema_string_formats_are_the_four_the_reference_implements() {
 }
 
 #[test]
+fn json_schema_patterns_match_the_documented_subset() {
+    // (pattern, must accept, must reject) — every case is a JSON string literal,
+    // so the `\uXXXX` spellings exercise the escape-aware matching directly.
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "^[0-9]{3}$",
+            &[r#""123""#, r#""007""#, r#""\u0031\u0032\u0033""#],
+            &[
+                r#""12""#,
+                r#""1234""#,
+                r#""12a""#,
+                r#""a123""#,
+                r#""\u0031\u0032""#,
+            ],
+        ),
+        // Unanchored: ECMA-262 matches a substring.
+        ("b", &[r#""abc""#, r#""b""#], &[r#""ac""#, r#""""#]),
+        // Each anchor is independent.
+        ("^a", &[r#""abc""#], &[r#""ba""#]),
+        ("c$", &[r#""abc""#], &[r#""ca""#]),
+        (
+            "^(cat|dog)$",
+            &[r#""cat""#, r#""dog""#],
+            &[r#""cattle""#, r#""""#],
+        ),
+        // `.` accepts one decoded character other than a line terminator: the
+        // escape spelling of `b` is accepted, and the escape spellings of the
+        // four line terminators are what only an exact automaton can refuse.
+        (
+            "^a.c$",
+            &[r#""abc""#, r#""a\u0062c""#, r#""a\\c""#],
+            &[r#""a\nc""#, r#""a\u000Ac""#, r#""a\u2028c""#, r#""ac""#],
+        ),
+        (
+            "^\\d+$",
+            &[r#""42""#, r#""\u0034\u0032""#],
+            &[r#""4a2""#, r#""""#],
+        ),
+        ("^\\w+$", &[r#""a_9""#], &[r#""a-b""#, r#""a b""#]),
+        (
+            "^\\s+$",
+            &[r#"" ""#, r#""\t""#, r#""\n""#, r#""\u000b""#],
+            &[r#""a""#, r#""""#],
+        ),
+        ("^[a-c0-2]+$", &[r#""abc012""#], &[r#""abd""#, r#""3""#]),
+        // The lazy quantifier accepts the same language.
+        (
+            "^a*?b$",
+            &[r#""b""#, r#""aaab""#],
+            &[r#""aab c""#, r#""a""#],
+        ),
+        // A literal quote, backslash and non-ASCII character, in both spellings.
+        (r#"^"$"#, &[r#""\"""#], &[r#""a""#]),
+        (r"^\\$", &[r#""\\""#], &[r#""a""#]),
+        (
+            "^\u{4e2d}$",
+            &["\"\u{4e2d}\"", r#""\u4e2d""#],
+            &[r#""\u4e2c""#],
+        ),
+        // An empty pattern matches every string; only the anchored empty form
+        // restricts anything.
+        ("", &[r#""""#, r#""anything""#], &[]),
+        ("^$", &[r#""""#], &[r#""a""#]),
+    ];
+    for (pattern, accepted, rejected) in cases {
+        let g = schema(json!({"type": "string", "pattern": pattern}));
+        for text in *accepted {
+            assert!(
+                g.accepts(text.as_bytes()),
+                "pattern {pattern:?} must accept {text}\ngrammar:\n{}",
+                g.source()
+            );
+        }
+        for text in *rejected {
+            assert!(
+                !g.accepts(text.as_bytes()),
+                "pattern {pattern:?} must reject {text}\ngrammar:\n{}",
+                g.source()
+            );
+        }
+    }
+}
+
+#[test]
+fn json_schema_pattern_refusals_are_named() {
+    let cases: &[(&str, &str)] = &[
+        (r"a\1", "backreference"),
+        (r"(?=a)", "non-capturing"),
+        (r"(?!a)", "non-capturing"),
+        (r"(?<x>a)", "non-capturing"),
+        (r"(?>a)", "non-capturing"),
+        (r"\ba", "word-boundary"),
+        (r"\p{L}", "Unicode property"),
+        (r"\D", "negated shorthand"),
+        (r"\W", "negated shorthand"),
+        (r"[^a]", "negated class"),
+        (r"[a\D]", "negated shorthand"),
+        (r"\u{1F600}", "not supported"),
+        (r"a*+", "possessive"),
+        (r"^a|b$", "anchor"),
+        (r"a^", "anchor"),
+        (r"a{", "quantifier"),
+        (r"a{2,1}", "upper bound below"),
+        (r"(a", "unmatched"),
+        (r"a)", "unmatched"),
+        (r"[\d-x]", "range endpoint"),
+        (r"[z-a]", "reversed"),
+        (r"[]", "empty character class"),
+        (r"[\u0100]", "U+0100"),
+        (r"[\u4e00-\u9fff]", "U+9FFF"),
+        (r"\uD800", "lone surrogate"),
+        (r"\cA", "control escape"),
+        (r"\x4", "needs 2 hex digits"),
+    ];
+    for (pattern, needle) in cases {
+        let err = schema_err(json!({"type": "string", "pattern": pattern}));
+        assert!(
+            err.contains(needle),
+            "pattern {pattern:?} -> `{err}` (wanted `{needle}`)"
+        );
+    }
+    // A non-string type is refused by the string-keyword rule, not reached here.
+    let err = schema_err(json!({"type": "integer", "pattern": "^a$"}));
+    assert!(err.contains("only supported on"), "{err}");
+    // And `pattern` cannot be combined with the other string constraints.
+    let err = schema_err(json!({"type": "string", "pattern": "^a$", "minLength": 1}));
+    assert!(err.contains("combined"), "{err}");
+}
+
+#[test]
 fn json_schema_refusals_are_named() {
     let cases: &[(Value, &str)] = &[
-        (json!({"type": "string", "pattern": "^a"}), "pattern"),
         // `minLength`/`maxLength`/`format` are supported on `type: "string"`
         // alone, and the combinations that would need intersection are refused
         // by name rather than approximated.
@@ -634,7 +763,7 @@ fn json_schema_refusals_are_named() {
         (json!({"type": "string", "format": "ipv4"}), "not supported"),
         (
             json!({"type": "string", "format": "date-time", "minLength": 4}),
-            "combined with",
+            "combined",
         ),
         (json!({"allOf": [{"type": "string"}]}), "allOf"),
         (json!({"not": {"type": "string"}}), "not"),

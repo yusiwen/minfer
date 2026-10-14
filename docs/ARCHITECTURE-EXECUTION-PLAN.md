@@ -7493,13 +7493,14 @@ startup error rather than a generation-time hang).
 `prefixItems`, `minItems`/`maxItems`, `string`, integer bounds (inclusive and
 exclusive, ranges compiled by digit decomposition), `number`, `boolean`,
 `null`, `anyOf`/`oneOf`, `$defs`/`definitions` + local `$ref` (recursive
-schemas work). Refused loudly: `pattern`, `contentEncoding`/`contentMediaType`,
+schemas work). Refused loudly: `contentEncoding`/`contentMediaType`,
 non-integer numeric bounds on `number`, `multipleOf`, `propertyNames`,
 `patternProperties`, `dependent*`, `uniqueItems`, `contains`, `allOf`, `not`,
 `if`/`then`/`else`, remote or nested `$ref`, `items` as an array (the draft-07
 tuple form), and a `required` name that is not declared. (**`minLength`/
-`maxLength` and four `format` validators left this list on 2026-10-14** — #125
-slices 2 and, for the class shorthands, 1; see the issue.)
+`maxLength`, four `format` validators and `pattern` left this list on 2026-10-14**
+— #125 slices 2 and 3, plus slice 1 for the class shorthands; `pattern` is a
+named regex subset, not the whole of ECMA-262 — see the issue.)
 
 *Engine.* One flat program per rule (`Cp`/`Class`/`Any`/`Split`/`Jump`/`Call`/
 `Ret`), a stack of `{rule, pc}` frames, a bounded **set** of nondeterministic
@@ -7569,9 +7570,11 @@ allowance.
 subset of the schema's language: extras may be interleaved only where no
 required property is pending); `oneOf` is compiled as `anyOf`; only
 integer-valued numeric bounds are compiled (`number` + bounds is refused);
-`pattern` and `multipleOf` are refused (**`minLength`/`maxLength` and the four
-`format` validators landed on 2026-10-14 as #125's slices 1–2; the class
-shorthands `\d`/`\w`/`\s` came with slice 1 — the issue is the record**). The mask is
+`multipleOf` is refused, and `pattern` is a named regex subset (**landed
+2026-10-14 as #125's slice 3, with `minLength`/`maxLength` and the four `format`
+validators in slice 2 and the class shorthands `\d`/`\w`/`\s` in slice 1 — the
+issue is the record; a negated class, a negated shorthand and any class member
+above U+00FF are still refused, because they need the escape-aware complement**). The mask is
 O(vocabulary) per new state — 5.4 ms on a 151k vocabulary, cached per state — so
 a long constrained generation still pays it once per unseen state (**narrowed by
 [#126](https://github.com/yusiwen/minfer/issues/126) on 2026-10-14: the record is
@@ -7580,9 +7583,10 @@ acceptance is CPU-only: CUDA/Metal are not touched by this ticket (the mask is
 host-side, before any device work), so the CUDA `build-linux-cuda` job compiles
 the change but no device run exercises it. Two follow-up issues carry what was
 deliberately left out: [#125](https://github.com/yusiwen/minfer/issues/125) (the
-GBNF/JSON-Schema constructs the compiler refuses: `pattern`, `format` outside the
-four, real-valued numeric bounds and `multipleOf`, property permutations,
-an exact `oneOf`, `allOf`/`not`, `\p{...}`) and
+GBNF/JSON-Schema constructs the compiler refuses: `format` outside the four,
+real-valued numeric bounds and `multipleOf`, property permutations,
+an exact `oneOf`, `allOf`/`not`, `\p{...}`, and the `pattern` constructs slice 3
+left out) and
 [#126](https://github.com/yusiwen/minfer/issues/126) (index the vocabulary by
 first codepoint to cut the residual mask cost — **DONE 2026-10-14**, below).
 
