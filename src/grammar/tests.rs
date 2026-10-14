@@ -657,10 +657,45 @@ fn json_schema_patterns_match_the_documented_subset() {
         // A literal quote, backslash and non-ASCII character, in both spellings.
         (r#"^"$"#, &[r#""\"""#], &[r#""a""#]),
         (r"^\\$", &[r#""\\""#], &[r#""a""#]),
+        ("^\u{4e2d}$", &[r#""中""#, r#""\u4e2d""#], &[r#""\u4e2c""#]),
+        // A negated class and a negated shorthand: the complement over the whole
+        // codepoint space, which is why `\D` accepts a non-ASCII character and
+        // `\S` still refuses the escape spelling of a tab.
         (
-            "^\u{4e2d}$",
-            &["\"\u{4e2d}\"", r#""\u4e2d""#],
-            &[r#""\u4e2c""#],
+            "^[^0-9]+$",
+            &[r#""abc""#, r#""中""#],
+            &[r#""a1""#, r#""1""#, r#""""#],
+        ),
+        ("^\\D+$", &[r#""abc""#, r#""中""#], &[r#""1""#, r#""a1""#]),
+        // A literal and a negated shorthand in one class: the negation applies to
+        // the shorthand only, not to the whole class.
+        (
+            "^[a\\D]+$",
+            &[r#""ab""#, r#""a中""#],
+            &[r#""1""#, r#""a1""#],
+        ),
+        (
+            "^\\S+$",
+            &[r#""abc""#],
+            &[r#"" ""#, r#""\t""#, r#""\u0009""#, r#""""#],
+        ),
+        // A class range above U+00FF, and the surrogate pair that spells one.
+        (
+            r"^[\u4e00-\u9fff]+$",
+            &[r#""中""#, r#""\u4e2d""#, r#""中中""#],
+            &[r#""a""#, r#""\u4dff""#],
+        ),
+        ("^[^\\n]+$", &[r#""abc""#], &[r#""a\nb""#, r#""\n""#]),
+        (
+            "^[\u{1F600}-\u{1F64F}]$",
+            &[r#""😀""#, r#""\uD83D\uDE00""#],
+            &[r#""a""#, r#""🙏😀""#],
+        ),
+        // `.` reaches the surrogate branch too.
+        (
+            "^.$",
+            &[r#""😀""#, r#""\uD83D\uDE00""#, r#""a""#],
+            &[r#""ab""#, r#""""#, r#""\n""#],
         ),
         // An empty pattern matches every string; only the anchored empty form
         // restricts anything.
@@ -696,10 +731,6 @@ fn json_schema_pattern_refusals_are_named() {
         (r"(?>a)", "non-capturing"),
         (r"\ba", "word-boundary"),
         (r"\p{L}", "Unicode property"),
-        (r"\D", "negated shorthand"),
-        (r"\W", "negated shorthand"),
-        (r"[^a]", "negated class"),
-        (r"[a\D]", "negated shorthand"),
         (r"\u{1F600}", "not supported"),
         (r"a*+", "possessive"),
         (r"^a|b$", "anchor"),
@@ -711,8 +742,6 @@ fn json_schema_pattern_refusals_are_named() {
         (r"[\d-x]", "range endpoint"),
         (r"[z-a]", "reversed"),
         (r"[]", "empty character class"),
-        (r"[\u0100]", "U+0100"),
-        (r"[\u4e00-\u9fff]", "U+9FFF"),
         (r"\uD800", "lone surrogate"),
         (r"\cA", "control escape"),
         (r"\x4", "needs 2 hex digits"),

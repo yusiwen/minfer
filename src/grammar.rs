@@ -2570,17 +2570,6 @@ fn get_count(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u
 /// The GBNF for the empty string, used for an empty regex branch or group.
 const GBNF_EMPTY: &str = r#""""#;
 
-/// ECMA-262's `.`: one decoded character that is **not** a line terminator.
-///
-/// A pattern is matched against the *decoded* string, but the grammar runs over
-/// the JSON *text*, where a character may be spelled literally or as an escape.
-/// The plain branch is therefore a class over the text (which can never hold a
-/// raw control character), and the escape branch spells out exactly the four
-/// characters `.` must reject — `\n`, `\r`, `\u2028`, `\u2029` — as a
-/// four-hex-digit automaton. Anything looser would accept a string the schema
-/// rejects, which is the one thing this compiler never does.
-const GBNF_ANY_CHAR: &str = r#"[^"\\\u0000-\u001f] | "\\" (["\\/bft] | "u" ([13-9a-fA-F] [0-9a-fA-F]{3} | "2" [1-9a-fA-F] [0-9a-fA-F]{2} | "20" [013-9a-fA-F] [0-9a-fA-F] | "202" [0-7a-fA-F] | "0" [1-9a-fA-F] [0-9a-fA-F]{2} | "00" [1-9a-fA-F] [0-9a-fA-F] | "000" [0-9b-cB-Ce-fE-F]))"#;
-
 /// One positive shorthand a pattern may name.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shorthand {
@@ -2704,7 +2693,12 @@ impl<'a> RegexParser<'a> {
             }
             '.' => {
                 self.bump();
-                Ok(format!("({GBNF_ANY_CHAR})"))
+                char_set_rule(&complement_ranges(&[
+                    (0x0A, 0x0A),
+                    (0x0D, 0x0D),
+                    (0x2028, 0x2028),
+                    (0x2029, 0x2029),
+                ]))
             }
             '^' | '$' => Err(self.err(
                 "an anchor is only supported as a leading `^` or a trailing `$` (an anchor \
@@ -2784,14 +2778,16 @@ impl<'a> RegexParser<'a> {
             _ => None,
         };
         if let Some(sh) = shorthand {
-            return class_rule(sh.ranges());
+            return char_set_rule(sh.ranges());
         }
         match c {
             'D' | 'W' | 'S' => {
-                return Err(self.err(format!(
-                    "the negated shorthand `\\{c}` is not supported yet (it is the complement \
-                     over the whole codepoint space; `\\d`, `\\w` and `\\s` are)"
-                )))
+                let sh = match c {
+                    'D' => Shorthand::Digit,
+                    'W' => Shorthand::Word,
+                    _ => Shorthand::Space,
+                };
+                return char_set_rule(&complement_ranges(sh.ranges()));
             }
             'b' | 'B' => {
                 return Err(self.err("a word-boundary assertion (`\\b`, `\\B`) is not supported"))
@@ -2851,13 +2847,7 @@ impl<'a> RegexParser<'a> {
 
     /// A positive `[...]` class, with `[` already consumed.
     fn class(&mut self) -> Result<String, String> {
-        if self.peek() == Some('^') {
-            return Err(self.err(
-                "a negated class `[^...]` is not supported yet (it needs the escape-aware \
-                 complement over the whole codepoint space; a positive class over \
-                 U+0000..=U+00FF is)",
-            ));
-        }
+        let negated = self.eat('^');
         let mut ranges: Vec<(u32, u32)> = Vec::new();
         loop {
             let c = self
@@ -2871,10 +2861,15 @@ impl<'a> RegexParser<'a> {
                 self.maybe_range(lo, &mut ranges)?;
             }
         }
-        if ranges.is_empty() {
+        if ranges.is_empty() && !negated {
             return Err(self.err("an empty character class `[]`"));
         }
-        class_rule(&ranges)
+        let written = merge_ranges(ranges);
+        char_set_rule(&if negated {
+            complement_ranges(&written)
+        } else {
+            written
+        })
     }
 
     /// One class member: a shorthand set (expanded into `ranges`), or a codepoint
@@ -2887,11 +2882,14 @@ impl<'a> RegexParser<'a> {
         }
         let save = self.i;
         self.bump();
-        let shorthand = match self.peek() {
-            Some('d') => Some(Shorthand::Digit),
-            Some('w') => Some(Shorthand::Word),
-            Some('s') => Some(Shorthand::Space),
-            _ => None,
+        let (shorthand, negated) = match self.peek() {
+            Some('d') => (Some(Shorthand::Digit), false),
+            Some('w') => (Some(Shorthand::Word), false),
+            Some('s') => (Some(Shorthand::Space), false),
+            Some('D') => (Some(Shorthand::Digit), true),
+            Some('W') => (Some(Shorthand::Word), true),
+            Some('S') => (Some(Shorthand::Space), true),
+            _ => (None, false),
         };
         let Some(sh) = shorthand else {
             self.i = save;
@@ -2902,7 +2900,11 @@ impl<'a> RegexParser<'a> {
         {
             return Err(self.err("a class shorthand cannot be a range endpoint"));
         }
-        ranges.extend_from_slice(sh.ranges());
+        if negated {
+            ranges.extend(complement_ranges(sh.ranges()));
+        } else {
+            ranges.extend_from_slice(sh.ranges());
+        }
         Ok(None)
     }
 
@@ -2924,9 +2926,7 @@ impl<'a> RegexParser<'a> {
                     'u' => Ok(self.hex_char(4)? as u32),
                     'b' => Err(self.err("`\\b` inside a class is not supported")),
                     'd' | 'w' | 's' => Err(self.err("a class shorthand is not a single character")),
-                    'D' | 'W' | 'S' => Err(self.err(format!(
-                        "the negated shorthand `\\{c}` is not supported yet"
-                    ))),
+                    'D' | 'W' | 'S' => Err(self.err("a class shorthand is not a single character")),
                     '1'..='9' => Err(self.err("a backreference is not supported")),
                     other if !other.is_ascii_alphanumeric() => Ok(other as u32),
                     other => Err(self.err(format!("unsupported escape `\\{other}` in a class"))),
@@ -2963,7 +2963,7 @@ impl<'a> RegexParser<'a> {
 fn char_expr(c: char) -> Result<String, String> {
     let cp = c as u32;
     if cp <= 0xFF {
-        return class_rule(&[(cp, cp)]);
+        return char_set_rule(&[(cp, cp)]);
     }
     Ok(format!(
         "({} | {})",
@@ -3029,40 +3029,34 @@ fn gbnf_class_char(cp: u32) -> Result<String, String> {
     })
 }
 
-/// A GBNF expression matching **one decoded character** from `ranges`.
+/// The codepoints JSON allows to appear in a string **literally**: everything
+/// except the control characters, `"` and `\` — and the surrogate block, which
+/// has no UTF-8 encoding.
+fn plain_char_set(set: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    set_subtract(
+        set,
+        &[(0x00, 0x1F), (0x22, 0x22), (0x5C, 0x5C), (0xD800, 0xDFFF)],
+    )
+}
+
+/// A GBNF alternation matching **one decoded character** from `set`, escape-aware.
 ///
-/// The text may spell that character literally or as an escape, so both spellings
-/// are accepted: the literal branch is a class over the text (minus `"` and `\`,
-/// which JSON forbids raw), and the escape branch is the short escapes plus the
-/// `\uXXXX` form for every value in the set. Only U+0000..=U+00FF is supported;
-/// a wider class needs the general four-digit automaton (§8).
-fn class_rule(ranges: &[(u32, u32)]) -> Result<String, String> {
-    if let Some(&(_, hi)) = ranges.iter().find(|&&(_, hi)| hi > 0xFF) {
-        return Err(format!(
-            "json-schema: pattern: a class member above U+00FF (U+{hi:04X}) is not supported yet \
-             — it needs the general four-hex-digit automaton, and matching the literal bytes \
-             would accept what the schema rejects (docs/GRAMMAR-DESIGN.md §3)"
-        ));
+/// The JSON text may spell a character literally or as an escape, so both are
+/// accepted: a class over the literal members, the short escapes, a four-hex-digit
+/// automaton for the BMP part, and the surrogate-pair form for everything above
+/// U+FFFF. Every part of the set is *enumerated* rather than approximated — a
+/// language that accepts what the schema rejects is what this compiler refuses to
+/// produce — which is why a negated class is as expressible as a positive one and
+/// no class has to be refused for its size.
+fn char_set_rule(set: &[(u32, u32)]) -> Result<String, String> {
+    let set = merge_ranges(set.to_vec());
+    if set.is_empty() {
+        return Err("json-schema: pattern: a character set that admits nothing".to_string());
     }
-    let set = merge_ranges(ranges.to_vec());
     let mut alts: Vec<String> = Vec::new();
-    let plain = set_subtract(&set, &[(0x00, 0x1F), (0x22, 0x22), (0x5C, 0x5C)]);
+    let plain = plain_char_set(&set);
     if !plain.is_empty() {
-        let body: String = plain
-            .iter()
-            .map(|&(a, b)| {
-                let lo = gbnf_class_char(a).expect("ASCII is never a surrogate");
-                if a == b {
-                    lo
-                } else {
-                    format!(
-                        "{lo}-{}",
-                        gbnf_class_char(b).expect("ASCII is never a surrogate")
-                    )
-                }
-            })
-            .collect();
-        alts.push(format!("[{body}]"));
+        alts.push(format!("[{}]", class_members(&plain)?));
     }
     let mut escapes: Vec<String> = Vec::new();
     for (value, spelling) in [
@@ -3079,12 +3073,72 @@ fn class_rule(ranges: &[(u32, u32)]) -> Result<String, String> {
             escapes.push(spelling.to_string());
         }
     }
-    // `\uXXXX` for a value below U+0100 always has the `00` prefix. Each entry
-    // is a *whole* escape spelling, introducer included, so the group is joined
-    // without another one.
-    escapes.push(format!(r#""\\u" "00" {}"#, hex_pairs(&set)));
-    alts.push(format!("({})", escapes.join(" | ")));
+    let bmp = set_subtract(&intersect(&set, &[(0x0000, 0xFFFF)]), &[(0xD800, 0xDFFF)]);
+    if !bmp.is_empty() {
+        escapes.push(format!(r#""\\u" {}"#, hex_expr(&bmp, 4)));
+    }
+    let non_bmp = intersect(&set, &[(0x10000, 0x10FFFF)]);
+    if !non_bmp.is_empty() {
+        escapes.push(surrogate_pair_expr(&non_bmp));
+    }
+    if !escapes.is_empty() {
+        alts.push(format!("({})", escapes.join(" | ")));
+    }
     Ok(format!("({})", alts.join(" | ")))
+}
+
+/// A GBNF class body for codepoints that may appear literally in the text.
+fn class_members(ranges: &[(u32, u32)]) -> Result<String, String> {
+    let mut body = String::new();
+    for &(a, b) in ranges {
+        body.push_str(&gbnf_class_char(a)?);
+        if b != a {
+            body.push('-');
+            body.push_str(&gbnf_class_char(b)?);
+        }
+    }
+    Ok(body)
+}
+
+/// A GBNF expression matching exactly `nibbles` hex digits whose value is in
+/// `ranges` (everything below `16^nibbles`). A subtree that is fully covered
+/// collapses to a repetition, and nibbles that share a subtree share a class, so
+/// even a wide set stays a short expression.
+fn hex_expr(ranges: &[(u32, u32)], nibbles: u32) -> String {
+    if nibbles == 1 {
+        let values: Vec<u32> = (0..16).filter(|v| set_contains(ranges, *v)).collect();
+        return hex_class(&values);
+    }
+    let span = 1u32 << (4 * (nibbles - 1));
+    let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
+    for hi in 0..16u32 {
+        let base = hi * span;
+        let sub: Vec<(u32, u32)> = ranges
+            .iter()
+            .filter_map(|&(a, b)| {
+                let lo = a.max(base);
+                let hi_max = b.min(base + span - 1);
+                (lo <= hi_max).then(|| (lo - base, hi_max - base))
+            })
+            .collect();
+        if sub.is_empty() {
+            continue;
+        }
+        let expr = if covers_exactly(&sub, span - 1) {
+            format!("[0-9a-fA-F]{{{}}}", nibbles - 1)
+        } else {
+            hex_expr(&sub, nibbles - 1)
+        };
+        match groups.iter_mut().find(|(e, _)| *e == expr) {
+            Some((_, his)) => his.push(hi),
+            None => groups.push((expr, vec![hi])),
+        }
+    }
+    let alts: Vec<String> = groups
+        .into_iter()
+        .map(|(expr, his)| format!("{} {expr}", hex_class(&his)))
+        .collect();
+    format!("({})", alts.join(" | "))
 }
 
 /// A GBNF class of hex-digit characters for the nibble values in `values`.
@@ -3101,29 +3155,6 @@ fn hex_class(values: &[u32]) -> String {
         }
     }
     format!("[{body}]")
-}
-
-/// Two hex digits whose value (0..=255) is in `set`, as a GBNF expression.
-fn hex_pairs(set: &[(u32, u32)]) -> String {
-    let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
-    for hi in 0u32..16 {
-        let lo: Vec<u32> = (0..16)
-            .filter(|&l| set_contains(set, hi * 16 + l))
-            .collect();
-        if lo.is_empty() {
-            continue;
-        }
-        let expr = hex_class(&lo);
-        match groups.iter_mut().find(|(e, _)| *e == expr) {
-            Some((_, his)) => his.push(hi),
-            None => groups.push((expr, vec![hi])),
-        }
-    }
-    let alts: Vec<String> = groups
-        .into_iter()
-        .map(|(lo, hi)| format!("{} {lo}", hex_class(&hi)))
-        .collect();
-    format!("({})", alts.join(" | "))
 }
 
 /// Is `value` covered by the ascending, disjoint `ranges`?
@@ -3157,6 +3188,85 @@ fn set_subtract(ranges: &[(u32, u32)], holes: &[(u32, u32)]) -> Vec<(u32, u32)> 
             out.push((cursor, b));
         }
     }
+    out
+}
+
+/// The surrogate-pair spelling (`\uD8xx\uDCxx`) of every codepoint in `ranges`
+/// (all above U+FFFF), as a GBNF expression.
+fn surrogate_pair_expr(ranges: &[(u32, u32)]) -> String {
+    let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
+    for hi_index in 0..0x400u32 {
+        let base = 0x10000 + hi_index * 0x400;
+        let sub: Vec<(u32, u32)> = ranges
+            .iter()
+            .filter_map(|&(a, b)| {
+                let lo = a.max(base);
+                let hi_max = b.min(base + 0x3FF);
+                (lo <= hi_max).then(|| (lo - base, hi_max - base))
+            })
+            .collect();
+        if sub.is_empty() {
+            continue;
+        }
+        let lo_values: Vec<(u32, u32)> =
+            sub.iter().map(|&(a, b)| (a + 0xDC00, b + 0xDC00)).collect();
+        // The low half is matched as its **escape spelling**, never as a literal
+        // surrogate (no UTF-8 text can hold one).
+        groups.push((hex_expr(&lo_values, 4), vec![hi_index + 0xD800]));
+    }
+    let mut merged: Vec<(String, Vec<u32>)> = Vec::new();
+    for (expr, his) in groups {
+        match merged.iter_mut().find(|(e, _)| *e == expr) {
+            Some((_, all)) => all.extend(his),
+            None => merged.push((expr, his)),
+        }
+    }
+    let alts: Vec<String> = merged
+        .into_iter()
+        .map(|(lo, hi)| {
+            let hi_ranges: Vec<(u32, u32)> = hi.iter().map(|&v| (v, v)).collect();
+            format!(r#""\\u" {} "\\u" {lo}"#, hex_expr(&hi_ranges, 4))
+        })
+        .collect();
+    format!("({})", alts.join(" | "))
+}
+
+/// Are the ascending ranges exactly one range covering `[0, hi]`?
+fn covers_exactly(ranges: &[(u32, u32)], hi: u32) -> bool {
+    ranges == [(0, hi)]
+}
+
+/// The intersection of two ascending, disjoint range lists.
+fn intersect(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for &(alo, ahi) in a {
+        for &(blo, bhi) in b {
+            let lo = alo.max(blo);
+            let hi = ahi.min(bhi);
+            if lo <= hi {
+                out.push((lo, hi));
+            }
+        }
+    }
+    merge_ranges(out)
+}
+
+/// The complement of `ranges` over the whole codepoint space, less the surrogate
+/// block (which no JSON string can encode).
+fn complement_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    const MAX: u32 = 0x10FFFF;
+    let mut out = Vec::new();
+    let mut next: u32 = 0;
+    for &(a, b) in ranges {
+        if a > next {
+            out.extend(non_surrogate_parts(next, a - 1));
+        }
+        if b >= MAX {
+            return out;
+        }
+        next = next.max(b + 1);
+    }
+    out.extend(non_surrogate_parts(next, MAX));
     out
 }
 
