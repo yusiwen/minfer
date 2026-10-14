@@ -7495,7 +7495,7 @@ exclusive, ranges compiled by digit decomposition), `number`, `boolean`,
 `null`, `anyOf`/`oneOf`, `$defs`/`definitions` + local `$ref` (recursive
 schemas work). Refused loudly: `contentEncoding`/`contentMediaType`,
 non-integer numeric bounds on `number`, `multipleOf`, `propertyNames`,
-`patternProperties`, `dependent*`, `uniqueItems`, `contains`, `allOf`, `not`,
+`patternProperties`, `dependent*`, `uniqueItems`, `contains`, `not`,
 `if`/`then`/`else`, remote or nested `$ref`, `items` as an array (the draft-07
 tuple form), and a `required` name that is not declared. (**`minLength`/
 `maxLength`, four `format` validators and `pattern` left this list on 2026-10-14**
@@ -7570,7 +7570,8 @@ allowance.
 subset of the schema's language: extras may be interleaved only where no
 required property is pending); `oneOf` is compiled as `anyOf`; only
 integer-valued numeric bounds are compiled (`number` + bounds is refused);
-`multipleOf` is refused, and `pattern` is a named regex subset (**landed
+`multipleOf` is refused, `allOf` is merged for object schemas, and `pattern` is
+a named regex subset (**landed
 2026-10-14 as #125's slice 3, with `minLength`/`maxLength` and the four `format`
 validators in slice 2 and the class shorthands `\d`/`\w`/`\s` in slice 1 — the
 issue is the record; the escape-aware automaton makes negated classes,
@@ -7586,7 +7587,8 @@ the change but no device run exercises it. Two follow-up issues carry what was
 deliberately left out: [#125](https://github.com/yusiwen/minfer/issues/125) (the
 GBNF/JSON-Schema constructs the compiler refuses: `format` outside the four,
 real-valued numeric bounds and `multipleOf`, property permutations,
-an exact `oneOf`, `allOf`/`not`, and `\p{...}`) and
+an exact `oneOf`, `not`/`if`-`then`-`else`, the `allOf` shapes a merge cannot
+express, and `\p{...}`) and
 [#126](https://github.com/yusiwen/minfer/issues/126) (index the vocabulary by
 first codepoint to cut the residual mask cost — **DONE 2026-10-14**, below).
 

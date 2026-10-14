@@ -1809,7 +1809,6 @@ const REFUSED_KEYWORDS: &[&str] = &[
     "contains",
     "minContains",
     "maxContains",
-    "allOf",
     "not",
     "if",
     "then",
@@ -1926,6 +1925,38 @@ impl JsonCompiler {
                      docs/GRAMMAR-DESIGN.md §3); remove it or constrain the model another way"
                 ));
             }
+        }
+
+        // `allOf`: the intersection of the branches, compiled by merging them.
+        // Only object schemas can be merged exactly; anything else would need a
+        // real intersection, so it is refused by name.
+        if let Some(branches) = obj.get("allOf") {
+            let extra: Vec<&str> = obj
+                .keys()
+                .filter(|k| !is_annotation(k) && k.as_str() != "allOf" && k.as_str() != "type")
+                .map(|k| k.as_str())
+                .collect();
+            if !extra.is_empty() {
+                return Err(format!(
+                    "json-schema: `allOf` combined with {extra:?} is not supported (the siblings \
+                     would have to be intersected with the union of the branches)"
+                ));
+            }
+            match obj.get("type") {
+                None => {}
+                Some(Value::String(t)) if t == "object" => {}
+                Some(other) => {
+                    return Err(format!(
+                        "json-schema: `allOf` is compiled for object schemas only \
+                         (`type: \"object\"`), got {}",
+                        json_type_name(other)
+                    ))
+                }
+            }
+            let Value::Array(branches) = branches else {
+                return Err("json-schema: `allOf` must be an array of schemas".to_string());
+            };
+            return self.compile_all_of(branches, hint);
         }
 
         // `const` / `enum` first: they are the whole language of the schema.
@@ -2162,6 +2193,207 @@ impl JsonCompiler {
             (m, None) => Ok(format!(r#""\"" j-char{{{m},}} "\"""#)),
             (m, Some(n)) => Ok(format!(r#""\"" j-char{{{m},{n}}} "\"""#)),
         }
+    }
+
+    /// Compile `allOf` by **merging** its branches: the union of the declared
+    /// properties (restricted to the names every closed branch allows), the union
+    /// of `required`, and the `additionalProperties` the branches imply.
+    ///
+    /// That is the exact intersection for object schemas — which is why a conflict
+    /// is refused rather than resolved: the same property declared twice with
+    /// different schemas, two different open-ended `additionalProperties`
+    /// schemas, a required name a closed branch forbids, or a branch that is not
+    /// an object schema all need a real intersection, and a guess would silently
+    /// widen or narrow the language.
+    fn compile_all_of(&mut self, branches: &[Value], hint: &str) -> Result<String, String> {
+        if branches.is_empty() {
+            return Err("json-schema: `allOf` with no branches admits nothing".to_string());
+        }
+        // One pass to validate the branches and collect what they say.
+        let mut declared: Vec<(String, Value, usize)> = Vec::new();
+        let mut required: Vec<String> = Vec::new();
+        let mut open_additional: Option<Value> = None;
+        let mut closed: Vec<Vec<String>> = Vec::new();
+        for (i, branch) in branches.iter().enumerate() {
+            let schema = self.resolve_branch(branch, 0)?;
+            let obj = schema.as_object().ok_or_else(|| {
+                format!("json-schema: `allOf` branch {i} must be an object schema")
+            })?;
+            // The type is checked first: a branch that is not an object schema is
+            // a more fundamental refusal than one of its keywords.
+            match obj.get("type") {
+                None => {}
+                Some(Value::String(t)) if t == "object" => {}
+                Some(other) => {
+                    return Err(format!(
+                        "json-schema: `allOf` branch {i} is not an object schema (`type` is {})",
+                        json_type_name(other)
+                    ))
+                }
+            }
+            for key in obj.keys() {
+                if is_annotation(key)
+                    || matches!(
+                        key.as_str(),
+                        "$ref" | "type" | "properties" | "required" | "additionalProperties"
+                    )
+                {
+                    continue;
+                }
+                return Err(format!(
+                    "json-schema: `allOf` branch {i} uses `{key}`, which cannot be intersected \
+                     with the other branches (only `properties`, `required` and \
+                     `additionalProperties` merge)"
+                ));
+            }
+            let names: Vec<String> = match obj.get("properties") {
+                None => Vec::new(),
+                Some(Value::Object(props)) => {
+                    for (name, sub) in props {
+                        declared.push((name.clone(), sub.clone(), i));
+                    }
+                    props.keys().cloned().collect()
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "json-schema: `allOf` branch {i} has a non-object `properties`"
+                    ))
+                }
+            };
+            match obj.get("required") {
+                None => {}
+                Some(Value::Array(req)) => {
+                    for r in req {
+                        let name = r.as_str().ok_or_else(|| {
+                            format!(
+                                "json-schema: `allOf` branch {i} has a non-string `required` entry"
+                            )
+                        })?;
+                        if !required.iter().any(|x| x == name) {
+                            required.push(name.to_string());
+                        }
+                    }
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "json-schema: `allOf` branch {i} has a non-array `required`"
+                    ))
+                }
+            }
+            match obj.get("additionalProperties") {
+                None => {}
+                Some(Value::Bool(false)) => closed.push(names),
+                Some(v) => {
+                    match &open_additional {
+                        None => open_additional = Some(v.clone()),
+                        Some(prev) if prev == v => {}
+                        Some(_) => return Err(
+                            "json-schema: `allOf` branches disagree on `additionalProperties` — \
+                             the intersection is not expressible"
+                                .to_string(),
+                        ),
+                    }
+                }
+            }
+        }
+        // A closed branch allows exactly the names it declares, so the merged
+        // object keeps the intersection of every closed branch's set.
+        let allowed: Option<Vec<String>> = if closed.is_empty() {
+            None
+        } else {
+            let mut set = closed[0].clone();
+            for c in &closed[1..] {
+                set.retain(|n| c.contains(n));
+            }
+            Some(set)
+        };
+        let permits = |name: &str| {
+            allowed
+                .as_ref()
+                .is_none_or(|set| set.contains(&name.to_string()))
+        };
+        let mut properties: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (name, sub, branch) in &declared {
+            if !permits(name) {
+                continue;
+            }
+            match properties.get(name) {
+                None => {
+                    properties.insert(name.clone(), sub.clone());
+                }
+                Some(existing) if existing == sub => {}
+                Some(_) => {
+                    return Err(format!(
+                        "json-schema: `allOf` declares `{name}` in more than one branch with \
+                         different schemas (branch {branch} differs) — the intersection is not \
+                         expressible"
+                    ))
+                }
+            }
+        }
+        for name in &required {
+            if !permits(name) {
+                return Err(format!(
+                    "json-schema: `allOf` admits nothing: `{name}` is required by one branch and \
+                     forbidden by a closed one"
+                ));
+            }
+        }
+        let mut merged = serde_json::Map::new();
+        merged.insert("type".to_string(), Value::String("object".to_string()));
+        if !properties.is_empty() {
+            merged.insert("properties".to_string(), Value::Object(properties));
+        }
+        if !required.is_empty() {
+            merged.insert(
+                "required".to_string(),
+                Value::Array(required.into_iter().map(Value::String).collect()),
+            );
+        }
+        if let Some(closed) = closed.first() {
+            // The merged object is closed too: the names above are the only ones
+            // every closed branch allows.
+            let _ = closed;
+            merged.insert("additionalProperties".to_string(), Value::Bool(false));
+        } else if let Some(v) = open_additional {
+            merged.insert("additionalProperties".to_string(), v);
+        }
+        self.compile_object(&merged, hint)
+    }
+
+    /// A branch of `allOf`, with a local `$ref` resolved to the schema it names so
+    /// the merge sees its properties. A cycle is refused rather than looped.
+    fn resolve_branch(&self, branch: &Value, depth: usize) -> Result<Value, String> {
+        if depth > 8 {
+            return Err("json-schema: `allOf` branch `$ref` chain exceeds 8 levels".to_string());
+        }
+        let obj = branch
+            .as_object()
+            .ok_or_else(|| "json-schema: `allOf` branch must be an object schema".to_string())?;
+        let Some(Value::String(r)) = obj.get("$ref") else {
+            return Ok(branch.clone());
+        };
+        let extra: Vec<&str> = obj
+            .keys()
+            .filter(|k| !is_annotation(k) && k.as_str() != "$ref")
+            .map(|k| k.as_str())
+            .collect();
+        if !extra.is_empty() {
+            return Err(format!(
+                "json-schema: `$ref` combined with {extra:?} is not supported (the siblings \
+                 would be silently dropped)"
+            ));
+        }
+        let name = r
+            .strip_prefix("#/$defs/")
+            .or_else(|| r.strip_prefix("#/definitions/"))
+            .ok_or_else(|| {
+                format!("json-schema: `$ref: \"{r}\"` is not supported inside `allOf`")
+            })?;
+        let schema = self.defs.get(name).cloned().ok_or_else(|| {
+            format!("json-schema: `$ref: \"{r}\"` does not resolve to a definition")
+        })?;
+        self.resolve_branch(&schema, depth + 1)
     }
 
     /// Refuse keywords combined with a terminal form (`const`/`enum`/`anyOf`)

@@ -762,6 +762,166 @@ fn json_schema_pattern_refusals_are_named() {
 }
 
 #[test]
+fn json_schema_all_of_merges_object_schemas() {
+    // Two open branches: the union of their properties and required names.
+    let g = schema(json!({"allOf": [
+        {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+        {"type": "object", "properties": {"b": {"type": "integer"}}, "required": ["b"]}
+    ]}));
+    assert!(g.accepts(br#"{"a":"x","b":1}"#));
+    assert!(
+        !g.accepts(br#"{"a":"x"}"#),
+        "`b` is required by the second branch"
+    );
+    assert!(
+        !g.accepts(br#"{"b":1}"#),
+        "`a` is required by the first branch"
+    );
+    assert!(!g.accepts(br#"{"a":1,"b":1}"#), "`a` is a string");
+    assert!(
+        g.accepts(br#"{"a":"x","b":1,"c":2}"#),
+        "neither branch closes the object, so an extra property is allowed"
+    );
+
+    // A branch may be a local `$ref`, resolved before the merge.
+    let g = schema(json!({
+        "$defs": {"base": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}},
+        "allOf": [
+            {"$ref": "#/$defs/base"},
+            {"properties": {"b": {"type": "integer"}}, "required": ["b"]}
+        ]
+    }));
+    assert!(g.accepts(br#"{"a":"x","b":1}"#));
+    assert!(!g.accepts(br#"{"a":"x"}"#));
+    assert!(
+        !g.accepts(br#"{"a":1,"b":1}"#),
+        "the resolved branch's own property schema survives the merge"
+    );
+
+    // The same property with the same schema in both branches is one property.
+    let g = schema(json!({"allOf": [
+        {"properties": {"a": {"type": "string"}}},
+        {"properties": {"a": {"type": "string"}}, "required": ["a"]}
+    ]}));
+    assert!(g.accepts(br#"{"a":"x"}"#));
+    assert!(!g.accepts(br#"{"a":1}"#));
+
+    // A closed branch allows exactly what it declares: another branch's property
+    // is dropped from the merge, and the merged object is closed.
+    let g = schema(json!({"allOf": [
+        {"properties": {"a": {"type": "string"}}, "additionalProperties": false},
+        {"properties": {"a": {"type": "string"}, "b": {"type": "integer"}}}
+    ]}));
+    assert!(g.accepts(br#"{"a":"x"}"#));
+    assert!(
+        !g.accepts(br#"{"a":"x","b":1}"#),
+        "the closed branch forbids `b`"
+    );
+    assert!(
+        !g.accepts(br#"{"a":"x","c":1}"#),
+        "and it forbids every other extra"
+    );
+
+    // The closed branch declares both, so both survive and `b` is required.
+    let g = schema(json!({"allOf": [
+        {
+            "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+            "additionalProperties": false
+        },
+        {"properties": {"b": {"type": "integer"}}, "required": ["b"]}
+    ]}));
+    assert!(g.accepts(br#"{"b":1}"#));
+    assert!(g.accepts(br#"{"a":"x","b":2}"#));
+    assert!(!g.accepts(br#"{"b":1,"c":2}"#));
+    assert!(!g.accepts(br#"{"a":"x"}"#));
+
+    // `type: "object"` next to `allOf` is accepted; the annotations are ignored.
+    let g = schema(json!({
+        "type": "object",
+        "title": "merged",
+        "allOf": [{"properties": {"a": {"type": "boolean"}}, "required": ["a"]}]
+    }));
+    assert!(g.accepts(br#"{"a":true}"#));
+    assert!(!g.accepts(br#"{"a":1}"#));
+}
+
+#[test]
+fn json_schema_all_of_refusals_are_named() {
+    let cases: &[(Value, &str)] = &[
+        (json!({"allOf": []}), "no branches"),
+        (
+            json!({"allOf": [{"type": "string", "minLength": 1}]}),
+            "not an object schema",
+        ),
+        (
+            json!({"allOf": [{"properties": {"a": {"type": "string"}}}, {"minItems": 1}]}),
+            "cannot be intersected",
+        ),
+        (
+            json!({"allOf": [
+                {"properties": {"a": {"type": "string"}}},
+                {"properties": {"a": {"type": "integer"}}}
+            ]}),
+            "different schemas",
+        ),
+        (
+            json!({"allOf": [
+                {"additionalProperties": {"type": "string"}},
+                {"additionalProperties": {"type": "integer"}}
+            ]}),
+            "disagree on `additionalProperties`",
+        ),
+        (
+            json!({"allOf": [
+                {"properties": {"a": {"type": "string"}}, "additionalProperties": false},
+                {"required": ["b"]}
+            ]}),
+            "admits nothing",
+        ),
+        (
+            json!({"allOf": [{"properties": {"a": {}}}], "properties": {"b": {}}}),
+            "combined",
+        ),
+        (
+            json!({"allOf": [{"properties": {"a": {}}}], "const": {}}),
+            "combined",
+        ),
+        (
+            json!({"type": "string", "allOf": [{"properties": {"a": {}}}]}),
+            "object schemas only",
+        ),
+        (
+            json!({"allOf": [{"$ref": "https://example.com/x.json"}]}),
+            "not supported inside",
+        ),
+        // A self-referential definition inside `allOf` is a cycle, refused
+        // rather than followed; a nested `allOf` is simply another keyword that
+        // cannot be merged.
+        (
+            json!({
+                "$defs": {"loop": {"$ref": "#/$defs/loop"}},
+                "allOf": [{"$ref": "#/$defs/loop"}]
+            }),
+            "exceeds 8 levels",
+        ),
+        (
+            json!({
+                "$defs": {"nested": {"allOf": [{"properties": {"a": {}}}]}},
+                "allOf": [{"$ref": "#/$defs/nested"}]
+            }),
+            "cannot be intersected",
+        ),
+    ];
+    for (schema, needle) in cases {
+        let err = schema_err(schema.clone());
+        assert!(
+            err.contains(needle),
+            "schema {schema} -> `{err}` (wanted `{needle}`)"
+        );
+    }
+}
+
+#[test]
 fn json_schema_refusals_are_named() {
     let cases: &[(Value, &str)] = &[
         // `minLength`/`maxLength`/`format` are supported on `type: "string"`
