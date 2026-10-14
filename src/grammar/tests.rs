@@ -515,10 +515,127 @@ fn json_defs_ref_and_recursion() {
 }
 
 #[test]
+fn json_schema_string_length_bounds_are_exact() {
+    // `minLength: 2, maxLength: 3` is the boundary case: 1 must be rejected, 2
+    // and 3 accepted, 4 rejected — the same shape as the integer-bound gate.
+    let g = schema(json!({"type": "string", "minLength": 2, "maxLength": 3}));
+    for (text, want) in [
+        (r#""""#, false),
+        (r#""a""#, false),
+        (r#""ab""#, true),
+        (r#""abc""#, true),
+        (r#""abcd""#, false),
+    ] {
+        assert_eq!(g.accepts(text.as_bytes()), want, "{text}");
+    }
+
+    // An open upper bound, and the two one-sided forms.
+    let at_least = schema(json!({"type": "string", "minLength": 2}));
+    assert!(!at_least.accepts(br#""a""#));
+    assert!(at_least.accepts(br#""ab""#));
+    assert!(at_least.accepts(br#""abcdefghij""#));
+    let at_most = schema(json!({"type": "string", "maxLength": 1}));
+    assert!(at_most.accepts(br#""""#));
+    assert!(at_most.accepts(br#""a""#));
+    assert!(!at_most.accepts(br#""ab""#));
+
+    // `minLength: 0` alone is the unconstrained string, not a new rule.
+    let any_len = schema(json!({"type": "string", "minLength": 0}));
+    assert!(any_len.accepts(br#""""#));
+    assert!(any_len.accepts(br#""anything at all""#));
+
+    // The bound counts *characters*, not bytes or escape syntax: `j-char`
+    // matches one plain character or one complete escape, so `\u0041` is one
+    // character (and a surrogate pair written as two escapes is two). Asserted
+    // so §8's statement of it cannot rot silently.
+    let exactly_one = schema(json!({"type": "string", "minLength": 1, "maxLength": 1}));
+    assert!(exactly_one.accepts(br#""A""#));
+    assert!(
+        exactly_one.accepts(br#""\u0041""#),
+        "an escape is one character, not six"
+    );
+    assert!(exactly_one.accepts(br#""\n""#), "a short escape too");
+    assert!(!exactly_one.accepts(br#""\u0041\u0042""#), "two characters");
+}
+
+#[test]
+fn json_schema_string_formats_are_the_four_the_reference_implements() {
+    let date = schema(json!({"type": "string", "format": "date"}));
+    assert!(date.accepts(br#""2026-10-14""#));
+    assert!(!date.accepts(br#""2026-13-14""#), "month 13");
+    assert!(!date.accepts(br#""2026-10-00""#), "day 00");
+    assert!(!date.accepts(br#""2026-10-32""#), "day 32");
+    assert!(!date.accepts(br#""2026-1-14""#), "month needs two digits");
+
+    let time = schema(json!({"type": "string", "format": "time"}));
+    assert!(time.accepts(br#""00:00:00Z""#));
+    assert!(time.accepts(br#""23:59:59.999+01:30""#));
+    assert!(!time.accepts(br#""24:00:00Z""#), "hour 24");
+    assert!(!time.accepts(br#""00:60:00Z""#), "minute 60");
+    assert!(!time.accepts(br#""00:00:00""#), "the offset is required");
+
+    let date_time = schema(json!({"type": "string", "format": "date-time"}));
+    assert!(date_time.accepts(br#""2026-10-14T00:00:00Z""#));
+    assert!(
+        !date_time.accepts(br#""2026-10-14 00:00:00Z""#),
+        "the `T` is literal"
+    );
+    assert!(!date_time.accepts(br#""2026-10-14T00:00:00""#));
+
+    // `uuid` and its versioned spellings share one rule (the version digit is
+    // not checked, exactly as in the reference).
+    for name in ["uuid", "uuid1", "uuid4", "uuid5"] {
+        let g = schema(json!({"type": "string", "format": name}));
+        assert!(
+            g.accepts(br#""01234567-89ab-cdef-0123-456789abcdef""#),
+            "{name}"
+        );
+        assert!(g.accepts(br#""01234567-89AB-CDEF-0123-456789ABCDEF""#));
+        assert!(
+            !g.accepts(br#""01234567-89ab-cdef-0123-456789abcde""#),
+            "{name}"
+        );
+        assert!(
+            !g.accepts(br#""01234567-89ab-cdef-0123-456789abcdeg""#),
+            "{name}: `g` is not hex"
+        );
+    }
+}
+
+#[test]
 fn json_schema_refusals_are_named() {
     let cases: &[(Value, &str)] = &[
         (json!({"type": "string", "pattern": "^a"}), "pattern"),
-        (json!({"type": "string", "minLength": 2}), "minLength"),
+        // `minLength`/`maxLength`/`format` are supported on `type: "string"`
+        // alone, and the combinations that would need intersection are refused
+        // by name rather than approximated.
+        (
+            json!({"type": "integer", "minLength": 2}),
+            "only supported on",
+        ),
+        (json!({"minLength": 2}), "only supported on"),
+        (
+            json!({"type": ["string", "null"], "maxLength": 2}),
+            "only supported on",
+        ),
+        (
+            json!({"type": "string", "minLength": 5, "maxLength": 2}),
+            "exceeds `maxLength`",
+        ),
+        (
+            json!({"type": "string", "minLength": -1}),
+            "non-negative integer",
+        ),
+        (json!({"type": "string", "format": 7}), "must be a string"),
+        (
+            json!({"type": "string", "format": "email"}),
+            "format: \"email\"",
+        ),
+        (json!({"type": "string", "format": "ipv4"}), "not supported"),
+        (
+            json!({"type": "string", "format": "date-time", "minLength": 4}),
+            "combined with",
+        ),
         (json!({"allOf": [{"type": "string"}]}), "allOf"),
         (json!({"not": {"type": "string"}}), "not"),
         (

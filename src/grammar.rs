@@ -1797,9 +1797,6 @@ const GENERIC_RULES: &[(&str, &str)] = &[
 /// is a named refusal (design §3).
 const REFUSED_KEYWORDS: &[&str] = &[
     "pattern",
-    "format",
-    "minLength",
-    "maxLength",
     "contentEncoding",
     "contentMediaType",
     "multipleOf",
@@ -1821,6 +1818,20 @@ const REFUSED_KEYWORDS: &[&str] = &[
     "unevaluatedProperties",
     "unevaluatedItems",
 ];
+
+/// Keywords that narrow `type: "string"` and are implemented only there. On any
+/// other type the constraint would be silently dropped, which this compiler
+/// refuses rather than ignores.
+const STRING_ONLY_KEYWORDS: &[&str] = &["format", "minLength", "maxLength"];
+
+/// The three `format` bodies the reference also implements. `date` and `time`
+/// are `STRING_FORMAT_RULES` in llama.cpp's `json-schema-to-grammar.cpp`; the
+/// `uuid` primitive there accepts `uuid` and `uuid1`..`uuid5` (version digit
+/// unchecked), which is what [`format_rule`] does.
+const GBNF_DATE: &str =
+    r#"[0-9]{4} "-" ("0" [1-9] | "1" [0-2]) "-" ("0" [1-9] | [1-2][0-9] | "3" [0-1])"#;
+const GBNF_TIME: &str = r#"([01][0-9] | "2" [0-3]) ":" [0-5][0-9] ":" [0-5][0-9] ("." [0-9]{3})? ("Z" | ("+" | "-") ([01][0-9] | "2" [0-3]) ":" [0-5][0-9])"#;
+const GBNF_UUID: &str = r#"[0-9a-fA-F]{8} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{4} "-" [0-9a-fA-F]{12}"#;
 
 struct JsonCompiler {
     rules: Vec<(String, String)>,
@@ -2031,6 +2042,19 @@ impl JsonCompiler {
                 "json-schema: array keywords present but `type` is {types:?}"
             ));
         }
+        // The string keywords are implemented for `type: "string"` alone.
+        let string_kws: Vec<&str> = STRING_ONLY_KEYWORDS
+            .iter()
+            .copied()
+            .filter(|k| obj.contains_key(*k))
+            .collect();
+        if !string_kws.is_empty() && !(types.len() == 1 && types[0] == "string") {
+            return Err(format!(
+                "json-schema: {string_kws:?} is only supported on `type: \"string\"` — here the \
+                 constraint would be silently dropped; give the schema that single type, or split \
+                 a union into `anyOf` branches"
+            ));
+        }
 
         if types.is_empty() {
             if has_object_kw {
@@ -2054,7 +2078,7 @@ impl JsonCompiler {
         match types[0] {
             "object" => self.compile_object(obj, hint),
             "array" => self.compile_array(obj, hint),
-            "string" => Ok("j-string".to_string()),
+            "string" => self.compile_string(obj),
             "number" => {
                 if numeric_bound_shape(obj)? {
                     return Err(
@@ -2074,6 +2098,49 @@ impl JsonCompiler {
                 "json-schema: unsupported `type` value `{other}` (supported: object, array, \
                  string, number, integer, boolean, null)"
             )),
+        }
+    }
+
+    /// `type: "string"`: the generic `j-string`, narrowed by `minLength` /
+    /// `maxLength` and/or a `format`.
+    ///
+    /// The bounds count characters, not bytes: `j-char` matches one plain
+    /// character **or one complete escape** (`j-esc` swallows the backslash and
+    /// the whole `\uXXXX` body), so `"\u0041"` is one character, exactly as
+    /// `"\A"` would be. A surrogate pair written as two escapes counts as two.
+    fn compile_string(&mut self, obj: &serde_json::Map<String, Value>) -> Result<String, String> {
+        let format = obj.get("format");
+        let min = get_count(obj, "minLength")?;
+        let max = get_count(obj, "maxLength")?;
+        if let Some(hi) = max {
+            if min.unwrap_or(0) > hi {
+                return Err(format!(
+                    "json-schema: `minLength` ({}) exceeds `maxLength` ({hi}) — no value can \
+                     satisfy it",
+                    min.unwrap_or(0)
+                ));
+            }
+        }
+        if format.is_some() && (min.is_some() || max.is_some()) {
+            return Err(
+                "json-schema: `format` combined with `minLength`/`maxLength` is not supported \
+                 (the two constraints would have to be intersected); keep one of them"
+                    .to_string(),
+            );
+        }
+        if let Some(f) = format {
+            let name = f.as_str().ok_or_else(|| {
+                format!(
+                    "json-schema: `format` must be a string, got {}",
+                    json_type_name(f)
+                )
+            })?;
+            return format_rule(name);
+        }
+        match (min.unwrap_or(0), max) {
+            (0, None) => Ok("j-string".to_string()),
+            (m, None) => Ok(format!(r#""\"" j-char{{{m},}} "\"""#)),
+            (m, Some(n)) => Ok(format!(r#""\"" j-char{{{m},{n}}} "\"""#)),
         }
     }
 
@@ -2478,6 +2545,30 @@ fn get_count(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u
             json_type_name(other)
         )),
     }
+}
+
+/// The quoted GBNF for one supported `format`, or a refusal that names it.
+///
+/// Only the validators the reference actually implements are supported. The
+/// others — `email`, `uri`, `hostname`, `ipv4`, `ipv6` — are **refused by
+/// name**: a loose rule for them would accept instances the schema rejects, and
+/// llama.cpp only uses those spellings to infer "this is a string".
+fn format_rule(name: &str) -> Result<String, String> {
+    let body = match name {
+        "date" => GBNF_DATE.to_string(),
+        "time" => GBNF_TIME.to_string(),
+        "date-time" => format!(r#"{GBNF_DATE} "T" {GBNF_TIME}"#),
+        "uuid" | "uuid1" | "uuid2" | "uuid3" | "uuid4" | "uuid5" => GBNF_UUID.to_string(),
+        other => {
+            return Err(format!(
+                "json-schema: `format: \"{other}\"` is not supported (supported: date, time, \
+                 date-time, uuid, uuid1..uuid5 — the four validators the reference implements; \
+                 a loose rule for the others would accept what the schema rejects). See \
+                 docs/GRAMMAR-DESIGN.md §3"
+            ))
+        }
+    };
+    Ok(format!(r#""\"" {body} "\"""#))
 }
 
 /// Read one inclusive integer bound, folding an exclusive bound into it. The
