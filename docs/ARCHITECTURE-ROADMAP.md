@@ -71,7 +71,7 @@ and mostly *enabled* by fixing (1) and (2) first.
 | 12 | Backend registry (drop the hard-coded 3-way enum/match) — **DONE (F4, 2026-09-24)**: the enum is a `Copy`/`Hash`/`Ord` handle over a fixed id space and the name-keyed table lives in `graph/registry.rs`; the nine match sites are gone. The set is still closed at compile time — this makes it data, not pluggable at runtime | L6 | M | 4–7 d |
 | 11 | CPU: AVX2/AVX-512 for the K-quant dots + weight repacking | L7 | L | 1–2 w |
 | 10 | Chunked prefill (`n_batch` actually used) — **E3, landed 2026-09-22** | L2+L5 | M | 3–5 d |
-| 15 | Grammar / JSON-schema constrained decoding — **DONE (F2, 2026-09-24)**; the mask is host-side and per state (5.4 ms on a 151k vocabulary) | L7 | M | 4–6 d |
+| 15 | Grammar / JSON-schema constrained decoding — **DONE (F2, 2026-09-24)**; the mask is host-side, cached per state, and first-codepoint indexed (**#126, 2026-10-14**: 49.5 ms for a 13-state JSON response on a 151k vocabulary, down from 90.4 ms) | L7 | M | 4–6 d |
 | 23 | Op × dtype × backend correctness matrix in CI | L8 | M | 3–5 d |
 
 ---
@@ -607,7 +607,12 @@ shortcut; CLI `--grammar`/`--json-schema`, server `response_format`
 accepted subset: `docs/GRAMMAR-DESIGN.md`. What it deliberately does not do
 (and refuses loudly rather than guessing): `pattern`/`minLength`/`maxLength`,
 `multipleOf`, real-valued numeric bounds, object property permutations, and a
-device-side mask — the mask is host work before any backend runs. Still
+device-side mask — the mask is host work before any backend runs. The mask's own
+cost was cut on 2026-10-14 (**#126**): token ids are indexed by the first
+codepoint of their piece, so a state walks only the buckets its frontier accepts
+(49.5 ms for a 13-state JSON response on the 151k vocabulary, down from 90.4 ms);
+a state inside a JSON string body accepts nearly every codepoint and still walks
+every piece. Still
 missing: top-n-sigma, adaptive-p, infill. 🟡
 
 **No LoRA (Low-Rank Adaptation) / adapter support.** There is no adapter path

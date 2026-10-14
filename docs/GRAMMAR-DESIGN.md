@@ -218,19 +218,43 @@ nothing) is never allowed.
 ### The mask
 
 `Grammar::mask(&state) -> Arc<[u64]>` (a packed bitset over token ids) is the
-only O(vocabulary) step. It is cached **by state key** in `GrammarState`
+only vocabulary-wide step. It is cached **by state key** in `GrammarState`
 (`HashMap<StateKey, Arc<[u64]>>`, bounded at 64 entries, cleared when full), so a
 run that revisits a state (JSON's "expect a key or `}`" state is revisited after
-every member) pays for the vocabulary once per distinct state. The compiled
+every member) pays for it once per distinct state. The compiled
 `Grammar` itself is immutable and shared by `Arc`, so a cache per run needs no
 lock.
 
-Inside one mask computation the start state is fixed, so "consume one codepoint"
-is a function of `(state, codepoint)`; the walk interns successor states and
-memoizes the transition. That turns the O(vocabulary × piece length) walk into
-O(distinct transitions), which is what makes the cost acceptable: **5.4 ms per
-new state on the 151,936-token Qwen vocabulary** (measured, §9), down from
-71.3 ms before the memo was added.
+Two independent things reduce the walk itself:
+
+1. **The per-call transition memo.** Inside one mask computation the start state
+   is fixed, so "consume one codepoint" is a function of `(state, codepoint)`;
+   the walk interns successor states and memoizes the transition, turning the
+   O(vocabulary × piece length) walk into O(distinct transitions). That is what
+   took the cost from 71.3 ms to 5.4 ms per new state (§9).
+2. **The first-codepoint index ([#126](https://github.com/yusiwen/minfer/issues/126)).**
+   Only a piece's *first* codepoint decides whether the piece can begin; the memo
+   decides the rest. `Grammar` therefore indexes its token ids by that codepoint
+   once, at compile time, and a state walks only the buckets its frontier accepts.
+   A piece whose leading bytes are an *incomplete* UTF-8 sequence has no first
+   codepoint and is always walked (it is judged against the completion range); a
+   piece that starts with an invalid byte, or is empty, can never be accepted on
+   this path and is not indexed at all.
+
+`Grammar::plan` chooses the walk per state: a frontier that is a `.` or a negated
+class, or whose accepted set is at least as wide as the vocabulary, keeps the
+whole-vocabulary walk (filtering cannot pay there), and everything else uses the
+buckets. **The bitset is identical either way** — the index only decides which
+pieces are examined.
+
+Measured on the 151,936-token Qwen2.5-0.5B q4_0 vocabulary (dgxspark, 2026-10-14,
+`cargo test --release --bin minfer real_model_json_schema_generation_parses --
+--ignored --nocapture`): the mask over a 17-step constrained JSON response (13 new
+states) costs **49.5 ms, down from 90.4 ms** — 45 % less — and the walk examines
+**42,329 pieces per new state on average (28 % of the vocabulary)**, 1,049 at the
+narrowest structural state (0.7 %). The ceiling is honest and recorded in §8: a
+state whose frontier accepts nearly every codepoint still walks all 151,935 pieces
+(33.7 ms), and that one state is most of what remains.
 
 ### "No token is allowed"
 
@@ -344,11 +368,18 @@ lives), before the job occupies a worker slot.
 * **Left recursion** is detected at parse time and refused; right recursion
   (the `$ref` cycle shape JSON uses) works.
 * **Per-request compile cost** is O(vocabulary) for the token pieces plus the
-  grammar size; it is measured in the record and is the reason the mask cache is
-  per state rather than recomputed per token.
+  grammar size, and the first-codepoint index (#126) adds one more O(vocabulary)
+  pass at compile time; it is measured in the record and is the reason the mask
+  cache is per state rather than recomputed per token.
+* **The mask's residual cost is the wild frontier, not the walk.** A state whose
+  frontier accepts nearly every codepoint — every state inside a JSON string body —
+  keeps the whole-vocabulary walk: 151,935 pieces, 33.7 ms, measured 2026-10-14.
+  That single state is most of the 49.5 ms a 13-state JSON response still costs;
+  the structural states fell to 0.7–37 % of the vocabulary. Narrowing it further
+  needs an index on the *rejected* codepoints, not on the first codepoint.
 * Follow-ups are filed as GitHub issues: [#125](https://github.com/yusiwen/minfer/issues/125)
-  (the refused GBNF/schema constructs) and
-  [#126](https://github.com/yusiwen/minfer/issues/126) (the residual mask cost).
+  (the refused GBNF/schema constructs); [#126](https://github.com/yusiwen/minfer/issues/126)
+  (the first-codepoint index) landed 2026-10-14.
 
 ## 9. Implementation notes (2026-09-24)
 
@@ -378,6 +409,16 @@ covered by unit tests:
    token-indexed first-codepoint bucket to remove it, and
    [#125](https://github.com/yusiwen/minfer/issues/125) the constructs the
    compiler refuses.
+
+**Follow-through (#126, 2026-10-14).** The first-codepoint bucket landed. §4 has
+the mechanics and the numbers (49.5 ms for the same 13-state JSON response, down
+from 90.4 ms). It does not remove the O(vocabulary) term for a *wild* frontier —
+a JSON string body still walks every piece — and §8 now says so instead of
+promising it. The gates are the same three that F2 left behind, plus a bitwise
+comparison of the indexed mask against the whole-vocabulary walk on both the
+synthetic vocabulary (`grammar::tests`) and the real 151,936-token one
+(`real_model_json_schema_generation_parses`), and a work bound that asserts the
+indexed walk examines fewer pieces than the vocabulary has tokens.
 
 The measured acceptance (both models, greedy, seed 42) is in
 `docs/ARCHITECTURE-EXECUTION-PLAN.md`'s F2 record.

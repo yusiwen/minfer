@@ -98,6 +98,10 @@ pub struct GrammarState {
     inner: StateKey,
     accepting: bool,
     cache: HashMap<StateKey, Arc<[u64]>>,
+    /// Pieces the last mask computation walked. Test-only instrumentation
+    /// (#126): `#[cfg(test)]` keeps the counter out of production builds.
+    #[cfg(test)]
+    walked: usize,
 }
 
 impl GrammarState {
@@ -114,6 +118,119 @@ impl GrammarState {
     pub(crate) fn cached_states(&self) -> usize {
         self.cache.len()
     }
+
+    /// Record the work the last mask computation did. The production arm is a
+    /// no-op: the count exists so a gate can bound the mask by work instead of
+    /// by a clock (GATE-CONTRACT §4), and `#[cfg(test)]` is what keeps the
+    /// counter out of the shipping struct.
+    #[cfg(test)]
+    fn set_walked(&mut self, walked: usize) {
+        self.walked = walked;
+    }
+
+    #[cfg(not(test))]
+    fn set_walked(&mut self, _walked: usize) {}
+
+    /// Token pieces the last [`Grammar::mask`] call walked — the work the mask
+    /// did, which is the machine-independent half of its cost (#126). Test-only
+    /// (#126): driven by
+    /// `grammar::tests::the_index_walks_only_the_accepted_buckets` and
+    /// `server::chat::tests::real_model_json_schema_generation_parses`;
+    /// `#[cfg(test)]` keeps it out of production builds.
+    #[cfg(test)]
+    pub(crate) fn pieces_walked(&self) -> usize {
+        self.walked
+    }
+}
+
+/// Token ids grouped by the first codepoint of their piece, built once when the
+/// grammar is compiled.
+///
+/// The mask only needs a piece's **first** codepoint to know whether the piece
+/// can begin at all; the memoized transition table decides the rest. Indexing on
+/// it lets a state look at the buckets its frontier accepts instead of walking
+/// the whole vocabulary.
+///
+/// Two kinds of token are deliberately absent:
+/// - a piece whose leading bytes are an **incomplete** UTF-8 sequence has no
+///   first codepoint, and whether it is accepted depends on the codepoint the
+///   frontier would complete it to — those ids go to `headless` and are always
+///   walked;
+/// - a `None` (empty) piece, or one starting with an **invalid** UTF-8 byte, is
+///   never accepted on the piece path and is not indexed at all.
+///
+/// End-of-generation ids are held separately by [`Grammar`]: they are admitted
+/// on the state's own condition, not on a codepoint.
+struct TokenIndex {
+    /// Ascending by first codepoint, one entry per distinct codepoint.
+    buckets: Vec<(u32, Vec<u32>)>,
+    /// Token ids whose piece has no complete first codepoint.
+    headless: Vec<u32>,
+}
+
+impl TokenIndex {
+    fn build(pieces: &[Option<Box<[u8]>>], eog_ids: &[u32]) -> TokenIndex {
+        let mut by_cp: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut headless: Vec<u32> = Vec::new();
+        for (id, piece) in pieces.iter().enumerate() {
+            let Some(piece) = piece.as_deref() else {
+                continue;
+            };
+            if eog_ids.contains(&(id as u32)) {
+                continue;
+            }
+            match decode_at(piece, 0) {
+                Utf8Step::Cp(cp, _) => by_cp.entry(cp).or_default().push(id as u32),
+                Utf8Step::Incomplete => headless.push(id as u32),
+                Utf8Step::Invalid => {}
+            }
+        }
+        let mut buckets: Vec<(u32, Vec<u32>)> = by_cp.into_iter().collect();
+        buckets.sort_unstable_by_key(|&(cp, _)| cp);
+        TokenIndex { buckets, headless }
+    }
+}
+
+/// The codepoints a frontier can consume next, for the first-codepoint filter.
+///
+/// `wide` marks the cases a filter cannot help — a `.` (`Inst::Any`) and a
+/// negated class both accept nearly the whole codepoint space — so the mask takes
+/// the whole-vocabulary walk instead of enumerating buckets.
+struct Accepted {
+    wide: bool,
+    /// Ascending, disjoint, non-adjacent ranges.
+    ranges: Vec<(u32, u32)>,
+}
+
+impl Accepted {
+    /// Total number of codepoints accepted.
+    fn width(&self) -> u64 {
+        self.ranges
+            .iter()
+            .map(|&(a, b)| u64::from(b) - u64::from(a) + 1)
+            .sum()
+    }
+
+    /// Is `cp` accepted? Asked on the bucket-scan path, where `ranges` is the
+    /// whole answer.
+    fn contains(&self, cp: u32) -> bool {
+        let i = self.ranges.partition_point(|&(a, _)| a <= cp);
+        i > 0 && self.ranges[i - 1].1 >= cp
+    }
+
+    /// Every accepted codepoint, in order. Only called when `width()` is known
+    /// to be no larger than the bucket count (see [`Grammar::mask_buckets`]).
+    fn codepoints(&self) -> impl Iterator<Item = u32> + '_ {
+        self.ranges.iter().flat_map(|&(a, b)| a..=b)
+    }
+}
+
+/// How one state's mask is computed (see [`Grammar::plan`]).
+enum Walk {
+    /// Every token id, in order.
+    Whole,
+    /// Only the tokens whose first codepoint the frontier accepts.
+    Buckets(Accepted),
 }
 
 /// A compiled grammar: rule programs, the token pieces and end-of-generation
@@ -127,10 +244,12 @@ pub struct Grammar {
     n_vocab: usize,
     /// Raw byte piece per token id; `None` for a token with an empty piece.
     pieces: Vec<Option<Box<[u8]>>>,
-    /// End-of-generation token ids.
-    eog: Vec<bool>,
+    /// End-of-generation token ids, ascending.
+    eog_ids: Vec<u32>,
     /// The GBNF text this grammar was compiled from (generated for a schema).
     source: String,
+    /// Token ids grouped by the first codepoint of their piece (#126).
+    index: TokenIndex,
 }
 
 impl std::fmt::Debug for Grammar {
@@ -139,7 +258,7 @@ impl std::fmt::Debug for Grammar {
             .field("rules", &self.rules.len())
             .field("root", &self.names[self.root as usize])
             .field("n_vocab", &self.n_vocab)
-            .field("eog", &self.eog.iter().filter(|b| **b).count())
+            .field("eog", &self.eog_ids.len())
             .field("source_len", &self.source.len())
             .finish()
     }
@@ -221,6 +340,8 @@ impl Grammar {
             inner,
             accepting,
             cache: HashMap::new(),
+            #[cfg(test)]
+            walked: 0,
         }
     }
 
@@ -252,14 +373,22 @@ impl Grammar {
             );
             rules.push(prog);
         }
+        let eog_ids: Vec<u32> = eog
+            .iter()
+            .enumerate()
+            .filter(|&(_, flag)| *flag)
+            .map(|(id, _)| id as u32)
+            .collect();
+        let index = TokenIndex::build(&pieces, &eog_ids);
         let g = Grammar {
             rules,
             names,
             root,
             n_vocab: pieces.len(),
             pieces,
-            eog,
+            eog_ids,
             source: source.to_string(),
+            index,
         };
         // Eagerly validate every rule's epsilon closure: left recursion and more
         // live stacks than the engine supports are compile errors here rather
@@ -336,35 +465,101 @@ impl Grammar {
     /// The token mask for `st`: a packed bitset over token ids. Cached by state
     /// in `st`, so the O(vocabulary) walk happens at most once per distinct
     /// state even though every step creates a new one.
+    ///
+    /// [`Grammar::plan`] decides which walk runs: a frontier that accepts few
+    /// codepoints is filtered through the first-codepoint index (#126), and one
+    /// that accepts nearly everything keeps the whole-vocabulary walk.
     pub fn mask(&self, st: &mut GrammarState) -> Result<Arc<[u64]>, String> {
         if let Some(cached) = st.cache.get(&st.inner) {
             return Ok(cached.clone());
         }
-        let words = self.n_vocab.div_ceil(64);
-        let mut bits = vec![0u64; words];
-        let done = st.inner.done;
-        // Per-call transition memo (a DFA construction on the fly): within one
-        // mask computation the start state is fixed, so "consume one codepoint"
-        // is a function of (state, codepoint). Interning the successor states
-        // collapses the walk over ~150k token pieces into a few thousand
-        // transitions — the difference between ~70 ms and ~5 ms per state on a
-        // 150k-token vocabulary. Correctness is unchanged: a token is allowed
-        // exactly when every codepoint of its piece is consumable (and a trailing
-        // partial sequence can still complete).
-        let mut states: Vec<Vec<Vec<[u32; 2]>>> = vec![st.inner.stacks.clone()];
-        let mut intern: HashMap<Vec<Vec<[u32; 2]>>, usize> =
-            HashMap::from([(st.inner.stacks.clone(), 0)]);
-        let mut memo: HashMap<(usize, u32), Option<usize>> = HashMap::new();
-        let carried = !st.inner.partial.is_empty();
-        for id in 0..self.n_vocab {
-            if self.eog[id] {
-                // End of generation only from a complete, character-aligned state.
-                if done || st.accepting {
-                    bits[id / 64] |= 1u64 << (id % 64);
+        let (mask, walked) = match self.plan(&st.inner) {
+            Walk::Whole => self.mask_whole(&st.inner, st.accepting)?,
+            Walk::Buckets(accepted) => self.mask_buckets(&st.inner, st.accepting, &accepted)?,
+        };
+        st.set_walked(walked);
+        if st.cache.len() >= MAX_MASK_CACHE {
+            st.cache.clear();
+        }
+        st.cache.insert(st.inner.clone(), mask.clone());
+        Ok(mask)
+    }
+
+    /// How a state's mask is computed.
+    fn plan(&self, key: &StateKey) -> Walk {
+        // A carried partial UTF-8 sequence is matched continuation-first against
+        // the piece's bytes, so a first-codepoint bucket says nothing about it;
+        // and a finished state admits only EOG.
+        if !key.partial.is_empty() || key.done {
+            return Walk::Whole;
+        }
+        let accepted = self.first_codepoints(&key.stacks);
+        if accepted.wide || accepted.width() >= self.n_vocab as u64 {
+            // The frontier accepts at least as many codepoints as there are
+            // tokens: the buckets would add one test per bucket to a walk that
+            // already visits nearly every token.
+            return Walk::Whole;
+        }
+        Walk::Buckets(accepted)
+    }
+
+    /// The codepoints a closed set of stacks can consume next. Only each stack's
+    /// current instruction matters, and `close` leaves every live stack on a
+    /// consuming instruction or on `Ret`.
+    fn first_codepoints(&self, stacks: &[Vec<[u32; 2]>]) -> Accepted {
+        let mut wide = false;
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for st in stacks {
+            let f = *st.last().expect("stacks are never empty");
+            match &self.rules[f[0] as usize][f[1] as usize] {
+                Inst::Any => {
+                    wide = true;
+                    break;
                 }
-                continue;
+                Inst::Cp(c) => {
+                    if !(0xD800..=0xDFFF).contains(c) {
+                        ranges.push((*c, *c));
+                    }
+                }
+                Inst::Class {
+                    negated: false,
+                    ranges: rs,
+                } => {
+                    for &(a, b) in rs {
+                        ranges.extend(non_surrogate_parts(a, b));
+                    }
+                }
+                // A negated class accepts all but a few codepoints -- a `.` with
+                // exceptions -- so filtering on it removes nothing.
+                Inst::Class { negated: true, .. } => {
+                    wide = true;
+                    break;
+                }
+                Inst::Ret | Inst::Split(_, _) | Inst::Jump(_) | Inst::Call(_) => {}
             }
-            if done {
+        }
+        Accepted {
+            wide,
+            ranges: if wide {
+                Vec::new()
+            } else {
+                merge_ranges(ranges)
+            },
+        }
+    }
+
+    /// The whole-vocabulary walk: what the mask did before the index, and still
+    /// the path for a wide frontier and for a carried partial sequence. Returns
+    /// the mask and the number of pieces it examined.
+    fn mask_whole(&self, key: &StateKey, accepting: bool) -> Result<(Arc<[u64]>, usize), String> {
+        let mut bits = self.eog_bits(key, accepting);
+        if key.done {
+            return Ok((bits.into(), 0));
+        }
+        let carried = !key.partial.is_empty();
+        let mut walk = MaskWalk::new(self, &key.stacks);
+        for id in 0..self.n_vocab {
+            if self.eog_ids.contains(&(id as u32)) {
                 continue;
             }
             let Some(piece) = self.pieces[id].as_deref() else {
@@ -375,79 +570,80 @@ impl Grammar {
             let allowed = if carried {
                 // A carried partial sequence is rare: the general path handles
                 // the piece + carry concatenation.
-                self.consume(&st.inner, piece).is_ok()
+                walk.walked += 1;
+                self.consume(key, piece).is_ok()
             } else {
-                self.mask_walk(piece, &mut states, &mut intern, &mut memo)
+                walk.allows(piece)
             };
             if allowed {
-                bits[id / 64] |= 1u64 << (id % 64);
+                set_bit(&mut bits, id);
             }
         }
-        let mask: Arc<[u64]> = bits.into();
-        if st.cache.len() >= MAX_MASK_CACHE {
-            st.cache.clear();
-        }
-        st.cache.insert(st.inner.clone(), mask.clone());
-        Ok(mask)
+        Ok((bits.into(), walk.walked))
     }
 
-    /// Walk a token piece through the memoized transition table built by
-    /// [`Self::mask`]. Returns true when every codepoint is consumable and a
-    /// trailing partial sequence (if any) can still complete.
-    fn mask_walk(
+    /// The indexed walk (#126): first the tokens whose piece has no first
+    /// codepoint, then the tokens the frontier's first codepoints can begin.
+    fn mask_buckets(
         &self,
-        piece: &[u8],
-        states: &mut Vec<Vec<Vec<[u32; 2]>>>,
-        intern: &mut HashMap<Vec<Vec<[u32; 2]>>, usize>,
-        memo: &mut HashMap<(usize, u32), Option<usize>>,
-    ) -> bool {
-        let mut cur = 0usize;
-        let mut i = 0usize;
-        while i < piece.len() {
-            match decode_at(piece, i) {
-                Utf8Step::Cp(cp, n) => {
-                    if (0xD800..=0xDFFF).contains(&cp) {
-                        return false;
-                    }
-                    match self.memo_step(states, intern, memo, cur, cp) {
-                        Some(next) => cur = next,
-                        None => return false,
-                    }
-                    i += n;
-                }
-                Utf8Step::Incomplete => {
-                    return self.partial_can_complete(&states[cur], &piece[i..]);
-                }
-                Utf8Step::Invalid => return false,
+        key: &StateKey,
+        accepting: bool,
+        accepted: &Accepted,
+    ) -> Result<(Arc<[u64]>, usize), String> {
+        let mut bits = self.eog_bits(key, accepting);
+        let mut walk = MaskWalk::new(self, &key.stacks);
+        for &id in &self.index.headless {
+            if walk.allows(self.piece(id)) {
+                set_bit(&mut bits, id as usize);
             }
         }
-        true
+        if accepted.width() <= self.index.buckets.len() as u64 {
+            // Few accepted codepoints: visit only their buckets.
+            for cp in accepted.codepoints() {
+                if let Ok(i) = self.index.buckets.binary_search_by_key(&cp, |&(c, _)| c) {
+                    walk.bucket(&self.index.buckets[i].1, &mut bits);
+                }
+            }
+        } else {
+            // More accepted codepoints than buckets: one range test per bucket is
+            // cheaper than one bucket lookup per codepoint.
+            for (cp, ids) in &self.index.buckets {
+                if accepted.contains(*cp) {
+                    walk.bucket(ids, &mut bits);
+                }
+            }
+        }
+        Ok((bits.into(), walk.walked))
     }
 
-    /// One memoized codepoint transition, interning the successor state.
-    fn memo_step(
-        &self,
-        states: &mut Vec<Vec<Vec<[u32; 2]>>>,
-        intern: &mut HashMap<Vec<Vec<[u32; 2]>>, usize>,
-        memo: &mut HashMap<(usize, u32), Option<usize>>,
-        cur: usize,
-        cp: u32,
-    ) -> Option<usize> {
-        if let Some(cached) = memo.get(&(cur, cp)) {
-            return *cached;
-        }
-        let next = self.step(&states[cur], cp).ok().map(|ns| {
-            if let Some(&idx) = intern.get(&ns) {
-                idx
-            } else {
-                let idx = states.len();
-                states.push(ns.clone());
-                intern.insert(ns, idx);
-                idx
+    /// The mask's starting bits: an EOG id is admitted exactly when the state is
+    /// a complete sentence (`done`) or a character-aligned prefix of one.
+    fn eog_bits(&self, key: &StateKey, accepting: bool) -> Vec<u64> {
+        let mut bits = vec![0u64; self.n_vocab.div_ceil(64)];
+        if key.done || accepting {
+            for &id in &self.eog_ids {
+                set_bit(&mut bits, id as usize);
             }
-        });
-        memo.insert((cur, cp), next);
-        next
+        }
+        bits
+    }
+
+    fn piece(&self, id: u32) -> &[u8] {
+        self.pieces[id as usize]
+            .as_deref()
+            .expect("indexed token ids always have a piece")
+    }
+
+    /// The whole-vocabulary walk for the state a [`GrammarState`] holds, which
+    /// [`Grammar::mask`] also runs whenever the frontier is wide. Test-only
+    /// (#126): driven by
+    /// `server::chat::tests::real_model_json_schema_generation_parses`, which
+    /// compares it against the indexed mask bit for bit over the real
+    /// 151,936-token vocabulary; `#[cfg(test)]` keeps it out of production
+    /// builds.
+    #[cfg(test)]
+    pub(crate) fn mask_whole_for_tests(&self, st: &GrammarState) -> Arc<[u64]> {
+        self.mask_whole(&st.inner, st.accepting).expect("mask").0
     }
 
     /// Advance the state by a sampled token. A failure names the byte offset of
@@ -464,7 +660,7 @@ impl Grammar {
         if st.inner.done {
             return Err("grammar: a token was sampled after the end of generation".to_string());
         }
-        if self.eog[idx] {
+        if self.eog_ids.contains(&id) {
             if !st.accepting {
                 return Err(format!(
                     "grammar: end-of-generation token {id} accepted in a non-accepting state ({})",
@@ -722,6 +918,113 @@ enum Flow {
     Call(u32),
     Ret,
     Consume,
+}
+
+/// The per-mask-computation machinery: the interned successor states and the
+/// DFA-style transition memo.
+///
+/// Within one mask computation the start state is fixed, so "consume one
+/// codepoint" is a function of (state, codepoint). Interning the successor states
+/// collapses the walk over ~150k token pieces into a few thousand transitions --
+/// the difference between ~70 ms and ~5 ms per state on a 150k-token vocabulary.
+/// Correctness is unchanged: a token is allowed exactly when every codepoint of
+/// its piece is consumable, and a trailing partial sequence can still complete.
+struct MaskWalk<'a> {
+    g: &'a Grammar,
+    states: Vec<Vec<Vec<[u32; 2]>>>,
+    intern: HashMap<Vec<Vec<[u32; 2]>>, usize>,
+    memo: HashMap<(usize, u32), Option<usize>>,
+    /// Pieces examined. Read by `GrammarState::pieces_walked` in tests only.
+    walked: usize,
+}
+
+impl<'a> MaskWalk<'a> {
+    fn new(g: &'a Grammar, seed: &[Vec<[u32; 2]>]) -> MaskWalk<'a> {
+        MaskWalk {
+            g,
+            states: vec![seed.to_vec()],
+            intern: HashMap::from([(seed.to_vec(), 0)]),
+            memo: HashMap::new(),
+            walked: 0,
+        }
+    }
+
+    /// Walk a token piece through the memoized transition table. Returns true
+    /// when every codepoint is consumable and a trailing partial sequence (if
+    /// any) can still complete.
+    fn allows(&mut self, piece: &[u8]) -> bool {
+        self.walked += 1;
+        let mut cur = 0usize;
+        let mut i = 0usize;
+        while i < piece.len() {
+            match decode_at(piece, i) {
+                Utf8Step::Cp(cp, n) => {
+                    if (0xD800..=0xDFFF).contains(&cp) {
+                        return false;
+                    }
+                    match self.memo_step(cur, cp) {
+                        Some(next) => cur = next,
+                        None => return false,
+                    }
+                    i += n;
+                }
+                Utf8Step::Incomplete => {
+                    return self.g.partial_can_complete(&self.states[cur], &piece[i..]);
+                }
+                Utf8Step::Invalid => return false,
+            }
+        }
+        true
+    }
+
+    /// Walk one first-codepoint bucket, setting the bit for every id whose whole
+    /// piece is consumable.
+    fn bucket(&mut self, ids: &[u32], bits: &mut [u64]) {
+        let g = self.g;
+        for &id in ids {
+            if self.allows(g.piece(id)) {
+                set_bit(bits, id as usize);
+            }
+        }
+    }
+
+    /// One memoized codepoint transition, interning the successor state.
+    fn memo_step(&mut self, cur: usize, cp: u32) -> Option<usize> {
+        if let Some(cached) = self.memo.get(&(cur, cp)) {
+            return *cached;
+        }
+        let stepped = self.g.step(&self.states[cur], cp).ok();
+        let next = stepped.map(|ns| match self.intern.get(&ns) {
+            Some(&idx) => idx,
+            None => {
+                let idx = self.states.len();
+                self.states.push(ns.clone());
+                self.intern.insert(ns, idx);
+                idx
+            }
+        });
+        self.memo.insert((cur, cp), next);
+        next
+    }
+}
+
+/// Set token `id` in a packed bitset.
+fn set_bit(bits: &mut [u64], id: usize) {
+    bits[id / 64] |= 1u64 << (id % 64);
+}
+
+/// Sort ranges and merge every overlapping or adjacent pair, so the result is
+/// ascending, disjoint and non-adjacent.
+fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        match out.last_mut() {
+            Some(last) if a <= last.1.saturating_add(1) => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
 }
 
 /// The contiguous codepoint range an incomplete-but-valid UTF-8 prefix can still
