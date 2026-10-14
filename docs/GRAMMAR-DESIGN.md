@@ -85,7 +85,9 @@ rules and compiled once, on demand.
 | `array`: `items` | one schema for every element |
 | `array`: `minItems`, `maxItems` | exact bounds on the element count (`minItems` may not exceed `maxItems`) |
 | `array`: `prefixItems` | a fixed leading tuple, then `items` for the remainder (or no remainder when `items` is absent/`false`) |
-| `string` | a JSON string: `[^"\\\u0000-\u001f]*` plus `\" \\ \/ \b \f \n \r \t` and `\uXXXX` escapes |
+| `string` | a JSON string: `[^"\\\u0000-\u001f]*` plus `\" \\ \/ \b \f \n \r \t` and `\uXXXX` escapes; `minLength`/`maxLength` count **characters** (one escape is one character), and `format` narrows it to one of the validators below |
+| `string`: `minLength`, `maxLength` | exact character bounds (`minLength` may not exceed `maxLength`); the encoded string is `"\"" j-char{m,n} "\""` |
+| `string`: `format` | `date`, `time`, `date-time`, `uuid`, `uuid1`..`uuid5` — the four rules the reference implements (the uuid version digit is not checked, as there) |
 | `integer`: `minimum`, `maximum` | inclusive bounds, integer-valued (see below) |
 | `integer`: `exclusiveMinimum`, `exclusiveMaximum` | integer-valued; folded into the inclusive range |
 | `number` | the general JSON number grammar (`-?int(.frac)?([eE]exp)?`) when unbounded |
@@ -98,7 +100,14 @@ rules and compiled once, on demand.
 
 * any `$ref` that is not a local `#/$defs/...` or `#/definitions/...` pointer —
   in particular remote URLs and nested JSON pointers (`#/$defs/a/properties/b`);
-* `pattern`, `format`, `minLength`, `maxLength`, `contentEncoding` on strings;
+* `pattern`, `contentEncoding`, `contentMediaType` on strings — and every
+  `format` outside the four above (`email`, `uri`, `hostname`, `ipv4`, `ipv6`),
+  refused **by name**: a loose rule would accept instances the schema rejects;
+* a string keyword (`format`, `minLength`, `maxLength`) on any single type other
+  than `"string"`, with no type at all, or on a union — the constraint would be
+  silently dropped, and a union would have to be split into `anyOf` branches;
+* `format` **combined with** `minLength`/`maxLength` (the two would have to be
+  intersected);
 * `multipleOf` and non-integer `minimum`/`maximum`/`exclusiveMinimum`/
   `exclusiveMaximum` on numbers (integer bounds are supported; a real-valued
   bound is a named refusal, see the follow-ups — narrowing a `number` to its
@@ -369,8 +378,18 @@ lives), before the job occupies a worker slot.
 * **`oneOf`** is compiled as `anyOf` (superset for overlapping branches).
 * **Real-valued numeric bounds** and `multipleOf` are refused; only integer
   bounds are compiled.
-* **String length/pattern constraints** are refused (`pattern` needs a regex
-  engine in GBNF; `minLength`/`maxLength` need counting rules).
+* **`pattern` is still refused** (it needs a regex engine in GBNF; #125's slice 3).
+  `minLength`/`maxLength` landed on 2026-10-14 as counting rules over `j-char`,
+  which makes them character counts rather than byte counts: one escape is one
+  character, and a surrogate pair written as two `\uXXXX` escapes is two. A
+  string keyword is accepted only on `type: "string"` itself — on another type,
+  with no type, or on a union, the constraint would be dropped or need
+  intersection, so it is refused by name.
+* **`format` implements four validators, not a format library.** `date`, `time`,
+  `date-time` and `uuid`/`uuid1`..`uuid5`, byte for byte the rules the reference
+  implements; `email`, `uri`, `hostname`, `ipv4` and `ipv6` are refused rather
+  than approximated (the reference only uses those spellings to infer "this is a
+  string", and a loose rule here would accept what the schema rejects).
 * **Left recursion** is detected at parse time and refused; right recursion
   (the `$ref` cycle shape JSON uses) works.
 * **The class shorthands `\d`/`\w`/`\s` are minfer's, not llama.cpp's.** The
