@@ -6565,7 +6565,7 @@ The 7 code items are `cudaStreamWaitEvent` + `CudaState::stream_wait_event` (res
 |---|---|---|
 | **delete** (internal, never read in any build, no API contract) | `SampledToken::logit`; `Slot::id`; `KVCacheLayer::{k,v,size,max_size,dim}` + `KVCache::layers` | **yes** |
 | **wire the lost caller** (small, behaviour-preserving) | `OffloadPlan::all_on_device` (called by `resolve`'s unset-request arm) | **yes** |
-| **keep + honest note, precise annotation** | `DType::{F16,Q8_0}`; `Op::{Scale,Softmax,Reshape,Permute,BatchMatMul}`; `AttnMode::Mha`; `RopeStyle::Interleaved`; `TimingMode::{Off,Private}`; `OffloadRequest::AutoWithBudget`; `HfCheckpoint::order` (deferred to [#209]); `Tokenizer::{id_to_score,id_to_type}`; `Vendor::{Amd,Mthreads,Apple}`; `QClass::Other`; `DeviceTier::{source,mmvq_batch_default,mmvq_batch_by_type}`; `TurnOutcome::{text,stopped_by_eog,stopped_by_string}`; `Tokenizer::{special_tokens,im_start,im_end}`; `BackendCaps::{supports_op,supports_fused,supports_attn_span}`; `BackendEntry::name`; `ModelDef::{as_any,forward_graph,offload}` | **yes** (annotation + note; the membership questions are escalated) |
+| **keep + honest note, precise annotation** | `DType::{F16,Q8_0}`; `Op::{Scale,Softmax,Reshape,Permute,BatchMatMul}`; `AttnMode::Mha`; `RopeStyle::Interleaved`; `TimingMode::{Off,Private}`; `OffloadRequest::AutoWithBudget`; `HfCheckpoint::order` (deferred to [#209]); `Tokenizer::{id_to_score,id_to_type}`; `Vendor::{Amd,Mthreads,Apple}`; `QClass::Other`; `DeviceTier::{source,mmvq_batch_default,mmvq_batch_by_type}`; `TurnOutcome::{text,stopped_by_eog,stopped_by_string}`; `Tokenizer::special_tokens`; `BackendCaps::{supports_op,supports_fused,supports_attn_span}`; `BackendEntry::name`; `ModelDef::{as_any,forward_graph,offload}` | **yes** (annotation + note; the membership questions are escalated) |
 | **keep, nothing to change** | `CudaState::cc` (already `not(test)` from [#243]); `cudaStreamWaitEvent` + `stream_wait_event` (bare, dead in every build — [#138](https://github.com/yusiwen/minfer/issues/138) landed 2026-10-04 and did not create a reachable caller) | n/a |
 | **escalate, do not land** | `BackendCaps` **authority**; `ModelDef::as_any`; `ModelDef::offload`; `KvCache::set_owner`; the deferred `DType`/`Op`/`RopeStyle` variant **membership**; removing `ModelDef::forward`'s `&mut KVCache` | **no** |
 
@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**; pre-tokenizer rules, data-driven special tokens and SentencePiece remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules and SentencePiece remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -7776,6 +7776,47 @@ on a new corpus. (c) DRY-breaker *matching* stays byte-exact against the vocabul
 (llama.cpp's semantics); only the tokenized tails are normalized, so a non-NFC breaker is
 still refused by name rather than silently matched. (d) Nothing here is device-adjacent: the
 CUDA and macOS CI jobs compile it and the CPU jobs test it.
+
+### F7 follow-up — special tokens are what the file declares ([#132](https://github.com/yusiwen/minfer/issues/132) S2) — **DONE 2026-10-15**
+
+**What landed.** `Tokenizer::load` builds its special-token set from the file's own
+declarations and nothing else: `tokenizer.ggml.token_type` 2 (UNKNOWN) / 3 (CONTROL) / 4
+(USER_DEFINED) — llama.cpp's `CONTROL | USER_DEFINED | UNKNOWN` cache predicate
+(`llama-vocab.cpp:3012` at the pinned checkout) — plus every id a declared role names, over
+the transcribed `SPECIAL_ROLE_KEYS` table (`llama-arch.cpp:382-406`, deprecated aliases
+included). The `<|im_start|>` / `<|im_end|>` / EOS-shaped fallbacks are gone, and with them
+the two `Tokenizer` fields (`im_start`, `im_end`) that carried the fabricated ids. ADR-0043
+records the decision and the rejected alternatives; §3.2 of the design record is the
+contract, §4 its gate.
+
+**The defect it removes (measured).** `unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` (Q4_K_M;
+the file's first 7 MB probed 2026-10-15 with a scratch GGUF metadata reader:
+`pre = deepseek-r1-qwen`, 18 type-3 + 4 type-4 tokens, bos/eos/padding declared, and
+**neither** `<|im_start|>` nor `<|im_end|>` in the 151 936-token vocabulary). The old
+fallback mapped the literal `<|im_start|>` to id `0` and `<|im_end|>` to the EOS token
+`151643`: two strings the model never had became tokens. Both now BPE-split as the ordinary
+text they are, which is llama.cpp's behaviour as well.
+
+**Gates and mutations.** The derivation is gated through `Tokenizer::load` on synthetic
+GGUFs (it had no load-level test before): a token typed 2/3/4 and a token a role declares
+match as single ids, an undeclared token does not, and a regression transcribed from the
+probed DeepSeek metadata asserts the fullwidth specials match while the two ChatML names are
+absent from `special_tokens` and never aliased to EOS. Five mutations, none escaped: the
+hardcode re-added, the declared-role arm dropped, the UNKNOWN type dropped, the
+USER_DEFINED type dropped, and specialness guessed from the name again — **mutations without
+a red gate: 0**. Full suite on dgxspark: **536 passed / 0 failed / 41 ignored** unit +
+10 / 0 / 6 integration (was 534/0/41; one synthetic fallback test replaced by three). The
+real-model id gate re-ran on all five cached GGUFs: still byte-for-byte.
+
+**Honest scope.** (a) llama.cpp's EOT/EOM/EOG/FIM *name* lists are deliberately not ported:
+for a token it recognizes by name, whose role the file does not declare and whose type
+NORMAL, llama.cpp matches it and minfer BPE-splits it — a recorded divergence (ADR-0043),
+reached by no measured model. (b) The DeepSeek-R1 GGUF itself is not cached, so its evidence
+is the probed metadata transcribed into the gate rather than a loaded 1.1 GB file. (c) A
+declared role whose id is out of range, or whose token text is empty, is skipped rather than
+refused (llama.cpp warns and disables it): the role table is data, and an unmatched id cannot
+be a special token. (d) Nothing here is device-adjacent: the CUDA and macOS jobs compile it
+and the CPU jobs test it.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 
