@@ -46,6 +46,37 @@ fn nfc_matches_cpython_on_the_committed_corpus() {
 }
 
 #[test]
+fn nfd_matches_cpython_on_the_committed_corpus() {
+    let doc = corpus();
+    let entries = doc["entries"].as_array().expect("entries is an array");
+    assert!(
+        entries.len() >= MIN_ENTRIES,
+        "the NFC corpus has only {} entries (expected at least {MIN_ENTRIES})",
+        entries.len()
+    );
+
+    let mut changed = 0;
+    for entry in entries {
+        let input = entry["input"].as_str().expect("entry.input");
+        let expected = entry["nfd"].as_str().expect("entry.nfd");
+        let got = nfd(input);
+        assert_eq!(
+            got,
+            expected,
+            "NFD({input:?}) with code points {:X?}",
+            input.chars().map(|c| c as u32).collect::<Vec<_>>()
+        );
+        if expected != input {
+            changed += 1;
+        }
+    }
+    assert!(
+        changed > 1000,
+        "only {changed} corpus entries change under NFD; the fixture looks wrong"
+    );
+}
+
+#[test]
 fn the_corpus_covers_every_table_entry() {
     let doc = corpus();
     let entries = doc["entries"].as_array().expect("entries is an array");
