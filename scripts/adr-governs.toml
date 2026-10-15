@@ -226,3 +226,8 @@ path = "src/tokenizer.rs"
 adr = "0044"
 what = "the input normalizer is a property of the pre-tokenizer rule, declared per family"
 symbol = "applies_nfc"
+
+[[governs]]
+adr = "0045"
+what = "the tokenizer engine is a dispatch on tokenizer.ggml.model — gpt2 and llama, everything else refused by name"
+symbol = "TokenizerModel"

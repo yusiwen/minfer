@@ -581,9 +581,15 @@ since [#132](https://github.com/yusiwen/minfer/issues/132) S1/S3 (2026-10-15,
 `qwen2`/`qwen35`, so decomposed text tokenizes like its composed form; none for
 `llama-bpe`, whose `tokenizer.json` declares `"normalizer": null` — llama.cpp
 applies none for byte-level BPE either, so the divergence is the Qwen families'
-alone. What remains: **no
-SentencePiece/unigram or WordPiece path**, and no `ignore_merges`/multi-regex
-pre-tokenizers (`falcon3`, `pixtral`, `default`, `deepseek-*`, …) — those refuse by name, so
+alone. The **engine itself is now a dispatch**
+([#132](https://github.com/yusiwen/minfer/issues/132) S4, 2026-10-15, ADR-0045):
+`tokenizer.ggml.model` selects `gpt2` (byte-level BPE) or `llama` (SentencePiece —
+score-driven merges over a `▁`-escaped text with `<0xXX>` byte fallback, no `pre` rule and no
+normalizer), gated against `llama-tokenize` on the same artifact. What remains: **WordPiece
+(`bert`), unigram-SPM with its own normalization (`t5`), and the other engines**
+(`rwkv`, `plamo2`, `gemma4`, `whitespace`, `hybriddna`, `none`), plus the remaining
+`ignore_merges`/multi-regex pre-tokenizers (`falcon3`, `pixtral`, `default`, `deepseek-*`, …) —
+those refuse by name, so
 the coverage gap is explicit rather than a wrong split. Special-token
 *matching* is what the file declares since [#132](https://github.com/yusiwen/minfer/issues/132) S2 (2026-10-15, ADR-0043): `token_type`
 2/3/4 plus every id a declared role names, with no name shape and no fabricated
@@ -729,7 +735,7 @@ work predates the tracker has no issue, and the plan is its record.
 | 17 | **MoE support** (see `MODEL-SUPPORT-ROADMAP.md` Tier 2 #1) — depends on item 7 for a clean implementation. | §2.1, §2.7 | L |
 | 18 | **Dense architecture port wave** (see `MODEL-SUPPORT-ROADMAP.md` Tier 1) — parameter mapping plus the per-port items listed there. | §2.7 | M–L |
 | 19 | **Chat-template fidelity**: replace or extend minijinja so Qwen3's template actually renders. — **landed in F7 (2026-09-24)**: [#50](https://github.com/yusiwen/minfer/issues/50), the Python-`str`-method hook + the loud refusal; design record `docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`; remains: `--chat-template <FILE>` + `strftime_now` ([#133](https://github.com/yusiwen/minfer/issues/133)) | §2.7 | M |
-| 20 | **Tokenizer generality**: SentencePiece/unigram, per-model pre-tokenizer variants, data-driven special tokens. — **partly landed in F7 (2026-09-24)**: [#50](https://github.com/yusiwen/minfer/issues/50) made `tokenizer.ggml.pre` authoritative (`qwen2`/`qwen35`, byte-for-byte gated, unknown values refused) and replaced the silent byte fallback; [#132](https://github.com/yusiwen/minfer/issues/132) S1 added the model's declared NFC normalizer (2026-10-15, ADR-0042), S2 made the special-token set the file's declarations rather than a name hardcode (2026-10-15, ADR-0043), and S3's first rules added `llama-bpe` and `lfm2` (2026-10-15); SentencePiece/unigram/WordPiece and the remaining pre-tokenizer rules are the rest of [#132](https://github.com/yusiwen/minfer/issues/132) | §2.7 | M |
+| 20 | **Tokenizer generality**: SentencePiece/unigram, per-model pre-tokenizer variants, data-driven special tokens. — **partly landed in F7 (2026-09-24)**: [#50](https://github.com/yusiwen/minfer/issues/50) made `tokenizer.ggml.pre` authoritative (`qwen2`/`qwen35`, byte-for-byte gated, unknown values refused) and replaced the silent byte fallback; [#132](https://github.com/yusiwen/minfer/issues/132) S1 added the model's declared NFC normalizer (2026-10-15, ADR-0042), S2 made the special-token set the file's declarations rather than a name hardcode (2026-10-15, ADR-0043), S3's first rules added `llama-bpe` and `lfm2` (2026-10-15); and S4 made the engine a dispatch, landing SentencePiece (`model = llama`) as a second engine (2026-10-15, ADR-0045) — WordPiece, unigram-SPM and the remaining engines, plus the remaining pre-tokenizer rules, are the rest of [#132](https://github.com/yusiwen/minfer/issues/132) | §2.7 | M |
 | 21 | **Quantized KV** (Q8_0 first) — after item 1. — **landed in C4 S1 + S2a on the CPU and S2b on CUDA (fused read, quantize-aware shift, layout-tagged kernels); the packed fused epilogue, the dp4a packed dot and the packed FA prefill followed ([#144](https://github.com/yusiwen/minfer/issues/144) items 1+3, [#186](https://github.com/yusiwen/minfer/issues/186), [#202](https://github.com/yusiwen/minfer/issues/202)), so what remains is the CUDA decode residual's stall attribution ([#212](https://github.com/yusiwen/minfer/issues/212)) and Metal's packed half ([#310](https://github.com/yusiwen/minfer/issues/310), enabled)** | §2.4 | M |
 | 22 | **Quantizer tooling**: `convert-hf-to-gguf` + `quantize` + `split`. | §2.7 | L |
 

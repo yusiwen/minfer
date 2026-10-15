@@ -63,6 +63,7 @@
     - [0042. The tokenizer applies the model's declared NFC normalizer](./adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md)
     - [0043. A special token is declared by the file, never inferred from its name](./adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md)
     - [0044. The input normalizer follows the pre-tokenizer family's declaration](./adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md)
+    - [0045. The tokenizer engine is a dispatch on tokenizer.ggml.model](./adr/0045-the-tokenizer-engine-is-a-dispatch-on-tokenizer-ggml-model.md)
 
 # Model Support
 

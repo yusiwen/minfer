@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; SentencePiece remains) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`) DONE 2026-10-15, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -7942,6 +7942,54 @@ already-implemented one; a value whose pattern differs (`pixtral` is identical t
 smallest artifact is 12B, `tekken`, `starcoder`, `deepseek-*`) still needs its own splitter
 and fixtures. (b) The corpus is the shared 52-entry one with this family's specials, so the
 families stay comparable. (c) Nothing here is device-adjacent.
+
+### F7 follow-up — S4: the engine dispatch, and SentencePiece ([#132](https://github.com/yusiwen/minfer/issues/132)) — **DONE 2026-10-15**
+
+**What landed.** `TokenizerModel::from_gguf` reads `tokenizer.ggml.model` and answers exactly
+two engines — `gpt2` (byte-level BPE, or a missing key: the F7 behaviour) and `llama`
+(SentencePiece) — refusing every other value **by name**. The SPM session is a faithful port
+of llama.cpp's (`llm_tokenizer_spm_session`, `llama-vocab.cpp:114`): symbols are UTF-8
+characters of the `▁`-escaped text, every adjacent pair whose concatenation is a vocabulary
+entry is queued with that entry's **score**, the highest score merges first, a pair whose
+sides grew since it was queued is stale and skipped, and the final walk emits an entry, else
+re-splits through the recorded pair, else emits one `<0xXX>` byte token per byte.
+`add_space_prefix` (SPM default `true`, `tokenizer.ggml.add_space_prefix` overrides it)
+prefixes the first raw-text segment and every segment after a special token.
+`Tokenizer::pre` became `Option<PreTokenizer>`: SentencePiece has no pre-tokenization rule, so
+the key is not read for it, and `applies_nfc()` is `false`. ADR-0045 records the decision and
+its five rejected alternatives.
+
+**Fixtures and evidence.** `tests/fixtures/tokenizer/ids_tinyllama-1.1b.json` (54 entries, the
+shared corpus with this model's own specials and the two decomposed entries), generated with
+`llama-tokenize --ids --no-bos` on the cached
+`second-state/TinyLlama-1.1B-Chat-v1.0-GGUF` Q4_K_M (667 814 880 B; probed 2026-10-15:
+`model = llama`, **no** `pre`, no `merges`, 32 000 tokens, 256 of them type 6, `bos` 1 `<s>`,
+`eos` 2 `</s>`, `unknown` 0 `<unk>`, `scores` 32 000). The ignored gate now covers **eight**
+cached models byte-for-byte, both engines; three new CI-runnable tests cover the dispatch and
+the SPM behaviours on a synthetic vocabulary (the scored chain, `▁` prefix on/off, a byte
+fallback, the post-special re-prefix).
+
+**Why llama.cpp is the SPM reference.** HuggingFace's `tokenizer.json` for TinyLlama is a
+**BPE** rendering of the same vocabulary with its own normalizer (`Prepend ▁`, a
+`Sequence`), i.e. a different code path — not a second opinion on this engine. The GGUF says
+`model = llama`, and llama.cpp defines what that means.
+
+**Gates and mutations.** Five mutations, none escaped: the engine dispatch collapsed to one
+engine, `pre` required again for SPM, the score comparison inverted, the `▁` prefix dropped,
+and the byte fallback replaced by id 0 — each red in the tokenizer gate (release build),
+restored and asserted green after the last one.
+
+**Suite.** 538 → **541 passed / 0 failed / 41 ignored** unit + 10 / 0 / 6 integration (+3
+platform-neutral tests; the new model joins the existing `#[ignore]`d gate, so no ignored
+count moves).
+
+**Honest scope.** (a) Two engines of ten; the rest are refused by name and each needs its own
+algorithm, fixture and ADR amendment. (b) The SPM path is validated against llama.cpp, not
+against HuggingFace; where the two disagree the engine follows llama.cpp deliberately
+(ADR-0045). (c) The SPM corpus is the shared 52-entry one with this model's specials, so the
+families stay comparable. (d) A leading space is part of an SPM tokenization
+(`decode(encode(x))` is `" " + x` with the prefix on), exactly as in llama.cpp. (e) Nothing
+here is device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 
