@@ -189,10 +189,8 @@ invariant violation that aborts with the byte value.
 
 ### 3.4 Not covered (documented, refused, or a follow-up)
 
-* **NFC normalization.** HF's `tokenizer.json` carries an NFC normalizer;
-  llama.cpp does not apply one for BPE, and minfer does not either. The gate
-  corpus is NFC-normalized and the difference is named in the honest scope; a
-  normalization table is a follow-up (a Unicode data dependency).
+* **NFC normalization** — *now applied* (F7's accepted gap, closed by
+  [#132](https://github.com/yusiwen/minfer/issues/132) S1 on 2026-10-14); see §3.6.
 * **SentencePiece / unigram / WordPiece** models (`tokenizer.ggml.model !=
   "gpt2"`) — out of scope, the tokenizer is a byte-level BPE.
 * **`ignore_merges` pre-tokenizers** (`llama3`, `llama-bpe`, `tekken`, …) and
@@ -225,6 +223,39 @@ Two of them changed the implementation and one the reference:
   a vocabulary missing any of the 256 byte tokens — each of which used to turn
   into quietly wrong ids (the last one via `unwrap_or(0)`).
 
+### 3.6 NFC normalization of the input (#132 S1, 2026-10-15)
+
+Every reference `tokenizer.json` this engine gates against declares
+`"normalizer": {"type": "NFC"}` — verified 2026-10-15 for `Qwen/Qwen3-0.6B@c1899de2`,
+`Qwen/Qwen2.5-0.5B-Instruct@main` and `unsloth/Qwen3.5-0.8B@23c69c53` — so the reference
+token ids already contain the normalization and minfer's must too. `Tokenizer::encode`
+and `Tokenizer::encode_raw` normalize to NFC before the special-token scan and the
+pre-tokenizer respectively. The normalizer belongs to the tokenizer, not to a request
+shape, so the CLI, the chat path, the server and the DRY breaker tails all get it; the
+input is borrowed when it is already NFC.
+
+The data is **generated and committed**, not a dependency:
+`scripts/gen_unicode_nfc.py` reads CPython's bundled `unicodedata` (Unicode 15.0.0) and
+writes `src/tokenizer/nfc/tables.rs` (canonical decomposition, combining class,
+composition and its second elements) plus the differential corpus
+`tests/fixtures/tokenizer/nfc_vectors.json` (5 103 inputs in 8 named sections, each
+answered by CPython). `src/tokenizer/nfc.rs` is the algorithm: canonical decomposition
+(recursive, Hangul arithmetic), canonical ordering of each mark run, and canonical
+composition with its blocked rule. NFC is **not** NFKC: compatibility forms (`U+FB01`,
+fullwidth) are left alone. The generated constant and the fixture's `unicode_version`
+are asserted to be the same data version, so an upgrade is a reviewable generator re-run.
+
+**Divergence, deliberate.** llama.cpp applies no normalizer for BPE, so on non-NFC input
+the two engines return different ids; minfer follows the model's own `tokenizer.json`
+(ADR-0042). The id-gate corpus is NFC, so the gates are unaffected. DRY-breaker
+*matching* stays byte-exact — a non-NFC breaker matches nothing and is refused by name —
+while the tails are normalized, because a tail is tokenized text.
+
+Measured on the cached GGUFs (dgxspark, 2026-10-15): `encode("café")` ==
+`encode("cafe\u{0301}")` on all five models — `[924, 58858]` for Qwen2.5/Qwen3 and
+`[895, 56868]` for Qwen3.5 — while the unnormalized path returns `[924, 1859, 53839]` /
+`[895, 1795, 52033]`, which is the pre-S1 answer for the decomposed input.
+
 ## 4. Gates
 
 | Gate | Where | Reference |
@@ -234,6 +265,7 @@ Two of them changed the implementation and one the reference:
 | Loud refusal | unit test: an unsupported method/syntax fails and the error **names** the construct; a mutation of the callback (dropping a method) must make a previously-passing case fail | — |
 | Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` | the `tokenizer.json` regex evaluated by CPython `regex` |
 | Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5); the two agree on all 52 corpus entries where both exist |
+| NFC normalization | `src/tokenizer/nfc.rs` unit tests over `tests/fixtures/tokenizer/nfc_vectors.json` (5 103 inputs: every decomposition, every composition pair, all 784 ordered mark pairs both after a starter and alone, Hangul, compatibility forms, a seeded random corpus), plus the tokenizer-level and real-model property (`encode("café") == encode("cafe\u{0301}")`) | CPython `unicodedata.normalize('NFC', …)`, the same database the tables are generated from |
 | Grammar (F2) + pinned sampler (F3) | existing suites | unchanged |
 
 Each new gate is mutation-checked (break the implementation, watch the gate
@@ -243,3 +275,4 @@ fail, revert) and the mutation result is recorded in the PR.
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0019](adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md) — A chat template that cannot be rendered refuses the load
+- [ADR-0042](adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md) — The tokenizer applies the model's declared NFC normalizer

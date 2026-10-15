@@ -183,6 +183,14 @@ named. Token ids match the reference (transformers `AutoTokenizer`, or llama.cpp
 `llama-tokenize` on the same GGUF) byte for byte over the corpus committed in
 `tests/fixtures/tokenizer/`.
 
+The tokenizer also applies the **NFC** normalizer every reference `tokenizer.json`
+declares, so a decomposed input (`e` + a combining accent) tokenizes exactly like its
+composed form ([#132](https://github.com/yusiwen/minfer/issues/132) S1, ADR-0042).
+llama.cpp applies no normalizer for byte-level BPE, so on non-NFC input the two engines
+return different ids; minfer follows the model's own `tokenizer.json`. DRY sequence
+breakers are matched byte-for-byte against the vocabulary (only their tokenized tails are
+normalized).
+
 ## Multi-turn conversation
 
 `--cnv` (docs/CLI-CONVERSATION-PLAN.md): append-only KV + incremental template
