@@ -167,6 +167,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0045](./0045-the-tokenizer-engine-is-a-dispatch-on-tokenizer-ggml-model.md) | 2026-10-15 | The tokenizer engine is a dispatch on `tokenizer.ggml.model` | Accepted |
 | [0046](./0046-wordpiece-is-the-third-engine-and-follows-berts-normalizer.md) | 2026-10-15 | WordPiece is the third engine, and it follows BERT's normalizer | Accepted (amends ADR-0045) |
 | [0047](./0047-the-unigram-engine-reads-the-files-charsmap-and-sentencepiece-is-its-reference.md) | 2026-10-15 | The unigram engine reads the file's charsmap, and SentencePiece is its reference | Accepted (amends ADR-0045) |
+| [0048](./0048-gemma4-is-a-bpe-over-raw-utf8-and-its-rule-comes-from-the-model-value.md) | 2026-10-15 | gemma4 is a BPE over raw UTF-8, and its rule comes from the model value | Accepted (amends ADR-0045) |
 
 ## The template
 
