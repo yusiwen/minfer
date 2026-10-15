@@ -56,6 +56,12 @@ pub enum PreTokenizer {
     /// symbol arms are the Qwen2 ones, but digits group **up to three at a
     /// time** (`\p{N}{1,3}`).
     LlamaBpe,
+    /// `gemma4`: Gemma-4 — the file's `model = gemma4` **forces** this rule
+    /// (llama.cpp sets the pre-type from the model value, and a gemma4 GGUF
+    /// carries no `tokenizer.ggml.pre`). Spaces are already `▁` when the split
+    /// runs, so the rule is only **newline runs** (`[^\n]+|[\n]+`): a merge
+    /// lookup never spans a newline, so a piece has to end at one.
+    Gemma4,
     /// `lfm2`: LiquidAI LFM2 — a separate value whose reference pattern is
     /// **byte-identical** to `llama-bpe`'s (verified 2026-10-15 on
     /// `LiquidAI/LFM2-1.2B@40f3da0d`), and whose `tokenizer.json` declares no
@@ -72,16 +78,17 @@ impl PreTokenizer {
             Some("qwen35") => Ok(Self::Qwen35),
             Some("llama-bpe") | Some("llama3") | Some("llama-v3") => Ok(Self::LlamaBpe),
             Some("lfm2") => Ok(Self::Lfm2),
+            Some("gemma4") => Ok(Self::Gemma4),
             Some(other) => Err(format!(
                 "tokenizer.ggml.pre = \"{other}\" is not supported by minfer's byte-level BPE \
                  pre-tokenizer (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"; \
-                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\"). \
+                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\"; \"gemma4\"). \
                  Refusing to tokenize rather than split with the wrong rule."
             )),
             None => Err(
                 "tokenizer.ggml.pre is missing, so the pre-tokenization rule is unknown; minfer \
                  refuses to guess (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"; \
-                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\")"
+                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\"; \"gemma4\")"
                     .to_string(),
             ),
         }
@@ -96,7 +103,9 @@ impl PreTokenizer {
     fn number_run(self) -> usize {
         match self {
             Self::LlamaBpe | Self::Lfm2 => 3,
-            Self::Qwen2 | Self::Qwen35 => 1,
+            // `gemma4` never reaches the letter/number arms (its own split runs),
+            // so this is the unused arm of an exhaustive match.
+            Self::Qwen2 | Self::Qwen35 | Self::Gemma4 => 1,
         }
     }
 
@@ -119,7 +128,7 @@ impl PreTokenizer {
     pub fn applies_nfc(self) -> bool {
         match self {
             Self::Qwen2 | Self::Qwen35 => true,
-            Self::LlamaBpe | Self::Lfm2 => false,
+            Self::LlamaBpe | Self::Lfm2 | Self::Gemma4 => false,
         }
     }
 
@@ -133,6 +142,22 @@ impl PreTokenizer {
     /// implemented as a scan rather than a `regex` pattern because the crate has
     /// no lookahead.
     pub fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
+        if self == Self::Gemma4 {
+            // `[^\n]+|[\n]+` — maximal runs of newlines and of everything else.
+            let mut out = Vec::new();
+            let bytes = text.as_bytes();
+            let mut start = 0usize;
+            for (i, &b) in bytes.iter().enumerate() {
+                if i > start && (b == b'\n') != (bytes[start] == b'\n') {
+                    out.push(&text[start..i]);
+                    start = i;
+                }
+            }
+            if start < text.len() {
+                out.push(&text[start..]);
+            }
+            return out;
+        }
         let marks = self.include_marks();
         let word = |c: char| is_letter(c) || (marks && is_accent_mark(c));
         let symbol = |c: char| {
@@ -290,6 +315,11 @@ pub enum TokenizerModel {
     /// per run of unmatched input. `pre`, merges and byte tokens do not
     /// participate.
     Ugm,
+    /// `gemma4`: Gemma-4 — byte-level BPE's merge loop over **raw UTF-8** (no
+    /// byte-to-unicode step), a normalizer that replaces spaces with `▁`, the
+    /// gemma4 newline rule taken from the model value (the file carries no `pre`,
+    /// llama.cpp sets it at load) and a `<0xXX>` byte fallback.
+    Gemma4,
     /// `bert`: WordPiece — llama.cpp's WPM. Each word is prefixed with the
     /// phantom `▁` and segmented by **greedy longest match** against the
     /// vocabulary, with one `<unk>` per word that does not fully match. Neither
@@ -307,12 +337,14 @@ impl TokenizerModel {
             None | Some("gpt2") => Ok(Self::Gpt2),
             Some("llama") => Ok(Self::Spm),
             Some("bert") => Ok(Self::Bert),
+            Some("gemma4") => Ok(Self::Gemma4),
             Some("t5") => Ok(Self::Ugm),
             Some(other) => Err(format!(
                 "tokenizer.ggml.model = \"{other}\" is not a tokenizer minfer implements \
                  (supported: \"gpt2\" — byte-level BPE — \"llama\" — SentencePiece — \
-                 \"bert\" — WordPiece — and \"t5\" — unigram). Refusing to run a different \
-                 engine rather than tokenize with the wrong one."
+                 \"bert\" — WordPiece — \"t5\" — unigram — and \"gemma4\" — Gemma-4's \
+                 raw-UTF-8 BPE). Refusing to run a different engine rather than \
+                 tokenize with the wrong one."
             )),
         }
     }
@@ -1044,6 +1076,39 @@ impl Tokenizer {
                     Self::get_gguf_bool(gguf, "tokenizer.ggml.add_space_prefix").unwrap_or(true);
                 None
             }
+            TokenizerModel::Gemma4 => {
+                // `model = gemma4` **forces** the rule: llama.cpp sets
+                // `tokenizer_pre = "gemma4"` from the model value, and the file
+                // carries no `pre` key — so the key is not read.
+                if merges.is_empty() {
+                    return Err(
+                        "tokenizer.ggml.merges is empty; minfer refuses to run the gemma4 BPE \
+                         with no merge ranks (every piece would silently degrade to single bytes)"
+                            .to_string(),
+                    );
+                }
+                // The byte fallback is the `<0xXX>` tokens the vocabulary declares,
+                // exactly as for SentencePiece: all 256 are required.
+                for (id, token) in id_to_token.iter().enumerate() {
+                    if id_to_type.get(id).copied().unwrap_or(1) != 6 {
+                        continue;
+                    }
+                    if let Some(b) = parse_spm_byte_token(token) {
+                        spm_byte_to_id.insert(b, id as u32);
+                    }
+                }
+                let missing: Vec<u8> = (0u8..=255)
+                    .filter(|b| !spm_byte_to_id.contains_key(b))
+                    .collect();
+                if let Some(first) = missing.first() {
+                    return Err(format!(
+                        "vocabulary is not byte-level complete: {} of 256 gemma4 byte tokens are \
+                         missing (first: <0x{first:02X}>); minfer refuses a lossy byte fallback",
+                        missing.len()
+                    ));
+                }
+                Some(PreTokenizer::Gemma4)
+            }
             TokenizerModel::Ugm => {
                 // The Viterbi is ordered by the score array; without it every
                 // segmentation would tie.
@@ -1411,6 +1476,7 @@ impl Tokenizer {
             TokenizerModel::Gpt2 => self.encode_bpe(text),
             TokenizerModel::Bert => self.wpm_encode(text),
             TokenizerModel::Ugm => self.ugm_encode(text),
+            TokenizerModel::Gemma4 => self.gemma4_encode(text),
             TokenizerModel::Spm => {
                 let mut escaped = String::with_capacity(text.len() + SPM_SPACE.len_utf8());
                 if self.add_space_prefix && prev_special {
@@ -1575,6 +1641,73 @@ impl Tokenizer {
                 ),
             }
         }
+    }
+
+    /// Gemma-4 encode: the normalizer replaces spaces with `▁`, the rule splits on
+    /// newline runs, and BPE runs on the raw UTF-8 pieces — **no** byte-to-unicode
+    /// step, which is what `model = gemma4` selects (`byte_encode = false`).
+    fn gemma4_encode(&self, text: &str) -> Vec<u32> {
+        let escaped: String = text
+            .chars()
+            .map(|c| if c == ' ' { SPM_SPACE } else { c })
+            .collect();
+        let pre = self
+            .pre
+            .expect("gemma4 always has its rule (it comes from the model value)");
+        let mut out = Vec::new();
+        for piece in pre.split(&escaped) {
+            // A piece that is nothing but newlines is emitted whole when the
+            // vocabulary has it (llama.cpp's gemma4 fix, PR 21343).
+            if piece.chars().all(|c| c == '\n') {
+                if let Some(&id) = self.vocab.get(piece) {
+                    out.push(id);
+                    continue;
+                }
+            }
+            out.extend(self.bpe_encode_raw(piece));
+        }
+        out
+    }
+
+    /// BPE over a raw UTF-8 piece: the merge loop on characters, a vocabulary
+    /// lookup per merged piece, and one `<0xXX>` byte token per byte otherwise.
+    fn bpe_encode_raw(&self, piece: &str) -> Vec<u32> {
+        let mut word: Vec<String> = piece.chars().map(|c| c.to_string()).collect();
+        loop {
+            let mut best_rank: Option<usize> = None;
+            let mut best_idx: Option<usize> = None;
+            for i in 0..word.len().saturating_sub(1) {
+                let pair = (word[i].clone(), word[i + 1].clone());
+                if let Some(&rank) = self.merges.get(&pair) {
+                    if best_rank.is_none() || rank < best_rank.unwrap() {
+                        best_rank = Some(rank);
+                        best_idx = Some(i);
+                    }
+                }
+            }
+            let Some(idx) = best_idx else { break };
+            let merged = format!("{}{}", word[idx], word[idx + 1]);
+            word.splice(idx..=idx + 1, std::iter::once(merged));
+        }
+
+        let mut out = Vec::with_capacity(word.len());
+        for w in &word {
+            match self.vocab.get(w) {
+                Some(&id) => out.push(id),
+                None => {
+                    for b in w.as_bytes() {
+                        match self.spm_byte_to_id.get(b) {
+                            Some(&id) => out.push(id),
+                            None => panic!(
+                                "tokenizer invariant violated: no byte token for <0x{b:02X}>; \
+                                 Tokenizer::load verifies all 256"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The byte length of the UTF-8 sequence that starts with `b` (llama.cpp's
@@ -1993,7 +2126,10 @@ impl Tokenizer {
             }
             return out;
         }
-        if self.model == TokenizerModel::Spm || self.model == TokenizerModel::Ugm {
+        if matches!(
+            self.model,
+            TokenizerModel::Spm | TokenizerModel::Ugm | TokenizerModel::Gemma4
+        ) {
             // SentencePiece: a BYTE token is its byte, every other token's `▁`
             // is a space (llama.cpp's `token_to_piece` for SPM).
             let mut out = Vec::new();
