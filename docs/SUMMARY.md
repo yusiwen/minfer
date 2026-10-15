@@ -65,6 +65,7 @@
     - [0044. The input normalizer follows the pre-tokenizer family's declaration](./adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md)
     - [0045. The tokenizer engine is a dispatch on tokenizer.ggml.model](./adr/0045-the-tokenizer-engine-is-a-dispatch-on-tokenizer-ggml-model.md)
     - [0046. WordPiece is the third engine, and it follows BERT's normalizer](./adr/0046-wordpiece-is-the-third-engine-and-follows-berts-normalizer.md)
+    - [0047. The unigram engine reads the file's charsmap, and SentencePiece is its reference](./adr/0047-the-unigram-engine-reads-the-files-charsmap-and-sentencepiece-is-its-reference.md)
 
 # Model Support
 
