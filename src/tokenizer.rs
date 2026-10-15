@@ -56,6 +56,12 @@ pub enum PreTokenizer {
     /// symbol arms are the Qwen2 ones, but digits group **up to three at a
     /// time** (`\p{N}{1,3}`).
     LlamaBpe,
+    /// `lfm2`: LiquidAI LFM2 — a separate value whose reference pattern is
+    /// **byte-identical** to `llama-bpe`'s (verified 2026-10-15 on
+    /// `LiquidAI/LFM2-1.2B@40f3da0d`), and whose `tokenizer.json` declares no
+    /// normalizer either. It is its own variant so the fixture and the refusal
+    /// name the value the file actually carries.
+    Lfm2,
 }
 
 impl PreTokenizer {
@@ -65,16 +71,17 @@ impl PreTokenizer {
             Some("qwen2") | Some("deepseek-r1-qwen") => Ok(Self::Qwen2),
             Some("qwen35") => Ok(Self::Qwen35),
             Some("llama-bpe") | Some("llama3") | Some("llama-v3") => Ok(Self::LlamaBpe),
+            Some("lfm2") => Ok(Self::Lfm2),
             Some(other) => Err(format!(
                 "tokenizer.ggml.pre = \"{other}\" is not supported by minfer's byte-level BPE \
                  pre-tokenizer (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"; \
-                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"). \
+                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\"). \
                  Refusing to tokenize rather than split with the wrong rule."
             )),
             None => Err(
                 "tokenizer.ggml.pre is missing, so the pre-tokenization rule is unknown; minfer \
                  refuses to guess (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"; \
-                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\")"
+                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\")"
                     .to_string(),
             ),
         }
@@ -88,7 +95,7 @@ impl PreTokenizer {
     /// piece), Llama 3.x's is `\p{N}{1,3}` (up to three).
     fn number_run(self) -> usize {
         match self {
-            Self::LlamaBpe => 3,
+            Self::LlamaBpe | Self::Lfm2 => 3,
             Self::Qwen2 | Self::Qwen35 => 1,
         }
     }
@@ -112,7 +119,7 @@ impl PreTokenizer {
     pub fn applies_nfc(self) -> bool {
         match self {
             Self::Qwen2 | Self::Qwen35 => true,
-            Self::LlamaBpe => false,
+            Self::LlamaBpe | Self::Lfm2 => false,
         }
     }
 
