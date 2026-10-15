@@ -29,9 +29,19 @@
   height: auto;
 }
 
-/* Captions are ordinary markdown italics right after a figure; keep them tight to it. */
+/* Captions are ordinary markdown italics right after a figure; keep them tight to it.
+ *
+ * The colour is `--fg`, never `--sidebar-fg`. `--sidebar-fg` is the colour of text on
+ * the sidebar, and mdBook 0.4.37's `rust` theme makes the sidebar dark while the page
+ * is light: `--sidebar-fg` is `#c8c9db` there, so a caption (or any figure label) in
+ * it is nearly invisible on that theme's `--quote-bg` card. `--fg` is the page's own
+ * text colour in every theme, so it is the safe one; the figures use the same rule with
+ * a slight opacity for their secondary labels. The guard against reintroducing it is
+ * the last step of the `check-docs` figure gate.
+ */
 .book-figure + p em:only-child {
-  color: var(--sidebar-fg);
+  color: var(--fg);
+  opacity: .9;
   font-size: 0.86em;
   line-height: 1.5;
 }
