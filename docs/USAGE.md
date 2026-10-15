@@ -191,13 +191,15 @@ declarations — `tokenizer.ggml.token_type` 2 (UNKNOWN) / 3 (CONTROL) / 4
 is inferred from a token's name, and no token the vocabulary lacks is ever
 matched (ADR-0043).
 
-The tokenizer also applies the **NFC** normalizer every reference `tokenizer.json`
-declares, so a decomposed input (`e` + a combining accent) tokenizes exactly like its
-composed form ([#132](https://github.com/yusiwen/minfer/issues/132) S1, ADR-0042).
-llama.cpp applies no normalizer for byte-level BPE, so on non-NFC input the two engines
-return different ids; minfer follows the model's own `tokenizer.json`. DRY sequence
-breakers are matched byte-for-byte against the vocabulary (only their tokenized tails are
-normalized).
+The tokenizer applies the **NFC** normalizer when the rule's reference `tokenizer.json`
+declares one — `qwen2`/`qwen35` do, so a decomposed input (`e` + a combining accent)
+tokenizes exactly like its composed form; `llama-bpe` declares none, so its input is left
+exactly as it arrived ([#132](https://github.com/yusiwen/minfer/issues/132) S1/S3,
+[#564](https://github.com/yusiwen/minfer/issues/564), ADR-0044). llama.cpp applies no
+normalizer for byte-level BPE, so on non-NFC input the Qwen families differ from it by
+design; minfer follows the model's own `tokenizer.json`. DRY sequence breakers are matched
+byte-for-byte against the vocabulary (only their tokenized tails are normalized, and only
+where the rule declares it).
 
 ## Multi-turn conversation
 

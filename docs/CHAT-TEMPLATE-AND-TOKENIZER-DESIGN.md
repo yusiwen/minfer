@@ -148,11 +148,15 @@ no `(?!\S)` arm (so `a  b` grouped the two interior spaces instead of splitting
 off the first) and no `\s*[\r\n]+` arm. The rules now come from
 `tokenizer.ggml.pre`:
 
-| `pre` value (aliases) | Rule | Reference regex (from `tokenizer.json`) |
-|---|---|---|
-| `qwen2` (`deepseek-r1-qwen`) | Qwen2/Qwen2.5/Qwen3 | `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)\|[^\r\n\p{L}\p{N}]?\p{L}+\|\p{N}\| ?[^\s\p{L}\p{N}]+[\r\n]*\|\s*[\r\n]+\|\s+(?!\S)\|\s+` |
-| `qwen35` | Qwen3.5 (letter runs also consume `\p{M}`) | same, with `[\p{L}\p{M}]+` and `[^\s\p{L}\p{M}\p{N}]` |
-| `llama-bpe` (`llama3`, `llama-v3`) | Llama 3.x (#132 S3, 2026-10-15) | same as `qwen2`, with `\p{N}{1,3}` in place of `\p{N}` — digits group **three at a time** |
+| `pre` value (aliases) | Rule | Reference regex (from `tokenizer.json`) | Input normalizer |
+|---|---|---|---|
+| `qwen2` (`deepseek-r1-qwen`) | Qwen2/Qwen2.5/Qwen3 | `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)\|[^\r\n\p{L}\p{N}]?\p{L}+\|\p{N}\| ?[^\s\p{L}\p{N}]+[\r\n]*\|\s*[\r\n]+\|\s+(?!\S)\|\s+` | **NFC** |
+| `qwen35` | Qwen3.5 (letter runs also consume `\p{M}`) | same, with `[\p{L}\p{M}]+` and `[^\s\p{L}\p{M}\p{N}]` | **NFC** |
+| `llama-bpe` (`llama3`, `llama-v3`) | Llama 3.x (#132 S3, 2026-10-15) | same as `qwen2`, with `\p{N}{1,3}` in place of `\p{N}` — digits group **three at a time** | none (`"normalizer": null`) |
+
+A `pre` value therefore answers two questions: which pattern splits the text, and whether the
+input is normalized first. Both come from the family's reference `tokenizer.json`, because the
+GGUF carries no normalizer field (#564, ADR-0044); §3.6 is the mechanism.
 
 Every other value — **including a missing key** — is a refused load:
 `Tokenizer::load` returns `Err` naming the value and the supported set. A guess
@@ -265,16 +269,19 @@ Two of them changed the implementation and one the reference:
   a vocabulary missing any of the 256 byte tokens — each of which used to turn
   into quietly wrong ids (the last one via `unwrap_or(0)`).
 
-### 3.6 NFC normalization of the input (#132 S1, 2026-10-15)
+### 3.6 Input normalization: NFC where the family declares it (#132 S1, 2026-10-15; ADR-0044)
 
-Every reference `tokenizer.json` this engine gates against declares
+Whether the input is normalized is a property of the **pre-tokenizer rule**, because that is
+where the reference `tokenizer.json` declares it and the GGUF carries no normalizer field.
+`PreTokenizer::applies_nfc()` answers it, and `Tokenizer::encode` / `Tokenizer::encode_raw`
+go through one `normalized()` seam that consults it: `qwen2`/`qwen35` declare
 `"normalizer": {"type": "NFC"}` — verified 2026-10-15 for `Qwen/Qwen3-0.6B@c1899de2`,
-`Qwen/Qwen2.5-0.5B-Instruct@main` and `unsloth/Qwen3.5-0.8B@23c69c53` — so the reference
-token ids already contain the normalization and minfer's must too. `Tokenizer::encode`
-and `Tokenizer::encode_raw` normalize to NFC before the special-token scan and the
-pre-tokenizer respectively. The normalizer belongs to the tokenizer, not to a request
-shape, so the CLI, the chat path, the server and the DRY breaker tails all get it; the
-input is borrowed when it is already NFC.
+`Qwen/Qwen2.5-0.5B-Instruct@main` and `unsloth/Qwen3.5-0.8B@23c69c53` — while `llama-bpe`
+declares `"normalizer": null` (verified for `unsloth/Llama-3.2-1B-Instruct@5a8abab4` and the
+family's other revisions), and llama.cpp applies none either. The normalizer belongs to the
+tokenizer, not to a request shape, so the CLI, the chat path, the server and the DRY breaker
+tails all get it; for a normalizing family the input is borrowed when it is already NFC, and
+for the others it is never touched.
 
 The data is **generated and committed**, not a dependency:
 `scripts/gen_unicode_nfc.py` reads CPython's bundled `unicodedata` (Unicode 15.0.0) and
@@ -287,16 +294,19 @@ composition with its blocked rule. NFC is **not** NFKC: compatibility forms (`U+
 fullwidth) are left alone. The generated constant and the fixture's `unicode_version`
 are asserted to be the same data version, so an upgrade is a reviewable generator re-run.
 
-**Divergence, deliberate.** llama.cpp applies no normalizer for BPE, so on non-NFC input
-the two engines return different ids; minfer follows the model's own `tokenizer.json`
-(ADR-0042). The id-gate corpus is NFC, so the gates are unaffected. DRY-breaker
-*matching* stays byte-exact — a non-NFC breaker matches nothing and is refused by name —
-while the tails are normalized, because a tail is tokenized text.
+**Divergence, deliberate and now one-directional.** For a `qwen2`/`qwen35` model llama.cpp
+applies no normalizer, so on non-NFC input the two engines return different ids — minfer
+follows the model's own `tokenizer.json`. For a `llama-bpe` model nothing is applied by
+either engine, so they agree; the corpus for that family carries decomposed entries whose
+reference ids are the decomposed ones. DRY-breaker *matching* stays byte-exact — a non-NFC
+breaker matches nothing and is refused by name — while the tails are tokenized like any
+other text (normalized only when the rule declares it).
 
-Measured on the cached GGUFs (dgxspark, 2026-10-15): `encode("café")` ==
-`encode("cafe\u{0301}")` on all five models — `[924, 58858]` for Qwen2.5/Qwen3 and
-`[895, 56868]` for Qwen3.5 — while the unnormalized path returns `[924, 1859, 53839]` /
-`[895, 1795, 52033]`, which is the pre-S1 answer for the decomposed input.
+Measured on the cached GGUFs (dgxspark, 2026-10-15): the five Qwen-family models have
+`encode("café")` == `encode("cafe\u{0301}")` — `[924, 58858]` for Qwen2.5/Qwen3 and
+`[895, 56868]` for Qwen3.5 — while `llama-3.2-1b-instruct` keeps them apart:
+`[936, 59958]` composed, `[936, 1897, 54939]` decomposed, which is what both references
+return.
 
 ## 4. Gates
 
@@ -307,7 +317,7 @@ Measured on the cached GGUFs (dgxspark, 2026-10-15): `encode("café")` ==
 | Loud refusal | unit test: an unsupported method/syntax fails and the error **names** the construct; a mutation of the callback (dropping a method) must make a previously-passing case fail | — |
 | Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (3 rules × 52 entries) | the `tokenizer.json` regex evaluated by CPython `regex` |
 | Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
-| NFC normalization | `src/tokenizer/nfc.rs` unit tests over `tests/fixtures/tokenizer/nfc_vectors.json` (5 103 inputs: every decomposition, every composition pair, all 784 ordered mark pairs both after a starter and alone, Hangul, compatibility forms, a seeded random corpus), plus the tokenizer-level and real-model property (`encode("café") == encode("cafe\u{0301}")`) | CPython `unicodedata.normalize('NFC', …)`, the same database the tables are generated from |
+| NFC normalization | `src/tokenizer/nfc.rs` unit tests over `tests/fixtures/tokenizer/nfc_vectors.json` (5 103 inputs: every decomposition, every composition pair, all 784 ordered mark pairs both after a starter and alone, Hangul, compatibility forms, a seeded random corpus), plus the per-rule table (`the_normalizer_follows_the_pre_tokenizer_rule`), the two synthetic-tokenizer arms, and the real-model gate (a normalizing family: `café == cafe\u{0301}`; `llama-bpe`: the decomposed corpus entries) | CPython `unicodedata.normalize('NFC', …)` for the tables; each family's `tokenizer.json` normalizer field for the declaration |
 | Grammar (F2) + pinned sampler (F3) | existing suites | unchanged |
 
 Each new gate is mutation-checked (break the implementation, watch the gate
@@ -319,3 +329,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0019](adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md) — A chat template that cannot be rendered refuses the load
 - [ADR-0042](adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md) — The tokenizer applies the model's declared NFC normalizer
 - [ADR-0043](adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) — A special token is declared by the file, never inferred from its name
+- [ADR-0044](adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md) — The input normalizer follows the pre-tokenizer family's declaration

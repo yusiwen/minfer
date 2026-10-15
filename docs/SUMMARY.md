@@ -62,6 +62,7 @@
     - [0041. A row that cannot take the target's block is demoted, the legacy targets included](./adr/0041-a-row-that-cannot-take-the-targets-block-is-demoted.md)
     - [0042. The tokenizer applies the model's declared NFC normalizer](./adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md)
     - [0043. A special token is declared by the file, never inferred from its name](./adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md)
+    - [0044. The input normalizer follows the pre-tokenizer family's declaration](./adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md)
 
 # Model Support
 

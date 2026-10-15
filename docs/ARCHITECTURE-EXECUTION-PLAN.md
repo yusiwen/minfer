@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` DONE 2026-10-15; SentencePiece remains) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` DONE 2026-10-15; SentencePiece remains) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -7705,10 +7705,12 @@ pre-tokenizers (`llama3`, `default`, `deepseek-*`, `falcon`, `starcoder`, …),
 | Full suite | `cargo test --release`: **393 passed / 0 failed / 23 ignored** + 3 / 0 / 6 (baseline 382/0/21 + 3/0/6; +11 unit gates, +2 `#[ignore]`d real-model gates) |
 | Real-model serial set | `cargo test --release --bin minfer -- --ignored --test-threads=1`: **23 passed / 0 failed** on the CPU build (baseline 21/0) — the F2 grammar and F3 pinned-sampler gates included |
 
-**Honest scope.** (a) The tokenizer now applies the model's declared NFC normalizer (S1 of
-[#132](https://github.com/yusiwen/minfer/issues/132), 2026-10-15, ADR-0042 — see the record
-below); the gap this bullet used to name is closed, and what stays is the **deliberate**
-divergence from llama.cpp on non-NFC input, which applies no normalizer for BPE. (b) Beyond `qwen2`/`qwen35` no
+**Honest scope.** (a) The tokenizer now applies the family's declared input normalizer (S1 of
+[#132](https://github.com/yusiwen/minfer/issues/132), 2026-10-15, ADR-0042; made per family by
+[#564](https://github.com/yusiwen/minfer/issues/564), ADR-0044) — NFC for `qwen2`/`qwen35`,
+nothing for `llama-bpe`. For the Qwen families that is a **deliberate** divergence from
+llama.cpp, which applies no normalizer for BPE; for `llama-bpe` both engines leave the input
+alone. (b) Beyond `qwen2`/`qwen35` no
 pre-tokenizer is implemented; each unsupported value is refused by name, and the
 classic GPT-2 rule was dropped from the design rather than shipped ungated
 (GPT-2's `tokenizer.json` has no `Split` pattern to reference). (c) SentencePiece
@@ -7866,6 +7868,45 @@ unconditional NFC diverges from *both* references for decomposed input on this f
 (measured: `[936, 1897, 54939]` against minfer's composed `[936, 59958]`); filed as
 [#564](https://github.com/yusiwen/minfer/issues/564) rather than smuggled into a rule
 addition. (d) Nothing here is device-adjacent.
+
+### F7 follow-up — the normalizer is per pre-tokenizer family ([#564](https://github.com/yusiwen/minfer/issues/564)) — **DONE 2026-10-15**
+
+**What landed.** `PreTokenizer::applies_nfc()` — NFC for `qwen2`/`qwen35`, nothing for
+`llama-bpe` — and one `Tokenizer::normalized()` seam that `encode` and `encode_raw` both go
+through, so a rule that declares no normalizer hands the text to BPE exactly as it arrived.
+ADR-0044 corrects ADR-0042's unconditional scope (its mechanisms stand: generated tables, no
+new dependency, the CPython differential corpus, the conservative quick check), and the
+design record's rule table now carries an **Input normalizer** column — a `pre` value answers
+both questions a family's `tokenizer.json` declares.
+
+**Why, measured (dgxspark, 2026-10-15).** `cafe` + U+0301 on
+`unsloth/Llama-3.2-1B-Instruct-GGUF` Q4_K_M: HuggingFace `tokenizers` and llama.cpp
+`llama-tokenize` both return `[936, 1897, 54939]`; minfer's unconditional NFC returned the
+composed `[936, 59958]`. After the fix minfer returns the decomposed ids, and the family's
+fixture corpus carries that entry — so the reference ids, not a property assertion alone, are
+what a wrong answer fails. The five Qwen-family models are unchanged (`café` ==
+`cafe\u{0301}`).
+
+**Gates and mutations.** Four mutations: `llama-bpe` declared to normalize, the Qwen rules
+declared not to, `normalized()` always applying NFC, and it never applying it — **mutations
+without a red gate: 0** after the correction below. The first run called the third **green**,
+because the harness ran only the non-ignored tests and the per-family property lived only in
+the `#[ignore]`d real-model gate. The fix was both a CI-runnable witness (a synthetic
+`llama-bpe` tokenizer whose composed character has a real vocabulary entry, so a rule that
+normalized would collapse `e` + U+0301 onto it) and `--include-ignored` in the harness. A
+mutation harness that skips the ignored set is not evidence.
+
+**Suite.** `cargo test --release` on dgxspark: 536/0/41 -> **538 passed / 0 failed / 41
+ignored** unit + 10 / 0 / 6 integration (the two new tests: the rule table and the
+no-normalizer wiring arm).
+
+**Honest scope.** (a) The GGUF carries no normalizer field, so the declaration is keyed on the
+`pre` value; a model whose `tokenizer.json` contradicts its family cannot be distinguished —
+recorded in ADR-0044 as the residual, with the escape hatches it rejected. (b) Only the two
+families that exist are mapped; every new S3 rule answers the question when it lands. (c) The
+decomposed corpus entries exist for `llama-bpe` only, because the normalizing families'
+references are NFC-corpus based (their property is asserted in the same gate). (d) Nothing
+here is device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 

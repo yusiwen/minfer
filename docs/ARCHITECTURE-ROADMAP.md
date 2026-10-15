@@ -574,10 +574,13 @@ non-`gpt2` model, an empty merge table and an incomplete byte vocabulary a loud
 load refusal. The first [#132](https://github.com/yusiwen/minfer/issues/132) S3
 rule landed 2026-10-15: `llama-bpe` (aliases `llama3`, `llama-v3`), the Llama-3
 pattern whose only difference from `qwen2` is `\p{N}{1,3}`, gated by its own
-split and id fixtures. The model's declared **NFC normalizer** is applied to the input
-since [#132](https://github.com/yusiwen/minfer/issues/132) S1 (2026-10-15), so
-decomposed text tokenizes like its composed form; llama.cpp applies none for
-byte-level BPE, which is a recorded divergence. What remains: **no
+split and id fixtures. The input **normalizer follows the pre-tokenizer rule**
+since [#132](https://github.com/yusiwen/minfer/issues/132) S1/S3 (2026-10-15,
+[#564](https://github.com/yusiwen/minfer/issues/564), ADR-0044): NFC for
+`qwen2`/`qwen35`, so decomposed text tokenizes like its composed form; none for
+`llama-bpe`, whose `tokenizer.json` declares `"normalizer": null` — llama.cpp
+applies none for byte-level BPE either, so the divergence is the Qwen families'
+alone. What remains: **no
 SentencePiece/unigram or WordPiece path**, and no `ignore_merges`/multi-regex
 pre-tokenizers (`falcon3`, `pixtral`, `default`, `deepseek-*`, …) — those refuse by name, so
 the coverage gap is explicit rather than a wrong split. Special-token

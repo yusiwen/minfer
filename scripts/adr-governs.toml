@@ -221,3 +221,8 @@ path = "src/tokenizer/nfc.rs"
 adr = "0043"
 what = "a special token is what the file declares — token_type 2/3/4 plus the named roles, never a name shape"
 path = "src/tokenizer.rs"
+
+[[governs]]
+adr = "0044"
+what = "the input normalizer is a property of the pre-tokenizer rule, declared per family"
+symbol = "applies_nfc"
