@@ -264,18 +264,6 @@ file = "src/tokenizer.rs"
 reason = "Deferred vocabulary (#244): the loader's local copy of the array derives the special-token table, so only a metadata re-emitter or a tokenizer test that inspects the loaded types would read the field."
 
 [[cpu]]
-name = "im_end"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Read by `conversation::tests` and `grammar::tests`; production reaches the token through `SpecialTokens`."
-
-[[cpu]]
-name = "im_start"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Read by `tokenizer::tests`; production reaches the token through the merged special-token index."
-
-[[cpu]]
 name = "llama_key"
 kind = "fn"
 file = "src/device_tier.rs"
@@ -485,18 +473,6 @@ name = "id_to_type"
 kind = "field"
 file = "src/tokenizer.rs"
 reason = "Deferred vocabulary (#244): the loader's local copy of the array derives the special-token table, so only a metadata re-emitter or a tokenizer test that inspects the loaded types would read the field."
-
-[[cuda]]
-name = "im_end"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Read by `conversation::tests` and `grammar::tests`; production reaches the token through `SpecialTokens`."
-
-[[cuda]]
-name = "im_start"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Read by `tokenizer::tests`; production reaches the token through the merged special-token index."
 
 [[cuda]]
 name = "mmvq_batch_by_type"
@@ -724,18 +700,6 @@ name = "id_to_type"
 kind = "field"
 file = "src/tokenizer.rs"
 reason = "Deferred vocabulary (#244): the loader's local copy of the array derives the special-token table, so only a metadata re-emitter or a tokenizer test that inspects the loaded types would read the field."
-
-[[macos]]
-name = "im_end"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Read by `conversation::tests` and `grammar::tests`; production reaches the token through `SpecialTokens`."
-
-[[macos]]
-name = "im_start"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Read by `tokenizer::tests`; production reaches the token through the merged special-token index."
 
 [[macos]]
 name = "llama_key"
