@@ -893,7 +893,7 @@ comment — and asserted by the unit test `kv_nodes_carry_layer_only`
 - [03 — Model dispatch and weights](03-model-dispatch-weights.md): registered
   every weight under the names this stage's metadata references.
 - [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) §4 — the verified design summary
-  this doc expands (§4.6 has the mermaid layer diagram); Appendix A preserves
+  this doc expands (§4.6 has the layer figure); Appendix A preserves
   the imperative design this replaced.
 - [`docs/COMPUTE-GRAPH-DESIGN.md`](../COMPUTE-GRAPH-DESIGN.md) §3–6 — the
   design record (IR, builder, fusion rules, reuse) and §17 — the

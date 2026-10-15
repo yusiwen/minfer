@@ -15,24 +15,19 @@ build-dir = "book"
 default-theme = "coal"
 preferred-dark-theme = "coal"
 git-repository-url = "https://github.com/yusiwen/minfer"
-# The two Mermaid assets are NOT committed. `scripts/build_book.sh` downloads
-# docs/assets/mermaid.min.js (mermaid 10.6.1, sha384-pinned), writes
-# mermaid-init.js, runs mdbook, and deletes both again on exit — including when the
-# build fails. Build through that script, not a bare `mdbook build`: on a clean
-# checkout the files do not exist and mdBook fails while copying them.
+# Figures are inline SVG: one file per figure in docs/figures/, pulled into a page
+# with {{#include}} and wrapped in <figure class="book-figure">. There is no
+# diagram JavaScript and no preprocessor — the SVG is rendered at build time, so it
+# survives a blocked script, an offline reader and the print/PDF route, and it is
+# plain text in git (diffable, reviewable in the same commit as the prose).
 #
-# `additional-js` paths are relative to the *book root* (this file's directory)
-# and are copied into the output preserving that path — hence the "docs/assets/…"
-# spelling, and the matching <script src> mdBook emits. An absolute path is NOT an
-# alternative: `Path::join` replaces the prefix, so the input and the output become
-# the same file and the copy truncates the source (exit 0, nothing emitted). Because
-# docs/ is also the book source, mdBook copies both files a second time as content
-# (book/assets/…); the duplicate is confined to the gitignored book/ tree.
-additional-js = ["docs/assets/mermaid.min.js", "docs/assets/mermaid-init.js"]
+# `additional-css` paths are relative to the *book root* (this file's directory),
+# not to `book.src` (docs/) — hence the "docs/css/…" spelling, and the matching
+# <link> mdBook emits. An absolute path is NOT an alternative: `Path::join`
+# replaces the prefix, so the input and the output become the same file and the
+# copy truncates the source (exit 0, nothing emitted).
+additional-css = ["docs/css/figures.css"]
 
 [output.html.fold]
 enable = true
 level = 0
-
-[preprocessor.mermaid]
-command = "mdbook-mermaid"

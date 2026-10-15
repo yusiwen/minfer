@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 810 910" width="100%" style="max-width:100%;height:auto"
+     role="img" aria-label="The inference pipeline: CLI args resolve to a model, load, dispatch on mode, then a single prefill and an autoregressive decode loop, each forward running build, assign, fuse, allocate, execute through the cached graph.">
+  <style>
+    .fig-card  { fill: var(--quote-bg, #13293d); stroke: var(--quote-border, #274357); stroke-width: 1; }
+    .fig-alt   { fill: var(--table-alternate-bg, #0f2438); stroke: var(--quote-border, #274357); stroke-width: 1; }
+    .fig-t     { fill: var(--fg, #dce6f0); font-size: 12.5px; font-weight: 600; }
+    .fig-s     { fill: var(--sidebar-fg, #8fa6bd); font-size: 11.5px; }
+    .fig-cap   { fill: var(--sidebar-fg, #8fa6bd); font-size: 11px; letter-spacing: .10em; }
+    .fig-edge  { stroke: var(--quote-border, #3c6b8f); stroke-width: 1.25; fill: none; }
+    .fig-dash  { stroke: var(--quote-border, #3c6b8f); stroke-width: 1.25; fill: none; stroke-dasharray: 4 3; }
+    .fig-a-acc { fill: #4d86b8; }
+    .fig-a-pos { fill: #3f8f6f; }
+    .fig-a-neg { fill: #b06a5e; }
+  </style>
+  <defs>
+    <marker id="fig61-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--quote-border, #3c6b8f)"/>
+    </marker>
+  </defs>
+  <rect class="fig-card" x="30" y="44" width="300" height="40" rx="8"/>
+  <text class="fig-t" x="46" y="69">CLI args: model, prompt, flags</text>
+  <path class="fig-edge" d="M180 84 V 102" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="104" width="300" height="48" rx="8"/>
+  <text class="fig-t" x="46" y="124">resolve model</text>
+  <text class="fig-s" x="46" y="142">download::resolve(model_ref)</text>
+  <path class="fig-edge" d="M180 152 V 172" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="174" width="300" height="46" rx="8"/>
+  <text class="fig-t" x="46" y="194">load GGUF v3 (mmap)</text>
+  <text class="fig-s" x="46" y="211">single or split parts, one index</text>
+  <path class="fig-edge" d="M180 220 V 238" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="240" width="300" height="42" rx="8"/>
+  <text class="fig-t" x="46" y="266">parse metadata KV + tensor table</text>
+  <path class="fig-edge" d="M180 282 V 300" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="302" width="300" height="42" rx="8"/>
+  <text class="fig-t" x="46" y="328">init device backend</text>
+  <path class="fig-edge" d="M180 344 V 362" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="364" width="300" height="44" rx="8"/>
+  <text class="fig-t" x="46" y="384">load model</text>
+  <text class="fig-s" x="46" y="400">dispatch on general.architecture</text>
+  <path class="fig-edge" d="M180 408 V 428" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="430" width="300" height="46" rx="8"/>
+  <text class="fig-t" x="46" y="458">mode?</text>
+  <path class="fig-edge" d="M180 476 V 498" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="500" width="300" height="46" rx="8"/>
+  <text class="fig-t" x="46" y="520">tokenizer + chat template</text>
+  <text class="fig-s" x="46" y="537">no template -> ChatML</text>
+  <path class="fig-edge" d="M180 546 V 566" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="568" width="300" height="42" rx="8"/>
+  <text class="fig-t" x="46" y="594">tokenize prompt</text>
+  <path class="fig-edge" d="M180 610 V 630" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="632" width="300" height="46" rx="8"/>
+  <text class="fig-t" x="46" y="652">PREFILL - all prompt tokens</text>
+  <text class="fig-s" x="46" y="669">last-token logits (n_out = 1)</text>
+  <path class="fig-edge" d="M180 678 V 698" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="700" width="300" height="50" rx="8"/>
+  <text class="fig-t" x="46" y="720">DECODE loop</text>
+  <text class="fig-s" x="46" y="738">while generated below n_predict</text>
+  <path class="fig-edge" d="M180 750 V 770" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="772" width="300" height="42" rx="8"/>
+  <text class="fig-t" x="46" y="798">sample next token</text>
+  <path class="fig-edge" d="M180 814 V 834" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-card" x="30" y="836" width="300" height="50" rx="8"/>
+  <text class="fig-t" x="46" y="856">stop token or stop string?</text>
+  <text class="fig-s" x="46" y="874">yes -> done; no -> append and forward</text>
+  <path class="fig-edge" d="M180 886 V 898 H 14 V 725 H 28" marker-end="url(#fig61-arrow)"/>
+  <rect class="fig-alt" x="380" y="104" width="400" height="64" rx="8"/>
+  <text class="fig-cap" x="396" y="124">RESOLVE OUTCOMES</text>
+  <text class="fig-s" x="396" y="144">local path -> must exist</text>
+  <text class="fig-s" x="396" y="162">hf: / ollama: -> download -> path</text>
+  <rect class="fig-alt" x="380" y="424" width="400" height="116" rx="8"/>
+  <text class="fig-cap" x="396" y="446">OTHER MODES</text>
+  <text class="fig-s" x="396" y="468">--cnv -> conversation REPL</text>
+  <text class="fig-s" x="396" y="490">serve -> OpenAI-compatible HTTP server</text>
+  <text class="fig-s" x="396" y="512">viz -> viz server (page + live SSE)</text>
+  <rect class="fig-alt" x="380" y="596" width="400" height="248" rx="8"/>
+  <text class="fig-cap" x="396" y="618">EVERY FORWARD</text>
+  <rect class="fig-card" x="396" y="630" width="368" height="32" rx="6"/>
+  <text class="fig-s" x="408" y="651">build_graph - pure IR, no compute at build</text>
+  <rect class="fig-card" x="396" y="670" width="368" height="32" rx="6"/>
+  <text class="fig-s" x="408" y="691">assign backends - priority Metal -> CUDA -> CPU</text>
+  <rect class="fig-card" x="396" y="710" width="368" height="32" rx="6"/>
+  <text class="fig-s" x="408" y="731">fuse - SwiGLU + decode fusions (gated)</text>
+  <rect class="fig-card" x="396" y="750" width="368" height="32" rx="6"/>
+  <text class="fig-s" x="408" y="771">alloc - liveness + persistent per-layer KV</text>
+  <rect class="fig-card" x="396" y="790" width="368" height="32" rx="6"/>
+  <text class="fig-s" x="408" y="811">execute - per split, cross-backend copies</text>
+  <text class="fig-s" x="396" y="838">reused until GraphParams changes</text>
+  <path class="fig-dash" d="M330 655 H 360"/>
+  <path class="fig-dash" d="M330 725 H 360"/>
+  <path class="fig-dash" d="M360 655 V 725"/>
+  <path class="fig-dash" d="M360 686 H 378" marker-end="url(#fig61-arrow)"/>
+</svg>

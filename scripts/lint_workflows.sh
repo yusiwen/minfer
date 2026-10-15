@@ -8,8 +8,8 @@
 # `needs:` naming a job that does not exist. Each of those is green on GitHub and
 # red here.
 #
-# The binary is pinned the way `scripts/build_book.sh` pins mdBook and the Mermaid
-# library: a release tarball plus a per-architecture sha256, so a mirrored or
+# The binary is pinned the way `scripts/build_book.sh` pins mdBook: a release
+# tarball plus a per-architecture sha256, so a mirrored or
 # replaced artifact is refused instead of linted. Verified bytes are the whole
 # verdict — which is why shellcheck integration is disabled explicitly
 # (`-shellcheck=`). By default actionlint shells out to whatever `shellcheck` the

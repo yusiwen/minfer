@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 282" width="100%" style="max-width:100%;height:auto"
+     role="img" aria-label="The walkthrough's fifteen chapters grouped into four acts, with dashed arrows showing that chapter 13 loops back to 09 and that 14 and 15 replace the CPU kernel chapters 10 and 11.">
+  <style>
+    .fig-card  { fill: var(--quote-bg, #13293d); stroke: var(--quote-border, #274357); stroke-width: 1; }
+    .fig-alt   { fill: var(--table-alternate-bg, #0f2438); stroke: var(--quote-border, #274357); stroke-width: 1; }
+    .fig-t     { fill: var(--fg, #dce6f0); font-size: 12.5px; font-weight: 600; }
+    .fig-s     { fill: var(--sidebar-fg, #8fa6bd); font-size: 11.5px; }
+    .fig-cap   { fill: var(--sidebar-fg, #8fa6bd); font-size: 11px; letter-spacing: .10em; }
+    .fig-edge  { stroke: var(--quote-border, #3c6b8f); stroke-width: 1.25; fill: none; }
+    .fig-dash  { stroke: var(--quote-border, #3c6b8f); stroke-width: 1.25; fill: none; stroke-dasharray: 4 3; }
+    .fig-a-acc { fill: #4d86b8; }
+    .fig-a-pos { fill: #3f8f6f; }
+    .fig-a-neg { fill: #b06a5e; }
+  </style>
+  <defs>
+    <marker id="fig14-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--quote-border, #3c6b8f)"/>
+    </marker>
+  </defs>
+  <text class="fig-t" x="30" y="30">ACT 1 STARTUP + LOAD</text>
+  <text class="fig-t" x="222" y="30">ACT 2 THE GRAPH</text>
+  <text class="fig-t" x="414" y="30">ACT 3 ONE FORWARD</text>
+  <text class="fig-t" x="606" y="30">ACT 4 DECODE + DEVICE</text>
+  <rect class="fig-card" x="30" y="46" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="42" y="66">01 CLI + resolve</text>
+  <text class="fig-s" x="42" y="84">flags -> GGUF path</text>
+  <rect class="fig-card" x="30" y="102" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="42" y="122">02 GGUF load</text>
+  <text class="fig-s" x="42" y="140">mmap v3, split parts</text>
+  <rect class="fig-card" x="30" y="158" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="42" y="178">03 dispatch weights</text>
+  <text class="fig-s" x="42" y="196">arch -> ModelDef</text>
+  <rect class="fig-card" x="30" y="214" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="42" y="234">04 tokenizer</text>
+  <text class="fig-s" x="42" y="252">+ chat template</text>
+  <rect class="fig-card" x="222" y="46" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="234" y="66">05 graph build</text>
+  <text class="fig-s" x="234" y="84">pure IR, per-layer</text>
+  <rect class="fig-card" x="222" y="102" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="234" y="122">06 assign + fuse</text>
+  <text class="fig-s" x="234" y="140">priority, SwiGLU</text>
+  <rect class="fig-card" x="222" y="158" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="234" y="178">07 allocate</text>
+  <text class="fig-s" x="234" y="196">liveness + KV regions</text>
+  <rect class="fig-card" x="222" y="214" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="234" y="234">08 execute</text>
+  <text class="fig-s" x="234" y="252">splits + cross copies</text>
+  <rect class="fig-card" x="414" y="46" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="426" y="66">09 prefill</text>
+  <text class="fig-s" x="426" y="84">all prompt tokens</text>
+  <rect class="fig-card" x="414" y="102" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="426" y="122">10 CPU matmuls</text>
+  <text class="fig-s" x="426" y="140">Q8_0 x quantized</text>
+  <rect class="fig-card" x="414" y="158" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="426" y="178">11 attention + KV</text>
+  <text class="fig-s" x="426" y="196">RoPE, GQA, softmax</text>
+  <rect class="fig-card" x="414" y="214" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="426" y="234">12 sampler</text>
+  <text class="fig-s" x="426" y="252">logits -> token</text>
+  <rect class="fig-alt" x="606" y="46" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="618" y="66">13 decode loop</text>
+  <text class="fig-s" x="618" y="84">reuse graph + KV</text>
+  <rect class="fig-alt" x="606" y="102" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="618" y="122">14 Metal backend</text>
+  <text class="fig-s" x="618" y="140">same graph, Apple GPU</text>
+  <rect class="fig-alt" x="606" y="158" width="160" height="48" rx="8"/>
+  <text class="fig-t" x="618" y="178">15 CUDA backend</text>
+  <text class="fig-s" x="618" y="196">MMQ + graph replay</text>
+  <path class="fig-edge" d="M110 94 V 100" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M110 150 V 156" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M110 206 V 212" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M302 94 V 100" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M302 150 V 156" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M302 206 V 212" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M494 94 V 100" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M494 150 V 156" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M494 206 V 212" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M190 238 H 206 V 70 H 218" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M382 238 H 398 V 70 H 410" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-edge" d="M574 238 H 780 V 70 H 770" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-dash" d="M606 70 H 578" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-dash" d="M606 126 H 578" marker-end="url(#fig14-arrow)"/>
+  <path class="fig-dash" d="M606 182 H 578" marker-end="url(#fig14-arrow)"/>
+</svg>

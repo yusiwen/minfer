@@ -1,0 +1,37 @@
+/* Figures.
+ *
+ * A figure is an SVG file in docs/figures/ , pulled into a page with {{#include}} and wrapped in
+ * <figure class="book-figure"> so the raw SVG forms a single HTML block (CommonMark only treats a
+ * fixed list of tags as block tags, and <svg> is not one of them - unwrapped, mdBook warns about
+ * unbalanced HTML), then captioned with an italic *Figure N.M - ...* line.
+ *
+ * Inline, never an <img>: CSS custom properties do not cross the image boundary, so an image
+ * reference would lose the theme entirely and be unreadable in one of the two themes.
+ *
+ * Figure numbers are per document: the file-name prefix is the document's figure series (the
+ * top-level chapter number from docs/SUMMARY.md where the document is one, otherwise the nearest
+ * number after its part), and the caption's minor number runs 1.. within a page. Each figure file
+ * is therefore named NN-slug.svg and its caption reads *Figure NN.M - ...*.
+ *
+ * Wired from book.toml. `additional-css` entries resolve against the book root, which is the
+ * directory holding book.toml (the repo root), not against `book.src` (docs/) - hence the
+ * "docs/css/..." spelling, exactly like the additional-js entries there.
+ */
+
+.book-figure {
+  margin: 1.8em 0;
+  padding: 0;
+}
+
+.book-figure svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* Captions are ordinary markdown italics right after a figure; keep them tight to it. */
+.book-figure + p em:only-child {
+  color: var(--sidebar-fg);
+  font-size: 0.86em;
+  line-height: 1.5;
+}

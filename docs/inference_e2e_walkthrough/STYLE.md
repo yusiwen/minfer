@@ -38,9 +38,9 @@ must accomplish, and what would break without it. (3-6 paragraphs, beginner
 friendly.)
 
 ## 2. Principle — how it works and why
-The mechanism, argued from data shapes and arithmetic. Diagrams (ascii or
-mermaid) where they help; equations where a diagram does not fit. New concepts
-defined on first use.
+The mechanism, argued from data shapes and arithmetic. Figures (hand-authored
+SVG in `docs/figures/`) where they help; equations where a diagram does not
+fit. New concepts defined on first use.
 
 ## 3. Implementation
 ### 3.1 Data in / data out
