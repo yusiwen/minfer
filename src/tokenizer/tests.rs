@@ -46,6 +46,8 @@ fn test_tokenizer() -> Tokenizer {
         normalizer: NormalizerOptions::default(),
         max_token_len: 0,
         unk_token: 0,
+        ugm: UgmData::default(),
+        remove_extra_whitespaces: false,
         special_by_first: HashMap::new(),
         bos_token: 0,
         eos_token: 0,
@@ -214,6 +216,105 @@ fn a_chat_token_the_file_does_not_declare_is_not_invented() {
     );
     assert!(!t.special_tokens.contains_key("<|im_start|>"));
     assert!(!t.special_tokens.contains_key("<|im_end|>"));
+}
+
+// === #132 S4: the unigram (`model = t5`) engine ============================
+
+/// A unigram vocabulary with the pieces the Viterbi needs to prefer one
+/// segmentation over another: `ab` scores above `a` + `b`, `▁ab` above `▁a` +
+/// `b`, and the scores bound the unknown transition (`min_score` is `▁`'s -5, so
+/// an unknown costs -15).
+///
+/// Ids: 0 `<pad>`, 1 `</s>`, 2 `<unk>` (the unknown role), then the pieces, then
+/// the two capitals the charsmap test replaces one with.
+fn ugm_tokenizer() -> Tokenizer {
+    let mut t = Tokenizer::empty();
+    t.model = TokenizerModel::Ugm;
+    t.pre = None;
+    t.unk_token = 2;
+    t.add_space_prefix = false;
+    t.remove_extra_whitespaces = false;
+
+    let mut push = |t: &mut Tokenizer, text: &str, ty: i32, score: f32| -> u32 {
+        let id = t.id_to_token.len() as u32;
+        t.id_to_token.push(text.to_string());
+        t.id_to_type.push(ty);
+        t.id_to_score.push(score);
+        t.vocab.insert(text.to_string(), id);
+        id
+    };
+    push(&mut t, "<pad>", 3, 0.0);
+    push(&mut t, "</s>", 3, 0.0);
+    push(&mut t, "<unk>", 2, 0.0);
+    for (text, score) in [
+        ("\u{2581}", -5.0),
+        ("a", -3.0),
+        ("b", -3.0),
+        ("ab", -1.0),
+        ("\u{2581}a", -2.0),
+        ("\u{2581}ab", -1.5),
+        ("A", -1.0),
+        ("B", -1.0),
+    ] {
+        push(&mut t, text, 1, score);
+    }
+    for (id, text) in t.id_to_token.clone().iter().enumerate() {
+        let ty = t.id_to_type[id];
+        if ty == 1 || ty == 4 || ty == 5 {
+            t.ugm.trie.insert(text, id as u32);
+        }
+    }
+    t.ugm.unknown_token_score = -5.0 - 10.0;
+    t
+}
+
+#[test]
+fn ugm_picks_the_highest_scoring_segmentation() {
+    let t = ugm_tokenizer();
+    // `ab` (-1) beats `a` + `b` (-6).
+    assert_eq!(t.encode("ab"), vec![t.vocab["ab"]]);
+    // With the prefix space, `▁ab` (-1.5) beats `▁a` + `b` (-5).
+    let mut prefixed = ugm_tokenizer();
+    prefixed.add_space_prefix = true;
+    assert_eq!(prefixed.encode("ab"), vec![prefixed.vocab["\u{2581}ab"]]);
+    // A code point nothing matches costs the unknown transition, and a run of
+    // them is one unknown token, never one per character.
+    assert_eq!(
+        t.encode("aXXb"),
+        vec![t.vocab["a"], t.unk_token, t.vocab["b"]]
+    );
+}
+
+#[test]
+fn ugm_applies_the_charsmap_prefix_replacement() {
+    // A hand-built XCDA table with one mapping: `A` -> `B`. The layout is the one
+    // `normalize_prefix` walks: BASE of the root, the child node (LCHECK = the
+    // byte, LEAF set), and the node its BASE points at, holding the replacement's
+    // offset in its low 31 bits.
+    let mut t = ugm_tokenizer();
+    assert_eq!(t.encode("A"), vec![t.vocab["A"]]);
+    t.ugm.xcda = vec![0x0001_0000, 0x0000_0D41, 0];
+    t.ugm.prefix_replacements = b"B\0".to_vec();
+    assert_eq!(
+        t.encode("A"),
+        vec![t.vocab["B"]],
+        "the charmap must rewrite `A` to `B` before the Viterbi runs"
+    );
+}
+
+#[test]
+fn ugm_whitespace_normalization_follows_the_file() {
+    let mut t = ugm_tokenizer();
+    t.add_space_prefix = true;
+    // `add_space_prefix` prepends one `▁` to text that does not start with space.
+    assert_eq!(t.ugm_normalize("ab"), "\u{2581}ab");
+    // `remove_extra_whitespaces` collapses a run of spaces into one, and keeps it
+    // attached to the following word.
+    t.remove_extra_whitespaces = true;
+    assert_eq!(t.ugm_normalize("a  b"), "\u{2581}a\u{2581}b");
+    // Without it every space is escaped, so the run survives.
+    t.remove_extra_whitespaces = false;
+    assert_eq!(t.ugm_normalize("a  b"), "\u{2581}a\u{2581}\u{2581}b");
 }
 
 // === #132 S4: the WordPiece (`model = bert`) engine =========================
@@ -393,10 +494,13 @@ fn the_tokenizer_model_is_a_dispatch() {
         TokenizerModel::from_gguf(Some("bert")).unwrap(),
         TokenizerModel::Bert
     );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("t5")).unwrap(),
+        TokenizerModel::Ugm
+    );
     // Every other engine is refused *by name* — an approximation with the wrong
     // engine would be worse than a refusal.
     for other in [
-        "t5",
         "rwkv",
         "plamo2",
         "gemma4",
@@ -844,6 +948,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         "~/.cache/minfer/models/hf/ggml-org/bge-small-en-v1.5-Q8_0-GGUF/bge-small-en-v1.5-q8_0.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_bge-small-en-v1.5.json"),
     ),
+    (
+        "flan-t5-small",
+        "~/.cache/minfer/models/hf/Felladrin/gguf-flan-t5-small/flan-t5-small.Q8_0.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_flan-t5-small.json"),
+    ),
 ];
 
 fn expand_home(path: &str) -> std::path::PathBuf {
@@ -947,7 +1056,20 @@ fn token_ids_match_the_reference() {
         // one, without it they must coincide.
         let composed = tok.encode("café");
         let decomposed = tok.encode("cafe\u{0301}");
-        if tok.model == TokenizerModel::Bert {
+        if tok.model == TokenizerModel::Ugm && !tok.ugm.xcda.is_empty() {
+            // The precompiled charsmap normalizes both spellings to one sequence —
+            // that is what this fixture's decomposed entries assert — so the
+            // property is the fold, not the distinction the BPE/SPM families make.
+            assert_eq!(
+                decomposed, composed,
+                "{slug}: the charsmap must fold both spellings onto one sequence"
+            );
+            assert_eq!(
+                decomposed,
+                tok.encode_raw("cafe\u{0301}"),
+                "{slug}: `Tokenizer::encode_raw` must use the same normalization"
+            );
+        } else if tok.model == TokenizerModel::Bert {
             // The BertNormalizer is NFD + dropping `Mn`, so with the options this
             // artifact's file leaves at their defaults the composed and decomposed
             // spellings of an accented word are the *same* word — the opposite of
@@ -1006,6 +1128,8 @@ fn token_ids_match_the_reference() {
                 "NFC declared"
             } else if tok.model == TokenizerModel::Bert {
                 "BertNormalizer declared"
+            } else if tok.model == TokenizerModel::Ugm {
+                "charsmap normalizer declared"
             } else {
                 "no normalizer"
             },
@@ -1028,6 +1152,7 @@ impl TokenizerModel {
             Self::Gpt2 => "gpt2",
             Self::Spm => "llama",
             Self::Bert => "bert",
+            Self::Ugm => "t5",
         }
     }
 }
