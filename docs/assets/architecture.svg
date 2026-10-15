@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 700" width="860" height="700"
+     role="img" aria-label="minfer architecture: the CLI loads a GGUF and tokenizes the prompt, PREFILL produces the last-token logits, then the DECODE loop samples a token and either stops or forwards one more token; both forwards run the same cached compute graph, which builds, assigns, fuses, allocates and executes.">
+  <!-- Self-contained on purpose: this diagram is referenced from README.md by an <img>, and
+       GitHub's markdown sanitiser strips an inline <svg>. CSS custom properties do not cross the
+       image boundary either, so the two GitHub colour modes are spelled out here as literal
+       colours behind prefers-color-scheme rather than as mdBook theme variables (compare
+       docs/figures/*.svg, which are included inline in the book). The node and edge set, and
+       every label, is the Mermaid diagram this replaces. -->
+  <style>
+    .panel  { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1; }
+    .card   { fill: #ffffff; stroke: #d0d7de; stroke-width: 1; }
+    .title  { fill: #1f2328; font-size: 13px; font-weight: 600; }
+    .sub    { fill: #59636e; font-size: 11.5px; }
+    .grp    { fill: #1f2328; font-size: 12.5px; font-weight: 600; }
+    .edge   { stroke: #8c959f; stroke-width: 1.4; fill: none; }
+    .head   { fill: #8c959f; }
+    .reuse  { stroke: #8250df; stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+    .head-r { fill: #8250df; }
+    .rlab   { fill: #8250df; font-size: 11.5px; }
+    @media (prefers-color-scheme: dark) {
+      .panel  { fill: #0d1117; stroke: #30363d; }
+      .card   { fill: #161b22; stroke: #30363d; }
+      .title  { fill: #e6edf3; }
+      .sub    { fill: #8b949e; }
+      .grp    { fill: #e6edf3; }
+      .edge   { stroke: #6e7681; }
+      .head   { fill: #6e7681; }
+      .reuse  { stroke: #a371f7; }
+      .head-r { fill: #a371f7; }
+      .rlab   { fill: #a371f7; }
+    }
+  </style>
+  <defs>
+    <marker id="fig-arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0 0 L10 5 L0 10 z"/>
+    </marker>
+    <marker id="fig-arw-reuse" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head-r" d="M0 0 L10 5 L0 10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="card" x="24" y="44" width="360" height="44" rx="8"/>
+  <text class="title" x="44" y="72">CLI</text>
+  <path class="edge" d="M204 88 V 98" marker-end="url(#fig-arw)"/>
+
+  <rect class="card" x="24" y="98" width="360" height="56" rx="8"/>
+  <text class="title" x="44" y="124">load GGUF</text>
+  <text class="sub" x="44" y="144">metadata + quantized weights</text>
+  <path class="edge" d="M204 154 V 164" marker-end="url(#fig-arw)"/>
+
+  <rect class="card" x="24" y="164" width="360" height="56" rx="8"/>
+  <text class="title" x="44" y="190">tokenize prompt</text>
+  <text class="sub" x="44" y="210">BPE + chat template</text>
+  <path class="edge" d="M204 220 V 230" marker-end="url(#fig-arw)"/>
+
+  <rect class="card" x="24" y="230" width="360" height="56" rx="8"/>
+  <text class="title" x="44" y="256">PREFILL</text>
+  <text class="sub" x="44" y="276">graph forward, all prompt tokens</text>
+  <path class="edge" d="M204 286 V 296" marker-end="url(#fig-arw)"/>
+
+  <rect class="card" x="24" y="296" width="360" height="44" rx="8"/>
+  <text class="title" x="44" y="324">last-token logits</text>
+  <path class="edge" d="M204 340 V 350" marker-end="url(#fig-arw)"/>
+
+  <rect class="card" x="24" y="350" width="360" height="48" rx="8"/>
+  <text class="title" x="44" y="380">DECODE loop</text>
+  <path class="edge" d="M204 398 V 408" marker-end="url(#fig-arw)"/>
+  <text class="sub" x="216" y="406">sample</text>
+
+  <rect class="card" x="24" y="408" width="360" height="112" rx="8"/>
+  <text class="title" x="44" y="434">sample next token</text>
+  <text class="sub" x="44" y="456">logit bias &#8594; penalties &#8594; DRY &#8594; top-k &#8594; typical &#8594;</text>
+  <text class="sub" x="44" y="474">top-p &#8594; min-p &#8594; XTC &#8594; temp | mirostat</text>
+
+  <path class="edge" d="M114 520 V 530" marker-end="url(#fig-arw)"/>
+  <text class="sub" x="126" y="529">stop</text>
+  <rect class="card" x="24" y="530" width="190" height="44" rx="8"/>
+  <text class="title" x="44" y="558">text out</text>
+
+  <path class="edge" d="M280 520 V 584" marker-end="url(#fig-arw)"/>
+  <text class="sub" x="294" y="556">continue</text>
+  <rect class="card" x="24" y="584" width="360" height="56" rx="8"/>
+  <text class="title" x="44" y="610">graph forward, 1 token</text>
+  <text class="sub" x="44" y="630">KV persists in the allocator</text>
+
+  <path class="edge" d="M24 612 H 6 V 374 H 22" marker-end="url(#fig-arw)"/>
+
+  <rect class="panel" x="504" y="200" width="332" height="470" rx="10"/>
+  <text class="grp" x="524" y="228">build &#8594; assign &#8594; fuse &#8594; alloc &#8594; execute</text>
+
+  <rect class="card" x="520" y="250" width="300" height="68" rx="8"/>
+  <text class="title" x="540" y="276">GraphBuilder</text>
+  <text class="sub" x="540" y="298">build_graph (pure IR)</text>
+  <path class="edge" d="M670 318 V 336" marker-end="url(#fig-arw)"/>
+
+  <rect class="card" x="520" y="336" width="300" height="68" rx="8"/>
+  <text class="title" x="540" y="362">assign backends</text>
+  <text class="sub" x="540" y="384">Metal &#8594; CUDA &#8594; CPU</text>
+  <path class="edge" d="M670 404 V 422" marker-end="url(#fig-arw)"/>
+
+  <rect class="card" x="520" y="422" width="300" height="68" rx="8"/>
+  <text class="title" x="540" y="448">fuse</text>
+  <text class="sub" x="540" y="470">SwiGLU + decode fusions (gated)</text>
+  <path class="edge" d="M670 490 V 508" marker-end="url(#fig-arw)"/>
+
+  <rect class="card" x="520" y="508" width="300" height="68" rx="8"/>
+  <text class="title" x="540" y="534">alloc</text>
+  <text class="sub" x="540" y="556">liveness + persistent KV</text>
+  <path class="edge" d="M670 576 V 594" marker-end="url(#fig-arw)"/>
+
+  <rect class="card" x="520" y="594" width="300" height="68" rx="8"/>
+  <text class="title" x="540" y="620">execute</text>
+  <text class="sub" x="540" y="642">per split, cross-backend copies</text>
+
+  <path class="reuse" d="M384 258 H 502" marker-end="url(#fig-arw-reuse)"/>
+  <text class="rlab" x="444" y="236" text-anchor="middle">GraphCache:</text>
+  <text class="rlab" x="444" y="250" text-anchor="middle">params-only reuse</text>
+  <path class="reuse" d="M384 612 H 502" marker-end="url(#fig-arw-reuse)"/>
+  <text class="rlab" x="444" y="590" text-anchor="middle">GraphCache:</text>
+  <text class="rlab" x="444" y="604" text-anchor="middle">params-only reuse</text>
+</svg>

@@ -109,28 +109,7 @@ then reused params-only via `GraphCache` — while the scheduler assigns backend
 per op (priority Metal → CUDA → CPU), applies pattern-based fusion, allocates
 buffers with liveness analysis, and executes in per-backend splits:
 
-```mermaid
-flowchart LR
-    subgraph GRAPH["build → assign → fuse → alloc → execute"]
-        B1["GraphBuilder<br/>build_graph (pure IR)"] --> B2["assign backends<br/>Metal → CUDA → CPU"]
-        B2 --> B3["fuse<br/>SwiGLU + decode fusions (gated)"]
-        B3 --> B4["alloc<br/>liveness + persistent KV"]
-        B4 --> B5["execute<br/>per split, cross-backend copies"]
-    end
-
-    A["CLI"] --> L["load GGUF<br/>metadata + quantized weights"]
-    L --> C["tokenize prompt<br/>BPE + chat template"]
-    C --> D["PREFILL<br/>graph forward, all prompt tokens"]
-    D --> E["last-token logits"]
-    E --> F{"DECODE loop"}
-    F -->|sample| G["sample next token<br/>logit bias → penalties → DRY → top-k → typical →<br/>top-p → min-p → XTC → temp | mirostat"]
-    G -->|stop| H["text out"]
-    G -->|continue| I["graph forward, 1 token<br/>KV persists in the allocator"]
-    I --> F
-
-    D -.->|"GraphCache: params-only reuse"| GRAPH
-    I -.->|"GraphCache: params-only reuse"| GRAPH
-```
+![minfer architecture. The request pipeline (CLI, load GGUF, tokenize prompt, PREFILL, last-token logits) feeds the DECODE loop: sample a token, then either stop with text out or forward one more token and loop. Both forwards run the same cached compute graph, which builds the IR, assigns backends, fuses, allocates and executes in per-backend splits.](docs/assets/architecture.svg)
 
 Key invariants: **KV positions are data** (the graph topology never depends on
 `n_past`, so decode steps reuse one graph); each layer owns **two persistent KV
