@@ -153,6 +153,7 @@ off the first) and no `\s*[\r\n]+` arm. The rules now come from
 | `qwen2` (`deepseek-r1-qwen`) | Qwen2/Qwen2.5/Qwen3 | `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)\|[^\r\n\p{L}\p{N}]?\p{L}+\|\p{N}\| ?[^\s\p{L}\p{N}]+[\r\n]*\|\s*[\r\n]+\|\s+(?!\S)\|\s+` | **NFC** |
 | `qwen35` | Qwen3.5 (letter runs also consume `\p{M}`) | same, with `[\p{L}\p{M}]+` and `[^\s\p{L}\p{M}\p{N}]` | **NFC** |
 | `llama-bpe` (`llama3`, `llama-v3`) | Llama 3.x (#132 S3, 2026-10-15) | same as `qwen2`, with `\p{N}{1,3}` in place of `\p{N}` — digits group **three at a time** | none (`"normalizer": null`) |
+| `lfm2` | LiquidAI LFM2 (#132 S3, 2026-10-15) | **byte-identical** to `llama-bpe`'s pattern (verified on `LiquidAI/LFM2-1.2B@40f3da0d`) | none (`"normalizer": null`) |
 
 A `pre` value therefore answers two questions: which pattern splits the text, and whether the
 input is normalized first. Both come from the family's reference `tokenizer.json`, because the
@@ -315,8 +316,8 @@ return.
 | Template byte-for-byte rendering, per model | `src/template.rs` unit test over `tests/fixtures/chat/*.json` | transformers 5.17.0 `apply_chat_template` |
 | The fixture template is the model's own | `#[ignore]`d real-model test: GGUF `tokenizer.chat_template` == fixture template and rendering matches | the cached GGUF |
 | Loud refusal | unit test: an unsupported method/syntax fails and the error **names** the construct; a mutation of the callback (dropping a method) must make a previously-passing case fail | — |
-| Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (3 rules × 52 entries) | the `tokenizer.json` regex evaluated by CPython `regex` |
-| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
+| Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (4 values, 52-54 entries each) | the `tokenizer.json` regex evaluated by CPython `regex` |
+| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (7 cached models) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
 | NFC normalization | `src/tokenizer/nfc.rs` unit tests over `tests/fixtures/tokenizer/nfc_vectors.json` (5 103 inputs: every decomposition, every composition pair, all 784 ordered mark pairs both after a starter and alone, Hangul, compatibility forms, a seeded random corpus), plus the per-rule table (`the_normalizer_follows_the_pre_tokenizer_rule`), the two synthetic-tokenizer arms, and the real-model gate (a normalizing family: `café == cafe\u{0301}`; `llama-bpe`: the decomposed corpus entries) | CPython `unicodedata.normalize('NFC', …)` for the tables; each family's `tokenizer.json` normalizer field for the declaration |
 | Grammar (F2) + pinned sampler (F3) | existing suites | unchanged |
 
