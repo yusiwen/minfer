@@ -211,6 +211,39 @@ fn chatml_specials_still_match_via_fallback() {
     assert_eq!(ids, vec![0, 42, 0]);
 }
 
+// === #132 S1: NFC normalization of the input =============================
+
+/// `Tokenizer::encode` normalizes to NFC, so a decomposed input reaches the
+/// same token as its composed form. The composed character is given a real
+/// vocabulary entry (a merge plus the two byte-encoded characters) so the
+/// assertion is about one *specific* id, and the unnormalized internal path is
+/// asserted to disagree — otherwise the test would pass for the wrong reason.
+#[test]
+fn encode_normalizes_decomposed_input_to_nfc() {
+    let mut t = test_tokenizer();
+    let encoded = byte_encode("é", &t.byte_to_unicode);
+    let chars: Vec<char> = encoded.chars().collect();
+    assert_eq!(chars.len(), 2, "é is two UTF-8 bytes");
+    t.merges
+        .insert((chars[0].to_string(), chars[1].to_string()), 0);
+    t.vocab.insert(encoded, 7);
+    t.id_to_token.push("é".into());
+    t.id_to_score.push(0.0);
+    t.id_to_type.push(1);
+
+    assert_eq!(t.encode("é"), vec![7]);
+    assert_eq!(
+        t.encode("e\u{0301}"),
+        vec![7],
+        "NFC must compose e + U+0301"
+    );
+    assert_ne!(
+        t.encode_bpe("e\u{0301}"),
+        vec![7],
+        "the unnormalized path must disagree, or this test proves nothing"
+    );
+}
+
 // === F7 (#50) pre-tokenizer rules and byte fallback ======================
 
 /// Reference splits produced by CPython `regex` from the model's own
@@ -409,8 +442,31 @@ fn token_ids_match_the_reference() {
             (Some(tok.im_start), Some(tok.im_end)),
             "{slug}: special tokens must survive as single ids: {ids:?}"
         );
+        // #132 S1: the declared normalizer, on a real vocabulary. No cached GGUF
+        // carries a decomposed corpus entry, so the assertion is the *property*
+        // (a decomposed input encodes like its composed form); CPython is the
+        // reference for the normalization itself (`nfc::tests`), and the
+        // unnormalized path is asserted to disagree — otherwise this would pass
+        // for the wrong reason.
+        let composed = tok.encode("café");
+        let decomposed = tok.encode("cafe\u{0301}");
+        let raw_decomposed = tok.encode_bpe("cafe\u{0301}");
+        assert_eq!(
+            decomposed, composed,
+            "{slug}: NFC is not applied to `Tokenizer::encode`"
+        );
+        assert_eq!(
+            tok.encode_raw("cafe\u{0301}"),
+            tok.encode_raw("café"),
+            "{slug}: NFC is not applied to `Tokenizer::encode_raw`"
+        );
+        assert_ne!(
+            raw_decomposed, composed,
+            "{slug}: a real vocabulary must split the decomposed form differently"
+        );
         eprintln!(
-            "{slug}: {} corpus entries + special tokens match the reference byte for byte",
+            "{slug}: {} corpus entries + special tokens match the reference byte for byte; \
+             NFC: café -> {composed:?}, decomposed -> {decomposed:?} (raw {raw_decomposed:?})",
             entries.len()
         );
     }
