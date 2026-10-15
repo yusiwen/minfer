@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` DONE 2026-10-15; SentencePiece remains) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; SentencePiece remains) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -7907,6 +7907,41 @@ families that exist are mapped; every new S3 rule answers the question when it l
 decomposed corpus entries exist for `llama-bpe` only, because the normalizing families'
 references are NFC-corpus based (their property is asserted in the same gate). (d) Nothing
 here is device-adjacent.
+
+### F7 follow-up — the `lfm2` pre-tokenizer rule ([#132](https://github.com/yusiwen/minfer/issues/132) S3, second rule) — **DONE 2026-10-15**
+
+**What landed.** `PreTokenizer::Lfm2`, accepted for `tokenizer.ggml.pre = lfm2`
+(`LiquidAI/LFM2-1.2B` and its GGUF). Its reference `tokenizer.json` pattern is
+**byte-identical** to `llama-bpe`'s — verified 2026-10-15 on `LiquidAI/LFM2-1.2B@40f3da0d`,
+`Split` + `ByteLevel`, `"normalizer": null` — so the splitter needed no new code; the value
+is its own variant so the fixture and the refusal name the value the file carries, and so
+`gguf_name()` reports it.
+
+**Fixtures.** `split_lfm2.json` (CPython `regex` 2026.9.29 on that pattern, 54 corpus
+entries: the shared corpus with the five foreign specials replaced by LFM2's own —
+`<|im_start|>`, `<|im_end|>`, `<|startoftext|>`, `<|tool_call_start|>`, all type 3 in the
+GGUF) and `ids_lfm2-1.2b.json` (HuggingFace `tokenizers` 0.23.3 on the same tokenizer.json),
+gated against the cached `LiquidAI/LFM2-1.2B-GGUF` Q4_K_M (730 893 248 B; probed: `pre =
+lfm2`, 505 type-3 + 2 type-4 tokens, bos 1 `<|startoftext|>` / eos 7 `<|im_end|>` declared).
+
+**Measured (dgxspark, 2026-10-15).** `token_ids_match_the_reference -- --ignored --nocapture`:
+**seven** cached models byte-for-byte, the new one included (54 corpus entries + its declared
+special tokens), with `café` = `[576, 2305, 860]` and the decomposed entries matching the
+reference's decomposed ids (`[576, 13260, 10186]`) — the family declares no normalizer, so
+ADR-0044's answer applies unchanged. The splitter matches CPython on all 54 entries.
+
+**Gates and mutations.** Five mutations, each making a gate fail: `lfm2` split with the Qwen2
+rule, `lfm2` refused again, `lfm2` declared to normalize, its digit cap set to one, and its
+letter arm made to consume combining marks — **mutations without a red gate: 0** (the harness
+runs `--include-ignored`, so the declared-normalizer mutation is caught by the id gate too).
+The suite counts do not move: the rule rides the fixture-driven gates, and the three test
+functions it touches were extended rather than added.
+
+**Honest scope.** (a) The value was accepted because its pattern is byte-identical to the
+already-implemented one; a value whose pattern differs (`pixtral` is identical too but its
+smallest artifact is 12B, `tekken`, `starcoder`, `deepseek-*`) still needs its own splitter
+and fixtures. (b) The corpus is the shared 52-entry one with this family's specials, so the
+families stay comparable. (c) Nothing here is device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 
