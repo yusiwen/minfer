@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC + the remaining pre-tokenizer rules) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**; pre-tokenizer rules, data-driven special tokens and SentencePiece remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -7705,10 +7705,10 @@ pre-tokenizers (`llama3`, `default`, `deepseek-*`, `falcon`, `starcoder`, …),
 | Full suite | `cargo test --release`: **393 passed / 0 failed / 23 ignored** + 3 / 0 / 6 (baseline 382/0/21 + 3/0/6; +11 unit gates, +2 `#[ignore]`d real-model gates) |
 | Real-model serial set | `cargo test --release --bin minfer -- --ignored --test-threads=1`: **23 passed / 0 failed** on the CPU build (baseline 21/0) — the F2 grammar and F3 pinned-sampler gates included |
 
-**Honest scope.** (a) The tokenizer does not apply the HF normalizer (NFC):
-llama.cpp does not either for BPE, and every corpus entry is NFC-normalized;
-composed-vs-decomposed input can therefore differ from transformers, and a
-normalization table is a follow-up ([#132](https://github.com/yusiwen/minfer/issues/132)). (b) Beyond `qwen2`/`qwen35` no
+**Honest scope.** (a) The tokenizer now applies the model's declared NFC normalizer (S1 of
+[#132](https://github.com/yusiwen/minfer/issues/132), 2026-10-15, ADR-0042 — see the record
+below); the gap this bullet used to name is closed, and what stays is the **deliberate**
+divergence from llama.cpp on non-NFC input, which applies no normalizer for BPE. (b) Beyond `qwen2`/`qwen35` no
 pre-tokenizer is implemented; each unsupported value is refused by name, and the
 classic GPT-2 rule was dropped from the design rather than shipped ungated
 (GPT-2's `tokenizer.json` has no `Split` pattern to reference). (c) SentencePiece
@@ -7725,6 +7725,57 @@ manual/local (`#[ignore]`d) evidence; the CI-runnable gates are the fixture-
 template rendering, the split fixtures, the str-method/semantics fixtures, the
 loud refusal and the mutation-checked unit gates. (h) Nothing here is
 device-adjacent: the CUDA and macOS CI jobs are compile-only for this change.
+
+### F7 follow-up — the model's declared NFC normalizer ([#132](https://github.com/yusiwen/minfer/issues/132) S1) — **DONE 2026-10-15**
+
+**What landed.** `Tokenizer::encode` and `Tokenizer::encode_raw` normalize their input to
+NFC before the special-token scan and the pre-tokenizer, because every reference
+`tokenizer.json` this engine gates against declares `"normalizer": {"type": "NFC"}` — the
+reference ids therefore contain the normalization and minfer's did not. The Unicode data is
+generated and committed rather than a dependency: `scripts/gen_unicode_nfc.py` reads
+CPython's bundled `unicodedata` (Unicode 15.0.0) and writes `src/tokenizer/nfc/tables.rs`
+plus the differential corpus `tests/fixtures/tokenizer/nfc_vectors.json`; the algorithm is
+`src/tokenizer/nfc.rs` (canonical decomposition, canonical ordering, blocked canonical
+composition, Hangul arithmetic). NFC is not NFKC — compatibility forms are untouched.
+ADR-0042 records the decision and the rejected alternatives (refuse non-NFC instead; the
+`unicode-normalization` crate; NFKC; normalizing at the server or template layer; a
+Latin-1-only subset).
+
+**Measured (dgxspark, aarch64, 2026-10-15).** Command: `cargo test --release --bin minfer
+token_ids_match_the_reference -- --ignored --nocapture`, five cached GGUFs:
+
+| Model | composed `"café"` | decomposed `"cafe\u{0301}"` | the unnormalized path |
+|---|---|---|---|
+| Qwen2.5-0.5B / 7B / 14B-Instruct, Qwen3-0.6B | `[924, 58858]` | **`[924, 58858]`** | `[924, 1859, 53839]` |
+| Qwen3.5-0.8B | `[895, 56868]` | **`[895, 56868]`** | `[895, 1795, 52033]` |
+
+The third column is the pre-S1 answer for the *decomposed* input, i.e. the silent
+divergence this slice removes.
+
+**Gates and mutations.** The differential corpus (5 103 inputs: every code point with a
+canonical decomposition, every one of the 941 composition pairs, all 784 ordered mark pairs
+both after a starter and alone, Hangul, compatibility forms and a seeded random corpus,
+every answer CPython's) is walked by `nfc_matches_cpython_on_the_committed_corpus`; a
+structural gate asserts every table row has a corpus entry and the fixture's
+`unicode_version` matches the generated one. The wiring is asserted twice: on a synthetic
+vocabulary where the composed character has a real entry, and in the `#[ignore]`d real-model
+id gate, which now asserts the property on every cached model and that the unnormalized
+path disagrees. Five mutations were run and each made a gate fail: the quick check dropping
+the composition-second arm (Indic class-0 pairs), dropping the jamo arm, composition never
+blocked, the composition table never consulted, and mark runs not ordered —
+**mutations without a red gate: 0**. Full suite on dgxspark: **534 passed / 0 failed / 41
+ignored** unit + 10 / 0 / 6 integration (was 526/0/41 + 10/0/6; +8 platform-neutral tests).
+
+**Honest scope.** (a) The tables are Unicode **15.0.0** (CPython's bundled database); a
+newer release changes NFC only for characters assigned since, and an upgrade is a generator
+re-run plus the corpus diff, which is why both outputs name the version. (b) The llama.cpp
+divergence on non-NFC input is recorded (ADR-0042, the design record, `docs/USAGE.md`) and
+gated only as a *property*: no cached GGUF carries a decomposed corpus entry, so there is no
+reference-id comparison for one — a real reference would need transformers or llama.cpp run
+on a new corpus. (c) DRY-breaker *matching* stays byte-exact against the vocabulary
+(llama.cpp's semantics); only the tokenized tails are normalized, so a non-NFC breaker is
+still refused by name rather than silently matched. (d) Nothing here is device-adjacent: the
+CUDA and macOS CI jobs compile it and the CPU jobs test it.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 

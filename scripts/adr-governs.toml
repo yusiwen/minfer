@@ -211,3 +211,8 @@ path = "src/metal/ops.rs"
 adr = "0038"
 what = "the per-tensor registration dispatch is one shared rule, not a copy per loader"
 path = "src/models/weight_reg.rs"
+
+[[governs]]
+adr = "0042"
+what = "the tokenizer applies the model's declared NFC normalizer, on generated tables with no new dependency"
+path = "src/tokenizer/nfc.rs"
