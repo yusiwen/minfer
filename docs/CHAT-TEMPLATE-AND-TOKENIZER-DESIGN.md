@@ -152,6 +152,8 @@ off the first) and no `\s*[\r\n]+` arm. The rules now come from
 |---|---|---|
 | `qwen2` (`deepseek-r1-qwen`) | Qwen2/Qwen2.5/Qwen3 | `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)\|[^\r\n\p{L}\p{N}]?\p{L}+\|\p{N}\| ?[^\s\p{L}\p{N}]+[\r\n]*\|\s*[\r\n]+\|\s+(?!\S)\|\s+` |
 | `qwen35` | Qwen3.5 (letter runs also consume `\p{M}`) | same, with `[\p{L}\p{M}]+` and `[^\s\p{L}\p{M}\p{N}]` |
+| `llama-bpe` (`llama3`, `llama-v3`) | Llama 3.x (#132 S3, 2026-10-15) | same as `qwen2`, with `\p{N}{1,3}` in place of `\p{N}` — digits group **three at a time** |
+
 Every other value — **including a missing key** — is a refused load:
 `Tokenizer::load` returns `Err` naming the value and the supported set. A guess
 here is exactly the "wrong split" the ticket forbids.
@@ -164,10 +166,20 @@ supported architectures do not use it. Shipping it ungated would have been a
 guess wearing the name of a rule; it is refused by name instead.
 
 The splitter is hand-written (a port of llama.cpp's
-`unicode_regex_split_custom_qwen2` / `_qwen35` / `_gpt2`) rather than a `regex`
-crate pattern, for two reasons: the Rust `regex` crate has **no lookahead**, so
-`(?!\S)` cannot be expressed; and a hand-written splitter makes the byte spans
-explicit, which is what the byte-level BPE and the grammar mask (F2) consume.
+`unicode_regex_split_custom_qwen2` / `_qwen35` / `_llama3` / `_gpt2`) rather
+than a `regex` crate pattern, for two reasons: the Rust `regex` crate has **no
+lookahead**, so `(?!\S)` cannot be expressed; and a hand-written splitter makes
+the byte spans explicit, which is what the byte-level BPE and the grammar mask
+(F2) consume.
+
+**Divergence, recorded (`llama-bpe`).** llama.cpp sets `ignore_merges` for this
+pre-type (`src/llama-vocab.cpp:2155`), and its BPE returns a piece unchanged when
+the piece *is* a vocabulary entry (`src/llama-vocab.cpp:627`); minfer removed that
+shortcut in F7 and always merges, which is what HuggingFace does and what the
+`tokenizer.json` declares. On the committed 52-entry corpus the two references
+agree byte for byte (measured 2026-10-15 with `llama-tokenize` on the same GGUF,
+52/52), so the divergence class is narrow: a pre-tokenized piece that is a
+vocabulary entry **unreachable through merges**.
 
 ### 3.2 Special and added tokens (#132 S2, 2026-10-15)
 
@@ -219,9 +231,13 @@ invariant violation that aborts with the byte value.
   [#132](https://github.com/yusiwen/minfer/issues/132) S1 on 2026-10-14); see §3.6.
 * **SentencePiece / unigram / WordPiece** models (`tokenizer.ggml.model !=
   "gpt2"`) — out of scope, the tokenizer is a byte-level BPE.
-* **`ignore_merges` pre-tokenizers** (`llama3`, `llama-bpe`, `tekken`, …) and
-  **multi-regex** pre-tokenizers (`default`, `deepseek-llm`, `deepseek-coder`,
-  `falcon`, `starcoder`, …): refused by name at load.
+* **The remaining `ignore_merges` pre-tokenizers** (`falcon3`, `falcon-h1`,
+  `pixtral`, `tekken`, …) and **multi-regex** pre-tokenizers (`default`,
+  `deepseek-llm`, `deepseek-coder`, `deepseek-v3`, `falcon`, `starcoder`, `mpt`,
+  `refact`, …): refused by name at load. Each one needs its own pattern check and
+  its own pair of fixtures — llama.cpp maps several of them onto the same
+  pre-type with an *adapted* regex, which is exactly why the value, not the
+  family, is what gets accepted.
 * **`byte_encode = false`** SPM-style BPE (`whitespace` pre-tokenizer) and the
   `<0xXX>` byte fallback for it: refused by name at load.
 
@@ -289,8 +305,8 @@ Measured on the cached GGUFs (dgxspark, 2026-10-15): `encode("café")` ==
 | Template byte-for-byte rendering, per model | `src/template.rs` unit test over `tests/fixtures/chat/*.json` | transformers 5.17.0 `apply_chat_template` |
 | The fixture template is the model's own | `#[ignore]`d real-model test: GGUF `tokenizer.chat_template` == fixture template and rendering matches | the cached GGUF |
 | Loud refusal | unit test: an unsupported method/syntax fails and the error **names** the construct; a mutation of the callback (dropping a method) must make a previously-passing case fail | — |
-| Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` | the `tokenizer.json` regex evaluated by CPython `regex` |
-| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5); the two agree on all 52 corpus entries where both exist |
+| Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (3 rules × 52 entries) | the `tokenizer.json` regex evaluated by CPython `regex` |
+| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
 | NFC normalization | `src/tokenizer/nfc.rs` unit tests over `tests/fixtures/tokenizer/nfc_vectors.json` (5 103 inputs: every decomposition, every composition pair, all 784 ordered mark pairs both after a starter and alone, Hangul, compatibility forms, a seeded random corpus), plus the tokenizer-level and real-model property (`encode("café") == encode("cafe\u{0301}")`) | CPython `unicodedata.normalize('NFC', …)`, the same database the tables are generated from |
 | Grammar (F2) + pinned sampler (F3) | existing suites | unchanged |
 

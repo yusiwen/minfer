@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules and SentencePiece remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` DONE 2026-10-15; SentencePiece remains) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -7817,6 +7817,55 @@ declared role whose id is out of range, or whose token text is empty, is skipped
 refused (llama.cpp warns and disables it): the role table is data, and an unmatched id cannot
 be a special token. (d) Nothing here is device-adjacent: the CUDA and macOS jobs compile it
 and the CPU jobs test it.
+
+### F7 follow-up — the first pre-tokenizer rule: `llama-bpe` ([#132](https://github.com/yusiwen/minfer/issues/132) S3) — **DONE 2026-10-15**
+
+**What landed.** `PreTokenizer::LlamaBpe`, the Llama-3.x rule, accepted for
+`tokenizer.ggml.pre = llama-bpe` and the aliases `llama3` / `llama-v3` (llama.cpp maps all
+three onto `LLAMA_VOCAB_PRE_TYPE_LLAMA3`, `llama-vocab.cpp:2155`, as it maps `qwen2` and
+`deepseek-r1-qwen` together). It is the Qwen2 scan — a port of
+`unicode_regex_split_custom_llama3` (`unicode.cpp:333`) — with exactly one difference: the
+digit arm is `\p{N}{1,3}` instead of `\p{N}`, so digits group up to three per piece.
+Everything else (contractions, the `\p{L}` letter arm, the symbol arm, the three whitespace
+arms) is shared.
+
+**Fixtures, both references committed.** `split_llama-bpe.json` — the `Split` pattern from
+`unsloth/Llama-3.2-1B-Instruct@5a8abab4` evaluated by CPython `regex` 2026.9.29 over 52
+corpus entries (the qwen fixtures' corpus with the five Qwen-specific specials replaced by
+Llama-3's header/eot tokens, so the families stay comparable).
+`ids_llama-3.2-1b-instruct.json` — HuggingFace `tokenizers` 0.23.3 on the same corpus,
+gated against the cached `unsloth/Llama-3.2-1B-Instruct-GGUF` Q4_K_M (807 694 368 B; probed
+2026-10-15: `pre = llama-bpe`, 128 000 type-1 + 256 type-3 tokens, bos 128000 /
+eos 128009 (`<|eot_id|>`) declared).
+
+**Measured (dgxspark, 2026-10-15).** `cargo test --release --bin minfer
+token_ids_match_the_reference -- --ignored --nocapture`: **six** cached models byte-for-byte,
+the new one included (52 corpus entries + its declared special tokens). The splitter matches
+CPython `regex` on all 52 entries. Cross-check: `llama-tokenize` (the pinned checkout) on the
+same GGUF agrees with the HuggingFace reference on **52/52** entries, so the `ignore_merges`
+divergence below is invisible on this corpus. The suite counts do **not** move: the rule
+rides the existing fixture-driven gates (the two test functions it touches were extended,
+not added).
+
+**Gates and mutations.** Five mutations, each making the tokenizer gate fail: the digit cap
+reverted to one, the cap set to two, `llama-bpe` accepted but split with the Qwen2 rule,
+`llama-bpe` refused again, and the letter arm made to consume combining marks —
+**mutations without a red gate: 0**, restore asserted green.
+
+**Honest scope.** (a) llama.cpp sets `ignore_merges` for this pre-type and its BPE returns a
+piece unchanged when the piece *is* a vocabulary entry (`llama-vocab.cpp:627`); minfer always
+merges, which is what HuggingFace does and what the `tokenizer.json` declares, so the
+divergence class is a pre-tokenized piece that is a vocabulary entry unreachable through
+merges — unobserved here (52/52 agreement) and recorded in §3.1. (b) Only this spelling
+lands: `falcon3`, `falcon-h1`, `pixtral`, `tekken` and the multi-regex family stay refused by
+name, because llama.cpp maps several of them onto the *same* pre-type with an adapted regex
+(`llama-vocab.cpp:297-304`) — the value, not the family, is what gets accepted, and each
+needs its own pattern check and fixtures. (c) The rule exposes a tokenizer-wide question
+S3 did not answer: `llama-bpe`'s `tokenizer.json` declares `normalizer: null`, so minfer's
+unconditional NFC diverges from *both* references for decomposed input on this family
+(measured: `[936, 1897, 54939]` against minfer's composed `[936, 59958]`); filed as
+[#564](https://github.com/yusiwen/minfer/issues/564) rather than smuggled into a rule
+addition. (d) Nothing here is device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 

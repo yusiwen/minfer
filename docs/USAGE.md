@@ -176,7 +176,9 @@ all, and the startup path prints a one-line notice when that happens.
 
 The tokenizer is byte-level BPE and is equally strict about what it does not
 implement. `tokenizer.ggml.pre` selects the pre-tokenization rule — `qwen2`
-(alias `deepseek-r1-qwen`) or `qwen35` — and an unknown or missing value, a
+(alias `deepseek-r1-qwen`), `qwen35`, or `llama-bpe` (aliases `llama3`,
+`llama-v3`, the Llama 3.x pattern whose only difference is `\p{N}{1,3}`) — and an
+unknown or missing value, a
 `tokenizer.ggml.model` that is not `gpt2`, an empty merge table, or a vocabulary
 missing any of the 256 byte tokens **refuses the load** with the offending value
 named. Token ids match the reference (transformers `AutoTokenizer`, or llama.cpp
