@@ -162,6 +162,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0040](./0040-a-decision-is-bound-to-the-surfaces-it-governs.md) | 2026-10-11 | A decision is bound to the surfaces it governs, so the question names it | Accepted (corrects ADR-0039) |
 | [0041](./0041-a-row-that-cannot-take-the-targets-block-is-demoted.md) | 2026-10-13 | A row that cannot take the target's block is demoted, the legacy targets included | Accepted (corrects ADR-0020) |
 | [0042](./0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md) | 2026-10-15 | The tokenizer applies the model's declared NFC normalizer | Accepted (corrects ADR-0019) |
+| [0043](./0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) | 2026-10-15 | A special token is declared by the file, never inferred from its name | Accepted |
 
 ## The template
 

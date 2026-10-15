@@ -216,3 +216,8 @@ path = "src/models/weight_reg.rs"
 adr = "0042"
 what = "the tokenizer applies the model's declared NFC normalizer, on generated tables with no new dependency"
 path = "src/tokenizer/nfc.rs"
+
+[[governs]]
+adr = "0043"
+what = "a special token is what the file declares — token_type 2/3/4 plus the named roles, never a name shape"
+path = "src/tokenizer.rs"

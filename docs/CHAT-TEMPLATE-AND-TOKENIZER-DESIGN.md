@@ -169,13 +169,39 @@ crate pattern, for two reasons: the Rust `regex` crate has **no lookahead**, so
 `(?!\S)` cannot be expressed; and a hand-written splitter makes the byte spans
 explicit, which is what the byte-level BPE and the grammar mask (F2) consume.
 
-### 3.2 Special and added tokens
+### 3.2 Special and added tokens (#132 S2, 2026-10-15)
 
-Unchanged and still exact: GGUF `tokenizer.ggml.token_type` 3 (CONTROL) / 4
-(USER_DEFINED) are matched as single ids *before* BPE, earliest position wins,
-longest text wins at the same position, plus the `<|im_start|>` / `<|im_end|>` /
-EOS fallbacks for GGUFs whose converter marked them type 1. This is what makes
-Qwen's `<|im_start|>` and DeepSeek-R1's `<｜User｜>`/`<think>` single tokens.
+The special-token set is **what the file declares**, and nothing is inferred from
+a token's name (ADR-0043):
+
+* `tokenizer.ggml.token_type` **2 (UNKNOWN), 3 (CONTROL) or 4 (USER_DEFINED)** —
+  llama.cpp's special-token cache predicate
+  (`src/llama-vocab.cpp:3012`, `CONTROL | USER_DEFINED | UNKNOWN`);
+* every id a declared role names, over the key table `SPECIAL_ROLE_KEYS` in
+  `src/tokenizer.rs` — transcribed from llama.cpp's role list
+  (`src/llama-arch.cpp:382-406`, deprecated `prefix`/`suffix`/`middle` aliases
+  included). A role is a declaration: the token matches as one id even when its
+  type says NORMAL.
+
+Matching is unchanged — earliest position wins, longest text wins at the same
+position, before BPE — so Qwen's `<|im_start|>` (type 3 in every Qwen GGUF) and
+DeepSeek-R1's `<｜User｜>`/`<think>` (type 3/4) stay single tokens.
+
+**The name hardcode is gone.** Special-token matching used to add
+`<|im_start|>`, `<|im_end|>` and any EOS text starting with `<`, whether or not
+the vocabulary contained them. Measured on
+`unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` (Q4_K_M, probed 2026-10-15): that
+vocabulary has **neither** name, so `<|im_start|>` was mapped to id `0` and
+`<|im_end|>` to the EOS token `151643` — two literal strings tokenized as tokens
+the model never had. Now they are ordinary text, which is also what llama.cpp
+does: it forces its name list upward only when the role is *not* declared, and it
+never invents a token. minfer does not port that name list; a converter that
+leaves a chat token type NORMAL gets llama.cpp's BPE split there too.
+
+**Divergence, deliberate.** For a token the file declares a role for *and* types
+NORMAL, minfer matches it (the declaration wins) while llama.cpp splits it (the
+type wins unless the name is in its list). The declaration is the data; the record
+of that choice, with the rejected alternatives, is ADR-0043.
 
 ### 3.3 Byte fallback replaces the silent id 0
 
@@ -276,3 +302,4 @@ fail, revert) and the mutation result is recorded in the PR.
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0019](adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md) — A chat template that cannot be rendered refuses the load
 - [ADR-0042](adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md) — The tokenizer applies the model's declared NFC normalizer
+- [ADR-0043](adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) — A special token is declared by the file, never inferred from its name

@@ -183,6 +183,12 @@ named. Token ids match the reference (transformers `AutoTokenizer`, or llama.cpp
 `llama-tokenize` on the same GGUF) byte for byte over the corpus committed in
 `tests/fixtures/tokenizer/`.
 
+Special tokens are matched as single ids before BPE from the file's own
+declarations — `tokenizer.ggml.token_type` 2 (UNKNOWN) / 3 (CONTROL) / 4
+(USER_DEFINED), plus every id a `tokenizer.ggml.*_token_id` role names. Nothing
+is inferred from a token's name, and no token the vocabulary lacks is ever
+matched (ADR-0043).
+
 The tokenizer also applies the **NFC** normalizer every reference `tokenizer.json`
 declares, so a decomposed input (`e` + a combining accent) tokenizes exactly like its
 composed form ([#132](https://github.com/yusiwen/minfer/issues/132) S1, ADR-0042).
