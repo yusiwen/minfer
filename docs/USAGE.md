@@ -175,14 +175,16 @@ all, and the startup path prints a one-line notice when that happens.
 `--no-template` still bypasses template rendering entirely.
 
 The tokenizer is byte-level BPE and is equally strict about what it does not
-implement. `tokenizer.ggml.pre` selects the pre-tokenization rule — `qwen2`
-(alias `deepseek-r1-qwen`), `qwen35`, `llama-bpe` (aliases `llama3`, `llama-v3`)
-or `lfm2` (the last two share the Llama 3.x pattern, whose only difference from
-`qwen2` is `\p{N}{1,3}`) — and an
-unknown or missing value, a
-`tokenizer.ggml.model` that is not `gpt2`, an empty merge table, or a vocabulary
-missing any of the 256 byte tokens **refuses the load** with the offending value
-named. Token ids match the reference (transformers `AutoTokenizer`, or llama.cpp
+implement. `tokenizer.ggml.model` selects the engine — `gpt2` (byte-level BPE) or `llama`
+(SentencePiece: score-driven merges over a `▁`-escaped text, `<0xXX>` byte
+fallback, no `pre` rule, no normalizer) — and every other value **refuses the
+load** naming it (ADR-0045). For the BPE engine `tokenizer.ggml.pre` selects the
+pre-tokenization rule — `qwen2` (alias `deepseek-r1-qwen`), `qwen35`, `llama-bpe`
+(aliases `llama3`, `llama-v3`) or `lfm2` (the last two share the Llama 3.x
+pattern, whose only difference from `qwen2` is `\p{N}{1,3}`) — and an unknown or
+missing value, an empty merge table, or a vocabulary missing any of the 256 byte
+tokens **refuses the load** with the offending value named; SentencePiece
+likewise refuses an empty score array or a missing `<0xXX>` byte token. Token ids match the reference (transformers `AutoTokenizer`, or llama.cpp
 `llama-tokenize` on the same GGUF) byte for byte over the corpus committed in
 `tests/fixtures/tokenizer/`.
 

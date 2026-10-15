@@ -141,6 +141,30 @@ payload.
 
 ## 3. Tokenizer — accepted, refused, detected
 
+### 3.0 The engine comes first: `tokenizer.ggml.model` (#132 S4, 2026-10-15; ADR-0045)
+
+`tokenizer.ggml.pre` answers "which rule" only for the engine the file already selected.
+`TokenizerModel::from_gguf` reads `tokenizer.ggml.model` and answers exactly two engines:
+
+| value | engine | driven by | `pre` used? | accepted |
+|---|---|---|---|---|
+| `gpt2` (or absent) | byte-level BPE | `tokenizer.ggml.merges` ranks + byte-level characters | yes — §3.1 | **yes** |
+| `llama` | SentencePiece | `tokenizer.ggml.scores` + `▁` (U+2581) escaping + `<0xXX>` byte tokens | no | **yes** |
+| anything else | — | — | — | refused, **naming the value** |
+
+SentencePiece (from llama.cpp's session, `llama-vocab.cpp:114`) is: symbols are UTF-8
+characters of the `▁`-escaped text; every adjacent pair whose concatenation is a vocabulary
+entry is queued with that entry's **score**; the highest score merges first, and a pair whose
+sides changed since it was queued is stale and skipped; the final walk emits a vocabulary
+entry where it can, re-splits through the recorded pair where it cannot, and otherwise emits
+one `<0xXX>` byte token per byte. `add_space_prefix` (default `true` for SPM,
+`tokenizer.ggml.add_space_prefix` overrides it) prefixes the first raw-text segment and every
+segment after a special token; a special token resets that state.
+
+`Tokenizer::pre` is therefore `Option<PreTokenizer>`: `None` means the engine has no
+pre-tokenization rule, and `applies_nfc()` is then `false` — the SPM families accepted here
+declare no normalizer (ADR-0044).
+
 ### 3.1 `tokenizer.ggml.pre` is authoritative
 
 The pre-tokenizer was a single hardcoded regex, and it was subtly wrong: it had
@@ -234,8 +258,12 @@ invariant violation that aborts with the byte value.
 
 * **NFC normalization** — *now applied* (F7's accepted gap, closed by
   [#132](https://github.com/yusiwen/minfer/issues/132) S1 on 2026-10-14); see §3.6.
-* **SentencePiece / unigram / WordPiece** models (`tokenizer.ggml.model !=
-  "gpt2"`) — out of scope, the tokenizer is a byte-level BPE.
+* **`bert` / `t5` / `rwkv` / `plamo2` / `gemma4` / `whitespace` / `hybriddna` /
+  `none`** engines — refused by name at load (§3.0). SentencePiece (`llama`) is
+  implemented (ADR-0045); each remaining value is a different algorithm
+  (WordPiece, unigram with its own normalization, RWKV, …) with its own
+  vocabulary shape and its own reference, so it lands with an ADR and a fixture,
+  not as another match arm.
 * **The remaining `ignore_merges` pre-tokenizers** (`falcon3`, `falcon-h1`,
   `pixtral`, `tekken`, …) and **multi-regex** pre-tokenizers (`default`,
   `deepseek-llm`, `deepseek-coder`, `deepseek-v3`, `falcon`, `starcoder`, `mpt`,
@@ -317,7 +345,9 @@ return.
 | The fixture template is the model's own | `#[ignore]`d real-model test: GGUF `tokenizer.chat_template` == fixture template and rendering matches | the cached GGUF |
 | Loud refusal | unit test: an unsupported method/syntax fails and the error **names** the construct; a mutation of the callback (dropping a method) must make a previously-passing case fail | — |
 | Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (4 values, 52-54 entries each) | the `tokenizer.json` regex evaluated by CPython `regex` |
-| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (7 cached models) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
+| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (8 cached models, both engines) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5, `llama-bpe`, `lfm2`, and the SentencePiece model — for SPM the HF file is a *BPE* rendering of the vocabulary, so llama.cpp is the only reference for this engine, ADR-0045); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
+| Engine dispatch | `src/tokenizer.rs` unit test `the_tokenizer_model_is_a_dispatch` (both accepted values, six refusals each naming its value) and the ignored gate's `tokenizer_model` field | `tokenizer.ggml.model` in the artifact |
+| SentencePiece session | `src/tokenizer.rs` unit tests `spm_merges_by_score_and_falls_back_to_byte_tokens` and `spm_prefixes_the_first_segment_with_a_space` (synthetic vocabulary: the scored chain, the `▁` prefix on/off, a byte fallback, the post-special re-prefix) | llama.cpp `llm_tokenizer_spm_session` (`llama-vocab.cpp:114`) |
 | NFC normalization | `src/tokenizer/nfc.rs` unit tests over `tests/fixtures/tokenizer/nfc_vectors.json` (5 103 inputs: every decomposition, every composition pair, all 784 ordered mark pairs both after a starter and alone, Hangul, compatibility forms, a seeded random corpus), plus the per-rule table (`the_normalizer_follows_the_pre_tokenizer_rule`), the two synthetic-tokenizer arms, and the real-model gate (a normalizing family: `café == cafe\u{0301}`; `llama-bpe`: the decomposed corpus entries) | CPython `unicodedata.normalize('NFC', …)` for the tables; each family's `tokenizer.json` normalizer field for the declaration |
 | Grammar (F2) + pinned sampler (F3) | existing suites | unchanged |
 
@@ -331,3 +361,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0042](adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md) — The tokenizer applies the model's declared NFC normalizer
 - [ADR-0043](adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) — A special token is declared by the file, never inferred from its name
 - [ADR-0044](adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md) — The input normalizer follows the pre-tokenizer family's declaration
+- [ADR-0045](adr/0045-the-tokenizer-engine-is-a-dispatch-on-tokenizer-ggml-model.md) — The tokenizer engine is a dispatch on `tokenizer.ggml.model`
