@@ -252,18 +252,6 @@ file = "src/models/mod.rs"
 reason = "Reachable only from the `#[cfg(target_os = \"macos\")]` test `models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits` — the macOS half of the blind spot (#244)."
 
 [[cpu]]
-name = "id_to_score"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Deferred vocabulary (#244): the loader parses the GGUF scores but nothing reads them back; a sampler or diagnostic that weights candidates by the declared score would."
-
-[[cpu]]
-name = "id_to_type"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Deferred vocabulary (#244): the loader's local copy of the array derives the special-token table, so only a metadata re-emitter or a tokenizer test that inspects the loaded types would read the field."
-
-[[cpu]]
 name = "llama_key"
 kind = "fn"
 file = "src/device_tier.rs"
@@ -461,18 +449,6 @@ name = "forward_graph"
 kind = "fn"
 file = "src/models/mod.rs"
 reason = "Reachable only from the `#[cfg(target_os = \"macos\")]` test `models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits` — the macOS half of the blind spot (#244)."
-
-[[cuda]]
-name = "id_to_score"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Deferred vocabulary (#244): the loader parses the GGUF scores but nothing reads them back; a sampler or diagnostic that weights candidates by the declared score would."
-
-[[cuda]]
-name = "id_to_type"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Deferred vocabulary (#244): the loader's local copy of the array derives the special-token table, so only a metadata re-emitter or a tokenizer test that inspects the loaded types would read the field."
 
 [[cuda]]
 name = "mmvq_batch_by_type"
@@ -688,18 +664,6 @@ name = "forward_graph"
 kind = "fn"
 file = "src/models/mod.rs"
 reason = "Dead in the non-test macOS check; live in the macOS test build, whose only caller is the `#[cfg(target_os = \"macos\")]` test `models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits` (#244)."
-
-[[macos]]
-name = "id_to_score"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Deferred vocabulary (#244): the loader parses the GGUF scores but nothing reads them back; a sampler or diagnostic that weights candidates by the declared score would."
-
-[[macos]]
-name = "id_to_type"
-kind = "field"
-file = "src/tokenizer.rs"
-reason = "Deferred vocabulary (#244): the loader's local copy of the array derives the special-token table, so only a metadata re-emitter or a tokenizer test that inspects the loaded types would read the field."
 
 [[macos]]
 name = "llama_key"
