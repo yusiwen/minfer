@@ -587,6 +587,20 @@
         " done",
         ".\n"
       ]
+    },
+    {
+      "text": "café",
+      "pieces": [
+        "cafe",
+        "́"
+      ]
+    },
+    {
+      "text": "naïve",
+      "pieces": [
+        "nai",
+        "̈ve"
+      ]
     }
   ]
 }
