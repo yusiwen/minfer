@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`) and WordPiece (`model = bert`) DONE 2026-10-15, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`), WordPiece (`model = bert`) and unigram (`model = t5`) DONE 2026-10-15, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -8035,6 +8035,50 @@ no artifact in the gate distinguishes it. (c) `strip_accents` lowercasing uses t
 mapping (multi-character expansions keep the code point rather than expanding). (d) The corpus
 carries no BERT special-token text: the declared-type scan covers those, asserted separately
 by the same gate. (e) Nothing here is device-adjacent.
+
+### F7 follow-up — S4: the unigram engine ([#132](https://github.com/yusiwen/minfer/issues/132)) — **DONE 2026-10-15**
+
+**What landed.** `TokenizerModel::Ugm` (`tokenizer.ggml.model = t5`) and llama.cpp's UGM
+session: the file's **precompiled charsmap** decoded as an XCDA ("XOR-compressed compact
+double array") prefix-replacement table, the whitespace normalization
+(`add_space_prefix` / `remove_extra_whitespaces`, with `escape_whitespaces` fixed on and the
+suffix form absent because the pinned reference never sets it), a `VocabTrie` over the
+NORMAL / USER_DEFINED / UNUSED entries, and a Viterbi walk weighted by
+`tokenizer.ggml.scores` whose unknown transition costs `min_score - 10`, with one unknown per
+run of unmatched input. ADR-0047 amends ADR-0045 and records the reference choice.
+
+**Fixtures and evidence.** `tests/fixtures/tokenizer/ids_flan-t5-small.json` (54 shared
+corpus entries) gated against `Felladrin/gguf-flan-t5-small` Q8_0 (113 709 824 B; probed:
+`model = t5`, `pre = default`, 32 128 tokens, `scores` present, no merges,
+`add_space_prefix = 1`, `remove_extra_whitespaces = 1`, eos 1 / unk 2 / pad 0, a
+237 539-byte `precompiled_charsmap`). The ignored gate now covers **ten** cached models across
+**four** engines.
+
+**The reference is the model's own SentencePiece model**, run by the `sentencepiece` package —
+the definition of the pipeline and an independent implementation of both the charsmap lookup
+and the normalizer. It agrees with `llama-tokenize` on **all 54** entries, so the port
+follows the definition exactly. HuggingFace's `tokenizer.json` for the same model is the one
+that diverges, and the reason is recorded: its Metaspace pre-tokenizer does not implement
+`remove_extra_whitespaces`, so it keeps a `▁` for trailing or all-whitespace input where
+SentencePiece and llama.cpp drop it — **11 of 54** entries, all whitespace
+(`"trailing spaces  "` → `[5032, 53, 4856, 3]` against `[5032, 53, 4856]`).
+
+**Gates and mutations.** Seven mutations, none escaped: `t5` refused again, `t5` run by the
+SPM engine, the charsmap skipped, the Viterbi preferring the lower score, the unknown-run
+merge removed, the prefix space never added, and whitespace runs never collapsed. The
+hand-built one-mapping XCDA table in the unit tests is the pure witness for the decoder; the
+2.4 MB real charsmap is exercised by the ignored gate.
+
+**Suite.** 545/0/41 -> **548 passed / 0 failed / 41 ignored** unit + 10 / 0 / 6 integration
+(+3 unigram tests).
+
+**Honest scope.** (a) Four engines of ten; `rwkv`, `plamo2`, `gemma4`, `whitespace`,
+`hybriddna` and `none` are still refused by name. (b) `treat_whitespace_as_suffix` is not
+implemented — no artifact in the pinned reference sets it. (c) A corrupt charsmap stops
+matching rather than refusing (the loader checks the header and the blob bounds; a deeper
+check would be a second implementation of the format). (d) The corpus excludes `<extra_id_N>`
+because the converter pads the tail (128 ids differ from the tokenizer.json's). (e) Nothing
+here is device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 

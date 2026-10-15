@@ -236,3 +236,8 @@ symbol = "TokenizerModel"
 adr = "0046"
 what = "WordPiece is the third engine and follows BERT's normalizer (NFD + Mn dropped), not llama.cpp's 1:1 approximation"
 symbol = "NormalizerOptions"
+
+[[governs]]
+adr = "0047"
+what = "the unigram engine decodes the file's precompiled charsmap and runs a score-weighted Viterbi, with the model's own SentencePiece as the reference"
+symbol = "ugm_encode"
