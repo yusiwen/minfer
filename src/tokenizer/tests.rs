@@ -39,7 +39,10 @@ fn test_tokenizer() -> Tokenizer {
         byte_to_unicode,
         unicode_to_byte,
         special_tokens: HashMap::new(),
-        pre: PreTokenizer::Qwen2,
+        model: TokenizerModel::Gpt2,
+        pre: Some(PreTokenizer::Qwen2),
+        add_space_prefix: false,
+        spm_byte_to_id: HashMap::new(),
         special_by_first: HashMap::new(),
         bos_token: 0,
         eos_token: 0,
@@ -208,6 +211,121 @@ fn a_chat_token_the_file_does_not_declare_is_not_invented() {
     );
     assert!(!t.special_tokens.contains_key("<|im_start|>"));
     assert!(!t.special_tokens.contains_key("<|im_end|>"));
+}
+
+// === #132 S4: the SentencePiece (`model = llama`) engine ====================
+
+/// A SentencePiece vocabulary with the three behaviours the engine has: a
+/// score-ordered merge chain, the `▁` space prefix, and a `<0xXX>` byte fallback.
+///
+/// Ids: 0 `<unk>` (type 2), 1 `<s>`, 2 `</s>` (type 3), 3..=258 the 256 byte
+/// tokens (type 6), then the normal entries — `▁` alone, the unprefixed chain
+/// (`h`, `he`, `hel`, `hell`, `hello`) and the prefixed one. The prefixed entries
+/// carry the higher scores, which is what makes the greedy merge build `▁hello`
+/// rather than `hello`.
+fn spm_tokenizer(add_space_prefix: bool) -> Tokenizer {
+    let mut t = Tokenizer::empty();
+    t.model = TokenizerModel::Spm;
+    t.pre = None;
+    t.add_space_prefix = add_space_prefix;
+
+    let mut push = |t: &mut Tokenizer, text: &str, ty: i32, score: f32| -> u32 {
+        let id = t.id_to_token.len() as u32;
+        t.id_to_token.push(text.to_string());
+        t.id_to_type.push(ty);
+        t.id_to_score.push(score);
+        t.vocab.insert(text.to_string(), id);
+        id
+    };
+    push(&mut t, "<unk>", 2, 0.0);
+    push(&mut t, "<s>", 3, 0.0);
+    push(&mut t, "</s>", 3, 0.0);
+    for b in 0u8..=255 {
+        let id = push(&mut t, &format!("<0x{b:02X}>"), 6, 0.0);
+        t.spm_byte_to_id.insert(b, id);
+    }
+    let space = push(&mut t, "▁", 1, 0.0);
+    for (i, part) in ["h", "he", "hel", "hell", "hello"].iter().enumerate() {
+        push(&mut t, part, 1, -1.0 - i as f32);
+        push(&mut t, &format!("▁{part}"), 1, 1.0 + i as f32);
+    }
+    // `▁` is emitted on its own when nothing longer matches.
+    t.vocab.insert("▁".to_string(), space);
+    // `<s>` / `</s>` / `<unk>` are declared specials: the scan index is what
+    // `encode` matches through, and the loader builds it the same way.
+    for text in ["<unk>", "<s>", "</s>"] {
+        let id = t.vocab[text];
+        t.special_tokens.insert(text.to_string(), id);
+    }
+    t.special_by_first = special_index(&t.special_tokens);
+    t
+}
+
+#[test]
+fn the_tokenizer_model_is_a_dispatch() {
+    assert_eq!(
+        TokenizerModel::from_gguf(None).unwrap(),
+        TokenizerModel::Gpt2
+    );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("gpt2")).unwrap(),
+        TokenizerModel::Gpt2
+    );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("llama")).unwrap(),
+        TokenizerModel::Spm
+    );
+    // Every other engine is refused *by name* — an approximation with the wrong
+    // engine would be worse than a refusal.
+    for other in ["bert", "t5", "rwkv", "plamo2", "whitespace", "none"] {
+        let err = TokenizerModel::from_gguf(Some(other)).unwrap_err();
+        assert!(
+            err.contains(other),
+            "the refusal must name the value: {err}"
+        );
+    }
+}
+
+#[test]
+fn spm_merges_by_score_and_falls_back_to_byte_tokens() {
+    let t = spm_tokenizer(true);
+    // The whole prefixed word is reachable through the scored chain, so the
+    // greedy merge builds it and emits one id.
+    let hello = *t.vocab.get("▁hello").expect("the fixture has it");
+    assert_eq!(t.encode("hello"), vec![hello]);
+    // A character the vocabulary has no entry for falls back to its byte token,
+    // one per byte — never to id 0 and never dropped.
+    let space = *t.vocab.get("▁").expect("the fixture has it");
+    let z = *t.spm_byte_to_id.get(&b'z').expect("byte token");
+    assert_eq!(t.encode("z"), vec![space, z]);
+    // Decode is the inverse for these: `▁` is a space and a byte token is a byte.
+    assert_eq!(t.decode_bytes(&[hello]), b" hello");
+    assert_eq!(t.decode_bytes(&[space, z]), b" z");
+}
+
+#[test]
+fn spm_prefixes_the_first_segment_with_a_space() {
+    let prefixed = spm_tokenizer(true);
+    let plain = spm_tokenizer(false);
+    assert_eq!(
+        prefixed.encode("hello"),
+        vec![*prefixed.vocab.get("▁hello").unwrap()]
+    );
+    assert_eq!(
+        plain.encode("hello"),
+        vec![*plain.vocab.get("hello").unwrap()],
+        "with `add_space_prefix` off there is no leading space"
+    );
+    // A special token resets the "previous is special" state, so the segment
+    // after it is prefixed again.
+    assert_eq!(
+        prefixed.encode("hello</s>hello"),
+        vec![
+            *prefixed.vocab.get("▁hello").unwrap(),
+            2,
+            *prefixed.vocab.get("▁hello").unwrap()
+        ]
+    );
 }
 
 // === #132 S3 / ADR-0044: the normalizer follows the pre-tokenizer rule =====
@@ -396,7 +514,7 @@ fn encode_normalizes_decomposed_input_to_nfc() {
 #[test]
 fn encode_leaves_decomposed_input_alone_when_the_rule_declares_no_normalizer() {
     let mut t = test_tokenizer();
-    t.pre = PreTokenizer::LlamaBpe;
+    t.pre = Some(PreTokenizer::LlamaBpe);
     let encoded = byte_encode("é", &t.byte_to_unicode);
     let chars: Vec<char> = encoded.chars().collect();
     t.merges
@@ -590,6 +708,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         "~/.cache/minfer/models/hf/LiquidAI/LFM2-1.2B-GGUF/LFM2-1.2B-Q4_K_M.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_lfm2-1.2b.json"),
     ),
+    (
+        "tinyllama-1.1b",
+        "~/.cache/minfer/models/hf/second-state/TinyLlama-1.1B-Chat-v1.0-GGUF/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_tinyllama-1.1b.json"),
+    ),
 ];
 
 fn expand_home(path: &str) -> std::path::PathBuf {
@@ -624,11 +747,31 @@ fn token_ids_match_the_reference() {
         let gguf = crate::gguf::load_gguf_model(&p).expect("parse GGUF");
         let tok = Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let fx: serde_json::Value = serde_json::from_str(raw).expect("ids fixture");
-        assert_eq!(
-            fx["pre"].as_str().unwrap(),
-            tok.pre.gguf_name(),
-            "{slug}: fixture pre-tokenizer does not match the GGUF"
-        );
+        // The engine: `pre` names the BPE rule, and its absence means
+        // SentencePiece (#132 S4). A fixture may also name the family
+        // explicitly, which the artifact must agree with.
+        if let Some(family) = fx.get("tokenizer_model").and_then(|v| v.as_str()) {
+            assert_eq!(
+                family,
+                tok.model.gguf_name(),
+                "{slug}: fixture tokenizer model does not match the GGUF"
+            );
+        }
+        match (tok.pre, fx.get("pre").and_then(|v| v.as_str())) {
+            (Some(pre), Some(want)) => assert_eq!(
+                want,
+                pre.gguf_name(),
+                "{slug}: fixture pre-tokenizer does not match the GGUF"
+            ),
+            (None, None) => {} // SentencePiece: no pre-tokenization rule
+            (Some(pre), None) => panic!(
+                "{slug}: the artifact carries pre = {} but the fixture names none",
+                pre.gguf_name()
+            ),
+            (None, Some(want)) => {
+                panic!("{slug}: the fixture names pre = {want} but the artifact is SentencePiece")
+            }
+        }
         let entries = fx["entries"].as_array().unwrap();
         assert!(entries.len() >= 45, "{slug}: fixture shrank");
         for e in entries {
@@ -673,8 +816,10 @@ fn token_ids_match_the_reference() {
         // one, without it they must coincide.
         let composed = tok.encode("café");
         let decomposed = tok.encode("cafe\u{0301}");
-        let raw_decomposed = tok.encode_bpe("cafe\u{0301}");
-        if tok.pre.applies_nfc() {
+        if tok.applies_nfc() {
+            // The control is the BPE engine's *unnormalized* path (a normalizing
+            // rule is always a BPE one; SentencePiece never normalizes).
+            let unnormalized = tok.encode_bpe("cafe\u{0301}");
             assert_eq!(
                 decomposed, composed,
                 "{slug}: NFC must be applied to `Tokenizer::encode`"
@@ -685,28 +830,30 @@ fn token_ids_match_the_reference() {
                 "{slug}: NFC must be applied to `Tokenizer::encode_raw`"
             );
             assert_ne!(
-                raw_decomposed, composed,
+                unnormalized, composed,
                 "{slug}: a real vocabulary must split the decomposed form differently"
             );
         } else {
             assert_ne!(
                 decomposed, composed,
-                "{slug}: this rule declares no normalizer, so the decomposed input must stay decomposed"
+                "{slug}: this tokenizer declares no normalizer, so the decomposed input must stay decomposed"
             );
             assert_eq!(
-                decomposed, raw_decomposed,
-                "{slug}: `Tokenizer::encode` must not normalize what the rule does not declare"
+                decomposed,
+                tok.encode_raw("cafe\u{0301}"),
+                "{slug}: `Tokenizer::encode` must not normalize what the file does not declare"
             );
         }
         eprintln!(
             "{slug}: {} corpus entries + special tokens match the reference byte for byte; \
-             NFC {}: café -> {composed:?}, decomposed -> {decomposed:?} (raw {raw_decomposed:?})",
+             {}: café -> {composed:?}, decomposed -> {decomposed:?} (encode_raw {raw:?})",
             entries.len(),
-            if tok.pre.applies_nfc() {
-                "declared"
+            if tok.applies_nfc() {
+                "NFC declared"
             } else {
-                "not declared"
-            }
+                "no normalizer"
+            },
+            raw = tok.encode_raw("cafe\u{0301}")
         );
     }
 }
@@ -715,6 +862,18 @@ fn token_ids_match_the_reference() {
 // #239: items moved out of `tokenizer.rs` (bucket B of the dead-code census —
 // every test caller already lives in this module's subtree).
 // ────────────────────────────────────────────────────────────────────────────
+
+impl TokenizerModel {
+    /// The `tokenizer.ggml.model` spelling this engine was selected from —
+    /// test-only (#132 S4): the id gate compares a fixture's `model` with the
+    /// artifact's.
+    pub fn gguf_name(self) -> &'static str {
+        match self {
+            Self::Gpt2 => "gpt2",
+            Self::Spm => "llama",
+        }
+    }
+}
 
 impl PreTokenizer {
     /// The `tokenizer.ggml.pre` spelling this rule was selected from.

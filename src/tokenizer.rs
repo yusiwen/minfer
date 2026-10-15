@@ -267,6 +267,109 @@ impl PreTokenizer {
     }
 }
 
+/// The tokenizer family, from `tokenizer.ggml.model` (#132 S4).
+///
+/// This is a **dispatch**, not a hint: the value selects the engine, and every
+/// other engine llama.cpp knows is refused by name rather than approximated with
+/// the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerModel {
+    /// `gpt2` (or a missing key): byte-level BPE — merge ranks plus the 256
+    /// byte-to-unicode byte tokens, pre-tokenized by [`PreTokenizer`].
+    Gpt2,
+    /// `llama`: SentencePiece — score-driven merges over a `▁`-escaped text with
+    /// `<0xXX>` byte fallback. The `tokenizer.ggml.pre` key does **not**
+    /// participate: llama.cpp fixes the SPM flags from the model type
+    /// (`add_space_prefix = true`, `clean_spaces = false`,
+    /// `src/llama-vocab.cpp:2409`) and never pre-splits an SPM text.
+    Spm,
+}
+
+impl TokenizerModel {
+    /// Resolve `tokenizer.ggml.model`. Only the two engines this crate
+    /// implements are accepted; every other value is a refusal naming it.
+    pub fn from_gguf(model: Option<&str>) -> Result<Self, String> {
+        match model {
+            None | Some("gpt2") => Ok(Self::Gpt2),
+            Some("llama") => Ok(Self::Spm),
+            Some(other) => Err(format!(
+                "tokenizer.ggml.model = \"{other}\" is not a tokenizer minfer implements \
+                 (supported: \"gpt2\" — byte-level BPE — and \"llama\" — SentencePiece). \
+                 Refusing to run a different engine rather than tokenize with the wrong one."
+            )),
+        }
+    }
+}
+
+/// The text SentencePiece uses for a space (`U+2581`).
+const SPM_SPACE: char = '\u{2581}';
+
+/// Group declared special tokens by first char, longest-first inside each group
+/// (the earliest-position, longest-match scan in [`Tokenizer::encode`] needs
+/// both). Built by the loader and by the tests' synthetic vocabularies.
+fn special_index(special_tokens: &HashMap<String, u32>) -> HashMap<char, Vec<(String, u32)>> {
+    let mut index: HashMap<char, Vec<(String, u32)>> = HashMap::new();
+    for (pat, id) in special_tokens.iter() {
+        let first = pat.chars().next().unwrap_or('\0');
+        index.entry(first).or_default().push((pat.clone(), *id));
+    }
+    for group in index.values_mut() {
+        group.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    }
+    index
+}
+
+/// Parse a SentencePiece byte token (`<0xXX>`) into the byte it stands for.
+/// Anything else (including a malformed spelling) is not a byte token.
+fn parse_spm_byte_token(token: &str) -> Option<u8> {
+    let hex = token.strip_prefix("<0x")?.strip_suffix('>')?;
+    if hex.len() != 2 {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
+}
+
+/// A candidate merge in the SPM session: two adjacent symbols whose
+/// concatenation is a vocabulary entry, ordered by that entry's score.
+#[derive(PartialEq)]
+struct SpmBigram {
+    /// The score of the merged vocabulary entry — the higher, the earlier.
+    score: f32,
+    left: usize,
+    right: usize,
+    /// The byte length of the concatenation when the bigram was pushed; a
+    /// mismatch means one side grew since, and the bigram is stale.
+    size: usize,
+}
+
+impl Eq for SpmBigram {}
+
+impl Ord for SpmBigram {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Highest score first; ties by the smaller left index, exactly as
+        // llama.cpp's `llm_bigram_spm::comparator`.
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| other.left.cmp(&self.left))
+    }
+}
+
+impl PartialOrd for SpmBigram {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// One symbol in the SPM session's doubly-linked list.
+struct SpmSymbol {
+    text: String,
+    /// Byte length of `text`; 0 marks a symbol merged into its left neighbour.
+    n: usize,
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
 /// Build byte-to-unicode mapping (GPT-2 style).
 fn build_byte_to_unicode() -> HashMap<u8, char> {
     let mut bs: Vec<u32> = Vec::new();
@@ -359,8 +462,19 @@ pub struct Tokenizer {
     /// `special_by_first`, which the loader builds from this map.
     #[cfg_attr(not(test), allow(dead_code))]
     pub special_tokens: HashMap<String, u32>,
-    /// The pre-tokenization rule selected from `tokenizer.ggml.pre` (F7).
-    pub pre: PreTokenizer,
+    /// The engine selected from `tokenizer.ggml.model` (#132 S4).
+    pub model: TokenizerModel,
+    /// The pre-tokenization rule selected from `tokenizer.ggml.pre` (F7) — the
+    /// **BPE** engine's step. `None` for SentencePiece, which has no
+    /// pre-tokenization rule: llama.cpp fixes the SPM flags from the model type
+    /// and never pre-splits an SPM text.
+    pub pre: Option<PreTokenizer>,
+    /// SentencePiece: whether a raw-text segment is prefixed with a space
+    /// (`tokenizer.ggml.add_space_prefix`, default `true` for SPM).
+    add_space_prefix: bool,
+    /// SentencePiece: the `<0xXX>` byte token ids, one per byte value. Empty for
+    /// the BPE engine, whose byte fallback is the 256 byte-level characters.
+    spm_byte_to_id: HashMap<u8, u32>,
     /// Special tokens grouped by first char, longest-first within a group,
     /// built from `special_tokens` — the file's declared types and roles
     /// (#132 S2). Nothing here is inferred from a token's name.
@@ -423,7 +537,10 @@ impl Tokenizer {
             byte_to_unicode: HashMap::new(),
             unicode_to_byte: HashMap::new(),
             special_tokens: HashMap::new(),
-            pre: PreTokenizer::Qwen2,
+            model: TokenizerModel::Gpt2,
+            pre: Some(PreTokenizer::Qwen2),
+            add_space_prefix: false,
+            spm_byte_to_id: HashMap::new(),
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
@@ -459,7 +576,10 @@ impl Tokenizer {
             byte_to_unicode,
             unicode_to_byte,
             special_tokens: HashMap::new(),
-            pre: PreTokenizer::Qwen2,
+            model: TokenizerModel::Gpt2,
+            pre: Some(PreTokenizer::Qwen2),
+            add_space_prefix: false,
+            spm_byte_to_id: HashMap::new(),
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
@@ -470,12 +590,17 @@ impl Tokenizer {
     ///
     /// Refuses loudly (returns `Err`) when the metadata describes a tokenizer
     /// this engine cannot reproduce byte for byte:
-    ///   * `tokenizer.ggml.model` present and not `gpt2` (only byte-level BPE);
-    ///   * `tokenizer.ggml.pre` missing or unsupported (see [`PreTokenizer`]);
-    ///   * no merges (a byte-level BPE without ranks would silently degrade to
-    ///     per-byte splits);
-    ///   * a vocabulary that is not byte-level complete (the byte fallback in
-    ///     [`Tokenizer::bpe_encode`] would otherwise drop bytes silently).
+    ///   * `tokenizer.ggml.model` naming an engine other than `gpt2`
+    ///     (byte-level BPE) or `llama` (SentencePiece) — see
+    ///     [`TokenizerModel::from_gguf`];
+    ///   * for `gpt2`: `tokenizer.ggml.pre` missing or unsupported (see
+    ///     [`PreTokenizer`]), no merges (a byte-level BPE without ranks would
+    ///     silently degrade to per-byte splits), or a vocabulary that is not
+    ///     byte-level complete (the byte fallback in [`Tokenizer::bpe_encode`]
+    ///     would otherwise drop bytes silently);
+    ///   * for `llama`: an empty `tokenizer.ggml.scores` (the SPM merges are
+    ///     score-ordered) or a vocabulary missing any `<0xXX>` byte token (the
+    ///     SPM byte fallback would otherwise drop bytes).
     pub fn load(gguf: &GgufContext) -> Result<Self, String> {
         // Load token strings
         let mut id_to_token: Vec<String> = Vec::new();
@@ -570,49 +695,79 @@ impl Tokenizer {
         let unicode_to_byte: HashMap<char, u8> =
             byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();
 
-        // Group the declared special tokens by first char, longest-first inside
-        // each group (an earliest-position, longest-match scan needs both).
-        let mut special_by_first: HashMap<char, Vec<(String, u32)>> = HashMap::new();
-        for (pat, id) in special_tokens.clone() {
-            let first = pat.chars().next().unwrap_or('\0');
-            special_by_first.entry(first).or_default().push((pat, id));
-        }
-        for group in special_by_first.values_mut() {
-            group.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-        }
+        let special_by_first = special_index(&special_tokens);
 
-        // F7: the pre-tokenization rule must be one this engine implements.
-        let model = Self::get_gguf_str(gguf, "tokenizer.ggml.model");
-        if let Some(model) = model.as_deref() {
-            if model != "gpt2" {
-                return Err(format!(
-                    "tokenizer.ggml.model = \"{model}\" is not a byte-level BPE; minfer's \
-                     tokenizer implements byte-level BPE only"
-                ));
+        // #132 S4: the engine comes from `tokenizer.ggml.model`, and each engine
+        // validates its own prerequisites.
+        let model =
+            TokenizerModel::from_gguf(Self::get_gguf_str(gguf, "tokenizer.ggml.model").as_deref())?;
+        let mut add_space_prefix = false;
+        let mut spm_byte_to_id: HashMap<u8, u32> = HashMap::new();
+        let pre = match model {
+            TokenizerModel::Gpt2 => {
+                // F7: the pre-tokenization rule must be one this engine implements.
+                let pre = PreTokenizer::from_gguf(
+                    Self::get_gguf_str(gguf, "tokenizer.ggml.pre").as_deref(),
+                )?;
+                if merges.is_empty() {
+                    return Err(
+                        "tokenizer.ggml.merges is empty; minfer refuses to run a byte-level BPE \
+                         with no merge ranks (every piece would silently degrade to single bytes)"
+                            .to_string(),
+                    );
+                }
+                // The byte fallback is exact only when every byte has a token.
+                // Qwen's vocabularies have all 256; a vocabulary that does not is
+                // a load error rather than a lossy fallback.
+                let missing: Vec<u8> = (0u8..=255)
+                    .filter(|b| !vocab.contains_key(&byte_to_unicode[b].to_string()))
+                    .collect();
+                if let Some(first) = missing.first() {
+                    return Err(format!(
+                        "vocabulary is not byte-level complete: {} of 256 byte tokens are missing \
+                         (first: <0x{first:02X}>); minfer refuses a lossy byte fallback",
+                        missing.len()
+                    ));
+                }
+                Some(pre)
             }
-        }
-        let pre =
-            PreTokenizer::from_gguf(Self::get_gguf_str(gguf, "tokenizer.ggml.pre").as_deref())?;
-        if merges.is_empty() {
-            return Err(
-                "tokenizer.ggml.merges is empty; minfer refuses to run a byte-level BPE with no \
-                 merge ranks (every piece would silently degrade to single bytes)"
-                    .to_string(),
-            );
-        }
-        // The byte fallback is exact only when every byte has a token. Qwen's
-        // vocabularies have all 256; a vocabulary that does not is a load error
-        // rather than a lossy fallback.
-        let missing: Vec<u8> = (0u8..=255)
-            .filter(|b| !vocab.contains_key(&byte_to_unicode[b].to_string()))
-            .collect();
-        if let Some(first) = missing.first() {
-            return Err(format!(
-                "vocabulary is not byte-level complete: {} of 256 byte tokens are missing \
-                 (first: <0x{first:02X}>); minfer refuses a lossy byte fallback",
-                missing.len()
-            ));
-        }
+            TokenizerModel::Spm => {
+                // The SPM merge order is the score array; without it every merge
+                // would tie and the split would be arbitrary.
+                if id_to_score.iter().all(|&s| s == 0.0) {
+                    return Err(
+                        "tokenizer.ggml.scores is empty (or all zero) for a SentencePiece \
+                         vocabulary; minfer refuses to order the merges arbitrarily"
+                            .to_string(),
+                    );
+                }
+                // `<0xXX>` byte tokens: built from the declared BYTE type (6), and
+                // required to be complete — the SPM fallback emits one per byte.
+                for (id, token) in id_to_token.iter().enumerate() {
+                    if id_to_type.get(id).copied().unwrap_or(1) != 6 {
+                        continue;
+                    }
+                    if let Some(b) = parse_spm_byte_token(token) {
+                        spm_byte_to_id.insert(b, id as u32);
+                    }
+                }
+                let missing: Vec<u8> = (0u8..=255)
+                    .filter(|b| !spm_byte_to_id.contains_key(b))
+                    .collect();
+                if let Some(first) = missing.first() {
+                    return Err(format!(
+                        "vocabulary is not byte-level complete: {} of 256 SentencePiece byte \
+                         tokens are missing (first: <0x{first:02X}>); minfer refuses a lossy \
+                         byte fallback",
+                        missing.len()
+                    ));
+                }
+                // llama.cpp's SPM default; the key overrides it.
+                add_space_prefix =
+                    Self::get_gguf_bool(gguf, "tokenizer.ggml.add_space_prefix").unwrap_or(true);
+                None
+            }
+        };
 
         Ok(Tokenizer {
             id_to_token,
@@ -623,7 +778,10 @@ impl Tokenizer {
             byte_to_unicode,
             unicode_to_byte,
             special_tokens,
+            model,
             pre,
+            add_space_prefix,
+            spm_byte_to_id,
             special_by_first,
             bos_token,
             eos_token,
@@ -636,6 +794,14 @@ impl Tokenizer {
             .iter()
             .find(|kv| kv.key == key && kv.type_ == GgufType::String)
             .map(|kv| kv.get_val_str(0).to_string())
+    }
+
+    /// A GGUF metadata boolean, if the key is present with that type.
+    fn get_gguf_bool(gguf: &GgufContext, key: &str) -> Option<bool> {
+        gguf.kv
+            .iter()
+            .find(|kv| kv.key == key && kv.type_ == GgufType::Bool && !kv.is_array)
+            .map(|kv| kv.get_val_bool(0))
     }
 
     fn get_gguf_u32(gguf: &GgufContext, key: &str) -> Option<u32> {
@@ -731,8 +897,11 @@ impl Tokenizer {
     /// Pre-tokenize with the rule selected from `tokenizer.ggml.pre`, then
     /// byte-encode each piece and run BPE on it.
     fn encode_bpe(&self, text: &str) -> Vec<u32> {
+        let pre = self
+            .pre
+            .expect("a gpt2 tokenizer always has a pre-tokenization rule");
         let mut result = Vec::new();
-        for piece in self.pre.split(text) {
+        for piece in pre.split(text) {
             let encoded = byte_encode(piece, &self.byte_to_unicode);
             result.extend(self.bpe_encode(&encoded));
         }
@@ -759,6 +928,10 @@ impl Tokenizer {
         let text: &str = normalized.as_ref();
         let mut result = Vec::new();
         let mut remaining = text;
+        // SentencePiece prefixes the first raw-text segment (and every segment
+        // after a special token) with a space — llama.cpp's `is_prev_special`,
+        // which starts `true` (`src/llama-vocab.cpp:3413`).
+        let mut prev_special = true;
 
         loop {
             // Find the earliest position where any special token starts.
@@ -778,13 +951,14 @@ impl Tokenizer {
             if let Some((pos, id, len)) = earliest {
                 // Encode text before the special token
                 if pos > 0 {
-                    result.extend(self.encode_bpe(&remaining[..pos]));
+                    result.extend(self.encode_text(&remaining[..pos], prev_special));
                 }
                 result.push(id);
                 remaining = &remaining[pos + len..];
+                prev_special = true;
             } else {
                 // No more special tokens, encode the rest
-                result.extend(self.encode_bpe(remaining));
+                result.extend(self.encode_text(remaining, prev_special));
                 break;
             }
         }
@@ -806,13 +980,200 @@ impl Tokenizer {
     /// the special-token pre-scan.
     pub fn encode_raw(&self, text: &str) -> Vec<u32> {
         let normalized = self.normalized(text);
-        self.encode_bpe(normalized.as_ref())
+        // No special-token scan, but the SPM space prefix still applies: it is
+        // part of the tokenizer, not of the scan (llama.cpp applies it on the
+        // `parse_special = false` path too).
+        self.encode_text(normalized.as_ref(), true)
+    }
+
+    /// Encode one raw-text segment — the piece between two special tokens — with
+    /// the engine this file selected.
+    ///
+    /// `prev_special` is `true` for the first segment and after every special
+    /// token; SentencePiece uses it to decide the leading-space prefix.
+    fn encode_text(&self, text: &str, prev_special: bool) -> Vec<u32> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        match self.model {
+            TokenizerModel::Gpt2 => self.encode_bpe(text),
+            TokenizerModel::Spm => {
+                let mut escaped = String::with_capacity(text.len() + SPM_SPACE.len_utf8());
+                if self.add_space_prefix && prev_special {
+                    escaped.push(SPM_SPACE);
+                }
+                for c in text.chars() {
+                    escaped.push(if c == ' ' { SPM_SPACE } else { c });
+                }
+                self.spm_encode(&escaped)
+            }
+        }
+    }
+
+    /// SentencePiece encode a `▁`-escaped segment: llama.cpp's
+    /// `llm_tokenizer_spm_session` (`src/llama-vocab.cpp:114`).
+    ///
+    /// Symbols start as single characters. A bigram whose concatenation is a
+    /// vocabulary entry is queued with that entry's **score**; the highest score
+    /// is merged first, and every merge re-queues the new neighbours. A bigram
+    /// whose sides changed since it was queued is stale and skipped. The final
+    /// symbol walk emits a vocabulary entry where it can, re-splits through the
+    /// recorded merge pair where it cannot, and otherwise falls back to one
+    /// `<0xXX>` byte token per byte.
+    fn spm_encode(&self, text: &str) -> Vec<u32> {
+        use std::collections::BinaryHeap;
+
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let mut symbols: Vec<SpmSymbol> = Vec::with_capacity(n);
+        for (i, c) in chars.iter().enumerate() {
+            let text = c.to_string();
+            symbols.push(SpmSymbol {
+                n: text.len(),
+                text,
+                prev: if i == 0 { None } else { Some(i - 1) },
+                next: if i + 1 == n { None } else { Some(i + 1) },
+            });
+        }
+
+        // The concatenation → the pair of symbol texts it was built from, for the
+        // re-split fallback (`rev_merge` in llama.cpp's session).
+        let mut rev_merge: HashMap<String, (String, String)> = HashMap::new();
+        let mut queue: BinaryHeap<SpmBigram> = BinaryHeap::new();
+
+        let try_add = |left: usize,
+                       right: usize,
+                       symbols: &Vec<SpmSymbol>,
+                       vocab: &HashMap<String, u32>,
+                       scores: &[f32],
+                       rev_merge: &mut HashMap<String, (String, String)>,
+                       queue: &mut BinaryHeap<SpmBigram>| {
+            let mut joined = String::with_capacity(symbols[left].n + symbols[right].n);
+            joined.push_str(&symbols[left].text);
+            joined.push_str(&symbols[right].text);
+            if let Some(&id) = vocab.get(&joined) {
+                if (id as usize) < scores.len() {
+                    queue.push(SpmBigram {
+                        score: scores[id as usize],
+                        left,
+                        right,
+                        size: joined.len(),
+                    });
+                    rev_merge.insert(
+                        joined,
+                        (symbols[left].text.clone(), symbols[right].text.clone()),
+                    );
+                }
+            }
+        };
+
+        for i in 1..n {
+            try_add(
+                i - 1,
+                i,
+                &symbols,
+                &self.vocab,
+                &self.id_to_score,
+                &mut rev_merge,
+                &mut queue,
+            );
+        }
+
+        while let Some(bigram) = queue.pop() {
+            let (left, right) = (bigram.left, bigram.right);
+            if symbols[left].n == 0
+                || symbols[right].n == 0
+                || symbols[left].n + symbols[right].n != bigram.size
+            {
+                continue; // one side grew (or died) since this bigram was queued
+            }
+            let right_text = std::mem::take(&mut symbols[right].text);
+            symbols[left].n += symbols[right].n;
+            symbols[left].text.push_str(&right_text);
+            symbols[right].n = 0;
+            symbols[right].text.clear();
+
+            let next = symbols[right].next;
+            symbols[left].next = next;
+            if let Some(nx) = next {
+                symbols[nx].prev = Some(left);
+            }
+            if let Some(prev) = symbols[left].prev {
+                try_add(
+                    prev,
+                    left,
+                    &symbols,
+                    &self.vocab,
+                    &self.id_to_score,
+                    &mut rev_merge,
+                    &mut queue,
+                );
+            }
+            if let Some(nx) = symbols[left].next {
+                try_add(
+                    left,
+                    nx,
+                    &symbols,
+                    &self.vocab,
+                    &self.id_to_score,
+                    &mut rev_merge,
+                    &mut queue,
+                );
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut i = Some(0usize);
+        while let Some(idx) = i {
+            self.resegment(&symbols[idx].text, &rev_merge, &mut out);
+            i = symbols[idx].next;
+        }
+        out
+    }
+
+    /// Emit `text` as tokens: a vocabulary entry, else its recorded merge pair,
+    /// else one `<0xXX>` byte token per byte.
+    fn resegment(
+        &self,
+        text: &str,
+        rev_merge: &HashMap<String, (String, String)>,
+        out: &mut Vec<u32>,
+    ) {
+        if let Some(&id) = self.vocab.get(text) {
+            out.push(id);
+            return;
+        }
+        if text.is_empty() {
+            return;
+        }
+        if let Some((left, right)) = rev_merge.get(text) {
+            // A symbol that is not itself a vocabulary entry but was built from a
+            // pair we recorded: re-split it (both halves are strictly shorter).
+            self.resegment(left, rev_merge, out);
+            self.resegment(right, rev_merge, out);
+            return;
+        }
+        for b in text.bytes() {
+            match self.spm_byte_to_id.get(&b) {
+                Some(&id) => out.push(id),
+                None => panic!(
+                    "tokenizer invariant violated: no SentencePiece byte token for <0x{b:02X}>;                      Tokenizer::load verifies all 256"
+                ),
+            }
+        }
+    }
+
+    /// Whether the input is normalized to NFC: true when the file's
+    /// pre-tokenizer rule declares one (ADR-0044). SentencePiece has no rule, and
+    /// the SPM families this engine accepts declare none.
+    pub fn applies_nfc(&self) -> bool {
+        self.pre.map_or(false, |pre| pre.applies_nfc())
     }
 
     /// The text this tokenizer actually tokenizes: NFC when the rule declares it,
     /// the input itself otherwise.
     fn normalized<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
-        if self.pre.applies_nfc() {
+        if self.applies_nfc() {
             nfc::nfc(text)
         } else {
             std::borrow::Cow::Borrowed(text)
@@ -957,6 +1318,31 @@ impl Tokenizer {
     /// render text incrementally (streaming) must buffer incomplete sequences —
     /// see [`complete_utf8_prefix_len`].
     pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        if self.model == TokenizerModel::Spm {
+            // SentencePiece: a BYTE token is its byte, every other token's `▁`
+            // is a space (llama.cpp's `token_to_piece` for SPM).
+            let mut out = Vec::new();
+            for &id in ids {
+                let Some(token) = self.id_to_token.get(id as usize) else {
+                    continue;
+                };
+                if self.id_to_type.get(id as usize).copied().unwrap_or(1) == 6 {
+                    if let Some(b) = parse_spm_byte_token(token) {
+                        out.push(b);
+                        continue;
+                    }
+                }
+                for c in token.chars() {
+                    if c == SPM_SPACE {
+                        out.push(b' ');
+                    } else {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
+            }
+            return out;
+        }
         let mut encoded = String::new();
         for &id in ids {
             if (id as usize) < self.id_to_token.len() {
