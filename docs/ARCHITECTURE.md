@@ -124,44 +124,9 @@ prefill** followed by an **autoregressive decode loop**; both call
 built graph is cached per `GraphParams` and reused — only the first call with
 new params pays the build/assign/alloc cost.
 
-```mermaid
-flowchart TD
-    A["CLI args: model, prompt, flags"] --> B{"resolve model<br/>download::resolve"}
-    B -->|local path| C["load GGUF v3<br/>single or split parts (mmap)"]
-    B -->|"hf:… / ollama:…"| D["auto-download → path"]
-    B -->|cached name| C
-    C --> E["parse metadata KV + tensor table"]
-    E --> F["init GPU backend<br/>MPS / CUDA"]
-    F --> G["load model<br/>dispatch on general.architecture"]
-    G --> MODE{"mode?"}
-    MODE -->|"--cnv"| CV["conversation REPL<br/>(run_conversation)"]
-    MODE -->|"serve"| SV["OpenAI-compatible HTTP server<br/>multi-slot, streaming"]
-    MODE -->|"viz"| VZ["viz server (page + live SSE)"]
-    MODE -->|single shot| H["load BPE tokenizer from GGUF"]
-    H --> J{"no-template?"}
-    J -->|no| K["render chat template<br/>GGUF chat_template via minijinja<br/>(unrenderable → loud refusal;<br/>no template at all → ChatML)"]
-    J -->|yes| L["raw prompt"]
-    K --> M["tokenize prompt<br/>n_ctx = max(--n-ctx, prompt len)<br/>(sizes the KV regions once)"]
-    L --> M
-    M --> N["PREFILL<br/>graph forward, all prompt tokens at once"]
-    N --> O["last-token logits (n_out = 1)"]
-    O --> P{"DECODE loop<br/>while generated < n_predict"}
-    P --> Q["sample next token<br/>penalties → top-k → top-p → temp"]
-    Q --> R{"stop token or<br/>stop string match?"}
-    R -->|yes| S["done"]
-    R -->|no| T["append token, decode+print"]
-    T --> U["graph forward, single token<br/>KV persists in the allocator"]
-    U --> P
+<figure class="book-figure">{{#include figures/06-inference-pipeline.svg}}</figure>
 
-    subgraph GRAPH["every forward: build → assign → fuse → alloc → execute"]
-        G1["GraphBuilder<br/>build_graph (pure IR)"] --> G2["assign backends<br/>priority Metal → CUDA → CPU"]
-        G2 --> G3["fuse<br/>SwiGLU + decode fusions (gated)"]
-        G3 --> G4["alloc<br/>liveness + persistent KV"]
-        G4 --> G5["execute<br/>per split, cross-backend copies"]
-    end
-    N -.->|"GraphCache: params-only reuse"| GRAPH
-    U -.->|"GraphCache: params-only reuse"| GRAPH
-```
+*Figure 6.1 - the whole run: resolve a model, load it, branch on mode, prefill once, then decode one token at a time, every forward running build, assign, fuse, alloc, execute through the graph the cache owns.*
 
 **Generation parameters** (defaults match llama.cpp): `temp=0.8`, `top_k=40`,
 `top_p=0.95`, `repeat_penalty=1.1` (last 64 tokens), `frequency_penalty=0.0`,
@@ -267,23 +232,9 @@ assert structural consistency (`Op: PartialEq`).
 
 ### 4.6 Per-layer computation (Qwen2) — as built by `graph.rs`
 
-```mermaid
-flowchart LR
-    A["token_embd lookup (GetRows)"] --> B["hidden"]
-    B --> C["RMSNorm attn_norm"]
-    C --> D["WQ / WK / WV matmuls + bias"]
-    D --> E["RoPE on Q and K (in-place alias)"]
-    E --> F["kvcache_store: K/V → layer regions"]
-    F --> G["GQA attention<br/>Q·K^T → softmax → ·V"]
-    G --> H["WO matmul + bias"]
-    H --> I["+ residual → hidden"]
-    I --> J["RMSNorm ffn_norm"]
-    J --> K["FFN gate + up matmuls"]
-    K --> L["SiLU(gate) × up (fused SwiGLU)"]
-    L --> M["FFN down matmul"]
-    M --> N["+ residual → hidden"]
-    N --> O["next layer / output_norm"]
-```
+<figure class="book-figure">{{#include figures/06-per-layer-forward.svg}}</figure>
+
+*Figure 6.2 - one Qwen2 layer as the graph builder emits it: the attention block then the FFN block, with the two fusions and the persistent KV regions called out on the right.*
 
 GQA: each query head `h` maps to KV head `hk = h / gqa`. The KV head dimension
 is independent (`n_kv_embd` read from the K weight's `ne[1]`), so Qwen2.5-0.5B
@@ -414,16 +365,9 @@ CPU backend. See `docs/GPU_SAFETY.md`.
   alignment; tensor strides computed from type block size exactly like
   ggml; split multi-part models are merged into one tensor index.
 
-```mermaid
-flowchart LR
-    A["GGUF file"] --> B["metadata KV<br/>hparams + tokenizer + template"]
-    A --> C["tensor table<br/>name / type / shape / offset"]
-    C --> D["quantized data blob"]
-    D --> E["Tensor: type, shape, strides, Vec&lt;u8&gt;"]
-    B --> F["HParams"]
-    B --> G["Tokenizer"]
-    B --> H["Chat template"]
-```
+<figure class="book-figure">{{#include figures/06-gguf-parsing.svg}}</figure>
+
+*Figure 6.3 - a GGUF file is two halves: metadata becomes hparams, tokenizer and chat template, while the tensor table plus the data blob becomes typed tensors.*
 
 ---
 
@@ -516,23 +460,9 @@ hidden state, and continued on the CPU.
 `ModelDef::forward(tokens, positions, kv)` was implemented in
 `models/qwen2/forward.rs` as an imperative loop:
 
-```mermaid
-flowchart LR
-    A["token_embd lookup"] --> B["hidden"]
-    B --> C["RMSNorm attn_norm"]
-    C --> D["WQ / WK / WV matmuls + bias"]
-    D --> E["RoPE on Q and K"]
-    E --> F["store K/V into KV cache"]
-    F --> G["GQA attention<br/>Q·K^T → softmax → ·V"]
-    G --> H["WO matmul + bias"]
-    H --> I["+ residual → hidden"]
-    I --> J["RMSNorm ffn_norm"]
-    J --> K["FFN gate + up matmuls"]
-    K --> L["SiLU(gate) × up"]
-    L --> M["FFN down matmul"]
-    M --> N["+ residual → hidden"]
-    N --> O["next layer / output_norm"]
-```
+<figure class="book-figure">{{#include figures/06-old-imperative-forward.svg}}</figure>
+
+*Figure 6.4 - the deleted imperative loop: the same math, but the decode-time fusions lived in hand-written kernels instead of builder nodes.*
 
 Decode-time optimizations: fused QKV (nt==1) via a concatenated
 `blk.{il}.attn_qkv` weight, fused bias+rope+store (`attn_bias_rope_store`),
@@ -546,22 +476,9 @@ run on `n_out` rows only (`models/qwen2/graph.rs:64`, `:228-231`;
 
 ## A.3 Old backend layering & fallback
 
-```mermaid
-flowchart TD
-    A["forward nt tokens"] --> B{"embedding on GPU?"}
-    B -->|yes| C["GPU embed lookup → buf_hidden"]
-    B -->|no| D["CPU embed → upload hidden"]
-    D --> E["upload positions"]
-    C --> E
-    E --> F{"per-layer: layer_gpu ok?"}
-    F -->|"yes, all layers"| G["output_norm_gpu<br/>on GPU"]
-    F -->|"no at layer i"| H["submit partial GPU work<br/>download hidden, sync KV to CPU"]
-    H --> I["CPU loop from layer i"]
-    G -->|"output on GPU"| J["download logits → return"]
-    G -->|"output fell back"| I
-    I --> K["output_norm + output matmul on CPU"]
-    K --> L["return logits"]
-```
+<figure class="book-figure">{{#include figures/06-old-backend-layering.svg}}</figure>
+
+*Figure 6.5 - the deleted fallback: the device decision was made once for the embedding and then re-made per layer, and the first ineligible layer handed the rest to the CPU.*
 
 Selection rules (then):
 

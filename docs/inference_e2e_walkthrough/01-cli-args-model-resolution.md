@@ -82,24 +82,9 @@ the same argument list:
   *after* parsing and *before* anything loads, in one call:
   `download::resolve(&model_ref)`.
 
-```mermaid
-flowchart TD
-    A["argv strings"] --> B{"arg starts with '-'?"}
-    B -->|yes| C["flag → typed value in GenParams / mode vars<br/>(unknown flag → usage + exit 1)"]
-    B -->|no| D["positional: subcommand? model? prompt words"]
-    C --> B
-    D --> B
-    B --> E{"positional[0]"}
-    E -->|bench / specverify| F["separate parser, exit before global parse"]
-    E -->|download / list / info| G["do it, return — no model load"]
-    E -->|serve / viz| H["set mode flag, drop the token, keep the model arg"]
-    E -->|anything else| I["single-shot / --cnv inference"]
-    I --> J["download::resolve(model_ref)"]
-    J -->|local path| K["PathBuf (must exist)"]
-    J -->|hf: / ollama:| L["download → cached path"]
-    J -->|bare name| M["search ~/.cache/minfer/models for *.gguf"]
-    K & L & M --> N["model_path — hand this to doc 02"]
-```
+<figure class="book-figure">{{#include ../figures/15-cli-argument-resolution.svg}}</figure>
+
+*Figure 15.1 - how main() reads argv: flags and positionals are classified in a loop, positional[0] picks the mode, and the model reference resolves in a fixed order.*
 
 The order of the checks inside `resolve` matters. A path-like reference
 (starts with `/`, `.`, or `~`) is taken literally and must exist — no

@@ -486,18 +486,12 @@ jobs:
       - name: The F6 producers must stay re-runnable (dry run)
         run: python3 scripts/check_f6_fixtures.py --regenerate --dry-run
       # Same toolchain as Docs (`.github/workflows/docs.yml`), so the gate builds the
-      # book the site actually ships: mdBook 0.4.37 because 0.5 changed the
-      # preprocessor protocol, and mdbook-mermaid 0.13.0 because it only understands
-      # the 0.4.x format.
-      - uses: dtolnay/rust-toolchain@1.97.1
+      # book the site actually ships: mdBook 0.4.37, and nothing else — the diagrams
+      # are inline SVG, so there is no preprocessor to install and no Rust step.
       - name: Install mdBook
         uses: taiki-e/install-action@v2
         with:
           tool: mdbook@0.4.37
-      - name: Install mdbook-mermaid
-        run: cargo install mdbook-mermaid --locked --version 0.13.0
-      # The Mermaid library is not committed: the script downloads it (sha384-pinned),
-      # stages it inside the book, builds, and removes it again — see scripts/build_book.sh.
       - name: Build the book
         run: scripts/build_book.sh
       # #515: the build above cannot fail on the two ways a link dies in the *rendered*
@@ -521,10 +515,14 @@ jobs:
         run: python3 scripts/check_book_coverage.py --selftest
       - name: The link checker's own pass/fail cases
         run: python3 scripts/check_docs_links.py --selftest
-      - name: The staged Mermaid assets must not survive the build
-        run: |
-          test ! -e docs/assets/mermaid.min.js
-          test ! -e docs/assets/mermaid-init.js
+      # The figures are linted from the source, not from the rendered page: the theme palette
+      # (W310), the geometry (W304), the include/caption shape, the character allowlist, the
+      # wrapper CSS wiring (W309) and label width at the viewBox edge (W311). Vendored from the
+      # `mdbook-figures` skill; scripts/check_figures_tests.py is its own fixture suite.
+      - name: Every figure must follow the book's figure rules
+        run: python3 scripts/check_figures.py --root . --strict
+      - name: The figure checker's own pass/fail cases
+        run: python3 scripts/check_figures_tests.py
 
   # The viz gate: the shape-flow model must agree with the engine's own export, both
   # render paths must survive a headless boot (e2e.js and app.js), and everything the

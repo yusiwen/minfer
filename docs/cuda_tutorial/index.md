@@ -43,15 +43,9 @@ the CPU counterpart from the
 | [06 · Optimization methods](06-optimization-methods.md) | 4 — from reading to changing | Profiling with ncu/nsys, the technique catalog (each anchored to the step that used it), the verification gate chain, three exercises |
 | [07 · Where to go next](07-where-next.md) | 5 — the map | Reading order for the reference docs, nvcc/ncu cheat sheet, pitfall list, toy index |
 
-```mermaid
-flowchart LR
-    A["01 mental model<br/>(Toy #1)"] --> B["02 minimal CUDA<br/>(Toys #2–#3)"]
-    B --> C["03 kernels I<br/>elementwise · dequant · embed"]
-    C --> D["04 kernels II<br/>GEMV → tiled GEMM → MMQ"]
-    D --> E["05 kernels III<br/>attention · host side · graphs"]
-    E --> F["06 optimization<br/>profile · change · verify"]
-    F --> G["07 the map<br/>reference docs · appendix"]
-```
+<figure class="book-figure">{{#include ../figures/36-cuda-tutorial-ladder.svg}}</figure>
+
+*Figure 36.1 - the tutorial's ladder: read 01 to 07 in order, each rung adding one layer of understanding and one kernel family or toy.*
 
 ## How this relates to the other CUDA docs (no duplication, only links)
 

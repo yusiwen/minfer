@@ -99,8 +99,11 @@ Neighboring chapters + linked reference docs, one line each.
    written a kernel must finish `01` able to predict what a kernel launch
    does; must finish `04` able to explain why decode is memory-bound.
 7. End every doc with the nav line; the index link is `./index.md`.
-8. At most one small diagram (ascii or mermaid) per chapter where it clearly
-   helps; mermaid must render under mdbook-mermaid (plain ` ```mermaid `).
+8. At most one small diagram per chapter where it clearly helps. Draw it as a
+   hand-authored SVG in `docs/figures/` and pull it in with
+   `{{#include}}` inside `<figure class="book-figure">`, captioned
+   `*Figure NN.M - ...*`; see `docs/css/figures.css` for the figure numbers and
+   the theme palette. No Mermaid, no client-side rendering.
 
 ## Series facts every author can rely on
 

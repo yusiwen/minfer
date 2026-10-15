@@ -573,8 +573,11 @@ file, line and both values — edit the ledger, not a counter. The suite ledger'
 is compared against the real `cargo test` log by `scripts/check_baselines.py --check-live` in
 `test-linux-cpu` — a job the change classifier keeps running whenever that ledger moves, while a
 docs-only change skips it (ADR-0025). The same job runs `scripts/build_book.sh`
-(pinned mdBook + a sha384-checked Mermaid download), then three checkers that read the two halves of
-"the book is correct". `scripts/check_docs_links.py` fails on a relative link whose target does not
+(pinned mdBook 0.4.37), then four checkers that read the two halves of
+"the book is correct". The first is `scripts/check_figures.py`, which lints every
+figure in `docs/figures/` — theme palette, geometry, the include/caption shape, the
+character allowlist, the wrapper-CSS wiring — with its own fixture suite in
+`scripts/check_figures_tests.py`. `scripts/check_docs_links.py` fails on a relative link whose target does not
 exist **in the checkout** — and, deliberately, on nothing else. `scripts/check_book_links.py` (#515)
 reads the *rendered* `book/` instead: every relative `href`/`src` must resolve, every `#fragment` must
 be an `id=` in the page it points at, and a link the reader cannot follow is reported with the document

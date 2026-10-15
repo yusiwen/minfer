@@ -52,32 +52,9 @@ macOS the same graph runs on Metal ([14](14-metal-backend.md)); with
 NVIDIA GPUs with int8 MMQ prefill and CUDA Graph replay
 ([15](15-cuda-backend.md)).
 
-```mermaid
-flowchart LR
-    subgraph ACT1["Act 1 — startup & load"]
-        D01["01 CLI + model resolution"] --> D02["02 GGUF load (mmap)"]
-        D02 --> D03["03 model dispatch + weights"]
-        D03 --> D04["04 tokenizer + template"]
-    end
-    subgraph ACT2["Act 2 — life of the graph"]
-        D04 --> D05["05 graph build (IR)"]
-        D05 --> D06["06 assign + fusion"]
-        D06 --> D07["07 allocator + KV regions"]
-        D07 --> D08["08 scheduler + execute"]
-    end
-    subgraph ACT3["Act 3 — inside one forward"]
-        D08 --> D09["09 prefill path"]
-        D09 --> D10["10 CPU matmul kernels"]
-        D10 --> D11["11 attention + vec ops + KV"]
-        D11 --> D12["12 sampler"]
-    end
-    subgraph ACT4["Act 4 — decode & backends"]
-        D12 --> D13["13 decode loop + graph reuse"]
-        D13 -.->|next token| D09
-        D14["14 Metal backend"] -.->|replaces 10/11| D09
-        D15["15 CUDA backend"] -.->|replaces 10/11| D09
-    end
-```
+<figure class="book-figure">{{#include ../figures/14-walkthrough-acts.svg}}</figure>
+
+*Figure 14.1 - the fifteen chapters as four acts in reading order; the dashed arrows show where chapter 13 loops back to 09 and where 14 and 15 replace the CPU kernel chapters.*
 
 ## Master table — stage → document → code
 

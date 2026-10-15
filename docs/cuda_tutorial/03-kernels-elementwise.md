@@ -28,12 +28,9 @@ or one of its type siblings.
 You will also meet the **dispatch chain**, the pattern every later chapter
 reuses:
 
-```mermaid
-flowchart LR
-    A["Rust: Op match arm<br/>graph/cuda_backend.rs"] --> B["Rust device layer<br/>CudaState method (cuda/methods/*.rs)"]
-    B --> C["C launcher: grid sizing<br/>launch_* (cuda/kernels/*.cu)"]
-    C --> D["__global__ kernel<br/>one thread's worth of math"]
-```
+<figure class="book-figure">{{#include ../figures/37-cuda-dispatch-chain.svg}}</figure>
+
+*Figure 37.1 - the dispatch chain every later chapter reuses: match arm, device method, C launcher, kernel, four hops with a distinct job each.*
 
 Keep it in mind while reading: a graph node named `Add` does not "run
 `add_f32`" directly. It runs a Rust match arm, which calls a CudaState method,

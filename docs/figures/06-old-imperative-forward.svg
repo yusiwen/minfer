@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 810 680" width="100%" style="max-width:100%;height:auto"
+     role="img" aria-label="The deleted imperative per-layer forward loop, annotated with the decode-time fusions the old path applied.">
+  <style>
+    .fig-card  { fill: var(--quote-bg, #13293d); stroke: var(--quote-border, #274357); stroke-width: 1; }
+    .fig-alt   { fill: var(--table-alternate-bg, #0f2438); stroke: var(--quote-border, #274357); stroke-width: 1; }
+    .fig-t     { fill: var(--fg, #dce6f0); font-size: 12.5px; font-weight: 600; }
+    .fig-s     { fill: var(--sidebar-fg, #8fa6bd); font-size: 11.5px; }
+    .fig-cap   { fill: var(--sidebar-fg, #8fa6bd); font-size: 11px; letter-spacing: .10em; }
+    .fig-edge  { stroke: var(--quote-border, #3c6b8f); stroke-width: 1.25; fill: none; }
+    .fig-a-acc { fill: #4d86b8; }
+    .fig-a-pos { fill: #3f8f6f; }
+    .fig-a-neg { fill: #b06a5e; }
+  </style>
+  <defs>
+    <marker id="fig64-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--quote-border, #3c6b8f)"/>
+    </marker>
+  </defs>
+  <text class="fig-cap" x="40" y="22">THE IMPERATIVE LOOP (THEN)</text>
+  <rect class="fig-alt" x="40" y="48" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="69">token_embd lookup -> hidden</text>
+  <text class="fig-s" x="500" y="68">embedding ran on GPU or CPU</text>
+  <path class="fig-edge" d="M260 80 V 90" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="90" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="111">RMSNorm attn_norm</text>
+  <path class="fig-edge" d="M260 122 V 132" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="132" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="153">WQ / WK / WV matmuls + bias</text>
+  <text class="fig-s" x="500" y="152">fused QKV when nt == 1</text>
+  <path class="fig-edge" d="M260 164 V 174" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="174" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="195">RoPE on Q and K</text>
+  <path class="fig-edge" d="M260 206 V 216" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="216" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="237">store K/V into the KV cache</text>
+  <text class="fig-s" x="500" y="236">fused bias + rope + store kernel</text>
+  <path class="fig-edge" d="M260 248 V 258" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="258" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="279">GQA attention: Q.K^T -> softmax -> .V</text>
+  <path class="fig-edge" d="M260 290 V 300" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="300" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="321">WO matmul + bias</text>
+  <path class="fig-edge" d="M260 332 V 342" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="342" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="363">+ residual -> hidden</text>
+  <path class="fig-edge" d="M260 374 V 384" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="384" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="405">RMSNorm ffn_norm</text>
+  <path class="fig-edge" d="M260 416 V 426" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="426" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="447">FFN gate + up matmuls</text>
+  <path class="fig-edge" d="M260 458 V 468" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="468" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="489">SiLU(gate) x up</text>
+  <text class="fig-s" x="500" y="488">fused SwiGLU kernel</text>
+  <path class="fig-edge" d="M260 500 V 510" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="510" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="531">FFN down matmul</text>
+  <text class="fig-s" x="500" y="530">last layer: only the n_out tail rows</text>
+  <path class="fig-edge" d="M260 542 V 552" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="552" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="573">+ residual -> hidden</text>
+  <path class="fig-edge" d="M260 584 V 594" marker-end="url(#fig64-arrow)"/>
+  <rect class="fig-alt" x="40" y="594" width="440" height="32" rx="6"/>
+  <text class="fig-t" x="54" y="615">next layer / output_norm</text>
+  <text class="fig-s" x="40" y="661">None of these fusions required a graph; the same optimizations were later rebuilt as builder nodes.</text>
+</svg>

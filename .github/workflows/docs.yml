@@ -28,24 +28,19 @@ jobs:
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
     steps:
       - uses: actions/checkout@v5
-      # Pinned to 0.4.37 — the same version nixpkgs 24.05 ships in the local
-      # devShell. mdbook 0.5 changed the preprocessor input protocol, and
-      # mdbook-mermaid 0.13.0 (below) only understands the 0.4.x format
-      # ("Unable to parse the input" otherwise).
+      # Pinned to 0.4.37 — the same version the local devShell ships, so local and
+      # CI builds render identically. Diagrams are inline SVG in docs/figures/ now
+      # (no preprocessor, no client-side renderer), so mdBook is the whole
+      # toolchain and no Rust/cargo step is needed.
       - name: Install mdBook
         uses: taiki-e/install-action@v2
         with:
           tool: mdbook@0.4.37
-      # Mermaid preprocessor (book.toml [preprocessor.mermaid]); pinned to
-      # 0.13.0 — the same version nixpkgs 24.05 ships in the devShell, so
-      # local and CI builds preprocess identically. The library itself is not
-      # committed: scripts/build_book.sh downloads it (sha384-pinned), stages it
-      # inside the book, and removes it again, so `mdbook-mermaid install` is not
-      # used here either.
-      - name: Install mdbook-mermaid
-        run: cargo install mdbook-mermaid --locked --version 0.13.0
       - name: Build the book
         run: scripts/build_book.sh
+      # Same figure gate as `check-docs`; the deploy refuses a book whose figures break the rules.
+      - name: Every figure must follow the book's figure rules
+        run: python3 scripts/check_figures.py --root . --strict
       # v5 is the Node.js 24 major of both Pages actions (v3/v4 emitted the
       # deprecation annotation); their inputs are unchanged.
       - name: Upload Pages artifact

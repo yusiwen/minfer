@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 810 340" width="100%" style="max-width:100%;height:auto"
+     role="img" aria-label="How a GGUF file splits into metadata and tensor halves: metadata feeds hparams, tokenizer and chat template, while the tensor table plus data blob yields typed tensors.">
+  <style>
+    .fig-card  { fill: var(--quote-bg, #13293d); stroke: var(--quote-border, #274357); stroke-width: 1; }
+    .fig-alt   { fill: var(--table-alternate-bg, #0f2438); stroke: var(--quote-border, #274357); stroke-width: 1; }
+    .fig-t     { fill: var(--fg, #dce6f0); font-size: 12.5px; font-weight: 600; }
+    .fig-s     { fill: var(--sidebar-fg, #8fa6bd); font-size: 11.5px; }
+    .fig-cap   { fill: var(--sidebar-fg, #8fa6bd); font-size: 11px; letter-spacing: .10em; }
+    .fig-edge  { stroke: var(--quote-border, #3c6b8f); stroke-width: 1.25; fill: none; }
+    .fig-a-acc { fill: #4d86b8; }
+    .fig-a-pos { fill: #3f8f6f; }
+    .fig-a-neg { fill: #b06a5e; }
+  </style>
+  <defs>
+    <marker id="fig63-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--quote-border, #3c6b8f)"/>
+    </marker>
+  </defs>
+  <rect class="fig-card" x="40" y="140" width="150" height="48" rx="8"/>
+  <text class="fig-t" x="56" y="170">GGUF file</text>
+  <path class="fig-edge" d="M190 164 H 215"/>
+  <path class="fig-edge" d="M215 96 V 284"/>
+  <path class="fig-edge" d="M215 96 H 238" marker-end="url(#fig63-arrow)"/>
+  <path class="fig-edge" d="M215 196 H 238" marker-end="url(#fig63-arrow)"/>
+  <path class="fig-edge" d="M215 284 H 238" marker-end="url(#fig63-arrow)"/>
+  <rect class="fig-card" x="240" y="70" width="260" height="52" rx="8"/>
+  <text class="fig-t" x="254" y="92">metadata KV</text>
+  <text class="fig-s" x="254" y="110">hparams + tokenizer + template</text>
+  <rect class="fig-card" x="240" y="170" width="260" height="52" rx="8"/>
+  <text class="fig-t" x="254" y="192">tensor table</text>
+  <text class="fig-s" x="254" y="210">name / type / shape / offset</text>
+  <path class="fig-edge" d="M370 222 V 260" marker-end="url(#fig63-arrow)"/>
+  <rect class="fig-card" x="240" y="262" width="260" height="44" rx="8"/>
+  <text class="fig-t" x="254" y="282">quantized data blob</text>
+  <text class="fig-s" x="254" y="300">mmap, zero-copy</text>
+  <path class="fig-edge" d="M500 284 H 558" marker-end="url(#fig63-arrow)"/>
+  <rect class="fig-alt" x="560" y="262" width="210" height="44" rx="8"/>
+  <text class="fig-t" x="574" y="282">Tensor</text>
+  <text class="fig-s" x="574" y="300">type, shape, strides, bytes</text>
+  <path class="fig-edge" d="M500 96 H 530"/>
+  <path class="fig-edge" d="M530 90 V 194"/>
+  <path class="fig-edge" d="M530 90 H 558" marker-end="url(#fig63-arrow)"/>
+  <path class="fig-edge" d="M530 142 H 558" marker-end="url(#fig63-arrow)"/>
+  <path class="fig-edge" d="M530 194 H 558" marker-end="url(#fig63-arrow)"/>
+  <rect class="fig-alt" x="560" y="70" width="210" height="40" rx="8"/>
+  <text class="fig-t" x="574" y="95">HParams</text>
+  <rect class="fig-alt" x="560" y="122" width="210" height="40" rx="8"/>
+  <text class="fig-t" x="574" y="147">Tokenizer</text>
+  <rect class="fig-alt" x="560" y="174" width="210" height="40" rx="8"/>
+  <text class="fig-t" x="574" y="199">Chat template</text>
+  <text class="fig-s" x="40" y="328">Split model parts are merged into one tensor index, so readers never see the parts.</text>
+</svg>
