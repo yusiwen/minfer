@@ -523,6 +523,19 @@ jobs:
         run: python3 scripts/check_figures.py --root . --strict
       - name: The figure checker's own pass/fail cases
         run: python3 scripts/check_figures_tests.py
+      # `--sidebar-fg` is the *sidebar's* text colour, not a muted body colour: mdBook
+      # 0.4.37's `rust` theme sets it to #c8c9db while that theme's `--quote-bg` card is
+      # light grey (#c1c1bd), so a label or caption in it is nearly invisible there. The
+      # source-level checker cannot see this (the variable is legal), so it is a grep.
+      # It matches the *use* (`var(--sidebar-fg`), not the name, so the explanation in
+      # docs/css/figures.css does not trip it. Figures paint secondary labels with
+      # `var(--fg)` plus an opacity instead.
+      - name: Figure labels must not use the sidebar's text colour
+        run: |
+          if grep -rn -- 'var(--sidebar-fg' docs/figures/ docs/css/figures.css; then
+            echo "figure text: use var(--fg) with an opacity, not --sidebar-fg (see docs/css/figures.css)" >&2
+            exit 1
+          fi
 
   # The viz gate: the shape-flow model must agree with the engine's own export, both
   # render paths must survive a headless boot (e2e.js and app.js), and everything the
