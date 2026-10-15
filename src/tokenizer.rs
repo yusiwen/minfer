@@ -283,6 +283,13 @@ pub enum TokenizerModel {
     /// (`add_space_prefix = true`, `clean_spaces = false`,
     /// `src/llama-vocab.cpp:2409`) and never pre-splits an SPM text.
     Spm,
+    /// `t5`: unigram — llama.cpp's UGM. The text is rewritten by the file's
+    /// **precompiled charsmap** (an XCDA-compressed prefix replacement table) and
+    /// by the whitespace rules, then segmented by a Viterbi walk over the
+    /// vocabulary trie weighted by `tokenizer.ggml.scores`, with one unknown token
+    /// per run of unmatched input. `pre`, merges and byte tokens do not
+    /// participate.
+    Ugm,
     /// `bert`: WordPiece — llama.cpp's WPM. Each word is prefixed with the
     /// phantom `▁` and segmented by **greedy longest match** against the
     /// vocabulary, with one `<unk>` per word that does not fully match. Neither
@@ -300,11 +307,12 @@ impl TokenizerModel {
             None | Some("gpt2") => Ok(Self::Gpt2),
             Some("llama") => Ok(Self::Spm),
             Some("bert") => Ok(Self::Bert),
+            Some("t5") => Ok(Self::Ugm),
             Some(other) => Err(format!(
                 "tokenizer.ggml.model = \"{other}\" is not a tokenizer minfer implements \
-                 (supported: \"gpt2\" — byte-level BPE — \"llama\" — SentencePiece — and \
-                 \"bert\" — WordPiece). Refusing to run a different engine rather than \
-                 tokenize with the wrong one."
+                 (supported: \"gpt2\" — byte-level BPE — \"llama\" — SentencePiece — \
+                 \"bert\" — WordPiece — and \"t5\" — unigram). Refusing to run a different \
+                 engine rather than tokenize with the wrong one."
             )),
         }
     }
@@ -478,6 +486,97 @@ fn parse_spm_byte_token(token: &str) -> Option<u8> {
     u8::from_str_radix(hex, 16).ok()
 }
 
+/// A byte trie over vocabulary entries — the unigram engine walks it once per
+/// input code point to find every token that starts there.
+#[derive(Default, Clone)]
+struct VocabTrie {
+    nodes: Vec<TrieNode>,
+}
+
+#[derive(Default, Clone)]
+struct TrieNode {
+    children: HashMap<u8, u32>,
+    token: Option<u32>,
+}
+
+impl VocabTrie {
+    fn insert(&mut self, text: &str, id: u32) {
+        if self.nodes.is_empty() {
+            self.nodes.push(TrieNode::default());
+        }
+        let mut node = 0u32;
+        for &b in text.as_bytes() {
+            let next = match self.nodes[node as usize].children.get(&b) {
+                Some(&next) => next,
+                None => {
+                    self.nodes.push(TrieNode::default());
+                    let next = (self.nodes.len() - 1) as u32;
+                    self.nodes[node as usize].children.insert(b, next);
+                    next
+                }
+            };
+            node = next;
+        }
+        self.nodes[node as usize].token = Some(id);
+    }
+
+    /// Every `(id, end)` whose entry is a prefix of `bytes[start..]`, in
+    /// increasing `end` order.
+    fn matches(&self, bytes: &[u8], start: usize) -> Vec<(u32, usize)> {
+        let mut out = Vec::new();
+        if self.nodes.is_empty() {
+            return out;
+        }
+        let mut node = 0u32;
+        for (i, &b) in bytes[start..].iter().enumerate() {
+            match self.nodes[node as usize].children.get(&b) {
+                Some(&next) => node = next,
+                None => break,
+            }
+            if let Some(id) = self.nodes[node as usize].token {
+                out.push((id, start + i + 1));
+            }
+        }
+        out
+    }
+
+    /// The longest entry that is a prefix of `text`, with its byte length.
+    fn longest_prefix(&self, text: &str) -> Option<(u32, usize)> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let mut best = None;
+        let mut node = 0u32;
+        for (i, &b) in text.as_bytes().iter().enumerate() {
+            match self.nodes[node as usize].children.get(&b) {
+                Some(&next) => node = next,
+                None => break,
+            }
+            if let Some(id) = self.nodes[node as usize].token {
+                best = Some((id, i + 1));
+            }
+        }
+        best
+    }
+}
+
+/// The unigram engine's loaded state: the two tries, the score bounds and the
+/// decoded precompiled charsmap (empty when the file carries none).
+#[derive(Default, Clone)]
+struct UgmData {
+    /// Every NORMAL / USER_DEFINED / UNUSED entry, for the Viterbi walk.
+    trie: VocabTrie,
+    /// The USER_DEFINED entries alone: a prefix matching one of these is emitted
+    /// whole, before the charsmap is consulted.
+    user_defined: VocabTrie,
+    /// The lowest normal-token score; the unknown transition costs 10 below it.
+    unknown_token_score: f32,
+    /// The XCDA array and the replacement strings of
+    /// `tokenizer.ggml.precompiled_charsmap`.
+    xcda: Vec<u32>,
+    prefix_replacements: Vec<u8>,
+}
+
 /// A candidate merge in the SPM session: two adjacent symbols whose
 /// concatenation is a vocabulary entry, ordered by that entry's score.
 #[derive(PartialEq)]
@@ -630,8 +729,14 @@ pub struct Tokenizer {
     /// upper bound (`llama_vocab::max_token_len`).
     max_token_len: usize,
     /// WordPiece: the `<unk>` id, the fallback for a word that cannot be fully
-    /// segmented. `load` refuses a vocabulary that does not declare one.
+    /// segmented. `load` refuses a vocabulary that does not declare one. The
+    /// unigram engine reads it too (one unknown per unmatched run).
     unk_token: u32,
+    /// Unigram (`t5`): the trie, the score bound and the charsmap.
+    ugm: UgmData,
+    /// Unigram (`t5`): `tokenizer.ggml.remove_extra_whitespaces` — collapse a run
+    /// of whitespace into one `▁`.
+    remove_extra_whitespaces: bool,
     /// Special tokens grouped by first char, longest-first within a group,
     /// built from `special_tokens` — the file's declared types and roles
     /// (#132 S2). Nothing here is inferred from a token's name.
@@ -701,6 +806,8 @@ impl Tokenizer {
             normalizer: NormalizerOptions::default(),
             max_token_len: 0,
             unk_token: 0,
+            ugm: UgmData::default(),
+            remove_extra_whitespaces: false,
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
@@ -743,6 +850,8 @@ impl Tokenizer {
             normalizer: NormalizerOptions::default(),
             max_token_len: 0,
             unk_token: 0,
+            ugm: UgmData::default(),
+            remove_extra_whitespaces: false,
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
@@ -869,6 +978,8 @@ impl Tokenizer {
         let mut normalizer = NormalizerOptions::default();
         let mut max_token_len = 0;
         let mut unk_token = 0;
+        let mut ugm = UgmData::default();
+        let mut remove_extra_whitespaces = false;
         let pre = match model {
             TokenizerModel::Gpt2 => {
                 // F7: the pre-tokenization rule must be one this engine implements.
@@ -933,6 +1044,87 @@ impl Tokenizer {
                     Self::get_gguf_bool(gguf, "tokenizer.ggml.add_space_prefix").unwrap_or(true);
                 None
             }
+            TokenizerModel::Ugm => {
+                // The Viterbi is ordered by the score array; without it every
+                // segmentation would tie.
+                if id_to_score.iter().all(|&s| s == 0.0) {
+                    return Err(
+                        "tokenizer.ggml.scores is empty (or all zero) for a unigram vocabulary; \
+                         minfer refuses to order the Viterbi arbitrarily"
+                            .to_string(),
+                    );
+                }
+                unk_token = Self::get_gguf_u32(gguf, "tokenizer.ggml.unknown_token_id").ok_or(
+                    "tokenizer.ggml.unknown_token_id is missing; minfer's unigram engine needs \
+                     the unknown id for input it cannot segment"
+                        .to_string(),
+                )?;
+                if unk_token as usize >= id_to_token.len() {
+                    return Err(format!(
+                        "tokenizer.ggml.unknown_token_id = {unk_token} is out of range (the \
+                         vocabulary has {} entries)",
+                        id_to_token.len()
+                    ));
+                }
+                // llama.cpp inserts NORMAL, USER_DEFINED and UNUSED entries.
+                let mut min_score = f32::MAX;
+                for (id, text) in id_to_token.iter().enumerate() {
+                    let ty = id_to_type.get(id).copied().unwrap_or(1);
+                    if ty == 1 || ty == 4 || ty == 5 {
+                        ugm.trie.insert(text, id as u32);
+                    }
+                    if ty == 4 {
+                        ugm.user_defined.insert(text, id as u32);
+                    }
+                    if ty == 1 {
+                        min_score = min_score.min(id_to_score.get(id).copied().unwrap_or(0.0));
+                    }
+                }
+                let min_score = if min_score == f32::MAX {
+                    0.0
+                } else {
+                    min_score
+                };
+                // llama.cpp's penalty: the unknown transition scores ten below the
+                // worst normal entry, so it is chosen only when nothing matches.
+                ugm.unknown_token_score = min_score - 10.0;
+                // The precompiled charsmap is a byte array: a 4-byte little-endian
+                // XCDA blob size, the blob, then NUL-terminated replacements.
+                if let Some(bytes) =
+                    Self::get_gguf_bytes(gguf, "tokenizer.ggml.precompiled_charsmap")
+                {
+                    if bytes.len() < 4 {
+                        return Err(
+                            "tokenizer.ggml.precompiled_charsmap is shorter than its 4-byte \
+                             header; minfer refuses to normalise with a truncated table"
+                                .to_string(),
+                        );
+                    }
+                    let blob =
+                        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+                    if 4 + blob > bytes.len() || blob % 4 != 0 {
+                        return Err(format!(
+                            "tokenizer.ggml.precompiled_charsmap declares a {blob}-byte XCDA blob \
+                             that does not fit its {} bytes; refusing a truncated table",
+                            bytes.len()
+                        ));
+                    }
+                    ugm.xcda = bytes[4..4 + blob]
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    ugm.prefix_replacements = bytes[4 + blob..].to_vec();
+                }
+                // llama.cpp: add_space_prefix defaults to false, and the key
+                // overrides it; treat_whitespace_as_suffix is always false in the
+                // pinned revision, so the prefix form is the only one implemented.
+                add_space_prefix =
+                    Self::get_gguf_bool(gguf, "tokenizer.ggml.add_space_prefix").unwrap_or(false);
+                remove_extra_whitespaces =
+                    Self::get_gguf_bool(gguf, "tokenizer.ggml.remove_extra_whitespaces")
+                        .unwrap_or(false);
+                None
+            }
             TokenizerModel::Bert => {
                 // BertNormalizer options: both default to `true`
                 // (`llama-vocab.h:83`), and `strip_accents` follows `lowercase`
@@ -981,6 +1173,8 @@ impl Tokenizer {
             normalizer,
             max_token_len,
             unk_token,
+            ugm,
+            remove_extra_whitespaces,
             special_by_first,
             bos_token,
             eos_token,
@@ -993,6 +1187,25 @@ impl Tokenizer {
             .iter()
             .find(|kv| kv.key == key && kv.type_ == GgufType::String)
             .map(|kv| kv.get_val_str(0).to_string())
+    }
+
+    /// A GGUF metadata byte array (int8 or uint8), if the key is present with
+    /// that type and is an array.
+    fn get_gguf_bytes(gguf: &GgufContext, key: &str) -> Option<Vec<u8>> {
+        let kv = gguf.kv.iter().find(|kv| {
+            kv.key == key && kv.is_array && matches!(kv.type_, GgufType::Int8 | GgufType::Uint8)
+        })?;
+        Some(
+            (0..kv.get_ne())
+                .map(|i| {
+                    if kv.type_ == GgufType::Int8 {
+                        kv.get_val_i8(i) as u8
+                    } else {
+                        kv.get_val_u8(i)
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// A GGUF metadata boolean, if the key is present with that type.
@@ -1197,6 +1410,7 @@ impl Tokenizer {
         match self.model {
             TokenizerModel::Gpt2 => self.encode_bpe(text),
             TokenizerModel::Bert => self.wpm_encode(text),
+            TokenizerModel::Ugm => self.ugm_encode(text),
             TokenizerModel::Spm => {
                 let mut escaped = String::with_capacity(text.len() + SPM_SPACE.len_utf8());
                 if self.add_space_prefix && prev_special {
@@ -1360,6 +1574,195 @@ impl Tokenizer {
                     "tokenizer invariant violated: no SentencePiece byte token for <0x{b:02X}>;                      Tokenizer::load verifies all 256"
                 ),
             }
+        }
+    }
+
+    /// The byte length of the UTF-8 sequence that starts with `b` (llama.cpp's
+    /// `unicode_len_utf8`; a continuation byte counts as one).
+    fn utf8_len(b: u8) -> usize {
+        if b < 0x80 {
+            1
+        } else if b >> 5 == 0b110 {
+            2
+        } else if b >> 4 == 0b1110 {
+            3
+        } else if b >> 3 == 0b11110 {
+            4
+        } else {
+            1
+        }
+    }
+
+    /// Unigram (`t5`) encode a raw segment: llama.cpp's `llm_tokenizer_ugm_session`
+    /// (`llama-vocab.cpp:963`).
+    ///
+    /// The text is normalized first (charsmap replacements + whitespace rules),
+    /// then a Viterbi walk over the vocabulary trie finds the highest-scoring
+    /// segmentation: at every code-point boundary, every token that starts there
+    /// is a transition, and when no token covers the whole code point the unknown
+    /// token is one too, at `min_score - 10`. The walk back merges a run of
+    /// consecutive unknowns into one token.
+    fn ugm_encode(&self, text: &str) -> Vec<u32> {
+        let normalized = self.ugm_normalize(text);
+        let bytes = normalized.as_bytes();
+        let n = bytes.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // `best[i]` = the token ending at `i`, where it started, and the best score
+        // sum reaching `i`. Seeded the way llama.cpp seeds it: everything unknown
+        // at `f64::MIN`, the start at 0 — so an offset nothing reaches behaves
+        // exactly like the C++ default-initialized entry.
+        let mut best: Vec<(u32, usize, f64)> = vec![(self.unk_token, 0, f64::MIN); n + 1];
+        best[0] = (self.unk_token, 0, 0.0);
+
+        let mut offset = 0usize;
+        while offset < n {
+            let cp_len = Self::utf8_len(bytes[offset]).min(n - offset);
+            let current = best[offset].2;
+            let mut single_codepoint = false;
+            for (id, end) in self.ugm.trie.matches(bytes, offset) {
+                if end - offset == cp_len {
+                    single_codepoint = true;
+                }
+                let score = if self.id_to_type.get(id as usize).copied() == Some(4) {
+                    // A user-defined token scores 0, so it is preferred over the
+                    // negative-scored normal entries (llama.cpp).
+                    0.0
+                } else {
+                    self.id_to_score.get(id as usize).copied().unwrap_or(0.0) as f64
+                };
+                let challenger = current + score;
+                if challenger > best[end].2 {
+                    best[end] = (id, offset, challenger);
+                }
+            }
+            if !single_codepoint {
+                let end = offset + cp_len;
+                let challenger = current + self.ugm.unknown_token_score as f64;
+                if challenger > best[end].2 {
+                    best[end] = (self.unk_token, offset, challenger);
+                }
+            }
+            offset += cp_len;
+        }
+
+        let mut out = Vec::new();
+        let mut at = n;
+        let mut prev_unknown = false;
+        loop {
+            let (id, prev, _) = best[at];
+            let unknown = id == self.unk_token;
+            if !(prev_unknown && unknown) {
+                out.push(id);
+            }
+            if prev == 0 {
+                break;
+            }
+            prev_unknown = unknown;
+            at = prev;
+        }
+        out.reverse();
+        out
+    }
+
+    /// The unigram whitespace and charsmap normalization
+    /// (`llm_tokenizer_ugm_session::normalize`, `llama-vocab.cpp:1071`).
+    ///
+    /// A space becomes `▁`; `add_space_prefix` prepends one when the text starts
+    /// with a non-space, and `remove_extra_whitespaces` collapses a run of spaces
+    /// into one (it also makes them part of the following word).
+    fn ugm_normalize(&self, input: &str) -> String {
+        let shall_prepend_space = self.add_space_prefix;
+        let shall_merge_spaces = self.remove_extra_whitespaces;
+        let mut out = String::with_capacity(input.len() * 3);
+        let mut is_space_prepended = false;
+        let mut processing_non_ws = false;
+        let mut offset = 0usize;
+        while offset < input.len() {
+            let (replacement, consumed) = self.ugm_normalize_prefix(input, offset);
+            if consumed == 0 {
+                break;
+            }
+            for c in replacement.chars() {
+                if c != ' ' {
+                    if !processing_non_ws {
+                        processing_non_ws = true;
+                        if (shall_prepend_space && !is_space_prepended) || shall_merge_spaces {
+                            out.push(SPM_SPACE);
+                            is_space_prepended = true;
+                        }
+                    }
+                    out.push(c);
+                } else {
+                    processing_non_ws = false;
+                    if !shall_merge_spaces {
+                        out.push(SPM_SPACE);
+                    }
+                }
+            }
+            offset += consumed;
+        }
+        out
+    }
+
+    /// The longest normalization of `input[offset..]` and how much input it
+    /// consumed: a USER_DEFINED token, else a charmap prefix replacement, else one
+    /// code point unchanged (`llm_tokenizer_ugm_session::normalize_prefix`).
+    fn ugm_normalize_prefix(&self, input: &str, offset: usize) -> (String, usize) {
+        // A declared USER_DEFINED token is kept whole.
+        if let Some((_, len)) = self.ugm.user_defined.longest_prefix(&input[offset..]) {
+            return (input[offset..offset + len].to_string(), len);
+        }
+
+        if !self.ugm.xcda.is_empty() {
+            let bytes = input.as_bytes();
+            // BASE of the root node, then `BASE[s] ^ c` per byte: a node is a child
+            // only when its LCHECK equals the byte, and its LEAF bit marks the
+            // nodes whose BASE holds the replacement's offset.
+            let base = |packed: u32| (packed >> 10) << ((packed & (1 << 9)) >> 6);
+            let mut node = base(self.ugm.xcda[0]);
+            let mut longest_len = 0usize;
+            let mut longest_off = 0usize;
+            for (i, &c) in bytes[offset..].iter().enumerate() {
+                if c == 0 {
+                    break;
+                }
+                node ^= c as u32;
+                let Some(&packed) = self.ugm.xcda.get(node as usize) else {
+                    // A truncated array stops the match rather than panicking; the
+                    // loader has already checked the header and the blob size.
+                    break;
+                };
+                if packed & ((1 << 31) | 0xff) != c as u32 {
+                    break;
+                }
+                let is_leaf = (packed >> 8) & 1 == 1;
+                node ^= base(packed);
+                if is_leaf {
+                    longest_len = i + 1;
+                    let value = self.ugm.xcda.get(node as usize).copied().unwrap_or(0);
+                    longest_off = (value & ((1 << 31) - 1)) as usize;
+                }
+            }
+            if longest_len > 0 {
+                if let Some(rest) = self.ugm.prefix_replacements.get(longest_off..) {
+                    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+                    return (
+                        String::from_utf8_lossy(&rest[..end]).into_owned(),
+                        longest_len,
+                    );
+                }
+                // A replacement offset outside the table: leave the input alone.
+                return (input[offset..offset + longest_len].to_string(), longest_len);
+            }
+        }
+
+        // No replacement: one code point, unchanged.
+        match input[offset..].chars().next() {
+            Some(c) => (c.to_string(), c.len_utf8()),
+            None => (String::new(), 0),
         }
     }
 
@@ -1590,7 +1993,7 @@ impl Tokenizer {
             }
             return out;
         }
-        if self.model == TokenizerModel::Spm {
+        if self.model == TokenizerModel::Spm || self.model == TokenizerModel::Ugm {
             // SentencePiece: a BYTE token is its byte, every other token's `▁`
             // is a space (llama.cpp's `token_to_piece` for SPM).
             let mut out = Vec::new();
