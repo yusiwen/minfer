@@ -1,6 +1,7 @@
 //! `#[cfg(test)] mod tests` for `src/tokenizer.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
+use crate::gguf::GgufKv;
 
 /// Gives a synthetic tokenizer the 256 byte tokens every real byte-level
 /// BPE vocabulary has (and which `Tokenizer::load` verifies). Without them
@@ -12,17 +13,10 @@ fn fill_byte_tokens(t: &mut Tokenizer) {
     }
 }
 
-/// Rebuilds `special_by_first` the way `load()` does: GGUF special tokens
-/// plus the hardcoded `<|im_start|>` / `<|im_end|>` fallbacks.
+/// Rebuilds `special_by_first` the way `load()` does: exactly the declared
+/// special tokens, nothing inferred from a name (#132 S2).
 fn rebuild_special_index(t: &mut Tokenizer) {
-    let mut merged: HashMap<String, u32> = t.special_tokens.clone();
-    if !merged.contains_key("<|im_start|>") {
-        merged.insert("<|im_start|>".into(), t.im_start);
-    }
-    if !merged.contains_key("<|im_end|>") {
-        merged.insert("<|im_end|>".into(), t.im_end);
-    }
-    for (pat, id) in merged {
+    for (pat, id) in t.special_tokens.clone() {
         let first = pat.chars().next().unwrap_or('\0');
         t.special_by_first.entry(first).or_default().push((pat, id));
     }
@@ -49,8 +43,6 @@ fn test_tokenizer() -> Tokenizer {
         special_by_first: HashMap::new(),
         bos_token: 0,
         eos_token: 0,
-        im_start: 0,
-        im_end: 0,
     };
     fill_byte_tokens(&mut t);
     rebuild_special_index(&mut t);
@@ -200,15 +192,153 @@ fn longest_special_token_wins_at_same_position() {
 }
 
 #[test]
-fn chatml_specials_still_match_via_fallback() {
-    // Even without GGUF type 3/4 info (special_tokens empty), the hardcoded
-    // <|im_start|>/<|im_end|> fallback must keep working.
+fn a_chat_token_the_file_does_not_declare_is_not_invented() {
+    // #132 S2: the `<|im_start|>` / `<|im_end|>` hardcode is gone. With an
+    // empty declared set those two names are ordinary text — they are never
+    // mapped to an id the vocabulary does not have (the old fallback produced
+    // id 0 for `<|im_start|>` and the EOS id for `<|im_end|>`).
     let mut t = test_tokenizer();
     t.vocab.insert("hi".into(), 42);
     t.merges.insert(("h".into(), "i".into()), 0);
-    let ids = t.encode("<|im_start|>hi<|im_end|>");
-    // im_start/im_end fall back to 0 (unknown) in this synthetic tokenizer
-    assert_eq!(ids, vec![0, 42, 0]);
+    let text = "<|im_start|>hi<|im_end|>";
+    assert_eq!(t.encode(text), t.encode_bpe(text));
+    assert!(
+        t.encode(text).contains(&42),
+        "the plain text still tokenizes"
+    );
+    assert!(!t.special_tokens.contains_key("<|im_start|>"));
+    assert!(!t.special_tokens.contains_key("<|im_end|>"));
+}
+
+// === #132 S2: the special-token set is what the file declares ==============
+
+/// A GGUF with just enough tokenizer metadata for `Tokenizer::load`: the 256
+/// byte tokens (ids 0-255), then `specials` as `(text, token_type)`, a `pre`
+/// rule, one merge rank, and `roles` as `(key, text)` role-id declarations.
+fn tokenizer_gguf(specials: &[(&str, i32)], roles: &[(&str, &str)], pre: &str) -> GgufContext {
+    let byte_to_unicode = build_byte_to_unicode();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut types: Vec<i32> = Vec::new();
+    for b in 0u8..=255 {
+        tokens.push(byte_to_unicode[&b].to_string());
+        types.push(1);
+    }
+    let mut id_of = HashMap::new();
+    for (text, ty) in specials {
+        id_of.insert((*text).to_string(), tokens.len() as u32);
+        tokens.push((*text).to_string());
+        types.push(*ty);
+    }
+    let mut kv = vec![
+        GgufKv::new_string_array("tokenizer.ggml.tokens".into(), tokens),
+        GgufKv::new_array(
+            "tokenizer.ggml.token_type".into(),
+            GgufType::Int32,
+            types.iter().flat_map(|t| t.to_le_bytes()).collect(),
+        ),
+        GgufKv::new_string("tokenizer.ggml.model".into(), "gpt2".into()),
+        GgufKv::new_string("tokenizer.ggml.pre".into(), pre.to_string()),
+        GgufKv::new_string_array("tokenizer.ggml.merges".into(), vec!["a b".to_string()]),
+    ];
+    for (key, text) in roles {
+        let id = *id_of
+            .get(*text)
+            .unwrap_or_else(|| panic!("role {key} names {text}, which is not in `specials`"));
+        kv.push(GgufKv::new_u32((*key).to_string(), id));
+    }
+    GgufContext {
+        version: 3,
+        kv,
+        info: Vec::new(),
+        alignment: 32,
+        offset: 0,
+        size: 0,
+    }
+}
+
+#[test]
+fn special_tokens_are_the_declared_types_and_roles() {
+    let gguf = tokenizer_gguf(
+        &[
+            ("<|ctrl|>", 3),
+            ("<|unknown|>", 2),
+            ("<|user|>", 4),
+            ("<end_of_turn>", 1),
+            ("<|ordinary|>", 1),
+        ],
+        &[("tokenizer.ggml.eot_token_id", "<end_of_turn>")],
+        "qwen2",
+    );
+    let t = Tokenizer::load(&gguf).expect("tokenizer load");
+
+    // A declared type is enough: UNKNOWN, CONTROL and USER_DEFINED all match.
+    for text in ["<|ctrl|>", "<|unknown|>", "<|user|>", "<end_of_turn>"] {
+        let id = *t
+            .special_tokens
+            .get(text)
+            .unwrap_or_else(|| panic!("{text} is declared special but is missing"));
+        assert_eq!(t.encode(text), vec![id], "{text} must be one id");
+    }
+    // A declared role is a declaration even when the type says NORMAL — and the
+    // name here is not Qwen-shaped (`eot_token_id`, `<end_of_turn>`). Ids are
+    // the 256 byte tokens followed by `specials` in order.
+    let eot = *t.special_tokens.get("<end_of_turn>").expect("declared eot");
+    assert_eq!((eot, t.encode("<end_of_turn>")), (259, vec![259]));
+    // A token the file declares nowhere stays ordinary text.
+    assert!(!t.special_tokens.contains_key("<|ordinary|>"));
+    assert_eq!(t.encode("<|ordinary|>"), t.encode_bpe("<|ordinary|>"));
+    // Three typed + one by role.
+    assert_eq!(t.special_tokens.len(), 4);
+}
+
+#[test]
+fn the_chatml_names_are_not_fabricated_for_a_vocabulary_without_them() {
+    // Transcribed from `unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` (Q4_K_M,
+    // probed 2026-10-15 with the first 7 MB of the file): `pre =
+    // deepseek-r1-qwen`, the fullwidth-bar control tokens are type 3 / 4, and
+    // the vocabulary contains **neither** `<|im_start|>` nor `<|im_end|>` — the
+    // two names the removed hardcode used to map to id 0 and to EOS.
+    let gguf = tokenizer_gguf(
+        &[
+            ("<｜end▁of▁sentence｜>", 3),
+            ("<｜User｜>", 3),
+            ("<｜Assistant｜>", 3),
+            ("<｜begin▁of▁sentence｜>", 3),
+            ("<|EOT|>", 3),
+            ("<think>", 4),
+        ],
+        &[
+            ("tokenizer.ggml.bos_token_id", "<｜begin▁of▁sentence｜>"),
+            ("tokenizer.ggml.eos_token_id", "<｜end▁of▁sentence｜>"),
+            ("tokenizer.ggml.padding_token_id", "<｜end▁of▁sentence｜>"),
+        ],
+        "deepseek-r1-qwen",
+    );
+    let t = Tokenizer::load(&gguf).expect("tokenizer load");
+
+    // The R1 template's tokens still match as single ids.
+    for text in [
+        "<｜User｜>",
+        "<｜Assistant｜>",
+        "<think>",
+        "<｜end▁of▁sentence｜>",
+    ] {
+        let id = *t.special_tokens.get(text).expect("declared special");
+        assert_eq!(t.encode(text), vec![id], "{text}");
+    }
+    // The two ChatML names are absent, so nothing may be invented for them.
+    for text in ["<|im_start|>", "<|im_end|>"] {
+        assert!(
+            !t.special_tokens.contains_key(text),
+            "{text} is not in this vocabulary and must not become special"
+        );
+        assert_eq!(
+            t.encode(text),
+            t.encode_bpe(text),
+            "{text} must tokenize as the ordinary text it is"
+        );
+        assert!(!t.encode(text).contains(&t.eos_token));
+    }
 }
 
 // === #132 S1: NFC normalization of the input =============================
@@ -436,10 +566,18 @@ fn token_ids_match_the_reference() {
         }
         // The special/added-token requirement, asserted directly: a special
         // token inside text is one id, never BPE-split.
+        let im_start = *tok
+            .special_tokens
+            .get("<|im_start|>")
+            .expect("this GGUF declares <|im_start|> a control token");
+        let im_end = *tok
+            .special_tokens
+            .get("<|im_end|>")
+            .expect("this GGUF declares <|im_end|> a control token");
         let ids = tok.encode("<|im_start|>hi<|im_end|>");
         assert_eq!(
             (ids.first().copied(), ids.last().copied()),
-            (Some(tok.im_start), Some(tok.im_end)),
+            (Some(im_start), Some(im_end)),
             "{slug}: special tokens must survive as single ids: {ids:?}"
         );
         // #132 S1: the declared normalizer, on a real vocabulary. No cached GGUF
@@ -647,7 +785,6 @@ fn dry_breaker_tail_does_not_absorb_a_special_token() {
     let mut t = breaker_tokenizer();
     t.special_tokens.insert("<|im_end|>".to_string(), 7);
     t.id_to_token[7] = "<|im_end|>".to_string();
-    t.im_end = 7;
     rebuild_special_index(&mut t);
 
     // The special-token pre-scan does collapse the text to the special id ...

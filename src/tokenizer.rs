@@ -299,33 +299,57 @@ pub struct Tokenizer {
     byte_to_unicode: HashMap<u8, char>,
     /// Reverse mapping for decode
     unicode_to_byte: HashMap<char, u8>,
-    /// Special-token map parsed from GGUF types 3/4.
+    /// The special tokens the file declares: `tokenizer.ggml.token_type` 2/3/4,
+    /// plus every id a `tokenizer.ggml.*_token_id` role names (#132 S2).
     ///
-    /// Read only by `tokenizer::tests` (`rebuild_special_index`) and
-    /// `conversation::tests`; production matches through `special_by_first`,
-    /// which the loader builds from this map.
+    /// Read only by `tokenizer::tests`; production matches through
+    /// `special_by_first`, which the loader builds from this map.
     #[cfg_attr(not(test), allow(dead_code))]
     pub special_tokens: HashMap<String, u32>,
     /// The pre-tokenization rule selected from `tokenizer.ggml.pre` (F7).
     pub pre: PreTokenizer,
-    /// Special tokens grouped by first char, longest-first within a group.
-    /// Built from `special_tokens` (GGUF type 3/4) plus the hardcoded
-    /// `<|im_start|>` / `<|im_end|>` / EOS fallbacks, so models whose
-    /// converters mark special tokens as type 1 still match.
+    /// Special tokens grouped by first char, longest-first within a group,
+    /// built from `special_tokens` — the file's declared types and roles
+    /// (#132 S2). Nothing here is inferred from a token's name.
     special_by_first: HashMap<char, Vec<(String, u32)>>,
     pub bos_token: u32,
     /// The EOS id; production reads it (`spec::SpecEngine` and the special-token
     /// table).
     pub eos_token: u32,
-    /// Reserved `<|im_start|>` id. Read only by `tokenizer::tests`; production
-    /// reaches the token through the merged special-token index.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub im_start: u32,
-    /// Reserved `<|im_end|>` id. Read only by `conversation::tests` /
-    /// `grammar::tests`; production reaches it through `SpecialTokens`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub im_end: u32,
 }
+
+/// The `tokenizer.ggml.*_token_id` keys that name a **single vocabulary entry**,
+/// transcribed from llama.cpp's role table (`src/llama-arch.cpp:382-406`, with
+/// the deprecated `prefix`/`suffix`/`middle` aliases it still reads at
+/// `src/llama-vocab.cpp:2584-2586`).
+///
+/// A declared role is a declaration, not a shape: the file says "this id is the
+/// EOS / eot / fim_pad", so that token matches as one id even when
+/// `tokenizer.ggml.token_type` says NORMAL. llama.cpp forces its *name* list
+/// upward only when the role is **not** declared; minfer never guesses a name at
+/// all, so a type-1 token is special here exactly when the file names it
+/// ([#132](https://github.com/yusiwen/minfer/issues/132) S2, ADR-0043).
+///
+/// The key spellings are llama.cpp's, typo included (`seperator_token_id`).
+const SPECIAL_ROLE_KEYS: &[&str] = &[
+    "tokenizer.ggml.bos_token_id",
+    "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.eot_token_id",
+    "tokenizer.ggml.eom_token_id",
+    "tokenizer.ggml.unknown_token_id",
+    "tokenizer.ggml.seperator_token_id",
+    "tokenizer.ggml.padding_token_id",
+    "tokenizer.ggml.mask_token_id",
+    "tokenizer.ggml.fim_pre_token_id",
+    "tokenizer.ggml.fim_suf_token_id",
+    "tokenizer.ggml.fim_mid_token_id",
+    "tokenizer.ggml.fim_pad_token_id",
+    "tokenizer.ggml.fim_rep_token_id",
+    "tokenizer.ggml.fim_sep_token_id",
+    "tokenizer.ggml.prefix_token_id",
+    "tokenizer.ggml.suffix_token_id",
+    "tokenizer.ggml.middle_token_id",
+];
 
 impl Tokenizer {
     /// A vocabulary with no tokens.
@@ -350,8 +374,6 @@ impl Tokenizer {
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
-            im_start: 0,
-            im_end: 0,
         }
     }
 
@@ -388,8 +410,6 @@ impl Tokenizer {
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
-            im_start: 0,
-            im_end: 0,
         }
     }
 
@@ -456,45 +476,51 @@ impl Tokenizer {
             }
         }
 
-        // Special tokens: type 3 (CONTROL) or 4 (USER_DEFINED)
+        // Special tokens: what the file declares, never a name shape (#132 S2).
+        //
+        //  * `tokenizer.ggml.token_type` 2 (UNKNOWN), 3 (CONTROL) or 4
+        //    (USER_DEFINED) — llama.cpp's special-token cache predicate
+        //    (`src/llama-vocab.cpp:3012`, `CONTROL | USER_DEFINED | UNKNOWN`).
+        //  * every id a declared role names ([`SPECIAL_ROLE_KEYS`]): the file
+        //    says "this is the EOS / eot / …", so that token matches as one id
+        //    even when its type says NORMAL.
+        //
+        // The `<|im_start|>` / `<|im_end|>` / EOS-shaped fallbacks this used to
+        // add are gone: they fabricated tokens the vocabulary does not contain.
+        // Measured on `unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` (Q4_K_M,
+        // 2026-10-15), whose vocabulary has neither name: `<|im_start|>` was
+        // mapped to id 0 and `<|im_end|>` to the EOS token 151643, so two
+        // literal strings tokenized as tokens the model never had. llama.cpp
+        // matches only declared control tokens either; a converter that leaves a
+        // chat token type NORMAL gets it BPE-split there as well.
         let mut special_tokens = HashMap::new();
         for (id, token) in id_to_token.iter().enumerate() {
-            if id_to_type.get(id).copied().unwrap_or(1) == 3
-                || id_to_type.get(id).copied().unwrap_or(1) == 4
-            {
+            if matches!(id_to_type.get(id).copied().unwrap_or(1), 2 | 3 | 4) {
                 special_tokens.insert(token.clone(), id as u32);
+            }
+        }
+        for key in SPECIAL_ROLE_KEYS {
+            if let Some(id) = Self::get_gguf_u32(gguf, key) {
+                if let Some(text) = id_to_token.get(id as usize) {
+                    if !text.is_empty() {
+                        special_tokens.insert(text.clone(), id);
+                    }
+                }
             }
         }
 
         // Token IDs from GGUF metadata
         let bos_token = Self::get_gguf_u32(gguf, "tokenizer.ggml.bos_token_id").unwrap_or(0);
         let eos_token = Self::get_gguf_u32(gguf, "tokenizer.ggml.eos_token_id").unwrap_or(0);
-        let im_start = vocab.get("<|im_start|>").copied().unwrap_or(0);
-        let im_end = vocab.get("<|im_end|>").copied().unwrap_or(eos_token);
 
         let byte_to_unicode = build_byte_to_unicode();
         let unicode_to_byte: HashMap<char, u8> =
             byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();
 
-        // Merge GGUF special tokens (type 3/4) with hardcoded fallbacks, then
-        // group by first char with longest-first ordering inside each group
-        // (an earliest-position, longest-match scan needs both).
-        let mut merged: HashMap<String, u32> = special_tokens.clone();
-        if !merged.contains_key("<|im_start|>") {
-            merged.insert("<|im_start|>".to_string(), im_start);
-        }
-        if !merged.contains_key("<|im_end|>") {
-            merged.insert("<|im_end|>".to_string(), im_end);
-        }
-        if eos_token != 0 {
-            if let Some(eos_text) = id_to_token.get(eos_token as usize) {
-                if eos_text.starts_with('<') && !merged.contains_key(eos_text) {
-                    merged.insert(eos_text.clone(), eos_token);
-                }
-            }
-        }
+        // Group the declared special tokens by first char, longest-first inside
+        // each group (an earliest-position, longest-match scan needs both).
         let mut special_by_first: HashMap<char, Vec<(String, u32)>> = HashMap::new();
-        for (pat, id) in merged {
+        for (pat, id) in special_tokens.clone() {
             let first = pat.chars().next().unwrap_or('\0');
             special_by_first.entry(first).or_default().push((pat, id));
         }
@@ -548,8 +574,6 @@ impl Tokenizer {
             special_by_first,
             bos_token,
             eos_token,
-            im_start,
-            im_end,
         })
     }
 
@@ -669,11 +693,12 @@ impl Tokenizer {
     /// declares, so a decomposed input tokenizes exactly like its composed
     /// form ([#132](https://github.com/yusiwen/minfer/issues/132) S1).
     ///
-    /// Special tokens (from the GGUF `tokenizer.ggml.token_type` 3/4 table,
-    /// plus `<|im_start|>` / `<|im_end|>` / EOS fallbacks) are matched as
-    /// single tokens *before* BPE — earliest position wins, longest text wins
-    /// at the same position. This is what makes special-token templates work
-    /// (e.g. DeepSeek-R1's `<｜User｜>` / `<think>`), matching llama.cpp.
+    /// Special tokens are matched as single ids *before* BPE — earliest position
+    /// wins, longest text wins at the same position. The set is what the file
+    /// declares ([`Tokenizer::load`], #132 S2): `tokenizer.ggml.token_type`
+    /// 2/3/4 plus every id a `tokenizer.ggml.*_token_id` role names. This is what
+    /// makes special-token templates work (e.g. DeepSeek-R1's `<｜User｜>` /
+    /// `<think>`), matching llama.cpp — whose converter marks those type 3.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let normalized = nfc::nfc(text);
         let text: &str = &normalized;
