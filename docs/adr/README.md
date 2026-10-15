@@ -165,6 +165,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0043](./0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) | 2026-10-15 | A special token is declared by the file, never inferred from its name | Accepted |
 | [0044](./0044-the-input-normalizer-follows-the-pre-tokenizer-family.md) | 2026-10-15 | The input normalizer follows the pre-tokenizer family's declaration | Accepted (corrects ADR-0042) |
 | [0045](./0045-the-tokenizer-engine-is-a-dispatch-on-tokenizer-ggml-model.md) | 2026-10-15 | The tokenizer engine is a dispatch on `tokenizer.ggml.model` | Accepted |
+| [0046](./0046-wordpiece-is-the-third-engine-and-follows-berts-normalizer.md) | 2026-10-15 | WordPiece is the third engine, and it follows BERT's normalizer | Accepted (amends ADR-0045) |
 
 ## The template
 

@@ -64,6 +64,7 @@
     - [0043. A special token is declared by the file, never inferred from its name](./adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md)
     - [0044. The input normalizer follows the pre-tokenizer family's declaration](./adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md)
     - [0045. The tokenizer engine is a dispatch on tokenizer.ggml.model](./adr/0045-the-tokenizer-engine-is-a-dispatch-on-tokenizer-ggml-model.md)
+    - [0046. WordPiece is the third engine, and it follows BERT's normalizer](./adr/0046-wordpiece-is-the-third-engine-and-follows-berts-normalizer.md)
 
 # Model Support
 

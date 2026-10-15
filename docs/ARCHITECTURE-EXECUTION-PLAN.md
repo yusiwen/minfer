@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`) DONE 2026-10-15, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`) and WordPiece (`model = bert`) DONE 2026-10-15, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -7990,6 +7990,51 @@ against HuggingFace; where the two disagree the engine follows llama.cpp deliber
 families stay comparable. (d) A leading space is part of an SPM tokenization
 (`decode(encode(x))` is `" " + x` with the prefix on), exactly as in llama.cpp. (e) Nothing
 here is device-adjacent.
+
+### F7 follow-up — S4: WordPiece, the third engine ([#132](https://github.com/yusiwen/minfer/issues/132)) — **DONE 2026-10-15**
+
+**What landed.** `TokenizerModel::Bert` (`tokenizer.ggml.model = bert`) and llama.cpp's WPM
+session: BERT's BasicTokenizer preprocessing (whitespace ends a word, `\p{C}` is dropped,
+`strip_accents` NFD-decomposes and drops `\p{Mn}`, `lowercase` lowercases, `\p{P}`/ASCII
+symbols/Chinese characters become their own words) and greedy longest match over
+`▁`-prefixed words with one `<unk>` per unmatched word. `NormalizerOptions` carries the two
+BertNormalizer flags, defaulting to `true`/`true` — llama.cpp's struct defaults, which is what
+a converted BERT file carrying neither key gets. `Tokenizer::pre` stays `None` (WordPiece has
+no pre-tokenization rule), and `load` requires the `<unk>` role and computes `max_token_len`.
+ADR-0046 amends ADR-0045 and records the reference choice and the divergences.
+
+**Fixtures and evidence.** `tests/fixtures/tokenizer/ids_bge-small-en-v1.5.json` (54 shared
+corpus entries), gated against `ggml-org/bge-small-en-v1.5-Q8_0-GGUF` Q4_K_M (36 685 152 B;
+probed: `model = bert`, `pre = jina-v2-en`, 30 522 tokens of which 5 are type 3, no merges, no
+scores, no normalizer keys, `unknown_token_id = 100`). The ignored gate now covers **nine**
+cached models across three engines.
+
+**The reference is HuggingFace, and that is measured.** The GGUF's vocabulary is
+`BAAI/bge-small-en-v1.5`'s vocabulary rewritten in place (word-initial entries gain `▁`,
+`##` continuations lose it, the first 999 specials are untouched) — verified entry by entry,
+30 522/30 522 — so the ids are comparable and HF's `tokenizers` is the WordPiece definition.
+llama.cpp's WPM differs on exactly **2 of the 54** entries, both because its "NFD" maps each
+code point to the single first code point of its decomposition and its accent drop tests
+`\p{M}` where BERT tests `Mn`: `한국어 텍스트` → 6 ids on llama.cpp vs 15 on HF, and
+`क्षि नमस्ते` → 6 vs 7 (the spacing mark U+093F). minfer follows BERT/HF; both witnesses are in
+ADR-0046 and the PR.
+
+**Gates and mutations.** Eight mutations, none escaped: `bert` refused again, `bert` run by
+the SPM engine, the accent drop widened to `\p{M}`, lowercasing disabled, the phantom space
+dropped, the `<unk>` fallback removed, the match bound zeroed, and NFD skipping canonical
+ordering. (A ninth candidate — removing the `max_token_len` bound — was **equivalent**, not a
+mutation: the bound can only prune substrings longer than the longest vocabulary entry; it was
+replaced, and that is the interesting part of this run.)
+
+**Suite.** 541/0/41 -> **545 passed / 0 failed / 41 ignored** unit + 10 / 0 / 6 integration
+(+4: the NFD differential test over the same 5 103 vectors, and the three WordPiece tests).
+
+**Honest scope.** (a) Three engines of ten; `t5`, `rwkv`, `plamo2`, `gemma4`, `whitespace`,
+`hybriddna` and `none` are still refused by name. (b) BERT's `clean_text` is not implemented —
+no artifact in the gate distinguishes it. (c) `strip_accents` lowercasing uses the simple 1:1
+mapping (multi-character expansions keep the code point rather than expanding). (d) The corpus
+carries no BERT special-token text: the declared-type scan covers those, asserted separately
+by the same gate. (e) Nothing here is device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 
