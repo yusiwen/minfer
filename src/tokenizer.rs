@@ -93,6 +93,29 @@ impl PreTokenizer {
         }
     }
 
+    /// Whether the input is normalized to NFC before pre-tokenization.
+    ///
+    /// The answer is the one the reference `tokenizer.json` declares for this
+    /// rule's models — the GGUF carries no normalizer field, so the `pre` value is
+    /// the only signal the file gives:
+    ///
+    /// * `qwen2`/`qwen35`: `"normalizer": {"type": "NFC"}` (verified 2026-10-15 on
+    ///   `Qwen/Qwen3-0.6B@c1899de2`, `Qwen/Qwen2.5-0.5B-Instruct@main` and
+    ///   `unsloth/Qwen3.5-0.8B@23c69c53`);
+    /// * `llama-bpe`: `"normalizer": null` (verified on
+    ///   `unsloth/Llama-3.2-1B-Instruct@5a8abab4`, and the family's other
+    ///   revisions), so minfer must **not** normalize — llama.cpp does not either.
+    ///
+    /// A model whose `tokenizer.json` disagrees with its rule's answer is out of
+    /// reach until the GGUF carries the flag; that limit is recorded in
+    /// [#564](https://github.com/yusiwen/minfer/issues/564) and ADR-0044.
+    pub fn applies_nfc(self) -> bool {
+        match self {
+            Self::Qwen2 | Self::Qwen35 => true,
+            Self::LlamaBpe => false,
+        }
+    }
+
     /// Split `text` into pre-tokenization pieces. The returned slices are in
     /// order and tile `text` exactly (concatenating them reproduces the input).
     ///
@@ -711,10 +734,12 @@ impl Tokenizer {
 
     /// Tokenize text into token IDs.
     ///
-    /// The text is first normalized to NFC ([`nfc::nfc`]), matching the
-    /// `"normalizer": {"type": "NFC"}` every reference `tokenizer.json`
-    /// declares, so a decomposed input tokenizes exactly like its composed
-    /// form ([#132](https://github.com/yusiwen/minfer/issues/132) S1).
+    /// The text is first normalized to NFC when the rule's reference
+    /// `tokenizer.json` declares one ([`PreTokenizer::applies_nfc`]), so for
+    /// those families a decomposed input tokenizes exactly like its composed
+    /// form ([#132](https://github.com/yusiwen/minfer/issues/132) S1, refined by
+    /// ADR-0044) — and for a family that declares none (`llama-bpe`) it is left
+    /// exactly as it arrived.
     ///
     /// Special tokens are matched as single ids *before* BPE — earliest position
     /// wins, longest text wins at the same position. The set is what the file
@@ -723,8 +748,8 @@ impl Tokenizer {
     /// makes special-token templates work (e.g. DeepSeek-R1's `<｜User｜>` /
     /// `<think>`), matching llama.cpp — whose converter marks those type 3.
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let normalized = nfc::nfc(text);
-        let text: &str = &normalized;
+        let normalized = self.normalized(text);
+        let text: &str = normalized.as_ref();
         let mut result = Vec::new();
         let mut remaining = text;
 
@@ -773,7 +798,18 @@ impl Tokenizer {
     /// NFC normalization applies here too: it belongs to the tokenizer, not to
     /// the special-token pre-scan.
     pub fn encode_raw(&self, text: &str) -> Vec<u32> {
-        self.encode_bpe(&nfc::nfc(text))
+        let normalized = self.normalized(text);
+        self.encode_bpe(normalized.as_ref())
+    }
+
+    /// The text this tokenizer actually tokenizes: NFC when the rule declares it,
+    /// the input itself otherwise.
+    fn normalized<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.pre.applies_nfc() {
+            nfc::nfc(text)
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        }
     }
 
     /// Every token sequence that *overlaps* `breaker` — llama.cpp's
