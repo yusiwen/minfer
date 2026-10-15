@@ -664,12 +664,19 @@ impl Tokenizer {
 
     /// Tokenize text into token IDs.
     ///
+    /// The text is first normalized to NFC ([`nfc::nfc`]), matching the
+    /// `"normalizer": {"type": "NFC"}` every reference `tokenizer.json`
+    /// declares, so a decomposed input tokenizes exactly like its composed
+    /// form ([#132](https://github.com/yusiwen/minfer/issues/132) S1).
+    ///
     /// Special tokens (from the GGUF `tokenizer.ggml.token_type` 3/4 table,
     /// plus `<|im_start|>` / `<|im_end|>` / EOS fallbacks) are matched as
     /// single tokens *before* BPE — earliest position wins, longest text wins
     /// at the same position. This is what makes special-token templates work
     /// (e.g. DeepSeek-R1's `<｜User｜>` / `<think>`), matching llama.cpp.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        let normalized = nfc::nfc(text);
+        let text: &str = &normalized;
         let mut result = Vec::new();
         let mut remaining = text;
 
@@ -714,8 +721,11 @@ impl Tokenizer {
     /// special token's id. DRY breaker tails need this — a tail is a fragment
     /// of a breaker string, not a prompt, so absorbing a special token there
     /// would produce a sequence the engine could never actually emit.
+    ///
+    /// NFC normalization applies here too: it belongs to the tokenizer, not to
+    /// the special-token pre-scan.
     pub fn encode_raw(&self, text: &str) -> Vec<u32> {
-        self.encode_bpe(text)
+        self.encode_bpe(&nfc::nfc(text))
     }
 
     /// Every token sequence that *overlaps* `breaker` — llama.cpp's
@@ -739,7 +749,11 @@ impl Tokenizer {
     ///    match does not reach the token's end is not a match.
     ///
     /// Matching is on **bytes** (a token's detokenized form is bytes), and the
-    /// tails are tokenized with [`Tokenizer::encode_raw`].
+    /// tails are tokenized with [`Tokenizer::encode_raw`]. Matching is *not*
+    /// normalized — the vocabulary's own text is the reference, exactly as in
+    /// llama.cpp — so a non-NFC breaker matches nothing and is refused by name
+    /// rather than silently matched on normalized text; the tails do go through
+    /// NFC, which is the tokenizer's normalizer for every text it tokenizes.
     ///
     /// Refusals, each naming the value (llama.cpp warns and skips or truncates
     /// instead — minfer never silently drops or cuts a requested breaker):
@@ -919,6 +933,18 @@ pub fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
     }
     end
 }
+
+// ---------------------------------------------------------------------------
+// Input normalization (#132 S1)
+//
+// Every reference `tokenizer.json` this engine gates against declares an NFC
+// normalizer, so the reference token ids already contain it. minfer normalizes
+// at `encode` / `encode_raw` — the two text→ids entry points — with generated
+// tables and no new dependency; llama.cpp applies no normalizer, which is a
+// recorded divergence (docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md §3.6).
+// ---------------------------------------------------------------------------
+
+mod nfc;
 
 #[cfg(test)]
 mod tests;
