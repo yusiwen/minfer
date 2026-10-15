@@ -387,12 +387,17 @@ const SPLIT_FIXTURES: &[(&str, &str)] = &[
         "qwen35",
         include_str!("../../tests/fixtures/tokenizer/split_qwen35.json"),
     ),
+    (
+        "llama-bpe",
+        include_str!("../../tests/fixtures/tokenizer/split_llama-bpe.json"),
+    ),
 ];
 
 fn pre_of(name: &str) -> PreTokenizer {
     match name {
         "qwen2" => PreTokenizer::Qwen2,
         "qwen35" => PreTokenizer::Qwen35,
+        "llama-bpe" => PreTokenizer::LlamaBpe,
         other => panic!("unknown pre-tokenizer {other}"),
     }
 }
@@ -448,9 +453,21 @@ fn pre_tokenizer_selection_refuses_unknown_and_missing() {
         PreTokenizer::from_gguf(Some("qwen35")).unwrap(),
         PreTokenizer::Qwen35
     );
-    let err = PreTokenizer::from_gguf(Some("llama3")).unwrap_err();
+    assert_eq!(
+        PreTokenizer::from_gguf(Some("llama-bpe")).unwrap(),
+        PreTokenizer::LlamaBpe
+    );
+    assert_eq!(
+        PreTokenizer::from_gguf(Some("llama3")).unwrap(),
+        PreTokenizer::LlamaBpe
+    );
+    assert_eq!(
+        PreTokenizer::from_gguf(Some("llama-v3")).unwrap(),
+        PreTokenizer::LlamaBpe
+    );
+    let err = PreTokenizer::from_gguf(Some("starcoder")).unwrap_err();
     assert!(
-        err.contains("llama3"),
+        err.contains("starcoder"),
         "the refusal must name the value: {err}"
     );
     let err = PreTokenizer::from_gguf(None).unwrap_err();
@@ -509,6 +526,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         "~/.cache/minfer/models/hf/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_qwen3.5-0.8b.json"),
     ),
+    (
+        "llama-3.2-1b-instruct",
+        "~/.cache/minfer/models/hf/unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_llama-3.2-1b-instruct.json"),
+    ),
 ];
 
 fn expand_home(path: &str) -> std::path::PathBuf {
@@ -565,20 +587,24 @@ fn token_ids_match_the_reference() {
             );
         }
         // The special/added-token requirement, asserted directly: a special
-        // token inside text is one id, never BPE-split.
-        let im_start = *tok
-            .special_tokens
-            .get("<|im_start|>")
-            .expect("this GGUF declares <|im_start|> a control token");
-        let im_end = *tok
-            .special_tokens
-            .get("<|im_end|>")
-            .expect("this GGUF declares <|im_end|> a control token");
-        let ids = tok.encode("<|im_start|>hi<|im_end|>");
+        // token inside text is one id, never BPE-split. The pair is taken from
+        // whatever this vocabulary declares (Qwen's ChatML pair, Llama-3's own
+        // header/eot tokens, …), smallest id first — `#132` S2 added the check
+        // and the model list is no longer Qwen-only.
+        let mut declared: Vec<(&String, u32)> =
+            tok.special_tokens.iter().map(|(t, &id)| (t, id)).collect();
+        declared.sort_by_key(|&(_, id)| id);
+        assert!(
+            declared.len() >= 2,
+            "{slug}: needs at least two declared special tokens"
+        );
+        let (open_text, open_id) = (declared[0].0.clone(), declared[0].1);
+        let (close_text, close_id) = (declared[1].0.clone(), declared[1].1);
+        let ids = tok.encode(&format!("{open_text}hi{close_text}"));
         assert_eq!(
             (ids.first().copied(), ids.last().copied()),
-            (Some(im_start), Some(im_end)),
-            "{slug}: special tokens must survive as single ids: {ids:?}"
+            (Some(open_id), Some(close_id)),
+            "{slug}: special tokens {open_text:?}/{close_text:?} must survive as single ids: {ids:?}"
         );
         // #132 S1: the declared normalizer, on a real vocabulary. No cached GGUF
         // carries a decomposed corpus entry, so the assertion is the *property*
@@ -624,6 +650,7 @@ impl PreTokenizer {
         match self {
             Self::Qwen2 => "qwen2",
             Self::Qwen35 => "qwen35",
+            Self::LlamaBpe => "llama-bpe",
         }
     }
 }

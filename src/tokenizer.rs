@@ -52,6 +52,10 @@ pub enum PreTokenizer {
     Qwen2,
     /// `qwen35`: Qwen3.5 — letter runs also consume Unicode combining marks.
     Qwen35,
+    /// `llama-bpe` (aliases: `llama3`, `llama-v3`): Llama 3.x — the letter and
+    /// symbol arms are the Qwen2 ones, but digits group **up to three at a
+    /// time** (`\p{N}{1,3}`).
+    LlamaBpe,
 }
 
 impl PreTokenizer {
@@ -60,14 +64,17 @@ impl PreTokenizer {
         match pre {
             Some("qwen2") | Some("deepseek-r1-qwen") => Ok(Self::Qwen2),
             Some("qwen35") => Ok(Self::Qwen35),
+            Some("llama-bpe") | Some("llama3") | Some("llama-v3") => Ok(Self::LlamaBpe),
             Some(other) => Err(format!(
                 "tokenizer.ggml.pre = \"{other}\" is not supported by minfer's byte-level BPE \
-                 pre-tokenizer (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"). \
+                 pre-tokenizer (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"; \
+                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"). \
                  Refusing to tokenize rather than split with the wrong rule."
             )),
             None => Err(
                 "tokenizer.ggml.pre is missing, so the pre-tokenization rule is unknown; minfer \
-                 refuses to guess (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\")"
+                 refuses to guess (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"; \
+                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\")"
                     .to_string(),
             ),
         }
@@ -77,13 +84,24 @@ impl PreTokenizer {
         matches!(self, Self::Qwen35)
     }
 
+    /// How many digits one piece may hold: Qwen's pattern is `\p{N}` (one per
+    /// piece), Llama 3.x's is `\p{N}{1,3}` (up to three).
+    fn number_run(self) -> usize {
+        match self {
+            Self::LlamaBpe => 3,
+            Self::Qwen2 | Self::Qwen35 => 1,
+        }
+    }
+
     /// Split `text` into pre-tokenization pieces. The returned slices are in
     /// order and tile `text` exactly (concatenating them reproduces the input).
     ///
-    /// This is the Qwen2 pattern
-    /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
-    /// (Qwen3.5 replaces `\p{L}` with `[\p{L}\p{M}]`), implemented as a scan
-    /// rather than a `regex` pattern because the crate has no lookahead.
+    /// The patterns differ in exactly two places: Qwen3.5 replaces `\p{L}` with
+    /// `[\p{L}\p{M}]` in the letter arm, and Llama 3.x replaces the Qwen digit
+    /// arm `\p{N}` with `\p{N}{1,3}`. Everything else is shared:
+    /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|<digits>| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`,
+    /// implemented as a scan rather than a `regex` pattern because the crate has
+    /// no lookahead.
     pub fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
         let marks = self.include_marks();
         let word = |c: char| is_letter(c) || (marks && is_accent_mark(c));
@@ -148,9 +166,14 @@ impl PreTokenizer {
                 }
             }
 
-            // \p{N}
+            // \p{N}{1,3} (llama-bpe) or \p{N} (Qwen, one digit per piece)
             if is_number(c) {
-                pos += 1;
+                let cap = self.number_run();
+                let mut taken = 0usize;
+                while taken < cap && pos < n && is_number(chars[pos].1) {
+                    pos += 1;
+                    taken += 1;
+                }
                 emit!(pos);
                 continue;
             }
