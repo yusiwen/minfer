@@ -218,6 +218,63 @@ fn a_chat_token_the_file_does_not_declare_is_not_invented() {
     assert!(!t.special_tokens.contains_key("<|im_end|>"));
 }
 
+// === #132 S4: the gemma4 engine ============================================
+
+/// A gemma4 vocabulary: the declared specials, the `<0xXX>` byte tokens the
+/// fallback needs, and the pieces the merge list builds — including `\n\n`, which
+/// exists only as a whole (no `\n` entry), so the newline shortcut is observable.
+fn gemma4_tokenizer() -> Tokenizer {
+    let mut t = Tokenizer::empty();
+    t.model = TokenizerModel::Gemma4;
+    t.pre = Some(PreTokenizer::Gemma4);
+
+    let mut push = |t: &mut Tokenizer, text: &str, ty: i32| -> u32 {
+        let id = t.id_to_token.len() as u32;
+        t.id_to_token.push(text.to_string());
+        t.id_to_type.push(ty);
+        t.vocab.insert(text.to_string(), id);
+        id
+    };
+    push(&mut t, "<pad>", 3);
+    push(&mut t, "<eos>", 3);
+    for b in 0u8..=255 {
+        let id = push(&mut t, &format!("<0x{b:02X}>"), 6);
+        t.spm_byte_to_id.insert(b, id);
+    }
+    for text in ["a", "b", "ab", "\u{2581}a", "\u{2581}", "\n\n"] {
+        push(&mut t, text, 1);
+    }
+    t.merges.insert(("a".to_string(), "b".to_string()), 0);
+    t.merges
+        .insert(("\u{2581}".to_string(), "a".to_string()), 1);
+    t
+}
+
+#[test]
+fn gemma4_splits_on_newlines_and_does_not_byte_encode() {
+    let t = gemma4_tokenizer();
+    let (ab, space_a) = (t.vocab["ab"], t.vocab["\u{2581}a"]);
+    // A space becomes `▁` *before* BPE, and the merge runs on raw UTF-8: the
+    // `▁a` entry is reachable only because no byte-to-unicode step happened.
+    assert_eq!(t.encode("ab a"), vec![ab, space_a]);
+    // The rule splits on newline runs, so `\n\n` is its own piece — emitted whole
+    // because it is a vocabulary entry (the gemma4 shortcut).
+    let two_newlines = t.vocab["\n\n"];
+    assert_eq!(t.encode("ab\n\na"), vec![ab, two_newlines, t.vocab["a"]]);
+}
+
+#[test]
+fn gemma4_falls_back_to_byte_tokens() {
+    let t = gemma4_tokenizer();
+    // `\n` alone is not a vocabulary entry, so the piece falls back byte by byte —
+    // never to the unknown token and never dropped.
+    assert_eq!(t.encode("\n"), vec![t.spm_byte_to_id[&b'\n']]);
+    assert_eq!(t.encode("z"), vec![t.spm_byte_to_id[&b'z']]);
+    // Decode is the inverse: `▁` is a space, a byte token is its byte.
+    assert_eq!(t.decode_bytes(&[t.vocab["\u{2581}a"]]), b" a");
+    assert_eq!(t.decode_bytes(&[t.spm_byte_to_id[&b'z']]), b"z");
+}
+
 // === #132 S4: the unigram (`model = t5`) engine ============================
 
 /// A unigram vocabulary with the pieces the Viterbi needs to prefer one
@@ -498,16 +555,13 @@ fn the_tokenizer_model_is_a_dispatch() {
         TokenizerModel::from_gguf(Some("t5")).unwrap(),
         TokenizerModel::Ugm
     );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("gemma4")).unwrap(),
+        TokenizerModel::Gemma4
+    );
     // Every other engine is refused *by name* — an approximation with the wrong
     // engine would be worse than a refusal.
-    for other in [
-        "rwkv",
-        "plamo2",
-        "gemma4",
-        "whitespace",
-        "hybriddna",
-        "none",
-    ] {
+    for other in ["rwkv", "plamo2", "whitespace", "hybriddna", "none"] {
         let err = TokenizerModel::from_gguf(Some(other)).unwrap_err();
         assert!(
             err.contains(other),
@@ -953,6 +1007,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         "~/.cache/minfer/models/hf/Felladrin/gguf-flan-t5-small/flan-t5-small.Q8_0.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_flan-t5-small.json"),
     ),
+    (
+        "gemma-4-e2b",
+        "~/.cache/minfer/models/hf/unsloth/gemma-4-E2B-it-GGUF/MTP/mtp-gemma-4-E2B-it-Q8_0.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_gemma-4-e2b.json"),
+    ),
 ];
 
 fn expand_home(path: &str) -> std::path::PathBuf {
@@ -987,8 +1046,9 @@ fn token_ids_match_the_reference() {
         let gguf = crate::gguf::load_gguf_model(&p).expect("parse GGUF");
         let tok = Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
         let fx: serde_json::Value = serde_json::from_str(raw).expect("ids fixture");
-        // The engine: `pre` names the BPE rule, and its absence means
-        // SentencePiece (#132 S4). A fixture may also name the family
+        // The engine: `pre` names the BPE rule (for `gemma4`, the rule the model
+        // value derives — the artifact itself carries no key), and its absence
+        // means SentencePiece or unigram (#132 S4). A fixture may also name the family
         // explicitly, which the artifact must agree with.
         if let Some(family) = fx.get("tokenizer_model").and_then(|v| v.as_str()) {
             assert_eq!(
@@ -1153,6 +1213,7 @@ impl TokenizerModel {
             Self::Spm => "llama",
             Self::Bert => "bert",
             Self::Ugm => "t5",
+            Self::Gemma4 => "gemma4",
         }
     }
 }
@@ -1168,6 +1229,7 @@ impl PreTokenizer {
             Self::Qwen35 => "qwen35",
             Self::LlamaBpe => "llama-bpe",
             Self::Lfm2 => "lfm2",
+            Self::Gemma4 => "gemma4",
         }
     }
 }
