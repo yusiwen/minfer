@@ -141,7 +141,7 @@ payload.
 
 ## 3. Tokenizer — accepted, refused, detected
 
-### 3.0 The engine comes first: `tokenizer.ggml.model` (#132 S4, 2026-10-15; ADR-0045)
+### 3.0 The engine comes first: `tokenizer.ggml.model` (#132 S4, 2026-10-15; ADR-0045/ADR-0046)
 
 `tokenizer.ggml.pre` answers "which rule" only for the engine the file already selected.
 `TokenizerModel::from_gguf` reads `tokenizer.ggml.model` and answers exactly two engines:
@@ -150,6 +150,7 @@ payload.
 |---|---|---|---|---|
 | `gpt2` (or absent) | byte-level BPE | `tokenizer.ggml.merges` ranks + byte-level characters | yes — §3.1 | **yes** |
 | `llama` | SentencePiece | `tokenizer.ggml.scores` + `▁` (U+2581) escaping + `<0xXX>` byte tokens | no | **yes** |
+| `bert` | WordPiece | greedy longest match over `▁`-prefixed words + `<unk>`; BertNormalizer options | no | **yes** |
 | anything else | — | — | — | refused, **naming the value** |
 
 SentencePiece (from llama.cpp's session, `llama-vocab.cpp:114`) is: symbols are UTF-8
@@ -161,9 +162,23 @@ one `<0xXX>` byte token per byte. `add_space_prefix` (default `true` for SPM,
 `tokenizer.ggml.add_space_prefix` overrides it) prefixes the first raw-text segment and every
 segment after a special token; a special token resets that state.
 
+**WordPiece** (llama.cpp's WPM, `llama-vocab.cpp:777`) preprocesses BERT's way
+(`llama-vocab.cpp:827`): whitespace ends a word, `\p{C}` is dropped, with
+`strip_accents` the text is NFD-decomposed and its **`\p{Mn}`** marks are dropped, with
+`lowercase` every code point is lowercased, and `\p{P}`, an ASCII symbol or a Chinese
+character becomes a word of its own. Each word then gets the phantom `▁` prefix and is
+segmented by greedy longest match; a word that cannot be fully matched emits one `<unk>`.
+`tokenizer.ggml.normalizer.lowercase` and `.strip_accents` both default to **`true`**
+(`llama-vocab.h:83`), with `strip_accents` following `lowercase`. The engine reads no
+merges and no scores, and requires the `<unk>` role. ADR-0046 records why the reference for
+this engine is HuggingFace's `tokenizers` (the GGUF's vocabulary is that file's vocabulary,
+rewritten in place with the same ids) and the two llama.cpp divergences that follow from its
+1:1 "NFD" and its `\p{M}` accent test.
+
 `Tokenizer::pre` is therefore `Option<PreTokenizer>`: `None` means the engine has no
-pre-tokenization rule, and `applies_nfc()` is then `false` — the SPM families accepted here
-declare no normalizer (ADR-0044).
+pre-tokenization rule, and `applies_nfc()` is then `false` — the SPM and WordPiece families
+accepted here declare no *NFC* normalizer (ADR-0044), and WordPiece's own normalizer is NFD
+based.
 
 ### 3.1 `tokenizer.ggml.pre` is authoritative
 
@@ -258,12 +273,15 @@ invariant violation that aborts with the byte value.
 
 * **NFC normalization** — *now applied* (F7's accepted gap, closed by
   [#132](https://github.com/yusiwen/minfer/issues/132) S1 on 2026-10-14); see §3.6.
-* **`bert` / `t5` / `rwkv` / `plamo2` / `gemma4` / `whitespace` / `hybriddna` /
+* **`t5` / `rwkv` / `plamo2` / `gemma4` / `whitespace` / `hybriddna` /
   `none`** engines — refused by name at load (§3.0). SentencePiece (`llama`) is
-  implemented (ADR-0045); each remaining value is a different algorithm
-  (WordPiece, unigram with its own normalization, RWKV, …) with its own
-  vocabulary shape and its own reference, so it lands with an ADR and a fixture,
-  not as another match arm.
+  implemented (ADR-0045) and WordPiece (`bert`) too (ADR-0046); each remaining
+  value is a different algorithm (unigram with its own normalization, RWKV, …)
+  with its own vocabulary shape and its own reference, so it lands with an ADR and
+  a fixture, not as another match arm.
+* **BERT's `clean_text`** (dropping control characters and normalizing whitespace
+  before the word split): not implemented, and no artifact in the gate
+  distinguishes it — recorded in ADR-0046 rather than written blind.
 * **The remaining `ignore_merges` pre-tokenizers** (`falcon3`, `falcon-h1`,
   `pixtral`, `tekken`, …) and **multi-regex** pre-tokenizers (`default`,
   `deepseek-llm`, `deepseek-coder`, `deepseek-v3`, `falcon`, `starcoder`, `mpt`,
@@ -345,9 +363,11 @@ return.
 | The fixture template is the model's own | `#[ignore]`d real-model test: GGUF `tokenizer.chat_template` == fixture template and rendering matches | the cached GGUF |
 | Loud refusal | unit test: an unsupported method/syntax fails and the error **names** the construct; a mutation of the callback (dropping a method) must make a previously-passing case fail | — |
 | Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (4 values, 52-54 entries each) | the `tokenizer.json` regex evaluated by CPython `regex` |
-| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (8 cached models, both engines) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5, `llama-bpe`, `lfm2`, and the SentencePiece model — for SPM the HF file is a *BPE* rendering of the vocabulary, so llama.cpp is the only reference for this engine, ADR-0045); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
-| Engine dispatch | `src/tokenizer.rs` unit test `the_tokenizer_model_is_a_dispatch` (both accepted values, six refusals each naming its value) and the ignored gate's `tokenizer_model` field | `tokenizer.ggml.model` in the artifact |
+| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (9 cached models, three engines) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5, `llama-bpe`, `lfm2`, and the SentencePiece model — for SPM the HF file is a *BPE* rendering of the vocabulary, so llama.cpp is the only reference for this engine, ADR-0045); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
+| Engine dispatch | `src/tokenizer.rs` unit test `the_tokenizer_model_is_a_dispatch` (three accepted values, seven refusals each naming its value) and the ignored gate's `tokenizer_model` field | `tokenizer.ggml.model` in the artifact |
 | SentencePiece session | `src/tokenizer.rs` unit tests `spm_merges_by_score_and_falls_back_to_byte_tokens` and `spm_prefixes_the_first_segment_with_a_space` (synthetic vocabulary: the scored chain, the `▁` prefix on/off, a byte fallback, the post-special re-prefix) | llama.cpp `llm_tokenizer_spm_session` (`llama-vocab.cpp:114`) |
+| WordPiece session | `src/tokenizer.rs` unit tests `wpm_segments_by_longest_match_and_unknowns_whole_words`, `wpm_normalizer_options_follow_the_file`, `wpm_decode_unescapes_the_phantom_space_and_keeps_specials` (synthetic vocabulary: the phantom space, per-word `<unk>`, punctuation words, lowercase on/off, `strip_accents` on/off) | BERT's BasicTokenizer + WordPiece (`llama-vocab.cpp:777`/`:827`), whose definition is HuggingFace's `tokenizers` (ADR-0046) |
+| NFD decomposition | `src/tokenizer/nfc/tests.rs` unit test `nfd_matches_cpython_on_the_committed_corpus` over the same 5 103 vectors, now carrying an `nfd` expectation | CPython `unicodedata.normalize('NFD', input)` |
 | NFC normalization | `src/tokenizer/nfc.rs` unit tests over `tests/fixtures/tokenizer/nfc_vectors.json` (5 103 inputs: every decomposition, every composition pair, all 784 ordered mark pairs both after a starter and alone, Hangul, compatibility forms, a seeded random corpus), plus the per-rule table (`the_normalizer_follows_the_pre_tokenizer_rule`), the two synthetic-tokenizer arms, and the real-model gate (a normalizing family: `café == cafe\u{0301}`; `llama-bpe`: the decomposed corpus entries) | CPython `unicodedata.normalize('NFC', …)` for the tables; each family's `tokenizer.json` normalizer field for the declaration |
 | Grammar (F2) + pinned sampler (F3) | existing suites | unchanged |
 
@@ -362,3 +382,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0043](adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) — A special token is declared by the file, never inferred from its name
 - [ADR-0044](adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md) — The input normalizer follows the pre-tokenizer family's declaration
 - [ADR-0045](adr/0045-the-tokenizer-engine-is-a-dispatch-on-tokenizer-ggml-model.md) — The tokenizer engine is a dispatch on `tokenizer.ggml.model`
+- [ADR-0046](adr/0046-wordpiece-is-the-third-engine-and-follows-berts-normalizer.md) — WordPiece is the third engine, and it follows BERT's normalizer

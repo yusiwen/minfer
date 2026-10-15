@@ -175,10 +175,12 @@ all, and the startup path prints a one-line notice when that happens.
 `--no-template` still bypasses template rendering entirely.
 
 The tokenizer is byte-level BPE and is equally strict about what it does not
-implement. `tokenizer.ggml.model` selects the engine — `gpt2` (byte-level BPE) or `llama`
+implement. `tokenizer.ggml.model` selects the engine — `gpt2` (byte-level BPE), `llama`
 (SentencePiece: score-driven merges over a `▁`-escaped text, `<0xXX>` byte
-fallback, no `pre` rule, no normalizer) — and every other value **refuses the
-load** naming it (ADR-0045). For the BPE engine `tokenizer.ggml.pre` selects the
+fallback, no `pre` rule, no normalizer) or `bert` (WordPiece: greedy longest match
+over `▁`-prefixed words with a per-word `<unk>`, BERT's normalizer from
+`tokenizer.ggml.normalizer.*`, no `pre` rule) — and every other value **refuses
+the load** naming it (ADR-0045/ADR-0046). For the BPE engine `tokenizer.ggml.pre` selects the
 pre-tokenization rule — `qwen2` (alias `deepseek-r1-qwen`), `qwen35`, `llama-bpe`
 (aliases `llama3`, `llama-v3`) or `lfm2` (the last two share the Llama 3.x
 pattern, whose only difference from `qwen2` is `\p{N}{1,3}`) — and an unknown or
