@@ -221,6 +221,7 @@ fn the_normalizer_follows_the_pre_tokenizer_rule() {
     assert!(PreTokenizer::Qwen2.applies_nfc());
     assert!(PreTokenizer::Qwen35.applies_nfc());
     assert!(!PreTokenizer::LlamaBpe.applies_nfc());
+    assert!(!PreTokenizer::Lfm2.applies_nfc());
 }
 
 // === #132 S2: the special-token set is what the file declares ==============
@@ -435,6 +436,10 @@ const SPLIT_FIXTURES: &[(&str, &str)] = &[
         "llama-bpe",
         include_str!("../../tests/fixtures/tokenizer/split_llama-bpe.json"),
     ),
+    (
+        "lfm2",
+        include_str!("../../tests/fixtures/tokenizer/split_lfm2.json"),
+    ),
 ];
 
 fn pre_of(name: &str) -> PreTokenizer {
@@ -442,6 +447,7 @@ fn pre_of(name: &str) -> PreTokenizer {
         "qwen2" => PreTokenizer::Qwen2,
         "qwen35" => PreTokenizer::Qwen35,
         "llama-bpe" => PreTokenizer::LlamaBpe,
+        "lfm2" => PreTokenizer::Lfm2,
         other => panic!("unknown pre-tokenizer {other}"),
     }
 }
@@ -509,6 +515,10 @@ fn pre_tokenizer_selection_refuses_unknown_and_missing() {
         PreTokenizer::from_gguf(Some("llama-v3")).unwrap(),
         PreTokenizer::LlamaBpe
     );
+    assert_eq!(
+        PreTokenizer::from_gguf(Some("lfm2")).unwrap(),
+        PreTokenizer::Lfm2
+    );
     let err = PreTokenizer::from_gguf(Some("starcoder")).unwrap_err();
     assert!(
         err.contains("starcoder"),
@@ -574,6 +584,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         "llama-3.2-1b-instruct",
         "~/.cache/minfer/models/hf/unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_llama-3.2-1b-instruct.json"),
+    ),
+    (
+        "lfm2-1.2b",
+        "~/.cache/minfer/models/hf/LiquidAI/LFM2-1.2B-GGUF/LFM2-1.2B-Q4_K_M.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_lfm2-1.2b.json"),
     ),
 ];
 
@@ -711,6 +726,7 @@ impl PreTokenizer {
             Self::Qwen2 => "qwen2",
             Self::Qwen35 => "qwen35",
             Self::LlamaBpe => "llama-bpe",
+            Self::Lfm2 => "lfm2",
         }
     }
 }
