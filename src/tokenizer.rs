@@ -283,6 +283,13 @@ pub enum TokenizerModel {
     /// (`add_space_prefix = true`, `clean_spaces = false`,
     /// `src/llama-vocab.cpp:2409`) and never pre-splits an SPM text.
     Spm,
+    /// `bert`: WordPiece — llama.cpp's WPM. Each word is prefixed with the
+    /// phantom `▁` and segmented by **greedy longest match** against the
+    /// vocabulary, with one `<unk>` per word that does not fully match. Neither
+    /// `pre` (there is no regex pre-tokenizer) nor merges nor scores participate;
+    /// the BertNormalizer options come from `tokenizer.ggml.normalizer.lowercase`
+    /// and `.strip_accents` (both default `false`).
+    Bert,
 }
 
 impl TokenizerModel {
@@ -292,17 +299,159 @@ impl TokenizerModel {
         match model {
             None | Some("gpt2") => Ok(Self::Gpt2),
             Some("llama") => Ok(Self::Spm),
+            Some("bert") => Ok(Self::Bert),
             Some(other) => Err(format!(
                 "tokenizer.ggml.model = \"{other}\" is not a tokenizer minfer implements \
-                 (supported: \"gpt2\" — byte-level BPE — and \"llama\" — SentencePiece). \
-                 Refusing to run a different engine rather than tokenize with the wrong one."
+                 (supported: \"gpt2\" — byte-level BPE — \"llama\" — SentencePiece — and \
+                 \"bert\" — WordPiece). Refusing to run a different engine rather than \
+                 tokenize with the wrong one."
             )),
         }
     }
 }
 
-/// The text SentencePiece uses for a space (`U+2581`).
+/// The text SentencePiece and WordPiece use for a space (`U+2581`).
 const SPM_SPACE: char = '\u{2581}';
+
+/// The BertNormalizer options the WordPiece engine reads
+/// (`tokenizer.ggml.normalizer.*`).
+///
+/// **Both default to `true`** — llama.cpp's `normalizer_options` member
+/// initialisers (`llama-vocab.h:83`), which is why a converted BERT file that
+/// carries neither key still lowercases its input; `strip_accents` follows
+/// `lowercase` unless the file says otherwise. The one pre-type that turns
+/// lowercasing off is `whitespace`, which this engine does not implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NormalizerOptions {
+    /// Lowercase every code point (the simple 1:1 mapping).
+    pub lowercase: bool,
+    /// Decompose with NFD and drop the combining marks.
+    pub strip_accents: bool,
+}
+
+impl Default for NormalizerOptions {
+    fn default() -> Self {
+        Self {
+            lowercase: true,
+            strip_accents: true,
+        }
+    }
+}
+
+/// BERT's BasicTokenizer preprocessing, as the WordPiece engine needs it
+/// (`llm_tokenizer_wpm_session::preprocess`, `llama-vocab.cpp:827`).
+///
+/// Whitespace ends a word; a control character is dropped; with `strip_accents`
+/// the text is NFD-decomposed first and its marks are dropped; with `lowercase`
+/// every code point is lowercased; and punctuation, an ASCII symbol or a Chinese
+/// character becomes a word of its own.
+fn wpm_preprocess(text: &str, opts: NormalizerOptions) -> Vec<String> {
+    let decomposed = if opts.strip_accents {
+        nfc::nfd(text).into_owned()
+    } else {
+        text.to_string()
+    };
+
+    let mut words: Vec<String> = vec![String::new()];
+    for c in decomposed.chars() {
+        if c.is_whitespace() {
+            if !words.last().is_some_and(String::is_empty) {
+                words.push(String::new());
+            }
+            continue;
+        }
+        if c == '\0' || c == '\u{FFFD}' || is_control_char(c) {
+            continue;
+        }
+        if opts.strip_accents && is_accent_mark_char(c) {
+            continue;
+        }
+        let piece: String = if opts.lowercase {
+            // The *simple* 1:1 mapping llama.cpp's `unicode_tolower` table
+            // implements; `char::to_lowercase` is the full mapping, so a code
+            // point whose full mapping is multi-character (U+0130 is the classic)
+            // is kept as the simple first character instead of expanding.
+            let mut lowered = c.to_lowercase();
+            match (lowered.next(), lowered.next()) {
+                (Some(first), None) => first.to_string(),
+                _ => c.to_string(),
+            }
+        } else {
+            c.to_string()
+        };
+
+        if is_punctuation_char(c)
+            || (c < '\u{7F}' && !c.is_alphanumeric() && c != '_')
+            || is_chinese_char(c as u32)
+        {
+            if !words.last().is_some_and(String::is_empty) {
+                words.push(String::new());
+            }
+            *words.last_mut().expect("never empty") = piece;
+            words.push(String::new());
+        } else {
+            words
+                .last_mut()
+                .expect("never empty")
+                .push_str(piece.as_str());
+        }
+    }
+    if words.last().is_some_and(String::is_empty) {
+        words.pop();
+    }
+    words
+}
+
+/// A `regex` Unicode class asked about a single character, without allocating.
+fn char_in_class(re: &regex::Regex, c: char) -> bool {
+    let mut buf = [0u8; 4];
+    re.is_match(c.encode_utf8(&mut buf))
+}
+
+/// Unicode general category `C` — the WordPiece normalizer drops these.
+fn is_control_char(c: char) -> bool {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    char_in_class(
+        RE.get_or_init(|| regex::Regex::new(r"\p{C}").expect("a static pattern")),
+        c,
+    )
+}
+
+/// Unicode general category `P` — WordPiece splits on these.
+fn is_punctuation_char(c: char) -> bool {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    char_in_class(
+        RE.get_or_init(|| regex::Regex::new(r"\p{P}").expect("a static pattern")),
+        c,
+    )
+}
+
+/// Unicode general category `Mn` — the marks `strip_accents` drops.
+///
+/// **Non-spacing marks only.** BERT's `_run_strip_accents` drops a character when
+/// `unicodedata.category(char) == "Mn"`, so a *spacing* mark (`Mc`, e.g. the
+/// Devanagari vowel sign U+093F) survives; llama.cpp's table flags all of `\p{M}`
+/// and drops those too, which is a recorded divergence (ADR-0046).
+fn is_accent_mark_char(c: char) -> bool {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    char_in_class(
+        RE.get_or_init(|| regex::Regex::new(r"\p{Mn}").expect("a static pattern")),
+        c,
+    )
+}
+
+/// BERT's `_is_chinese_char`, ranges and typo included (llama.cpp notes that the
+/// HF Rust code spells `0x2B920` where the intent is `0x2B820`).
+fn is_chinese_char(cp: u32) -> bool {
+    (0x4E00..=0x9FFF).contains(&cp)
+        || (0x3400..=0x4DBF).contains(&cp)
+        || (0x20000..=0x2A6DF).contains(&cp)
+        || (0x2A700..=0x2B73F).contains(&cp)
+        || (0x2B740..=0x2B81F).contains(&cp)
+        || (0x2B920..=0x2CEAF).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
+        || (0x2F800..=0x2FA1F).contains(&cp)
+}
 
 /// Group declared special tokens by first char, longest-first inside each group
 /// (the earliest-position, longest-match scan in [`Tokenizer::encode`] needs
@@ -475,6 +624,14 @@ pub struct Tokenizer {
     /// SentencePiece: the `<0xXX>` byte token ids, one per byte value. Empty for
     /// the BPE engine, whose byte fallback is the 256 byte-level characters.
     spm_byte_to_id: HashMap<u8, u32>,
+    /// WordPiece: the BertNormalizer options from `tokenizer.ggml.normalizer.*`.
+    normalizer: NormalizerOptions,
+    /// WordPiece: the longest vocabulary entry in bytes — the greedy match's
+    /// upper bound (`llama_vocab::max_token_len`).
+    max_token_len: usize,
+    /// WordPiece: the `<unk>` id, the fallback for a word that cannot be fully
+    /// segmented. `load` refuses a vocabulary that does not declare one.
+    unk_token: u32,
     /// Special tokens grouped by first char, longest-first within a group,
     /// built from `special_tokens` — the file's declared types and roles
     /// (#132 S2). Nothing here is inferred from a token's name.
@@ -541,6 +698,9 @@ impl Tokenizer {
             pre: Some(PreTokenizer::Qwen2),
             add_space_prefix: false,
             spm_byte_to_id: HashMap::new(),
+            normalizer: NormalizerOptions::default(),
+            max_token_len: 0,
+            unk_token: 0,
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
@@ -580,6 +740,9 @@ impl Tokenizer {
             pre: Some(PreTokenizer::Qwen2),
             add_space_prefix: false,
             spm_byte_to_id: HashMap::new(),
+            normalizer: NormalizerOptions::default(),
+            max_token_len: 0,
+            unk_token: 0,
             special_by_first: HashMap::new(),
             bos_token: 0,
             eos_token: 0,
@@ -703,6 +866,9 @@ impl Tokenizer {
             TokenizerModel::from_gguf(Self::get_gguf_str(gguf, "tokenizer.ggml.model").as_deref())?;
         let mut add_space_prefix = false;
         let mut spm_byte_to_id: HashMap<u8, u32> = HashMap::new();
+        let mut normalizer = NormalizerOptions::default();
+        let mut max_token_len = 0;
+        let mut unk_token = 0;
         let pre = match model {
             TokenizerModel::Gpt2 => {
                 // F7: the pre-tokenization rule must be one this engine implements.
@@ -767,6 +933,36 @@ impl Tokenizer {
                     Self::get_gguf_bool(gguf, "tokenizer.ggml.add_space_prefix").unwrap_or(true);
                 None
             }
+            TokenizerModel::Bert => {
+                // BertNormalizer options: both default to `true`
+                // (`llama-vocab.h:83`), and `strip_accents` follows `lowercase`
+                // unless the file says otherwise (llama.cpp, `llama-vocab.cpp:2635`).
+                let lowercase = Self::get_gguf_bool(gguf, "tokenizer.ggml.normalizer.lowercase")
+                    .unwrap_or(true);
+                let strip_accents =
+                    Self::get_gguf_bool(gguf, "tokenizer.ggml.normalizer.strip_accents")
+                        .unwrap_or(lowercase);
+                normalizer = NormalizerOptions {
+                    lowercase,
+                    strip_accents,
+                };
+                // The `<unk>` fallback is the engine's only answer for a word it
+                // cannot segment, so the role must be declared and in range.
+                unk_token = Self::get_gguf_u32(gguf, "tokenizer.ggml.unknown_token_id").ok_or(
+                    "tokenizer.ggml.unknown_token_id is missing; minfer's WordPiece engine needs \
+                     the [UNK] id for a word it cannot segment"
+                        .to_string(),
+                )?;
+                if unk_token as usize >= id_to_token.len() {
+                    return Err(format!(
+                        "tokenizer.ggml.unknown_token_id = {unk_token} is out of range (the \
+                         vocabulary has {} entries)",
+                        id_to_token.len()
+                    ));
+                }
+                max_token_len = id_to_token.iter().map(String::len).max().unwrap_or(0);
+                None
+            }
         };
 
         Ok(Tokenizer {
@@ -782,6 +978,9 @@ impl Tokenizer {
             pre,
             add_space_prefix,
             spm_byte_to_id,
+            normalizer,
+            max_token_len,
+            unk_token,
             special_by_first,
             bos_token,
             eos_token,
@@ -997,6 +1196,7 @@ impl Tokenizer {
         }
         match self.model {
             TokenizerModel::Gpt2 => self.encode_bpe(text),
+            TokenizerModel::Bert => self.wpm_encode(text),
             TokenizerModel::Spm => {
                 let mut escaped = String::with_capacity(text.len() + SPM_SPACE.len_utf8());
                 if self.add_space_prefix && prev_special {
@@ -1163,6 +1363,54 @@ impl Tokenizer {
         }
     }
 
+    /// WordPiece encode a raw segment: llama.cpp's `llm_tokenizer_wpm_session`
+    /// (`llama-vocab.cpp:777`).
+    ///
+    /// Each preprocessed word gets the phantom `▁` prefix and is segmented by
+    /// **greedy longest match**; a word with no match at all — or one that stops
+    /// matching part way — emits a single `<unk>` and nothing else. `max_token_len`
+    /// bounds the match length so the scan is not quadratic in the vocabulary.
+    fn wpm_encode(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        for word in wpm_preprocess(text, self.normalizer) {
+            if word.is_empty() {
+                continue;
+            }
+            // The phantom space is part of the vocabulary's shape: the converter
+            // rewrites a BERT vocabulary into `▁`-prefixed entries, so every word
+            // starts with one.
+            let word1 = format!("{SPM_SPACE}{word}");
+            let n = word1.len();
+            let start = out.len();
+            let mut i = 0usize;
+            while i < n {
+                let mut matched = false;
+                let mut j = (i + self.max_token_len + 1).min(n);
+                while j > i {
+                    if word1.is_char_boundary(i) && word1.is_char_boundary(j) {
+                        if let Some(&id) = self.vocab.get(&word1[i..j]) {
+                            out.push(id);
+                            matched = true;
+                            break;
+                        }
+                    }
+                    j -= 1;
+                }
+                if !matched {
+                    // Drop what this word produced and report it as unknown —
+                    // llama.cpp's `output.resize(current_tokens)` + break.
+                    out.truncate(start);
+                    break;
+                }
+                i = j;
+            }
+            if out.len() == start {
+                out.push(self.unk_token);
+            }
+        }
+        out
+    }
+
     /// Whether the input is normalized to NFC: true when the file's
     /// pre-tokenizer rule declares one (ADR-0044). SentencePiece has no rule, and
     /// the SPM families this engine accepts declare none.
@@ -1318,6 +1566,30 @@ impl Tokenizer {
     /// render text incrementally (streaming) must buffer incomplete sequences —
     /// see [`complete_utf8_prefix_len`].
     pub fn decode_bytes(&self, ids: &[u32]) -> Vec<u8> {
+        if self.model == TokenizerModel::Bert {
+            // WordPiece: a declared special is emitted verbatim, every other
+            // token's `▁` is a space (llama.cpp's `token_to_piece` for WPM).
+            let mut out = Vec::new();
+            for &id in ids {
+                let Some(token) = self.id_to_token.get(id as usize) else {
+                    continue;
+                };
+                let ty = self.id_to_type.get(id as usize).copied().unwrap_or(1);
+                if ty == 2 || ty == 3 || ty == 4 {
+                    out.extend_from_slice(token.as_bytes());
+                    continue;
+                }
+                for c in token.chars() {
+                    if c == SPM_SPACE {
+                        out.push(b' ');
+                    } else {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
+            }
+            return out;
+        }
         if self.model == TokenizerModel::Spm {
             // SentencePiece: a BYTE token is its byte, every other token's `▁`
             // is a space (llama.cpp's `token_to_piece` for SPM).

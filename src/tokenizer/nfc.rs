@@ -71,6 +71,27 @@ pub fn nfc(input: &str) -> Cow<'_, str> {
     }
 }
 
+/// The NFD form of `input`, borrowed when the input is already decomposed.
+///
+/// The WordPiece engine's `strip_accents` option decomposes with NFD before it
+/// drops the combining marks (#132 S4), so the decompose + order steps are shared
+/// with [`nfc`] rather than reimplemented: one UAX #15 decomposition, two forms.
+pub fn nfd(input: &str) -> Cow<'_, str> {
+    if input.is_ascii() {
+        return Cow::Borrowed(input);
+    }
+    let decomposed = canonical_order(decompose(input));
+    let mut out = String::with_capacity(input.len());
+    for cp in decomposed {
+        out.push(char::from_u32(cp).expect("NFD decomposition produced a non-character"));
+    }
+    if out == input {
+        Cow::Borrowed(input)
+    } else {
+        Cow::Owned(out)
+    }
+}
+
 /// Whether `input` can change under NFC at all: a character that decomposes
 /// (canonically), a combining mark that may need reordering, a conjoining jamo
 /// that may compose, or a character that can be the second half of a canonical

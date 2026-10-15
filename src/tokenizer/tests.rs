@@ -43,6 +43,9 @@ fn test_tokenizer() -> Tokenizer {
         pre: Some(PreTokenizer::Qwen2),
         add_space_prefix: false,
         spm_byte_to_id: HashMap::new(),
+        normalizer: NormalizerOptions::default(),
+        max_token_len: 0,
+        unk_token: 0,
         special_by_first: HashMap::new(),
         bos_token: 0,
         eos_token: 0,
@@ -213,6 +216,117 @@ fn a_chat_token_the_file_does_not_declare_is_not_invented() {
     assert!(!t.special_tokens.contains_key("<|im_end|>"));
 }
 
+// === #132 S4: the WordPiece (`model = bert`) engine =========================
+
+/// A WordPiece vocabulary shaped like a converted BERT file: the five declared
+/// specials (types 2/3/4), `▁`-prefixed word entries (the converter rewrites a
+/// BERT vocabulary this way), single letters for the fallback cases, and no
+/// merges or scores — the engine reads neither.
+///
+/// Ids: 0 `[PAD]`, 1 `[UNK]`, 2 `[CLS]`, 3 `[SEP]`, 4 `[MASK]` (all type 3),
+/// then the entries. `hex` exists so a word can be composed of two known pieces;
+/// `zzz` exists only unprefixed, so `▁zzz` is unknown.
+fn wpm_tokenizer(opts: NormalizerOptions) -> Tokenizer {
+    let mut t = Tokenizer::empty();
+    t.model = TokenizerModel::Bert;
+    t.pre = None;
+    t.normalizer = opts;
+    t.unk_token = 1;
+
+    let mut push = |t: &mut Tokenizer, text: &str, ty: i32| -> u32 {
+        let id = t.id_to_token.len() as u32;
+        t.id_to_token.push(text.to_string());
+        t.id_to_type.push(ty);
+        t.vocab.insert(text.to_string(), id);
+        id
+    };
+    for text in ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] {
+        push(&mut t, text, 3);
+    }
+    for text in [
+        "▁hello", "hello", "##", "▁world", "▁hex", "he", "x", "▁zzz", "zzz", "▁cafe", "▁naive",
+        "▁", "!", "▁f", "f", "▁i", "i", "▁S", "▁café",
+    ] {
+        push(&mut t, text, 1);
+    }
+    for text in ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"] {
+        let id = t.vocab[text];
+        t.special_tokens.insert(text.to_string(), id);
+    }
+    t.special_by_first = special_index(&t.special_tokens);
+    t.max_token_len = t.id_to_token.iter().map(String::len).max().unwrap_or(0);
+    t
+}
+
+#[test]
+fn wpm_segments_by_longest_match_and_unknowns_whole_words() {
+    // An explicit no-normalizer configuration, so the words reach the vocabulary
+    // exactly as written.
+    let t = wpm_tokenizer(NormalizerOptions {
+        lowercase: false,
+        strip_accents: false,
+    });
+    let hello = t.vocab["▁hello"];
+    let world = t.vocab["▁world"];
+    let unk = t.unk_token;
+    assert_eq!(t.encode("hello world"), vec![hello, world]);
+    // A word with no fully matching segmentation is one `<unk>`, never a partial
+    // sequence: `▁h` does not exist, so `hxyz` cannot be built.
+    assert_eq!(t.encode("hxyz"), vec![unk]);
+    // Punctuation becomes a word of its own. Its phantom-space form `▁!` is not
+    // in this vocabulary, so the greedy match emits the bare `▁` entry and then
+    // the punctuation entry — the same two pieces llama.cpp's session produces.
+    let (space, bang) = (t.vocab["▁"], t.vocab["!"]);
+    assert_eq!(t.encode("hello!"), vec![hello, space, bang]);
+    // The declared specials still match through the scan before the engine runs.
+    let (cls, sep) = (t.vocab["[CLS]"], t.vocab["[SEP]"]);
+    assert_eq!(t.encode("[CLS] hello [SEP]"), vec![cls, hello, sep]);
+}
+
+#[test]
+fn wpm_normalizer_options_follow_the_file() {
+    // Lowercase on: the vocabulary's `▁hello` is reached from `Hello`.
+    let lowered = wpm_tokenizer(NormalizerOptions {
+        lowercase: true,
+        strip_accents: false,
+    });
+    assert_eq!(lowered.encode("Hello"), vec![lowered.vocab["▁hello"]]);
+    // Lowercase off (the default a converted BERT file leaves): `Hello` is not a
+    // vocabulary entry, so the word is unknown.
+    let plain = wpm_tokenizer(NormalizerOptions {
+        lowercase: false,
+        strip_accents: false,
+    });
+    assert_eq!(plain.encode("Hello"), vec![plain.unk_token]);
+    // Strip accents decomposes with NFD and drops the marks, so `café` written
+    // precomposed and decomposed both reach `▁cafe` — and only then does the
+    // vocabulary's `▁cafe` entry match.
+    let stripped = wpm_tokenizer(NormalizerOptions {
+        lowercase: false,
+        strip_accents: true,
+    });
+    let cafe = stripped.vocab["▁cafe"];
+    assert_eq!(stripped.encode("cafe\u{0301}"), vec![cafe]);
+    assert_eq!(stripped.encode("café"), vec![cafe]);
+    // Without it the two forms are different words: the precomposed `café` has a
+    // vocabulary entry of its own, and `cafe` + U+0301 does not.
+    let plain = wpm_tokenizer(NormalizerOptions {
+        lowercase: false,
+        strip_accents: false,
+    });
+    assert_eq!(plain.encode("café"), vec![plain.vocab["▁café"]]);
+    assert_eq!(plain.encode("cafe\u{0301}"), vec![plain.unk_token]);
+}
+
+#[test]
+fn wpm_decode_unescapes_the_phantom_space_and_keeps_specials() {
+    let t = wpm_tokenizer(NormalizerOptions::default());
+    let hello = t.vocab["▁hello"];
+    let sep = t.vocab["[SEP]"];
+    assert_eq!(t.decode_bytes(&[hello]), b" hello");
+    assert_eq!(t.decode_bytes(&[hello, sep]), b" hello[SEP]");
+}
+
 // === #132 S4: the SentencePiece (`model = llama`) engine ====================
 
 /// A SentencePiece vocabulary with the three behaviours the engine has: a
@@ -275,9 +389,21 @@ fn the_tokenizer_model_is_a_dispatch() {
         TokenizerModel::from_gguf(Some("llama")).unwrap(),
         TokenizerModel::Spm
     );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("bert")).unwrap(),
+        TokenizerModel::Bert
+    );
     // Every other engine is refused *by name* — an approximation with the wrong
     // engine would be worse than a refusal.
-    for other in ["bert", "t5", "rwkv", "plamo2", "whitespace", "none"] {
+    for other in [
+        "t5",
+        "rwkv",
+        "plamo2",
+        "gemma4",
+        "whitespace",
+        "hybriddna",
+        "none",
+    ] {
         let err = TokenizerModel::from_gguf(Some(other)).unwrap_err();
         assert!(
             err.contains(other),
@@ -713,6 +839,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         "~/.cache/minfer/models/hf/second-state/TinyLlama-1.1B-Chat-v1.0-GGUF/TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_tinyllama-1.1b.json"),
     ),
+    (
+        "bge-small-en-v1.5",
+        "~/.cache/minfer/models/hf/ggml-org/bge-small-en-v1.5-Q8_0-GGUF/bge-small-en-v1.5-q8_0.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_bge-small-en-v1.5.json"),
+    ),
 ];
 
 fn expand_home(path: &str) -> std::path::PathBuf {
@@ -816,7 +947,30 @@ fn token_ids_match_the_reference() {
         // one, without it they must coincide.
         let composed = tok.encode("café");
         let decomposed = tok.encode("cafe\u{0301}");
-        if tok.applies_nfc() {
+        if tok.model == TokenizerModel::Bert {
+            // The BertNormalizer is NFD + dropping `Mn`, so with the options this
+            // artifact's file leaves at their defaults the composed and decomposed
+            // spellings of an accented word are the *same* word — the opposite of
+            // the property the BPE/SPM families assert, and what BERT declares.
+            assert_eq!(
+                tok.normalizer,
+                NormalizerOptions {
+                    lowercase: true,
+                    strip_accents: true,
+                },
+                "{slug}: this fixture's file is expected to leave the BertNormalizer \
+                 options at their defaults"
+            );
+            assert_eq!(
+                decomposed, composed,
+                "{slug}: the BertNormalizer must fold both spellings onto one word"
+            );
+            assert_eq!(
+                decomposed,
+                tok.encode_raw("cafe\u{0301}"),
+                "{slug}: `Tokenizer::encode_raw` must use the same normalizer"
+            );
+        } else if tok.applies_nfc() {
             // The control is the BPE engine's *unnormalized* path (a normalizing
             // rule is always a BPE one; SentencePiece never normalizes).
             let unnormalized = tok.encode_bpe("cafe\u{0301}");
@@ -850,6 +1004,8 @@ fn token_ids_match_the_reference() {
             entries.len(),
             if tok.applies_nfc() {
                 "NFC declared"
+            } else if tok.model == TokenizerModel::Bert {
+                "BertNormalizer declared"
             } else {
                 "no normalizer"
             },
@@ -871,6 +1027,7 @@ impl TokenizerModel {
         match self {
             Self::Gpt2 => "gpt2",
             Self::Spm => "llama",
+            Self::Bert => "bert",
         }
     }
 }

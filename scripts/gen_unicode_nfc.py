@@ -12,9 +12,11 @@ reviewed:
   class, and canonical composition (the last derived by asking CPython whether
   the pair composes, which is exactly the exclusion rule).
 - `tests/fixtures/tokenizer/nfc_vectors.json` — the differential corpus. Every
-  entry is `unicodedata.normalize("NFC", input)` from the same CPython that
-  produced the tables, so the Rust algorithm is checked against an independent
-  implementation (the data source is shared; the algorithm is not).
+  entry carries `unicodedata.normalize("NFC", input)` **and**
+  `unicodedata.normalize("NFD", input)` from the same CPython that produced the
+  tables, so both Rust algorithms are checked against an independent
+  implementation (the data source is shared; the algorithms are not). NFD is what
+  the WordPiece engine's `strip_accents` option decomposes with (#132 S4).
 
 Regenerate (from the repository root):
 
@@ -257,28 +259,36 @@ def build_vectors(decomposition, composition):
 
     # Deduplicate by input, keeping the first occurrence and its section.
     sections: dict[str, int] = {}
-    vectors: list[tuple[str, str]] = []
+    vectors: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for name, text in tagged:
         if text in seen:
             continue
         seen.add(text)
         sections[name] = sections.get(name, 0) + 1
-        vectors.append((text, unicodedata.normalize("NFC", text)))
+        vectors.append(
+            (
+                text,
+                unicodedata.normalize("NFC", text),
+                unicodedata.normalize("NFD", text),
+            )
+        )
     return sections, vectors
 
 
 def render_vectors(sections, vectors) -> str:
     doc = {
         "provenance": {
-            "reference": "CPython unicodedata.normalize('NFC', input)",
+            "reference": "CPython unicodedata.normalize('NFC', input) and normalize('NFD', input)",
             "python": f"CPython {platform.python_version()} (unicodedata {unicodedata.unidata_version})",
             "command": "python3 scripts/gen_unicode_nfc.py",
             "date": date.today().isoformat(),
         },
         "unicode_version": unicodedata.unidata_version,
         "sections": sections,
-        "entries": [{"input": text, "nfc": nfc} for text, nfc in vectors],
+        "entries": [
+            {"input": text, "nfc": nfc, "nfd": nfd} for text, nfc, nfd in vectors
+        ],
     }
     # Compact: this is a generated data file, and the pretty form triples it.
     return json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -293,10 +303,14 @@ def main() -> int:
     sections, vectors = build_vectors(decomposition, composition)
     VECTORS.write_text(render_vectors(sections, vectors), encoding="utf-8")
 
-    changed = sum(1 for text, nfc in vectors if text != nfc)
+    changed = sum(1 for text, nfc, _ in vectors if text != nfc)
+    needs_nfd = sum(1 for text, _, nfd in vectors if text != nfd)
     print(f"tables: decomposition={len(decomposition)} ccc={len(classes)} composition={len(composition)}")
     print(f"tables: {TABLES.relative_to(ROOT)} ({len(tables) / 1024:.1f} KiB)")
-    print(f"vectors: {len(vectors)} entries ({changed} change under NFC)")
+    print(
+        f"vectors: {len(vectors)} entries ({changed} change under NFC, "
+        f"{needs_nfd} under NFD)"
+    )
     for name, count in sections.items():
         print(f"  {name}: {count}")
     print(f"vectors: {VECTORS.relative_to(ROOT)} ({VECTORS.stat().st_size / 1024:.1f} KiB)")
