@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`), WordPiece (`model = bert`) and unigram (`model = t5`) DONE 2026-10-15, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`), WordPiece (`model = bert`), unigram (`model = t5`) and `gemma4` DONE 2026-10-15, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -8079,6 +8079,47 @@ matching rather than refusing (the loader checks the header and the blob bounds;
 check would be a second implementation of the format). (d) The corpus excludes `<extra_id_N>`
 because the converter pads the tail (128 ids differ from the tokenizer.json's). (e) Nothing
 here is device-adjacent.
+
+### F7 follow-up — S4: the gemma4 engine, and a GGUF loader defect it exposed ([#132](https://github.com/yusiwen/minfer/issues/132), [#575](https://github.com/yusiwen/minfer/issues/575)) — **DONE 2026-10-15**
+
+**What landed.** `TokenizerModel::Gemma4` (`tokenizer.ggml.model = gemma4`) and
+`PreTokenizer::Gemma4`: a BPE whose merge loop runs on **raw UTF-8** (no byte-to-unicode step),
+whose normalizer escapes spaces to `▁` before the split, whose rule — newline runs, with an
+all-newline piece emitted whole when the vocabulary has it — is **derived from the model value**
+(the file carries no `tokenizer.ggml.pre`, exactly as llama.cpp sets the pre-type at load), and
+whose fallback is one `<0xXX>` byte token per byte. ADR-0048 amends ADR-0045.
+
+**Fixtures and evidence.** `tests/fixtures/tokenizer/ids_gemma-4-e2b.json` (54 shared-corpus
+entries) gated against `unsloth/gemma-4-E2B-it-GGUF`'s 98 MB
+`MTP/mtp-gemma-4-E2B-it-Q8_0.gguf` assistant module (262 144 tokens, 514 906 merges, 262 144
+scores, 256 type-6 byte tokens, 16 type-3 and 7 type-4 specials, no `pre`). HuggingFace's own
+`tokenizer.json` (BPE + `byte_fallback` + the `▁` `Replace`) and llama.cpp on the target model's
+artifact agree on **all 54** entries, and minfer agrees with both. The ignored gate now covers
+**eleven** cached models across **five** engines.
+
+**Why the fixture is the assistant module.** The target's
+`gemma-4-E2B-it-UD-IQ2_M.gguf` (2 290 860 128 B) is **rejected by minfer's GGUF parser**:
+`tensor 'blk.0.attn_q.weight' has offset 1523334144, expected 1522768896`. llama.cpp loads and
+tokenizes it fine, so this is a minfer defect and it is filed as
+[#575](https://github.com/yusiwen/minfer/issues/575) with a runnable capture recipe and an
+attribution acceptance criterion. The substitution is verified rather than assumed: the two
+files' `tokens`, `merges` and `scores` arrays are byte-identical (only `token_type` and the `eos`
+role differ), and the corpus is gated twice — HuggingFace on both, llama.cpp on the target.
+
+**Gates and mutations.** Seven mutations, none escaped: `gemma4` refused again, `gemma4` run by
+the byte-level engine, the rule not applied to the split, the space escaping dropped, the
+newline shortcut removed, the byte fallback replaced by id 0, and the rule read from `pre`
+instead of the model value.
+
+**Suite.** 548/0/41 -> **550 passed / 0 failed / 41 ignored** unit + 10 / 0 / 6 integration
+(+2 gemma4 tests).
+
+**Honest scope.** (a) Five engines of ten; `rwkv`, `plamo2`, `whitespace`, `hybriddna` and
+`none` are still refused by name. (b) llama.cpp's **name-based** special-token type override is
+deliberately not implemented (ADR-0043) — a text containing `</s>` or `<|tool_response>`
+tokenizes as text on minfer and as a control on llama.cpp; the warning llama.cpp itself prints
+for this artifact is recorded in ADR-0048. (c) The fixture's artifact is the assistant module,
+for the reason above. (d) The UD-quant layout is still unparsed ([#575](https://github.com/yusiwen/minfer/issues/575)). (e) Nothing here is device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 

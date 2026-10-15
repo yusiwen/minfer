@@ -66,6 +66,7 @@
     - [0045. The tokenizer engine is a dispatch on tokenizer.ggml.model](./adr/0045-the-tokenizer-engine-is-a-dispatch-on-tokenizer-ggml-model.md)
     - [0046. WordPiece is the third engine, and it follows BERT's normalizer](./adr/0046-wordpiece-is-the-third-engine-and-follows-berts-normalizer.md)
     - [0047. The unigram engine reads the file's charsmap, and SentencePiece is its reference](./adr/0047-the-unigram-engine-reads-the-files-charsmap-and-sentencepiece-is-its-reference.md)
+    - [0048. gemma4 is a BPE over raw UTF-8, and its rule comes from the model value](./adr/0048-gemma4-is-a-bpe-over-raw-utf8-and-its-rule-comes-from-the-model-value.md)
 
 # Model Support
 
