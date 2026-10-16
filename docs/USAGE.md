@@ -184,9 +184,10 @@ precompiled charsmap, the whitespace flags, then a score-weighted Viterbi, one
 `<unk>` per unmatched run) or `gemma4` (BPE over raw UTF-8: spaces escaped to
 `▁`, a newline-run rule derived from the model value, an all-newline-piece
 shortcut and `<0xXX>` byte fallback) `rwkv` (a greedy longest match over the
-vocabulary's decoded bytes, one `<unk>` per unmatched byte) or `plamo2` (a backward DP
-over the file's own scores with `<0xXX>` byte fallback) — and every other value
-**refuses the load** naming it (ADR-0045–ADR-0050). For the BPE engine `tokenizer.ggml.pre` selects the
+vocabulary's decoded bytes, one `<unk>` per unmatched byte) `plamo2` (a backward DP
+over the file's own scores with `<0xXX>` byte fallback) or `hybriddna` (the `gpt2`
+engine plus the `<dna>` k-mer block) — and every other value **refuses the load**
+naming it (ADR-0045–ADR-0051). For the BPE engine `tokenizer.ggml.pre` selects the
 pre-tokenization rule — `qwen2` (alias `deepseek-r1-qwen`), `qwen35`, `llama-bpe`
 (aliases `llama3`, `llama-v3`) or `lfm2` (the last two share the Llama 3.x
 pattern, whose only difference from `qwen2` is `\p{N}{1,3}`) — and an unknown or
