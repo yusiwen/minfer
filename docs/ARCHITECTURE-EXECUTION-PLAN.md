@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`), WordPiece (`model = bert`), unigram (`model = t5`), `gemma4` and `rwkv` DONE 2026-10-15/16, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`), WordPiece (`model = bert`), unigram (`model = t5`), `gemma4`, `rwkv` and `plamo2` DONE 2026-10-15/16, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -8167,6 +8167,45 @@ revision. (b) Every vocabulary entry is in the trie, `<unk>` included, so a text
 suffix-automaton table and needs a 2.7 GB artifact; it is the largest remaining slice.
 (d) [#575](https://github.com/yusiwen/minfer/issues/575) is still open. (e) Nothing here is
 device-adjacent.
+
+### F7 follow-up — S4: the plamo2 engine, and a measured design decision ([#132](https://github.com/yusiwen/minfer/issues/132)) — **DONE 2026-10-16**
+
+**What landed.** `TokenizerModel::Plamo2` (`tokenizer.ggml.model = plamo2`) plus `plamo2_encode`: a
+backward DP over codepoints whose objective is the file's own `tokenizer.ggml.scores` — `s =
+scores[i + piece_length] - round(score × 1e4)`, a **strict `<`** so a tie keeps the longest candidate,
+non-finite scores skipped as `INVALID_SCORE`, and a one-codepoint fallback row (`UNKNOWN_SCORE`) that
+emits **one `<0xXX>` byte token per UTF-8 byte**, never `<unk>`. A leading BOM is stripped; the `pre`
+key is not read (this artifact declares `"default"`, which is not one of the four accepted rules, and
+llama.cpp sets the pre-type from the model value). `VocabTrie` gains `step`/`terminal`, and
+`Tokenizer::id_to_score` gains its **first production reader**, so the `#[allow(dead_code)]` allowance
+#244 carried is gone (the oracle stays at 41 entries, 0/0). ADR-0050 amends ADR-0045.
+
+**The decision, measured rather than assumed.** llama.cpp indexes plamo2's candidate set with a suffix
+automaton (953 292 table rows over 193 510 token suffixes here), whose state depends on the text
+*suffix*, so a locally matching piece can in principle be unavailable. A literal Python port of its
+build + encode agrees with `llama-tokenize` **54/54** on the corpus; the direct trie DP agrees with
+that port **54/54** on the corpus, **0 divergences** over **160 000 random strings**, and **8/8** on
+purpose-built state-collapse cases (a real piece followed by a codepoint verified absent from all
+100 032 tokens). The port is therefore the DP, with the automaton recorded as the fallback design and
+the equality recorded as an observation, not a proof.
+
+**Fixture and evidence.** `tests/fixtures/tokenizer/ids_plamo-2-translate.json` (54 shared-corpus
+entries) gated against `mitmul/plamo-2-translate-GGUF`'s `plamo-2-translate_IQ1_S.gguf`
+(2 714 053 408 B, 100 032 tokens/scores, 256 `<0xXX>` byte tokens, `unknown_token_id = 0`). The
+reference is llama.cpp on the artifact — the engine *is* llama.cpp's construction over the file's
+vocabulary and scores. The artifact is a quant minfer **cannot run**; the gate only needs it to parse,
+which #575's accounting fix made possible, and the fixture says so. The ignored gate now covers
+**thirteen** cached models across **seven** engines.
+
+**Suite.** 554/0/41 -> **556 passed / 0 failed / 41 ignored** unit + 12 / 0 / 6 integration
+(+2 plamo2 tests). Six mutations, none escaped: `plamo2` refused again, run by the unigram engine, the
+`× 1e4` quantization dropped, the tie comparison relaxed to `<=`, the fallback emitting `<unk>`, and
+the BOM strip removed.
+
+**Honest scope.** (a) Seven engines of ten; `whitespace` (no converter emits it), `hybriddna` (no GGUF
+to gate against) and `none` (a vocabulary-less type) remain. (b) The DP/automaton equality is
+observational on three measured input sets. (c) The artifact is 2.7 GB and un-runnable here — a
+tokenizer reference only. (d) Nothing here is device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 
