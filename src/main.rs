@@ -1068,8 +1068,22 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let gguf_model =
-                gguf::load_gguf_model(std::path::Path::new(&model_path)).expect("parse GGUF");
+            // A parse failure is a *refusal*, not a panic: the loader has already
+            // printed the specific reason (magic, type, shape, bounds, …) to
+            // stderr, and this names the file and exits non-zero ([#580]).
+            //
+            // [#580]: https://github.com/yusiwen/minfer/issues/580
+            let gguf_model = match gguf::load_gguf_model(std::path::Path::new(&model_path)) {
+                Some(model) => model,
+                None => {
+                    eprintln!(
+                        "Error: '{}' is not a GGUF file minfer can parse; the loader's reason is \
+                         printed above",
+                        model_path
+                    );
+                    std::process::exit(1);
+                }
+            };
             let ctx = &gguf_model.parts[0].ctx;
             dump_gguf_metadata(ctx);
             dump_key_tensors(ctx);

@@ -1015,9 +1015,9 @@ redundancy is an assertion.
 
 - **`minfer info <model>`** (`src/main.rs:1055`) runs this exact stage and
   dumps its output instead of continuing: you get the full metadata KV dump
-  (`dump_gguf_metadata`, `src/main.rs:2406` — every key with its type and
+  (`dump_gguf_metadata`, `src/main.rs:2420` — every key with its type and
   value, arrays itemized) followed by `dump_key_tensors`' name/type/shape
-  table (`src/main.rs:2461`). On the 0.5B Q4_0 file: `n_kv=26`, `n_tensors=291`,
+  table (`src/main.rs:2475`). On the 0.5B Q4_0 file: `n_kv=26`, `n_tensors=291`,
   `general.architecture = "qwen2"`, `qwen2.block_count = 24`,
   `output.weight` q8_0 `[896,151936]`, `token_embd.weight` q4_0 `[896,151936]`.
 - **The normal startup lines** are this stage's stdout: `Loading model: …`,
@@ -1025,9 +1025,9 @@ redundancy is an assertion.
   `GGUF: 26 KV, 291 tensors` (line 634), then `Model loaded.` after doc 03.
   On a split you'll see `in 2 part(s)`; the number printed is the sum of the
   parts.
-- **`--meta` takes the same printer on a normal run** (`src/main.rs:1234`);
+- **`--meta` takes the same printer on a normal run** (`src/main.rs:1248`);
   without it the run prints the one-line `GGUF: N KV, M tensors`
-  (`src/main.rs:1236`) the transcript above shows.
+  (`src/main.rs:1250`) the transcript above shows.
 - **Unit tests**: `cargo test gguf` runs the split-pattern tests
   (`split_file_info_parses_pattern` at line 2059,
   `resolve_splits_builds_all_parts` at line 2078) — the filename grammar and
