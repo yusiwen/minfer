@@ -77,7 +77,7 @@ own invariants rather than inventing new ones.
 
 1. **Params-only reuse.** Anything that changes graph topology must join
    `GraphParams` / `CParams` and be compared in `GraphCache::params_match`
-   (`src/graph/cache.rs:57-64`); `n_past` never enters the identity. Decision: [ADR-0002](adr/0002-topology-is-a-function-of-graph-params.md).
+   (`src/graph/cache.rs:`); `n_past` never enters the identity. Decision: [ADR-0002](adr/0002-topology-is-a-function-of-graph-params.md).
 2. **No silent fallback.** A kernel-invariant violation returns `Err` from
    `execute_node` with the actual values; assignment is decided at build time. Decision: [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md).
 3. **Identity gate.** Any change to a kernel or an execution path is A/B'd
@@ -300,7 +300,7 @@ roadmap §4 defects automatically.
 
 ### A4 — Worker panic isolation  · item 6 · S — **DONE**
 - **Correction to the ticket as written:** the worker did have a
-  `catch_unwind` — `guarded_forward` (`chat.rs:438-450`) contains a panic inside
+  `catch_unwind` — `guarded_forward` (`chat.rs:`) contains a panic inside
   `forward_graph_cached`. It is just too narrow: the speculative path calls both
   models' forwards **directly** (`spec.rs:385/417/447/471/509`), and the
   tokenizer, sampler, stop-string and streaming paths were unguarded too. One
@@ -376,7 +376,7 @@ roadmap §4 defects automatically.
 ### A7 — Dead identity fields  · item 26 · S — **DONE, closed in E2**
 - **Decision taken: option (a)** — delete `CParams.n_batch`, keep `GraphParams.n_seqs`
   marked *reserved for item 3* (rationale in §8).
-- **Files:** `src/graph/params.rs`, `src/graph/cache.rs:57-64`,
+- **Files:** `src/graph/params.rs`, `src/graph/cache.rs:`,
   `src/graph/json.rs:40`, and the `n_batch` construction sites in
   `src/models/*/graph.rs`.
 - **Deliverable:** `n_batch` gone from `CParams`, from `params_match` and from
@@ -5532,7 +5532,7 @@ unchanged. `docs/status.toml` and `AGENTS.md` carry the new CUDA counts.
 production-shaped entry point with `#[cfg_attr(not(test), allow(dead_code))]` and a
 doc that claimed *"the model path and hand-built graphs both use it"*. The model path
 does not: `forward_batch` and `forward_cached` — the latter literally
-`forward_batch(&Batch::single(tokens, positions), …)` (`models/qwen2/graph.rs:458-465`)
+`forward_batch(&Batch::single(tokens, positions), …)` (`models/qwen2/graph.rs:`)
 — call `fill_batch_inputs`, a **separate implementation** of the same job. The
 coverage was therefore inverted: E2 had **one** test call site
 (`qwen2::graph::tests:2068`) while E1, which production never runs, had **15**. A
@@ -5659,7 +5659,7 @@ ticket asks for exactly that shape, not because it catches a bug.
 #### Test-infrastructure record (#232, 2026-09-29) — `GraphAllocator::kv_own_range` deleted; the tests drive `KvCache::own_range`
 
 **The finding (S2 of [#227](https://github.com/yusiwen/minfer/issues/227)).**
-`GraphAllocator::kv_own_range` (`alloc.rs:1645-1650` on master `f4d3390`) was a one-line
+`GraphAllocator::kv_own_range` (`alloc.rs:` on master `f4d3390`) was a one-line
 forwarder — `self.kv.own_range(seq, from, to)` — carrying
 `#[cfg_attr(not(test), allow(dead_code))]` and a doc that claimed a production role:
 *"Mark cells `[from, to)` as written by `seq` in every layer (E2's batched forwards write
@@ -5920,7 +5920,7 @@ here, and one of them changed a recorded call list without changing a bucket:
 - `optiming::record` vs `TimingSink::record`: the census's `optiming/tests.rs:142` caller is the
   sink's method; the free function's one caller is `graph/scheduler/tests.rs:208`.
 - `GgufContext::get_val_bool` vs `GgufKv::get_val_bool`: the four non-test matches (`gguf.rs:770`,
-  `:1752`, `:1849`, `main.rs:2412`) are the inner type's method; the context's is test-only.
+  `:1752`, `:1849`, `main.rs:2427`) are the inner type's method; the context's is test-only.
 - `CpuBackend::pool_len` vs `BackendTrait::pool_len`: `GraphAllocator::pool_len_of` calls the trait
   method; the inherent method's only caller is `n_cpu_buffers`.
 - `Tensor::new` vs `Vec::new()` / `String::new()` / `OnceLock::new()`: the census's ~200 "other
@@ -7192,8 +7192,8 @@ branch point (`bef4bd9`), not trusted from the ticket: `git grep -n 'KVCache' sr
 | Qwen2 impls | `src/models/qwen2/mod.rs:56`/`:97` (`kv` at `:60`/`:101`) | both removed; `use crate::cache::KVCache;` gone |
 | Qwen3 impls | `src/models/qwen3/mod.rs:48`/`:89` (`kv` at `:52`/`:93`) | both removed; `use crate::cache::KVCache;` gone |
 | graph entry points | `src/models/qwen2/graph.rs:435`, `src/models/qwen3/graph.rs:380` | `_kv: &mut KVCache` removed from `forward`; imports gone |
-| CLI construction | `src/main.rs:1241` (`KVCache::new`) | deleted, with the then-unused `n_kv_embd`/`n_layer` locals |
-| CLI forwards | `src/main.rs:1492`, `:1788` | argument dropped |
+| CLI construction | `src/main.rs:1256` (`KVCache::new`) | deleted, with the then-unused `n_kv_embd`/`n_layer` locals |
+| CLI forwards | `src/main.rs:1507`, `:1788` | argument dropped |
 | test construction | `src/models/qwen2/graph/tests.rs:2978/3019/3023` | `KVCache::new` calls and arguments dropped |
 | test mock | `src/server/batch/tests.rs:1794` (`FailingForward::forward`) | `_kv` parameter dropped |
 
@@ -7302,7 +7302,7 @@ names the removed type. (4) The `--tests` warnings are the two configurations' p
 
 `CParams.n_batch` and `GraphParams.n_seqs` live in the two structs that define
 the graph-reuse identity (`src/graph/params.rs`), and
-`GraphCache::params_match` compares both (`src/graph/cache.rs:57-64`). A change
+`GraphCache::params_match` compares both (`src/graph/cache.rs:`). A change
 in either forces a full graph rebuild.
 
 They are *dead* because nothing reads them:
@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`), WordPiece (`model = bert`), unigram (`model = t5`), `gemma4`, `rwkv` and `plamo2` DONE 2026-10-15/16, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`), WordPiece (`model = bert`), unigram (`model = t5`), `gemma4`, `rwkv`, `plamo2` and `none`/`no_vocab` DONE 2026-10-15/16, `whitespace` remains) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -8246,6 +8246,33 @@ the ASCII upper-casing dropped.
 type) remain. (b) Byte-wise chunking splits a multi-byte character inside a block, exactly as llama.cpp
 does — those pieces are `<oov>`, which is the recorded behaviour. (c) The NFC caveat above. (d) Nothing
 here is device-adjacent.
+
+### F7 follow-up — S4: the `none` engine, the checked entry points and the required key ([#132](https://github.com/yusiwen/minfer/issues/132), [#585](https://github.com/yusiwen/minfer/issues/585), [#586](https://github.com/yusiwen/minfer/issues/586)) — **DONE 2026-10-16**
+
+**What landed.** `TokenizerModel::None` accepts `none`/`no_vocab` and builds llama.cpp's placeholder
+contract (the optional `tokenizer.ggml.vocab_size` entries with empty text, no scores, no types, no
+specials), so `minfer info` works on a vocabulary-less file. `Tokenizer::encode_checked` /
+`decode_checked` are the **checked** pair — a named refusal for `model = none`, delegating to
+`encode`/`decode_bytes` for every engine that has a vocabulary, so nothing else changed; the CLI routes
+its prompt encoding and its display decoding through them (the latter is what the dead-code gate
+demanded: `decode_checked` had no production caller until then, and `deny(warnings)` failed the build).
+A **missing** `tokenizer.ggml.model` is now a named refusal instead of an implicit `gpt2` (#585),
+matching llama.cpp, which reads that key as required (`llama-vocab.cpp:1935`). ADR-0052 amends
+ADR-0045.
+
+**Why a deliberate divergence.** llama.cpp *aborts* in `tokenize` (`llama-vocab.cpp:3587`) and returns
+0 from `detokenize`; minfer refuses both by name, because an empty result is indistinguishable from
+"this text produced no tokens" and a panic is what #580 removed.
+
+**Suite.** 558/0/41 -> **560 passed / 0 failed / 41 ignored** unit + 12 / 0 / 6 integration (+2 tests:
+the placeholder/refusal contract, and the checked pair not changing any other engine). Four mutations,
+none escaped: `none` refused again, a missing key defaulting to `gpt2` again, `encode_checked`
+accepting `none`, and the placeholder count not read from `vocab_size`.
+
+**Honest scope.** (a) `whitespace` is S4's last value (no artifact found carrying it; the public Jina
+GGUFs use `gpt2` + `pre = jina-v1-en`, an unsupported pre rule). (b) A vocabulary-less model has no
+decode path at all — that is the contract, not an omission. (c) The end-to-end CLI refusal reuses
+#580's shape (non-zero exit + stderr message + no panic), which its own gate covers.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 
@@ -10047,7 +10074,7 @@ split is backend-agnostic and Metal's pool already ran through it.
 |---|---|---|---|
 | G1 | A3 | `pos < n_ctx` guard in Metal's `KvcacheStore` · [#38](https://github.com/yusiwen/minfer/issues/38) | **landed** on a Mac (2026-10-06): the allocator already bounds `cells`/`positions` on the `fill_input_i32` path (`docs/ARCHITECTURE-EXECUTION-PLAN.md` §A3), so the delta is the arm that indexes the region — `MetalBackend::check_kv_store_rows` now bounds every Metal KV-write arm (`KvcacheStore` on `cells`; `FusedQKV`/`FusedQkvNorm` on `positions`) against the layer region's `n_ctx` and returns `Err` naming the cell and the arena before any dispatch — record in `docs/METAL-BACKEND-DESIGN.md` §4.9; gate `metal_kvcache_store_refuses_a_cell_past_the_arena` (PR [#304](https://github.com/yusiwen/minfer/pull/304)) |
 | G2 | A8 | `debug_assert!` → `Err` for `FusedFFN`/`FusedQKV`/`FusedQkvNorm` `nt == 1` · [#39](https://github.com/yusiwen/minfer/issues/39) | **landed** on a Mac (2026-10-06): each decode-only arm now refuses `nt != 1` with an `Err` naming the node and the observed `nt` *before* the weight lookup, so a release build no longer dispatches a shape the kernel does not handle — record in `docs/METAL-BACKEND-DESIGN.md` §4.9; gates `metal_fused_ffn_refuses_nt_other_than_one` / `..._qkv_...` / `..._qkv_norm_...` drive each arm through the real `BackendScheduler::execute` (PR [#307](https://github.com/yusiwen/minfer/pull/307)) |
-| G3 | A8 | Remove the silent weightless-RMSNorm fallback (`metal_backend.rs:403-414`, `:457-468`) · [#40](https://github.com/yusiwen/minfer/issues/40) | **landed** on a Mac (2026-10-06): `Op::RmsNorm` and `Op::QkNorm` now call `MetalBackend::norm_weight`, which returns `Err` naming the node and the missing tensor for both `None` meanings (`weight_name` absent, or a set name the device never registered) instead of falling through to the weightless kernel — no supported producer builds a weightless norm, so nothing legitimate is lost — record in `docs/METAL-BACKEND-DESIGN.md` §4.9; gates `metal_rms_norm_refuses_a_weight_not_on_gpu` / `..._weightless_node` / `metal_qk_norm_refuses_a_weight_not_on_gpu` (PR [#311](https://github.com/yusiwen/minfer/pull/311)) |
+| G3 | A8 | Remove the silent weightless-RMSNorm fallback (`metal_backend.rs:`, `:457-468`) · [#40](https://github.com/yusiwen/minfer/issues/40) | **landed** on a Mac (2026-10-06): `Op::RmsNorm` and `Op::QkNorm` now call `MetalBackend::norm_weight`, which returns `Err` naming the node and the missing tensor for both `None` meanings (`weight_name` absent, or a set name the device never registered) instead of falling through to the weightless kernel — no supported producer builds a weightless norm, so nothing legitimate is lost — record in `docs/METAL-BACKEND-DESIGN.md` §4.9; gates `metal_rms_norm_refuses_a_weight_not_on_gpu` / `..._weightless_node` / `metal_qk_norm_refuses_a_weight_not_on_gpu` (PR [#311](https://github.com/yusiwen/minfer/pull/311)) |
 | G4 | A8 | CUDA/Metal op-set asymmetry: decide whether Metal gains `QkvBiasRopeStore` · [#52](https://github.com/yusiwen/minfer/issues/52) | **landed** on a Mac (2026-10-06): the decision is **keep the refusal** — the mixed-quant epilogue port would save 6 dispatches per mixed layer (10 → 4), **84/token** on Qwen2.5-7B-Q4_K_M (14/28 layers carry `attn_v` as Q6_K against Q4_K q/k), with no numerical difference and a sub-1% time ceiling, so the asymmetry is recorded instead of closed; record in `docs/SUPPORT-MATRIX.md` (PR [#318](https://github.com/yusiwen/minfer/pull/318)) |
 | G5 | C1/C2/E1 | Port the cell store, the KV removal/shift and the explicit attention span to Metal (`supports_attn_span()` becomes true; today `copy_kv_to_cpu` has no Metal arm, so a Metal session re-renders instead of shifting, and a multi-sequence batch is refused outright) · [#44](https://github.com/yusiwen/minfer/issues/44) | **landed** on a Mac (2026-10-06), both halves. **(a) read side** — `kernel_gqa_attn_window_f32/_f16` (`src/metal/kernels/attn_window.metal`) reads the one-range `attn_span` window for `nt == 1` and `nt > 1` at both KV widths, the `Op::Attn` arm selects the mode by the window input's *size* (causal / span / a refused map) and `supports_attn_span()` is true; the causal kernels are byte-untouched (PR [#313](https://github.com/yusiwen/minfer/pull/313)). **(b) write/move side** (PR [#316](https://github.com/yusiwen/minfer/pull/316)) — `Backend::copy_cells` moves rows one at a time with `MTLBlitCommandEncoder` in the overlap-safe order (both directions; f16 halves the stride), `GraphAllocator::copy_kv_to_cpu` reads through the registry `host_read` hook after flushing the split (so a Metal session shifts/saves instead of re-rendering), `MetalBackend` holds a per-engine `kv_format` (the process-wide `KV_F16`/`kv_cache_is_f16`/`set_kv_cache_type` are deleted) and `batch_mode(Metal)` follows the device. The packed `q8_0` read is enabled since [#310](https://github.com/yusiwen/minfer/issues/310) (mechanism A native packed decode + mechanism B f32 stage) and a physical shift of an f16 region refuses loudly ([#306](https://github.com/yusiwen/minfer/issues/306), CUDA exposed too). Records: `docs/METAL-BACKEND-DESIGN.md` §4.4.2; gates `metal_copy_cells_moves_overlapping_rows_in_both_directions` / `metal_f16_kv_cell_move_strides_by_row_bytes` / `metal_kv_format_is_per_engine` / `metal_copy_kv_to_cpu_reads_after_the_pending_split`, the Metal arms of `a_compaction_between_steps_keeps_the_continuation` / `kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class` / `reused_cache_across_prompts_matches_a_fresh_cache` and `a_long_prefill_keeps_another_slot_decoding`, plus `metal_attn_span_*`. The windowed kernel is a correctness path, not a speed one — a batched multi-sequence prefill runs it and its throughput is unmeasured ([#315](https://github.com/yusiwen/minfer/issues/315)) |
 | G6 | E4 | Adopt the reserve/assign allocator split in Metal's pool · [#53](https://github.com/yusiwen/minfer/issues/53) | **landed** on a Mac (2026-10-05): the allocator split was already backend-agnostic (E4 S3), so the delta is Metal's `DeviceMemory` answer (`recommendedMaxWorkingSetSize`) — record under the E4 record |

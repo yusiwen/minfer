@@ -429,6 +429,21 @@ fn split_backend_flag(args: Vec<String>) -> (Vec<String>, Vec<String>) {
     (rest, names)
 }
 
+/// Decode one token for display, through the **checked** entry point: a
+/// vocabulary-less model (`model = none`) cannot turn ids into text, and that is a
+/// named refusal rather than an empty string ([#586]).
+///
+/// [#586]: https://github.com/yusiwen/minfer/issues/586
+fn decode_token(tokenizer: &tokenizer::Tokenizer, id: u32) -> Vec<u8> {
+    match tokenizer.decode_checked(&[id]) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let prog = raw_args[0].clone();
@@ -1501,7 +1516,10 @@ fn main() {
     };
     #[cfg(feature = "debug_dump")]
     crate::dump::maybe_dump_text("minfer_dump_prompt", &processed);
-    let input_ids = tokenizer.encode(&processed);
+    let input_ids = match tokenizer.encode_checked(&processed) {
+        Ok(ids) => ids,
+        Err(e) => refuse(e),
+    };
     if input_ids.is_empty() {
         eprintln!("tokenize failed");
         std::process::exit(1);
@@ -1700,7 +1718,7 @@ fn main() {
         } else {
             generated.push(next_token);
             prev_tokens.push(next_token);
-            full.extend_from_slice(&tokenizer.decode_bytes(&[next_token]));
+            full.extend_from_slice(&decode_token(&tokenizer, next_token));
             if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
                 full.truncate(cut);
                 if cut > emitted {
@@ -1715,7 +1733,7 @@ fn main() {
             }
             if trace_on {
                 let text =
-                    String::from_utf8_lossy(&tokenizer.decode_bytes(&[next_token])).into_owned();
+                    String::from_utf8_lossy(&decode_token(&tokenizer, next_token)).into_owned();
                 crate::trace::set_token(next_token, &text);
             }
         }
@@ -1743,7 +1761,7 @@ fn main() {
                     break;
                 }
                 generated.push(tok);
-                full.extend_from_slice(&tokenizer.decode_bytes(&[tok]));
+                full.extend_from_slice(&decode_token(&tokenizer, tok));
                 if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
                     full.truncate(cut);
                     if cut > emitted {
@@ -1758,8 +1776,7 @@ fn main() {
                     emitted = full.len();
                 }
                 if trace_on {
-                    let text =
-                        String::from_utf8_lossy(&tokenizer.decode_bytes(&[tok])).into_owned();
+                    let text = String::from_utf8_lossy(&decode_token(&tokenizer, tok)).into_owned();
                     crate::trace::set_token(tok, &text);
                 }
                 consumed += 1;
@@ -1827,7 +1844,7 @@ fn main() {
             }
 
             // Stop-string detection on the FULL byte stream before emitting.
-            full.extend_from_slice(&tokenizer.decode_bytes(&[sampled.token_id]));
+            full.extend_from_slice(&decode_token(&tokenizer, sampled.token_id));
             if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
                 full.truncate(cut);
                 if cut > emitted {
@@ -1844,7 +1861,7 @@ fn main() {
             // forward() returns n_out*nv logits (n_out=1 for single-token decode,
             // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
             if trace_on {
-                let text = String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id]))
+                let text = String::from_utf8_lossy(&decode_token(&tokenizer, sampled.token_id))
                     .into_owned();
                 crate::trace::set_token(sampled.token_id, &text);
             }
@@ -2531,3 +2548,13 @@ fn get_chat_template(data: &[u8]) -> Option<String> {
 mod arg_parse_tests;
 #[cfg(test)]
 mod think_highlighter_tests;
+
+/// A refusal that cannot be ignored: the loader's message on stderr, a non-zero exit
+/// and no panic ([#580]). At the end of the file on purpose — the doc anchors above
+/// cite `main.rs` line numbers, so a helper inserted in the middle would move them.
+///
+/// [#580]: https://github.com/yusiwen/minfer/issues/580
+fn refuse(message: String) -> ! {
+    eprintln!("Error: {message}");
+    std::process::exit(1)
+}

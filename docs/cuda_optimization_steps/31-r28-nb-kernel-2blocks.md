@@ -315,7 +315,7 @@ if !nb_ok { /* wide → narrow, unchanged */ }
 
 (This segment has since evolved further in the current tree: r34's A-transpose
 prepass path now sits at the front, with plain NB as its fallback arm —
-`src/cuda.rs:3352-3380`; the NB-BT variant carries the default path.)
+`src/cuda.rs:`; the NB-BT variant carries the default path.)
 
 ### 3.3 Pitfalls
 

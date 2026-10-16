@@ -244,7 +244,7 @@ __global__ void add_bias_f32(
   is read by every row, so it stays hot in L2 across the grid.
 
 The bias call site sits *inside* the MatMul arm
-(`src/graph/cuda_backend.rs:1510-1514`, the `add_bias_f32` epilogue), and the comment there
+(`src/graph/cuda_backend.rs:`, the `add_bias_f32` epilogue), and the comment there
 records the one bug-prone detail of this kernel's contract:
 
 ```rust
@@ -256,7 +256,7 @@ self.state.add_bias_f32(self.ptr_of_ref(out_buf)?, bptr, od, nt);
 
 Pass the element count instead of the row count and `grid.x` becomes `nt * d`
 rows — the kernel indexes `y[t * d + i]` far past the buffer. The Rust
-wrapper's docstring `add_bias_f32` (`src/cuda/methods/elementwise.rs:104-107`) repeats the warning. This is the
+wrapper's docstring `add_bias_f32` (`src/cuda/methods/elementwise.rs:`) repeats the warning. This is the
 chapter's first lesson in **grid-shape contracts**: a kernel is not just its
 body, it is the geometry its launcher assumes.
 
@@ -414,7 +414,7 @@ kernels in a profile:
 - Why a cache at all: the two-pass prefill GEMM used to dequantize W on
   *every* call — "288 ms per 7B @2K forward" — because weights are immutable
   after registration, the dequant result is cached per weight pointer
-  (`w16_cache` (`src/cuda.rs:615-623`)).
+  (`w16_cache` (`src/cuda.rs:`)).
 
 And why dequantize at all, when the CPU side made a point of *never*
 dequantizing at load (walkthrough doc 10 §2.1's bandwidth argument)? The
@@ -429,7 +429,7 @@ token; on the GPU it buys access to hardware the packed format cannot feed.
 the full story.)
 
 An honest footnote from the same dispatch comment
-(`src/cuda/methods/dispatch.rs:173-183`): the *default* prefill today is the int8 MMQ GEMM,
+(`src/cuda/methods/dispatch.rs:`): the *default* prefill today is the int8 MMQ GEMM,
 which streams raw quantized bytes and never touches `dequant_*_f16` —
 `MINFER_MMQ=0` escapes to the f16 wmma path that does. Both paths coexist;
 §5 shows how to run each.
@@ -561,7 +561,7 @@ if §3.1 made sense, these read themselves.
 ### 4.1 Bytes per element — before and after dequant
 
 The fixed exchange rate of this chapter, from the block layouts
-(`src/block.rs:30-38`, walkthrough doc 02):
+(`src/block.rs:`, walkthrough doc 02):
 
 | Representation | Bytes / element | 0.5B tok_embd (151,936 × 896) |
 |---|---|---|
@@ -574,7 +574,7 @@ What that does to bandwidth, both directions:
 - **Every kernel that reads the f16 copy pays 3.56× the weight bytes** that
   the packed MMQ kernels pay (2 vs 0.5625 B/elem). That is the standing cost
   of the f16 prefill path, and the reason the int8 MMQ GEMM — which streams
-  raw nibbles — is the default (dispatch comment, `src/cuda/methods/dispatch.rs:173-183`).
+  raw nibbles — is the default (dispatch comment, `src/cuda/methods/dispatch.rs:`).
 - **The one-time dequant itself moves ≈ 349 MB** (read 76.6 + write 272.3)
   per weight tensor of that size, which is why the campaign cached the
   result: doing it per call cost a measured 288 ms per 7B @2K forward before
@@ -621,7 +621,7 @@ contiguous).
 - **A wrong grid contract.** Pass element count instead of row count to
   `add_bias_f32` and you launch `nt × d` block-rows — out-of-bounds writes,
   not a slowdown but a crash or silent corruption (the call-site comment,
-  `src/graph/cuda_backend.rs:1510-1512`).
+  `src/graph/cuda_backend.rs:`).
 - **Element-per-thread dequant.** One thread per *element* would re-read the
   scale byte and re-enter the nibble 32× more often per output; the
   block-per-thread shape exists to amortize the scale read and emit

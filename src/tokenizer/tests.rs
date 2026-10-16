@@ -219,6 +219,58 @@ fn a_chat_token_the_file_does_not_declare_is_not_invented() {
     assert!(!t.special_tokens.contains_key("<|im_end|>"));
 }
 
+// === #132 S4: the `none` engine, the checked entry points, and the required key =====
+
+/// A vocabulary-less file, written by minfer's own writer and read straight back:
+/// `model = none` with `tokenizer.ggml.vocab_size = N`, which is the shape
+/// llama.cpp builds (`llama-vocab.cpp:1942`).
+fn none_tokenizer(n: u32) -> Tokenizer {
+    let kv = vec![
+        crate::gguf::GgufKv::new_string("general.architecture".into(), "llama".into()),
+        crate::gguf::GgufKv::new_string("tokenizer.ggml.model".into(), "none".into()),
+        crate::gguf::GgufKv::new_u32("tokenizer.ggml.vocab_size".into(), n),
+    ];
+    let path = std::env::temp_dir().join("minfer-none-vocab.gguf");
+    let data = |_i: usize, _w: &mut dyn std::io::Write| Ok(());
+    crate::gguf_write::write_single(&path, &kv, vec![], 32, data).expect("write the fixture");
+    let bytes = std::fs::read(&path).expect("read it back");
+    let ctx = GgufContext::init_from_data(&bytes).expect("parse it");
+    let t = Tokenizer::load(&ctx).expect("a vocabulary-less file loads");
+    let _ = std::fs::remove_file(&path);
+    t
+}
+
+#[test]
+fn none_builds_placeholder_tokens_and_refuses_text() {
+    let t = none_tokenizer(7);
+    assert_eq!(t.model, TokenizerModel::None);
+    // The placeholder count is the file's `vocab_size`, exactly as llama.cpp's
+    // `id_to_token.resize(n_tokens)` builds it: ids exist, text does not.
+    assert_eq!(t.id_to_token.len(), 7);
+    assert!(t.id_to_token.iter().all(|s| s.is_empty()));
+    // Text cannot be tokenized — a named refusal, never an empty vector (#586).
+    let err = t.encode_checked("hello").unwrap_err();
+    assert!(err.contains("vocabulary-less"), "{err}");
+    assert!(err.contains("supply token ids directly"), "{err}");
+    // And the ids cannot be turned back into text either.
+    let err = t.decode_checked(&[0, 1]).unwrap_err();
+    assert!(err.contains("no text representation"), "{err}");
+    // The infallible shorthand still exists for the engines that cannot fail; on
+    // this one it is deliberately empty and `encode_checked` is the authority.
+    assert!(t.encode("hello").is_empty());
+}
+
+#[test]
+fn every_other_engine_still_tokenizes_through_the_checked_entry_point() {
+    let t = test_tokenizer();
+    assert_eq!(
+        t.encode_checked("hello").unwrap(),
+        t.encode("hello"),
+        "the checked entry point must not change any engine that has a vocabulary"
+    );
+    assert_eq!(t.decode_checked(&[0]).unwrap(), t.decode_bytes(&[0]));
+}
+
 // === #132 S4: the hybriddna engine ========================================
 
 /// A tokenizer carrying only the DNA block state: the three tag ids and a k-mer
@@ -700,10 +752,8 @@ fn spm_tokenizer(add_space_prefix: bool) -> Tokenizer {
 
 #[test]
 fn the_tokenizer_model_is_a_dispatch() {
-    assert_eq!(
-        TokenizerModel::from_gguf(None).unwrap(),
-        TokenizerModel::Gpt2
-    );
+    // A missing key is a refusal, not an implicit `gpt2` (#585) — the assertion
+    // lives next to the `none`/`no_vocab` arms below.
     assert_eq!(
         TokenizerModel::from_gguf(Some("gpt2")).unwrap(),
         TokenizerModel::Gpt2
@@ -736,9 +786,21 @@ fn the_tokenizer_model_is_a_dispatch() {
         TokenizerModel::from_gguf(Some("hybriddna")).unwrap(),
         TokenizerModel::HybridDna
     );
+    // A vocabulary-less file is accepted (so it can be inspected), and a **missing**
+    // model key is a refusal rather than an implicit `gpt2` (#585).
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("none")).unwrap(),
+        TokenizerModel::None
+    );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("no_vocab")).unwrap(),
+        TokenizerModel::None
+    );
+    let err = TokenizerModel::from_gguf(None).unwrap_err();
+    assert!(err.contains("tokenizer.ggml.model is missing"), "{err}");
     // Every other engine is refused *by name* — an approximation with the wrong
     // engine would be worse than a refusal.
-    for other in ["whitespace", "none"] {
+    for other in ["whitespace"] {
         let err = TokenizerModel::from_gguf(Some(other)).unwrap_err();
         assert!(
             err.contains(other),
@@ -1409,6 +1471,7 @@ impl TokenizerModel {
             Self::Rwkv => "rwkv",
             Self::Plamo2 => "plamo2",
             Self::HybridDna => "hybriddna",
+            Self::None => "none",
         }
     }
 }

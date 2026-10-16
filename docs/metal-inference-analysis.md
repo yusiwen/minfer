@@ -60,14 +60,14 @@ minfer only has mat-vec kernels (`NR0=2-4` rows per threadgroup). During prefill
 **Files**: `cache.rs` vs `src/metal/ops.rs`
 
 Two independent KV caches are maintained:
-- CPU side: `KVCache.layers[i].k/v` (`Vec<f32>`, `cache.rs:6-11`)
+- CPU side: `KVCache.layers[i].k/v` (`Vec<f32>`, `cache.rs:`)
 - GPU side: `kv_k`/`kv_v` (`Vec<metal::Buffer>`, `src/metal/ops.rs`)
 
 The GPU path writes KV via `store_kv_f32`, but the CPU KV cache is never updated. If the inference falls back from GPU to CPU path, KV data is lost.
 
 ### HIGH #4 — Single CommandBuffer, No Parallelism
 
-**Files**: `src/metal/`, `forward.rs:62-75`
+**Files**: `src/metal/`, `forward.rs:`
 
 All layers are encoded into one `MpsCommandBuffer`, then `submit()` blocks until completion. The GPU sits idle while the CPU encodes.
 
@@ -89,7 +89,7 @@ Before each GPU matmul dispatch, `quantize_row_q8_0_buf` runs on the CPU to quan
 
 ### HIGH #7 — No Non-Mac GPU Path
 
-**Files**: `src/metal/`, `main.rs:17-18`
+**Files**: `src/metal/`, `main.rs:`
 
 `MpsStateInner` is entirely wrapped in `#[cfg(target_os = "macos")]`. There is no Vulkan/MoltenVK fallback for Intel Macs.
 

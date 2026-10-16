@@ -64,7 +64,7 @@ out: [nt][od] f32
 The block sizes come from `block.rs` and are the contract between the GGUF file (doc 02), the loader (doc 03), and the kernels:
 
 ```rust
-// src/block.rs:18-27
+// src/block.rs:
 pub const Q4B: usize = 18;  // sizeof(block_q4_0)
 pub const Q8B: usize = 34;  // sizeof(block_q8_0)
 pub const Q4KB: usize = 144; // sizeof(block_q4_k)
@@ -77,7 +77,7 @@ Sanity check with a real number: `token_embd` of Qwen2.5-0.5B in Q4_0 with `id =
 
 ### 2.4 Two activation formats, one pairing rule
 
-The entry-point branch (`src/kernel/dispatch.rs:9-31`, below) is not cosmetic — each weight family pairs with a **specific activation format**, fixed by the kernels' inner loops:
+The entry-point branch (`src/kernel/dispatch.rs:`, below) is not cosmetic — each weight family pairs with a **specific activation format**, fixed by the kernels' inner loops:
 
 | Weight family | Weight block | Paired activation format | Activation block |
 |---|---|---|---|
@@ -87,11 +87,11 @@ The entry-point branch (`src/kernel/dispatch.rs:9-31`, below) is not cosmetic �
 The Q8_K pairing exists because the K-quant kernels unpack one 256-value weight super-block — with its 8 sub-block scales and mins — and want the matching 256-value activation super-block with its own group sums (`bsums`, used by the K-quant dot's correction term) adjacent. The layout comment is pinned in the source:
 
 ```text
-// src/quants/quantize_q8_k.rs:8-18 — activation q8_K block: d(f16) + qs[256 i8] +
+// src/quants/quantize_q8_k.rs: — activation q8_K block: d(f16) + qs[256 i8] +
 // bsums[16 i16] = 306 bytes (crate::block::Q8KB).
 ```
 
-(Note a subtlety doc 02 flagged: `block.rs`'s `BlockQ8_K` *struct* — a `f32 d` ggml-style layout, `block.rs:173-177` — is not the same 306-byte arrangement the activation quantizer writes. The activation-side format is defined by the quantizer + dot kernel pair, and that is the only contract the matmul path relies on.)
+(Note a subtlety doc 02 flagged: `block.rs`'s `BlockQ8_K` *struct* — a `f32 d` ggml-style layout, `block.rs:` — is not the same 306-byte arrangement the activation quantizer writes. The activation-side format is defined by the quantizer + dot kernel pair, and that is the only contract the matmul path relies on.)
 
 ## 3. Implementation
 
@@ -123,7 +123,7 @@ Every number here comes straight from the formulas of §2.3/§3.2 — this table
 **The entry point: quantize activations, then dispatch.** `cpu_quant_matmul_f32` is what the CPU backend's `MatMul` arm calls (doc 08):
 
 ```rust
-// src/kernel/dispatch.rs:9-31
+// src/kernel/dispatch.rs:
 pub fn cpu_quant_matmul_f32(w: &Tensor, x: &[f32], out: &mut [f32],
                             od: usize, id: usize, nt: usize) {
     match w.ttype {
@@ -148,7 +148,7 @@ The two activation formats of §2.4 are chosen *here*, once, so no call site can
 **The row kernel: `mm_rows`.** One function handles every weight type; the type only changes the byte arithmetic and which `dot_*` gets called:
 
 ```rust
-// src/kernel/pool.rs:98-120 (Q4_0 arm; the other 7 arms are the same shape)
+// src/kernel/pool.rs: (Q4_0 arm; the other 7 arms are the same shape)
 unsafe fn mm_rows(job: &MmJob, r0: usize, r1: usize) {
     let od = job.od;          // outputs (weight rows)
     let id = job.id;          // input dim
@@ -176,7 +176,7 @@ The other arms only change the stride constants and the kernel name: `Q8_0` has 
 **One AVX2 kernel, line by line.** `dot_q4_0_q8_0` first picks its engine (all the `dot_*` wrappers share this shape):
 
 ```rust
-// src/quants/dot_q4_0.rs:9-25 (abridged to the dispatch)
+// src/quants/dot_q4_0.rs: (abridged to the dispatch)
 pub fn dot_q4_0_q8_0(q4: &[u8], q8: &[u8]) -> f32 {
     let nb = q8.len() / Q8B;                       // 32-value blocks
     #[cfg(target_arch = "x86_64")]
@@ -192,7 +192,7 @@ Runtime detection (`is_x86_feature_detected!`, wrapped in `avx2_enabled()`) is w
 The AVX2 kernel processes one 32-value block per iteration with two 256-bit registers:
 
 ```rust
-// src/quants/dot_q4_0.rs:29-52 (core loop, comments mine)
+// src/quants/dot_q4_0.rs: (core loop, comments mine)
 unsafe fn dot_q4_0_q8_0_avx2(x: &[u8], y: &[u8], nb: usize) -> f32 {
     let mut acc = _mm256_setzero_ps();
     for ib in 0..nb {
@@ -224,7 +224,7 @@ The moves worth understanding:
 4. **The horizontal sum** is its own small art — one lane value out of eight:
 
 ```rust
-// src/quants/avx2.rs:76-81
+// src/quants/avx2.rs:
 unsafe fn hsum_float_8(x: __m256) -> f32 {
     let x128 = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
     let x128 = _mm_add_ps(x128, _mm_movehl_ps(x128, x128));
@@ -235,7 +235,7 @@ unsafe fn hsum_float_8(x: __m256) -> f32 {
 **The scalar kernel is the reference semantics.** Before admiring the SIMD, read the portable version — it is the mathematical definition every fast path must reproduce:
 
 ```rust
-// src/quants/dot_q4_0.rs:54-71
+// src/quants/dot_q4_0.rs:
 fn dot_q4_0_q8_0_scalar(x: &[u8], y: &[u8], nb: usize) -> f32 {
     let mut s = 0.0f32;
     for ib in 0..nb {
@@ -261,7 +261,7 @@ This is also the honest worked example. Take `dx = dy = 1.0` for clarity and a w
 **The Q8_0 kernel is the same skeleton, minus unpacking.** With both sides already int8, the loop shrinks to load-scale-multiply-accumulate:
 
 ```rust
-// src/quants/dot_q8_0.rs:28-48 (core, abridged)
+// src/quants/dot_q8_0.rs: (core, abridged)
 unsafe fn dot_q8_0_q8_0_avx2(x: &[u8], y: &[u8], nb: usize) -> f32 {
     let mut acc = _mm256_setzero_ps();
     for ib in 0..nb {
@@ -287,7 +287,7 @@ This kernel is also the entire `lm_head` story: the output projection matmul (vo
 **The NEON counterpart: one instruction, 16 MACs.** On aarch64 (Apple Silicon, doc 14's home turf) the equivalent of the unpack-and-multiply chain is a single instruction — `SDOT`, issued through inline assembly because Rust's `std::arch` exposed no stable intrinsic at the time:
 
 ```rust
-// src/quants/neon.rs:44-54
+// src/quants/neon.rs:
 #[target_feature(enable = "dotprod")]
 pub(super) unsafe fn sdot_vec(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
     std::arch::asm!(
@@ -304,7 +304,7 @@ Each `sdot` takes two 16-byte int8 vectors and adds **sixteen** multiply-accumul
 **The activation quantizers.** The Q8_0 one, entry first:
 
 ```rust
-// src/quants/quantize_q8_0.rs:85-93 (entry; _buf variant at :95 writes into a caller buffer)
+// src/quants/quantize_q8_0.rs: (entry; _buf variant at :95 writes into a caller buffer)
 pub fn quantize_row_q8_0(x: &[f32]) -> Vec<u8> {
     let k = x.len();
     debug_assert!(k % 32 == 0);
@@ -318,7 +318,7 @@ pub fn quantize_row_q8_0(x: &[f32]) -> Vec<u8> {
 Per 32-value block: find `amax = max|x|`, store `d = amax / 127` as `f16` (2 bytes), store each `x[i]/d` rounded to nearest `i8` (32 bytes) → 34 bytes. The AVX2 variant (`quantize_avx2`, `src/quants/avx2.rs:7`) is worth reading because it shows the max-reduce and the rounding in registers:
 
 ```rust
-// src/quants/avx2.rs:7-27 (core, abridged)
+// src/quants/avx2.rs: (core, abridged)
 unsafe fn quantize_avx2(x: &[f32], y: &mut [u8], k: usize) {
     for i in 0..nb {
         let v0..v3 = /* four 8-float loads: the 32-value block */;
@@ -340,7 +340,7 @@ Two details to notice: the **absolute value is free** (`_mm256_andnot_ps` with `
 The K-quant activations quantizer (`quantize_row_q8_k_buf`, `src/quants/quantize_q8_k.rs:25`) fills the 306-byte Q8_K blocks of §2.4. Its NEON worker (`:75`) shows every field:
 
 ```rust
-// src/quants/quantize_q8_k.rs:75-114 (core, abridged)
+// src/quants/quantize_q8_k.rs: (core, abridged)
 unsafe fn quantize_row_q8_k_buf_neon(row: &[f32], out: &mut [u8]) {
     for s in 0..n_super {
         let blk = &row[s * 256..(s + 1) * 256];
@@ -362,10 +362,10 @@ unsafe fn quantize_row_q8_k_buf_neon(row: &[f32], out: &mut [u8]) {
 
 Three details carry weight: ② uses **saturating** narrowing (clamping to [−128, 127] exactly like the scalar `.clamp()`), ③ computes the `bsums` from the *saturated* values so the integer group sums are exact — the K-quant dot kernels use them for their correction term and any drift there would break parity — and ④ keeps the reserved field zeroed so the region reads deterministically. The AVX2/scalar paths write byte-identical layouts, which is what lets one kernel consume activations from any build.
 
-**The payoff: a K-quant dot kernel, walked.** All of §2.4's structure (super-scales, 6-bit sub-scales, mins, `bsums`) exists to serve this loop — `dot_q4_k_q8_k_scalar` (`src/quants/kquant.rs:30-69`), the reference every K-quant fast path must match:
+**The payoff: a K-quant dot kernel, walked.** All of §2.4's structure (super-scales, 6-bit sub-scales, mins, `bsums`) exists to serve this loop — `dot_q4_k_q8_k_scalar` (`src/quants/kquant.rs:`), the reference every K-quant fast path must match:
 
 ```rust
-// src/quants/kquant.rs:30-69 (scalar, abridged but complete in structure)
+// src/quants/kquant.rs: (scalar, abridged but complete in structure)
 fn dot_q4_k_q8_k_scalar(q4: &[u8], q8k: &[u8]) -> f32 {
     for i in 0..n_super {
         let d    = w_scale(i) * a_scale(i);          // super-scale × activation scale
@@ -407,7 +407,7 @@ The Q4_K value formula is `value = q · d_s − min_s` per sub-block `s` (a *non
 **The persistent thread pool.** Decode runs ~250 matmuls per token (doc 13), each tiny (one token row through `od` rows of weights). Spawning threads per matmul measured **~170 µs** (kernel.rs's own comment) — against a per-token budget of a few milliseconds, that alone would be the bottleneck:
 
 ```text
-// src/kernel/pool.rs:242-249 (the dispatch every worker wakes for)
+// src/kernel/pool.rs: (the dispatch every worker wakes for)
 let job = *pool.job.lock().unwrap();
 match job {
     PoolJob::MatMul(m) => {
@@ -423,7 +423,7 @@ The design (kernel.rs comment block, lines ~274–287):
 
 - Workers are spawned **once**, lazily, by `get_pool` (`OnceLock`, process lifetime) and spin on an atomic `gen` counter — 8000 spin iterations, then `yield_now`, so idle workers cost nothing but wake in microseconds.
 - The submitting thread publishes a `MmJob` under `job`, bumps `gen`, and waits on `done == n+1` (the main thread participates as the last worker — no wasted idle main).
-- A `gate` `Mutex` serializes submissions: the comment (`src/kernel/pool.rs:212-218`) records the real hazard — two concurrent callers (parallel tests, the multi-slot server) would clobber `job` and share `done`, letting one caller return before *its* range was computed while workers still read its stack-local context. That is a use-after-free, and the fix is one lock around submit→wait.
+- A `gate` `Mutex` serializes submissions: the comment (`src/kernel/pool.rs:`) records the real hazard — two concurrent callers (parallel tests, the multi-slot server) would clobber `job` and share `done`, letting one caller return before *its* range was computed while workers still read its stack-local context. That is a use-after-free, and the fix is one lock around submit→wait.
 - `chunk(parts, idx, total)` splits `od` rows evenly; each row belongs to exactly one worker → bit-identical results at any thread count (§2.3's promise).
 - Worker count: `set_cpu_threads` (CLI `--threads`, `src/kernel/pool.rs:21`) must run before the first matmul because the pool is spawned lazily on first use; `cpu_threads()` (`:28`) reads the `CPU_THREADS` atomic where `0` means auto-detect.
 - The same pool also serves `par_for` (`src/kernel/pool.rs:290`) — which is exactly what attention reuses for per-head parallelism in doc 11.
@@ -431,7 +431,7 @@ The design (kernel.rs comment block, lines ~274–287):
 **The embedding "matmul".** `embed_tokens` (`src/kernel/embed.rs:5`) is not a matmul at all: for each token id it walks the quantized `token_embd` row block-by-block, dequantizing (scale × nibble for Q4_0/Q4_1, scale × byte for Q8_0) into the output row:
 
 ```rust
-// src/kernel/embed.rs:5-26 (Q4_0/Q8_0/Q4_1 arm, abridged)
+// src/kernel/embed.rs: (Q4_0/Q8_0/Q4_1 arm, abridged)
 pub fn embed_tokens(ids: &[u32], t: &crate::tensor::Tensor, out: &mut [f32], ne: usize) {
     for (ti, &id) in ids.iter().enumerate() {
         let idx = id as usize;                       // the token's row in the table
@@ -463,11 +463,11 @@ This is the `GetRows` node of doc 05 made concrete — "the embedding table is a
 ### 3.4 Pitfalls & invariants
 
 - **Block-size divisibility is a format contract, not a hint.** `id % 32 == 0` (and `id % 256 == 0` for K-quants) is guaranteed by GGUF conversion tools and asserted in the quantizer; a model that broke it would silently misindex without the assert.
-- **The transposed-output bug that decode hid** (`src/vec_ops/vec.rs:366-370`, the `mat_mul_f32` comment): an earlier version wrote `C[row*n + col]` — an `[m,n]` output — while every caller wanted `[nt][od]`. For decode (`nt == 1`) the two layouts coincide, so no decode-only test caught it; prefill output was transposed. Lesson the repo kept: **test with `nt > 1` or the token-major convention will bite.**
+- **The transposed-output bug that decode hid** (`src/vec_ops/vec.rs:`, the `mat_mul_f32` comment): an earlier version wrote `C[row*n + col]` — an `[m,n]` output — while every caller wanted `[nt][od]`. For decode (`nt == 1`) the two layouts coincide, so no decode-only test caught it; prefill output was transposed. Lesson the repo kept: **test with `nt > 1` or the token-major convention will bite.**
 - **Row ownership = bit-identical parallelism.** Never "optimize" the pool into splitting a row's reduction; that trades away the determinism the verification gates rely on (§3.3).
-- **The `gate` lock is load-bearing** (`src/kernel/pool.rs:212-218`): removing it works in single-threaded tests and corrupts memory the first time two threads submit concurrently (the server's multi-slot path).
+- **The `gate` lock is load-bearing** (`src/kernel/pool.rs:`): removing it works in single-threaded tests and corrupts memory the first time two threads submit concurrently (the server's multi-slot path).
 - **K-quant weights need Q8_K activations, 32-value weights need Q8_0** — crossing the pairing (e.g. feeding Q8_0 blocks to `dot_q4_k_q8_k`) misindexes the super-block scales. The `cpu_quant_matmul_f32` branch exists to make the pairing unstateable from the call site.
-- **The activation-Q8_K layout is kernel-pair-defined** — 306 bytes as written by `quantize_row_q8_k_buf` (`src/quants/quantize_q8_k.rs:20-25` comment), *not* the `BlockQ8_K` struct layout (`block.rs:173`); doc 02 flagged the same nuance on the on-disk side. When touching either side, re-verify the quantizer→kernel byte contract together.
+- **The activation-Q8_K layout is kernel-pair-defined** — 306 bytes as written by `quantize_row_q8_k_buf` (`src/quants/quantize_q8_k.rs:` comment), *not* the `BlockQ8_K` struct layout (`block.rs:173`); doc 02 flagged the same nuance on the on-disk side. When touching either side, re-verify the quantizer→kernel byte contract together.
 - **Scales fold once per block, integers stay exact** — any refactor that converts intermediate integer dots to float mid-block changes the numerics and breaks parity with llama.cpp.
 
 ## 4. Observe & verify

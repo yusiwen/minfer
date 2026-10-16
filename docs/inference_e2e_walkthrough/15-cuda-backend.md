@@ -147,7 +147,7 @@ is why `matmul_f32_ptr_layout` — the single dispatch every CUDA matmul flows
 through — opens with a token-count gate:
 
 ```rust
-// src/cuda/methods/weights.rs:487-509 (dispatch gate; abridged comment)
+// src/cuda/methods/weights.rs: (dispatch gate; abridged comment)
 if (nt >= 9 || small_m_gemm)
     && id % 32 == 0
     && !Self::no_prefill_gemm()
@@ -476,7 +476,7 @@ participates in the legacy default stream's implicit global synchronization —
 exactly the call that invalidated the capture before #188.
 
 ```rust
-// src/cuda/methods/weights.rs:39-87 (core of register_weight)
+// src/cuda/methods/weights.rs: (core of register_weight)
 let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
 let err = unsafe { cudaMalloc(&mut ptr, data.len()) };
 if err != 0 || ptr.is_null() {
@@ -513,7 +513,7 @@ self.weights.lock().unwrap()
 ```
 
 The pre-#188 blocking form survives only as the test-only
-`register_weight_blocking_legacy` probe (`weights.rs:99-131`), which the capture
+`register_weight_blocking_legacy` probe (`weights.rs:`), which the capture
 acceptance probe needs in order to measure the capture mode against the
 *historical* setup.
 
@@ -763,7 +763,7 @@ picks the Q6_K block stride (224 padded vs 210 raw), and then walks a
 first and each failure falls through cleanly:
 
 ```rust
-// src/cuda/methods/dispatch.rs:289-364 (the q4_K raw-byte branch, abridged)
+// src/cuda/methods/dispatch.rs: (the q4_K raw-byte branch, abridged)
 // P6: raw-byte staging variant (q4_K, whole super-blocks only).
 // Same quantized activations; the GEMM stages RAW weight bytes via
 // cp.async and dequants in registers (docs/CUDA_OPTIMIZATION.md).
@@ -1088,7 +1088,7 @@ i32 conversion), because at a boundary the pool reuses buffer ids for
 The sync itself is bounded and checked, per GPU_SAFETY:
 
 ```rust
-// src/cuda/methods/weights.rs:125-134
+// src/cuda/methods/weights.rs:
 pub fn sync(&self) {
     let err = unsafe { cudaGetLastError() };
     if err != 0 {
@@ -1169,7 +1169,7 @@ cannot grow at run time.
 rms_norm silently runs weightless if the gains are not registered on the
 backend — a debuggable-but-wrong result. CUDA's `norm_weight` returns
 `Err("cuda: weight '...' not registered")` instead
-(`cuda_backend.rs:1220-1246`, comment citing `docs/GPU_SAFETY.md`). The
+(`cuda_backend.rs:`, comment citing `docs/GPU_SAFETY.md`). The
 difference is deliberate: the all-or-nothing participation gate makes a
 missing CUDA weight *unreachable* through normal wiring, so reaching that
 error means an invariant is already broken — and broken invariants abort.

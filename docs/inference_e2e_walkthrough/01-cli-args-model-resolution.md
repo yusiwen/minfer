@@ -169,7 +169,7 @@ arrives in two steps:
   of headroom costs 36 × 2 × 1024 × 4 B = **288 KB**, so the default 4096
   reserves ≈ 1.2 GB while the model's maximum (40960 tokens) would reserve
   ≈ 11.8 GB — the "12 GB+" the code comment warns about
-  (`src/main.rs:759-763`, citing `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §2).
+  (`src/main.rs:763-774`, citing `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §2).
 - **And it is clamped twice, defensively.** In `main.rs` the effective
   context is `params.n_ctx.max(input_ids.len())` — a long prompt must never
   overflow the notepad — and the model's forward pass clamps again with
@@ -186,14 +186,14 @@ number consistent for the whole run.
 ### 2.5 Modes: where the same parsed data goes
 
 The parsed state fans out into mode-specific structs, and each mode takes a
-different subset. In `run_conversation` (`src/main.rs:2078`), the
+different subset. In `run_conversation` (`src/main.rs:2092`), the
 conversation gets a `ConversationSpec` (template, special tokens, `seed`,
 `n_ctx`, system prompt) plus a `TurnParams` (all the sampling knobs *plus*
 `stop_strings`) — every field is copied out of `GenParams`, so the
 conversation REPL and the single-shot loop sample identically given the
 same flags. The server instead receives `n_ctx` as the **total across all
 slots** (each slot's conversation gets a slice of it — usage text,
-`src/main.rs:137-142`), because the server holds several independent KV
+`src/main.rs:`), because the server holds several independent KV
 sets at once.
 
 ## 3. Implementation
@@ -221,7 +221,7 @@ covers. Everything above it in `main()` is this stage.
 
 #### The parameter struct and its llama.cpp defaults
 
-`src/main.rs:73-115` — 26 fields. The excerpt keeps the ten this chapter works with; the sampler
+`src/main.rs:` — 26 fields. The excerpt keeps the ten this chapter works with; the sampler
 additions (min-p, typical, XTC, DRY, mirostat, logit bias, and the F2 grammar source) are
 `12-sampler.md`'s subject:
 
@@ -267,7 +267,7 @@ repeatable).
 
 #### Subcommand dispatch: `bench` and `specverify` leave early
 
-`src/main.rs:154-171` — the very first thing `main` does:
+`src/main.rs:` — the very first thing `main` does:
 
 ```rust
 fn main() {
@@ -293,7 +293,7 @@ fn main() {
 Why the separate parse? The global parser (below) **rejects unknown flags
 with an error** — a safety feature. But `bench` legitimately uses `-p` /
 `-n` with *different meanings* (`bench -p 512` = 512 *prompt tokens* for
-the prefill test, per `src/bench.rs:38-43`) that collide with nothing in
+the prefill test, per `src/bench.rs:`) that collide with nothing in
 the inference flag set yet would still be rejected there, and `--n-ctx`
 means something different again (bench sizes KV as pp+tg+16 unless
 overridden, `src/bench.rs:244`). Giving bench the raw tail
@@ -305,7 +305,7 @@ process::exit(code)` then means the two paths never share state.
 
 #### The parse loop: flags, values, and the unknown-flag rejection
 
-The loop is ~220 lines of one `match` (`src/main.rs:208-435`); the shapes
+The loop is ~220 lines of one `match` (`src/main.rs:`); the shapes
 worth seeing are the value-taking flag, the seed/greedy pair, and the
 fallback:
 
@@ -342,9 +342,9 @@ fallback:
         }
 ```
 
-(`src/main.rs:218-434`, condensed.) Three details carry the design:
+(`src/main.rs:`, condensed.) Three details carry the design:
 
-- **`next_val`** (`src/main.rs:532`) is a closure that peeks at
+- **`next_val`** (`src/main.rs:547`) is a closure that peeks at
   `raw_args[i+1]` and records `parse_err = Some("missing value for …")` if
   it is absent — the error is *remembered* and reported after the whole
   parse, so the user sees one clean message, not an early exit mid-list.
@@ -359,7 +359,7 @@ fallback:
 
 #### Subcommands that stay: `download`, `list`, `info`, `serve`, `viz`
 
-`src/main.rs:448-539` (condensed; `positional[0]` decides):
+`src/main.rs:` (condensed; `positional[0]` decides):
 
 ```rust
     match positional[0].as_str() {
@@ -380,14 +380,14 @@ The split is by *side effects*: `download`, `list`, `info` finish and
 only *set a mode flag and remove their own token*, so positional[0] becomes
 the model and the normal load path continues — the model must be loaded
 before a server can serve it. The branches themselves are far down the same
-`main` (server: `src/main.rs:678-701`, viz: `688-696`, conversation:
+`main` (server: `src/main.rs:`, viz: `688-696`, conversation:
 `698-713`), each taking the already-loaded `model` + `tokenizer`. This is
 why a wrong flag in `serve` mode is still caught by the same global parser
 — only `bench`/`specverify` opted out.
 
 #### Resolution call site in `main`
 
-`src/main.rs:553-570` — right before the prompt logic, and before any load:
+`src/main.rs:` — right before the prompt logic, and before any load:
 
 ```rust
     // Resolve paths, hf:/ollama: URIs, and cached model names.
@@ -421,7 +421,7 @@ through the name-lookup path announces its result.
 
 #### `resolve`: the four sources
 
-`src/download/mod.rs:21-53` — the whole dispatcher is 33 lines:
+`src/download/mod.rs:` — the whole dispatcher is 33 lines:
 
 ```rust
 pub fn resolve(uri: &str) -> Result<PathBuf, String> {
@@ -465,12 +465,12 @@ crate) and existence is the only check — note it is `exists()`, not
 error (§3.2 "Error UX"). Sources (b) and (c) delegate to the downloaders.
 Source (d) is the fallback chain: relative path first, then cache lookup.
 The cache dir itself honors an env override
-(`src/download/mod.rs:7-13`): `MINFER_MODEL_DIR` if set, else
+(`src/download/mod.rs:`): `MINFER_MODEL_DIR` if set, else
 `~/.cache/minfer/models`.
 
 #### Cached names: exact, then prefix, with split collapsing
 
-`src/download/mod.rs:57-105` — the ergonomics feature:
+`src/download/mod.rs:` — the ergonomics feature:
 
 ```rust
 fn resolve_cached_name(name: &str, cache_dir: &Path) -> Result<PathBuf, String> {
@@ -525,7 +525,7 @@ candidate path so you can copy-paste one.
 
 #### The HF downloader: API listing, quant matching, size-checked resume
 
-`src/download/mod.rs:210-290` (condensed to the decision loop):
+`src/download/mod.rs:` (condensed to the decision loop):
 
 ```rust
     let hf_dir = cache_dir.join("hf").join(&repo);          // hf/<org>/<repo>/
@@ -561,21 +561,21 @@ enough — a Ctrl-C'd download leaves a truncated file that would parse as
 garbage in doc 02. So "complete" means *exists and byte-length equals the
 remote size* (from the API listing, or a HEAD request when the repo omits
 it). The transfer itself is a curl subprocess
-(`src/download/mod.rs:449-473`) with `-C -` — curl's own resume flag, which
+(`src/download/mod.rs:`) with `-C -` — curl's own resume flag, which
 appends from the current file length — plus `-L` for HF's redirect chain
 and `--progress-bar`. Delegating to curl buys HTTP/2, TLS, retries, and
 resume without an HTTP-client crate; it is the same trade as the Ollama
-path (`src/download/mod.rs:309-395`), which shells out to `ollama pull` and
+path (`src/download/mod.rs:`), which shells out to `ollama pull` and
 then symlinks the largest blob from Ollama's own store into
 `~/.cache/minfer/models/ollama/<model>/model.gguf` so both sources share
 one cache layout.
 
-Quant selection (`match_model`, `src/download/mod.rs:136-205`) groups the
+Quant selection (`match_model`, `src/download/mod.rs:`) groups the
 repo's files by split prefix, matches the requested quant
 case-insensitively against the group base name (`…-q4_k_m`), expands an
 exact part filename to its whole group, and errors with the available
 choices when the request is missing or ambiguous. Unit tests cover all of
-those branches (`src/download/tests.rs:14-89`).
+those branches (`src/download/tests.rs:`).
 
 #### Cache layout and `minfer list`
 
@@ -598,7 +598,7 @@ directly usable as the model argument. That is the whole point of source
 
 Resolution can reject a path ("File not found") but it cannot detect every
 failure — the decisive check is the first read, which is the GGUF loader.
-`src/main.rs:594-635` turns that failure into three distinct diagnoses
+`src/main.rs:` turns that failure into three distinct diagnoses
 (condensed):
 
 ```rust
@@ -637,7 +637,7 @@ exists to prevent.
 
 #### Where the prompt comes from
 
-`src/main.rs:571-590` — after resolution, before loading:
+`src/main.rs:` — after resolution, before loading:
 
 ```rust
     // Conversation mode: the positional prompt is the FIRST user turn; stdin
@@ -669,11 +669,11 @@ while the server-like modes explicitly take an *empty* prompt — they would
 otherwise hang waiting on a stdin that nobody will write. Conversation mode
 splits the difference: an optional positional becomes the first turn, and
 further turns come from the REPL's own reader (`read_user_input`,
-`src/main.rs:1175`), never from this one-shot read.
+`src/main.rs:1190`), never from this one-shot read.
 
 #### `--n-ctx` at the moment it starts to matter
 
-The first consumer of `params.n_ctx` after load (`src/main.rs:759-772`):
+The first consumer of `params.n_ctx` after load (`src/main.rs:772-774`):
 
 ```rust
     // n_ctx (--n-ctx, default 4096) sizes the graph KV regions — NOT the
@@ -762,13 +762,13 @@ because the seed is stable.
   call site pass a different value would change KV geometry mid-run — the
   graph-reuse identity (doc 13) treats KV size as a rebuild trigger, so a
   mismatched `n_ctx` would silently reallocate and discard accumulated KV.
-- **`--cnv` rejects `--no-template` up front** (`src/main.rs:545-551`),
+- **`--cnv` rejects `--no-template` up front** (`src/main.rs:551-560`),
   before resolution: conversation history is rendered through the chat
   template, so a template-less conversation would corrupt the KV with
   un-formatted turns. Failing at parse time (not first-turn time) keeps
   the error message adjacent to the mistake.
 - **Unknown flags die loudly; flag words never become the model path.** The
-  `starts_with('-')` rejection (`src/main.rs:425-430`) protects the
+  `starts_with('-')` rejection (`src/main.rs:`) protects the
   positional contract. A flag missing its value is remembered in
   `parse_err` and reported after the full parse — one error, at the end,
   with usage.
@@ -776,7 +776,7 @@ because the seed is stable.
   alone would treat a Ctrl-C'd partial file as cached (the truncated file
   becomes doc 02's "corrupt" error, and worse, is *not* resumed because the
   code believed it was complete). The `exists && len == remote` rule
-  (`src/download/mod.rs:276-281`) is what makes repeated `hf:` runs
+  (`src/download/mod.rs:`) is what makes repeated `hf:` runs
   idempotent.
 - **Ambiguity must refuse to guess.** Both ambiguity sites — cached-name
   prefix matches and repo quant matches — enumerate candidates in the
@@ -790,13 +790,13 @@ because the seed is stable.
   the loader co-own that convention.
 - **Server-like modes never consume stdin.** `serve`/`viz`/`--cnv` read
   prompts from requests or the REPL; the single-shot stdin read
-  (`src/main.rs:587-589`) would otherwise block startup on an empty pipe —
+  (`src/main.rs:589-602`) would otherwise block startup on an empty pipe —
   the exact hang the code comment describes for `minfer viz model`.
 
 ## 4. Observe & verify
 
 - **`minfer --help`** — prints the usage block (`print_usage`,
-  `src/main.rs:80-152`): the four MODEL forms and every option with its
+  `src/main.rs:`): the four MODEL forms and every option with its
   default, which is this stage's contract in readable form.
 - **`minfer list`** — runs `list_local`: the cache tree with sizes; every
   printed name is directly runnable as the model argument. With an empty
@@ -807,11 +807,11 @@ because the seed is stable.
   inference — a dry run of stages 01+02.
 - **`--meta`** — with single-shot inference, replaces the one-line GGUF
   summary with the full metadata dump and still continues to generate
-  (`src/main.rs:645-667`).
+  (`src/main.rs:`).
 - **`minfer download hf Qwen/Qwen2.5-0.5B-Instruct-GGUF q4_0`** — shows the
   whole download path: API listing, quant match, curl progress bar, and on
   a second run the `Already cached: …` line proving the size check passed.
-- **Unit tests** — `src/download/tests.rs:14-89` covers quant matching
+- **Unit tests** — `src/download/tests.rs:` covers quant matching
   (single/split, case-insensitivity, ambiguity, exact-filename expansion)
   and `src/gguf/tests.rs:6` covers split-filename parsing — the two pieces of
   logic the resolver leans on.

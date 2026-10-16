@@ -29,7 +29,7 @@ general.quantization_version = 2    → IQ4_NL for embedding/output tensors
 
 Before the fix, `TensorType::from_ggml_type` mapped unknown GGML types to `TensorType::Raw` (blck_size=1, type_size=1), causing `nbytes = n_elements` — up to **3.5× larger** than the actual block data. This caused a bounds-check panic at `loader.rs:171`.
 
-**Fix** (`loader.rs:167-168`): Use `ti.type_.type_size()` and `ti.type_.blck_size()` directly from the GGML type for byte-size calculation, bypassing TensorType mapping:
+**Fix** (`loader.rs:`): Use `ti.type_.type_size()` and `ti.type_.blck_size()` directly from the GGML type for byte-size calculation, bypassing TensorType mapping:
 
 ```rust
 let ts = ti.type_.type_size();         // always correct from GGML metadata

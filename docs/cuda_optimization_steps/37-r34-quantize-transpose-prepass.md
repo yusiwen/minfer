@@ -174,7 +174,7 @@ for (int i = 0; i < KDR * 2; ++i) {
 **The Rust-side dispatch** (`src/cuda.rs`; the comments are r34's original, the cache logic is r49/r52's later story):
 
 ```rust
-// src/cuda.rs:3288-3307 (prefill_mmq's routing branch, excerpt)
+// src/cuda.rs: (prefill_mmq's routing branch, excerpt)
 // P6 r34: relocate the A-side layout transform out of the mma
 // kernel into a quantize-transpose prepass (llama.cpp's design).
 // Under MINFER_MMQ_A_TRANSPOSE=1 the activations are emitted

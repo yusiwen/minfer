@@ -261,3 +261,8 @@ symbol = "plamo2_encode"
 adr = "0051"
 what = "hybriddna is the gpt2 engine plus a `<dna>` block cut into marked 6-mers, with the marker erased at load"
 symbol = "hybriddna_encode"
+
+[[governs]]
+adr = "0052"
+what = "`model = none` is a vocabulary-less file: placeholder tokens from `vocab_size`, and a named refusal through the checked entry points"
+symbol = "encode_checked"

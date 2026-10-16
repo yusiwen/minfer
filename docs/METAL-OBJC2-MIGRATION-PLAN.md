@@ -354,7 +354,7 @@ This file mostly accesses `MpsState` methods and `MpsCommandBuffer` methods — 
 
 4. **`capture_split()` / `staging_alloc()`** — `staging_alloc` uses `state.new_f32_buffer()` (already abstracted) — no change. `capture_split` calls `cb().encode_captures(...)`, which internally switches to `blitCommandEncoder()` (`Option`) + `copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size` (unsafe) — see §3.2.5/Phase 3.
 
-5. **`cb()` method** — ⚠️ the `Option` simplification shown below is **borrow-checker-unsound as written** and does **not** compile in the current call pattern. `execute_node` does `let cb = self.cb();` then immediately calls `self.buf(..)`, `self.copy_in(..)`, `self.pool[..]`, `self.state.weight_buf(..)` (all `&self`) in the same scope (`metal_backend.rs:297-310`). A `cb()` returning `&mut MpsCommandBuffer` would hold a **mutable** borrow of `self` and conflict with those `&self` calls.
+5. **`cb()` method** — ⚠️ the `Option` simplification shown below is **borrow-checker-unsound as written** and does **not** compile in the current call pattern. `execute_node` does `let cb = self.cb();` then immediately calls `self.buf(..)`, `self.copy_in(..)`, `self.pool[..]`, `self.state.weight_buf(..)` (all `&self`) in the same scope (`metal_backend.rs:`). A `cb()` returning `&mut MpsCommandBuffer` would hold a **mutable** borrow of `self` and conflict with those `&self` calls.
 
    Two workable options:
    - **(a) Minimal — keep the `'static` escape.** Keep the `Box::into_raw`/`Box::from_raw` pointer pattern exactly as today; just retype the boxed value. This is the safe default (no call-site changes).
@@ -387,7 +387,7 @@ This file mostly accesses `MpsState` methods and `MpsCommandBuffer` methods — 
    }
    ```
 
-7. **`unsafe impl Send/Sync for MetalBackend` (`metal_backend.rs:72-73`)** — re-evaluate. Its justification is "the raw pointer is only dereferenced inside `&self`/`&mut self` methods". If you keep option (a) (raw pointer), keep the impls (reword the comment). If you switch to `Option<MpsCommandBuffer>` (option b) and the `Retained` fields make `MpsCommandBuffer` `Send`/`Sync`, the impls may become unnecessary — confirm before removing, and confirm the command buffer is still only touched on the scheduler thread.
+7. **`unsafe impl Send/Sync for MetalBackend` (`metal_backend.rs:`)** — re-evaluate. Its justification is "the raw pointer is only dereferenced inside `&self`/`&mut self` methods". If you keep option (a) (raw pointer), keep the impls (reword the comment). If you switch to `Option<MpsCommandBuffer>` (option b) and the `Retained` fields make `MpsCommandBuffer` `Send`/`Sync`, the impls may become unnecessary — confirm before removing, and confirm the command buffer is still only touched on the scheduler thread.
 
 ### 3.4 `build.rs`
 

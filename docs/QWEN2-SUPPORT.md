@@ -25,10 +25,10 @@ Distinguishing properties a loader/graph must get right:
 | FFN activation | SwiGLU (`silu(gate) · up`), no bias | fused `SwiGLU` node |
 | Attention | GQA — `n_head` query heads share `n_head_kv` K/V heads | `attn_heads` GQA mapping (walkthrough 11 §3.2.4) |
 | QKV biases | **present** on WQ/WK/WV (none on WO, none in FFN) | `QKVBiasRopeStore` decode fusion needs them |
-| Output-head bias | optional `output.bias` tensor | `Qwen2Model.output_b: Option<Tensor>` (`mod.rs:19`, consumed at `graph.rs:267-271`) |
+| Output-head bias | optional `output.bias` tensor | `Qwen2Model.output_b: Option<Tensor>` (`mod.rs:19`, consumed at `graph.rs:`) |
 | RoPE | **NonInterleaved** pairs `(i, i+hd/2)` — GGUF's NEOX convention | hardcoded `RopeStyle::NonInterleaved` (`loader.rs:154`) |
-| Attention scale | `1/√n_embd_head` | `HParams::attention_scale()` (`loader.rs:36-38`) |
-| KV head dim | may differ from query head dim (`n_kv_embd` decoupled) | `HParams.n_kv_embd` — Qwen2.5-0.5B: `kv_dim=128` vs `n_embd=896` (`loader.rs:25-28`) |
+| Attention scale | `1/√n_embd_head` | `HParams::attention_scale()` (`loader.rs:`) |
+| KV head dim | may differ from query head dim (`n_kv_embd` decoupled) | `HParams.n_kv_embd` — Qwen2.5-0.5B: `kv_dim=128` vs `n_embd=896` (`loader.rs:`) |
 
 ## 2. Where the implementation lives
 
@@ -41,10 +41,10 @@ src/models/qwen2/
 
 - Dispatch: `models/mod.rs::load_model()` selects Qwen2 by
   `general.architecture == "qwen2"` (Qwen3 has its own module).
-- `HParams` fields (`loader.rs:11-29`): `n_embd`, `n_head`, `n_head_kv`,
+- `HParams` fields (`loader.rs:`): `n_embd`, `n_head`, `n_head_kv`,
   `n_layer`, `n_ff`, `n_vocab`, `max_seq_len`, `f_norm_rms_eps`,
   `rope_freq_base` / `rope_freq_scale` (read from `qwen2.rope.freq_base`,
-  falling back to `llama.rope.*` keys — `loader.rs:146-150`), `eos_token_id`,
+  falling back to `llama.rope.*` keys — `loader.rs:`), `eos_token_id`,
   `im_end_token_id`, `rope_style`, `n_kv_embd`.
 - Per-layer weights (`LayerWeights`): `attn_norm`, `wq/wk/wv` (+ biases),
   `wo`, `ffn_norm`, `ffn_gate/ffn_up/ffn_down` — all as the GGUF lays them
@@ -55,7 +55,7 @@ src/models/qwen2/
 - **G3 tail-row optimization** — when `n_out < nt`, the graph reduces the
   hidden states to the last `n_out` rows **before the final layer's FFN**, so
   the tail FFN, final RMSNorm and `lm_head` all run on `n_out` rows only
-  (`graph.rs:61-64`, `214-222`). With tied embeddings
+  (`graph.rs:`, `214-222`). With tied embeddings
   (`Qwen2.5-0.5B`: `output` is `token_embd`), the output matmul is a
   `n_vocab × n_embd` Q4_0/Q8_0 matmul — the single most expensive decode
   op, which is why the tail cut matters (walkthrough 05 §3, 10 §3.2).
@@ -88,12 +88,12 @@ untested rather than known-broken.
 ## 5. Tokenizer and chat
 
 - Byte-level BPE, self-contained from GGUF metadata (`src/tokenizer.rs`).
-- Stop tokens: `SpecialTokens { eos, im_end }` (`src/models/mod.rs:88-91`) —
+- Stop tokens: `SpecialTokens { eos, im_end }` (`src/models/mod.rs:`) —
   Qwen2's `<|im_end|>` id is read from GGUF (`HParams.im_end_token_id`) and
   stops generation alongside EOS.
 - Chat template: the GGUF's Jinja template is rendered with minijinja
   (`src/template.rs`); on missing/invalid templates minfer falls back to
-  multi-message **ChatML** (`template.rs:10-14`, `:119-130`) — which is
+  multi-message **ChatML** (`template.rs:`, `:119-130`) — which is
   Qwen2.5's native format, so the fallback is semantically safe here. System
   prompt default: `"You are a helpful assistant."`.
 

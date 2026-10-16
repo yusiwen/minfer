@@ -321,6 +321,12 @@ pub enum TokenizerModel {
     /// scores, no `pre` rule and no byte-level encoding: a byte that starts no
     /// entry emits the unknown token and advances one byte.
     Rwkv,
+    /// `none` / `no_vocab`: the file declares **no vocabulary** — llama.cpp reads
+    /// `tokenizer.ggml.vocab_size`, creates that many placeholder tokens and aborts
+    /// in `tokenize` (`llama-vocab.cpp:1942`/`:3587`), because the ids come from the
+    /// caller (vision/audio/diffusion pipelines). minfer accepts the file so it can
+    /// be inspected, and refuses text tokenization through the checked entry points.
+    None,
     /// `hybriddna`: Carbon-3B's HybridDNA tokenizer — byte-level BPE plus a
     /// `<dna>`…`</dna>` block whose content is upper-cased and cut into 6-mers that
     /// look up tokens carrying a reserved U+E000 suffix (`<oov>` when a k-mer is
@@ -351,7 +357,19 @@ impl TokenizerModel {
     /// implements are accepted; every other value is a refusal naming it.
     pub fn from_gguf(model: Option<&str>) -> Result<Self, String> {
         match model {
-            None | Some("gpt2") => Ok(Self::Gpt2),
+            // llama.cpp reads this key as **required** (`ml.get_key(LLM_KV_TOKENIZER_MODEL,
+            // tokenizer_model)`, no optional flag, `llama-vocab.cpp:1935`), so a file
+            // without it is refused rather than assumed to be `gpt2` ([#585]).
+            //
+            // [#585]: https://github.com/yusiwen/minfer/issues/585
+            None => Err(
+                "tokenizer.ggml.model is missing, so the tokenizer engine is unknown; minfer \
+                 refuses the file rather than assuming `gpt2` (llama.cpp reads this key as \
+                 required too)"
+                    .to_string(),
+            ),
+            Some("gpt2") => Ok(Self::Gpt2),
+            Some("none") | Some("no_vocab") => Ok(Self::None),
             Some("llama") => Ok(Self::Spm),
             Some("bert") => Ok(Self::Bert),
             Some("gemma4") => Ok(Self::Gemma4),
@@ -1121,6 +1139,16 @@ impl Tokenizer {
         let mut ugm = UgmData::default();
         let mut remove_extra_whitespaces = false;
         let pre = match model {
+            TokenizerModel::None => {
+                // The placeholder vocabulary: `vocab_size` entries with no text, no
+                // scores, no types and no special roles — the shape llama.cpp builds
+                // with `id_to_token.resize(n_tokens)`.
+                let n = Self::get_gguf_u32(gguf, "tokenizer.ggml.vocab_size").unwrap_or(0) as usize;
+                id_to_token = vec![String::new(); n];
+                id_to_score = vec![0.0; n];
+                id_to_type = vec![0; n];
+                None
+            }
             TokenizerModel::Gpt2 | TokenizerModel::HybridDna => {
                 // F7: the pre-tokenization rule must be one this engine implements.
                 let pre = PreTokenizer::from_gguf(
@@ -1618,6 +1646,42 @@ impl Tokenizer {
     /// 2/3/4 plus every id a `tokenizer.ggml.*_token_id` role names. This is what
     /// makes special-token templates work (e.g. DeepSeek-R1's `<｜User｜>` /
     /// `<think>`), matching llama.cpp — whose converter marks those type 3.
+    /// The **checked** text→id entry point ([#586]). Every engine that has a
+    /// vocabulary delegates to [`Tokenizer::encode`]; `model = none` is a named
+    /// refusal, because a vocabulary-less file has nothing to tokenize text with
+    /// (llama.cpp aborts there — `llama-vocab.cpp:3587` — and an empty vector would
+    /// be a silent lie). Production callers that turn user text into tokens use this.
+    ///
+    /// [#586]: https://github.com/yusiwen/minfer/issues/586
+    pub fn encode_checked(&self, text: &str) -> Result<Vec<u32>, String> {
+        if self.model == TokenizerModel::None {
+            return Err(format!(
+                "this file declares `tokenizer.ggml.model = {}` (a vocabulary-less model with {} \
+                 placeholder token(s)): it has no vocabulary, so no text can be turned into \
+                 tokens — supply token ids directly instead",
+                "none/no_vocab",
+                self.id_to_token.len()
+            ));
+        }
+        Ok(self.encode(text))
+    }
+
+    /// The **checked** id→text entry point ([#586]): `model = none` has no pieces to
+    /// emit, and an empty result would be indistinguishable from "the ids decoded to
+    /// nothing".
+    ///
+    /// [#586]: https://github.com/yusiwen/minfer/issues/586
+    pub fn decode_checked(&self, ids: &[u32]) -> Result<Vec<u8>, String> {
+        if self.model == TokenizerModel::None {
+            return Err(format!(
+                "this file declares `tokenizer.ggml.model = {}` (a vocabulary-less model): its ids \
+                 have no text representation to decode",
+                "none/no_vocab"
+            ));
+        }
+        Ok(self.decode_bytes(ids))
+    }
+
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let normalized = self.normalized(text);
         let text: &str = normalized.as_ref();
@@ -1691,6 +1755,9 @@ impl Tokenizer {
             return Vec::new();
         }
         match self.model {
+            // `model = none` has no vocabulary; `encode_checked` refuses it before
+            // this point, and a direct `encode` call gets an empty list.
+            TokenizerModel::None => Vec::new(),
             TokenizerModel::Gpt2 => self.encode_bpe(text),
             TokenizerModel::HybridDna => self.hybriddna_encode(text),
             TokenizerModel::Bert => self.wpm_encode(text),

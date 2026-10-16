@@ -3,7 +3,7 @@
 > **Stage**: GGUF parsed (02) → **this stage: the file becomes a runnable
 > model, with weights wired into every backend** → tokenizer + template (04).
 > **Code**: `models/mod.rs::load_model` (dispatch), `models/qwen2/loader.rs::load`
-> and `models/qwen3/loader.rs::load` (the two implementations), `main.rs:652-672`
+> and `models/qwen3/loader.rs::load` (the two implementations), `main.rs:`
 > (GPU init + legacy KV cache), `tensor.rs` (`Cow<'static,[u8]>` weight bytes),
 > `graph/alloc.rs::register_weight`, `src/metal/::register_weight` /
 > `cuda.rs::register_weight` (per-backend registries),
@@ -148,7 +148,7 @@ is a *view*, not a copy. The `Tensor` type stores its payload as
 `std::borrow::Cow<'static, [u8]>` — a Rust "clone-on-write" enum that here is
 always the `Borrowed` variant, i.e. a plain `(pointer, length)` slice pointing
 into the mmap'd GGUF file. The `'static` lifetime works because doc 02's
-loader `Box::leak`s each mmap for the process lifetime (`gguf.rs:1826-1832`).
+loader `Box::leak`s each mmap for the process lifetime (`gguf.rs:`).
 
 Three consequences follow, and each one answers a "why not the obvious
 alternative":
@@ -160,7 +160,7 @@ directly — they dequantize a block on the fly inside the dot product, one
 kernels do the same in shaders (Metal) or stream raw quantized bytes (CUDA's
 int8 MMQ path). Meanwhile the memory math is brutal for the alternative: a
 Q4_0 block is 18 bytes for 32 values (2-byte fp16 scale + 16 bytes of
-nibbles, `block.rs:53-56`), which is ≈ 0.56 bytes per value. A
+nibbles, `block.rs:`), which is ≈ 0.56 bytes per value. A
 0.5-billion-parameter checkpoint is then ≈ 0.28 GB of file bytes; dequantized
 to f32 it would be 2 GB — 7× more, copied at load time, for zero benefit.
 
@@ -227,10 +227,10 @@ every weight this model will use registered — and kernel-supported — on this
 backend?" Two functions do this:
 
 - `Qwen2Graph::weights_on_gpu` (Metal): every weight name must be present in
-  `MpsState`'s registry (`models/qwen2/graph.rs:636-677`).
+  `MpsState`'s registry (`models/qwen2/graph.rs:`).
 - `Qwen2Graph::weights_on_cuda` (CUDA): every weight must be registered *and*
   of a type a kernel exists for — e.g. the embedding gather supports every
-  registered type except Q4_1 (`models/qwen2/graph.rs:695-756`).
+  registered type except Q4_1 (`models/qwen2/graph.rs:`).
 
 The result — `metal_on || cuda_on` — is stored in `CParams.gpu`, which is
 part of the *reuse identity*: the fingerprint that decides whether a cached
@@ -260,13 +260,13 @@ First, the head dimension. In Qwen2, the per-head size is derivable:
 `n_embd_head = n_embd / n_head`. Qwen3 broke that identity — the 0.6B model
 has `n_embd / n_head = 64` but its keys are 128-wide — so the loader reads
 `qwen3.attention.key_length` explicitly and asserts the K weight's actual
-output width agrees (`qwen3/loader.rs:311-326`). Trust the bytes, not the
+output width agrees (`qwen3/loader.rs:`). Trust the bytes, not the
 derived formula.
 
 Second, per-head Q/K RMSNorm: Qwen3 normalizes each head's query and key
 vectors before RoPE, with small learned gain vectors (`q_norm`, `k_norm`).
 The loader stores them; the graph builder has a dedicated `qk_norm` op
-(`graph/builder.rs:99-119`) that consumes them. The loader's job is
+(`graph/builder.rs:`) that consumes them. The loader's job is
 recognizing that these tensors exist and must not be lost — the `minfer
 info` listing truncates names, but they are in the file. Everything else —
 the loader shape, the registration calls, the fused-QKV and fused-FFN concat
@@ -282,7 +282,7 @@ key/values), `ctx.info` (tensor index; each entry has `name`, `type_`, `ne[4]`
 shape, and `offset` — offset from the start of the part's data section), and
 `part.data: &'static [u8]` (the mmap'd bytes). A weight's file position is
 `ctx.offset + ti.offset`, where `ctx.offset` is where the data section starts
-in the file (`gguf.rs:603-619`).
+in the file (`gguf.rs:`).
 
 **Out:** three things.
 
@@ -311,7 +311,7 @@ fewer bits, grouped into blocks that share a scale factor.
 ### 3.2 Key code
 
 Excerpt 1 — the startup order in `main.rs`: GPU init, dispatch, legacy KV
-cache. (`src/main.rs:652-672`; the KV block below is **historical** — see the
+cache. (`src/main.rs:`; the KV block below is **historical** — see the
 forward note under the annotations)
 
 ```rust
@@ -353,7 +353,7 @@ in the excerpt allocated the legacy KV cache, whose only remaining job (after
 argument and the type rather than keep a dead allocation alive for the API
 shape.
 
-Excerpt 2 — the dispatch itself. (`src/models/mod.rs:95-112`)
+Excerpt 2 — the dispatch itself. (`src/models/mod.rs:`)
 
 ```rust
 pub fn load_model(model: &GgufModel) -> Option<Box<dyn ModelDef>> {
@@ -384,7 +384,7 @@ which is what makes a mistyped or future architecture diagnosable in one
 glance.
 
 Excerpt 3 — the interface everything downstream codes against.
-(`src/models/mod.rs:22-45`, `:77-85` — abridged)
+(`src/models/mod.rs:`, `:77-85` — abridged)
 
 ```rust
 pub trait ModelDef: Send + Sync {
@@ -421,13 +421,13 @@ not know which architecture it is talking to.
 | `n_layer` | loader-loop sizing here, the graph builder's per-layer loop (doc 05), the legacy KV cache above |
 | `n_head_kv`, `n_embd_head`, `n_kv_embd` | GQA (grouped-query attention: fewer K/V heads than query heads) head mapping and strides (doc 11), and the KV region width `n_kv_embd × n_ctx` (doc 07) |
 | `n_vocab` | logits width — the sampler's input size (doc 12) |
-| `special_tokens` | the sampler's stop condition: `main.rs` fetches `eos`/`im_end` ids once and checks every sampled token against them (`main.rs:867,900,1020`) |
+| `special_tokens` | the sampler's stop condition: `main.rs` fetches `eos`/`im_end` ids once and checks every sampled token against them (`main.rs:882,900,1020`) |
 | `rope_style` | doc 11: RoPE (rotary positional encoding) has two layout styles — Qwen's non-interleaved vs Llama's interleaved — and the vec-op must be told which |
 | `as_any` | lets graph code downcast to the concrete model when it needs specifics |
 | `Send + Sync` | the HTTP server shares the model across threads (`Arc<dyn ModelDef>`) |
 
 Excerpt 4 — hyperparameter parsing with the dual metadata prefix.
-(`src/models/qwen2/loader.rs:117-156`, abridged)
+(`src/models/qwen2/loader.rs:`, abridged)
 
 ```rust
     // Try qwen2 prefix first, fall back to llama/generic
@@ -460,7 +460,7 @@ starts as the naive product, purely so the struct is initialized; the loader
 immediately overwrites it from the K weight's real shape.
 
 Excerpt 5 — a weight tensor is born as a borrowed slice, then handed to the
-GPU registries. (`src/models/qwen2/loader.rs:176-220`, abridged; the CUDA
+GPU registries. (`src/models/qwen2/loader.rs:`, abridged; the CUDA
 branch at :221-285 is discussed in the annotations)
 
 ```rust
@@ -513,9 +513,9 @@ per-backend representation is decided** — bytes for CPU, (buffer, offset)
 for Metal, device allocation (+optional repack) for CUDA.
 
 Excerpt 6 — two load-time side decisions: the true KV width, and the KV element
-type. (`src/models/qwen2/loader.rs:608-611`; Qwen3's guarded version at
-`src/models/qwen3/loader.rs:418-424`; the element type is resolved one level up,
-after the loader returns — `src/models/mod.rs:407-424`)
+type. (`src/models/qwen2/loader.rs:`; Qwen3's guarded version at
+`src/models/qwen3/loader.rs:`; the element type is resolved one level up,
+after the loader returns — `src/models/mod.rs:`)
 
 ```rust
     // Override n_kv_embd from layer 0 K weight's actual output dimension
@@ -566,7 +566,7 @@ that decode is KV-bandwidth-bound (measured −1 ms/token on the 7B at 2K
 context), f32 for small models where f16 measured ~3% *slower*.
 
 Excerpt 7 — the merged tensor index and name lookup.
-(`src/models/qwen2/loader.rs:329-343`)
+(`src/models/qwen2/loader.rs:`)
 
 ```rust
     // Merged tensor index across all split parts (llama.cpp weights_map): each
@@ -589,7 +589,7 @@ Excerpt 7 — the merged tensor index and name lookup.
 The loader then reads weights by *canonical name*: `token_embd.weight`,
 `output_norm.weight`, `output.weight`, `blk.{i}.attn_norm.weight`,
 `blk.{i}.attn_q.weight`, … — the names come from a small `tensor_names`
-module (`models/qwen2/mod.rs:124-166`), so a naming convention change is a
+module (`models/qwen2/mod.rs:`), so a naming convention change is a
 one-file edit. Two notable lookups: `output` falls back to the embedding
 table when absent (`load_one(tn::OUTPUT).unwrap_or_else(|| tok_embd.clone())`
 — *weight tying*: small models reuse the embedding table as the final
@@ -633,16 +633,16 @@ condensation of `register_part` :2320-2372 and `register_weight` :2374-2424)
 ```
 
 Annotations: the loader calls `register_part` for every mmap'd part *before*
-registering any weight (`qwen2/loader.rs:319-327`) — the ordering is load-
+registering any weight (`qwen2/loader.rs:`) — the ordering is load-
 bearing, because `register_weight` locates its zero-copy entry by finding the
 part that contains the pointer. `StorageModeShared` on Apple Silicon means
 one physical allocation both CPU and GPU address; "zero-copy" is literal.
 The copy fallback exists for the two cases where bytes are *not* file pages:
 the fused `attn_qkv`/`ffn_gu` concat weights (built in RAM at load,
-`qwen2/loader.rs:391-426,446-491`) and `MINFER_WEIGHT_COPY=1`, an A/B switch
+`qwen2/loader.rs:,446-491`) and `MINFER_WEIGHT_COPY=1`, an A/B switch
 that makes the cost of the zero-copy path measurable.
 
-Excerpt 9 — CUDA's upload-once registry. (`src/cuda/methods/weights.rs:18-97`, abridged)
+Excerpt 9 — CUDA's upload-once registry. (`src/cuda/methods/weights.rs:`, abridged)
 
 ```rust
     pub fn register_weight(&self, name: &str, data: &[u8]) {
@@ -684,7 +684,7 @@ model reusing a tensor name with a non-Q6_K type cannot be dispatched
 through the padded-224 kernel on a raw-210 buffer (a Phase 8 review
 finding).
 
-Excerpt 10 — CPU registration: the cheapest one. (`src/graph/cpu_backend.rs:34-47`)
+Excerpt 10 — CPU registration: the cheapest one. (`src/graph/cpu_backend.rs:`)
 
 ```rust
     /// Register a weight tensor by name (Phase 6 wires this from the model).
@@ -706,11 +706,11 @@ Excerpt 10 — CPU registration: the cheapest one. (`src/graph/cpu_backend.rs:34
 The comment is the whole lesson: with borrowed bytes, even the *unguarded*
 insert is cheap; the guard exists because one call path produced *owned*
 clones. The graph allocator simply forwards to it
-(`graph/alloc.rs:135-138`: `self.cpu.register_weight(name, t)`), which is
+(`graph/alloc.rs:`: `self.cpu.register_weight(name, t)`), which is
 why the allocator's registration costs nothing on CPU.
 
 Excerpt 11 — the graph's own registration pass, at first build.
-(`src/models/qwen2/graph.rs:344-378`, abridged)
+(`src/models/qwen2/graph.rs:`, abridged)
 
 ```rust
     /// Register every weight the graph references on the allocator's backend.
@@ -741,7 +741,7 @@ The list is deliberately spelled out — not derived by reflection — so the
 compiler catches field renames in *both* the registration and the gate
 (excerpt 12), which must enumerate the same weights.
 
-Excerpt 12 — the Metal participation gate. (`src/models/qwen2/graph.rs:634-677`,
+Excerpt 12 — the Metal participation gate. (`src/models/qwen2/graph.rs:`,
 names list abridged)
 
 ```rust
@@ -765,7 +765,7 @@ names list abridged)
     }
 ```
 
-And where the verdict lands (`src/models/qwen2/graph.rs:431-457,462-470`):
+And where the verdict lands (`src/models/qwen2/graph.rs:,462-470`):
 
 ```rust
         #[cfg(target_os = "macos")]
@@ -814,11 +814,11 @@ shape inverts it: the trait declares everything the *pipeline* needs
 architecture implements them once, and downstream code stays
 architecture-blind. The cost is some `#[allow(dead_code)]` ceremony on
 methods only reached through `Box<dyn ModelDef>` — noted in the trait's own
-comment (`models/mod.rs:17-21`) — which is a fair price for the type safety.
+comment (`models/mod.rs:`) — which is a fair price for the type safety.
 
 **The IR references weights by name, not by pointer.** Graph nodes carry
 `NodeMeta::MatMul { weight_name, weight_ttype, in_dim, out_dim }`
-(`graph/builder.rs:127-145`); backends resolve the name through their
+(`graph/builder.rs:`); backends resolve the name through their
 registry at execute time. The alternatives: embedding raw byte pointers in
 the IR (couples the pure graph to mmap lifetimes and makes the CUDA
 representation impossible), or embedding `Tensor`s (makes graph comparison —
@@ -865,7 +865,7 @@ deletion, so keeping the parameter bought nothing.
   `debug_assert`, not a hope (`src/metal/runtime.rs`).
 - **CUDA init must complete before the first registration.** The loaders
   call `CudaState::init()` up front and hold a model-load guard for the whole
-  load (`qwen2/loader.rs:295-306`). The recorded failure mode: lazy init
+  load (`qwen2/loader.rs:`). The recorded failure mode: lazy init
   mid-load flips the backend gate between tensors, producing a graph that
   mixes CPU/CUDA assignment against persistent KV regions that were sized
   for one of them.
@@ -875,7 +875,7 @@ deletion, so keeping the parameter bought nothing.
   measured 635 ms per prefill→decode switch.
 - **CUDA device buffers are never freed on replace.** A captured graph may
   reference them; the leak is bounded by distinct (architecture, tensor)
-  shapes ever loaded (`src/cuda/methods/weights.rs:24-37`).
+  shapes ever loaded (`src/cuda/methods/weights.rs:`).
 - **The gate and the registration must enumerate the same weights.** Loader
   registers; `weights_on_gpu`/`weights_on_cuda` check the same field list
   spelled out twice. That duplication is intentional — a new weight field
@@ -883,7 +883,7 @@ deletion, so keeping the parameter bought nothing.
 - **Loader registers ⊋ gate accepts (on CUDA).** Some types are registered
   for the legacy path but have no graph kernel; the gate's type check is
   what keeps those on CPU. The embedding's Q4_1 exclusion is the standing
-  example (`qwen2/graph.rs:685-693`).
+  example (`qwen2/graph.rs:`).
 - **The KV element-type decision is made once, per engine.** `kvformat::resolve`
   runs after the loader returns and its answer is stored on the engine
   (`set_kv_format`) — there is deliberately no process-wide tag (ADR-0006), so
@@ -892,7 +892,7 @@ deletion, so keeping the parameter bought nothing.
   multiplies it.
 - **`positions[i] < n_ctx` is a caller obligation.** The KV regions are
   sized `n_kv_embd × n_ctx` once; `forward_cached` asserts it loudly
-  (`qwen2/graph.rs:421-426`) rather than corrupting a region.
+  (`qwen2/graph.rs:`) rather than corrupting a region.
 
 ## 4. Observe & verify
 

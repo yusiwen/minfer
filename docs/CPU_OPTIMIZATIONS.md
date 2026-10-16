@@ -40,7 +40,7 @@ The forward pass already uses SIMD-optimized operations throughout:
 
 ### 1. RMSNorm with Fused Weight Multiply
 
-**Location:** `src/models/qwen2/forward.rs:242-250`
+**Location:** `src/models/qwen2/forward.rs:`
 
 ```rust
 fn rms_norm(x: &[f32], eps: f32, out: &mut [f32], n: usize, d: usize, w: Option<&[f32]>) {
@@ -55,13 +55,13 @@ fn rms_norm(x: &[f32], eps: f32, out: &mut [f32], n: usize, d: usize, w: Option<
 }
 ```
 
-Uses `rms_norm_fused_f32` from `vec_ops.rs:511-533` with AVX2 sum-of-squares
+Uses `rms_norm_fused_f32` from `vec_ops.rs:` with AVX2 sum-of-squares
 computation using `_mm256_fmadd_ps`. Fuses RMSNorm + weight multiply in a
 single pass.
 
 ### 2. Vectorized Residual Add
 
-**Location:** `src/models/qwen2/forward.rs:110-115`
+**Location:** `src/models/qwen2/forward.rs:`
 
 ```rust
 unsafe {
@@ -77,7 +77,7 @@ Uses `vec_add_f32` with AVX2 `_mm256_add_ps` (8-wide). Called twice per layer
 
 ### 3. Vectorized Gate × Up Multiply
 
-**Location:** `src/models/qwen2/forward.rs:127-130`
+**Location:** `src/models/qwen2/forward.rs:`
 
 ```rust
 crate::vec_ops::vec_mul_f32(len,
@@ -90,7 +90,7 @@ Uses `vec_mul_f32` with AVX2 `_mm256_mul_ps`. Called once per layer (24 times).
 
 ### 4. RoPE Sin/Cos Cache
 
-**Location:** `src/models/qwen2/forward.rs:257-275`
+**Location:** `src/models/qwen2/forward.rs:`
 
 ```rust
 let mut sin_cache = vec![0.0f32; half];
@@ -456,7 +456,7 @@ Expected gain: 4-6× speedup on attention portion (30-40% overall)
 
 **2. Q/K/V Matmul Batch Parallel**
 
-Location: `forward.rs:95-99`
+Location: `forward.rs:`
 
 ```rust
 crate::kernel::quant_matmul_f32_batch(&mut [
@@ -475,7 +475,7 @@ Expected gain: 2-3× speedup on matmul portion (10-15% overall)
 
 **3. FFN Gate/Up Parallel**
 
-Location: `forward.rs:118-121`
+Location: `forward.rs:`
 
 ```rust
 crate::kernel::quant_matmul_f32_batch(&mut [

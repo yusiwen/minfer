@@ -492,7 +492,7 @@ launches it.
 section bases*, which lets one kernel serve both decode layer classes
 `attn_bias_rope_store_f32` (`kv_store.cu:118`): the **concat class** points all three into one
 concatenated matmul output (`q = base`, `k = base + nqt`, `v = base + 2·nkt`;
-the Rust arm does this pointer arithmetic at (`cuda_backend.rs:1426-1433`, the `Op::FusedQKV` section bases), and
+the Rust arm does this pointer arithmetic at (`cuda_backend.rs:`, the `Op::FusedQKV` section bases), and
 the **mixed-quant class** (e.g. a model where `attn_v` is Q6_K and cannot join
 the concat) points them at three separate matmul outputs
 (`Op::QkvBiasRopeStore`, arm at `cuda_backend.rs:1299`). One device kernel,
@@ -575,7 +575,7 @@ engine's resolved `KvFormat` (`src/graph/kvformat.rs` is the single authority): 
 `GraphAllocator::set_kv_format`. When the tag is f16, every store converts to `__half` and
 every attention read converts back; §3.2's kernel shows both sides of that. The
 `store_kv_f16` header comment states the trade (`kv_store.cu:23-30`): "halves attention
-read bandwidth", and the Rust `store_kv_f16` doc comment (`src/cuda/methods/kvstore.rs:153-155`) adds the fine
+read bandwidth", and the Rust `store_kv_f16` doc comment (`src/cuda/methods/kvstore.rs:`) adds the fine
 print — *the region stays f32-sized; the f16 view uses the first half of the bytes*:
 allocation does not shrink, the bytes written per store and read per attention call do
 (§4 does the arithmetic). The correctness story for the f16 round trip is test
@@ -641,23 +641,23 @@ match &node.op {
 
 Three representative arms:
 
-- `Op::FusedQKV` (`cuda_backend.rs:1365-1453`) — the decode tail of §3.2: the concat matmul
-  (`matmul_f32_ptr_layout`, `cuda_backend.rs:1399-1408`, writing `[q|k|v]` into the output
-  buffer), then the fused epilogue (`fused_qkv_epilogue`, `cuda_backend.rs:1435-1451`) with
-  pointer-form section bases computed at `cuda_backend.rs:1425-1434`. KV pointers come
+- `Op::FusedQKV` (`cuda_backend.rs:`) — the decode tail of §3.2: the concat matmul
+  (`matmul_f32_ptr_layout`, `cuda_backend.rs:`, writing `[q|k|v]` into the output
+  buffer), then the fused epilogue (`fused_qkv_epilogue`, `cuda_backend.rs:`) with
+  pointer-form section bases computed at `cuda_backend.rs:`. KV pointers come
   from the scheduler's `kv_pair` (§3.3); guards reject `nt != 1`, non-neox
-  RoPE, odd `hd` — each `Err` with the offending values (`cuda_backend.rs:1372-1390`).
-- `Op::Attn` (`cuda_backend.rs:1599-1783`) — the shape dispatcher of §3.1/§3.2: invariants
-  first (`cuda_backend.rs:1604-1651`), then `nt == 1` → `gqa_attn_split` (split-K
-  flash-decoding; the 8d comment at `cuda_backend.rs:1689-1693` records why: the single-warp
+  RoPE, odd `hd` — each `Err` with the offending values (`cuda_backend.rs:`).
+- `Op::Attn` (`cuda_backend.rs:`) — the shape dispatcher of §3.1/§3.2: invariants
+  first (`cuda_backend.rs:`), then `nt == 1` → `gqa_attn_split` (split-K
+  flash-decoding; the 8d comment at `cuda_backend.rs:` records why: the single-warp
   kernel left the GPU idle, 48% of the 7B decode step per nsys), `2..=16` (f16/f32) →
-  the batched variant (`cuda_backend.rs:1711-1742`), `nt > 16` → the prefill kernels
-  (`cuda_backend.rs:1743-1782`), where the host wrapper `gqa_attn_kv_prefill`
+  the batched variant (`cuda_backend.rs:`), `nt > 16` → the prefill kernels
+  (`cuda_backend.rs:`), where the host wrapper `gqa_attn_kv_prefill`
   (`src/cuda/methods/attention.rs:261`) internally routes to the FA prefill kernel.
-- `Op::KvcacheStore` (`cuda_backend.rs:1552-1597`) — the unfused prefill store: verifies the
-  output buffer *is* the K region (`cuda_backend.rs:1555-1560`), derives `nt` from the element
+- `Op::KvcacheStore` (`cuda_backend.rs:`) — the unfused prefill store: verifies the
+  output buffer *is* the K region (`cuda_backend.rs:`), derives `nt` from the element
   count, converts the boundary array device-side, and launches the layout's store
-  (`store_kv_q8_0`/`store_kv_f16`/`store_kv_f32`, `cuda_backend.rs:1581-1595`) once per region.
+  (`store_kv_q8_0`/`store_kv_f16`/`store_kv_f32`, `cuda_backend.rs:`) once per region.
 
 Every arm ends `Ok(())` or returns `Err(String)`; there is no third outcome.
 The match's fallthrough makes the policy explicit `execute_node_inner` (`cuda_backend.rs:916`):
@@ -886,7 +886,7 @@ measured band for per-launch CPU overhead is ~2–7 µs
 work. A captured step replays all of it with one launch call. The repo has a
 measured anchor for this class of win: the positions-conversion memo (§3.4)
 eliminated re-conversions that cost "240 launches/step … ~0.28 ms of pure
-launch overhead" at a 14B decode (`cuda_backend.rs:68-74`, the positions-memo comment) — about 1.2 µs per
+launch overhead" at a 14B decode (`cuda_backend.rs:`, the positions-memo comment) — about 1.2 µs per
 launch, right in TECH-PRIMER's band. §3.2's fusion is the same arithmetic at
 graph level — the 7-launch QKV tail becomes 1 ("−310 launches/step" across a
 whole model, `docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels")  — and the dispatch notes
