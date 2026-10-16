@@ -891,6 +891,37 @@ impl<'a> GgufReader<'a> {
     }
 }
 
+/// The data section's size: the furthest tensor end (`offset + nbytes`), with
+/// every tensor's range checked against `limit` (the part's data-section length).
+///
+/// The layout is **not** required to be contiguous in index order. Each tensor
+/// carries its own offset, writers insert padding between tensors (unsloth's UD
+/// quants do) and may even order the data differently from the index, and the
+/// section ends at the furthest tensor. Requiring `offset == accumulated` rejected
+/// legal files ([#575](https://github.com/yusiwen/minfer/issues/575)); what matters
+/// is that every range fits.
+fn data_section_size(info: &[GgufTensorInfo], limit: usize) -> Result<usize, String> {
+    let mut size = 0usize;
+    for ti in info {
+        let nbytes = ggml_nbytes(ti) as u64;
+        let Some(end) = ti.offset.checked_add(nbytes) else {
+            return Err(format!(
+                "GGUF: tensor '{}' has offset {} and {} bytes, which overflows",
+                ti.name, ti.offset, nbytes
+            ));
+        };
+        if end > limit as u64 {
+            return Err(format!(
+                "GGUF: tensor '{}' spans bytes {}..{} of the data section, which is only {} bytes \
+                 (the file is truncated, or the offsets are corrupt)",
+                ti.name, ti.offset, end, limit
+            ));
+        }
+        size = size.max(end as usize);
+    }
+    Ok(size)
+}
+
 // === Main init function (gguf.cpp lines 451-893, gguf_init_from_reader) ===
 
 impl GgufContext {
@@ -1571,28 +1602,19 @@ impl GgufContext {
         // store data section offset (gguf.cpp line 759)
         ctx.offset = gr.tell() as usize;
 
-        // compute total data section size (gguf.cpp lines 762-782)
-        {
-            ctx.size = 0;
-            for i in 0..ctx.info.len() {
-                let ti = &ctx.info[i];
-                if ti.offset != ctx.size as u64 {
-                    eprintln!(
-                        "GGUF: tensor '{}' has offset {}, expected {}",
-                        ti.name, ti.offset, ctx.size
-                    );
-                    eprintln!("GGUF: failed to read tensor data");
-                    return None;
-                }
-                let padded_size = ggml_pad(ggml_nbytes(ti), ctx.alignment);
-                if usize::MAX - ctx.size < padded_size {
-                    eprintln!(
-                        "GGUF: tensor '{}' size overflow, cannot accumulate size {} + {}",
-                        ti.name, ctx.size, padded_size
-                    );
-                    return None;
-                }
-                ctx.size += padded_size;
+        // Total data-section size: the end of the furthest tensor
+        // (`gguf.cpp`: `size = max(offset + nbytes)`).
+        //
+        // The layout is **not** required to be contiguous in index order — each
+        // tensor carries its own offset, and writers insert padding between
+        // tensors (unsloth's UD quants do) or order the data differently from the
+        // index. Requiring `offset == accumulated` rejected legal files (#575);
+        // what actually matters is that every tensor's range fits in the part.
+        match data_section_size(&ctx.info, gr.data.len().saturating_sub(ctx.offset)) {
+            Ok(size) => ctx.size = size,
+            Err(msg) => {
+                eprintln!("{msg}");
+                return None;
             }
         }
 
