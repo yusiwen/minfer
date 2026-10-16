@@ -36,6 +36,7 @@ fn test_tokenizer() -> Tokenizer {
         id_to_type: vec![1; 3],
         vocab: HashMap::new(),
         merges: HashMap::new(),
+        dna: None,
         byte_to_unicode,
         unicode_to_byte,
         special_tokens: HashMap::new(),
@@ -216,6 +217,60 @@ fn a_chat_token_the_file_does_not_declare_is_not_invented() {
     );
     assert!(!t.special_tokens.contains_key("<|im_start|>"));
     assert!(!t.special_tokens.contains_key("<|im_end|>"));
+}
+
+// === #132 S4: the hybriddna engine ========================================
+
+/// A tokenizer carrying only the DNA block state: the three tag ids and a k-mer
+/// table. `hybriddna_kmers` and the block walk do not touch the BPE tables unless
+/// text *outside* the tags is present, which these tests avoid on purpose.
+fn hybriddna_tokenizer() -> Tokenizer {
+    let mut t = Tokenizer::empty();
+    t.model = TokenizerModel::HybridDna;
+    let mut kmers = HashMap::new();
+    kmers.insert("ACGTAC".to_string(), 7u32);
+    kmers.insert("GTACGT".to_string(), 8u32);
+    t.dna = Some(DnaData {
+        begin: 1,
+        end: 2,
+        oov: 3,
+        kmers,
+    });
+    t
+}
+
+#[test]
+fn hybriddna_cuts_a_block_into_marked_kmers_and_pads_the_tail() {
+    let t = hybriddna_tokenizer();
+    let dna = t.dna.as_ref().unwrap();
+    // Lower case is upper-cased first, exactly six bytes per k-mer.
+    assert_eq!(t.hybriddna_kmers("acgtac", dna), vec![7]);
+    assert_eq!(t.hybriddna_kmers("acgtacgtacgt", dna), vec![7, 8]);
+    // A short tail is padded with `A` to six bytes: `ACGTA` + `A` = `ACGTAA`, which
+    // this table does not carry, so it is `<oov>` — the padding is what decides.
+    assert_eq!(t.hybriddna_kmers("acgta", dna), vec![3]);
+    // Bytes that are not ACGT have no k-mer either, and are never dropped.
+    assert_eq!(t.hybriddna_kmers("acgtnc", dna), vec![3]);
+    // Twelve bytes with no table entries at all is still two `<oov>` tokens.
+    assert_eq!(t.hybriddna_kmers("nnnnnnnnnnnn", dna), vec![3, 3]);
+}
+
+#[test]
+fn hybriddna_wraps_the_block_in_its_tags_and_stops_at_eof() {
+    let mut t = hybriddna_tokenizer();
+    // The block is `acgtac` → one k-mer; the tags are emitted around it.
+    assert_eq!(t.hybriddna_encode("<dna>acgtac</dna>"), vec![1, 7, 2]);
+    // Two k-mers.
+    assert_eq!(
+        t.hybriddna_encode("<dna>acgtacgtacgt</dna>"),
+        vec![1, 7, 8, 2]
+    );
+    // No closing tag: llama.cpp emits the opening tag, the k-mers, and stops — no
+    // closing tag, and no BPE over the remainder.
+    assert_eq!(t.hybriddna_encode("<dna>acgtac"), vec![1, 7]);
+    // Without the three tag ids the engine is plain BPE (`dna` is `None`).
+    t.dna = None;
+    assert_eq!(t.hybriddna_encode(""), Vec::<u32>::new());
 }
 
 // === #132 S4: the plamo2 engine ============================================
@@ -677,9 +732,13 @@ fn the_tokenizer_model_is_a_dispatch() {
         TokenizerModel::from_gguf(Some("plamo2")).unwrap(),
         TokenizerModel::Plamo2
     );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("hybriddna")).unwrap(),
+        TokenizerModel::HybridDna
+    );
     // Every other engine is refused *by name* — an approximation with the wrong
     // engine would be worse than a refusal.
-    for other in ["whitespace", "hybriddna", "none"] {
+    for other in ["whitespace", "none"] {
         let err = TokenizerModel::from_gguf(Some(other)).unwrap_err();
         assert!(
             err.contains(other),
@@ -1140,6 +1199,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         "~/.cache/minfer/models/hf/mitmul/plamo-2-translate-GGUF/plamo-2-translate_IQ1_S.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_plamo-2-translate.json"),
     ),
+    (
+        "carbon-3b",
+        "~/.cache/minfer/models/hf/HuggingFaceBio/Carbon-3B-GGUF/carbon-3b-q4_k_m.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_carbon-3b.json"),
+    ),
 ];
 
 fn expand_home(path: &str) -> std::path::PathBuf {
@@ -1344,6 +1408,7 @@ impl TokenizerModel {
             Self::Gemma4 => "gemma4",
             Self::Rwkv => "rwkv",
             Self::Plamo2 => "plamo2",
+            Self::HybridDna => "hybriddna",
         }
     }
 }

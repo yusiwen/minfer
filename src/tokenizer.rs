@@ -321,6 +321,12 @@ pub enum TokenizerModel {
     /// scores, no `pre` rule and no byte-level encoding: a byte that starts no
     /// entry emits the unknown token and advances one byte.
     Rwkv,
+    /// `hybriddna`: Carbon-3B's HybridDNA tokenizer — byte-level BPE plus a
+    /// `<dna>`…`</dna>` block whose content is upper-cased and cut into 6-mers that
+    /// look up tokens carrying a reserved U+E000 suffix (`<oov>` when a k-mer is
+    /// missing, the tail padded with `A`). Outside the tags it is the `gpt2` engine,
+    /// `pre` rule included.
+    HybridDna,
     /// `plamo2`: PLaMo-2 — a backward DP over codepoints whose objective is the
     /// vocabulary's own `tokenizer.ggml.scores`, with one `<0xXX>` byte token per
     /// byte as the fallback (never `<unk>`). The `pre` key does **not** participate
@@ -351,6 +357,7 @@ impl TokenizerModel {
             Some("gemma4") => Ok(Self::Gemma4),
             Some("rwkv") => Ok(Self::Rwkv),
             Some("plamo2") => Ok(Self::Plamo2),
+            Some("hybriddna") => Ok(Self::HybridDna),
             Some("t5") => Ok(Self::Ugm),
             Some(other) => Err(format!(
                 "tokenizer.ggml.model = \"{other}\" is not a tokenizer minfer implements \
@@ -521,6 +528,11 @@ fn special_index(special_tokens: &HashMap<String, u32>) -> HashMap<char, Vec<(St
     index
 }
 
+/// The reserved suffix (U+E000) that keeps a DNA k-mer distinct from an identical
+/// base-vocabulary BPE token of the same spelling; erased from `id_to_token` at load
+/// and kept in the token-to-id map (`llama-vocab.cpp:2524`).
+const DNA_KMER_MARKER: &str = "\u{e000}";
+
 /// Decode an RVKV vocabulary entry: `\xNN` is the byte 0xNN, `\t`/`\n`/`\r` are
 /// themselves, any other `\c` is `c`, and a trailing lone `\` is dropped
 /// (`llama_unescape_rwkv_token`, `llama-vocab.cpp:1247`).
@@ -671,6 +683,17 @@ impl VocabTrie {
         }
         best
     }
+}
+
+/// `hybriddna`'s DNA block: the three tag ids and the marked 6-mers, keyed by the
+/// **bare** k-mer (the marker is erased from `id_to_token` at load, as llama.cpp
+/// does, so detokenization yields the bare sequence).
+#[derive(Default, Clone)]
+struct DnaData {
+    begin: u32,
+    end: u32,
+    oov: u32,
+    kmers: HashMap<String, u32>,
 }
 
 /// The unigram engine's loaded state: the two tries, the score bounds and the
@@ -846,6 +869,8 @@ pub struct Tokenizer {
     unk_token: u32,
     /// Unigram (`t5`): the trie, the score bound and the charsmap.
     ugm: UgmData,
+    /// `hybriddna` only; `None` for every other engine.
+    dna: Option<DnaData>,
     /// Unigram (`t5`): `tokenizer.ggml.remove_extra_whitespaces` — collapse a run
     /// of whitespace into one `▁`.
     remove_extra_whitespaces: bool,
@@ -919,6 +944,7 @@ impl Tokenizer {
             max_token_len: 0,
             unk_token: 0,
             ugm: UgmData::default(),
+            dna: None,
             remove_extra_whitespaces: false,
             special_by_first: HashMap::new(),
             bos_token: 0,
@@ -963,6 +989,7 @@ impl Tokenizer {
             max_token_len: 0,
             unk_token: 0,
             ugm: UgmData::default(),
+            dna: None,
             remove_extra_whitespaces: false,
             special_by_first: HashMap::new(),
             bos_token: 0,
@@ -1087,13 +1114,14 @@ impl Tokenizer {
             TokenizerModel::from_gguf(Self::get_gguf_str(gguf, "tokenizer.ggml.model").as_deref())?;
         let mut add_space_prefix = false;
         let mut spm_byte_to_id: HashMap<u8, u32> = HashMap::new();
+        let mut dna: Option<DnaData> = None;
         let mut normalizer = NormalizerOptions::default();
         let mut max_token_len = 0;
         let mut unk_token = 0;
         let mut ugm = UgmData::default();
         let mut remove_extra_whitespaces = false;
         let pre = match model {
-            TokenizerModel::Gpt2 => {
+            TokenizerModel::Gpt2 | TokenizerModel::HybridDna => {
                 // F7: the pre-tokenization rule must be one this engine implements.
                 let pre = PreTokenizer::from_gguf(
                     Self::get_gguf_str(gguf, "tokenizer.ggml.pre").as_deref(),
@@ -1117,6 +1145,32 @@ impl Tokenizer {
                          (first: <0x{first:02X}>); minfer refuses a lossy byte fallback",
                         missing.len()
                     ));
+                }
+                if matches!(model, TokenizerModel::HybridDna) {
+                    // The three tag ids must all be declared, and the k-mer table is
+                    // read **before** the marker is erased: the marked spelling is the
+                    // lookup key, the bare one is what detokenization emits.
+                    let dna_tag = |tag: &str| vocab.get(tag).copied();
+                    match (dna_tag("<dna>"), dna_tag("</dna>"), dna_tag("<oov>")) {
+                        (Some(begin), Some(end), Some(oov)) => {
+                            let mut kmers = HashMap::new();
+                            for (id, text) in id_to_token.iter_mut().enumerate() {
+                                let Some(bare) = text.strip_suffix(DNA_KMER_MARKER) else {
+                                    continue;
+                                };
+                                kmers.insert(bare.to_string(), id as u32);
+                                *text = bare.to_string();
+                            }
+                            dna = Some(DnaData {
+                                begin,
+                                end,
+                                oov,
+                                kmers,
+                            });
+                        }
+                        // llama.cpp falls back to plain BPE when a tag is absent.
+                        _ => {}
+                    }
                 }
                 Some(pre)
             }
@@ -1398,6 +1452,7 @@ impl Tokenizer {
             pre,
             add_space_prefix,
             spm_byte_to_id,
+            dna,
             normalizer,
             max_token_len,
             unk_token,
@@ -1637,6 +1692,7 @@ impl Tokenizer {
         }
         match self.model {
             TokenizerModel::Gpt2 => self.encode_bpe(text),
+            TokenizerModel::HybridDna => self.hybriddna_encode(text),
             TokenizerModel::Bert => self.wpm_encode(text),
             TokenizerModel::Ugm => self.ugm_encode(text),
             TokenizerModel::Gemma4 => self.gemma4_encode(text),
@@ -1806,6 +1862,67 @@ impl Tokenizer {
                 ),
             }
         }
+    }
+
+    /// HybridDNA encode (`llm_tokenizer_hybriddna_session`, `llama-vocab.cpp:1640`):
+    /// the `<dna>`…`</dna>` blocks are cut into 6-mers, everything else is the plain
+    /// `gpt2` engine. Without the three tag ids the engine is plain BPE.
+    fn hybriddna_encode(&self, text: &str) -> Vec<u32> {
+        const OPEN: &str = "<dna>";
+        const CLOSE: &str = "</dna>";
+        let Some(dna) = self.dna.as_ref() else {
+            return self.encode_bpe(text);
+        };
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos < text.len() {
+            let Some(start) = text[pos..].find(OPEN).map(|i| i + pos) else {
+                out.extend(self.encode_bpe(&text[pos..]));
+                break;
+            };
+            if start > pos {
+                out.extend(self.encode_bpe(&text[pos..start]));
+            }
+            out.push(dna.begin);
+            let content_start = start + OPEN.len();
+            let close = text[content_start..].find(CLOSE).map(|i| i + content_start);
+            let content_end = close.unwrap_or(text.len());
+            out.extend(self.hybriddna_kmers(&text[content_start..content_end], dna));
+            match close {
+                Some(end) => {
+                    out.push(dna.end);
+                    pos = end + CLOSE.len();
+                }
+                // No closing tag: the rest of the input is the block, as in llama.cpp.
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// `emit_dna_kmers`: upper-case the ASCII letters, cut into 6-byte k-mers, look
+    /// each up, and pad the tail with `A` to six bytes.
+    fn hybriddna_kmers(&self, raw: &str, dna: &DnaData) -> Vec<u32> {
+        const K: usize = 6;
+        let seq: Vec<u8> = raw
+            .bytes()
+            .map(|b| if b.is_ascii_lowercase() { b - 32 } else { b })
+            .collect();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + K <= seq.len() {
+            let kmer = String::from_utf8_lossy(&seq[i..i + K]).to_string();
+            out.push(*dna.kmers.get(&kmer).unwrap_or(&dna.oov));
+            i += K;
+        }
+        if i < seq.len() {
+            let mut kmer = String::from_utf8_lossy(&seq[i..]).to_string();
+            while kmer.len() < K {
+                kmer.push('A');
+            }
+            out.push(*dna.kmers.get(&kmer).unwrap_or(&dna.oov));
+        }
+        out
     }
 
     /// PLaMo-2 encode: a backward DP over codepoints from the end of the text
