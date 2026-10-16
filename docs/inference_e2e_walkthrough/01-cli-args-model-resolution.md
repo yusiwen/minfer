@@ -785,7 +785,7 @@ because the seed is stable.
   have.
 - **Split models enter through part 0.** Both resolution paths (cached-name
   collapse, `match_model` group expansion) guarantee the returned path is
-  `…-00001-of-0000N.gguf`, because `gguf::resolve_splits` (`gguf.rs:1790`)
+  `…-00001-of-0000N.gguf`, because `gguf::resolve_splits` (`gguf.rs:1812`)
   refuses to act as the entry when handed a later part. The resolver and
   the loader co-own that convention.
 - **Server-like modes never consume stdin.** `serve`/`viz`/`--cnv` read

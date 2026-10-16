@@ -66,10 +66,13 @@ fn every_metadata_type_round_trips_through_the_parser() {
     assert!(ctx.get_val_bool(ctx.find_key("flag")));
     // data section starts aligned and holds exactly the one tensor
     assert_eq!(ctx.get_data_offset() % 32, 0);
-    assert_eq!(ctx.size, 32);
+    // `size` is the furthest tensor's *end* (`offset + nbytes`), not a padded
+    // total: padding between tensors is the writer's business (and #575's files
+    // have more of it than this loader used to assume).
+    assert_eq!(ctx.size, 16);
     assert_eq!(ctx.info[0].offset, 0);
-    // The file must actually *contain* the padding the index declares.
-    assert_eq!(bytes.len(), ctx.get_data_offset() + ctx.size);
+    // This writer pads the last tensor to the alignment, so the file is that long.
+    assert_eq!(bytes.len(), ctx.get_data_offset() + ggml_pad(ctx.size, 32));
     let _ = std::fs::remove_file(&path);
 }
 
