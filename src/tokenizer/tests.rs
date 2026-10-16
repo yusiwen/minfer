@@ -218,6 +218,63 @@ fn a_chat_token_the_file_does_not_declare_is_not_invented() {
     assert!(!t.special_tokens.contains_key("<|im_end|>"));
 }
 
+// === #132 S4: the plamo2 engine ============================================
+
+/// A plamo2 tokenizer: the pieces of `pieces` (name, score) plus the 256 `<0xXX>`
+/// byte tokens the fallback needs. Ids 0..n are the pieces in order; the byte
+/// tokens follow.
+fn plamo2_tokenizer(pieces: &[(&str, f32)]) -> Tokenizer {
+    let mut t = Tokenizer::empty();
+    t.model = TokenizerModel::Plamo2;
+    t.pre = None;
+    for (text, score) in pieces {
+        let id = t.id_to_token.len() as u32;
+        t.id_to_token.push(text.to_string());
+        t.id_to_type.push(1);
+        t.id_to_score.push(*score);
+        t.vocab.insert(text.to_string(), id);
+        t.ugm.trie.insert_bytes(text.as_bytes(), id);
+    }
+    for b in 0u16..=255 {
+        let id = t.id_to_token.len() as u32;
+        t.id_to_token.push(format!("<0x{b:02X}>"));
+        t.id_to_type.push(6);
+        t.id_to_score.push(0.0);
+        t.spm_byte_to_id.insert(b as u8, id);
+    }
+    t
+}
+
+#[test]
+fn plamo2_maximizes_the_declared_scores_not_the_match_length() {
+    // `ab` costs -5 while `a` + `b` cost nothing: the DP's objective is the sum of
+    // the file's scores, so it must split — a longest-match tokenizer would not.
+    let t = plamo2_tokenizer(&[("a", 0.0), ("b", 0.0), ("ab", -5.0)]);
+    assert_eq!(t.encode("ab"), vec![t.vocab["a"], t.vocab["b"]]);
+    // With equal scores the strict `<` keeps the first examined candidate, which
+    // is the longest: `ab` wins a tie.
+    let t = plamo2_tokenizer(&[("a", 0.0), ("b", 0.0), ("ab", 0.0)]);
+    assert_eq!(t.encode("ab"), vec![t.vocab["ab"]]);
+}
+
+#[test]
+fn plamo2_falls_back_to_byte_tokens_and_strips_a_leading_bom() {
+    let t = plamo2_tokenizer(&[("a", 0.0), ("ab", 0.0)]);
+    // U+20AC has no piece, so its three UTF-8 bytes are emitted as byte tokens —
+    // never `<unk>`, and never dropped.
+    assert_eq!(
+        t.encode("a\u{20ac}"),
+        vec![
+            t.vocab["a"],
+            t.spm_byte_to_id[&0xE2],
+            t.spm_byte_to_id[&0x82],
+            t.spm_byte_to_id[&0xAC],
+        ]
+    );
+    // A leading BOM is stripped before the DP runs.
+    assert_eq!(t.encode("\u{feff}ab"), t.encode("ab"));
+}
+
 // === #132 S4: the rwkv engine ==============================================
 
 /// An RVKV vocabulary: the entries are **escaped** (`\x41` stands for the byte
@@ -616,9 +673,13 @@ fn the_tokenizer_model_is_a_dispatch() {
         TokenizerModel::from_gguf(Some("rwkv")).unwrap(),
         TokenizerModel::Rwkv
     );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("plamo2")).unwrap(),
+        TokenizerModel::Plamo2
+    );
     // Every other engine is refused *by name* — an approximation with the wrong
     // engine would be worse than a refusal.
-    for other in ["plamo2", "whitespace", "hybriddna", "none"] {
+    for other in ["whitespace", "hybriddna", "none"] {
         let err = TokenizerModel::from_gguf(Some(other)).unwrap_err();
         assert!(
             err.contains(other),
@@ -1074,6 +1135,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         "~/.cache/minfer/models/hf/latestissue/rwkv-6-world-1b6-gguf/rwkv-6-world-1.6b-Q4_0.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_rwkv-6-world-1.6b.json"),
     ),
+    (
+        "plamo-2-translate",
+        "~/.cache/minfer/models/hf/mitmul/plamo-2-translate-GGUF/plamo-2-translate_IQ1_S.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_plamo-2-translate.json"),
+    ),
 ];
 
 fn expand_home(path: &str) -> std::path::PathBuf {
@@ -1277,6 +1343,7 @@ impl TokenizerModel {
             Self::Ugm => "t5",
             Self::Gemma4 => "gemma4",
             Self::Rwkv => "rwkv",
+            Self::Plamo2 => "plamo2",
         }
     }
 }

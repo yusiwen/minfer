@@ -321,6 +321,11 @@ pub enum TokenizerModel {
     /// scores, no `pre` rule and no byte-level encoding: a byte that starts no
     /// entry emits the unknown token and advances one byte.
     Rwkv,
+    /// `plamo2`: PLaMo-2 — a backward DP over codepoints whose objective is the
+    /// vocabulary's own `tokenizer.ggml.scores`, with one `<0xXX>` byte token per
+    /// byte as the fallback (never `<unk>`). The `pre` key does **not** participate
+    /// (there is no regex rule), and neither do merges.
+    Plamo2,
     /// `gemma4`: Gemma-4 — byte-level BPE's merge loop over **raw UTF-8** (no
     /// byte-to-unicode step), a normalizer that replaces spaces with `▁`, the
     /// gemma4 newline rule taken from the model value (the file carries no `pre`,
@@ -345,6 +350,7 @@ impl TokenizerModel {
             Some("bert") => Ok(Self::Bert),
             Some("gemma4") => Ok(Self::Gemma4),
             Some("rwkv") => Ok(Self::Rwkv),
+            Some("plamo2") => Ok(Self::Plamo2),
             Some("t5") => Ok(Self::Ugm),
             Some(other) => Err(format!(
                 "tokenizer.ggml.model = \"{other}\" is not a tokenizer minfer implements \
@@ -625,6 +631,18 @@ impl VocabTrie {
         out
     }
 
+    /// The child of `node` for the byte `b`, if any.
+    fn step(&self, node: u32, b: u8) -> Option<u32> {
+        self.nodes
+            .get(node as usize)
+            .and_then(|n| n.children.get(&b).copied())
+    }
+
+    /// The entry that ends at `node`, if any.
+    fn terminal(&self, node: u32) -> Option<u32> {
+        self.nodes.get(node as usize).and_then(|n| n.token)
+    }
+
     /// Whether any entry starts with the byte `b` (a root child).
     fn starts_with_byte(&self, b: u8) -> bool {
         !self.nodes.is_empty() && self.nodes[0].children.contains_key(&b)
@@ -772,16 +790,15 @@ pub const MAX_BREAKER_TAIL_TOKENS: usize = 20;
 #[derive(Clone)]
 pub struct Tokenizer {
     pub id_to_token: Vec<String>,
-    /// The GGUF `tokenizer.ggml.scores` array, parsed for llama.cpp parity.
+    /// The GGUF `tokenizer.ggml.scores` array.
     ///
-    /// Retained with an allowance ([#244]'s verdict: keep, deferred): the engine
-    /// reads `id_to_token` + `vocab` + `merges`, and nothing reads the scores —
-    /// the field is dead in every build. What would read it: a sampler or
-    /// diagnostic that weights candidates by the vocabulary's declared score
-    /// (llama.cpp's `llama_token_data` carries it).
+    /// Read by the plamo2 engine ([#132] S4): its backward DP maximizes the sum of
+    /// these scores, so `plamo2_score_int` is the field's first production reader
+    /// (the allowance [#244] carried was removed with it). The other engines still
+    /// ignore the array.
     ///
+    /// [#132]: https://github.com/yusiwen/minfer/issues/132
     /// [#244]: https://github.com/yusiwen/minfer/issues/244
-    #[allow(dead_code)]
     pub id_to_score: Vec<f32>,
     /// The GGUF `tokenizer.ggml.token_type` array.
     ///
@@ -1180,6 +1197,45 @@ impl Tokenizer {
                             missing.len()
                         ));
                     }
+                }
+                None
+            }
+            TokenizerModel::Plamo2 => {
+                // `model = plamo2` fixes the rule itself: llama.cpp sets the
+                // pre-type from the model value, and this artifact declares
+                // `pre = "default"`, which is not one of the four rules minfer
+                // accepts — so the key is deliberately not read.
+                //
+                // The DP's objective is the file's own scores and its fallback is
+                // the `<0xXX>` byte table; both are mandatory here.
+                if id_to_score.len() != id_to_token.len() || id_to_score.is_empty() {
+                    return Err(format!(
+                        "tokenizer.ggml.scores has {} entries for {} tokens; the plamo2 engine's \
+                         objective is the file's own scores, so a mismatched table cannot be run",
+                        id_to_score.len(),
+                        id_to_token.len()
+                    ));
+                }
+                for (id, token) in id_to_token.iter().enumerate() {
+                    if id_to_type.get(id).copied().unwrap_or(1) == 6 {
+                        if let Some(b) = parse_spm_byte_token(token) {
+                            spm_byte_to_id.insert(b, id as u32);
+                        }
+                        continue;
+                    }
+                    // Byte tokens are the fallback, not candidates.
+                    ugm.trie.insert_bytes(token.as_bytes(), id as u32);
+                }
+                let missing: Vec<u8> = (0u8..=255)
+                    .filter(|b| !spm_byte_to_id.contains_key(b))
+                    .collect();
+                if let Some(first) = missing.first() {
+                    return Err(format!(
+                        "this plamo2 vocabulary declares no <0x{first:02X}> byte token ({} byte(s) \
+                         uncovered); the engine's fallback emits one byte token per byte, so it \
+                         refuses the file rather than dropping input",
+                        missing.len()
+                    ));
                 }
                 None
             }
@@ -1585,6 +1641,7 @@ impl Tokenizer {
             TokenizerModel::Ugm => self.ugm_encode(text),
             TokenizerModel::Gemma4 => self.gemma4_encode(text),
             TokenizerModel::Rwkv => self.rwkv_encode(text),
+            TokenizerModel::Plamo2 => self.plamo2_encode(text),
             TokenizerModel::Spm => {
                 let mut escaped = String::with_capacity(text.len() + SPM_SPACE.len_utf8());
                 if self.add_space_prefix && prev_special {
@@ -1748,6 +1805,98 @@ impl Tokenizer {
                     "tokenizer invariant violated: no SentencePiece byte token for <0x{b:02X}>;                      Tokenizer::load verifies all 256"
                 ),
             }
+        }
+    }
+
+    /// PLaMo-2 encode: a backward DP over codepoints from the end of the text
+    /// (`llm_tokenizer_plamo2`, `llama-vocab.cpp:1360-1592`).
+    ///
+    /// The candidates at `i` are every non-byte piece that is a prefix of
+    /// `text[i..]`, longest first, plus the one-codepoint fallback row:
+    /// `s = scores[i + piece_length] - round(score × 1e4)`, and the **first**
+    /// candidate to lower `scores[i]` wins (a strict `<`, so ties keep the longest).
+    /// A chosen fallback emits one `<0xXX>` byte token per UTF-8 byte, never `<unk>`,
+    /// and a leading BOM is stripped. llama.cpp indexes the candidate set with a
+    /// suffix automaton; this direct walk is measured equivalent to it (ADR-0050).
+    fn plamo2_encode(&self, text: &str) -> Vec<u32> {
+        const INVALID_SCORE: i64 = -20_000_000;
+        const UNKNOWN_SCORE: i64 = -10_000_000;
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let cps: Vec<char> = text.chars().collect();
+        let n = cps.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut scores = vec![1i64 << 60; n + 1];
+        scores[n] = 0;
+        let mut take: Vec<(usize, Option<u32>)> = vec![(1, None); n];
+        for i in (0..n).rev() {
+            let start = text
+                .char_indices()
+                .nth(i)
+                .map(|(b, _)| b)
+                .unwrap_or(text.len());
+            let bytes = text.as_bytes();
+            let mut candidates: Vec<(usize, u32)> = Vec::new();
+            if !self.ugm.trie.nodes.is_empty() {
+                let mut node = 0u32;
+                let mut k = start;
+                while k < bytes.len() {
+                    match self.ugm.trie.step(node, bytes[k]) {
+                        Some(next) => {
+                            node = next;
+                            k += 1;
+                        }
+                        None => break,
+                    }
+                    if let Some(id) = self.ugm.trie.terminal(node) {
+                        candidates.push((text[start..k].chars().count(), id));
+                    }
+                }
+            }
+            for &(piece_len, id) in candidates.iter().rev() {
+                let score = self.plamo2_score_int(id);
+                if score <= INVALID_SCORE {
+                    continue;
+                }
+                let s = scores[i + piece_len] - score;
+                if s < scores[i] {
+                    scores[i] = s;
+                    take[i] = (piece_len, Some(id));
+                }
+            }
+            let s = scores[i + 1] - UNKNOWN_SCORE;
+            if s < scores[i] {
+                scores[i] = s;
+                take[i] = (1, None);
+            }
+        }
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos < n {
+            let (piece_len, id) = take[pos];
+            match id {
+                Some(id) => out.push(id),
+                None => {
+                    let mut buf = [0u8; 4];
+                    for &b in cps[pos].encode_utf8(&mut buf).as_bytes() {
+                        if let Some(&byte_id) = self.spm_byte_to_id.get(&b) {
+                            out.push(byte_id);
+                        }
+                    }
+                }
+            }
+            pos += piece_len;
+        }
+        out
+    }
+
+    /// `round(score × 1e4)` as `llama.cpp` quantizes it, or `INVALID_SCORE` for a
+    /// non-finite entry (which the DP skips).
+    fn plamo2_score_int(&self, id: u32) -> i64 {
+        match self.id_to_score.get(id as usize) {
+            Some(score) if score.is_finite() => (score * 1e4).round() as i64,
+            _ => -20_000_000,
         }
     }
 
@@ -2268,7 +2417,10 @@ impl Tokenizer {
         }
         if matches!(
             self.model,
-            TokenizerModel::Spm | TokenizerModel::Ugm | TokenizerModel::Gemma4
+            TokenizerModel::Spm
+                | TokenizerModel::Ugm
+                | TokenizerModel::Gemma4
+                | TokenizerModel::Plamo2
         ) {
             // SentencePiece: a BYTE token is its byte, every other token's `▁`
             // is a space (llama.cpp's `token_to_piece` for SPM).
