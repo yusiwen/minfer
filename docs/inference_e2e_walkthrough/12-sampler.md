@@ -25,7 +25,7 @@ depends on the model, the quantization, even the layer's final RMSNorm gain).
 For the Qwen family the vocabulary has **151,936** entries, so what this
 stage receives is a `Vec<f32>` with 151,936 elements — 151,936 × 4 bytes =
 607,744 bytes ≈ **0.6 MB** of scores (the `607 KB` the code comment at
-`src/main.rs:952-953` refers to).
+`src/main.rs:953-967` refers to).
 
 The sampler's whole job is to turn that list into one `u32` token id. That
 sounds trivially small next to the transformer's billions of multiplies, and
@@ -45,7 +45,7 @@ Three quiet facts shape the design:
    penalties need to know which tokens appeared recently. That means the
    decode loop keeps a sliding window of the last 64 token ids — seeded from
    the prompt's tail — and passes it in alongside the logits
-   (`src/main.rs:870-875`).
+   (`src/main.rs:875-885`).
 3. **"Stop generating" is a sampling-adjacent concern.** After a token is
    chosen, three gates decide whether generation ends: the token is the
    end-of-text sentinel (eos or `<|im_end|>`, doc 04), the generated *byte
@@ -154,8 +154,8 @@ sometimes wins, which is exactly the escape hatch that breaks loops and
 gives the model its range of phrasing. The trade is coherence for diversity;
 **temperature** (§2.6) is the dial between the two, and the dial's zero stop
 is greedy itself — `--greedy` in the CLI is literally `--temp 0`
-(`src/main.rs:327-329`), and `sample_temperature` returns the argmax when
-`temp < 1e-6` (`src/sampler.rs:230-232`). Greedy is not a different
+(`src/main.rs:`), and `sample_temperature` returns the argmax when
+`temp < 1e-6` (`src/sampler.rs:`). Greedy is not a different
 algorithm here; it is a degenerate temperature.
 
 minfer's default is llama.cpp's: **temp = 0.8** — mildly random. The rest of
@@ -168,7 +168,7 @@ The first filter looks at the last **64** generated-or-prompted tokens (the
 *window*; llama.cpp calls the setting `repeat_last_n` and 64 is its default)
 and pushes down the logits of anything that appears in that window. minfer
 implements all three penalties in **one pass** (`apply_penalties`,
-`src/sampler.rs:47-79`), matching llama.cpp's `llama_sampler_init_penalties`
+`src/sampler.rs:`), matching llama.cpp's `llama_sampler_init_penalties`
 semantics, which the doc comment spells out:
 
 ```text
@@ -263,7 +263,7 @@ unreachable. The token that *crosses* the threshold is kept, so the nucleus
 is never smaller than the first token that gets you to p.
 
 One subtlety of minfer's implementation matters enough that the code
-documents it (`src/sampler.rs:142-145`): top-p does **not** rewrite the
+documents it (`src/sampler.rs:`): top-p does **not** rewrite the
 kept entries with their probabilities. It computes probabilities only
 *internally*, to decide who stays; then it masks the losers' **raw logits**
 to −∞ and leaves the winners' raw logits untouched. Why that distinction is
@@ -274,7 +274,7 @@ softmax has not happened yet, and it still needs the real logits.
 
 Everything so far *selected* candidates. The last stage *weights* them and
 picks one. Three sub-steps, all in `sample_temperature`
-(`src/sampler.rs:229-278`):
+(`src/sampler.rs:`):
 
 1. **Divide every surviving logit by `temp`.** Temperature is a dial on the
    softmax's contrast. Dividing by a small number *stretches* the logit
@@ -302,7 +302,7 @@ picks one. Three sub-steps, all in `sample_temperature`
    entries already masked to −∞ are *skipped* rather than exponentiated —
    `exp(−∞)` is exactly `+0.0`, so skipping is bit-identical and saves ~150k
    transcendental calls per token when top-k/top-p have pruned hard
-   (`src/sampler.rs:239-242`).
+   (`src/sampler.rs:`).
 
 3. **The multinomial draw.** **Multinomial sampling** means: pick one token
    with probability equal to its weight. Picture the unit interval [0, 1)
@@ -317,10 +317,10 @@ picks one. Three sub-steps, all in `sample_temperature`
 
    The code walks the tokens in index order accumulating a running total
    and returns the first token whose cumulative sum reaches the dart
-   (`src/sampler.rs:260-273`). The dart comes from `rng.gen()` — one
+   (`src/sampler.rs:`). The dart comes from `rng.gen()` — one
    uniform `f32` in [0, 1) per generated token — from a **seeded** random
    number generator: `StdRng::seed_from_u64(params.seed)`, default seed 42
-   (`src/main.rs:1636`). A *seed* is the starting state of a pseudo-random
+   (`src/main.rs:1651`). A *seed* is the starting state of a pseudo-random
    generator: same seed in, same sequence of "random" numbers out — which
    is why the same command produces the same text even while sampling
    (§3.3's fourth design question covers why minfer wants that).
@@ -328,7 +328,7 @@ picks one. Three sub-steps, all in `sample_temperature`
 ### 2.7 Stopping: when does generation end?
 
 The sampler produces a token; the loop decides whether to keep going. Three
-gates, checked in this order each step (`src/main.rs:1819-1842`):
+gates, checked in this order each step (`src/main.rs:`):
 
 1. **Stop tokens.** `is_stop_token(id, &special)` — true when the sampled id
    equals the model's **eos** (end of sequence) token or `<|im_end|>` (doc
@@ -370,7 +370,7 @@ finds every possible match exactly once, in O(len(stop)) time.
 | `prev_tokens` | `&[u32]`, ≤ 64 entries | sliding window: prompt tail (`recent_window(&input_ids, 64)`, :847) + every generated token so far (:903-907) |
 | `rng` | `&mut StdRng`, seeded once at :845 | `seed_from_u64(params.seed)`, default 42 |
 
-**Out**: a `SampledToken { token_id: u32, logit: f32 }` (`src/sampler.rs:7-13`).
+**Out**: a `SampledToken { token_id: u32, logit: f32 }` (`src/sampler.rs:`).
 Only `token_id` drives the loop; `logit` is result metadata (a sampled
 probability after the final softmax, actually — the field name is
 historical).
@@ -381,7 +381,7 @@ struct — no full-vocab copy crosses the sampler boundary, and no second
 buffer needs to stay alive per token. Why that shape matters is design
 question 5 in §3.3.
 
-**After the call** (still inside one loop iteration, `src/main.rs:928-950`):
+**After the call** (still inside one loop iteration, `src/main.rs:`):
 stop-token gate → `generated.push(id)` + window update → decode to bytes
 into `full` → stop-string gate → stream newly finished bytes → next forward.
 
@@ -389,12 +389,12 @@ into `full` → stop-string gate → stream newly finished bytes → next forwar
 
 #### The whole pipeline in one function
 
-`src/sampler.rs:1067-1156` — the complete sampler is one function whose body is
+`src/sampler.rs:` — the complete sampler is one function whose body is
 the stage order, elided only where a stage is long; the order *is* the design:
 
 ```rust
 // src/sampler.rs:1067 — the pipeline; `sample_with_config` (:1181) is the
-// unconstrained wrapper the CLI calls (`src/main.rs:1689`)
+// unconstrained wrapper the CLI calls (`src/main.rs:1704`)
 pub fn sample_with_config_grammar<R: Rng>(
     logits: &mut [f32], cfg: &SamplerConfig, prev_tokens: &[u32],
     mirostat: &mut MirostatState, grammar: &mut Option<GrammarState>,
@@ -437,11 +437,11 @@ identical result.
 
 #### Penalties: one pass, one HashMap, llama.cpp semantics
 
-`src/sampler.rs:71-102` (its doc comment `:46-70` spells out the semantics). First
+`src/sampler.rs:` (its doc comment `:46-70` spells out the semantics). First
 the counting — note the early-out when every penalty is at its "off" value:
 
 ```rust
-// src/sampler.rs:78-82
+// src/sampler.rs:
     if (repeat - 1.0).abs() < 1e-6 && frequency.abs() < 1e-6 && presence.abs() < 1e-6 {
         return;
     }
@@ -457,7 +457,7 @@ not 10 times) and the counts for frequency penalty. Then the combined
 mutation per distinct token:
 
 ```rust
-// src/sampler.rs:85-102 (loop body)
+// src/sampler.rs: (loop body)
     for (&t, &c) in &counts {
         let idx = t as usize;
         if idx >= logits.len() {
@@ -488,22 +488,22 @@ test `test_freq_presence_then_repeat_penalty` pins with the comment
 
 #### The window, and how the loop keeps it sliding
 
-`src/sampler.rs:108-111` is trivial — the interesting part is the call-site
+`src/sampler.rs:` is trivial — the interesting part is the call-site
 choreography in `main.rs`:
 
 ```rust
-// src/sampler.rs:108-111
+// src/sampler.rs:
 pub fn recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
     let start = tokens.len().saturating_sub(last_n);
     tokens[start..].to_vec()
 }
 
-// src/main.rs:1633-1638 — seeded once, window seeded from the PROMPT tail
+// src/main.rs:1638-1648 — seeded once, window seeded from the PROMPT tail
     let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
     const REPEAT_LAST_N: usize = 64;
     let mut prev_tokens = sampler::recent_window(&input_ids, REPEAT_LAST_N);
 
-// src/main.rs:1824-1827 — every sampled token enters the window
+// src/main.rs:1827-1839 — every sampled token enters the window
         generated.push(sampled.token_id);
         prev_tokens.push(sampled.token_id);
         if prev_tokens.len() > REPEAT_LAST_N {
@@ -522,10 +522,10 @@ text.
 
 #### Top-k: O(n) threshold, mask in place
 
-`src/sampler.rs:141-153`:
+`src/sampler.rs:`:
 
 ```rust
-// src/sampler.rs:141-153
+// src/sampler.rs:
 pub fn apply_top_k(logits: &mut [f32], k: usize) {
     if k == 0 || k >= logits.len() {
         return;
@@ -558,12 +558,12 @@ full-array path, below).
 
 #### Top-p: nucleus over survivors, mask raw logits
 
-`src/sampler.rs:152-201`, the function whose doc comment (:142-151) is the
+`src/sampler.rs:`, the function whose doc comment (:142-151) is the
 design record. First the fast path — after top-k, at most k entries are
 finite:
 
 ```rust
-// src/sampler.rs:169-175
+// src/sampler.rs:
     let survivors: Vec<(usize, f32)> = logits
         .iter()
         .enumerate()
@@ -582,7 +582,7 @@ finite:
 Then the nucleus decision, computed on the survivors alone:
 
 ```rust
-// src/sampler.rs:173-200 (core)
+// src/sampler.rs: (core)
     let max_val = survivors.iter().fold(f32::NEG_INFINITY, |a, &(_, v)| a.max(v));
     let sum: f64 = survivors
         .iter()
@@ -625,10 +625,10 @@ the winners' entries stay untouched raw logits for the temperature stage.
 
 #### Temperature + softmax + the draw
 
-`src/sampler.rs:229-278`, all three sub-steps in one function:
+`src/sampler.rs:`, all three sub-steps in one function:
 
 ```rust
-// src/sampler.rs:229-256 (core)
+// src/sampler.rs: (core)
 pub fn sample_temperature<R: Rng>(logits: &mut [f32], temp: f32, rng: &mut R) -> SampledToken {
     if temp < 1e-6 {
         return sample_greedy(logits);          // greedy IS temp 0
@@ -659,7 +659,7 @@ Then normalization and the draw (`:253-277`): divide by the sum in place,
 draw one uniform `f32` via `rng.gen()`, and walk the buffer accumulating:
 
 ```rust
-// src/sampler.rs:265-277
+// src/sampler.rs:
     let r: f32 = rng.gen();
     let mut cumulative = 0.0f32;
     for (i, &v) in logits.iter().enumerate() {
@@ -687,7 +687,7 @@ fresh `Vec` (§3.1).
 The gates run immediately after sampling, before anything is appended:
 
 ```rust
-// src/main.rs:1797-1813 (condensed to the sampler-adjacent lines)
+// src/main.rs: (condensed to the sampler-adjacent lines)
     while generated.len() < params.n_predict {
         let sampled = match sampler::sample_with_config_grammar(
             &mut logits,
@@ -724,7 +724,7 @@ The gates run immediately after sampling, before anything is appended:
         }
 ```
 
-`is_stop_token` is the two-line sentinel (`src/main.rs:1048-1050`):
+`is_stop_token` is the two-line sentinel (`src/main.rs:1050-1063`):
 
 ```rust
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
@@ -732,10 +732,10 @@ fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
 }
 ```
 
-and `match_stop_suffix` is the byte-level tail check (`src/sampler.rs:120-132`):
+and `match_stop_suffix` is the byte-level tail check (`src/sampler.rs:`):
 
 ```rust
-// src/sampler.rs:120-132
+// src/sampler.rs:
 pub fn match_stop_suffix(buf: &[u8], stops: &[&[u8]]) -> Option<usize> {
     let mut best: Option<usize> = None;
     for s in stops {
@@ -754,7 +754,7 @@ pub fn match_stop_suffix(buf: &[u8], stops: &[&[u8]]) -> Option<usize> {
 "Earliest start wins" means the *longest* applicable stop string decides
 where to cut (a later start truncates less text). The bytes already flushed
 to the terminal before the match completed are not un-printed — that is the
-llama.cpp antiprompt behavior the comment at `src/main.rs:877-881` describes,
+llama.cpp antiprompt behavior the comment at `src/main.rs:881-892` describes,
 and it is why `full` (everything generated) and `emitted` (everything
 streamed) are tracked as separate cursors.
 
@@ -768,7 +768,7 @@ self-reinforcing basin where the most likely token after a repetition is
 the same repetition. Multinomial sampling injects exactly enough noise to
 escape those basins while staying biased toward good tokens (a 0.73-likely
 token still wins 73% of the time); temperature is the coherence-vs-diversity
-dial and greedy its zero point (`--greedy`, `src/main.rs:327-329`). The
+dial and greedy its zero point (`--greedy`, `src/main.rs:`). The
 composition minfer chose matters as much as the mechanism: penalties apply
 in *both* modes (a repeated token can lose the argmax), so even greedy
 output is loop-resistant — the default 1.1 penalty does real work in every
@@ -806,7 +806,7 @@ the horizon. 64 is llama.cpp's tuned compromise, and minfer copies it
 instead of re-tuning (doc 01 §2.3's "less invention risk").
 
 **3. Why is top-p implemented as logit masking rather than truncating the
-probability vector?** The comment at `src/sampler.rs:142-145` states the
+probability vector?** The comment at `src/sampler.rs:` states the
 rule — "sets excluded tokens' raw logits to −∞ (does NOT overwrite logits
 with probabilities, so the final temperature softmax stays correct)" — and
 the reason is composition. The pipeline applies top-p *before* temperature,
@@ -854,7 +854,7 @@ parity tests rather than trusting either alone.)
 obvious alternative — `let probs = sampler::sample(logits.clone(), …)` or
 returning a new `Vec` — buys a full-vocab copy per token for zero benefit.
 The arithmetic: 151,936 × 4 B = 607,744 B ≈ 0.6 MB per generated token,
-which is precisely the copy the call-site comment at `src/main.rs:952-953`
+which is precisely the copy the call-site comment at `src/main.rs:953-967`
 brags about not making ("move the Vec in place instead of copying 607
 KB/token") for the *forward* boundary — the sampler boundary gets the same
 treatment. The ownership dance that makes it work: `logits` starts as the
@@ -925,7 +925,7 @@ run even when the stochastic stages are skipped.
 - **The sampler destroys its input buffer** (it holds probabilities after
   `sample_temperature`). The caller-side invariant that makes this safe:
   `logits` is reassigned from the next forward before it is ever read
-  again (`src/main.rs:1852`). Reading `logits` between sample and reassign
+  again (`src/main.rs:1867`). Reading `logits` between sample and reassign
   would read probabilities and call them logits.
 
 ## 4. Observe & verify
@@ -936,7 +936,7 @@ run even when the stochastic stages are skipped.
   selection, a ≤40-entry softmax, and one draw.
 - **`MINFER_TRACE=<path>`** — the decode loop attaches each sampled token's
   id and decoded text to the trace (`crate::trace::set_token`,
-  `src/main.rs:954-958`); the viz page shows the token stream the sampler
+  `src/main.rs:958-969`); the viz page shows the token stream the sampler
   produced.
 - **The reproducibility experiment** — run the same command twice, e.g.
   `./target/release/minfer qwen2.5-0.5b-instruct-q4_0 "Tell me a story" -n 24`:

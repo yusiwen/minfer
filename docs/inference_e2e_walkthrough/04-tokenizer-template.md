@@ -244,7 +244,7 @@ They get special treatment at both ends of the pipeline:
   penalty window (`src/main.rs`, doc 12). The ids come from
   `ModelDef::special_tokens()` (doc 03), sourced from GGUF metadata:
   `tokenizer.ggml.eos_token_id`, plus a lookup of `<|im_end|>` that falls back
-  to the eos id (`src/models/qwen2/loader.rs:130-131`). One vocabulary, two
+  to the eos id (`src/models/qwen2/loader.rs:`). One vocabulary, two
   directions, and a set of reserved ids that act as the protocol's
   punctuation.
 

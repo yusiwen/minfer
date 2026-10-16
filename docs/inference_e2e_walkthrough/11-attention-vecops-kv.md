@@ -87,13 +87,13 @@ Attention runs in parallel **heads**: `n_head` independent query/attention chann
 The attention scale is defined per model next to the head geometry it depends on:
 
 ```rust
-// src/models/qwen2/loader.rs:36-38 (Qwen3 has its own at loader.rs:48)
+// src/models/qwen2/loader.rs: (Qwen3 has its own at loader.rs:48)
 pub fn attention_scale(&self) -> f32 {
     1.0 / (self.n_embd_head() as f32).sqrt()
 }
 ```
 
-and flows into the graph as `attn_scale` (`models/qwen2/graph.rs:93`), landing in every `AttnMeta` (`graph.rs:200-207`). Doc 05 covered the meta's plumbing; here it is the `c.scale` of §3.2.4.
+and flows into the graph as `attn_scale` (`models/qwen2/graph.rs:93`), landing in every `AttnMeta` (`graph.rs:`). Doc 05 covered the meta's plumbing; here it is the `c.scale` of §3.2.4.
 
 ### 2.5 What changes on the GPU (preview)
 
@@ -127,7 +127,7 @@ The invariants survive all three deltas: positions are data, windows come from `
 The formula: `y = x / sqrt(mean(x²) + eps) × weight`. The scalar fallback shows every piece:
 
 ```rust
-// src/vec_ops/rms_norm.rs:8-31 (scalar path; AVX2 path at :35)
+// src/vec_ops/rms_norm.rs: (scalar path; AVX2 path at :35)
 pub fn rms_norm_f32(n: usize, y: &mut [f32], x: &[f32], eps: f32) {
     let mut sum_sq = 0.0f64;
     for i in 0..n {
@@ -156,7 +156,7 @@ Worked example: `x = [1, 2, 3, 4]`, `eps ≈ 0`. `mean(x²) = (1+4+9+16)/4 = 7.5
 The `RoPE` node arm shows the two conventions this series keeps meeting — positions decoded from f32 bits, and in-place execution:
 
 ```rust
-// src/graph/cpu_backend.rs:592-636 (abridged)
+// src/graph/cpu_backend.rs: (abridged)
 Op::RoPE { style } => {
     let meta = match &node.meta { NodeMeta::Rope(m) => m, ... };
     let nh = meta.n_head;
@@ -173,7 +173,7 @@ Op::RoPE { style } => {
 `cpu_rope` then does the rotation of §2.3:
 
 ```rust
-// src/graph/cpu_backend.rs:857-895 (core loop, abridged)
+// src/graph/cpu_backend.rs: (core loop, abridged)
 pub(crate) fn cpu_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize,
                        freq_base: f32, freq_scale: f32, style: RopeStyle) {
     let half = hd / 2;
@@ -213,7 +213,7 @@ Worked example: `hd = 4` (`half = 2`), `base = 10⁴` → `freqs = [1.0, 10⁻¹
 The store arm is where "KV positions are data" becomes memory writes:
 
 ```rust
-// src/graph/cpu_backend.rs:318-382 (core, abridged)
+// src/graph/cpu_backend.rs: (core, abridged)
 if let Op::KvcacheStore { layer } = &node.op {
     let (k_id, v_id) = kv_pair.ok_or_else(...)?;          // doc 07's persistent regions
     if k_id != out_buf { return Err("KV store out buffer must be the K region".into()); }
@@ -246,7 +246,7 @@ Two things to internalize:
 The node arm resolves the regions and computes one derived quantity — the *current* KV length:
 
 ```rust
-// src/graph/cpu_backend.rs:655-755 (core, abridged)
+// src/graph/cpu_backend.rs: (core, abridged)
 Op::Attn { .. } => {
     let meta = ...;                                        // AttnMeta: n_head, hd, nkt, scale, layer
     let (k_id, v_id) = kv_pair.ok_or_else(...)?;           // this layer's K and V regions
@@ -260,14 +260,14 @@ Op::Attn { .. } => {
 }
 ```
 
-① is the causal mask in data form: the attention window is `max(positions) + 1` — during prefill of 100 tokens that is 100; during decode at position 100 it is 101. There is no mask tensor anywhere; the window *is* the mask, derived from the same positions input the store used. (builder.rs:592-600 documents the contract: `vl = pos[t]+1`.)
+① is the causal mask in data form: the attention window is `max(positions) + 1` — during prefill of 100 tokens that is 100; during decode at position 100 it is 101. There is no mask tensor anywhere; the window *is* the mask, derived from the same positions input the store used. (builder.rs: documents the contract: `vl = pos[t]+1`.)
 
 `cpu_gqa_attn` (`:503`) validates the head geometry (`hd < hd_kv` → `Err` — the Qwen3 decoupled-dims guard from §1), then farms head ranges to the same thread pool as the matmuls (`kernel::par_for`, doc 10), each worker with a private scores buffer. Heads never reduce against each other → bit-identical at any thread count, the same invariant as doc 10's row ownership. Single-threaded fallback when `--threads 1` or `n_head < 2`.
 
 The per-head worker does the math of §2.1:
 
 ```rust
-// src/graph/cpu_backend.rs:1101-1162 (core loop, abridged; runs per head range via par_for)
+// src/graph/cpu_backend.rs: (core loop, abridged; runs per head range via par_for)
 let gqa = c.nh / c.hk;                                     // e.g. 14/2 = 7
 for h in h0..h1 {                                          // this worker's query heads
     let hk = h / gqa;                                      // ① my shared kv head
@@ -325,7 +325,7 @@ That is decode in miniature: one new K/V row per step, windows growing monotonic
 #### 3.2.5 Softmax and SiLU — `src/vec_ops/softmax.rs:8`, `src/vec_ops/silu.rs:8`
 
 ```rust
-// src/vec_ops/softmax.rs:8-32 (scalar path; caller supplies the max)
+// src/vec_ops/softmax.rs: (scalar path; caller supplies the max)
 pub fn vec_soft_max_f32(n: usize, y: &mut [f32], x: &[f32], max: f32) -> f64 {
     let mut sum = 0.0f64;
     for i in 0..n {
@@ -337,7 +337,7 @@ pub fn vec_soft_max_f32(n: usize, y: &mut [f32], x: &[f32], max: f32) -> f64 {
 }
 ```
 
-① is the numerical-stability trick the whole series keeps meeting: `softmax` is invariant under subtracting any constant, but `e^1000` overflows `f32` while `e^(1000−1000) = 1` does not. So every caller finds the max first — the standalone `Softmax` node arm (`cpu_backend.rs:357-368`) shows the full ceremony (scan for max → copy → softmax → caller divides by the returned sum), while attention's hot path uses the in-place variant (`vec_soft_max_inplace_f32`, `:276`) since its scores buffer is scratch anyway. The `f64` sum ② then normalizes without precision loss.
+① is the numerical-stability trick the whole series keeps meeting: `softmax` is invariant under subtracting any constant, but `e^1000` overflows `f32` while `e^(1000−1000) = 1` does not. So every caller finds the max first — the standalone `Softmax` node arm (`cpu_backend.rs:`) shows the full ceremony (scan for max → copy → softmax → caller divides by the returned sum), while attention's hot path uses the in-place variant (`vec_soft_max_inplace_f32`, `:276`) since its scores buffer is scratch anyway. The `f64` sum ② then normalizes without precision loss.
 
 SiLU is one formula — `silu(x) = x / (1 + e^(−x))` (`vec_silu_f32`, `:158`, scalar shown):
 

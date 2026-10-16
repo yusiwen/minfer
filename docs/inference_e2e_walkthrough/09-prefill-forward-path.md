@@ -107,14 +107,14 @@ data:
 - the `attn` node uses it for **causal masking** — token `t` may only attend
   to positions `0..=pos[t]` (the builder's own words: "`pos` carries the
   per-token write positions (I32 input), needed for causal masking
-  (`vl = pos[t]+1`)", `builder.rs:325-327`);
+  (`vl = pos[t]+1`)", `builder.rs:`);
 - the `rope` nodes use it as the rotation angle's input (position determines
   the angle — doc 11).
 
 This indirection is what lets *one* graph topology serve prefill *and* decode:
 prefill fills `positions` with `0, 1, 2, …, nt-1`; the decode loop fills it
 with one running number (`current_pos`, starting at the prompt length,
-`main.rs:868`, incrementing per step, `main.rs:968`). If positions were
+`main.rs:883`, incrementing per step, `main.rs:983`). If positions were
 instead baked into the topology (say, attention shaped to read exactly
 `n_past + nt` cache rows), the graph would have to be rebuilt on *every*
 decode step, because `n_past` changes every step — and the params-only reuse
@@ -184,7 +184,7 @@ problem bounded.
 ### 2.4 Why only the last token's logits (`n_out = 1`)
 
 The prefill forward's fourth argument is `n_out`, and the CLI passes `1`
-(`main.rs:1542`). This is the tail-row optimization whose *topology* doc 05
+(`main.rs:1557`). This is the tail-row optimization whose *topology* doc 05
 §2.8 built; here is the *why*.
 
 A transformer is **causal**: token `t`'s hidden state is computed only from
@@ -215,7 +215,7 @@ setting: it is a property of the **single-sequence CLI**. The engine keeps
 `n_out` as a `GraphParams` field precisely because other callers want more —
 a trainer computing loss over all positions would pass `n_out = nt` (and the
 graph would keep every row), and the graph's own fallback (`forward_batch`,
-`graph.rs:757-758`) handles the `n_out == nt` case with the same code path.
+`graph.rs:`) handles the `n_out == nt` case with the same code path.
 The CLI's choice is the degenerate, cheapest corner of a general mechanism.
 
 ### 2.5 Sizing the context once for both phases
@@ -227,8 +227,8 @@ let ctx = params.n_ctx.max(input_ids.len());
 ```
 
 and passes that single number to *every* forward of the run — prefill at
-`main.rs:1542`, each decode step at `main.rs:1852`. The comment above it
-(`main.rs:1518-1522`) records the three facts that make this the right shape:
+`main.rs:1557`, each decode step at `main.rs:1867`. The comment above it
+(`main.rs:1522-1533`) records the three facts that make this the right shape:
 
 1. `n_ctx` **sizes the graph's KV regions** — the allocator carves each
    layer's K and V regions as `n_kv_embd × n_ctx` f32 elements, once (doc 07
@@ -238,7 +238,7 @@ and passes that single number to *every* forward of the run — prefill at
    tax).
 2. It **never shrinks below the prompt length** (`max`): the prompt itself
    needs `nt` KV slots, positions `0..nt`, and the decode loop continues at
-   `current_pos = input_ids.len()` (`main.rs:868`) — if `ctx < prompt len`,
+   `current_pos = input_ids.len()` (`main.rs:883`) — if `ctx < prompt len`,
    the very first decode position would overflow the regions.
 3. The model **clamps again** to `max_seq_len` (`n_ctx.min(max_seq_len)`,
    `graph.rs:392`): a prompt longer than the model was trained for is capped
@@ -271,7 +271,7 @@ recomputed with some other value. Two failure modes, both bad:
   shape `[n_kv_embd, n_ctx]`) but write into the small ones — an
   out-of-bounds write waiting for a long generation.
 - **A smaller decode `n_ctx` would trip the pre-flight assert** —
-  `forward_batch` asserts `max(positions) < n_ctx` (`graph.rs:515-521`) —
+  `forward_batch` asserts `max(positions) < n_ctx` (`graph.rs:`) —
   after the prefill already filled positions `0..512`. Loud, but a crash the
   design made unnecessary.
 
@@ -305,7 +305,7 @@ let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");
 if logits.len() == n_out * nv { logits } else { logits[..n_out * nv].to_vec() }
 ```
 
-(`graph.rs:617-625`.) That one copy is unavoidable: the pool buffer will be
+(`graph.rs:`.) That one copy is unavoidable: the pool buffer will be
 overwritten by the *next* forward's lm_head (the allocator pins it only for
 the duration of one execute, doc 07 §2.2), so the caller must own its own
 copy before the next step. What the design *avoids* is every copy after
@@ -315,17 +315,17 @@ G3-reduced path; the comment records its removal as R3-A2), and from there
 the value travels by **move**, Rust's zero-byte ownership transfer:
 
 ```rust
-let logits = model.forward(&input_ids, &positions, 1, ctx);  // owned Vec, main.rs:1542
-let last_logits: Vec<f32> = logits;      // move, main.rs:1544
+let logits = model.forward(&input_ids, &positions, 1, ctx);  // owned Vec, main.rs:1557
+let last_logits: Vec<f32> = logits;      // move, main.rs:1559
 ...
-let mut logits = last_logits;            // move into the decode binding, main.rs:1624
+let mut logits = last_logits;            // move into the decode binding, main.rs:1639
 ...
 let sampled = sampler::sample_with_config(&mut logits, ...); // borrow, mutate in place
 ...
-logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:1852
+logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:1867
 ```
 
-The decode loop's comment (`main.rs:1844-1845`) states the stakes: *forward()
+The decode loop's comment (`main.rs:1845-1859`) states the stakes: *forward()
 returns n_out\*nv logits (n_out=1 for single-token decode, exactly n_vocab),
 so move the Vec in place instead of copying 607 KB/token.* At ~300 decode
 tokens/second, an extra 608 KB copy per token would be ~180 MB/s of pure
@@ -377,7 +377,7 @@ from the decode side.
 
 ### 3.2 Key code
 
-#### The prefill block (`src/main.rs:752-784`)
+#### The prefill block (`src/main.rs:`)
 
 ```rust
     // === Prefill ===
@@ -427,30 +427,30 @@ caliber.
 
 #### The call chain — four hops, one delegation each
 
-`main.rs:1542` calls through the architecture-agnostic trait object
+`main.rs:1557` calls through the architecture-agnostic trait object
 (`Box<dyn ModelDef>`), so the static type knows nothing about Qwen. Each hop
 adds exactly one concern:
 
 ```
-main.rs:1542  model.forward(&input_ids, &positions, 1, ctx)
+main.rs:1557  model.forward(&input_ids, &positions, 1, ctx)
   │           trait method (models/mod.rs:222): the architecture-agnostic
   ▼           signature; callers must guarantee positions[i] < n_ctx
-qwen2/mod.rs:54-57   impl ModelDef for Qwen2Model
+qwen2/mod.rs:   impl ModelDef for Qwen2Model
   │           one line: graph::Qwen2Graph::forward(self, tokens, positions, n_out, n_ctx)
   ▼           (qwen3/mod.rs mirrors this identically for Qwen3)
-qwen2/graph.rs:438-448   Qwen2Graph::forward
+qwen2/graph.rs:   Qwen2Graph::forward
   │           n_ctx = n_ctx.min(model.hparams.max_seq_len)  ← 2nd clamp
   │           locks the process-global GraphCache (graph_cache())
   ▼           delegates to forward_cached; server code calls that directly
               with a slot-scoped cache
-qwen2/graph.rs:456-472   forward_cached — a 17-line wrapper: one sequence *is* a
+qwen2/graph.rs:   forward_cached — a 17-line wrapper: one sequence *is* a
   │           one-sequence batch, so it builds `Batch::single(tokens, positions)`
   ▼           and delegates
-qwen2/graph.rs:480-765   forward_batch — the real work (below), 286 lines
+qwen2/graph.rs:   forward_batch — the real work (below), 286 lines
 ```
 
 The two trait-level aliases on the way are worth one glance
-(`models/mod.rs:272-298`): `forward_graph` and `forward_graph_cached` expose
+(`models/mod.rs:`): `forward_graph` and `forward_graph_cached` expose
 the same two implementations at trait level — `forward_graph_cached` is the
 server/multi-slot entry point (it takes an explicit `&mut GraphCache`
 instead of using the process-global one). The CLI goes through plain
@@ -460,7 +460,7 @@ alone; the wrapper is what is left when the batch path took over, and the
 chapters of 05–08 that name `forward_cached` mean this pipeline.)
 
 #### `forward_batch`: the build → fill → execute → read pipeline
-(`src/models/qwen2/graph.rs:480-765` — the condensation below keeps the
+(`src/models/qwen2/graph.rs:` — the condensation below keeps the
 pipeline order and elides the batch bookkeeping with `/* … */`)
 
 ```rust
@@ -562,7 +562,7 @@ is worth reading as five beats:
    final value (doc 08 §2.4).
 5. **Read the output** (L757–758): one `copy_to_cpu` of the output buffer,
    returned as an owned `Vec` (§2.6). For a batch it holds one row per
-   sequence, in batch order (`Batch::out_rows`, `src/graph/batch.rs:84-95`).
+   sequence, in batch order (`Batch::out_rows`, `src/graph/batch.rs:`).
 
 #### `GraphParams` → topology: what each field changes
 
@@ -588,7 +588,7 @@ ONLY inputs to graph reuse". The batch's composition — sequence count, cell
 rows, attention windows — is deliberately *not* here: it is data, refilled
 per forward (A7/E2).)
 
-#### The trace phase boundary (`src/trace.rs:70-80`, CLI at `main.rs:768-776`)
+#### The trace phase boundary (`src/trace.rs:`, CLI at `main.rs:776-783`)
 
 ```rust
 /// CLI: mark the start of a phase (prefill / decode). Repeated calls within the
@@ -605,14 +605,14 @@ pub fn begin_phase(kind: &str) {
 `begin_phase("prefill")` opens a `Phase` record; the scheduler then appends
 one `Step` per `execute()` call (`begin_step`, called from the scheduler —
 prefill is *one* step, each decode forward one more), and
-`attach_step(&last_logits)` (L759–761, `trace.rs:130-145`) staples the
+`attach_step(&last_logits)` (L759–761, `trace.rs:`) staples the
 prefill logits' top-5 `(token_id, probability)` pairs onto that step. The
 JSON export (`trace.rs::finish`) embeds the prefill-phase graph, so the viz
 page can show the whole prefill execution node by node. Note the phase
 *naming* lives in the CLI, not the engine: the engine has `GraphType`, the
 trace has human-facing labels.
 
-#### The timing calibers (`src/main.rs:778-784`, `837`, `1000-1017`)
+#### The timing calibers (`src/main.rs:784-793`, `837`, `1000-1017`)
 
 Three stopwatches, three printed calibers — and the differences between them
 are the point:
@@ -658,7 +658,7 @@ change (say, faster dot products) moves prefill a lot and decode barely; a
 memory-side change (quantization, bandwidth) moves decode and barely touches
 prefill. Reporting them separately is what makes such measurements
 interpretable — and `minfer bench` (§4) adopts llama-bench's `pp`/`tg` test
-split for exactly this reason (`bench.rs:1-12`: "pp\<P\>: prefill-only …
+split for exactly this reason (`bench.rs:`: "pp\<P\>: prefill-only …
 tg\<T\>: prefill P context tokens (untimed setup), then time the decode").
 
 ### 3.3 Design choices (why this shape and not another)
@@ -696,7 +696,7 @@ the design-shaped summary: for an autoregressive *generator*, every prompt
 position except the last has a known continuation (it is in the prompt), so
 computing logits for them buys nothing the CLI can use. The `n_out` mechanism
 generalizes (any tail count; `n_out = nt` restores full logits and is the
-code's own fallback path, `graph.rs:613-626`), so choosing `1` is a *caller
+code's own fallback path, `graph.rs:`), so choosing `1` is a *caller
 policy*, not an engine limitation — the engine still offers every row to
 callers who want them (trainers, scoring tools). The placement of the cut
 *after the last attention projection* (not at lm_head) is doc 05's §2.8
@@ -738,14 +738,14 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
 ### 3.4 Pitfalls & invariants
 
 - **Positions must satisfy `positions[i] < n_ctx` — always.** The preflight
-  assert (`graph.rs:415-420`) and the store kernel's hard error
-  (`cpu_backend.rs:169-171`, doc 07) both enforce it, because a bad position
+  assert (`graph.rs:`) and the store kernel's hard error
+  (`cpu_backend.rs:`, doc 07) both enforce it, because a bad position
   is an out-of-bounds write into a persistent region. The CLI satisfies it
   structurally: positions are `0..nt` and `ctx ≥ nt` by the `max` clamp.
 - **`n_ctx` is a run-level constant.** Passing a different `n_ctx` to decode
   than to prefill breaks the run (§2.5, Q3): either silently (regions sized
   on first use) or loudly (the preflight assert). This is why the comment
-  says "computed ONCE" — and why `main.rs:1852` passes the *same* `ctx`
+  says "computed ONCE" — and why `main.rs:1867` passes the *same* `ctx`
   binding, not a recomputation.
 - **The legacy `kv_cache` argument is gone (#252).** It was dead on this path
   from the start — nothing read it in `forward_batch` — and [#252] deleted it
@@ -778,11 +778,11 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   in the thousands of tok/s and decode in the hundreds — the compute-bound vs
   memory-bound split of §2.3, visible in two numbers.
 - **`MINFER_TIMING=1`** — decomposes the decode side one level further
-  (`main.rs:1654-1659`): per token it times the sampler call (`t_samp`,
-  accumulated at `main.rs:1816`) and the `forward` call (`t_fwd`, `main.rs:1735`
-  on the speculative path and `main.rs:1857` on the plain one — "CPU encode + GPU
+  (`main.rs:1659-1669`): per token it times the sampler call (`t_samp`,
+  accumulated at `main.rs:1831`) and the `forward` call (`t_fwd`, `main.rs:1750`
+  on the speculative path and `main.rs:1872` on the plain one — "CPU encode + GPU
   exec + logits download" per the comment), then prints one line
-  (`main.rs:1871-1873`), e.g. `[MINFER_TIMING] over 512 tokens:
+  (`main.rs:1873-1886`), e.g. `[MINFER_TIMING] over 512 tokens:
   sample 0.02 ms/tok (1.2%), forward 3.30 ms/tok (98.8%)`. One
   paragraph is all it needs: it exists to answer "is my decode time
   *inference* or *sampling/streaming*?" — on every model in the support
@@ -794,7 +794,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   (`attach_step`). Load at `viz/index.html` or `minfer viz`.
 - **`MINFER_GRAPH_DUMP=/tmp/d`** — writes `logits_prefill.f32`
   (`n_out × n_vocab` lef32 values — the exact `Vec` this doc is about) plus
-  per-node and per-layer KV dumps (`graph.rs:554-611`), so CPU-vs-GPU logits
+  per-node and per-layer KV dumps (`graph.rs:`), so CPU-vs-GPU logits
   comparisons start from this stage's output.
 - **`--dump-graph / --dump-graph-json`** — rebuilds and exports the prefill
   graph (the same `GraphParams` the runtime used, doc 05 §4): the `n_out`
@@ -802,7 +802,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   the node count differs from the decode graph's (440 vs 437 on 0.5B).
 - **`minfer bench`** — the measurement-grade version of the calibers:
   `pp<P>` (prefill-only) and `tg<T>` (prefill untimed + decode timed) rows
-  with llama-bench-style mean/stdev over reps (`bench.rs:1-12`, greedy
+  with llama-bench-style mean/stdev over reps (`bench.rs:`, greedy
   sampling for reproducibility). Use it instead of single-shot prints for
   any number you intend to compare.
 - **Tests** — `graph_logits_match_forward_real_model` (graph path vs the old

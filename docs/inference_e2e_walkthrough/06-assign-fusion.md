@@ -79,7 +79,7 @@ The policy that assigns backends is one line long (we'll read it in §3.2):
 `supports_op` is a **capability query**: a pure yes/no function from `(operation, data type)` to
 `bool`, implemented *by each backend about itself*. The scheduler never consults a master table
 of "which ops run where"; it just asks the engines in order. The **priority order is a number in
-the registry** (`src/graph/registry.rs:72-75`: Metal 300, CUDA 200, CPU 100), which the allocator
+the registry** (`src/graph/registry.rs:`: Metal 300, CUDA 200, CPU 100), which the allocator
 walks through `supports_for` (`src/graph/alloc.rs:403`) — the `supports` helper beside it is
 `#[cfg(test)]` since F4 — Metal is asked first because, when available, it is the fastest engine;
 CUDA second; CPU last, and CPU is also the landing pad
@@ -96,7 +96,7 @@ Two facts make GPU assignment possible at all, and both are decided before this 
   weight tensor it needs is only on the host. The model layer therefore gates GPU participation
   all-or-nothing: `metal_on = metal_available() && Self::weights_on_gpu(model)` — either every
   matmul weight is registered on the GPU registry, or the whole graph stays on CPU
-  (`src/models/qwen2/graph.rs:431-433`; the CUDA arm is the same shape at line 435). This is why
+  (`src/models/qwen2/graph.rs:`; the CUDA arm is the same shape at line 435). This is why
   doc 03 (weight registration) is a *precondition* of this stage.
 - **The user can opt out.** `MINFER_DISABLE_MPS=1` makes `metal_available()` false
   (`src/metal/runtime.rs`), so the priority question falls straight through to CPU.
@@ -110,7 +110,7 @@ Three concrete consequences, all visible in the code:
    `Err` and the run aborts — `docs/GPU_SAFETY.md` rule 1: *"Kernel-invariant violations return
    `Err` from `execute_node` — never a silent CPU fallback."* The CPU backend even has an
    explicit arm that turns "I have no kernel for this fused op" into a loud error
-   (`cpu_backend.rs:433-441`, quoted in §3.4). A quiet fallback would mask the bug the guard
+   (`cpu_backend.rs:`, quoted in §3.4). A quiet fallback would mask the bug the guard
    exists to catch.
 2. **Splits are deterministic.** The scheduler partitions the graph into *splits* — maximal
    runs of consecutive nodes on the same backend (doc 08) — and copies data across backends only
@@ -121,7 +121,7 @@ Three concrete consequences, all visible in the code:
    skipped), the flag makes a backend toggle — MPS becoming available mid-session, or the env
    var flipping between runs — *force a rebuild* instead of silently reusing a graph whose
    backends are wrong. The comment on the field says exactly this
-   (`params.rs:19-21`, quoted in §3.2).
+   (`params.rs:`, quoted in §3.2).
 
 ### 2.2 What fusion is, and why elementwise fusion is a bandwidth story
 
@@ -173,7 +173,7 @@ layer**, and one dispatch. Now put real numbers on it (Qwen2.5-0.5B: hidden 896,
   time.
 - **Decode** (`nt = 1`): `A = 19.4 KB`, so 2A ≈ 39 KB per layer → under 1 MB across the model —
   *bandwidth is irrelevant here*. The decode win is the **dispatch**: every Metal pass costs a
-  host-side encode (`MINFER_OP_PROFILE=1` prints this cost per op; metal_backend.rs:253-271),
+  host-side encode (`MINFER_OP_PROFILE=1` prints this cost per op; metal_backend.rs:),
   and at one token per forward there is nothing else to hide it behind.
 
 That decode asymmetry is why minfer has *two* fusion mechanisms, and keeping them apart is the
@@ -213,7 +213,7 @@ AFTER (silu folded into SwiGLU; the Silu node is orphaned)
   Mul  out: [nt, nf] buf written          orphaned → no buffer → never runs
 ```
 
-The matcher's exact logic (`fusion.rs:48-79`, read in full in §3.2):
+The matcher's exact logic (`fusion.rs:`, read in full in §3.2):
 
 1. Find a node whose op is `Op::Mul` with exactly two sources.
 2. Check whether either source is an `Op::Silu` (the pattern may arrive as `Mul(Silu(x), y)` or
@@ -261,7 +261,7 @@ fused ops? Because they are not produced by this pass at all. The division of la
 
 - **The builder** decides *topology*: when `CParams.fuse_qkv` / `fuse_ffn` are on (decode, GPU,
   concat weights available, `nf ≤ 16384` for FFN), it emits `Op::FusedQKV` / `Op::FusedFFN`
-  nodes *directly* (`models/qwen2/graph.rs:93-105` and `236-262`). When they are off it emits
+  nodes *directly* (`models/qwen2/graph.rs:` and `236-262`). When they are off it emits
   the decomposed chain — **and the FFN branch deliberately builds `silu` + `mul` rather than a
   `swiglu` node**, with the in-code comment "built as silu+mul so the fusion pass folds it"
   (line 228). One builder, two shapes, one downstream pass.
@@ -288,7 +288,7 @@ ops its assigned backend claimed.
 ### 2.5 The env toggles: fusion as a first-class A/B experiment
 
 Both builder fusions are controlled by environment variables read at graph-build time
-(`models/qwen2/graph.rs:468-473`):
+(`models/qwen2/graph.rs:`):
 
 ```
 MINFER_NO_FUSE_QKV=1  →  CParams.fuse_qkv = false  →  builder emits the decomposed QKV chain
@@ -343,13 +343,13 @@ splits and dispatch.
 **Where the stage physically runs:** inside the model's `forward_cached` — the first place a
 forward needs a graph. The sequence there is `try_reuse → build → register weights → enable
 backends → assign_backends → FusionPass → alloc_graph → replace_graph`
-(`src/models/qwen2/graph.rs:611-650`). Note the pipeline lives in *model* code, not the
+(`src/models/qwen2/graph.rs:`). Note the pipeline lives in *model* code, not the
 scheduler: the scheduler provides `assign_backends`, but the model orchestrates, because only
 the model knows whether its weights made it onto the GPU.
 
 ### 3.2 Key code
 
-**The whole assignment policy** — `src/graph/scheduler.rs:68-83`:
+**The whole assignment policy** — `src/graph/scheduler.rs:`:
 
 ```rust
 /// Assign every node to the best backend that supports it (capability
@@ -374,7 +374,7 @@ makes the assignment *total*: every node leaves with a backend even if `supports
 `Err` arm for ops it has no kernel for (§3.4) — it just guarantees the *abort names the right
 node* instead of crashing on an `Option` unwrap.
 
-**Where the priority actually lives** — `src/graph/alloc.rs:403-433`, trimmed:
+**Where the priority actually lives** — `src/graph/alloc.rs:`, trimmed:
 
 ```rust
 /// Which backend may take a node of `(op, dtype)` that belongs to `layer` — the
@@ -406,9 +406,9 @@ pub fn supports_for(&self, op: &Op, dtype: DType, layer: Option<usize>) -> Optio
 ```
 
 **The order is data, not statement order.** `Backend` is a `Copy` handle into a fixed id space
-(`src/graph/registry.rs:85-87`: `CPU = 0`, `METAL = 1`, `CUDA = 2`) and the registry holds the
+(`src/graph/registry.rs:`: `CPU = 0`, `METAL = 1`, `CUDA = 2`) and the registry holds the
 entries in **priority** order — Metal 300, CUDA 200, CPU 100 (`PRIORITY_METAL` / `PRIORITY_CUDA` /
-`PRIORITY_CPU`, `src/graph/registry.rs:72-75`). `by_priority()` is that list, so the assignment
+`PRIORITY_CPU`, `src/graph/registry.rs:`). `by_priority()` is that list, so the assignment
 preference is one table rather than the order of `if` blocks in this function.
 
 `enable_metal()` / `enable_cuda()` still populate the allocator's per-backend pools (model code
@@ -420,7 +420,7 @@ identical**, which is what the registry's own pinning test
 contract — the two orders, the name surface and the three startup refusals — is
 `docs/BACKEND-REGISTRY-DESIGN.md`; this doc only shows how the assignment reads it.
 
-**The contract every backend implements** — `src/graph/backend.rs:21-191`. The full method list
+**The contract every backend implements** — `src/graph/backend.rs:`. The full method list
 is `docs/ARCHITECTURE.md` §5.1, and the contract around it is
 `docs/BACKEND-REGISTRY-DESIGN.md`:
 
@@ -440,7 +440,7 @@ The trait has no `name()`: since F4 a backend's identity, id, priority and names
 registry's handle and entry (`src/graph/registry.rs`), which is what lets a backend be requested
 by name at all.
 
-**A backend's self-description, CPU** — `src/graph/cpu_backend.rs:73-105`:
+**A backend's self-description, CPU** — `src/graph/cpu_backend.rs:`:
 
 ```rust
 fn supports_op(&self, op: &Op, dtype: DType) -> bool {
@@ -484,7 +484,7 @@ The CPU claims the whole per-layer vocabulary — everything is F32-only, and th
 decode fusions are GPU-only (§2.3). The `supports_fused` answer is `true` for `SwiGLU`, so the
 pass *does* fold on CPU; what "fused" means there is a single-pass kernel, shown next.
 
-**What a "fused" SwiGLU means on CPU** — `src/graph/cpu_backend.rs:373-379`:
+**What a "fused" SwiGLU means on CPU** — `src/graph/cpu_backend.rs:`:
 
 ```rust
 Op::SwiGLU => {
@@ -502,7 +502,7 @@ version computes `silu(gate[i]) * up[i]` in one loop and is bit-identical to tha
 formula, same per-element order — pinned by `vec_ops::tests::swiglu_matches_silu_then_mul`).
 
 **Metal's table, with the decode fusions and the CUDA-only epilogue negative** —
-`src/graph/metal_backend.rs:294-319`:
+`src/graph/metal_backend.rs:`:
 
 ```rust
 fn supports_op(&self, op: &Op, dtype: DType) -> bool {
@@ -575,7 +575,7 @@ can be *payload-conditional* — CUDA rotates only the `NonInterleaved` style, s
 interleaved-RoPE node would silently route to CPU instead of producing wrong numbers. This is
 `supports_op` earning its keep as a per-node query rather than a per-backend yes/no.
 
-**The fusion pass, part 1 — dispatch** — `src/graph/fusion.rs:20-35`:
+**The fusion pass, part 1 — dispatch** — `src/graph/fusion.rs:`:
 
 ```rust
 /// Run all supported fusions over the graph. Returns the number of nodes
@@ -599,7 +599,7 @@ cfg-conditional order; the closure is built at the call site where that layout i
 `None` case of the closure means "unassigned" — and unassigned nodes are never fused (the gate
 treats `None` as `false`, §2.4's promise again).
 
-**The fusion pass, part 2 — the SwiGLU matcher** — `src/graph/fusion.rs:48-79` (inside
+**The fusion pass, part 2 — the SwiGLU matcher** — `src/graph/fusion.rs:` (inside
 `fuse_swiglu`):
 
 ```rust
@@ -650,7 +650,7 @@ because `SwiGLU`'s output shape equals the Mul's by definition.
 and its `FusedOp::BiasRope` capability tag were removed (§2.3): no backend claimed the capability,
 so the matcher was unreachable code. `run()` now composes exactly one rewrite.
 
-**The call site that wires it all together** — `src/models/qwen2/graph.rs:611-650`, trimmed:
+**The call site that wires it all together** — `src/models/qwen2/graph.rs:`, trimmed:
 
 ```rust
 if !cache.try_reuse(&params) {
@@ -684,9 +684,9 @@ if !cache.try_reuse(&params) {
 This is the stage's place in the pipeline, verbatim: reuse check → build → enable → **assign →
 fuse** → allocate → store. The whole block is skipped when `try_reuse` succeeds — assignment and
 fusion run *once* per `GraphParams`, which is why they can afford to be thorough. (`Qwen3Graph`
-mirrors this block at `src/models/qwen3/graph.rs:521-548`.)
+mirrors this block at `src/models/qwen3/graph.rs:`.)
 
-**The reuse identity that makes toggles work** — `src/graph/params.rs:17-35`:
+**The reuse identity that makes toggles work** — `src/graph/params.rs:`:
 
 ```rust
 /// Runtime parameters that affect graph construction.
@@ -709,7 +709,7 @@ pub struct CParams {
 }
 ```
 
-and the comparison that consumes it — `src/graph/cache.rs:47-64`:
+and the comparison that consumes it — `src/graph/cache.rs:`:
 
 ```rust
 pub fn try_reuse(&mut self, params: &GraphParams) -> bool {
@@ -737,7 +737,7 @@ of a silent stale-graph reuse. The dedicated test
 `fuse_flags_are_part_of_the_reuse_identity` (cache/tests.rs:36) flips each flag and asserts
 non-reuse.
 
-**Where fusion orphans die** — `src/graph/scheduler.rs:225-233` (doc 08's executor, forward
+**Where fusion orphans die** — `src/graph/scheduler.rs:` (doc 08's executor, forward
 pointer):
 
 ```rust
@@ -827,7 +827,7 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
 
 - *Why is priority hardcoded as if-block order instead of a sorted backend list?* — **F4 reversed
   this.** The ordered list is now the registry's `priority` field (`PRIORITY_METAL` 300 /
-  `PRIORITY_CUDA` 200 / `PRIORITY_CPU` 100, `src/graph/registry.rs:72-75`), for the reason the
+  `PRIORITY_CUDA` 200 / `PRIORITY_CPU` 100, `src/graph/registry.rs:`), for the reason the
   old argument missed: once `Backend` is a *handle* rather than an enum variant, the order has
   more than one reader — the assignment pass, the fusion pass's node → index map, and the
   exporters — so one table is what keeps them from disagreeing. The if-chain was readable; it
@@ -843,7 +843,7 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
 - **Assignment is total and final.** Every node exits this stage with a backend, and no stage
   after this may change it. Execution errors are `Err` + abort: the CPU backend's arm for ops
   it cannot run says so in its error text —
-  `cpu_backend.rs:433-441`:
+  `cpu_backend.rs:`:
 
   ```rust
   Op::BatchMatMul
@@ -890,18 +890,18 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
 ## 4. Observe & verify
 
 - **`MINFER_GRAPH_TRACE=1`** prints the split map and a per-op/per-backend node census at
-  execute time (`scheduler.rs:127-144`), e.g. `op SwiGLU  backend Metal  x24` — the direct
+  execute time (`scheduler.rs:`), e.g. `op SwiGLU  backend Metal  x24` — the direct
   output of this stage: 24 folded nodes, one per layer, on their assigned backend.
 - **`MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1`** switch the builder's decode fusions off
   for one run; combined with the trace (or the decode throughput line) they are the A/B switch,
   and the rebuild they force is the mechanism §2.5 describes.
 - **`--dump-graph-json <file>` / `--dump-graph <dot>`** rebuild the graph through
   `json.rs::build_runtime_graph` — explicitly *"build → assign → FusionPass"*
-  (json.rs:50-68) — so the exported node list shows the fused ops (`"swiglu"`, `"fused_qkv"`)
+  (json.rs:) — so the exported node list shows the fused ops (`"swiglu"`, `"fused_qkv"`)
   and each node's backend, i.e. a picture of this stage's output. `MINFER_TRACE` /
   the `viz` server show the same graph live, with per-node data.
 - **`MINFER_OP_PROFILE=1`** (Metal) prints host-encode time per op after the run
-  (metal_backend.rs:36-39, 224-242) — the dispatch cost that fusion removes, made visible.
+  (metal_backend.rs:, 224-242) — the dispatch cost that fusion removes, made visible.
 - **`MINFER_DISABLE_MPS=1`** forces `metal_on = false` and shows the priority chain collapsing
   to CPU (everything in the trace census becomes `backend CPU`).
 - **Tests** (all `cargo test`): `fusion.rs` — `swiglu_fusion_applies_when_backend_supports`
@@ -911,7 +911,7 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
   `cache.rs::fuse_flags_are_part_of_the_reuse_identity` (flag flip ⇒ no reuse);
   `qwen2/graph.rs::fused_qkv_matches_unfused_decode` (fused nodes present iff gated on, logits
   **bit-identical**, plus per-layer output comparison); the tail-reduction test asserts the
-  SwiGLU node exists and consumes the gate/up matmuls (qwen2/graph/tail_tests.rs:111-146) — the pass is
+  SwiGLU node exists and consumes the gate/up matmuls (qwen2/graph/tail_tests.rs:) — the pass is
   exercised on every graph-level test run, not just the fusion unit tests.
 
 ## 5. Cross-references

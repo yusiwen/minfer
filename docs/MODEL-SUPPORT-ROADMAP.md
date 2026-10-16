@@ -47,19 +47,19 @@ Four items are **not** covered by that estimate and apply to every port:
    registered the concatenated tensors — once for Metal and once for CUDA
    (`models/qwen2/loader.rs:425`, `:488`; `models/qwen3/loader.rs:426`, `:468`)
    — plus the matching `qkv_concat_available` / `gu_concat_available`
-   predicates (`models/qwen2/graph.rs:288-326`). Skip them and the port is
+   predicates (`models/qwen2/graph.rs:`). Skip them and the port is
    still **correct**, but decode fusion silently disables: no error, just a
    slower decode path.
 2. **RoPE style.** `rope_style` is hard-coded to `NonInterleaved` in both
    loaders (`models/qwen2/loader.rs:154`, `models/qwen3/loader.rs:172`).
    `RopeStyle::Interleaved` exists and the CPU implements it
-   (`graph/cpu_backend.rs:491-492`), but CUDA refuses it
+   (`graph/cpu_backend.rs:`), but CUDA refuses it
    (`graph/cuda_backend.rs:1324`) and no loader ever selects it. A family
    needing interleaved RoPE (Llama 1/2, Mistral 7B v0.1) needs a loader change
    **and** a CUDA kernel, or must be converted to the non-interleaved
    convention.
 3. **RoPE scaling.** Only `*.rope.freq_base` and `*.rope.frequency_scale` are
-   read (`models/qwen2/loader.rs:146-149`). The long-context scaling types
+   read (`models/qwen2/loader.rs:`). The long-context scaling types
    (`rope.scaling.type = llama3`, i.e. the low/high-frequency factors in
    Llama 3.1+) are not implemented, so a Llama 3.x port is correct at short
    context and wrong past the original training window until this lands.

@@ -146,11 +146,11 @@ Legend for **Gap**: 🔴 structural (blocks a class of use cases) · 🟠 materi
 ### 2.1 L1 — Graph IR and build
 
 **Today.** `ComputeGraph` is a flat, topologically ordered vector of `CNode`
-(`graph/mod.rs:83-115`). Each node has exactly one output, a static
+(`graph/mod.rs:`). Each node has exactly one output, a static
 `[usize; 4]` shape, and an `Op` carrying its full payload. `Op::View { offset,
-shape }`, `Reshape`, `Permute` exist (`ops.rs:105-116`) but both backends
-execute them as **identity copies** (`cpu_backend.rs:384-388`,
-`cuda_backend.rs:433-438`, `metal_backend.rs` likewise) — the allocator has no
+shape }`, `Reshape`, `Permute` exist (`ops.rs:`) but both backends
+execute them as **identity copies** (`cpu_backend.rs:`,
+`cuda_backend.rs:`, `metal_backend.rs` likewise) — the allocator has no
 aliasing for views, so a view costs a full tensor copy. The builder appends
 sources before consumers, so node-id order *is* the execution order
 (`scheduler.rs:214`).
@@ -159,10 +159,10 @@ sources before consumers, so node-id order *is* the execution order
 them the IR cannot express slicing, concatenation, or a copy between
 overlapping regions as compositions of primitive ops — which is why minfer
 carries four hand-written decode-specific fused ops instead: `FusedQKV`,
-`QkvBiasRopeStore`, `FusedFFN`, `FusedQkvNorm` (`ops.rs:125-154`). Each one
-costs changes in *five* places: the builder constructor (`builder.rs:193-281`),
-the allocator's special cases (`alloc.rs:232-273`), the scheduler's `kv_pair`
-resolution (`scheduler.rs:261-271`), every backend's `supports_op` +
+`QkvBiasRopeStore`, `FusedFFN`, `FusedQkvNorm` (`ops.rs:`). Each one
+costs changes in *five* places: the builder constructor (`builder.rs:`),
+the allocator's special cases (`alloc.rs:`), the scheduler's `kv_pair`
+resolution (`scheduler.rs:`), every backend's `supports_op` +
 `execute_node`, and both models' `build_graph`. `BatchMatMul` is deferred for
 the same reason (`COMPUTE-GRAPH-DESIGN.md §5.4`).
 
@@ -183,13 +183,13 @@ fusions become compiler output instead of bespoke ops.
 
 ### 2.2 L2 — Scheduler and execution
 
-**Today.** `assign_backends` (`scheduler.rs:68-83`) walks nodes in build order
+**Today.** `assign_backends` (`scheduler.rs:`) walks nodes in build order
 and assigns the highest-priority backend whose `supports_op` returns true.
 `split_graph` partitions into *contiguous* same-backend runs derived from that
-positional assignment (`scheduler.rs:73-120`); split
+positional assignment (`scheduler.rs:`); split
 inputs/outputs are the crossing edges. Execution then walks splits, calling
 `sync_backend(prev)` and `copy_across` for each cross edge
-(`scheduler.rs:176-189`), and finally `sync_backend`.
+(`scheduler.rs:`), and finally `sync_backend`.
 
 **Gap.** 🟠 Two distinct issues.
 
@@ -232,7 +232,7 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
 **Also:** ~~the cross-boundary staging map is keyed by node id alone
 (`alloc.rs:34`), so a node consumed by two different foreign backends can only
 have one staging buffer; the scheduler compensates by filtering on backend
-(`scheduler.rs:252-255`), which is correct only while at most two backends are
+(`scheduler.rs:`), which is correct only while at most two backends are
 enabled.~~ **Fixed in A5**: the map is keyed by `(node, destination backend)`,
 one node can feed two foreign consumers, and the consumer-side filter is gone.
 
@@ -248,14 +248,14 @@ are prerequisites for multi-device execution and for any heterogeneous split.
 
 ### 2.3 L3 — Allocator and memory
 
-**Today.** `GraphAllocator::alloc_graph` (`alloc.rs:513-521`) rebuilds the whole
+**Today.** `GraphAllocator::alloc_graph` (`alloc.rs:`) rebuilds the whole
 node→buffer mapping on every graph rebuild: it frees every previously live
 buffer back to the backend pool (`:165-177`), recomputes `last_use` over build
 order, and re-allocates. Buffer pools are per backend, not unified
-(`alloc.rs:315-335`), and allocation is by **exact element count** — both the
-Metal (`metal_backend.rs:322-332`) and CUDA (`cuda_backend.rs:1333-1353`) pools
+(`alloc.rs:`), and allocation is by **exact element count** — both the
+Metal (`metal_backend.rs:`) and CUDA (`cuda_backend.rs:`) pools
 scan a free list for an exact byte-length match and otherwise allocate fresh.
-`free_buffer` never returns memory to the device (`cuda_backend.rs:1355-1362`).
+`free_buffer` never returns memory to the device (`cuda_backend.rs:`).
 
 **Gap.** 🟠 Three consequences.
 
@@ -280,9 +280,9 @@ scan a free list for an exact byte-length match and otherwise allocate fresh.
 3. **No VRAM budget or feasibility check.** `cudaMemGetInfo` is queried once at
    init and only printed (`src/cuda/methods/init.rs:126`); the sole consumer of free-memory
    information today is a valve guarding the optional f16 weight cache
-   (`src/cuda/methods.rs:57-62`) — the activation/KV allocator has no accounting at all.
+   (`src/cuda/methods.rs:`) — the activation/KV allocator has no accounting at all.
    Out-of-memory surfaces as a null pointer that fails at execute time
-   (`cuda_backend.rs:1345-1348`). There is no "this graph will not fit, offload
+   (`cuda_backend.rs:`). There is no "this graph will not fit, offload
    the last *n* layers" fallback because there is no layer-offload concept at
    all (§2.6).
 
@@ -301,11 +301,11 @@ backend assignment).
 ### 2.4 L4 — KV cache and sequence state 🔴
 
 **Today.** Each layer owns two persistent contiguous regions, K and V, created
-on first use by `ensure_kv(layer, backend, size)` (`alloc.rs:385-393`), sized
+on first use by `ensure_kv(layer, backend, size)` (`alloc.rs:`), sized
 `n_kv_embd × n_ctx` f32 (or f16 when the type flag is set). They live in the
 allocator inside `GraphCache` and survive graph rebuilds (`graph/cache.rs:69`).
 Positions are *data*, injected per step through the `positions` input node, so
-the topology never depends on `n_past` (`ops.rs:94-99`,
+the topology never depends on `n_past` (`ops.rs:`,
 `COMPUTE-GRAPH-DESIGN.md §1.4`).
 
 That design is a genuine strength — it is the precondition for graph reuse — but
@@ -335,11 +335,11 @@ re-prefill, and any state-space/hybrid model family.
 Two concrete defects live here as well:
 
 - **`ensure_kv` ignores the requested size after the first call**
-  (`alloc.rs:385-393`: the early `if let Some(&pair) = self.kv.get(&layer)`
+  (`alloc.rs:`: the early `if let Some(&pair) = self.kv.get(&layer)`
   returns without comparing `size`). `CParams.n_ctx` is part of the reuse
   identity, so a session that changes `n_ctx` on the same `GraphCache` silently
   keeps the old region. The CPU backend then errors on out-of-range positions
-  (`cpu_backend.rs:170-172`); the GPU backends do not check at all (below).
+  (`cpu_backend.rs:`); the GPU backends do not check at all (below).
   Today no caller changes `n_ctx` on a live cache, so it is latent rather than
   live — but it is a landmine directly under the "grow the context" feature
   that a server wants.
@@ -399,16 +399,16 @@ once item 3 landed and showed the count is data rather than topology
 see `ARCHITECTURE-EXECUTION-PLAN.md` §8). The other dead identity field,
 `CParams.n_batch`, was **deleted** in Phase A7; chunked prefill (item 10) will
 reintroduce it with its real semantics. Attention derives its causal bound from
-the per-token positions input (`cpu_backend.rs:411-416`, `cuda_backend.rs:1100-1102`), so two
+the per-token positions input (`cpu_backend.rs:`, `cuda_backend.rs:`), so two
 sequences in one batch would attend to each other.
 
-The prefill is one graph covering the entire prompt (`main.rs:890-918`):
+The prefill is one graph covering the entire prompt (`main.rs:`):
 `n_ctx = max(--n-ctx, prompt_len)`, one forward with `nt = prompt_len`. The
-server rejects any prompt longer than the slot context (`chat.rs:118-124`);
-`new_slots` (`slot.rs:33-36`) divides `n_ctx_total` equally per slot.
-`worker_loop` drains the queue **serially, one slot at a time** (`chat.rs:452-518`),
+server rejects any prompt longer than the slot context (`chat.rs:`);
+`new_slots` (`slot.rs:`) divides `n_ctx_total` equally per slot.
+`worker_loop` drains the queue **serially, one slot at a time** (`chat.rs:`),
 and every request starts from a fresh `GraphCache` (`chat.rs:77`). Default `--n-slots` is
-1 (`main.rs:507`), so the default server is strictly serial with a cold KV per
+1 (`main.rs:522`), so the default server is strictly serial with a cold KV per
 request.
 
 **Gap.** 🔴 This is the largest capability difference between what minfer does
@@ -436,14 +436,14 @@ Two smaller but immediate items sit in this layer:
   219-token second turn): prefill 219 → 16 tokens, time-to-first-token
   ≈2.8 s → 0.25 s (≈11×), with the cold-slot turn unchanged.
 - ~~**No panic isolation.**~~ **Fixed in A4.** The guard that existed
-  (`guarded_forward`, `chat.rs:585-597`) only covered
+  (`guarded_forward`, `chat.rs:`) only covered
   `forward_graph_cached`; the speculative path calls both models' forwards
   directly (`spec.rs`) and the tokenizer, sampler and stop-string paths were
   bare. A panic in any of them unwound `worker_loop`, dropping the bounded job
   channel (capacity 64, `server/mod.rs:66`) — later requests got 503 — and the
   queued jobs' `StreamEvent` senders, ending their SSE
   (Server-Sent Events) stream after an empty `[DONE]` rather than an error
-  (`server/mod.rs:198-216`). The whole per-job body now runs under
+  (`server/mod.rs:`). The whole per-job body now runs under
   `run_job_isolated`, which turns a panic into a logged 500 for that request
   and keeps the worker draining the queue.
 
@@ -452,19 +452,19 @@ Two smaller but immediate items sit in this layer:
 ### 2.6 L6 — Backend abstraction and device reach
 
 **Today.** `Backend` is a `Copy`/`Hash`/`Eq`/`Ord` **handle** over a fixed id space
-(`graph/registry.rs`, F4) and a trait (`graph/backend.rs:21-98`). The ids are a
+(`graph/registry.rs`, F4) and a trait (`graph/backend.rs:`). The ids are a
 KV-session file-format contract, and the name-keyed registry carries each backend's
 priority, capability matrix and pool hooks; consumers read it instead of matching.
 Before F4, adding a backend meant teaching nine `#[cfg]`-laden match sites
-about it: `GraphAllocator::supports` (`alloc.rs:384-386`),
+about it: `GraphAllocator::supports` (`alloc.rs:`),
 `alloc_in_pool`/`alloc_fresh_in`/`free_in_pool` (`:819`, `:955`, `:959`),
 `sync_backend` (`alloc.rs:2400`), `copy_across` (`alloc.rs:2449`), and the
-scheduler's execute match (`scheduler.rs:274-292`); the functions are registry-driven now.
+scheduler's execute match (`scheduler.rs:`); the functions are registry-driven now.
 
 GPU participation is decided by an all-or-nothing model-level gate: every weight
 must be registered on the GPU or the model runs on CPU (`ARCHITECTURE.md §5.2`;
 `CUDA-BACKEND-DESIGN.md:251-255`). The engine enumerates devices and honours
-`--gpu N` but uses exactly one (`src/cuda/methods/init.rs:63-81`); there is no
+`--gpu N` but uses exactly one (`src/cuda/methods/init.rs:`); there is no
 `tensor_split`, no peer copies, and no remote-device backend.
 
 **Gap.** 🟠 Two axes.
@@ -510,7 +510,7 @@ accounting from §2.3.
 ### 2.7 L7 — Models, quantization, tokenizer, sampling
 
 **Architectures.** Two (`qwen2`, `qwen3` dense), dispatched on
-`general.architecture` (`models/mod.rs:105-121`). Every other family is absent:
+`general.architecture` (`models/mod.rs:`). Every other family is absent:
 MoE, MLA, sliding-window/hybrid, state-space (Mamba/RWKV), multimodal, and every
 non-Qwen dense family (Llama, Mistral, Phi, GLM, InternLM). The per-family
 decision, its prerequisites and its cost live in `MODEL-SUPPORT-ROADMAP.md`; the
@@ -550,7 +550,7 @@ bf16 output is refused ([#142](https://github.com/yusiwen/minfer/issues/142)).
 🟢 for conversion/quantization of the supported set.
 
 **CPU SIMD.** AVX2 (Advanced Vector Extensions 2) dot kernels exist for
-`Q4_0`/`Q8_0` (`src/quants/dot_q4_0.rs:1-9`, `src/quants/dot_q8_0.rs:28`), and since
+`Q4_0`/`Q8_0` (`src/quants/dot_q4_0.rs:`, `src/quants/dot_q8_0.rs:28`), and since
 [#56](https://github.com/yusiwen/minfer/issues/56) (2026-10-08) the K-quants too:
 `Q4_K`/`Q5_K`/`Q6_K × Q8_K` have AVX2+FMA kernels (`src/quants/avx2.rs`) and
 AVX-512/VNNI variants (`src/quants/avx512.rs`), dispatched **AVX-512 → AVX2 →
@@ -595,9 +595,9 @@ all-newline-piece shortcut and a `<0xXX>` byte fallback, gated against the model
 bytes, gated against the model author's own tokenizer; ADR-0049) or `plamo2` (a backward DP over the
 file's own `scores` with a `<0xXX>` byte fallback, measured equivalent to llama.cpp's suffix automaton;
 ADR-0050) or `hybriddna` (the `gpt2` engine plus a `<dna>` k-mer block over a marker-suffixed vocabulary;
-ADR-0051). What
-remains: **the other engines**
-(`whitespace`, `none`), plus the remaining
+ADR-0051) or `none`/`no_vocab` (a vocabulary-less file with checked entry points; ADR-0052). What
+remains: **the other engine**
+(`whitespace`), plus the remaining
 `ignore_merges`/multi-regex pre-tokenizers (`falcon3`, `pixtral`, `default`, `deepseek-*`, …) —
 those refuse by name, so
 the coverage gap is explicit rather than a wrong split. Special-token
@@ -651,7 +651,7 @@ every piece. Still
 missing: top-n-sigma, adaptive-p, infill. 🟡
 
 **No LoRA (Low-Rank Adaptation) / adapter support.** There is no adapter path
-at all. minfer's `weights_version` field in `GraphParams` (`params.rs:88-98`) exists
+at all. minfer's `weights_version` field in `GraphParams` (`params.rs:`) exists
 precisely to break reuse on a weight swap, but nothing produces such a swap. 🟡
 
 ---
@@ -662,7 +662,7 @@ precisely to break reuse on a weight swap, but nothing produces such a swap. �
 parity-only stubs that no architecture emits (`Scale`, `Softmax`, `View`,
 `Reshape`, `Permute`, `AttnMode::Mha` — `COMPUTE-GRAPH-DESIGN.md §1.3`), and
 `View`/`Reshape`/`Permute` execute as copies. CUDA additionally refuses
-`transpose_b` matmul (`cuda_backend.rs:1454-1459`) and `FusedQkvNorm`
+`transpose_b` matmul (`cuda_backend.rs:`) and `FusedQkvNorm`
 (`cuda_backend.rs:1905`), and Metal refuses `QkvBiasRopeStore` (`metal_backend.rs:700`) —
 so the two GPU backends do not implement the same op set, and a model's decode
 path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
@@ -685,7 +685,7 @@ a silent fallback" (`AGENTS.md §GPU Safety`) any more.
 **Testing.** Five integration files, four of them `#![cfg(target_os = "macos")]`
 Metal kernel isolation tests; CPU/CUDA correctness rests on inline unit tests
 plus real-model tests that skip when a GGUF is not cached
-(`tests/conversation_cli.rs:1-12`). ~~CI is `cargo build --release` on macOS only
+(`tests/conversation_cli.rs:`). ~~CI is `cargo build --release` on macOS only
 — no test run, no CUDA build, no Linux build.~~ **Fixed in A2**: CI now runs
 `cargo test --release` on Linux/CPU, compiles the CUDA backend in NVIDIA's devel
 image, and keeps the macOS build. 🟠 The remaining highest-value addition is a
@@ -745,7 +745,7 @@ work predates the tracker has no issue, and the plan is its record.
 | 17 | **MoE support** (see `MODEL-SUPPORT-ROADMAP.md` Tier 2 #1) — depends on item 7 for a clean implementation. | §2.1, §2.7 | L |
 | 18 | **Dense architecture port wave** (see `MODEL-SUPPORT-ROADMAP.md` Tier 1) — parameter mapping plus the per-port items listed there. | §2.7 | M–L |
 | 19 | **Chat-template fidelity**: replace or extend minijinja so Qwen3's template actually renders. — **landed in F7 (2026-09-24)**: [#50](https://github.com/yusiwen/minfer/issues/50), the Python-`str`-method hook + the loud refusal; design record `docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`; remains: `--chat-template <FILE>` + `strftime_now` ([#133](https://github.com/yusiwen/minfer/issues/133)) | §2.7 | M |
-| 20 | **Tokenizer generality**: SentencePiece/unigram, per-model pre-tokenizer variants, data-driven special tokens. — **partly landed in F7 (2026-09-24)**: [#50](https://github.com/yusiwen/minfer/issues/50) made `tokenizer.ggml.pre` authoritative (`qwen2`/`qwen35`, byte-for-byte gated, unknown values refused) and replaced the silent byte fallback; [#132](https://github.com/yusiwen/minfer/issues/132) S1 added the model's declared NFC normalizer (2026-10-15, ADR-0042), S2 made the special-token set the file's declarations rather than a name hardcode (2026-10-15, ADR-0043), S3's first rules added `llama-bpe` and `lfm2` (2026-10-15); and S4 made the engine a dispatch, landing SentencePiece (`model = llama`), WordPiece (`model = bert`), unigram (`model = t5`), gemma4 (`model = gemma4`), rwkv (`model = rwkv`), plamo2 (`model = plamo2`) and hybriddna (`model = hybriddna`) as seven more engines (2026-10-15/16, ADR-0045–ADR-0051) — the remaining engines, plus the remaining pre-tokenizer rules, are the rest of [#132](https://github.com/yusiwen/minfer/issues/132) | §2.7 | M |
+| 20 | **Tokenizer generality**: SentencePiece/unigram, per-model pre-tokenizer variants, data-driven special tokens. — **partly landed in F7 (2026-09-24)**: [#50](https://github.com/yusiwen/minfer/issues/50) made `tokenizer.ggml.pre` authoritative (`qwen2`/`qwen35`, byte-for-byte gated, unknown values refused) and replaced the silent byte fallback; [#132](https://github.com/yusiwen/minfer/issues/132) S1 added the model's declared NFC normalizer (2026-10-15, ADR-0042), S2 made the special-token set the file's declarations rather than a name hardcode (2026-10-15, ADR-0043), S3's first rules added `llama-bpe` and `lfm2` (2026-10-15); and S4 made the engine a dispatch, landing SentencePiece (`model = llama`), WordPiece (`model = bert`), unigram (`model = t5`), gemma4 (`model = gemma4`), rwkv (`model = rwkv`), plamo2 (`model = plamo2`), hybriddna (`model = hybriddna`) and the vocabulary-less `none`/`no_vocab` as eight more values (2026-10-15/16, ADR-0045–ADR-0052) — the remaining engines, plus the remaining pre-tokenizer rules, are the rest of [#132](https://github.com/yusiwen/minfer/issues/132) | §2.7 | M |
 | 21 | **Quantized KV** (Q8_0 first) — after item 1. — **landed in C4 S1 + S2a on the CPU and S2b on CUDA (fused read, quantize-aware shift, layout-tagged kernels); the packed fused epilogue, the dp4a packed dot and the packed FA prefill followed ([#144](https://github.com/yusiwen/minfer/issues/144) items 1+3, [#186](https://github.com/yusiwen/minfer/issues/186), [#202](https://github.com/yusiwen/minfer/issues/202)), so what remains is the CUDA decode residual's stall attribution ([#212](https://github.com/yusiwen/minfer/issues/212)) and Metal's packed half ([#310](https://github.com/yusiwen/minfer/issues/310), enabled)** | §2.4 | M |
 | 22 | **Quantizer tooling**: `convert-hf-to-gguf` + `quantize` + `split`. | §2.7 | L |
 
@@ -758,7 +758,7 @@ work predates the tracker has no issue, and the plan is its record.
 | 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. — **done in F8** ([#51](https://github.com/yusiwen/minfer/issues/51), 2026-09-24; the only member of the A-era batch that had no ticket). Structured logging/levels and worker supervision were **not** part of the ticket and remain open in §2.8 | §2.8 | M |
 | 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7; fully closed in E2**, which deleted `n_seqs` too after item 3 showed it was redundant, not just unread | §2.5 | S |
 | 27 | **Re-key the cross-backend staging map** by `(node, dst_backend)`. — **done in A5** | §2.2 | S |
-| 28 | **CPU per-op allocations**: `cpu_backend.rs:157-158` clones the K/V sources on every store node and `:195` allocates a `Vec<&[f32]>` per node. — **closed in A6 as not worth doing**: the allocation removal measured −1.2 % prefill / −1.8 % decode and was reverted (the loop is weight-streaming bound) | §2.3 | S |
+| 28 | **CPU per-op allocations**: `cpu_backend.rs:` clones the K/V sources on every store node and `:195` allocates a `Vec<&[f32]>` per node. — **closed in A6 as not worth doing**: the allocation removal measured −1.2 % prefill / −1.8 % decode and was reverted (the loop is weight-streaming bound) | §2.3 | S |
 
 ---
 
@@ -773,7 +773,7 @@ behavioural defects found while executing the plan, already fixed.
    [#38](https://github.com/yusiwen/minfer/issues/38) added the arm-level Metal
    guard (`MetalBackend::check_kv_store_rows`) for the fill paths that bypass it —
    §2.4 states the same closure in the gap list.
-2. **`ensure_kv` ignores a changed size** (`alloc.rs:995-1002`). The KV region is
+2. **`ensure_kv` ignores a changed size** (`alloc.rs:`). The KV region is
    frozen at first allocation while `CParams.n_ctx` remains part of the reuse
    identity, so a size change is neither honoured nor detected.
 3. **Metal weakens kernel guards.** Both halves are **closed**: the decode-fusion
@@ -801,7 +801,7 @@ behavioural defects found while executing the plan, already fixed.
 7. ~~**Stale `unreachable!("CUDA pool not implemented")`** in the non-CUDA arms —
    the string and any `unreachable!` are gone from `alloc.rs`.~~ **Fixed in [#57](https://github.com/yusiwen/minfer/issues/57)** (`cdf41b2`).
 8. ~~**Dead fields in the reuse identity**: `CParams.n_batch` and
-   `GraphParams.n_seqs` are compared by `params_match` (`cache.rs:95-101`) but no
+   `GraphParams.n_seqs` are compared by `params_match` (`cache.rs:`) but no
    builder reads them; every construction site hard-codes 1 / `n_tokens`.~~
    **Fixed in A7, closed in E2**: `n_batch` is deleted; `n_seqs` was kept for
    item 3 and then deleted by it (the sequence count is data — the topology
@@ -813,8 +813,8 @@ behavioural defects found while executing the plan, already fixed.
    by `(graph uid, node, dst_backend)`; two foreign consumers can now be served.
 10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2268`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
-    with `copy_to_host` (`alloc.rs:2137-2143`).
-11. **CUDA pool never releases device memory** (`cuda_backend.rs:2148-2156`),
+    with `copy_to_host` (`alloc.rs:`).
+11. **CUDA pool never releases device memory** (`cuda_backend.rs:`),
     documented as accepted debt but reasoned about for fixed-shape CLI runs; a
     varying-`n_tokens` workload accumulates one buffer set per distinct shape.
 12. ~~**Tests**: no Linux/CUDA/CPU in CI, four of five integration files macOS-only

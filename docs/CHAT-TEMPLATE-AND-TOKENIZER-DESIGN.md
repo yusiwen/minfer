@@ -141,7 +141,7 @@ payload.
 
 ## 3. Tokenizer — accepted, refused, detected
 
-### 3.0 The engine comes first: `tokenizer.ggml.model` (#132 S4, 2026-10-15/16; ADR-0045–ADR-0051)
+### 3.0 The engine comes first: `tokenizer.ggml.model` (#132 S4, 2026-10-15/16; ADR-0045–ADR-0052)
 
 `tokenizer.ggml.pre` answers "which rule" only for the engine the file already selected.
 `TokenizerModel::from_gguf` reads `tokenizer.ggml.model` and answers exactly two engines:
@@ -155,6 +155,7 @@ payload.
 | `gemma4` | BPE over **raw UTF-8** | the merge ranks, with spaces escaped to `▁` first, a newline-run rule (**from the model value**, the key is absent), the all-newline-piece shortcut and `<0xXX>` byte fallback | derived from the model | **yes** |
 | `rwkv` | greedy trie match | the vocabulary's **decoded bytes** (`\xNN` escapes), longest match first; one `<unk>` per unmatched byte | no | **yes** |
 | `plamo2` | backward DP | the file's **`scores`**: maximize the summed score, one codepoint of fallback emitting `<0xXX>` byte tokens | — | **yes** |
+| `none` / `no_vocab` | — (no vocabulary) | `tokenizer.ggml.vocab_size` placeholder tokens; every text↔id path is a **named refusal** through `encode_checked`/`decode_checked` | — | — |
 | `hybriddna` | BPE + a DNA rule | the `gpt2` engine, except that `<dna>`…`</dna>` is upper-cased and cut into 6-byte k-mers of tokens carrying a reserved U+E000 suffix (`<oov>`, tail padded with `A`) | the file's `pre` | **yes** |
 | anything else | — | — | — | refused, **naming the value** |
 
@@ -318,7 +319,8 @@ invariant violation that aborts with the byte value.
 
 * **NFC normalization** — *now applied* (F7's accepted gap, closed by
   [#132](https://github.com/yusiwen/minfer/issues/132) S1 on 2026-10-14); see §3.6.
-* **`whitespace` / `none`** engines — refused by name at load
+* **`whitespace`** — refused by name at load (`none` is accepted as a
+  vocabulary-less file, ADR-0052).
   (§3.0). SentencePiece (`llama`, ADR-0045), WordPiece (`bert`, ADR-0046),
   unigram (`t5`, ADR-0047), gemma4 (ADR-0048), rwkv (ADR-0049), plamo2
   (ADR-0050) and hybriddna (ADR-0051) are implemented;
@@ -422,7 +424,7 @@ return.
 | Loud refusal | unit test: an unsupported method/syntax fails and the error **names** the construct; a mutation of the callback (dropping a method) must make a previously-passing case fail | — |
 | Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (4 values, 52-54 entries each) | the `tokenizer.json` regex evaluated by CPython `regex` |
 | Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (14 cached models, eight engines; the carbon-3b fixture carries 54 shared entries **plus 8 DNA entries**, because the shared corpus would never exercise the `<dna>` rule) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5, `llama-bpe`, `lfm2`, and the SentencePiece model — for SPM the HF file is a *BPE* rendering of the vocabulary, so llama.cpp is the only reference for this engine, ADR-0045); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
-| Engine dispatch | `src/tokenizer.rs` unit test `the_tokenizer_model_is_a_dispatch` (eight accepted values, two refusals each naming its value) and the ignored gate's `tokenizer_model` field | `tokenizer.ggml.model` in the artifact |
+| Engine dispatch | `src/tokenizer.rs` unit test `the_tokenizer_model_is_a_dispatch` (nine accepted values — `none`/`no_vocab` included, a **missing** key refused — plus `whitespace` refused by name) | `tokenizer.ggml.model` in the artifact |
 | SentencePiece session | `src/tokenizer.rs` unit tests `spm_merges_by_score_and_falls_back_to_byte_tokens` and `spm_prefixes_the_first_segment_with_a_space` (synthetic vocabulary: the scored chain, the `▁` prefix on/off, a byte fallback, the post-special re-prefix) | llama.cpp `llm_tokenizer_spm_session` (`llama-vocab.cpp:114`) |
 | WordPiece session | `src/tokenizer.rs` unit tests `wpm_segments_by_longest_match_and_unknowns_whole_words`, `wpm_normalizer_options_follow_the_file`, `wpm_decode_unescapes_the_phantom_space_and_keeps_specials` (synthetic vocabulary: the phantom space, per-word `<unk>`, punctuation words, lowercase on/off, `strip_accents` on/off) | BERT's BasicTokenizer + WordPiece (`llama-vocab.cpp:777`/`:827`), whose definition is HuggingFace's `tokenizers` (ADR-0046) |
 | NFD decomposition | `src/tokenizer/nfc/tests.rs` unit test `nfd_matches_cpython_on_the_committed_corpus` over the same 5 103 vectors, now carrying an `nfd` expectation | CPython `unicodedata.normalize('NFD', input)` |
@@ -451,3 +453,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0049](adr/0049-rwkv-is-a-trie-over-decoded-bytes-and-its-unknown-role-is-conditional.md) — rwkv is a trie over decoded bytes, and its unknown role is conditional
 - [ADR-0050](adr/0050-plamo2-is-a-backward-dp-over-the-files-own-scores-and-the-automaton-is-an-index.md) — plamo2 is a backward DP over the file's own scores, and llama.cpp's automaton is an index
 - [ADR-0051](adr/0051-hybriddna-is-the-gpt2-engine-plus-a-dna-kmer-block.md) — hybriddna is the gpt2 engine plus a DNA k-mer block
+- [ADR-0052](adr/0052-none-is-a-vocabulary-less-file-and-the-checked-entry-points-are-how-it-refuses.md) — none is a vocabulary-less file, and the checked entry points are how it refuses

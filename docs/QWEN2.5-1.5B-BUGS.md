@@ -113,7 +113,7 @@ let output = load_one(tn::OUTPUT).unwrap_or_else(|| tok_embd.clone());
 ### Current Fallback Flow
 
 ```
-forward.rs:62-88
+forward.rs:
 ├── GPU processes 28 layers → succeeds (but Bug 1 corrupts results)
 ├── output_norm_gpu → returns false
 ├── cb.submit() → GPU work completes (28 layers executed)
@@ -124,7 +124,7 @@ forward.rs:62-88
 Then CPU executes the final output:
 
 ```rust
-// forward.rs:128-136
+// forward.rs:
 rms_norm(&hidden, ...);                              // RMSNorm on GPU result
 quant_matmul_f32(output, &bn, &mut logits, ...);     // output projection (CPU scalar path)
 ```

@@ -291,7 +291,7 @@ counts are 24. In the DOT dump you can literally see the stale edge
 
 Here is the sentence the whole design stands on: **the graph topology is a
 deterministic function of `GraphParams`** — equal parameters produce an
-identical graph, node for node. `GraphParams` (`src/graph/params.rs:88-98`)
+identical graph, node for node. `GraphParams` (`src/graph/params.rs:`)
 contains exactly `n_tokens`, `n_out` (tail rows, §2.8), `gtype`
 (prefill or decode), `cparams` (context size, flash-attn flag, GPU
 participation, the two fusion toggles), and `weights_version`.
@@ -302,7 +302,7 @@ of the structure. Where does the position live instead? In an **input node**:
 the `positions` leaf (node 1) is filled with fresh values before every
 execution, and the KV store/load and RoPE nodes read it as data. Positions
 are data, not structure — the one invariant everything else protects
-(`ops.rs:3-6` states it; §3.3 Q5 asks "what breaks without it").
+(`ops.rs:` states it; §3.3 Q5 asks "what breaks without it").
 
 Given that invariant, reuse is a six-field comparison: `GraphCache::try_reuse`
 compares the new `GraphParams` against the cached one; equal means the graph —
@@ -330,7 +330,7 @@ deviation 16).
 
 One subtlety worth admiring: `tail_ids` is declared at the **head** of the
 graph, next to the other inputs, though its consumers sit at the very end.
-The code comment explains why (`graph.rs:55-60`): a mid-graph input node
+The code comment explains why (`graph.rs:`): a mid-graph input node
 would split execution into extra backend boundary segments, each costing
 full-stream syncs and host round trips on the GPU path. Node order is not
 semantics — only the edges are — so declaration position is free to optimize
@@ -374,7 +374,7 @@ every rebuild (doc 07 owns that machinery).
 
 ### 3.2 Key code
 
-#### The node and the graph (`src/graph/mod.rs:82-115`)
+#### The node and the graph (`src/graph/mod.rs:`)
 
 ```rust
 /// Single compute node.
@@ -410,7 +410,7 @@ for later stages. The IR records only structure and shape; the
 at this stage it is `None` everywhere.
 
 Topological order is not maintained — it is *implied*. The `topo_order()`
-doc comment (`src/graph/mod.rs:151-153`) says it outright: *"The builder
+doc comment (`src/graph/mod.rs:`) says it outright: *"The builder
 appends sources before consumers, so `nodes` is already topologically
 ordered; this validates the invariant and returns a stable order (used by
 the allocator)."* Because a node can only reference ids the builder has
@@ -419,7 +419,7 @@ still runs a full Kahn pass — but its real job is validation (cycle
 detection, dangling ids), and its result is deliberately *not* used as the
 execution order (a G3 bug story told in doc 07).
 
-#### Operations with payloads (`src/graph/ops.rs:36-101`, abridged)
+#### Operations with payloads (`src/graph/ops.rs:`, abridged)
 
 ```rust
 /// Operator type. Implements full `PartialEq` (payloads included) so debug
@@ -466,14 +466,14 @@ pub enum Op {
 ```
 
 Two things to notice. First, the KV ops carry **only the layer index** — no
-position, no length. The module doc at `ops.rs:3-6` states the invariant:
+position, no length. The module doc at `ops.rs:` states the invariant:
 *positions are data, injected via the `positions` input node, so the graph
 topology never depends on `n_past`*. Second, the `PartialEq` derive is
 annotated with its purpose: structural identity checks for the reuse
 invariant.
 
 Weights and other per-node parameters travel in `NodeMeta`, a concrete enum
-(`ops.rs:160-178`) rather than the plan's original `Box<dyn Any>` — a
+(`ops.rs:`) rather than the plan's original `Box<dyn Any>` — a
 recorded deviation that buys `PartialEq`, no downcast panics, and `Clone`
 nodes. The workhorse is `MatMulMeta { weight_name, bias_name,
 weight_ttype, in_dim, out_dim }`: the graph references the weight **by
@@ -490,7 +490,7 @@ creates an `Op::Input` leaf with no sources, records its id in
 names the payoff: *"so `n_past`/positions changes never force a graph
 rebuild"*). Everything else in the 496-line file is sugar over `node`.
 
-#### The builder in practice (`src/graph/builder.rs:127-145`)
+#### The builder in practice (`src/graph/builder.rs:`)
 
 A representative convenience method, `matmul`:
 
@@ -522,7 +522,7 @@ taste of how aggressively this IR avoids node spam). `transpose_b` is
 `[out][in]` and never needs the transposed form; the flag exists for ggml
 vocabulary parity.
 
-And the KV pair (`src/graph/builder.rs:368-389`, store side — trimmed):
+And the KV pair (`src/graph/builder.rs:`, store side — trimmed):
 
 ```rust
     /// Write this step's K/V into the layer's persistent KV region at the
@@ -550,7 +550,7 @@ simpler: **no sources at all** (it is a view of the region, which is why
 `kv_load` nodes have no incoming edges in the DOT dump), carrying
 `{layer}` again and nothing positional.
 
-#### The main event, part 1: inputs and the QKV branch (`src/models/qwen2/graph.rs:53-130`)
+#### The main event, part 1: inputs and the QKV branch (`src/models/qwen2/graph.rs:`)
 
 ```rust
         let inp_ids = b.input("token_ids", [nt, 1, 1, 1], crate::graph::DType::I32);
@@ -618,7 +618,7 @@ each branch emits a different topology. A different `GraphParams` (nt = 1 vs
 and because the deciding values all live in `GraphParams`, the difference is
 exactly reproducible.
 
-#### The main event, part 2: attention, tail rows, FFN (`src/models/qwen2/graph.rs:201-269`, abridged)
+#### The main event, part 2: attention, tail rows, FFN (`src/models/qwen2/graph.rs:`, abridged)
 
 ```rust
             // attention
@@ -634,7 +634,7 @@ exactly reproducible.
                     hd,
                     hd_kv,
                     nkt,             // KV row stride = n_kv_embd
-                    scale: attn_scale,   // 1/sqrt(hd), loader.rs:36-38
+                    scale: attn_scale,   // 1/sqrt(hd), loader.rs:
                 },
             );
 
@@ -676,11 +676,11 @@ After the loop, two lines finish the pass: `rms_norm(h, output_norm)` then
 and `b.build()` hands back the finished `ComputeGraph`. Two details deserve a
 pause: the attention node takes the **positions input as a third source** —
 attention needs it for causal masking (token `t` may attend to positions
-`0..=pos[t]`; builder comment at `builder.rs:325-327`) — and on the last
+`0..=pos[t]`; builder comment at `builder.rs:`) — and on the last
 layer the *residual* is also narrowed by a second `get_rows`, because both
 sides of the add must shrink or the shapes would disagree.
 
-#### The reuse check (`src/graph/cache.rs:47-64`)
+#### The reuse check (`src/graph/cache.rs:`)
 
 ```rust
     /// Params-only reuse check. On success the previously stored graph is
@@ -706,7 +706,7 @@ sides of the add must shrink or the shapes would disagree.
 
 No node walk, no comparison of 440 nodes — six field comparisons, because
 §2.7's invariant makes them sufficient. The caller
-(`Qwen2Graph::forward_cached`, `models/qwen2/graph.rs:456-472`) shows the
+(`Qwen2Graph::forward_cached`, `models/qwen2/graph.rs:`) shows the
 whole production loop in one glance: `try_reuse`; if it fails, `build` →
 register weights → `assign_backends` (doc 06) → `FusionPass` (doc 06) →
 `alloc_graph` (doc 07) → store in the cache with a fresh `uid`; then execute
@@ -731,11 +731,11 @@ that, and it worked. Four things it could not do well:
    per-layer fallback heuristics and surprise host round trips
    (ARCHITECTURE.md Appendix A.3).
 3. *Fusion as a rewrite pass.* `Mul(Silu(x), y) → SwiGLU` is a few lines of
-   pattern matching over the IR (`fusion.rs:39-87`), applied wherever a
+   pattern matching over the IR (`fusion.rs:`), applied wherever a
    backend has the kernel. In an imperative loop the same optimization is
    hand-woven into the control flow of every model's forward code.
 4. *Observability.* `--dump-graph` / `--dump-graph-json` are ~40 lines each
-   because the forward pass *is* data (dot.rs:13-55). The old loop had to be
+   because the forward pass *is* data (dot.rs:). The old loop had to be
    reverse-engineered from breakpoints.
 
 The cost is real but bounded: 289 + 369 + 720 lines of IR (`mod.rs` + `ops.rs` +
@@ -759,7 +759,7 @@ invariant becomes unverifiable.
 **Q3: Why does `Op` carry full payloads?**
 So that graphs are *comparable* and *self-describing*. Comparison is concrete:
 `GraphCache::verify_structural` walks two graphs asserting `op == op` per
-node, and the unit test `op_partial_eq_compares_payloads` (`mod.rs:255-264`)
+node, and the unit test `op_partial_eq_compares_payloads` (`mod.rs:`)
 pins the semantics — `RmsNorm{eps: 1e-5} ≠ RmsNorm{eps: 1e-6}`,
 `KvcacheLoad{layer: 2} ≠ {layer: 3}`. Without payloads in the equality, two
 graphs differing only in an eps or a layer index would look identical and the
@@ -802,7 +802,7 @@ This is why the invariant is repeated in the three places a reader will trip
 over it — the `ops.rs` module doc, the `params.rs` module doc ("`n_past`
 deliberately absent: it is execution data"), the builder's `input` doc
 comment — and asserted by the unit test `kv_nodes_carry_layer_only`
-(`builder.rs:470-484`), the smallest expression of "positions are data".
+(`builder.rs:`), the smallest expression of "positions are data".
 
 ### 3.4 Pitfalls & invariants
 
@@ -814,7 +814,7 @@ comment — and asserted by the unit test `kv_nodes_carry_layer_only`
    Execution order = build order (doc 08) — which is also why a KV store
    built before its attention is guaranteed to run before it.
 3. **Node order is not semantics — the edges are.** `tail_ids` is declared at
-   the graph head but consumed at the last layer (`graph.rs:55-60`), purely
+   the graph head but consumed at the last layer (`graph.rs:`), purely
    to keep input nodes from fragmenting execution into extra backend
    boundary segments. When reading `build`, follow `src`, not position.
 4. **Fused and unfused are both real graphs, and they must agree.** The
@@ -827,7 +827,7 @@ comment — and asserted by the unit test `kv_nodes_carry_layer_only`
    by ~1e-6 float noise that amplifies at large magnitudes.
 5. **Fusion orphans stay in the node list.** After `Mul→SwiGLU` rewrites, the
    old `Silu` node has no consumers and gets no buffer; the executor skips
-   bufferless nodes (`scheduler.rs:228-233`: "dead nodes … are skipped, not
+   bufferless nodes (`scheduler.rs:`: "dead nodes … are skipped, not
    executed"). Do not panic at a node count that exceeds the number of
    "real" operations.
 6. **Attention's output shape comes from metadata, not from Q.** With
@@ -837,7 +837,7 @@ comment — and asserted by the unit test `kv_nodes_carry_layer_only`
 7. **GPU participation and fusion toggles are part of the reuse identity**
    (`CParams.gpu`, `fuse_qkv`, `fuse_ffn`): they change the topology, so
    they must (and do) change the reuse decision — a test locks this in after
-   it was nearly broken (cache.rs:135-140).
+   it was nearly broken (cache.rs:).
 8. **Weights are referenced by name, registered elsewhere** (doc 03): a
    `MatMulMeta.weight_name` with no registered weight is an execution-time
    error — the IR cannot check it, and purity forbids it from trying.

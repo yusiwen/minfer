@@ -185,9 +185,10 @@ precompiled charsmap, the whitespace flags, then a score-weighted Viterbi, one
 `▁`, a newline-run rule derived from the model value, an all-newline-piece
 shortcut and `<0xXX>` byte fallback) `rwkv` (a greedy longest match over the
 vocabulary's decoded bytes, one `<unk>` per unmatched byte) `plamo2` (a backward DP
-over the file's own scores with `<0xXX>` byte fallback) or `hybriddna` (the `gpt2`
-engine plus the `<dna>` k-mer block) — and every other value **refuses the load**
-naming it (ADR-0045–ADR-0051). For the BPE engine `tokenizer.ggml.pre` selects the
+over the file's own scores with `<0xXX>` byte fallback) `hybriddna` (the `gpt2`
+engine plus the `<dna>` k-mer block) or `none`/`no_vocab` (a vocabulary-less file:
+`minfer info` works, text↔id is a named refusal) — and every other value, and a
+**missing** key, **refuse the load** naming it (ADR-0045–ADR-0052). For the BPE engine `tokenizer.ggml.pre` selects the
 pre-tokenization rule — `qwen2` (alias `deepseek-r1-qwen`), `qwen35`, `llama-bpe`
 (aliases `llama3`, `llama-v3`) or `lfm2` (the last two share the Llama 3.x
 pattern, whose only difference from `qwen2` is `\p{N}{1,3}`) — and an unknown or

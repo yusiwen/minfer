@@ -320,7 +320,7 @@ scheduler orchestrates assignment, cross-backend copies, and sync.
 ### 5.2 Selection rules
 
 Assignment asks each node in the registry's **priority** order — Metal 300, CUDA 200, CPU 100
-(`src/graph/registry.rs:72-75`) — for the first backend that has a pool, is not fenced off, and
+(`src/graph/registry.rs:`) — for the first backend that has a pool, is not fenced off, and
 reports the op supported; the CPU is tried last and is always allowed, so the answer is total
 (`GraphAllocator::supports_for`, `src/graph/alloc.rs:403`). The fence is `--backend <name>` /
 `MINFER_BACKENDS=<csv>`, and an unknown name, a name this build does not contain and a name this

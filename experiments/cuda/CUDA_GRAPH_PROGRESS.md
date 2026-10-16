@@ -111,12 +111,12 @@ for il in 0..model.n_layer() {
 | File | Change | Purpose |
 |------|--------|---------|
 | `src/models/qwen2/forward.rs:136` | Add `run_cpu = false;` | Enable GPU results download path |
-| `src/models/qwen2/forward.rs:122-131` | Add graph replay fast path | Replay captured graph for decode |
+| `src/models/qwen2/forward.rs:` | Add graph replay fast path | Replay captured graph for decode |
 | `src/models/qwen2/forward.rs:138` | Enable `capture = ... && cuda.graph_begin_capture()` | Trigger graph capture on first decode |
-| `src/cuda.rs:487-495` | Simplify `graph_begin_capture` | Use ThreadLocal mode (1) |
-| `src/cuda.rs:497-524` | Simplify `graph_end_capture`/`graph_launch` | Clean up diagnostics |
+| `src/cuda.rs:` | Simplify `graph_begin_capture` | Use ThreadLocal mode (1) |
+| `src/cuda.rs:` | Simplify `graph_end_capture`/`graph_launch` | Clean up diagnostics |
 | `build.rs:84` | Add `"61"` to SM arch candidates | GTX 1060 Pascal support |
-| `src/cuda.rs:173-211` | Auto-select best GPU | Picks highest compute capability device |
+| `src/cuda.rs:` | Auto-select best GPU | Picks highest compute capability device |
 
 ---
 

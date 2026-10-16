@@ -50,7 +50,7 @@
 | P2 | Batch preparation & microbatching | Split the API batch into micro-batches, reserve host output buffers | `llama-context.cpp:1635` `llama-batch.cpp:25` | `src/main.rs` (single batch, no split) "N/A" |
 | P3 | Compute graph build (Qwen2) | Build the ggml compute graph (DFS topological order) | `src/models/qwen2.cpp:53` `llama-graph.cpp` `ggml.c:7188` | `src/models/qwen2/graph.rs:438` (declarative graph build) |
 | P4 | Scheduler split & allocation | Assign nodes to backends, split into runs, gallocr allocation | `ggml-backend.cpp:1936`→`:1055` | "N/A" (single MPS backend, static buffers) |
-| P5 | Scheduler compute | Per-split: copy inputs, call backend graph_compute | `ggml-backend.cpp:1594` `ggml-metal.cpp:535` | `forward.rs:88-134` (single CB, all layers) |
+| P5 | Scheduler compute | Per-split: copy inputs, call backend graph_compute | `ggml-backend.cpp:1594` `ggml-metal.cpp:535` | `forward.rs:` (single CB, all layers) |
 | P6 | Metal graph compute | Multi-command-buffer encode (main thread + n_cb workers) | `ggml-metal-context.m:438` `:663` | `src/metal/ops.rs` (submit, single CB) |
 | P7 | Per-op encoding & concurrency/barrier | Filter empty nodes, concurrency check, insert memoryBarrier | `ggml-metal-ops.cpp:175` `device.m:513` | `src/metal/` (barrier), `:327` (dispatch_2d) |
 | P8 | Per-op kernel dispatch | Per op type: set pipeline + args + threadgroups | `ggml-metal-ops.cpp:265-497` | `src/metal/` (quant_matmul_f32_on_gpu_buf) et al. |
@@ -141,7 +141,7 @@
 > **n_cb value**: `ggml_backend_metal_set_n_cb(backend, 1)` (`ggml-metal.cpp:612,707`),
 > `ggml_metal_set_n_cb` caps at `GGML_METAL_MAX_COMMAND_BUFFERS` (`context.m:665`).
 > That is **2 CBs** (1 main + 1 worker). minfer uses a **single CB for all
-> layers** (`forward.rs:76-134`).
+> layers** (`forward.rs:`).
 
 ### P7 Per-op encoding & concurrency/barrier model
 

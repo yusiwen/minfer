@@ -945,14 +945,14 @@ models. Revisit when a >32K-context model is the user-facing one.
 
 **Observed**: 7B run twice in a row → the second run ≈ 2× faster (Total
 1.46 s → 0.77 s). Note the CLI's `Total` timing starts AFTER model load
-(`main.rs:1512 infer_start`), so the 2× is in the **inference phases**
+(`main.rs:1527 infer_start`), so the 2× is in the **inference phases**
 (prefill + decode), not the load. Root causes:
 
 | Factor | Effect | Evidence |
 |---|---|---|
 | **GPU weight-buffer cold state (run 1)** | the 5.2 GB weights are freshly CPU-memcpy'd into Shared buffers at load; the GPU's first read hits cold MMU/TLB + page residency → slower prefill + decode on run 1 | decode 32.6 t/s (~84 GB/s) run 1 vs 46.4 t/s (~119 GB/s) run 2 |
 | **GPU clock ramp** | first GPU burst after idle starts below max clock | secondary |
-| **Model-load wall (not in `Total`, but real wall time)** | 4.4 GB model load (mmap, `gguf.rs:1733-1760`) + Metal shader source compile (`newLibraryWithSource`, src/metal/ops.rs) — run 2 mitigated by the OS page cache + the Metal driver's on-disk shader cache | run 1 load visibly slow, run 2 ~free |
+| **Model-load wall (not in `Total`, but real wall time)** | 4.4 GB model load (mmap, `gguf.rs:`) + Metal shader source compile (`newLibraryWithSource`, src/metal/ops.rs) — run 2 mitigated by the OS page cache + the Metal driver's on-disk shader cache | run 1 load visibly slow, run 2 ~free |
 
 Warm steady-state = run 2's numbers (pp30 ~0.17 s, decode ~46 t/s). Not a bug.
 

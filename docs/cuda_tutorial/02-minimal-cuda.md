@@ -211,13 +211,13 @@ elements, one thread per element. Note the kernel takes no row count: the
 grid *encodes* it, which makes the launcher responsible for the launch
 geometry matching the kernel's expectation. That is a contract, and breaking
 it is exactly the bug minfer documents on the Rust wrapper
-`add_bias_f32` (`src/cuda/methods/elementwise.rs:104-107`): *"`rows` is the ROW COUNT (token count) — the
+`add_bias_f32` (`src/cuda/methods/elementwise.rs:`): *"`rows` is the ROW COUNT (token count) — the
 kernel grid maps one block row per token, so passing the total element count
 writes out of bounds."* Passing `rows * d` would launch `rows*d` block-rows —
 a grid that reads and writes far past the buffer. On CUDA this does not
 segfault the host; it either corrupts unrelated device memory or surfaces at
 the *next* synchronization point (§2.2). The backend repeats the warning at
-its only call site (`src/graph/cuda_backend.rs:1510-1514`, the row-count comment at the `add_bias_f32` call, which passes `nt`,
+its only call site (`src/graph/cuda_backend.rs:`, the row-count comment at the `add_bias_f32` call, which passes `nt`,
 the token count) — leave this kind of comment on every launch geometry you
 write.
 
@@ -286,10 +286,10 @@ is re-created — so a misdiagnosed "error at line 4000" is usually the first
 which is what minfer's debug sync (below) is for.
 
 **How minfer wraps this.** minfer checks each launch's own error and drains at
-*sync points*; the wrapper is `CudaState::sync` (`src/cuda/methods/events.rs:143-157`):
+*sync points*; the wrapper is `CudaState::sync` (`src/cuda/methods/events.rs:`):
 
 ```rust
-// `CudaState::sync` (src/cuda/methods/events.rs:143-157; #145 comment elided)
+// `CudaState::sync` (src/cuda/methods/events.rs:; #145 comment elided)
 pub fn sync(&self) {
     let err = unsafe { cudaGetLastError() };
     if err != 0 {
@@ -358,7 +358,7 @@ the host — the rule just above); `cudaFree(void* ptr)` frees it; and
 function serve all three directions: H2D (host→device upload),
 `CUDA_MEMCPY_HOST_TO_DEVICE = 1`; D2H (download, `= 2`); D2D (device-internal,
 `= 3`) — the kind tells the driver which address spaces the pointers live in,
-and minfer defines the constants by hand `CUDA_MEMCPY_HOST_TO_DEVICE` (`src/cuda.rs:94-96`)). A blocking
+and minfer defines the constants by hand `CUDA_MEMCPY_HOST_TO_DEVICE` (`src/cuda.rs:`)). A blocking
 host↔device `cudaMemcpy` is *synchronous*: it does not return until the
 bytes have moved. For decode-speed code that is a problem (waiting for the
 GPU), which is why the async variants (`cudaMemcpyAsync` on a stream, plus
@@ -393,7 +393,7 @@ calling convention so Rust and C agree on how arguments are passed) in
 `src/cuda/ffi_runtime.rs`:
 
 ```rust
-// src/cuda/ffi_runtime.rs:1-127 (excerpt — incl. cudaMemcpyAsync,
+// src/cuda/ffi_runtime.rs: (excerpt — incl. cudaMemcpyAsync,
 // cudaStreamSynchronize, device queries, CUDA Graph APIs)
 extern "C" {
     fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
@@ -418,7 +418,7 @@ How to read such a block — the skill of *reading* an FFI layer:
   rest of the file perform exactly the translation into Rust-style `Result`s.
 - **Raw pointers are not `Send`/`Sync`.** Rust assumes a raw pointer may alias
   anything, so types containing them are not thread-safe by default. minfer's
-  `CudaPtr` newtype `CudaPtr` (`src/cuda.rs:71-72`)) is the deliberate, documented
+  `CudaPtr` newtype `CudaPtr` (`src/cuda.rs:`)) is the deliberate, documented
   exception — `unsafe impl Send/Sync` is an assertion *you* must defend:
   sound here because CUDA device allocations are process-global resources
   usable from any thread, and every access is funneled through `Mutex`es.
@@ -433,8 +433,8 @@ Initialization — the idiom where acquiring a resource in a constructor and
 releasing it in a destructor ties the resource's lifetime to an object's, so
 drops and panics cannot leak it) is how minfer keeps the *host-side* CUDA
 resources leak-proof: every pinned allocation has a `Drop` impl calling
-`cudaFreeHost` (`PinnedPool` `src/cuda.rs:397`, `PinnedBuf` `src/cuda.rs:415-424`,
-`CaptureStaging` `src/cuda.rs:435-532`). Device memory is the interesting
+`cudaFreeHost` (`PinnedPool` `src/cuda.rs:397`, `PinnedBuf` `src/cuda.rs:`,
+`CaptureStaging` `src/cuda.rs:`). Device memory is the interesting
 half-exception. A *weight* buffer is not RAII-managed at all: weights live
 for the whole process, keyed by name in the registry
 (`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `CudaState::weights` (`src/cuda.rs:614`)), and
@@ -450,7 +450,7 @@ contrast, are pooled: the backend frees every pool buffer in its `Drop`
 **One complete ownership path, walked.** The simplest non-toy path in the
 file: *register a weight → use it → (never) free it*.
 
-1. **Alloc.** `register_weight(name, data)` `register_weight` (`src/cuda/methods/weights.rs:18-97`)) first
+1. **Alloc.** `register_weight(name, data)` `register_weight` (`src/cuda/methods/weights.rs:`)) first
    checks the registry — same name *and* same byte size ⇒ the device copy
    exists, reuse it and return (`:24-31`). Otherwise it calls `cudaMalloc`
    for `data.len()` bytes (`:39-48`); on OOM (out of memory) it prints
@@ -682,18 +682,18 @@ compilation) does the whole pipeline:
    `src/cuda.rs` declares the `launch_*` symbols that only the kernels
    archive provides, so every failure below `panic!`s with an actionable
    message (`build.rs:368`, the panic path).
-2. **Find nvcc and the toolkit root.** `find_nvcc()` (`build.rs:578-601`)
+2. **Find nvcc and the toolkit root.** `find_nvcc()` (`build.rs:`)
    probes `CUDA_HOME`/`CUDA_PATH`, then `which nvcc`, resolving to an
-   absolute path either way; `find_cuda_home()` (`build.rs:603-622`) derives
+   absolute path either way; `find_cuda_home()` (`build.rs:`) derives
    the root for `-I{home}/include`.
 3. **Pin the host compiler (ccbin).** nvcc uses the first `cc`/`g++` on PATH
    as its host compiler and *hard-fails* when that GCC is newer than the
    toolkit supports (CUDA 13 rejects GCC 15 — the error surfaces confusingly
-   inside `<cmath>`). `detect_host_compiler()` (`build.rs:680-719`) probes
+   inside `<cmath>`). `detect_host_compiler()` (`build.rs:`) probes
    nvcc's default first, then `g++-15 … g++-11, g++, clang++`; the winner is
    passed as `-ccbin` (`build.rs:385`, `:476`), and
    `MINFER_CUDA_CCBIN` overrides the probe.
-4. **Probe the architectures.** `detect_archs()` (`build.rs:732-763`)
+4. **Probe the architectures.** `detect_archs()` (`build.rs:`)
    compiles a one-line dummy kernel for every candidate from `sm_70` to
    sm_121 `detect_archs` (`build.rs:732`)) and keeps the ones this nvcc accepts —
    candidates newer than the toolkit simply fail their probe and are skipped,
@@ -703,15 +703,15 @@ compilation) does the whole pipeline:
 5. **Compile once, embed many targets.** The single `nvcc` invocation
    (`build.rs:476`, the one nvcc invocation) carries `-O3 -fPIC` plus one
    `-gencode arch=compute_NN,code=sm_NN` per detected arch — SASS for every
-   GPU class — *plus* two kinds of PTX (`build.rs:469-474`, the PTX pushes): a backward
+   GPU class — *plus* two kinds of PTX (`build.rs:`, the PTX pushes): a backward
    `compute_70/72` (so an older card like a V100 can JIT forward) and a
    forward `compute_{highest}` (so a GPU newer than the newest SASS can JIT).
    The result is the portable fat binary: every probed arch as native SASS,
    plus PTX from Volta up that any future GPU can JIT.
 
 6. **Archive and link into the Rust binary.** The object is packed into
-   `libcuda_kernels.a` with `ar rcs` (`build.rs:486-495`), and two cargo
-   directives hand it to the linker (`build.rs:497-498`):
+   `libcuda_kernels.a` with `ar rcs` (`build.rs:`), and two cargo
+   directives hand it to the linker (`build.rs:`):
    `cargo:rustc-link-search=native={out_dir}` +
    `cargo:rustc-link-lib=static=cuda_kernels`. The `launch_*` symbols the
    `extern "C"` block of §2.3 declares are resolved against this archive —
@@ -766,7 +766,7 @@ never-silently-fallback rule from `docs/GPU_SAFETY.md`). The CUDA backend's
 `Op::Silu` arm (`src/graph/cuda_backend.rs:1026`, the arm in `execute_node_inner`) is seven lines:
 
 ```rust
-// `Op::Silu` (src/graph/cuda_backend.rs:1026-1032)
+// `Op::Silu` (src/graph/cuda_backend.rs:)
 // In-place op (alias rule, graph rules §5): stage via D2D copy when
 // the allocator did not alias the input, then run on the output.
 Op::Silu => {
@@ -801,9 +801,9 @@ microseconds while the kernel may not even have started. Finally the CPU
 counterpart — this tutorial's pattern is kernel → CPU → why the GPU version
 looks the way it does (chapter 03 does this line by line for the whole
 elementwise family). The same op on CPU is `vec_silu_f32`
-`vec_silu_f32` (`src/vec_ops/silu.rs:8-23`)): signature
+`vec_silu_f32` (`src/vec_ops/silu.rs:`)): signature
 `pub fn vec_silu_f32(n: usize, y: &mut [f32], x: &[f32])`, an x86_64
-AVX2+FMA arm detected at run time `vec_silu_f32_avx2` (`src/vec_ops/silu.rs:27-53`), 8 lanes per
+AVX2+FMA arm detected at run time `vec_silu_f32_avx2` (`src/vec_ops/silu.rs:`), 8 lanes per
 step), and the scalar fallback `y[i] = x[i] / (1.0 + (-x[i]).exp())` — the
 same formula as the kernel, one explicit loop index instead of 4,864
 materialized threads.
@@ -818,7 +818,7 @@ Compare the two and the design falls out:
   arch *at build time* (the §2.5 gencode list); both keep a scalar fallback,
   and neither hides a failed dispatch (the GPU arm's fallback is an `Err`,
   per the safety contract) — the backend's test gates compare against this
-  exact CPU function (`src/graph/cuda_backend/tests/elementwise.rs:159-171`, the host reference through the same `vec_ops`) computes
+  exact CPU function (`src/graph/cuda_backend/tests/elementwise.rs:`, the host reference through the same `vec_ops`) computes
   `vec_*_f32` and asserts the kernel output matches: the toy's
   CPU-reference pattern, scaled to the whole op set).
 - **In-place is a graph decision, not a kernel decision.** The CPU signature

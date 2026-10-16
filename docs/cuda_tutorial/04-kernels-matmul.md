@@ -401,7 +401,7 @@ flag (`_layout` — whether a Q6_K weight was registered with the padded
 224-byte stride). The decision tree inside `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`) has three
 tiers:
 
-**Tier 1 — prefill GEMM** (`src/cuda/methods/dispatch.rs:191-218`, the prefill-GEMM gate): `nt >= 9` (or
+**Tier 1 — prefill GEMM** (`src/cuda/methods/dispatch.rs:`, the prefill-GEMM gate): `nt >= 9` (or
 `nt >= 2` when the off-by-default `MINFER_SMALL_M_GEMM=1` experiment routes nt 2–8 here, doc 91) **and**
 `id % 32 == 0` **and** a supported quant type → a tiled GEMM — `prefill_mmq` (int8, default) or
 `prefill_gemm_f16` (the f16 escape, §3.5) depending on `mmq_active()` (`src/cuda/methods/policy.rs:39`:
@@ -409,7 +409,7 @@ the resolved device tier's MMQ flag — a table flag, or `cc >= 800` — and `MI
 
 **Tier 2 — decode/small-batch per-type kernels**: everything else falls
 through to a `match ttype` with per-type shape gates. The Q4_0 arm
-(`src/cuda/methods/dispatch.rs:273-284`, the Q4_0 arm's decode gates):
+(`src/cuda/methods/dispatch.rs:`, the Q4_0 arm's decode gates):
 
 ```rust
 } else if nt == 1 && id >= 2048 && id % 32 == 0 && !Self::no_q40_mmvq() {
@@ -425,7 +425,7 @@ through to a `match ttype` with per-type shape gates. The Q4_0 arm
 ```
 
 and the K-quant arms have the same skeleton with their own measured gates
-(`src/cuda/methods/dispatch.rs:323-403`, the K-quant arms' measured gates): Q4_K decode MMVQ at `id >= 2048`, Q5_K at
+(`src/cuda/methods/dispatch.rs:`, the K-quant arms' measured gates): Q4_K decode MMVQ at `id >= 2048`, Q5_K at
 `od*id >= 24_000_000`, Q6_K at `od*id >= 4_000_000` — each a documented
 crossover where the dp4a structure starts beating the f32-activation kernel,
 each with an env opt-out for A/B. **Tier 3 — the F32 fallback**:
@@ -459,7 +459,7 @@ the gate and the whole step is MMVQ — plus the v2 variants, since
 `mmvq_v2(id)` (`src/cuda/methods/mmvq.rs:725`, the `mmvq_v2` gate) additionally requires `id % 256 == 0`
 (3584 = 256·14 ✓). The gate is not an oversight: the arms' comments record
 the measured crossovers (small-`id` MMVQ loses — the uncoalesced nibble
-loads dominate when rows are short; the Q5_K arm prices it at `src/cuda/methods/dispatch.rs:342-357`). The reading habit
+loads dominate when rows are short; the Q5_K arm prices it at `src/cuda/methods/dispatch.rs:`). The reading habit
 this tutorial keeps hammering: **the master table gives the structure; the
 gates give your model's truth.**
 
@@ -741,7 +741,7 @@ its pieces in a profile:
   kernel `mmq_raw_nb_bt_q6k_kernel` (`mmq_bt_q6k.cu:42`);
   non-BT-consumable shapes fall back to `mmq_nt_kernel` (`mmq_int8.cu:236`).
 - **Split-K**: when the grid is M-starved (small `nt`), doc 92's auto
-  ksplit (`prefill_mmq.rs:121-131`, `auto_ksplit`) slices the k-range across `grid.z` and
+  ksplit (`prefill_mmq.rs:`, `auto_ksplit`) slices the k-range across `grid.z` and
   `mmq_ksplit_reduce_kernel` (`mmq_nb.cu:589`) adds the partials — the same split-K
   family as decode attention (chapter 05 §2.4).
 
@@ -796,7 +796,7 @@ Two consequences worth internalizing:
   change can raise AI; the levers are fewer bytes (quantization: 7.1× here)
   or fewer launches around the same bytes (chapter 05's fusion + CUDA
   Graph). Hence decode wins like "MMVQ +74–77% at 7B shapes"
-  (`src/cuda/methods/dispatch.rs:324-328`, the 8e② record) vs prefill wins like "the whole
+  (`src/cuda/methods/dispatch.rs:`, the 8e② record) vs prefill wins like "the whole
   kernel replaced".
 - **Prefill's wall only moves when the math does.** At AI ≈ 600 the traffic
   is amortized; what limits the GEMM is MACs per second — why the MMQ
@@ -829,7 +829,7 @@ at `nt ≥ 9` you buy MACs.**
   walks only pay off because dp4a turns them into 8 MACs per load; on short
   rows (`id < 2048`, or the 24M/4M-element K-quant floors) the f32 kernels'
   wide coalesced loads win — that is what the per-arm gates *are*
-  (`src/cuda/methods/dispatch.rs:273-392`, the per-type arm gates).
+  (`src/cuda/methods/dispatch.rs:`, the per-type arm gates).
 - **Prefill GEMM, mis-tiled.** A tile that underfills the machine (TM=64 at
   huge `od`, the `MINFER_GEMM_TM` A/B) or a k-step whose shared appetite
   halves occupancy (KS=64's −38%, `gemm_dynamic_smem_bytes` (`gemm_wmma.cu:585`)) trades the

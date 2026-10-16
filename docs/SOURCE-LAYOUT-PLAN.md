@@ -388,7 +388,7 @@ no `crate::kernel::cpu_quant_matmul` path exists anywhere in the tree.
 
 ### Step 4 — Metal (Mac round, after [#255](https://github.com/yusiwen/minfer/issues/255))
 
-`src/metal.rs` and `src/metal.metal` are **not compiled on Linux** (`src/main.rs:31-32` gates the
+`src/metal.rs` and `src/metal.metal` are **not compiled on Linux** (`src/main.rs:` gates the
 module; a failed `.metal` compile only warns and writes an empty metallib marker), so this step is
 part of [#260](https://github.com/yusiwen/minfer/issues/260) and is verified by the Mac-local gates.
 

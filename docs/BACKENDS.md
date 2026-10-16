@@ -26,7 +26,7 @@ detail.
 
 ## 1. The contract: the `Backend` trait
 
-Every backend implements one trait (`src/graph/backend.rs:21-98`). The
+Every backend implements one trait (`src/graph/backend.rs:`). The
 scheduler knows nothing about Metal or CUDA specifics — it only talks to this
 surface:
 
@@ -35,17 +35,17 @@ surface:
 | `supports_op(op, dtype)` | capability query, asked **per node at build time** |
 | `supports_fused(fused)` | gates the fusion pass — fused IR nodes are only produced where a kernel exists (`fusion.rs:72`) |
 | `alloc_buffer` / `free_buffer` | the backend's own buffer pool, sized in `f32` elements |
-| `alloc_fresh` | same, but bypasses the recycle free list — split-boundary staging needs ids whose physical contents are still referenced later in the same execute (`backend.rs:36-45`) |
+| `alloc_fresh` | same, but bypasses the recycle free list — split-boundary staging needs ids whose physical contents are still referenced later in the same execute (`backend.rs:`) |
 | `execute_node(node, in_bufs, out_buf, kv_pair)` | run one node; `kv_pair` carries the layer's persistent (K, V) region ids for KV ops; the output may alias an input (in-place ops) |
 | `read_host` / `write_host` | host access to a pool buffer — direct slices on CPU, staged transfers on GPU |
 | `synchronize` | wait for async work: CPU no-op; Metal submits the pending command buffer; CUDA closes a capture window if one is open |
-| `graph_replay` *(CUDA only)* | replay a previously captured CUDA Graph for a split (`backend.rs:94-97`, feature-gated; default no-op) |
+| `graph_replay` *(CUDA only)* | replay a previously captured CUDA Graph for a split (`backend.rs:`, feature-gated; default no-op) |
 
 Two supporting traits/rules ride along:
 
 - `KvProvider::kv_pair(layer)` — each layer owns **two persistent KV regions**
   (K and V) that live in the backend's pool and survive graph rebuilds
-  (`backend.rs:12-19`; allocator detail in
+  (`backend.rs:`; allocator detail in
   [walkthrough 07](./inference_e2e_walkthrough/07-allocator-liveness-kv.md)).
 - **The allocator is the single owner.** Backends own pools, but buffers are
   only created through the allocator's liveness pass; input buffers are never
@@ -56,7 +56,7 @@ Two supporting traits/rules ride along:
 Assignment happens **once, at build time** — never mid-run:
 
 1. `GraphAllocator::supports(op, dtype)` walks the registered backends
-   **highest priority first: Metal → CUDA → CPU** (`src/graph/alloc.rs:140-153`).
+   **highest priority first: Metal → CUDA → CPU** (`src/graph/alloc.rs:`).
    The first backend whose `supports_op` answers `true` wins that node. The CPU
    backend supports the full op set, so it always terminates the walk.
 2. **GPU participation is gated on weights**: a GPU backend only claims ops
@@ -142,8 +142,8 @@ in `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5.
 
 The fusion pass consults `supports_fused` before producing fused IR nodes, so
 the same model builds a different graph per backend: Metal accepts
-`SwiGLU` (`metal_backend.rs:705-709`); CUDA accepts `SwiGLU`
-(`cuda_backend.rs:1303-1305`) and carries its own fused decode kernels from
+`SwiGLU` (`metal_backend.rs:`); CUDA accepts `SwiGLU`
+(`cuda_backend.rs:`) and carries its own fused decode kernels from
 the campaign (see the CUDA docs for the inventory). The decode fusions
 (`Op::FusedQKV`, `Op::FusedFFN`) are env-revertable
 (`MINFER_NO_FUSE_QKV=1` / `MINFER_NO_FUSE_FFN=1`) and are part of the reuse
