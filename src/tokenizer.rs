@@ -315,6 +315,12 @@ pub enum TokenizerModel {
     /// per run of unmatched input. `pre`, merges and byte tokens do not
     /// participate.
     Ugm,
+    /// `rwkv`: RWKV — a greedy longest match over a trie built from the
+    /// vocabulary's **unescaped** bytes (`\xNN`, `\t`, `\n`, `\r` escapes are
+    /// decoded first, because the tokens stand for arbitrary bytes). No merges, no
+    /// scores, no `pre` rule and no byte-level encoding: a byte that starts no
+    /// entry emits the unknown token and advances one byte.
+    Rwkv,
     /// `gemma4`: Gemma-4 — byte-level BPE's merge loop over **raw UTF-8** (no
     /// byte-to-unicode step), a normalizer that replaces spaces with `▁`, the
     /// gemma4 newline rule taken from the model value (the file carries no `pre`,
@@ -338,13 +344,14 @@ impl TokenizerModel {
             Some("llama") => Ok(Self::Spm),
             Some("bert") => Ok(Self::Bert),
             Some("gemma4") => Ok(Self::Gemma4),
+            Some("rwkv") => Ok(Self::Rwkv),
             Some("t5") => Ok(Self::Ugm),
             Some(other) => Err(format!(
                 "tokenizer.ggml.model = \"{other}\" is not a tokenizer minfer implements \
                  (supported: \"gpt2\" — byte-level BPE — \"llama\" — SentencePiece — \
-                 \"bert\" — WordPiece — \"t5\" — unigram — and \"gemma4\" — Gemma-4's \
-                 raw-UTF-8 BPE). Refusing to run a different engine rather than \
-                 tokenize with the wrong one."
+                 \"bert\" — WordPiece — \"t5\" — unigram — \"gemma4\" — Gemma-4's \
+                 raw-UTF-8 BPE — and \"rwkv\" — RVKV's trie match). Refusing to run a \
+                 different engine rather than tokenize with the wrong one."
             )),
         }
     }
@@ -508,6 +515,45 @@ fn special_index(special_tokens: &HashMap<String, u32>) -> HashMap<char, Vec<(St
     index
 }
 
+/// Decode an RVKV vocabulary entry: `\xNN` is the byte 0xNN, `\t`/`\n`/`\r` are
+/// themselves, any other `\c` is `c`, and a trailing lone `\` is dropped
+/// (`llama_unescape_rwkv_token`, `llama-vocab.cpp:1247`).
+fn unescape_rwkv_token(escaped: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(escaped.len());
+    let mut escaping = false;
+    let mut hex_remaining = 0u8;
+    let mut hex_acc = 0u8;
+    for &b in escaped.as_bytes() {
+        if hex_remaining != 0 {
+            let value = if b >= b'a' { b - b'a' + 10 } else { b - b'0' };
+            hex_acc = (hex_acc << 4) + value;
+            hex_remaining -= 1;
+            if hex_remaining == 0 {
+                out.push(hex_acc);
+                hex_acc = 0;
+            }
+            continue;
+        }
+        if escaping {
+            match b {
+                b't' => out.push(b'\t'),
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b'x' => hex_remaining = 2,
+                other => out.push(other),
+            }
+            escaping = false;
+            continue;
+        }
+        if b == b'\\' {
+            escaping = true;
+            continue;
+        }
+        out.push(b);
+    }
+    out
+}
+
 /// Parse a SentencePiece byte token (`<0xXX>`) into the byte it stands for.
 /// Anything else (including a malformed spelling) is not a byte token.
 fn parse_spm_byte_token(token: &str) -> Option<u8> {
@@ -533,11 +579,18 @@ struct TrieNode {
 
 impl VocabTrie {
     fn insert(&mut self, text: &str, id: u32) {
+        self.insert_bytes(text.as_bytes(), id);
+    }
+
+    /// Insert a token whose bytes are **not** necessarily valid UTF-8 (the RWKV
+    /// vocabulary escapes arbitrary bytes as `\xNN`, and the trie has to hold the
+    /// decoded bytes, not the escape text).
+    fn insert_bytes(&mut self, bytes: &[u8], id: u32) {
         if self.nodes.is_empty() {
             self.nodes.push(TrieNode::default());
         }
         let mut node = 0u32;
-        for &b in text.as_bytes() {
+        for &b in bytes {
             let next = match self.nodes[node as usize].children.get(&b) {
                 Some(&next) => next,
                 None => {
@@ -572,14 +625,24 @@ impl VocabTrie {
         out
     }
 
+    /// Whether any entry starts with the byte `b` (a root child).
+    fn starts_with_byte(&self, b: u8) -> bool {
+        !self.nodes.is_empty() && self.nodes[0].children.contains_key(&b)
+    }
+
     /// The longest entry that is a prefix of `text`, with its byte length.
     fn longest_prefix(&self, text: &str) -> Option<(u32, usize)> {
+        self.longest_prefix_bytes(text.as_bytes())
+    }
+
+    /// The longest entry that is a prefix of `bytes`, with its byte length.
+    fn longest_prefix_bytes(&self, bytes: &[u8]) -> Option<(u32, usize)> {
         if self.nodes.is_empty() {
             return None;
         }
         let mut best = None;
         let mut node = 0u32;
-        for (i, &b) in text.as_bytes().iter().enumerate() {
+        for (i, &b) in bytes.iter().enumerate() {
             match self.nodes[node as usize].children.get(&b) {
                 Some(&next) => node = next,
                 None => break,
@@ -1076,6 +1139,50 @@ impl Tokenizer {
                     Self::get_gguf_bool(gguf, "tokenizer.ggml.add_space_prefix").unwrap_or(true);
                 None
             }
+            TokenizerModel::Rwkv => {
+                // RVKV has no `pre` rule, no merges and no scores: the vocabulary
+                // *is* the tokenizer, and the trie holds the decoded bytes.
+                for (id, text) in id_to_token.iter().enumerate() {
+                    let bytes = unescape_rwkv_token(text);
+                    ugm.trie.insert_bytes(&bytes, id as u32);
+                }
+                // The engine answers a byte no entry starts with by emitting the
+                // unknown token (llama.cpp's session). Real RVKV vocabularies carry
+                // all 256 bytes as single-byte entries, so that path is unreachable
+                // — and the artifact does not always declare the role. Require the
+                // role only when a byte really has no entry, and refuse that case by
+                // naming the byte instead of emitting a made-up id.
+                let missing: Vec<u8> = (0u8..=255)
+                    .filter(|&b| !ugm.trie.starts_with_byte(b))
+                    .collect();
+                match Self::get_gguf_u32(gguf, "tokenizer.ggml.unknown_token_id") {
+                    Some(id) => {
+                        if id as usize >= id_to_token.len() {
+                            return Err(format!(
+                                "tokenizer.ggml.unknown_token_id = {id} is out of range (the \
+                                 vocabulary has {} entries)",
+                                id_to_token.len()
+                            ));
+                        }
+                        unk_token = id;
+                    }
+                    None if missing.is_empty() => {
+                        // Unreachable by construction; `rwkv_encode` never emits it.
+                        unk_token = 0;
+                    }
+                    None => {
+                        return Err(format!(
+                            "this RVKV vocabulary has no token starting with <0x{:02X}> ({} byte(s) \
+                             uncovered) and declares no tokenizer.ggml.unknown_token_id, so a byte \
+                             of that value has no representation; minfer refuses it rather than \
+                             inventing an id",
+                            missing[0],
+                            missing.len()
+                        ));
+                    }
+                }
+                None
+            }
             TokenizerModel::Gemma4 => {
                 // `model = gemma4` **forces** the rule: llama.cpp sets
                 // `tokenizer_pre = "gemma4"` from the model value, and the file
@@ -1477,6 +1584,7 @@ impl Tokenizer {
             TokenizerModel::Bert => self.wpm_encode(text),
             TokenizerModel::Ugm => self.ugm_encode(text),
             TokenizerModel::Gemma4 => self.gemma4_encode(text),
+            TokenizerModel::Rwkv => self.rwkv_encode(text),
             TokenizerModel::Spm => {
                 let mut escaped = String::with_capacity(text.len() + SPM_SPACE.len_utf8());
                 if self.add_space_prefix && prev_special {
@@ -1641,6 +1749,28 @@ impl Tokenizer {
                 ),
             }
         }
+    }
+
+    /// RVKV encode: a greedy longest match over the vocabulary trie, byte by byte
+    /// (`llm_tokenizer_rwkv_session`, `llama-vocab.cpp:1285`). A byte that starts
+    /// no entry emits the unknown token and advances one byte.
+    fn rwkv_encode(&self, text: &str) -> Vec<u32> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut position = 0usize;
+        while position < bytes.len() {
+            match self.ugm.trie.longest_prefix_bytes(&bytes[position..]) {
+                Some((id, len)) => {
+                    out.push(id);
+                    position += len;
+                }
+                None => {
+                    out.push(self.unk_token);
+                    position += 1;
+                }
+            }
+        }
+        out
     }
 
     /// Gemma-4 encode: the normalizer replaces spaces with `▁`, the rule splits on
@@ -2122,6 +2252,16 @@ impl Tokenizer {
                         let mut buf = [0u8; 4];
                         out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
                     }
+                }
+            }
+            return out;
+        }
+        if self.model == TokenizerModel::Rwkv {
+            // RVKV: every token is its unescaped bytes (`llama-vocab.cpp:3674`).
+            let mut out = Vec::new();
+            for &id in ids {
+                if let Some(token) = self.id_to_token.get(id as usize) {
+                    out.extend_from_slice(&unescape_rwkv_token(token));
                 }
             }
             return out;

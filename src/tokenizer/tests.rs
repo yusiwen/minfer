@@ -218,6 +218,59 @@ fn a_chat_token_the_file_does_not_declare_is_not_invented() {
     assert!(!t.special_tokens.contains_key("<|im_end|>"));
 }
 
+// === #132 S4: the rwkv engine ==============================================
+
+/// An RVKV vocabulary: the entries are **escaped** (`\x41` stands for the byte
+/// `A`, `\n` for a newline), which is exactly what the trie has to decode before
+/// it can match, and `hello`/`he`/`l` make the greedy longest match observable.
+fn rwkv_tokenizer() -> Tokenizer {
+    let mut t = Tokenizer::empty();
+    t.model = TokenizerModel::Rwkv;
+    t.pre = None;
+    t.unk_token = 0;
+    for (text, ty) in [
+        ("<unk>", 2),
+        ("hello", 1),
+        ("he", 1),
+        ("l", 1),
+        ("\\x41", 1),
+        ("\\n", 1),
+    ] {
+        let id = t.id_to_token.len() as u32;
+        t.id_to_token.push(text.to_string());
+        t.id_to_type.push(ty);
+        t.vocab.insert(text.to_string(), id);
+    }
+    for (id, text) in t.id_to_token.clone().iter().enumerate() {
+        let bytes = unescape_rwkv_token(text);
+        t.ugm.trie.insert_bytes(&bytes, id as u32);
+    }
+    t
+}
+
+#[test]
+fn rwkv_takes_the_longest_match_and_unescapes_the_vocabulary() {
+    let t = rwkv_tokenizer();
+    assert_eq!(t.encode("hello"), vec![t.vocab["hello"]]);
+    // Not a whole word: `hello` does not match, but `he` then `l` do.
+    assert_eq!(t.encode("hel"), vec![t.vocab["he"], t.vocab["l"]]);
+    // The escaped entries stand for bytes, so a literal `A` and a newline match.
+    assert_eq!(t.encode("A"), vec![t.vocab["\\x41"]]);
+    assert_eq!(t.encode("\n"), vec![t.vocab["\\n"]]);
+    // Decode is the same unescaping: `\x41` is one byte, not four characters.
+    assert_eq!(t.decode_bytes(&[t.vocab["\\x41"]]), b"A");
+    assert_eq!(t.decode_bytes(&[t.vocab["hello"]]), b"hello");
+}
+
+#[test]
+fn rwkv_emits_one_unknown_per_unmatched_byte() {
+    let t = rwkv_tokenizer();
+    // `z` starts no entry, so it is one unknown token — and the next byte still
+    // matches, so a miss is one unknown per byte, never a dropped byte.
+    assert_eq!(t.encode("z"), vec![t.unk_token]);
+    assert_eq!(t.encode("zA"), vec![t.unk_token, t.vocab["\\x41"]]);
+}
+
 // === #132 S4: the gemma4 engine ============================================
 
 /// A gemma4 vocabulary: the declared specials, the `<0xXX>` byte tokens the
@@ -559,9 +612,13 @@ fn the_tokenizer_model_is_a_dispatch() {
         TokenizerModel::from_gguf(Some("gemma4")).unwrap(),
         TokenizerModel::Gemma4
     );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("rwkv")).unwrap(),
+        TokenizerModel::Rwkv
+    );
     // Every other engine is refused *by name* — an approximation with the wrong
     // engine would be worse than a refusal.
-    for other in ["rwkv", "plamo2", "whitespace", "hybriddna", "none"] {
+    for other in ["plamo2", "whitespace", "hybriddna", "none"] {
         let err = TokenizerModel::from_gguf(Some(other)).unwrap_err();
         assert!(
             err.contains(other),
@@ -1012,6 +1069,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         "~/.cache/minfer/models/hf/unsloth/gemma-4-E2B-it-GGUF/MTP/mtp-gemma-4-E2B-it-Q8_0.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_gemma-4-e2b.json"),
     ),
+    (
+        "rwkv-6-world-1.6b",
+        "~/.cache/minfer/models/hf/latestissue/rwkv-6-world-1b6-gguf/rwkv-6-world-1.6b-Q4_0.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_rwkv-6-world-1.6b.json"),
+    ),
 ];
 
 fn expand_home(path: &str) -> std::path::PathBuf {
@@ -1214,6 +1276,7 @@ impl TokenizerModel {
             Self::Bert => "bert",
             Self::Ugm => "t5",
             Self::Gemma4 => "gemma4",
+            Self::Rwkv => "rwkv",
         }
     }
 }

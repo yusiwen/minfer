@@ -7361,7 +7361,7 @@ Can run in parallel with A–E by a different workstream.
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
 | F5 | 14 | Async cross-backend copy + events · [#58](https://github.com/yusiwen/minfer/issues/58) — **DONE 2026-09-24** · CUDA's boundary copy is an `cudaMemcpyAsync` D2H into a pinned slab plus an event, waited on once at a documented synchronization point; the CPU is a registered synchronous no-op and Metal declines (unported) · follow-ups [#137](https://github.com/yusiwen/minfer/issues/137) (Metal), [#138](https://github.com/yusiwen/minfer/issues/138) (deferred wait — **DONE 2026-10-04**, see the F5 S2 record) | M | dgxspark (CUDA) |
 | F6 | 22 | Quantizer tooling (`convert-hf-to-gguf`, `quantize`, `split`) · [#49](https://github.com/yusiwen/minfer/issues/49) — **DONE 2026-09-24** · a GGUF v3 *writer* (`gguf_write.rs`), byte-exact weight encoders (`quantize.rs`), an HF converter that passes the strict loader (`convert.rs`), the three subcommands (`tooling.rs`), and a real download size check — follow-ups [#140](https://github.com/yusiwen/minfer/issues/140) (K-quant encoders), [#141](https://github.com/yusiwen/minfer/issues/141) (f16 on the device), [#142](https://github.com/yusiwen/minfer/issues/142) (bf16) | L | dgxspark |
-| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`), WordPiece (`model = bert`), unigram (`model = t5`) and `gemma4` DONE 2026-10-15, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
+| F7 | 19/20 | Chat-template fidelity + tokenizer generality · [#50](https://github.com/yusiwen/minfer/issues/50) — **DONE 2026-09-24** · follow-ups [#132](https://github.com/yusiwen/minfer/issues/132) (NFC — **S1 DONE 2026-10-15**, per family since [#564](https://github.com/yusiwen/minfer/issues/564) / ADR-0044; data-driven special tokens — **S2 DONE 2026-10-15**; pre-tokenizer rules — **S3 started**, `llama-bpe` and `lfm2` DONE 2026-10-15; **S4 started**, SentencePiece (`model = llama`), WordPiece (`model = bert`), unigram (`model = t5`), `gemma4` and `rwkv` DONE 2026-10-15/16, the other engines remain) and [#133](https://github.com/yusiwen/minfer/issues/133) (`--chat-template`, `strftime_now`) | M | dgxspark |
 | F8 | 25 | **Metrics/observability** (`/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain). Item 25 was the only member of the A-era batch (items 23/24/26/27/28 -> A1/A2/A7/A5/A6) with no ticket; it is independent of the critical path, hence this table · [#51](https://github.com/yusiwen/minfer/issues/51) — **DONE 2026-09-24**, both real-model gates **device-verified on GB10 sm_121 2026-09-24**; the serial `#[ignore]`d set it left red (**#123**) is green as of 2026-09-24 (**22 passed / 0 failed**) | M | dgxspark |
 
 F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
@@ -8120,6 +8120,53 @@ deliberately not implemented (ADR-0043) — a text containing `</s>` or `<|tool_
 tokenizes as text on minfer and as a control on llama.cpp; the warning llama.cpp itself prints
 for this artifact is recorded in ADR-0048. (c) The fixture's artifact is the assistant module,
 for the reason above. (d) The UD-quant layout is still unparsed ([#575](https://github.com/yusiwen/minfer/issues/575)). (e) Nothing here is device-adjacent.
+
+### F7 follow-up — S4: the rwkv engine, and a second loader witness ([#132](https://github.com/yusiwen/minfer/issues/132), [#575](https://github.com/yusiwen/minfer/issues/575)) — **DONE 2026-10-16**
+
+**What landed.** `TokenizerModel::Rwkv` (`tokenizer.ggml.model = rwkv`) and a greedy longest
+match over a trie built from the vocabulary's **decoded bytes**: the entries are escaped
+(`\xNN`, `\t`, `\n`, `\r`), so `unescape_rwkv_token` runs first and `VocabTrie` gains
+byte-level entry points (`insert_bytes`, `longest_prefix_bytes`, `starts_with_byte`) — the first
+vocabulary in this engine whose entries are not valid UTF-8. A byte no entry starts with emits
+the unknown token and advances one byte, and decode is the same unescaping. No merges, no
+scores, no `pre` rule. ADR-0049 amends ADR-0045.
+
+**Gates and mutations.** Seven mutations, none escaped: `rwkv` refused again, `rwkv` run by the
+gemma4 engine, the escapes not decoded, the `\x` escape consuming no hex digits, the match
+advancing one byte instead of its length, an unmatched byte dropped instead of emitting the
+unknown token, and the trie keeping the shortest instead of the longest match.
+
+**The unknown role is conditional, and checked.** No RVKV file declares
+`tokenizer.ggml.unknown_token_id`, and llama.cpp leaves it `LLAMA_TOKEN_NULL` (its session would
+push `-1`). minfer requires the role only when some byte value starts no entry; this vocabulary
+covers all 256, so the fallback is unreachable by construction and the load is otherwise refused
+**naming the byte**, never an invented id.
+
+**Fixture and evidence.** `tests/fixtures/tokenizer/ids_rwkv-6-world-1.6b.json` (54 shared-corpus
+entries) gated against `latestissue/rwkv-6-world-1b6-gguf`'s Q4_0 file (992 738 880 B). The
+reference is the **model author's own tokenizer** (`RWKV/rwkv-6-world-1b6`'s
+`hf_rwkv_tokenizer.py` + `rwkv_vocab_v20230424.txt`) — the definition of both the escaping and
+the walk — and llama.cpp agrees with it on all 54 entries (`Hello, world!` →
+`[33155, 45, 40213, 34]`); minfer agrees with both. The ignored gate now covers **twelve** cached
+models across **six** engines.
+
+**The second loader witness.** The same repository's **Q2_K** file trips minfer's tensor-offset
+accounting (`tensor 'blk.0.attn_norm.weight' has offset 44040192, expected 36700160`) while
+llama.cpp loads it — the second witness for [#575](https://github.com/yusiwen/minfer/issues/575),
+which now carries both deltas (both multiples of the 32-byte alignment), the note that the type
+table is *not* the gap, and the Q4_0 discriminator that this slice answered: Q4_0 parses, so the
+accounting is wrong for some quant families rather than for the layout itself.
+
+**Suite.** 550/0/41 -> **552 passed / 0 failed / 41 ignored** unit + 10 / 0 / 6 integration
+(+2 rwkv tests).
+
+**Honest scope.** (a) Six engines of ten; `plamo2`, `whitespace`, `hybriddna` and `none` remain —
+`hybriddna` has no GGUF to gate against and `whitespace` is emitted by no converter at the pinned
+revision. (b) Every vocabulary entry is in the trie, `<unk>` included, so a text containing
+`<unk>` matches that token — llama.cpp's behaviour too. (c) `plamo2` is a backward DP over a
+suffix-automaton table and needs a 2.7 GB artifact; it is the largest remaining slice.
+(d) [#575](https://github.com/yusiwen/minfer/issues/575) is still open. (e) Nothing here is
+device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 
