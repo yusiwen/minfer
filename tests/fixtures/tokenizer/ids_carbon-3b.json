@@ -1,0 +1,834 @@
+{
+  "model": "HuggingFaceBio/Carbon-3B-GGUF",
+  "tokenizer_model": "hybriddna",
+  "pre": "qwen2",
+  "gguf": "~/.cache/minfer/models/hf/HuggingFaceBio/Carbon-3B-GGUF/carbon-3b-q4_k_m.gguf",
+  "provenance": {
+    "reference": "llama.cpp's own hybriddna engine on this artifact (llm_tokenizer_hybriddna_session, llama-vocab.cpp:1640) — Carbon-3B's tokenizer has no independent Python implementation in its repository, so llama.cpp is the definition here, as it is for plamo2 (ADR-0050)",
+    "tokenizer_source": "the GGUF's tokenizer.ggml.{tokens,merges,pre} (155 776 tokens, 151 387 merges, pre = qwen2, 4096 tokens carrying the reserved U+E000 k-mer suffix)",
+    "gguf_source": "https://huggingface.co/HuggingFaceBio/Carbon-3B-GGUF @ main (Q4_K_M, 2 285 MB)",
+    "command": "python3 /tmp/s4-hybriddna-fixtures.py",
+    "date": "2026-10-16",
+    "nfc_note": "llama.cpp's pinned revision has no input normalizer (no NFC code in src/), while minfer follows the `pre` rule's declared NFC; the plain-text corpus is therefore gated in its NFC-stable spelling here. The decomposed `café` entry is the one input where the two differ, and it stays gated for the qwen family where the definition is HuggingFace's tokenizer (ADR-0044).",
+    "extra_note": "the last 8 entries are DNA-specific: the shared corpus would never exercise the <dna> rule, so a tag block, a lower-case block, a tail shorter than 6, a non-ACGT base, a block with no closing tag, text outside the tags and an all-N block are gated too"
+  },
+  "entries": [
+    {
+      "text": "Hello, world!",
+      "ids": [
+        9707,
+        11,
+        1879,
+        0
+      ]
+    },
+    {
+      "text": "it's don't we're I'm he'll she'd they've",
+      "ids": [
+        275,
+        594,
+        1513,
+        944,
+        582,
+        2299,
+        358,
+        2776,
+        566,
+        3278,
+        1340,
+        4172,
+        807,
+        3003
+      ]
+    },
+    {
+      "text": "It'S DON'T WE'RE I'M HE'LL SHE'D THEY'VE",
+      "ids": [
+        2132,
+        13272,
+        44273,
+        17323,
+        19677,
+        94153,
+        358,
+        27603,
+        11685,
+        6,
+        4086,
+        53595,
+        27705,
+        62493,
+        6,
+        4491
+      ]
+    },
+    {
+      "text": "中文测试，标点符号。",
+      "ids": [
+        104811,
+        81705,
+        3837,
+        30844,
+        27442,
+        108872,
+        1773
+      ]
+    },
+    {
+      "text": "日本語のテキストです",
+      "ids": [
+        101059,
+        102819,
+        15767,
+        56833,
+        61803,
+        70534,
+        37541
+      ]
+    },
+    {
+      "text": "한국어 텍스트",
+      "ids": [
+        23573,
+        124785,
+        31079,
+        10764,
+        44104,
+        53189
+      ]
+    },
+    {
+      "text": "café naïve façade résumé",
+      "ids": [
+        924,
+        58858,
+        94880,
+        586,
+        94872,
+        1021,
+        9333,
+        1242,
+        963
+      ]
+    },
+    {
+      "text": "emoji: 👨‍👩‍👧 🚀 🇨🇳",
+      "ids": [
+        37523,
+        25,
+        61804,
+        101,
+        378,
+        235,
+        145233,
+        378,
+        235,
+        145665,
+        11162,
+        248,
+        222,
+        11162,
+        229,
+        101,
+        145754
+      ]
+    },
+    {
+      "text": "Ω≈ç√∫˜µ≤≥÷",
+      "ids": [
+        144572,
+        144540,
+        3131,
+        144336,
+        145706,
+        144775,
+        73048,
+        144570,
+        144481,
+        144422
+      ]
+    },
+    {
+      "text": "Δοκιμή Ελληνικά",
+      "ids": [
+        144665,
+        27554,
+        67337,
+        29762,
+        43123,
+        72930,
+        7851,
+        243,
+        33486,
+        33486,
+        41424,
+        33269,
+        29762,
+        67337,
+        74134
+      ]
+    },
+    {
+      "text": "Привет, мир!",
+      "ids": [
+        53645,
+        26991,
+        8178,
+        11,
+        137144,
+        0
+      ]
+    },
+    {
+      "text": "مرحبا بالعالم",
+      "ids": [
+        124122,
+        29825,
+        124671,
+        124476,
+        129634
+      ]
+    },
+    {
+      "text": "אבגדה",
+      "ids": [
+        126572,
+        124443,
+        45971
+      ]
+    },
+    {
+      "text": "ᐊᓂ ᓄᓇᕗᑦ",
+      "ids": [
+        148298,
+        128232,
+        224,
+        86089,
+        241,
+        226,
+        128232,
+        229,
+        148999,
+        124589,
+        99
+      ]
+    },
+    {
+      "text": "क्षि नमस्ते",
+      "ids": [
+        64704,
+        30484,
+        115,
+        38851,
+        14925,
+        101,
+        87244,
+        78368,
+        30484,
+        97,
+        34370
+      ]
+    },
+    {
+      "text": "สวัสดี",
+      "ids": [
+        143126,
+        23271,
+        125136,
+        28319
+      ]
+    },
+    {
+      "text": "  leading spaces",
+      "ids": [
+        220,
+        6388,
+        12621
+      ]
+    },
+    {
+      "text": "trailing spaces  ",
+      "ids": [
+        376,
+        14277,
+        12621,
+        256
+      ]
+    },
+    {
+      "text": "   ",
+      "ids": [
+        262
+      ]
+    },
+    {
+      "text": "\t\t",
+      "ids": [
+        298
+      ]
+    },
+    {
+      "text": "\n\n\n",
+      "ids": [
+        1406
+      ]
+    },
+    {
+      "text": "a  b",
+      "ids": [
+        64,
+        220,
+        293
+      ]
+    },
+    {
+      "text": "a   b    c",
+      "ids": [
+        64,
+        256,
+        293,
+        262,
+        272
+      ]
+    },
+    {
+      "text": "a\tb\tc",
+      "ids": [
+        64,
+        2233,
+        1444
+      ]
+    },
+    {
+      "text": "a\nb\r\nc",
+      "ids": [
+        64,
+        198,
+        65,
+        319,
+        66
+      ]
+    },
+    {
+      "text": "a\n\n\nb",
+      "ids": [
+        64,
+        1406,
+        65
+      ]
+    },
+    {
+      "text": "line one\nline two\n\nline three",
+      "ids": [
+        1056,
+        825,
+        198,
+        1056,
+        1378,
+        271,
+        1056,
+        2326
+      ]
+    },
+    {
+      "text": " \t mixed \n whitespace \r\n everywhere \t ",
+      "ids": [
+        7018,
+        9519,
+        715,
+        36372,
+        2529,
+        16852,
+        65497
+      ]
+    },
+    {
+      "text": "end with newline\n",
+      "ids": [
+        408,
+        448,
+        39027,
+        198
+      ]
+    },
+    {
+      "text": "end with two newlines\n\n",
+      "ids": [
+        408,
+        448,
+        1378,
+        501,
+        7969,
+        271
+      ]
+    },
+    {
+      "text": "\nstart with newline",
+      "ids": [
+        198,
+        2468,
+        448,
+        39027
+      ]
+    },
+    {
+      "text": " \n \t \n ",
+      "ids": [
+        715,
+        7018,
+        715,
+        220
+      ]
+    },
+    {
+      "text": "1234567890",
+      "ids": [
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        15
+      ]
+    },
+    {
+      "text": "3.14159",
+      "ids": [
+        18,
+        13,
+        16,
+        19,
+        16,
+        20,
+        24
+      ]
+    },
+    {
+      "text": "0xDEADBEEF",
+      "ids": [
+        15,
+        78979,
+        94373,
+        7099,
+        37
+      ]
+    },
+    {
+      "text": "a1b2c3d4",
+      "ids": [
+        64,
+        16,
+        65,
+        17,
+        66,
+        18,
+        67,
+        19
+      ]
+    },
+    {
+      "text": "1,000,000.50",
+      "ids": [
+        16,
+        11,
+        15,
+        15,
+        15,
+        11,
+        15,
+        15,
+        15,
+        13,
+        20,
+        15
+      ]
+    },
+    {
+      "text": "2024-01-02T03:04:05Z",
+      "ids": [
+        17,
+        15,
+        17,
+        19,
+        12,
+        15,
+        16,
+        12,
+        15,
+        17,
+        51,
+        15,
+        18,
+        25,
+        15,
+        19,
+        25,
+        15,
+        20,
+        57
+      ]
+    },
+    {
+      "text": "!!!???...,,,;;;:::",
+      "ids": [
+        12069,
+        33015,
+        1112,
+        60723,
+        36328,
+        486,
+        25
+      ]
+    },
+    {
+      "text": "C++17 and x86_64",
+      "ids": [
+        34,
+        1027,
+        16,
+        22,
+        323,
+        856,
+        23,
+        21,
+        62,
+        21,
+        19
+      ]
+    },
+    {
+      "text": "https://example.com/path?q=1&r=2#frag",
+      "ids": [
+        2428,
+        1110,
+        8687,
+        905,
+        50976,
+        43782,
+        28,
+        16,
+        60617,
+        28,
+        17,
+        2,
+        33198
+      ]
+    },
+    {
+      "text": "user@example.com",
+      "ids": [
+        872,
+        35487,
+        905
+      ]
+    },
+    {
+      "text": "a-b_c.d/e\\f",
+      "ids": [
+        64,
+        1455,
+        666,
+        950,
+        16546,
+        64526
+      ]
+    },
+    {
+      "text": "((nested [brackets] {braces}))",
+      "ids": [
+        1188,
+        59271,
+        508,
+        1323,
+        18382,
+        60,
+        314,
+        1323,
+        2434,
+        65305
+      ]
+    },
+    {
+      "text": "→ ⇒ ⇔ ± × ÷ ≠ ≤ ≥",
+      "ids": [
+        51018,
+        58703,
+        46018,
+        242,
+        20287,
+        24768,
+        1683,
+        115,
+        94304,
+        37294,
+        62147
+      ]
+    },
+    {
+      "text": "50% + 25% = 75%",
+      "ids": [
+        20,
+        15,
+        4,
+        488,
+        220,
+        17,
+        20,
+        4,
+        284,
+        220,
+        22,
+        20,
+        4
+      ]
+    },
+    {
+      "text": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>",
+      "ids": [
+        27,
+        91,
+        7265,
+        3575,
+        4326,
+        91,
+        1784,
+        91,
+        2468,
+        8757,
+        842,
+        91,
+        29,
+        872,
+        27,
+        91,
+        408,
+        8757,
+        842,
+        91,
+        1339,
+        9707,
+        27,
+        91,
+        68,
+        354,
+        842,
+        91,
+        29
+      ]
+    },
+    {
+      "text": "a<|eot_id|>b",
+      "ids": [
+        64,
+        27,
+        91,
+        68,
+        354,
+        842,
+        91,
+        29,
+        65
+      ]
+    },
+    {
+      "text": "<|end_of_text|>",
+      "ids": [
+        27,
+        91,
+        408,
+        3575,
+        4326,
+        91,
+        29
+      ]
+    },
+    {
+      "text": "<|start_header_id|>",
+      "ids": [
+        27,
+        91,
+        2468,
+        8757,
+        842,
+        91,
+        29
+      ]
+    },
+    {
+      "text": "text with <|eot_id|> in the middle",
+      "ids": [
+        1318,
+        448,
+        82639,
+        68,
+        354,
+        842,
+        91,
+        29,
+        304,
+        279,
+        6149
+      ]
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.  Pack my box with five dozen liquor jugs!\nSphinx of black quartz, judge my vow — 1234567890.\n混合文本 with English, numbers 42, and punctuation... done.\n",
+      "ids": [
+        785,
+        3974,
+        13876,
+        38835,
+        34208,
+        916,
+        279,
+        15678,
+        5562,
+        13,
+        220,
+        13795,
+        847,
+        3745,
+        448,
+        4236,
+        20403,
+        44204,
+        502,
+        13299,
+        4894,
+        50,
+        49561,
+        315,
+        3691,
+        51155,
+        11,
+        11651,
+        847,
+        39343,
+        1959,
+        220,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        15,
+        624,
+        105063,
+        108704,
+        448,
+        6364,
+        11,
+        5109,
+        220,
+        19,
+        17,
+        11,
+        323,
+        61503,
+        1112,
+        2814,
+        624
+      ]
+    },
+    {
+      "text": "café",
+      "ids": [
+        924,
+        58858
+      ]
+    },
+    {
+      "text": "naïve",
+      "ids": [
+        3376,
+        37572,
+        586
+      ]
+    },
+    {
+      "text": "<dna>ACGTACGTACGT</dna>",
+      "ids": [
+        151669,
+        152394,
+        155045,
+        151670
+      ]
+    },
+    {
+      "text": "<dna>acgtacgtacgt</dna>",
+      "ids": [
+        151669,
+        152394,
+        155045,
+        151670
+      ]
+    },
+    {
+      "text": "<dna>ACGTACGTACG</dna>",
+      "ids": [
+        151669,
+        152394,
+        155044,
+        151670
+      ]
+    },
+    {
+      "text": "<dna>ACGTNACGTN</dna>",
+      "ids": [
+        151669,
+        151671,
+        151671,
+        151670
+      ]
+    },
+    {
+      "text": "<dna>ACGTACGTACGT",
+      "ids": [
+        151669,
+        152394,
+        155045
+      ]
+    },
+    {
+      "text": "ATCG<dna>ACGTACGT</dna>TTAG",
+      "ids": [
+        828,
+        8798,
+        151669,
+        152394,
+        155000,
+        151670,
+        14903,
+        1890
+      ]
+    },
+    {
+      "text": "x <dna>ACGTACGTACGT</dna> y",
+      "ids": [
+        87,
+        220,
+        151669,
+        152394,
+        155045,
+        151670,
+        379
+      ]
+    },
+    {
+      "text": "<dna>NNNNNNNNNNNN</dna>",
+      "ids": [
+        151669,
+        151671,
+        151671,
+        151670
+      ]
+    }
+  ]
+}
