@@ -246,3 +246,8 @@ symbol = "ugm_encode"
 adr = "0048"
 what = "gemma4 is a BPE over raw UTF-8 whose rule (newline runs, ▁ spaces, <0xXX> fallback) comes from the model value, not from tokenizer.ggml.pre"
 symbol = "gemma4_encode"
+
+[[governs]]
+adr = "0049"
+what = "rwkv is a greedy longest match over a trie of decoded vocabulary bytes, with a conditional unknown role"
+symbol = "unescape_rwkv_token"

@@ -67,6 +67,7 @@
     - [0046. WordPiece is the third engine, and it follows BERT's normalizer](./adr/0046-wordpiece-is-the-third-engine-and-follows-berts-normalizer.md)
     - [0047. The unigram engine reads the file's charsmap, and SentencePiece is its reference](./adr/0047-the-unigram-engine-reads-the-files-charsmap-and-sentencepiece-is-its-reference.md)
     - [0048. gemma4 is a BPE over raw UTF-8, and its rule comes from the model value](./adr/0048-gemma4-is-a-bpe-over-raw-utf8-and-its-rule-comes-from-the-model-value.md)
+    - [0049. rwkv is a trie over decoded bytes, and its unknown role is conditional](./adr/0049-rwkv-is-a-trie-over-decoded-bytes-and-its-unknown-role-is-conditional.md)
 
 # Model Support
 
