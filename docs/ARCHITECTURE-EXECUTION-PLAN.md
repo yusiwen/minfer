@@ -8161,7 +8161,7 @@ accounting is wrong for some quant families rather than for the layout itself.
 (+2 rwkv tests).
 
 **Honest scope.** (a) Six engines of ten; `plamo2`, `whitespace`, `hybriddna` and `none` remain —
-`hybriddna` has no GGUF to gate against and `whitespace` is emitted by no converter at the pinned
+`whitespace` has no artifact carrying the value that I could find (the public Jina GGUFs use `gpt2` + `pre = jina-v1-en`), `hybriddna` **does** have one (`HuggingFaceBio/Carbon-3B-GGUF`, which ADR-0051 gates) and `none` is a vocabulary-less model type rather than a tokenizer.
 revision. (b) Every vocabulary entry is in the trie, `<unk>` included, so a text containing
 `<unk>` matches that token — llama.cpp's behaviour too. (c) `plamo2` is a backward DP over a
 suffix-automaton table and needs a 2.7 GB artifact; it is the largest remaining slice.
@@ -8202,10 +8202,50 @@ which #575's accounting fix made possible, and the fixture says so. The ignored 
 `× 1e4` quantization dropped, the tie comparison relaxed to `<=`, the fallback emitting `<unk>`, and
 the BOM strip removed.
 
-**Honest scope.** (a) Seven engines of ten; `whitespace` (no converter emits it), `hybriddna` (no GGUF
+**Honest scope.** (a) Eight engines of ten by the end of S4; `whitespace` (no artifact found) and `none` (a vocabulary-less type) remain.
 to gate against) and `none` (a vocabulary-less type) remain. (b) The DP/automaton equality is
 observational on three measured input sets. (c) The artifact is 2.7 GB and un-runnable here — a
 tokenizer reference only. (d) Nothing here is device-adjacent.
+
+### F7 follow-up — S4: the hybriddna engine, and two artifact claims corrected ([#132](https://github.com/yusiwen/minfer/issues/132)) — **DONE 2026-10-16**
+
+**What landed.** `TokenizerModel::HybridDna` (`tokenizer.ggml.model = hybriddna`) shares the `gpt2` load
+path — the `pre` rule, the merge table, the byte-level completeness check — and adds the DNA session:
+inside `<dna>`…`</dna>` the ASCII letters are upper-cased, the content is cut into 6-**byte** k-mers,
+each is looked up in a table built from the tokens carrying the reserved U+E000 suffix (`<oov>` when a
+k-mer is missing, a tail shorter than six bytes padded with `A`), and a block with no closing tag emits
+the opening tag and its k-mers and stops. Outside the tags it is the plain BPE engine; the marker is
+erased from `id_to_token` at load (kept in `vocab`), so detokenization yields the bare sequence. If any
+of the three tags is missing the engine degrades to plain BPE, as llama.cpp does. ADR-0051 amends
+ADR-0045.
+
+**Two claims of mine were wrong and are corrected here** (recorded on the issue first): `hybriddna`
+**does** have a gateable artifact — `HuggingFaceBio/Carbon-3B-GGUF` (211 531 downloads), probed metadata
+`model = hybriddna`, `general.architecture = llama`, 155 776 tokens, 151 387 merges, `pre = qwen2`, the
+three tags and exactly 4096 marked k-mers — and `whitespace` is not "emitted by no converter" but "has no
+artifact carrying the value that I could find" (its public Jina GGUFs use `gpt2` + `pre = jina-v1-en`,
+a rule minfer does not accept either). The design record's §3.4 and this file's earlier records carry the
+corrected wording.
+
+**Fixture and evidence.** `tests/fixtures/tokenizer/ids_carbon-3b.json`: the 54 shared corpus entries
+**plus 8 DNA entries** (a tag block, a lower-case block, a short tail, a non-ACGT base, no closing tag,
+text outside the tags, an all-`N` block, a block between words) — the shared corpus alone would never
+exercise the rule. Reference: llama.cpp on the artifact (`llm_tokenizer_hybriddna_session`,
+`llama-vocab.cpp:1640`). **One recorded divergence:** llama.cpp's pinned revision has **no input
+normalizer at all** (no NFC code in `src/`), while minfer follows the `pre` rule's declared NFC, so the
+plain-text corpus is gated in its NFC-stable spelling here and the fixture's provenance says why; the
+decomposed entry stays gated for the qwen family, where the definition is HuggingFace's tokenizer
+(ADR-0044). The ignored gate now covers **fourteen** cached models across **eight** engines.
+
+**Suite.** 556/0/41 -> **558 passed / 0 failed / 41 ignored** unit + 12 / 0 / 6 integration (+2 hybriddna
+tests). Six mutations, none escaped: `hybriddna` refused again, run by the plain `gpt2` engine, the k-mer
+table keyed by the marked spelling, the tail not padded, the closing tag emitted when it is missing, and
+the ASCII upper-casing dropped.
+
+**Honest scope.** (a) Eight engines of ten; `whitespace` (no artifact found) and `none` (a vocabulary-less
+type) remain. (b) Byte-wise chunking splits a multi-byte character inside a block, exactly as llama.cpp
+does — those pieces are `<oov>`, which is the recorded behaviour. (c) The NFC caveat above. (d) Nothing
+here is device-adjacent.
 
 ### F8 — Metrics and observability (#51) — design (2026-09-24)
 

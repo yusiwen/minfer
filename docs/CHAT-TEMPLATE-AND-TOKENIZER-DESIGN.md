@@ -141,7 +141,7 @@ payload.
 
 ## 3. Tokenizer — accepted, refused, detected
 
-### 3.0 The engine comes first: `tokenizer.ggml.model` (#132 S4, 2026-10-15/16; ADR-0045–ADR-0050)
+### 3.0 The engine comes first: `tokenizer.ggml.model` (#132 S4, 2026-10-15/16; ADR-0045–ADR-0051)
 
 `tokenizer.ggml.pre` answers "which rule" only for the engine the file already selected.
 `TokenizerModel::from_gguf` reads `tokenizer.ggml.model` and answers exactly two engines:
@@ -155,6 +155,7 @@ payload.
 | `gemma4` | BPE over **raw UTF-8** | the merge ranks, with spaces escaped to `▁` first, a newline-run rule (**from the model value**, the key is absent), the all-newline-piece shortcut and `<0xXX>` byte fallback | derived from the model | **yes** |
 | `rwkv` | greedy trie match | the vocabulary's **decoded bytes** (`\xNN` escapes), longest match first; one `<unk>` per unmatched byte | no | **yes** |
 | `plamo2` | backward DP | the file's **`scores`**: maximize the summed score, one codepoint of fallback emitting `<0xXX>` byte tokens | — | **yes** |
+| `hybriddna` | BPE + a DNA rule | the `gpt2` engine, except that `<dna>`…`</dna>` is upper-cased and cut into 6-byte k-mers of tokens carrying a reserved U+E000 suffix (`<oov>`, tail padded with `A`) | the file's `pre` | **yes** |
 | anything else | — | — | — | refused, **naming the value** |
 
 SentencePiece (from llama.cpp's session, `llama-vocab.cpp:114`) is: symbols are UTF-8
@@ -194,6 +195,15 @@ lookup runs on raw UTF-8), the normalizer replaces spaces with `▁` before the 
 the rule — newline runs — is **derived from the model value** because the file carries no
 `tokenizer.ggml.pre` (ADR-0048). A piece that is nothing but newlines and is itself a
 vocabulary entry is emitted whole, and the fallback is one `<0xXX>` byte token per byte.
+
+**hybriddna** is not a new algorithm: llama.cpp maps it to the BPE type alongside `gpt2` and only swaps
+the session. Inside `<dna>`…`</dna>` the ASCII letters are upper-cased and the content is cut into
+6-**byte** k-mers, each looked up as a token whose spelling carries a reserved U+E000 suffix (the suffix
+keeps the k-mer `CCCCCC` distinct from the base vocabulary's `CCCCCC`); a k-mer that is not in the
+vocabulary — a non-ACGT base, a split multi-byte character — becomes `<oov>`, a tail shorter than six
+bytes is padded with `A`, and a block with no closing tag emits the opening tag and its k-mers and stops.
+Everything outside the tags is the `gpt2` engine, `pre` rule included, and the marker is erased from the
+decoded side at load so detokenization yields the bare DNA sequence (ADR-0051).
 
 **plamo2** is the first engine whose *objective* comes from the file: the vocabulary carries
 `tokenizer.ggml.scores` and no merges, and encoding is a backward DP over codepoints that maximizes
@@ -308,15 +318,20 @@ invariant violation that aborts with the byte value.
 
 * **NFC normalization** — *now applied* (F7's accepted gap, closed by
   [#132](https://github.com/yusiwen/minfer/issues/132) S1 on 2026-10-14); see §3.6.
-* **`whitespace` / `hybriddna` / `none`** engines — refused by name at load
+* **`whitespace` / `none`** engines — refused by name at load
   (§3.0). SentencePiece (`llama`, ADR-0045), WordPiece (`bert`, ADR-0046),
-  unigram (`t5`, ADR-0047), gemma4 (ADR-0048), rwkv (ADR-0049) and plamo2
-  (ADR-0050) are implemented;
+  unigram (`t5`, ADR-0047), gemma4 (ADR-0048), rwkv (ADR-0049), plamo2
+  (ADR-0050) and hybriddna (ADR-0051) are implemented;
   each remaining value is a different algorithm with its own vocabulary shape and
   its own reference, so it lands with an ADR and a fixture, not as another match
-  arm. `hybriddna` has no GGUF to gate against (its repository ships safetensors
-  only) and `whitespace` is emitted by no converter at the pinned revision —
-  recorded so the gap is explicit rather than assumed.
+  arm. For the two that remain, what is missing is an **artifact**, not a converter:
+  `whitespace` (added for Jina's models, llama.cpp #18756) has no GGUF carrying the
+  value that I could find — the public Jina GGUFs use `gpt2` with `pre = jina-v1-en`,
+  a rule minfer does not accept either — and `none`/`no_vocab` is a **vocabulary-less**
+  model type (llama.cpp creates `tokenizer.ggml.vocab_size` dummy tokens and its
+  `tokenize` aborts), so it is a product decision rather than a tokenizer to port.
+  `hybriddna` was in this list on the wrong grounds — it does have an artifact
+  (`HuggingFaceBio/Carbon-3B-GGUF`) and landed in ADR-0051.
 * **llama.cpp's name-based special-token override** (its `</s>`, `<|tool_response>`
   and friends are forced to CONTROL whatever the file says): deliberately not
   implemented (ADR-0043). A text containing one of those names therefore
@@ -406,14 +421,15 @@ return.
 | The fixture template is the model's own | `#[ignore]`d real-model test: GGUF `tokenizer.chat_template` == fixture template and rendering matches | the cached GGUF |
 | Loud refusal | unit test: an unsupported method/syntax fails and the error **names** the construct; a mutation of the callback (dropping a method) must make a previously-passing case fail | — |
 | Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (4 values, 52-54 entries each) | the `tokenizer.json` regex evaluated by CPython `regex` |
-| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (13 cached models, seven engines) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5, `llama-bpe`, `lfm2`, and the SentencePiece model — for SPM the HF file is a *BPE* rendering of the vocabulary, so llama.cpp is the only reference for this engine, ADR-0045); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
-| Engine dispatch | `src/tokenizer.rs` unit test `the_tokenizer_model_is_a_dispatch` (seven accepted values, three refusals each naming its value) and the ignored gate's `tokenizer_model` field | `tokenizer.ggml.model` in the artifact |
+| Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (14 cached models, eight engines; the carbon-3b fixture carries 54 shared entries **plus 8 DNA entries**, because the shared corpus would never exercise the `<dna>` rule) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5, `llama-bpe`, `lfm2`, and the SentencePiece model — for SPM the HF file is a *BPE* rendering of the vocabulary, so llama.cpp is the only reference for this engine, ADR-0045); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
+| Engine dispatch | `src/tokenizer.rs` unit test `the_tokenizer_model_is_a_dispatch` (eight accepted values, two refusals each naming its value) and the ignored gate's `tokenizer_model` field | `tokenizer.ggml.model` in the artifact |
 | SentencePiece session | `src/tokenizer.rs` unit tests `spm_merges_by_score_and_falls_back_to_byte_tokens` and `spm_prefixes_the_first_segment_with_a_space` (synthetic vocabulary: the scored chain, the `▁` prefix on/off, a byte fallback, the post-special re-prefix) | llama.cpp `llm_tokenizer_spm_session` (`llama-vocab.cpp:114`) |
 | WordPiece session | `src/tokenizer.rs` unit tests `wpm_segments_by_longest_match_and_unknowns_whole_words`, `wpm_normalizer_options_follow_the_file`, `wpm_decode_unescapes_the_phantom_space_and_keeps_specials` (synthetic vocabulary: the phantom space, per-word `<unk>`, punctuation words, lowercase on/off, `strip_accents` on/off) | BERT's BasicTokenizer + WordPiece (`llama-vocab.cpp:777`/`:827`), whose definition is HuggingFace's `tokenizers` (ADR-0046) |
 | NFD decomposition | `src/tokenizer/nfc/tests.rs` unit test `nfd_matches_cpython_on_the_committed_corpus` over the same 5 103 vectors, now carrying an `nfd` expectation | CPython `unicodedata.normalize('NFD', input)` |
 | Unigram session | `src/tokenizer.rs` unit tests `ugm_picks_the_highest_scoring_segmentation`, `ugm_applies_the_charsmap_prefix_replacement` (a hand-built one-mapping XCDA table) and `ugm_whitespace_normalization_follows_the_file` | the model's own SentencePiece model (`sentencepiece` package), and llama.cpp's `llm_tokenizer_ugm_session` (`llama-vocab.cpp:963`) |
 | gemma4 session | `src/tokenizer.rs` unit tests `gemma4_splits_on_newlines_and_does_not_byte_encode` and `gemma4_falls_back_to_byte_tokens` (a synthetic vocabulary whose `▁a` entry is reachable only without the byte-to-unicode step, and a `\n\n` entry that exists only whole) | the model's own `tokenizer.json` (BPE + `byte_fallback` + the `▁` `Replace`) and llama.cpp's gemma4 path (`llama-vocab.cpp:529`/`:630`) |
 | rwkv session | `src/tokenizer.rs` unit tests `rwkv_takes_the_longest_match_and_unescapes_the_vocabulary` and `rwkv_emits_one_unknown_per_unmatched_byte` (a synthetic vocabulary whose `\x41` entry must decode to the byte `A` before it can match) | the model author's own tokenizer (`hf_rwkv_tokenizer.py` + `rwkv_vocab_v20230424.txt`) and llama.cpp's RVKV path (`llama-vocab.cpp:1247`/`:1285`) |
+| hybriddna session | `src/tokenizer.rs` unit tests `hybriddna_cuts_a_block_into_marked_kmers_and_pads_the_tail` and `hybriddna_wraps_the_block_in_its_tags_and_stops_at_eof` | llama.cpp's own hybriddna engine on the artifact (`llama-vocab.cpp:1640`) — Carbon-3B's `tokenizer.py` documents the same rule but is not runnable here |
 | plamo2 session | `src/tokenizer.rs` unit tests `plamo2_maximizes_the_declared_scores_not_the_match_length` (a case where splitting beats the longer piece, and the strict-`<` tie) and `plamo2_falls_back_to_byte_tokens_and_strips_a_leading_bom` | llama.cpp's own plamo2 engine on the artifact (`llama-vocab.cpp:1360-1592`) — the engine *is* the reference — with ADR-0050's probe as the cross-check |
 | NFC normalization | `src/tokenizer/nfc.rs` unit tests over `tests/fixtures/tokenizer/nfc_vectors.json` (5 103 inputs: every decomposition, every composition pair, all 784 ordered mark pairs both after a starter and alone, Hangul, compatibility forms, a seeded random corpus), plus the per-rule table (`the_normalizer_follows_the_pre_tokenizer_rule`), the two synthetic-tokenizer arms, and the real-model gate (a normalizing family: `café == cafe\u{0301}`; `llama-bpe`: the decomposed corpus entries) | CPython `unicodedata.normalize('NFC', …)` for the tables; each family's `tokenizer.json` normalizer field for the declaration |
 | Grammar (F2) + pinned sampler (F3) | existing suites | unchanged |
@@ -434,3 +450,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0048](adr/0048-gemma4-is-a-bpe-over-raw-utf8-and-its-rule-comes-from-the-model-value.md) — gemma4 is a BPE over raw UTF-8, and its rule comes from the model value
 - [ADR-0049](adr/0049-rwkv-is-a-trie-over-decoded-bytes-and-its-unknown-role-is-conditional.md) — rwkv is a trie over decoded bytes, and its unknown role is conditional
 - [ADR-0050](adr/0050-plamo2-is-a-backward-dp-over-the-files-own-scores-and-the-automaton-is-an-index.md) — plamo2 is a backward DP over the file's own scores, and llama.cpp's automaton is an index
+- [ADR-0051](adr/0051-hybriddna-is-the-gpt2-engine-plus-a-dna-kmer-block.md) — hybriddna is the gpt2 engine plus a DNA k-mer block

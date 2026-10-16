@@ -69,6 +69,7 @@
     - [0048. gemma4 is a BPE over raw UTF-8, and its rule comes from the model value](./adr/0048-gemma4-is-a-bpe-over-raw-utf8-and-its-rule-comes-from-the-model-value.md)
     - [0049. rwkv is a trie over decoded bytes, and its unknown role is conditional](./adr/0049-rwkv-is-a-trie-over-decoded-bytes-and-its-unknown-role-is-conditional.md)
     - [0050. plamo2 is a backward DP over the file's own scores, and llama.cpp's automaton is an index](./adr/0050-plamo2-is-a-backward-dp-over-the-files-own-scores-and-the-automaton-is-an-index.md)
+    - [0051. hybriddna is the gpt2 engine plus a DNA k-mer block, and its vocabulary is escaped in place](./adr/0051-hybriddna-is-the-gpt2-engine-plus-a-dna-kmer-block.md)
 
 # Model Support
 

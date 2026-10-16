@@ -256,3 +256,8 @@ symbol = "unescape_rwkv_token"
 adr = "0050"
 what = "plamo2 is a backward DP over the file's own scores; llama.cpp's suffix automaton is an index, not the semantics"
 symbol = "plamo2_encode"
+
+[[governs]]
+adr = "0051"
+what = "hybriddna is the gpt2 engine plus a `<dna>` block cut into marked 6-mers, with the marker erased at load"
+symbol = "hybriddna_encode"
