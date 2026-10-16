@@ -184,7 +184,7 @@ problem bounded.
 ### 2.4 Why only the last token's logits (`n_out = 1`)
 
 The prefill forward's fourth argument is `n_out`, and the CLI passes `1`
-(`main.rs:1528`). This is the tail-row optimization whose *topology* doc 05
+(`main.rs:1542`). This is the tail-row optimization whose *topology* doc 05
 §2.8 built; here is the *why*.
 
 A transformer is **causal**: token `t`'s hidden state is computed only from
@@ -227,8 +227,8 @@ let ctx = params.n_ctx.max(input_ids.len());
 ```
 
 and passes that single number to *every* forward of the run — prefill at
-`main.rs:1528`, each decode step at `main.rs:1838`. The comment above it
-(`main.rs:1504-1508`) records the three facts that make this the right shape:
+`main.rs:1542`, each decode step at `main.rs:1852`. The comment above it
+(`main.rs:1518-1522`) records the three facts that make this the right shape:
 
 1. `n_ctx` **sizes the graph's KV regions** — the allocator carves each
    layer's K and V regions as `n_kv_embd × n_ctx` f32 elements, once (doc 07
@@ -315,17 +315,17 @@ G3-reduced path; the comment records its removal as R3-A2), and from there
 the value travels by **move**, Rust's zero-byte ownership transfer:
 
 ```rust
-let logits = model.forward(&input_ids, &positions, 1, ctx);  // owned Vec, main.rs:1528
-let last_logits: Vec<f32> = logits;      // move, main.rs:1530
+let logits = model.forward(&input_ids, &positions, 1, ctx);  // owned Vec, main.rs:1542
+let last_logits: Vec<f32> = logits;      // move, main.rs:1544
 ...
-let mut logits = last_logits;            // move into the decode binding, main.rs:1610
+let mut logits = last_logits;            // move into the decode binding, main.rs:1624
 ...
 let sampled = sampler::sample_with_config(&mut logits, ...); // borrow, mutate in place
 ...
-logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:1838
+logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:1852
 ```
 
-The decode loop's comment (`main.rs:1830-1831`) states the stakes: *forward()
+The decode loop's comment (`main.rs:1844-1845`) states the stakes: *forward()
 returns n_out\*nv logits (n_out=1 for single-token decode, exactly n_vocab),
 so move the Vec in place instead of copying 607 KB/token.* At ~300 decode
 tokens/second, an extra 608 KB copy per token would be ~180 MB/s of pure
@@ -427,12 +427,12 @@ caliber.
 
 #### The call chain — four hops, one delegation each
 
-`main.rs:1528` calls through the architecture-agnostic trait object
+`main.rs:1542` calls through the architecture-agnostic trait object
 (`Box<dyn ModelDef>`), so the static type knows nothing about Qwen. Each hop
 adds exactly one concern:
 
 ```
-main.rs:1528  model.forward(&input_ids, &positions, 1, ctx)
+main.rs:1542  model.forward(&input_ids, &positions, 1, ctx)
   │           trait method (models/mod.rs:222): the architecture-agnostic
   ▼           signature; callers must guarantee positions[i] < n_ctx
 qwen2/mod.rs:54-57   impl ModelDef for Qwen2Model
@@ -745,7 +745,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
 - **`n_ctx` is a run-level constant.** Passing a different `n_ctx` to decode
   than to prefill breaks the run (§2.5, Q3): either silently (regions sized
   on first use) or loudly (the preflight assert). This is why the comment
-  says "computed ONCE" — and why `main.rs:1838` passes the *same* `ctx`
+  says "computed ONCE" — and why `main.rs:1852` passes the *same* `ctx`
   binding, not a recomputation.
 - **The legacy `kv_cache` argument is gone (#252).** It was dead on this path
   from the start — nothing read it in `forward_batch` — and [#252] deleted it
@@ -778,11 +778,11 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   in the thousands of tok/s and decode in the hundreds — the compute-bound vs
   memory-bound split of §2.3, visible in two numbers.
 - **`MINFER_TIMING=1`** — decomposes the decode side one level further
-  (`main.rs:1640-1645`): per token it times the sampler call (`t_samp`,
-  accumulated at `main.rs:1802`) and the `forward` call (`t_fwd`, `main.rs:1721`
-  on the speculative path and `main.rs:1843` on the plain one — "CPU encode + GPU
+  (`main.rs:1654-1659`): per token it times the sampler call (`t_samp`,
+  accumulated at `main.rs:1816`) and the `forward` call (`t_fwd`, `main.rs:1735`
+  on the speculative path and `main.rs:1857` on the plain one — "CPU encode + GPU
   exec + logits download" per the comment), then prints one line
-  (`main.rs:1857-1859`), e.g. `[MINFER_TIMING] over 512 tokens:
+  (`main.rs:1871-1873`), e.g. `[MINFER_TIMING] over 512 tokens:
   sample 0.02 ms/tok (1.2%), forward 3.30 ms/tok (98.8%)`. One
   paragraph is all it needs: it exists to answer "is my decode time
   *inference* or *sampling/streaming*?" — on every model in the support

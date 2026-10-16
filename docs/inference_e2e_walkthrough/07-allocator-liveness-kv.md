@@ -859,14 +859,14 @@ driver's one-time first-submit setup, which scales with total buffer bytes:
 289 ms at n_ctx 40960 vs 106 ms at 4096 — a 3× tax on the *first* token
 (`docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §2). The fix put the choice in the CLI's
 hands (`--n-ctx`, default 4096; doc 01 covered that side) and clamped it:
-`main.rs` computes `ctx` as the larger of `params.n_ctx` and `input_ids` (`main.rs:1507-1509`) — a long prompt
+`main.rs` computes `ctx` as the larger of `params.n_ctx` and `input_ids` (`main.rs:1521-1523`) — a long prompt
 must never overflow the notepad — and the model clamps again with
 `Qwen2Graph::forward` (`src/models/qwen2/graph.rs:438-445`), which applies `n_ctx.min(max_seq_len)`.
 One more consistency requirement hides here: because `ensure_kv` sizes on
 *first use only* (excerpt 5), prefill and decode must pass the **same** `n_ctx`
 so the regions created during prefill are correctly sized for every decode
 step — the comment "Computed ONCE so prefill and decode size the same KV
-regions" `main.rs:1508` pins that.
+regions" `main.rs:1522` pins that.
 
 **Why are inputs f32 buffers at all?** Because the pool is uniform and the
 two numeric paths agree on f32 as the interchange format: GPU backends read

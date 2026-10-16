@@ -320,7 +320,7 @@ picks one. Three sub-steps, all in `sample_temperature`
    (`src/sampler.rs:260-273`). The dart comes from `rng.gen()` — one
    uniform `f32` in [0, 1) per generated token — from a **seeded** random
    number generator: `StdRng::seed_from_u64(params.seed)`, default seed 42
-   (`src/main.rs:1622`). A *seed* is the starting state of a pseudo-random
+   (`src/main.rs:1636`). A *seed* is the starting state of a pseudo-random
    generator: same seed in, same sequence of "random" numbers out — which
    is why the same command produces the same text even while sampling
    (§3.3's fourth design question covers why minfer wants that).
@@ -328,7 +328,7 @@ picks one. Three sub-steps, all in `sample_temperature`
 ### 2.7 Stopping: when does generation end?
 
 The sampler produces a token; the loop decides whether to keep going. Three
-gates, checked in this order each step (`src/main.rs:1805-1828`):
+gates, checked in this order each step (`src/main.rs:1819-1842`):
 
 1. **Stop tokens.** `is_stop_token(id, &special)` — true when the sampled id
    equals the model's **eos** (end of sequence) token or `<|im_end|>` (doc
@@ -394,7 +394,7 @@ the stage order, elided only where a stage is long; the order *is* the design:
 
 ```rust
 // src/sampler.rs:1067 — the pipeline; `sample_with_config` (:1181) is the
-// unconstrained wrapper the CLI calls (`src/main.rs:1675`)
+// unconstrained wrapper the CLI calls (`src/main.rs:1689`)
 pub fn sample_with_config_grammar<R: Rng>(
     logits: &mut [f32], cfg: &SamplerConfig, prev_tokens: &[u32],
     mirostat: &mut MirostatState, grammar: &mut Option<GrammarState>,
@@ -498,12 +498,12 @@ pub fn recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
     tokens[start..].to_vec()
 }
 
-// src/main.rs:1619-1624 — seeded once, window seeded from the PROMPT tail
+// src/main.rs:1633-1638 — seeded once, window seeded from the PROMPT tail
     let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
     const REPEAT_LAST_N: usize = 64;
     let mut prev_tokens = sampler::recent_window(&input_ids, REPEAT_LAST_N);
 
-// src/main.rs:1810-1813 — every sampled token enters the window
+// src/main.rs:1824-1827 — every sampled token enters the window
         generated.push(sampled.token_id);
         prev_tokens.push(sampled.token_id);
         if prev_tokens.len() > REPEAT_LAST_N {
@@ -687,7 +687,7 @@ fresh `Vec` (§3.1).
 The gates run immediately after sampling, before anything is appended:
 
 ```rust
-// src/main.rs:1783-1799 (condensed to the sampler-adjacent lines)
+// src/main.rs:1797-1813 (condensed to the sampler-adjacent lines)
     while generated.len() < params.n_predict {
         let sampled = match sampler::sample_with_config_grammar(
             &mut logits,
@@ -925,7 +925,7 @@ run even when the stochastic stages are skipped.
 - **The sampler destroys its input buffer** (it holds probabilities after
   `sample_temperature`). The caller-side invariant that makes this safe:
   `logits` is reassigned from the next forward before it is ever read
-  again (`src/main.rs:1838`). Reading `logits` between sample and reassign
+  again (`src/main.rs:1852`). Reading `logits` between sample and reassign
   would read probabilities and call them logits.
 
 ## 4. Observe & verify
