@@ -154,7 +154,6 @@ GRANDFATHERED_BARE = {
     "src/device_tier.rs:Mthreads",
     "src/device_tier.rs:Apple",
     "src/graph/ops.rs:Mha",
-    "src/tokenizer.rs:id_to_score",
     "src/tokenizer.rs:id_to_type",
 }
 

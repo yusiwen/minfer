@@ -68,6 +68,7 @@
     - [0047. The unigram engine reads the file's charsmap, and SentencePiece is its reference](./adr/0047-the-unigram-engine-reads-the-files-charsmap-and-sentencepiece-is-its-reference.md)
     - [0048. gemma4 is a BPE over raw UTF-8, and its rule comes from the model value](./adr/0048-gemma4-is-a-bpe-over-raw-utf8-and-its-rule-comes-from-the-model-value.md)
     - [0049. rwkv is a trie over decoded bytes, and its unknown role is conditional](./adr/0049-rwkv-is-a-trie-over-decoded-bytes-and-its-unknown-role-is-conditional.md)
+    - [0050. plamo2 is a backward DP over the file's own scores, and llama.cpp's automaton is an index](./adr/0050-plamo2-is-a-backward-dp-over-the-files-own-scores-and-the-automaton-is-an-index.md)
 
 # Model Support
 

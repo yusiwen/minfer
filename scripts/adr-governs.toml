@@ -251,3 +251,8 @@ symbol = "gemma4_encode"
 adr = "0049"
 what = "rwkv is a greedy longest match over a trie of decoded vocabulary bytes, with a conditional unknown role"
 symbol = "unescape_rwkv_token"
+
+[[governs]]
+adr = "0050"
+what = "plamo2 is a backward DP over the file's own scores; llama.cpp's suffix automaton is an index, not the semantics"
+symbol = "plamo2_encode"
