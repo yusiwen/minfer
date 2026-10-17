@@ -249,6 +249,50 @@ SYMBOL = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:::[A-Za-z][A-Za-z0-9_]*)*$")
 #: the checker greps for.
 CALL_SUFFIX = re.compile(r"\(\)$")
 
+#: What a **definition** of an identifier looks like. The same shape
+#: `scripts/classify_changes.py` uses (`SYMBOL_DEFINES`, #541) — that checker needed
+#: the definition/mention split first, and this one had been grepping for any
+#: occurrence, which is why its `range_miss` hint pointed at call sites, comments and
+#: unrelated spellings of the same name (#587).
+SYMBOL_DEFINES = (
+    r"^\s*(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?(?:async\s+)?"
+    # `let` is an extension over `classify_changes.py`'s shape: a doc anchor may cite a
+    # binding (`current_pos`, `stop_refs`), and for the hint a binding *is* where the
+    # name comes into existence.
+    r"(?:fn|struct|enum|trait|const|static|type|impl|mod)\s+{symbol}\b"
+    r"|^\s*let\s+(?:mut\s+)?{symbol}\b"
+)
+
+#: How far above a definition to look for the `impl Type` / `trait Type` that owns it,
+#: when the citation is qualified (`Type::method`).
+CONTAINER_LOOKBACK = 400
+
+
+def container_of(lines: list[str], definition: int) -> str | None:
+    """The `Type` of the nearest enclosing `impl Type` / `trait Type` above a line."""
+    for number in range(definition, max(0, definition - CONTAINER_LOOKBACK), -1):
+        text = lines[number - 1]
+        m = re.match(r"\s*(?:unsafe\s+)?(?:impl(?:<[^>]*>)?\s+(?:[\w:<>]+\s+for\s+)?|trait\s+)([A-Za-z_]\w*)", text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def definition_lines(lines: list[str], symbol: str, container: str | None = None) -> list[int]:
+    """The lines that **define** `symbol` (not the lines that merely mention it).
+
+    With a `container` from a qualified citation (`Type::method`), definitions owned by
+    another container are dropped when at least one candidate matches — the qualifier is
+    the disambiguator, and dropping it was the root of the misleading hint.
+    """
+    pattern = re.compile(SYMBOL_DEFINES.format(symbol=re.escape(symbol)), re.MULTILINE)
+    hits = [n for n, text in enumerate(lines, 1) if pattern.match(text)]
+    if container and hits:
+        owned = [n for n in hits if container_of(lines, n) == container]
+        if owned:
+            return owned
+    return hits
+
 
 def symbol_base(token: str) -> str:
     """The identifier a backticked token names: `f()`, `Type::f`, `f` → `f`."""
@@ -753,10 +797,20 @@ class Checker:
         # *start*) and is a note rather than the claim.
         end = anchor.end if anchor.end is not None else anchor.start
         if not re.search(pattern, "\n".join(lines[anchor.start - 1 : end])):
-            for number, text in enumerate(lines, start=1):
-                if re.search(pattern, text):
-                    anchor.range_miss = number
-                    break
+            # The hint is the **definition** when the file has one; only a symbol with
+            # no definition at all falls back to its first mention, and the message
+            # says which kind it reported (#587).
+            container = anchor.symbol.split("::")[0] if "::" in anchor.symbol else None
+            defs = definition_lines(lines, base, container)
+            if defs:
+                anchor.range_miss = defs[0]
+                anchor.range_miss_kind = "definition"
+            else:
+                for number, text in enumerate(lines, start=1):
+                    if re.search(pattern, text):
+                        anchor.range_miss = number
+                        anchor.range_miss_kind = "mention"
+                        break
         lo = max(0, anchor.start - 1 - SYMBOL_WINDOW)
         hi = min(len(lines), anchor.start + SYMBOL_WINDOW)
         window = "\n".join(lines[lo:hi])
@@ -865,14 +919,16 @@ def main(argv: list[str]) -> int:
     summarize(report, args.strict_symbols)
 
     violations = report.violations(args.strict_symbols)
-    for anchor in violations:
+    for anchor in sorted(violations, key=lambda a: a.where()):
         # A bare rule-E miss has no verdict of its own (the anchor resolves and the
         # window passes), so it is labelled by what it is; an anchor that already
         # violates something keeps its verdict and gains the range-miss detail.
         label = anchor.verdict if anchor.verdict != "ok" else "range-miss"
+        hint = getattr(anchor, "range_miss_kind", "mention")
+        hint = "definition" if hint == "definition" else "no definition; first mention"
         miss = (
             f" — `{anchor.symbol}` is not inside {anchor.shown()}; it is at "
-            f"{anchor.target}:{anchor.range_miss}"
+            f"{anchor.target}:{anchor.range_miss} ({hint})"
             if anchor.range_miss is not None
             else ""
         )
