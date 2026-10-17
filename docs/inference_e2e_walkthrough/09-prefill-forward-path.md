@@ -227,7 +227,7 @@ let ctx = params.n_ctx.max(input_ids.len());
 ```
 
 and passes that single number to *every* forward of the run — prefill at
-`main.rs:1869`, each decode step at `main.rs:1867`. The comment above it
+`main.rs:1867`, each decode step at `main.rs:1560`. The comment above it
 (`main.rs:1536-1540`) records the three facts that make this the right shape:
 
 1. `n_ctx` **sizes the graph's KV regions** — the allocator carves each
