@@ -186,7 +186,7 @@ number consistent for the whole run.
 ### 2.5 Modes: where the same parsed data goes
 
 The parsed state fans out into mode-specific structs, and each mode takes a
-different subset. In `run_conversation` (`src/main.rs:2092`), the
+different subset. In `run_conversation` (`src/main.rs:2095`), the
 conversation gets a `ConversationSpec` (template, special tokens, `seed`,
 `n_ctx`, system prompt) plus a `TurnParams` (all the sampling knobs *plus*
 `stop_strings`) — every field is copied out of `GenParams`, so the
