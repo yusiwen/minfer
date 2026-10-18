@@ -454,3 +454,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0050](adr/0050-plamo2-is-a-backward-dp-over-the-files-own-scores-and-the-automaton-is-an-index.md) — plamo2 is a backward DP over the file's own scores, and llama.cpp's automaton is an index
 - [ADR-0051](adr/0051-hybriddna-is-the-gpt2-engine-plus-a-dna-kmer-block.md) — hybriddna is the gpt2 engine plus a DNA k-mer block
 - [ADR-0052](adr/0052-none-is-a-vocabulary-less-file-and-the-checked-entry-points-are-how-it-refuses.md) — none is a vocabulary-less file, and the checked entry points are how it refuses
+- [ADR-0053](adr/0053-whitespace-is-the-gpt2-engine-behind-a-whitespace-cut-and-has-no-artifact-gate.md) — whitespace is the gpt2 engine behind a whitespace cut, and it has no artifact gate
