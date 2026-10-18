@@ -67,9 +67,11 @@ plus the group membership (nine values set it, five do not).
   `whitespace`.
 - `ignore_merges` is now part of every byte-level BPE encode path; the fourteen-model
   gate is the regression net.
-- **Residuals, recorded:** (a) no id fixture for the five new values yet — they need an
-  `ignore_merges` artifact, and the smallest Pixtral GGUF is ~7 GB, so this waits on a
-  smaller model or on accepting the size (the gate only parses the file); (b) the
+- **Residuals, recorded:** (a) two of the five new values now have an id fixture —
+  `falcon3` (via ADR-0056's byte-reachability fix, #593) and `falcon-h1`
+  (`tiiuae/Falcon-H1-0.5B-Instruct-GGUF`, Q2_K, 200 913 184 B); `pixtral`,
+  `midm-2.0` and `jina-v5-nano` still need an artifact small enough to cache (the
+  smallest Pixtral GGUF is ~7 GB); (b) the
   `add_bos` flag that comes with the same group is not implemented, like `add_sep`
   (ADR-0054) — minfer's text path adds no specials; (c) `ignore_merges` also appears at
   six load sites in llama.cpp; only the `LLAMA_VOCAB_PRE_TYPE_LLAMA3` group is covered
