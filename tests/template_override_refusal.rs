@@ -87,3 +87,88 @@ fn the_template_flags_are_refused_together() {
         "both flags are named:\n{stderr}"
     );
 }
+
+/// The happy path on `serve` (#602): a good override starts the server and the
+/// health endpoint answers. Needs a cached model, so it belongs to the
+/// `#[ignore]`d set that `scripts/real_model_gates.sh` runs.
+#[test]
+#[ignore = "needs a cached model; run with scripts/real_model_gates.sh"]
+fn serve_starts_and_answers_health_with_an_override_file() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::TcpStream;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let model = std::env::var("MINFER_BATCH_TEST_MODEL").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    if !std::path::Path::new(&model).exists() {
+        eprintln!("skipped: no cached model at {model}");
+        return;
+    }
+    let template = scratch("serve-ok.jinja", "U:{{ messages[0]['content'] }}");
+    let port: u16 = 18099;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_minfer"))
+        .arg("serve")
+        .arg(&model)
+        .args(["--port", &port.to_string(), "--chat-template"])
+        .arg(&template)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn minfer serve");
+
+    // The listening banner is on stderr; wait for it, bounded.
+    let stderr = child.stderr.take().expect("stderr pipe");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut log = String::new();
+    let listening = loop {
+        match rx.recv_timeout(Duration::from_secs(180)) {
+            Ok(line) => {
+                log.push_str(&line);
+                log.push('\n');
+                if line.contains("listening on") {
+                    break true;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+
+    let health = if listening {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to serve");
+        use std::io::Write as _;
+        stream
+            .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        resp
+    } else {
+        String::new()
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        listening,
+        "the server never printed its listening banner; log so far:\n{log}"
+    );
+    assert!(
+        health.contains("\"status\":\"ok\""),
+        "health response was:\n{health}"
+    );
+}

@@ -5920,7 +5920,7 @@ here, and one of them changed a recorded call list without changing a bucket:
 - `optiming::record` vs `TimingSink::record`: the census's `optiming/tests.rs:142` caller is the
   sink's method; the free function's one caller is `graph/scheduler/tests.rs:208`.
 - `GgufContext::get_val_bool` vs `GgufKv::get_val_bool`: the four non-test matches (`gguf.rs:770`,
-  `:1752`, `:1849`, `main.rs:2488`) are the inner type's method; the context's is test-only.
+  `:1752`, `:1849`, `main.rs:2485`) are the inner type's method; the context's is test-only.
 - `CpuBackend::pool_len` vs `BackendTrait::pool_len`: `GraphAllocator::pool_len_of` calls the trait
   method; the inherent method's only caller is `n_cpu_buffers`.
 - `Tensor::new` vs `Vec::new()` / `String::new()` / `OnceLock::new()`: the census's ~200 "other
@@ -7193,7 +7193,7 @@ branch point (`bef4bd9`), not trusted from the ticket: `git grep -n 'KVCache' sr
 | Qwen3 impls | `src/models/qwen3/mod.rs:48`/`:89` (`kv` at `:52`/`:93`) | both removed; `use crate::cache::KVCache;` gone |
 | graph entry points | `src/models/qwen2/graph.rs:435`, `src/models/qwen3/graph.rs:380` | `_kv: &mut KVCache` removed from `forward`; imports gone |
 | CLI construction | `src/main.rs:1298` (`KVCache::new`) | deleted, with the then-unused `n_kv_embd`/`n_layer` locals |
-| CLI forwards | `src/main.rs:1569`, `:1788` | argument dropped |
+| CLI forwards | `src/main.rs:1567`, `:1788` | argument dropped |
 | test construction | `src/models/qwen2/graph/tests.rs:2978/3019/3023` | `KVCache::new` calls and arguments dropped |
 | test mock | `src/server/batch/tests.rs:1794` (`FailingForward::forward`) | `_kv` parameter dropped |
 

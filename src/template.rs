@@ -716,6 +716,36 @@ pub fn resolve_template(
     Ok(chosen)
 }
 
+/// The one-line notice a caller prints when a run has no template at all.
+///
+/// One constant, so the four entry points cannot word it differently, and a test
+/// can pin the text (#602).
+pub const CHATML_NOTICE: &str = "Notice: this GGUF has no tokenizer.chat_template; using the \
+                                 generic ChatML renderer";
+
+/// What a startup path needs from the resolver: the template to use, and whether
+/// to announce the ChatML fallback.
+///
+/// `announce_chatml` is returned with the text it describes, so a notice cannot
+/// claim a template the resolver did not pick — the same pairing
+/// `render_single_turn` gives the CLI, for `--cnv`, `serve` and `viz` (#602).
+#[derive(Debug)]
+pub struct StartupTemplate {
+    pub text: Option<String>,
+    pub announce_chatml: bool,
+}
+
+pub fn startup_template(
+    embedded: Option<&str>,
+    override_text: Option<&str>,
+) -> Result<StartupTemplate, TemplateError> {
+    let text = resolve_template(embedded, override_text)?;
+    Ok(StartupTemplate {
+        announce_chatml: text.is_none(),
+        text,
+    })
+}
+
 /// Compile the template and render a canary conversation through it.
 ///
 /// This is the load-time gate: the CLI and `serve` call it once so an
