@@ -1385,6 +1385,11 @@ const ID_FIXTURES: &[(&str, &str, &str)] = &[
         include_str!("../../tests/fixtures/tokenizer/ids_plamo-2-translate.json"),
     ),
     (
+        "falcon3-1b-instruct",
+        "~/.cache/minfer/models/hf/bartowski/Falcon3-1B-Instruct-GGUF/Falcon3-1B-Instruct-Q2_K.gguf",
+        include_str!("../../tests/fixtures/tokenizer/ids_falcon3-1b-instruct.json"),
+    ),
+    (
         "carbon-3b",
         "~/.cache/minfer/models/hf/HuggingFaceBio/Carbon-3B-GGUF/carbon-3b-q4_k_m.gguf",
         include_str!("../../tests/fixtures/tokenizer/ids_carbon-3b.json"),
