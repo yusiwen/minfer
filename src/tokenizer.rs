@@ -68,6 +68,11 @@ pub enum PreTokenizer {
     /// normalizer either. It is its own variant so the fixture and the refusal
     /// name the value the file actually carries.
     Lfm2,
+    /// `whitespace`: Jina's rule (llama.cpp #18756) — the text is cut on Unicode
+    /// whitespace, the whitespace itself is **dropped**, and each remaining run is
+    /// BPE'd on its own. With this rule the engine also turns lower-casing off
+    /// (`llama-vocab.cpp:2231-2233`).
+    Whitespace,
 }
 
 impl PreTokenizer {
@@ -78,11 +83,13 @@ impl PreTokenizer {
             Some("qwen35") => Ok(Self::Qwen35),
             Some("llama-bpe") | Some("llama3") | Some("llama-v3") => Ok(Self::LlamaBpe),
             Some("lfm2") => Ok(Self::Lfm2),
+            Some("whitespace") => Ok(Self::Whitespace),
             Some("gemma4") => Ok(Self::Gemma4),
             Some(other) => Err(format!(
                 "tokenizer.ggml.pre = \"{other}\" is not supported by minfer's byte-level BPE \
                  pre-tokenizer (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"; \
-                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\"; \"gemma4\"). \
+                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\"; \"gemma4\"; \
+                 \"whitespace\"). \
                  Refusing to tokenize rather than split with the wrong rule."
             )),
             None => Err(
@@ -103,9 +110,9 @@ impl PreTokenizer {
     fn number_run(self) -> usize {
         match self {
             Self::LlamaBpe | Self::Lfm2 => 3,
-            // `gemma4` never reaches the letter/number arms (its own split runs),
-            // so this is the unused arm of an exhaustive match.
-            Self::Qwen2 | Self::Qwen35 | Self::Gemma4 => 1,
+            // `gemma4` and `whitespace` never reach the letter/number arms (their own
+            // splits run), so this is the unused arm of an exhaustive match.
+            Self::Qwen2 | Self::Qwen35 | Self::Gemma4 | Self::Whitespace => 1,
         }
     }
 
@@ -128,7 +135,7 @@ impl PreTokenizer {
     pub fn applies_nfc(self) -> bool {
         match self {
             Self::Qwen2 | Self::Qwen35 => true,
-            Self::LlamaBpe | Self::Lfm2 | Self::Gemma4 => false,
+            Self::LlamaBpe | Self::Lfm2 | Self::Gemma4 | Self::Whitespace => false,
         }
     }
 
@@ -142,6 +149,11 @@ impl PreTokenizer {
     /// implemented as a scan rather than a `regex` pattern because the crate has
     /// no lookahead.
     pub fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
+        if self == Self::Whitespace {
+            // `\s+` dropped, everything between kept: the segmenting the whitespace
+            // session performs before it hands a run to the BPE tables.
+            return text.split_whitespace().collect();
+        }
         if self == Self::Gemma4 {
             // `[^\n]+|[\n]+` — maximal runs of newlines and of everything else.
             let mut out = Vec::new();
@@ -321,6 +333,11 @@ pub enum TokenizerModel {
     /// scores, no `pre` rule and no byte-level encoding: a byte that starts no
     /// entry emits the unknown token and advances one byte.
     Rwkv,
+    /// `whitespace`: Jina's tokenizer — the `gpt2` engine behind a pre rule that cuts
+    /// on whitespace and drops it. llama.cpp maps the model value to the BPE type and
+    /// only swaps the session (`llama-vocab.cpp:1986`), so the engine is the byte-level
+    /// BPE; the distinguishing behaviour is the `whitespace` pre rule.
+    Whitespace,
     /// `none` / `no_vocab`: the file declares **no vocabulary** — llama.cpp reads
     /// `tokenizer.ggml.vocab_size`, creates that many placeholder tokens and aborts
     /// in `tokenize` (`llama-vocab.cpp:1942`/`:3587`), because the ids come from the
@@ -370,6 +387,7 @@ impl TokenizerModel {
             ),
             Some("gpt2") => Ok(Self::Gpt2),
             Some("none") | Some("no_vocab") => Ok(Self::None),
+            Some("whitespace") => Ok(Self::Whitespace),
             Some("llama") => Ok(Self::Spm),
             Some("bert") => Ok(Self::Bert),
             Some("gemma4") => Ok(Self::Gemma4),
@@ -1149,7 +1167,7 @@ impl Tokenizer {
                 id_to_type = vec![0; n];
                 None
             }
-            TokenizerModel::Gpt2 | TokenizerModel::HybridDna => {
+            TokenizerModel::Gpt2 | TokenizerModel::HybridDna | TokenizerModel::Whitespace => {
                 // F7: the pre-tokenization rule must be one this engine implements.
                 let pre = PreTokenizer::from_gguf(
                     Self::get_gguf_str(gguf, "tokenizer.ggml.pre").as_deref(),
@@ -1758,7 +1776,7 @@ impl Tokenizer {
             // `model = none` has no vocabulary; `encode_checked` refuses it before
             // this point, and a direct `encode` call gets an empty list.
             TokenizerModel::None => Vec::new(),
-            TokenizerModel::Gpt2 => self.encode_bpe(text),
+            TokenizerModel::Gpt2 | TokenizerModel::Whitespace => self.encode_bpe(text),
             TokenizerModel::HybridDna => self.hybriddna_encode(text),
             TokenizerModel::Bert => self.wpm_encode(text),
             TokenizerModel::Ugm => self.ugm_encode(text),

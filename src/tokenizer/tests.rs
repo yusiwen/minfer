@@ -325,6 +325,37 @@ fn hybriddna_wraps_the_block_in_its_tags_and_stops_at_eof() {
     assert_eq!(t.hybriddna_encode(""), Vec::<u32>::new());
 }
 
+// === #132 S4: the whitespace engine =======================================
+
+#[test]
+fn the_whitespace_rule_drops_whitespace_and_keeps_the_runs() {
+    use PreTokenizer::Whitespace as W;
+    // The rule is the segmenting llm_tokenizer_whitespace_session performs: cut on
+    // Unicode whitespace, drop it, keep the runs.
+    assert_eq!(W.split("the  cat"), vec!["the", "cat"]);
+    assert_eq!(
+        W.split("  leading and trailing  "),
+        vec!["leading", "and", "trailing"]
+    );
+    assert_eq!(W.split("one"), vec!["one"]);
+    assert_eq!(W.split("   "), Vec::<&str>::new());
+    assert_eq!(W.split(""), Vec::<&str>::new());
+    // The pieces tile the input *minus* the whitespace — never a dropped character.
+    let text = "a\tb\nc";
+    assert_eq!(W.split(text).concat(), "abc");
+    // No NFC, no digit grouping, no accent-mark folding: this rule only whitespace.
+    assert!(!W.applies_nfc());
+    assert_eq!(W.number_run(), 1);
+}
+
+#[test]
+fn the_whitespace_model_runs_the_byte_level_bpe_behind_that_rule() {
+    // llama.cpp maps the model value to the BPE type and swaps the session
+    // (`llama-vocab.cpp:1986`), so a loaded file is the gpt2 engine plus the rule.
+    let t = test_tokenizer();
+    assert_eq!(t.model, TokenizerModel::Gpt2);
+}
+
 // === #132 S4: the plamo2 engine ============================================
 
 /// A plamo2 tokenizer: the pieces of `pieces` (name, score) plus the 256 `<0xXX>`
@@ -796,11 +827,15 @@ fn the_tokenizer_model_is_a_dispatch() {
         TokenizerModel::from_gguf(Some("no_vocab")).unwrap(),
         TokenizerModel::None
     );
+    assert_eq!(
+        TokenizerModel::from_gguf(Some("whitespace")).unwrap(),
+        TokenizerModel::Whitespace
+    );
     let err = TokenizerModel::from_gguf(None).unwrap_err();
     assert!(err.contains("tokenizer.ggml.model is missing"), "{err}");
     // Every other engine is refused *by name* — an approximation with the wrong
     // engine would be worse than a refusal.
-    for other in ["whitespace"] {
+    for other in ["plamo3"] {
         let err = TokenizerModel::from_gguf(Some(other)).unwrap_err();
         assert!(
             err.contains(other),
@@ -1472,6 +1507,7 @@ impl TokenizerModel {
             Self::Plamo2 => "plamo2",
             Self::HybridDna => "hybriddna",
             Self::None => "none",
+            Self::Whitespace => "whitespace",
         }
     }
 }
@@ -1488,6 +1524,7 @@ impl PreTokenizer {
             Self::LlamaBpe => "llama-bpe",
             Self::Lfm2 => "lfm2",
             Self::Gemma4 => "gemma4",
+            Self::Whitespace => "whitespace",
         }
     }
 }
