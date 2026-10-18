@@ -172,6 +172,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0050](./0050-plamo2-is-a-backward-dp-over-the-files-own-scores-and-the-automaton-is-an-index.md) | 2026-10-16 | plamo2 is a backward DP over the file's own scores, and llama.cpp's automaton is an index | Accepted (amends ADR-0045) |
 | [0051](./0051-hybriddna-is-the-gpt2-engine-plus-a-dna-kmer-block.md) | 2026-10-16 | hybriddna is the gpt2 engine plus a DNA k-mer block, and its vocabulary is escaped in place | Accepted (amends ADR-0045) |
 | [0052](./0052-none-is-a-vocabulary-less-file-and-the-checked-entry-points-are-how-it-refuses.md) | 2026-10-16 | none is a vocabulary-less file, and the checked entry points are how it refuses | Accepted (amends ADR-0045) |
+| [0053](./0053-whitespace-is-the-gpt2-engine-behind-a-whitespace-cut-and-has-no-artifact-gate.md) | 2026-10-17 | whitespace is the gpt2 engine behind a whitespace cut, and it has no artifact gate | Accepted (amends ADR-0045) |
 
 ## The template
 

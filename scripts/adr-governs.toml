@@ -266,3 +266,8 @@ symbol = "hybriddna_encode"
 adr = "0052"
 what = "`model = none` is a vocabulary-less file: placeholder tokens from `vocab_size`, and a named refusal through the checked entry points"
 symbol = "encode_checked"
+
+[[governs]]
+adr = "0053"
+what = "`whitespace` is the gpt2 engine behind a pre rule that cuts on whitespace and drops it"
+symbol = "encode_bpe"
