@@ -574,7 +574,11 @@ is compared against the real `cargo test` log by `scripts/check_baselines.py --c
 `test-linux-cpu` — a job the change classifier keeps running whenever that ledger moves, while a
 docs-only change skips it (ADR-0025). The same job runs `scripts/build_book.sh`
 (pinned mdBook 0.4.37), then four checkers that read the two halves of
-"the book is correct". The first is `scripts/check_figures.py`, which lints every
+"the book is correct". The book build is **runnable outside CI** and should be run there when a change
+touches the book: `nix develop -c scripts/build_book.sh` — the devShell ships the same mdBook, so the
+rendered book is the one the site ships (`docs/BUILD.md` §"The devShell"). A shell where that fails
+with `nix: command not found` has no devShell, not no mdBook: find the binary before recording the gate
+as unrunnable. The first checker is `scripts/check_figures.py`, which lints every
 figure in `docs/figures/` — theme palette, geometry, the include/caption shape, the
 character allowlist, the wrapper-CSS wiring — with its own fixture suite in
 `scripts/check_figures_tests.py`. `scripts/check_docs_links.py` fails on a relative link whose target does not

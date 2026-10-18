@@ -4,6 +4,54 @@ Requirements: **Rust** (edition 2021, no ML-framework dependencies — runtime
 deps are minimal). A **Nix flake devShell** (`nix develop`) is available for a
 batteries-included dev environment.
 
+## The devShell: what it provides, and how to reach it
+
+The flake's `devShells.default` ([`flake.nix`](../flake.nix)) is not only a Rust
+toolchain. It is also the **only** source of the docs toolchain: a session that
+cannot enter it cannot build the book, and the natural conclusion — "mdBook is
+not installed here" — is then wrong.
+
+It contains, all at the pinned versions the CI jobs use:
+
+| Tool | Why it matters |
+|---|---|
+| `rust` (the `rust-toolchain.toml` pin) | `cargo build/test`, and the `rustfmt` the commit hook runs |
+| **`mdbook` 0.4.37** | `scripts/build_book.sh`; the CI jobs pin the same version, so a local build renders what the site ships |
+| `uv` | the Python fixture generators (`scripts/gen_*.py`) |
+| `pkg-config`, `curl`, `libiconv` | native build deps |
+| `git-hooks.nix` pre-commit | the `rustfmt --check` hook (see "Git hooks" below) |
+
+```bash
+# plain shell
+nix develop
+
+# one command inside it (the form to use in scripts and agent sessions)
+nix develop -c scripts/build_book.sh
+nix develop -c mdbook --version          # mdbook v0.4.37
+
+# sandboxed agent shell: nix-command/flakes are not enabled by default, and the
+# client's scratch dirs are outside the workspace — redirect them
+export XDG_CONFIG_HOME=/tmp/dsh-nix-xdg/config XDG_DATA_HOME=/tmp/dsh-nix-xdg/data \
+       XDG_STATE_HOME=/tmp/dsh-nix-xdg/state XDG_CACHE_HOME=/tmp/dsh-nix-xdg/cache
+nix --extra-experimental-features 'nix-command flakes' develop \
+    -c scripts/build_book.sh /path/to/minfer
+```
+
+`.envrc` is `use flake`, so with `direnv` on `PATH` and allowed the shell sets
+itself up on entry. **When it does not:** if `nix` is not on `PATH`, `direnv`
+fails with `nix: command not found` and the devShell's tools simply vanish from
+the shell — every later `mdbook`/`rustfmt`/`uv` call then looks like a missing
+tool. Before drawing that conclusion, look for the binary itself: the Nix
+profile (`/nix/var/nix/profiles/default/bin/nix`), the store
+(`ls /nix/store/*-mdbook-*/bin`), or `nix develop -c` with the absolute path.
+A bare name that is not on `PATH` is not evidence the machine lacks the tool.
+
+**Version drift to watch:** the workflows pin `mdbook@0.4.37`, while the flake
+takes `pkgs.mdbook` from nixpkgs — a channel bump can move the devShell ahead of
+the CI pin, and the two would then render slightly different HTML. When bumping
+nixpkgs, compare `nix develop -c mdbook --version` with the `tool:
+mdbook@0.4.37` lines in `.github/workflows/ci.yml` and `docs.yml`.
+
 ## Build commands
 
 ```bash
