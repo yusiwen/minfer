@@ -1,7 +1,7 @@
 {
   "provenance": {
     "generator": "CPython 3.12.3 builtin str methods",
-    "command": "/tmp/f7-venv/bin/python /tmp/f7-make-fixtures.py",
+    "command": "scripts/gen_chat_fixtures.py",
     "date": "2026-09-24"
   },
   "entries": [
@@ -272,6 +272,134 @@
         "an"
       ],
       "expected": 2
+    },
+    {
+      "method": "splitlines",
+      "receiver": "a\nb\r\nc",
+      "args": [],
+      "expected": [
+        "a",
+        "b",
+        "c"
+      ]
+    },
+    {
+      "method": "splitlines",
+      "receiver": "a\nb\r\nc",
+      "args": [
+        1
+      ],
+      "expected": [
+        "a\n",
+        "b\r\n",
+        "c"
+      ]
+    },
+    {
+      "method": "splitlines",
+      "receiver": "trailing\n",
+      "args": [],
+      "expected": [
+        "trailing"
+      ]
+    },
+    {
+      "method": "splitlines",
+      "receiver": "a\rb c",
+      "args": [],
+      "expected": [
+        "a",
+        "b",
+        "c"
+      ]
+    },
+    {
+      "method": "splitlines",
+      "receiver": "x\u000bv\ff\u001cg\u001dh\u001eij",
+      "args": [],
+      "expected": [
+        "x",
+        "v",
+        "f",
+        "g",
+        "h",
+        "i",
+        "j"
+      ]
+    },
+    {
+      "method": "splitlines",
+      "receiver": "",
+      "args": [],
+      "expected": []
+    },
+    {
+      "method": "ljust",
+      "receiver": "ab",
+      "args": [
+        5
+      ],
+      "expected": "ab   "
+    },
+    {
+      "method": "ljust",
+      "receiver": "ab",
+      "args": [
+        5,
+        "-"
+      ],
+      "expected": "ab---"
+    },
+    {
+      "method": "ljust",
+      "receiver": "abc",
+      "args": [
+        2
+      ],
+      "expected": "abc"
+    },
+    {
+      "method": "ljust",
+      "receiver": "",
+      "args": [
+        3,
+        "."
+      ],
+      "expected": "..."
+    },
+    {
+      "method": "rjust",
+      "receiver": "ab",
+      "args": [
+        5
+      ],
+      "expected": "   ab"
+    },
+    {
+      "method": "rjust",
+      "receiver": "ab",
+      "args": [
+        5,
+        "0"
+      ],
+      "expected": "000ab"
+    },
+    {
+      "method": "rjust",
+      "receiver": "abc",
+      "args": [
+        1
+      ],
+      "expected": "abc"
+    },
+    {
+      "method": "rjust",
+      "receiver": "日本",
+      "args": [
+        5,
+        "x"
+      ],
+      "expected": "xxx日本"
     }
   ]
 }

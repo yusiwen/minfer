@@ -288,6 +288,11 @@ fn print_usage(prog: &str) {
     eprintln!("OPTIONS:");
     eprintln!("  --meta               print GGUF metadata and key tensors");
     eprintln!("  --no-template        use the raw prompt without the chat template");
+    eprintln!(
+        "  --chat-template <FILE>    render a template file instead of the GGUF's\n\
+         \x20                           tokenizer.chat_template (mutually exclusive with\n\
+         \x20                           --no-template; an unrenderable file refuses at startup)"
+    );
     eprintln!("  --cnv, --conversation   multi-turn conversation mode (interactive REPL)");
     eprintln!("  -st, --single-turn   conversation: run one turn, then exit");
     eprintln!("  --system <STR>       conversation: system prompt");
@@ -503,6 +508,8 @@ fn main() {
     let mut params = GenParams::default();
     let mut meta_flag = false;
     let mut no_template = false;
+    // S1 (#133): a template file that replaces the GGUF's `tokenizer.chat_template`.
+    let mut chat_template_file: Option<String> = None;
     // Multi-turn conversation mode (CLI-CONVERSATION-PLAN.md, Phase 2).
     let mut conv_mode = false;
     let mut single_turn = false;
@@ -663,6 +670,13 @@ fn main() {
             "--no-template" => {
                 no_template = true;
                 i += 1;
+            }
+            // S1 (#133): a file whose contents replace the GGUF's own template.
+            "--chat-template" => {
+                if let Some(v) = next_val(a) {
+                    chat_template_file = Some(v);
+                }
+                i += 2;
             }
             "--cnv" | "--conversation" => {
                 conv_mode = true;
@@ -1166,6 +1180,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    // S1 (#133): a file override and the bypass are mutually exclusive. The run
+    // would carry two contradictory instructions about the prompt, and silently
+    // ignoring one is the class of bug this ticket exists to remove.
+    if no_template {
+        if let Some(file) = &chat_template_file {
+            eprintln!(
+                "Error: --chat-template {file} conflicts with --no-template (one names the \
+                 template to use, the other says use none)"
+            );
+            print_usage(&prog);
+            std::process::exit(1);
+        }
+    }
+
     // Resolve paths, hf:/ollama: URIs, and cached model names.
     let is_uri = model_path.starts_with("hf:")
         || model_path.starts_with("ollama:")
@@ -1408,6 +1436,7 @@ fn main() {
             server_n_slots,
             server_spec,
             server_slots_file,
+            chat_template_file.as_deref().map(std::path::Path::new),
         );
         return;
     }
@@ -1418,7 +1447,15 @@ fn main() {
             "Starting viz server (model={}, n_ctx={}, slots={})",
             model_path, params.n_ctx, 1
         );
-        server::viz::run_viz(model, tokenizer, &gguf_model, viz_port, params.n_ctx, 1);
+        server::viz::run_viz(
+            model,
+            tokenizer,
+            &gguf_model,
+            viz_port,
+            params.n_ctx,
+            1,
+            chat_template_file.as_deref().map(std::path::Path::new),
+        );
         return;
     }
 
@@ -1449,6 +1486,7 @@ fn main() {
             model,
             &tokenizer,
             &gguf_model.parts[0].data,
+            chat_template_file.as_deref(),
             &params,
             system_prompt,
             single_turn,
@@ -1487,32 +1525,37 @@ fn main() {
     let mut target_cache = graph::cache::GraphCache::new();
 
     // === Chat template (need tokenizer for bos_token text) ===
+    // `template::render_single_turn` is the one place the single-turn path picks
+    // the template: a `--chat-template <FILE>` override, else the GGUF's copy,
+    // else the announced ChatML fallback (#596 — the notice and the prompt come
+    // back together, so they cannot disagree).
+    let bos_text = tokenizer
+        .id_to_token
+        .get(tokenizer.bos_token as usize)
+        .map(|s| s.as_str())
+        .unwrap_or("");
     let processed = if no_template {
         prompt.clone()
-    } else if let Some(tmpl) = get_chat_template(&gguf_model.parts[0].data) {
-        let bos_text = tokenizer
-            .id_to_token
-            .get(tokenizer.bos_token as usize)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        // F7 (#50): an unrenderable template is refused here, before inference —
-        // never silently replaced by a generic ChatML prompt.
-        if let Err(e) = template::validate(&tmpl) {
-            eprintln!("Error: {}", e.message());
-            std::process::exit(1);
-        }
-        match template::render_template(&tmpl, &prompt, true, bos_text) {
-            Ok(p) => p,
+    } else {
+        match template::render_single_turn(
+            get_chat_template(&gguf_model.parts[0].data).as_deref(),
+            chat_template_file.as_deref().map(std::path::Path::new),
+            &prompt,
+            bos_text,
+        ) {
+            Ok(r) => {
+                if r.chatml_notice {
+                    eprintln!(
+                        "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
+                    );
+                }
+                r.text
+            }
             Err(e) => {
                 eprintln!("Error: {}", e.message());
                 std::process::exit(1);
             }
         }
-    } else {
-        eprintln!(
-            "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
-        );
-        prompt.clone()
     };
     #[cfg(feature = "debug_dump")]
     crate::dump::maybe_dump_text("minfer_dump_prompt", &processed);
@@ -2096,6 +2139,7 @@ fn run_conversation(
     model: Box<dyn models::ModelDef>,
     tokenizer: &tokenizer::Tokenizer,
     gguf_data: &[u8],
+    template_file: Option<&str>,
     params: &GenParams,
     system_prompt: Option<String>,
     single_turn: bool,
@@ -2108,19 +2152,22 @@ fn run_conversation(
     use crate::conversation::Engine as _;
     use std::io::Write; // reset_cache / forward trait methods
 
-    let template = get_chat_template(gguf_data);
-    // F7 (#50): refuse an unrenderable template before the first turn. A GGUF
-    // with no template at all still uses ChatML, and says so once.
-    match template.as_deref() {
-        Some(t) => {
-            if let Err(e) = template::validate(t) {
-                eprintln!("Error: {}", e.message());
-                return 1;
-            }
+    // One resolver (#133 S1): a `--chat-template <FILE>` override beats the
+    // GGUF's copy, and whichever wins is validated before the first turn.
+    let template = match template::resolve_template(
+        get_chat_template(gguf_data).as_deref(),
+        template_file.map(std::path::Path::new),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {}", e.message());
+            return 1;
         }
-        None => eprintln!(
+    };
+    if template.is_none() {
+        eprintln!(
             "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
-        ),
+        );
     }
     let special = model.special_tokens();
     let bos_text = tokenizer

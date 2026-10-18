@@ -3,7 +3,7 @@
 //
 // Design record: docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md (F7, #50).
 //
-// Two contracts matter here:
+// Three contracts matter here:
 //
 //  1. A template that **cannot be rendered** is a loud error naming the
 //     construct — never a silent generic ChatML prompt. The old behaviour
@@ -15,10 +15,17 @@
 //     through minijinja's own extension point
 //     (`Environment::set_unknown_method_callback`) with CPython semantics, so
 //     the *published* template renders instead of being refused.
+//  3. **One resolver decides which template is used** (`resolve_template`): a
+//     `--chat-template <FILE>` override beats the GGUF's copy, and whichever
+//     wins is validated there, so no entry point can render text another one
+//     refused. Time reaches a template through one injected clock, never a
+//     wall-clock read inside a render (ADR-0057).
 
 use minijinja::value::{Value, ValueKind};
 use minijinja::{context, Environment, Error, ErrorKind, State};
 use std::fmt;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The Python `str` methods the unknown-method hook implements. Listed in the
 /// refusal message so an unsupported template tells the reader what *is*
@@ -30,12 +37,15 @@ const SUPPORTED_STR_METHODS: &[&str] = &[
     "find",
     "join",
     "lower",
+    "ljust",
     "lstrip",
     "replace",
     "rfind",
+    "rjust",
     "rsplit",
     "rstrip",
     "split",
+    "splitlines",
     "startswith",
     "strip",
     "title",
@@ -75,9 +85,23 @@ impl TemplateError {
         }
     }
 
+    /// A `--chat-template <FILE>` that cannot be used: unreadable, empty, or
+    /// (through `classify`) unrenderable. The path is part of the text because
+    /// the user named it and nothing else identifies which file failed.
+    fn file(path: &Path, detail: impl Into<String>) -> Self {
+        Self {
+            kind: "template file",
+            detail: format!("{}: {}", path.display(), detail.into()),
+            line: None,
+        }
+    }
+
     /// The full, user-facing refusal. Names the construct, the template line
     /// and the engine's alternative, so nothing is silent.
     pub fn message(&self) -> String {
+        if self.kind == "template file" {
+            return format!("chat template error — {}: {}", self.kind, self.detail);
+        }
         let at = match self.line {
             Some(n) => format!(" (template line {n})"),
             None => String::new(),
@@ -268,6 +292,94 @@ fn py_title(recv: &str) -> String {
     out
 }
 
+/// CPython `str.splitlines`: split at every line boundary, and a trailing
+/// boundary does not produce a trailing empty element.
+///
+/// The boundary set is CPython's, not `char::is_whitespace`: `\n`, `\r`,
+/// `\r\n`, `\v`, `\f`, `\x1c`, `\x1d`, `\x1e`, `\x85`, `\u{2028}`, `\u{2029}`.
+fn py_splitlines(recv: &str, keepends: bool) -> Vec<String> {
+    let is_boundary = |c: char| {
+        matches!(
+            c,
+            '\n' | '\r'
+                | '\u{0b}'
+                | '\u{0c}'
+                | '\u{1c}'
+                | '\u{1d}'
+                | '\u{1e}'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    };
+    let mut out = Vec::new();
+    let mut chars = recv.char_indices().peekable();
+    let mut start = 0;
+    while let Some((i, c)) = chars.next() {
+        if !is_boundary(c) {
+            continue;
+        }
+        let mut end = i + c.len_utf8();
+        if c == '\r' {
+            // `\r\n` is one boundary, not two: consume the `\n`.
+            if let Some(&(j, '\n')) = chars.peek() {
+                chars.next();
+                end = j + 1;
+            }
+        }
+        out.push(if keepends {
+            recv[start..end].to_string()
+        } else {
+            recv[start..i].to_string()
+        });
+        start = end;
+    }
+    if start < recv.len() {
+        out.push(recv[start..].to_string());
+    }
+    out
+}
+
+/// CPython `str.ljust` / `str.rjust`: pad to `width` with one fill character.
+fn py_justify(recv: &str, args: &[PyArg], pad_right: bool) -> Result<PyValue, String> {
+    let width = match args.first() {
+        Some(PyArg::Int(i)) => *i,
+        Some(other) => return Err(format!("width must be an integer, got {other:?}")),
+        None => return Err("a width is required".to_string()),
+    };
+    let fill = match args.get(1) {
+        None => ' ',
+        Some(PyArg::Str(s)) => {
+            let mut cs = s.chars();
+            match (cs.next(), cs.next()) {
+                (Some(c), None) => c,
+                _ => {
+                    return Err(
+                        "the fill character must be a string of exactly one character".to_string(),
+                    )
+                }
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "the fill character must be a string, got {other:?}"
+            ))
+        }
+    };
+    let len = recv.chars().count() as i64;
+    if width <= len {
+        return Ok(PyValue::Str(recv.to_string()));
+    }
+    let pad: String = std::iter::repeat(fill)
+        .take((width - len) as usize)
+        .collect();
+    Ok(PyValue::Str(if pad_right {
+        format!("{recv}{pad}")
+    } else {
+        format!("{pad}{recv}")
+    }))
+}
+
 /// CPython `str.find`/`str.rfind`: the character index, not the byte offset.
 fn py_index(recv: &str, sub: &str, from_right: bool) -> Option<i64> {
     let idx = if from_right {
@@ -286,7 +398,7 @@ fn py_str_method(name: &str, recv: &str, args: &[PyArg]) -> Option<Result<PyValu
     match name {
         "strip" | "lstrip" | "rstrip" | "split" | "rsplit" | "startswith" | "endswith"
         | "replace" | "lower" | "upper" | "title" | "capitalize" | "join" | "find" | "rfind"
-        | "count" => {}
+        | "count" | "splitlines" | "ljust" | "rjust" => {}
         _ => return None,
     }
     Some(impl_str_method(name, recv, args))
@@ -405,6 +517,19 @@ fn impl_str_method(name: &str, recv: &str, args: &[PyArg]) -> Result<PyValue, St
             }
             Ok(PyValue::Int(recv.matches(&sub).count() as i64))
         }
+        "splitlines" => {
+            let keepends = match args.first() {
+                None | Some(PyArg::None_) => false,
+                Some(PyArg::Int(i)) => *i != 0,
+                Some(other) => return Err(format!("keepends must be a boolean, got {other:?}")),
+            };
+            if args.len() > 1 {
+                return Err("splitlines() takes at most one argument".to_string());
+            }
+            Ok(PyValue::List(py_splitlines(recv, keepends)))
+        }
+        "ljust" => py_justify(recv, args, true),
+        "rjust" => py_justify(recv, args, false),
         other => unreachable!("unarity-checked method {other}"),
     }
 }
@@ -442,17 +567,151 @@ fn unknown_method(
     }
 }
 
-/// The engine's template environment. Every render goes through this so the
-/// Python-compatibility hook cannot be forgotten, and `raise_exception` (used
-/// by many templates for their own refusals) surfaces as a real error.
-fn environment() -> Environment<'static> {
+/// A UTC civil timestamp — the value a template's `strftime_now` formats.
+///
+/// It is *injected* rather than read inside a render, so a render is
+/// reproducible in a test and an unknown directive cannot silently become a
+/// literal (ADR-0057).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CivilTime {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+}
+
+/// Unix seconds → UTC civil date/time (Howard Hinnant's `civil_from_days`,
+/// proleptic Gregorian, valid far past any timestamp a chat template prints).
+pub(crate) fn civil_from_unix(secs: i64) -> CivilTime {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let hour = (rem / 3_600) as u32;
+    let minute = ((rem % 3_600) / 60) as u32;
+    let second = (rem % 60) as u32;
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11], March-based
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = (yoe + era * 400 + i64::from(month <= 2)) as i32;
+
+    CivilTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    }
+}
+
+/// The production clock: UTC now, second resolution.
+fn utc_now() -> CivilTime {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    civil_from_unix(secs)
+}
+
+/// The `strftime` directive subset `strftime_now` implements. The full CPython
+/// set is deliberately not claimed: an unknown directive is refused by name, the
+/// same policy the `str` methods follow.
+const SUPPORTED_STRFTIME: &str = "%Y %y %m %d %H %M %S %F %T %%";
+
+pub(crate) fn format_civil(t: CivilTime, fmt: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut chars = fmt.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let Some(d) = chars.next() else {
+            return Err("a format may not end with a bare `%`".to_string());
+        };
+        match d {
+            'Y' => out.push_str(&format!("{:04}", t.year)),
+            'y' => out.push_str(&format!("{:02}", t.year.rem_euclid(100))),
+            'm' => out.push_str(&format!("{:02}", t.month)),
+            'd' => out.push_str(&format!("{:02}", t.day)),
+            'H' => out.push_str(&format!("{:02}", t.hour)),
+            'M' => out.push_str(&format!("{:02}", t.minute)),
+            'S' => out.push_str(&format!("{:02}", t.second)),
+            'F' => out.push_str(&format!("{:04}-{:02}-{:02}", t.year, t.month, t.day)),
+            'T' => out.push_str(&format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)),
+            '%' => out.push('%'),
+            other => {
+                return Err(format!(
+                    "unsupported strftime_now directive `%{other}`; supported: {SUPPORTED_STRFTIME}"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The environment with an explicit clock: the only way time enters a render.
+fn environment_with_clock(clock: fn() -> CivilTime) -> Environment<'static> {
     let mut env = Environment::new();
     env.set_unknown_method_callback(unknown_method);
     env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
         // A template's deliberate refusal is not a fallback trigger either.
         Err(Error::new(ErrorKind::InvalidOperation, msg))
     });
+    env.add_function(
+        "strftime_now",
+        move |fmt: String| -> Result<String, Error> {
+            format_civil(clock(), &fmt).map_err(|m| Error::new(ErrorKind::InvalidOperation, m))
+        },
+    );
     env
+}
+
+/// The single place that decides which template a run uses.
+///
+/// A `--chat-template <FILE>` override wins over the GGUF's copy; whichever is
+/// chosen is validated here, so every entry point refuses the same text at the
+/// same moment. `Ok(None)` is the documented ChatML case (no template anywhere)
+/// — the caller announces it, it is never silent.
+pub fn resolve_template(
+    embedded: Option<&str>,
+    file: Option<&Path>,
+) -> Result<Option<String>, TemplateError> {
+    let chosen = match file {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| TemplateError::file(path, e.to_string()))?;
+            if text.trim().is_empty() {
+                return Err(TemplateError::file(path, "the template file is empty"));
+            }
+            Some(text)
+        }
+        None => embedded.map(str::to_string),
+    };
+    if let Some(text) = chosen.as_deref() {
+        if let Err(e) = validate(text) {
+            // A file's refusal names the file; an embedded one already names the
+            // model's template, so it is passed through unchanged.
+            return Err(match file {
+                Some(path) => {
+                    let at = e
+                        .line
+                        .map(|n| format!(" (template line {n})"))
+                        .unwrap_or_default();
+                    TemplateError::file(path, format!("{}{}", e.detail, at))
+                }
+                None => e,
+            });
+        }
+    }
+    Ok(chosen)
 }
 
 /// Compile the template and render a canary conversation through it.
@@ -497,7 +756,25 @@ pub fn render_messages(
     add_generation_prompt: bool,
     bos_token: &str,
 ) -> Result<String, TemplateError> {
-    let mut env = environment();
+    render_messages_with_clock(
+        utc_now,
+        template,
+        messages,
+        add_generation_prompt,
+        bos_token,
+    )
+}
+
+/// `render_messages` with an explicit clock (the injection point): the
+/// environment is built from the clock, so nothing inside a render reads time.
+fn render_messages_with_clock(
+    clock: fn() -> CivilTime,
+    template: &str,
+    messages: &[(String, Option<String>)],
+    add_generation_prompt: bool,
+    bos_token: &str,
+) -> Result<String, TemplateError> {
+    let mut env = environment_with_clock(clock);
     if let Err(e) = env.add_template("chat", template) {
         return Err(TemplateError::classify(&e));
     }
@@ -535,8 +812,25 @@ pub fn render_messages_opt(
     add_generation_prompt: bool,
     bos_token: &str,
 ) -> Result<String, TemplateError> {
+    render_messages_opt_in(
+        utc_now,
+        template,
+        messages,
+        add_generation_prompt,
+        bos_token,
+    )
+}
+
+/// `render_messages_opt` with an explicit clock, so a render is reproducible.
+fn render_messages_opt_in(
+    clock: fn() -> CivilTime,
+    template: Option<&str>,
+    messages: &[(String, Option<String>)],
+    add_generation_prompt: bool,
+    bos_token: &str,
+) -> Result<String, TemplateError> {
     match template {
-        Some(t) => render_messages(t, messages, add_generation_prompt, bos_token),
+        Some(t) => render_messages_with_clock(clock, t, messages, add_generation_prompt, bos_token),
         None => Ok(fallback_chatml_messages(messages, add_generation_prompt)),
     }
 }
@@ -565,8 +859,29 @@ pub fn format_single(
     add_generation_prompt: bool,
     bos_token: &str,
 ) -> Result<FormattedDelta, TemplateError> {
+    format_single_clocked(
+        utc_now,
+        template,
+        messages,
+        new_msg,
+        add_generation_prompt,
+        bos_token,
+    )
+}
+
+/// `format_single` with an explicit clock: a clock-dependent template renders
+/// differently on the two passes, so the diff reports `prefix_matched = false`
+/// and the caller does a full re-render (§5.4).
+fn format_single_clocked(
+    clock: fn() -> CivilTime,
+    template: Option<&str>,
+    messages: &[(String, Option<String>)],
+    new_msg: (String, Option<String>),
+    add_generation_prompt: bool,
+    bos_token: &str,
+) -> Result<FormattedDelta, TemplateError> {
     let render = |msgs: &[(String, Option<String>)], add_gen: bool| {
-        render_messages_opt(template, msgs, add_gen, bos_token)
+        render_messages_opt_in(clock, template, msgs, add_gen, bos_token)
     };
     let fmt_past = if messages.is_empty() {
         String::new()
@@ -608,6 +923,44 @@ pub fn render_template(
 ) -> Result<String, TemplateError> {
     let messages = vec![("user".to_string(), Some(user_input.to_string()))];
     render_messages(template, &messages, add_generation_prompt, bos_token)
+}
+
+/// The single-turn CLI prompt, plus whether the caller must announce the
+/// no-template case.
+pub struct SingleTurnPrompt {
+    pub text: String,
+    /// True when neither the GGUF nor a file supplied a template: the caller
+    /// prints the one-line ChatML notice.
+    pub chatml_notice: bool,
+}
+
+/// The single-turn prompt: `--chat-template <FILE>`, else the GGUF's copy, else
+/// the announced ChatML fallback.
+///
+/// This is the **only** place the single-turn path chooses between a rendered
+/// template and ChatML, and the notice flag is returned with the text it
+/// describes — so a notice can never claim a prompt the render did not produce
+/// (#596). `--no-template` bypasses this entirely (the caller keeps the raw
+/// prompt) and is refused alongside `--chat-template`.
+pub fn render_single_turn(
+    embedded: Option<&str>,
+    file: Option<&Path>,
+    prompt: &str,
+    bos_token: &str,
+) -> Result<SingleTurnPrompt, TemplateError> {
+    match resolve_template(embedded, file)? {
+        Some(template) => Ok(SingleTurnPrompt {
+            text: render_template(&template, prompt, true, bos_token)?,
+            chatml_notice: false,
+        }),
+        None => {
+            let messages = vec![("user".to_string(), Some(prompt.to_string()))];
+            Ok(SingleTurnPrompt {
+                text: render_messages_opt(None, &messages, true, bos_token)?,
+                chatml_notice: true,
+            })
+        }
+    }
 }
 
 /// Fallback: simple ChatML format over ALL messages (server path). Every

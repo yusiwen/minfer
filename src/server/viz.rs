@@ -68,6 +68,9 @@ pub fn run_viz(
     port: u16,
     n_ctx: usize,
     n_slots: usize,
+    // S1 (#133): a `--chat-template <FILE>` override, resolved and validated
+    // before the worker exists.
+    template_file: Option<&std::path::Path>,
 ) {
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = super::slot::new_slots(n_slots, n_ctx);
@@ -115,19 +118,22 @@ pub fn run_viz(
         ],
     }));
 
-    // F7 (#50): refuse to start with an unrenderable template, before the worker
-    // thread exists.
-    let template = super::chat_template_from_gguf(&gguf.parts[0].data);
-    match template.as_deref() {
-        Some(t) => {
-            if let Err(e) = crate::template::validate(t) {
-                eprintln!("Error: {}", e.message());
-                return;
-            }
+    // F7 (#50) + S1 (#133): one resolver, refusing to start with an unrenderable
+    // template before the worker thread exists.
+    let template = match crate::template::resolve_template(
+        super::chat_template_from_gguf(&gguf.parts[0].data).as_deref(),
+        template_file,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {}", e.message());
+            return;
         }
-        None => eprintln!(
+    };
+    if template.is_none() {
+        eprintln!(
             "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
-        ),
+        );
     }
 
     let worker_tokenizer = tokenizer.clone();
