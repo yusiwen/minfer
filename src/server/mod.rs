@@ -108,9 +108,10 @@ pub fn run(
     n_slots: usize,
     spec_cfg: Option<crate::spec::SpecConfig>,
     slots_file: Option<String>,
-    // S1 (#133): a `--chat-template <FILE>` override, resolved and validated by
-    // `template::resolve_template` before the worker starts.
-    template_file: Option<&std::path::Path>,
+    // S1 (#133) + #601: the `--chat-template <FILE>` override, already read and
+    // validated by `template::load_template_file` before the model loaded; the
+    // resolver below still re-checks the winner.
+    template_override: Option<&str>,
 ) {
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = slot::new_slots(n_slots, n_ctx);
@@ -123,12 +124,14 @@ pub fn run(
     // and says so once.
     let template = match crate::template::resolve_template(
         chat_template_from_gguf(&gguf.parts[0].data).as_deref(),
-        template_file,
+        template_override,
     ) {
         Ok(t) => t,
         Err(e) => {
+            // #601: a refused startup is a non-zero exit, like every other one in
+            // this function (the bind failure below uses the same status).
             eprintln!("Error: {}", e.message());
-            return;
+            std::process::exit(1);
         }
     };
     if template.is_none() {

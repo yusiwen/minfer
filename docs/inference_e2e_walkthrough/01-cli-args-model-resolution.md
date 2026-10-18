@@ -186,7 +186,7 @@ number consistent for the whole run.
 ### 2.5 Modes: where the same parsed data goes
 
 The parsed state fans out into mode-specific structs, and each mode takes a
-different subset. In `run_conversation` (`src/main.rs:2138`), the
+different subset. In `run_conversation` (`src/main.rs:2152`), the
 conversation gets a `ConversationSpec` (template, special tokens, `seed`,
 `n_ctx`, system prompt) plus a `TurnParams` (all the sampling knobs *plus*
 `stop_strings`) — every field is copied out of `GenParams`, so the
@@ -669,7 +669,7 @@ while the server-like modes explicitly take an *empty* prompt — they would
 otherwise hang waiting on a stdin that nobody will write. Conversation mode
 splits the difference: an optional positional becomes the first turn, and
 further turns come from the REPL's own reader (`read_user_input`,
-`src/main.rs:1218`), never from this one-shot read.
+`src/main.rs:1232`), never from this one-shot read.
 
 #### `--n-ctx` at the moment it starts to matter
 

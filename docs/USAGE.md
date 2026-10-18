@@ -177,9 +177,9 @@ path renders that ChatML — including the single-turn CLI.
 ### Overriding the template, and time-dependent templates
 
 `--chat-template <FILE>` (on the CLI and on `serve`/`viz`) reads a template file
-and uses it instead of the GGUF's own copy. The file is validated at startup on
-the same terms as an embedded template, so one that cannot render refuses the run
-with the file named:
+and uses it instead of the GGUF's own copy. The file is read and validated
+**before the model loads** — it needs no GGUF — so a broken template costs a file
+read and a non-zero exit (the CLI, `serve` and `viz` alike), with the file named:
 
 ```
 Error: chat template error — template file: /tmp/model.jinja: unsupported Python str

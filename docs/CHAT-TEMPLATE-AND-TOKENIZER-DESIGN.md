@@ -155,13 +155,19 @@ payload.
 
 ### 2.6 Where the template comes from, and where time comes from
 
-One resolver decides the template: `template::resolve_template(embedded, file)`.
-A `--chat-template <FILE>` override wins over the GGUF's copy, and whichever
-wins is validated **there**, so all four entry points (`run`, `--cnv`, `serve`,
-`viz`) refuse the same text at the same moment. The two refusals are distinct on
-purpose: a file that cannot be read, is empty, or cannot render names the
-**file** (`chat template error — template file: <path>: …`), while an embedded
-template keeps its construct-and-line refusal. `--chat-template` together with
+One resolver decides the template: `template::resolve_template(embedded,
+override_text)`, where `override_text` is what `template::load_template_file`
+read and validated. The split is deliberate: the file half needs no GGUF, so it
+runs **before the model loads** — a missing or unrenderable `--chat-template`
+costs a file read and exits 1, instead of a 0.6B-weight load first (#601). The
+resolver still re-validates whichever copy wins, so no caller can skip the check.
+A `--chat-template <FILE>` override wins over the GGUF's copy, so all four entry
+points (`run`, `--cnv`, `serve`, `viz`) refuse the same text at the same moment.
+The two refusals are distinct on purpose: a file that cannot be read, is empty,
+or cannot render names the **file** (`chat template error — template file: <path>:
+…`), while an embedded template keeps its construct-and-line refusal; both are a
+non-zero exit on every entry point (`serve`/`viz` included since #601).
+`--chat-template` together with
 `--no-template` is a startup error naming both flags — the run would carry two
 contradictory instructions about the prompt, and silently preferring one is the
 class of bug this contract exists to remove. ADR-0057.
