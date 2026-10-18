@@ -37,6 +37,7 @@ fn test_tokenizer() -> Tokenizer {
         vocab: HashMap::new(),
         merges: HashMap::new(),
         dna: None,
+        ignore_merges: false,
         byte_to_unicode,
         unicode_to_byte,
         special_tokens: HashMap::new(),
@@ -323,6 +324,60 @@ fn hybriddna_wraps_the_block_in_its_tags_and_stops_at_eof() {
     // Without the three tag ids the engine is plain BPE (`dna` is `None`).
     t.dna = None;
     assert_eq!(t.hybriddna_encode(""), Vec::<u32>::new());
+}
+
+// === S3: `ignore_merges` (the whole-piece shortcut) ======================
+
+#[test]
+fn ignore_merges_emits_a_whole_piece_before_the_merge_ranks() {
+    // A byte-level vocabulary with single letters and one whole word, and **no**
+    // merges: without the shortcut, `hello` can only be five single-byte pieces.
+    let mut t = Tokenizer::empty();
+    t.model = TokenizerModel::Gpt2;
+    t.pre = Some(PreTokenizer::LlamaBpe);
+    for (text, id) in [("h", 1u32), ("e", 2), ("l", 3), ("o", 4), ("hello", 5)] {
+        t.id_to_token.push(text.to_string());
+        t.id_to_type.push(1);
+        t.id_to_score.push(0.0);
+        t.vocab.insert(text.to_string(), id);
+        t.byte_to_unicode
+            .insert(text.as_bytes()[0], text.chars().next().unwrap());
+    }
+    for (c, b) in [('h', b'h'), ('e', b'e'), ('l', b'l'), ('o', b'o')] {
+        t.unicode_to_byte.insert(c, b);
+    }
+    // The flag is off: the merge loop has nothing to join, so it is five pieces.
+    t.ignore_merges = false;
+    assert_eq!(t.encode("hello"), vec![1, 2, 3, 3, 4]);
+    // On (llama.cpp's `ignore_merges`, set for the whole `llama-bpe` group): the
+    // piece is itself an entry, so it is emitted whole.
+    t.ignore_merges = true;
+    assert_eq!(t.encode("hello"), vec![5]);
+    // A piece that is *not* an entry still takes the byte path.
+    assert_eq!(t.encode("hel"), vec![1, 2, 3]);
+}
+
+#[test]
+fn the_llama3_pre_group_aliases_llama_bpe() {
+    for pre in [
+        "llama-bpe",
+        "llama3",
+        "llama-v3",
+        "falcon3",
+        "falcon-h1",
+        "pixtral",
+        "midm-2.0",
+        "jina-v5-nano",
+        "lfm2",
+    ] {
+        let rule = PreTokenizer::from_gguf(Some(pre)).unwrap_or_else(|e| panic!("{pre}: {e}"));
+        assert!(rule.ignores_merges(), "{pre} must set ignore_merges");
+    }
+    // A rule outside the group must not.
+    for pre in ["qwen2", "qwen35", "gemma4", "whitespace", "jina-v1-en"] {
+        let rule = PreTokenizer::from_gguf(Some(pre)).unwrap_or_else(|e| panic!("{pre}: {e}"));
+        assert!(!rule.ignores_merges(), "{pre} must not set ignore_merges");
+    }
 }
 
 // === S3: the plain GPT-2 pre rule (`jina-v1-en`) ===========================
