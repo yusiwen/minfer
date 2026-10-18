@@ -33,9 +33,14 @@ nix develop -c mdbook --version          # mdbook v0.4.37
 # client's scratch dirs are outside the workspace — redirect them
 export XDG_CONFIG_HOME=/tmp/dsh-nix-xdg/config XDG_DATA_HOME=/tmp/dsh-nix-xdg/data \
        XDG_STATE_HOME=/tmp/dsh-nix-xdg/state XDG_CACHE_HOME=/tmp/dsh-nix-xdg/cache
-nix --extra-experimental-features 'nix-command flakes' develop \
-    -c scripts/build_book.sh /path/to/minfer
+nix --extra-experimental-features 'nix-command flakes' \
+    develop /path/to/minfer -c scripts/build_book.sh
 ```
+
+The flake path goes **before** `-c`: everything after `-c` is the command and its
+arguments, so `develop -c scripts/build_book.sh /path/to/minfer` hands the path to
+`build_book.sh` (`mdbook` then exits 2 with its usage line, because it was given a
+directory as a subcommand).
 
 `.envrc` is `use flake`, so with `direnv` on `PATH` and allowed the shell sets
 itself up on entry. **When it does not:** if `nix` is not on `PATH`, `direnv`
