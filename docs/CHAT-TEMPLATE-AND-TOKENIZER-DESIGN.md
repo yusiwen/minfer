@@ -78,6 +78,15 @@ filter semantics — the reference is CPython):
 | `splitlines` | CPython's line-boundary set (`\n`, `\r`, `\r\n`, `\v`, `\f`, `\x1c`-`\x1e`, `\x85`, `\u{2028}`, `\u{2029}`), optional `keepends` |
 | `ljust`, `rjust` | width plus one fill character; a longer fill is an error, as in CPython |
 
+**Two methods stay refused on purpose (#603).** `encode` returns `bytes`, which is
+not a value a chat template can concatenate into a prompt, and `format` needs
+CPython's format-spec mini-language (`{}`, `{0}`, `{:>5}`, `{!r}`) — a subsystem,
+not a method. Both are refused **by name**, exactly like any other unimplemented
+construct, so a template that needs one is a loud error and not a silently mangled
+prompt; `unknown_str_method_is_reported_as_unsupported` pins that, and `format` is
+the construct the refusal gate itself names. A model whose template requires either
+is a bug report, not a reason to grow the subset.
+
 `raise_exception(message)` is registered as a function: a template that refuses
 its own input (many published templates do) surfaces that message instead of an
 "unknown function" error. Slices with a step (`messages[::-1]`) are minijinja

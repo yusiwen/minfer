@@ -168,6 +168,11 @@ join, lower, ljust, lstrip, replace, rfind, rjust, rsplit, rstrip, split,
 splitlines, startswith, strip, title, upper.
 ```
 
+`encode` and `format` are the two deliberate exceptions to that list: `encode`
+returns bytes, which is not a template value, and `format` needs CPython's
+format-spec mini-language. Both are refused **by name** like any other
+unimplemented construct (see §2.2 of the design record), never silently ignored.
+
 The CLI exits before inference, `serve`/`viz` refuse to start (checked before the
 worker thread is spawned), and a per-request refusal is an HTTP `400`. The generic
 ChatML renderer survives only for a GGUF that has no `tokenizer.chat_template` at
