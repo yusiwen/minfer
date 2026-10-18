@@ -455,3 +455,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0051](adr/0051-hybriddna-is-the-gpt2-engine-plus-a-dna-kmer-block.md) — hybriddna is the gpt2 engine plus a DNA k-mer block
 - [ADR-0052](adr/0052-none-is-a-vocabulary-less-file-and-the-checked-entry-points-are-how-it-refuses.md) — none is a vocabulary-less file, and the checked entry points are how it refuses
 - [ADR-0053](adr/0053-whitespace-is-the-gpt2-engine-behind-a-whitespace-cut-and-has-no-artifact-gate.md) — whitespace is the gpt2 engine behind a whitespace cut, and it has no artifact gate
+- [ADR-0054](adr/0054-jina-v1-en-is-the-plain-gpt2-pre-rule.md) — jina-v1-en is the plain GPT-2 pre rule, not a Qwen variant

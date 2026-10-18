@@ -173,6 +173,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0051](./0051-hybriddna-is-the-gpt2-engine-plus-a-dna-kmer-block.md) | 2026-10-16 | hybriddna is the gpt2 engine plus a DNA k-mer block, and its vocabulary is escaped in place | Accepted (amends ADR-0045) |
 | [0052](./0052-none-is-a-vocabulary-less-file-and-the-checked-entry-points-are-how-it-refuses.md) | 2026-10-16 | none is a vocabulary-less file, and the checked entry points are how it refuses | Accepted (amends ADR-0045) |
 | [0053](./0053-whitespace-is-the-gpt2-engine-behind-a-whitespace-cut-and-has-no-artifact-gate.md) | 2026-10-17 | whitespace is the gpt2 engine behind a whitespace cut, and it has no artifact gate | Accepted (amends ADR-0045) |
+| [0054](./0054-jina-v1-en-is-the-plain-gpt2-pre-rule.md) | 2026-10-17 | jina-v1-en is the plain GPT-2 pre rule, not a Qwen variant | Accepted |
 
 ## The template
 

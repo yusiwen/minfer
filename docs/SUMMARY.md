@@ -72,6 +72,7 @@
     - [0051. hybriddna is the gpt2 engine plus a DNA k-mer block, and its vocabulary is escaped in place](./adr/0051-hybriddna-is-the-gpt2-engine-plus-a-dna-kmer-block.md)
     - [0052. none is a vocabulary-less file, and the checked entry points are how it refuses](./adr/0052-none-is-a-vocabulary-less-file-and-the-checked-entry-points-are-how-it-refuses.md)
     - [0053. whitespace is the gpt2 engine behind a whitespace cut, and it has no artifact gate](./adr/0053-whitespace-is-the-gpt2-engine-behind-a-whitespace-cut-and-has-no-artifact-gate.md)
+    - [0054. jina-v1-en is the plain GPT-2 pre rule, not a Qwen variant](./adr/0054-jina-v1-en-is-the-plain-gpt2-pre-rule.md)
 
 # Model Support
 
