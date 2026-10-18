@@ -75,6 +75,8 @@ filter semantics — the reference is CPython):
 | `lower`, `upper`, `title`, `capitalize` | |
 | `join` | sequence of strings |
 | `find`, `rfind`, `count` | substring, optional `start`/`end` |
+| `splitlines` | CPython's line-boundary set (`\n`, `\r`, `\r\n`, `\v`, `\f`, `\x1c`-`\x1e`, `\x85`, `\u{2028}`, `\u{2029}`), optional `keepends` |
+| `ljust`, `rjust` | width plus one fill character; a longer fill is an error, as in CPython |
 
 `raise_exception(message)` is registered as a function: a template that refuses
 its own input (many published templates do) surfaces that message instead of an
@@ -90,15 +92,18 @@ A template is **refused loudly** — never silently re-rendered as ChatML — wh
 2. Rendering fails: an unknown method (the callback returns
    `ErrorKind::UnknownMethod` for anything outside the table above), a value of
    the wrong type, or an undefined value in a position that requires one.
+3. A `strftime_now` directive outside the documented subset (`%Y %y %m %d %H %M
+   %S %F %T %%`) is refused by name. A literal `%Q` in a prompt is a silently
+   wrong prompt, so an unknown directive is an error, never an echo.
 
 The refusal text names the construct and the line, e.g.
 
 ```
 chat template error — unsupported template construct: unsupported Python str
-method `splitlines` (template line 41); minfer refuses to fall back to a generic
+method `format` (template line 41); minfer refuses to fall back to a generic
 ChatML prompt. Supported Python str methods: capitalize, count, endswith, find,
-join, lower, lstrip, replace, rfind, rsplit, rstrip, split, startswith, strip,
-title, upper.
+join, lower, ljust, lstrip, replace, rfind, rjust, rsplit, rstrip, split,
+splitlines, startswith, strip, title, upper.
 ```
 
 `render_messages` / `render_template` / `format_single` therefore return
@@ -115,7 +120,10 @@ ChatML is kept for exactly one case, and it is not a silent one: a GGUF with
 model-specific format to lose, the startup path prints a one-line notice, and
 `docs/USAGE.md` documents it. Every other caller now sees the refusal:
 
-* CLI (`main.rs`): template validated at load → `Error: …` on stderr, exit 1.
+* CLI (`main.rs`): the template is resolved and validated at load → `Error: …` on
+  stderr, exit 1. A GGUF with **no** template renders the same ChatML the other paths
+  render; the single-turn path used to print the notice and pass the raw prompt through
+  ([#596](https://github.com/yusiwen/minfer/issues/596)).
 * `serve` / `viz` / batch: validated at load → startup refuses; a render error
   at request time is a `400 invalid_request` carrying the message text.
 * `conversation.rs`: propagates the error instead of a wrong delta.
@@ -128,16 +136,43 @@ model-specific format to lose, the startup path prints a one-line notice, and
 The reference rendering is produced by **transformers 5.17.0**
 (`AutoTokenizer.apply_chat_template(..., tokenize=False)`), i.e. Python
 `jinja2` with the model's own `chat_template` from its
-`tokenizer_config.json`, fetched from the Hugging Face Hub. The generator is
+`tokenizer_config.json`, fetched from the Hugging Face Hub. That generator is
 `/tmp` tooling kept out of the tree; its output is committed as JSON fixtures
 under `tests/fixtures/chat/` with the provenance (model id, template source,
 generator command, date) inside each file. The engine is never its own
 reference.
 
+The **`str`-method semantics** fixture is the exception that must be
+reproducible: `scripts/gen_chat_fixtures.py` is committed, `--check` regenerates
+it from CPython and compares, and the gate asserts the fixture's method set
+**equals** `SUPPORTED_STR_METHODS` (a plain count floor could not catch a
+method being removed). ADR-0057.
+
 Cases per model: single user + generation prompt, system + user, a multi-turn
 conversation with and without `add_generation_prompt`, a `<think>`-reasoning
 assistant turn (the construct that motivated the ticket), and a Unicode/`\n`
 payload.
+
+### 2.6 Where the template comes from, and where time comes from
+
+One resolver decides the template: `template::resolve_template(embedded, file)`.
+A `--chat-template <FILE>` override wins over the GGUF's copy, and whichever
+wins is validated **there**, so all four entry points (`run`, `--cnv`, `serve`,
+`viz`) refuse the same text at the same moment. The two refusals are distinct on
+purpose: a file that cannot be read, is empty, or cannot render names the
+**file** (`chat template error — template file: <path>: …`), while an embedded
+template keeps its construct-and-line refusal. `--chat-template` together with
+`--no-template` is a startup error naming both flags — the run would carry two
+contradictory instructions about the prompt, and silently preferring one is the
+class of bug this contract exists to remove. ADR-0057.
+
+`strftime_now(fmt)` is registered against the environment's **injected clock**.
+Production passes UTC now; every test passes a fixed clock, so no gate reads the
+wall clock. The directive subset is `%Y %y %m %d %H %M %S %F %T %%`, and
+anything else is refused by name (§2.3). A clock-dependent template is
+non-deterministic for the incremental renderer, which already handles that: the
+two-pass diff reports `prefix_matched = false` and the caller re-renders the
+whole history (`CLI-CONVERSATION-PLAN.md` §5.4).
 
 ## 3. Tokenizer — accepted, refused, detected
 
@@ -422,6 +457,9 @@ return.
 | Template byte-for-byte rendering, per model | `src/template.rs` unit test over `tests/fixtures/chat/*.json` | transformers 5.17.0 `apply_chat_template` |
 | The fixture template is the model's own | `#[ignore]`d real-model test: GGUF `tokenizer.chat_template` == fixture template and rendering matches | the cached GGUF |
 | Loud refusal | unit test: an unsupported method/syntax fails and the error **names** the construct; a mutation of the callback (dropping a method) must make a previously-passing case fail | — |
+| Template provenance | unit test: the file wins over the GGUF; an unreadable, empty or unrenderable file is a refusal **naming the file**; the two flags are refused together | the resolver's contract (ADR-0057) |
+| `strftime_now` | unit test with a fixed clock: two renders are byte-identical, an unknown directive is refused by name, and a ticking clock forces `prefix_matched = false` | CPython `strftime` over the documented subset |
+| `str`-method coverage | unit test: the fixture's method set **equals** `SUPPORTED_STR_METHODS`; `python3 scripts/gen_chat_fixtures.py --check` regenerates it | CPython 3.12.3 |
 | Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (4 values, 52-54 entries each) | the `tokenizer.json` regex evaluated by CPython `regex` |
 | Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (14 cached models, eight engines; the carbon-3b fixture carries 54 shared entries **plus 8 DNA entries**, because the shared corpus would never exercise the `<dna>` rule) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5, `llama-bpe`, `lfm2`, and the SentencePiece model — for SPM the HF file is a *BPE* rendering of the vocabulary, so llama.cpp is the only reference for this engine, ADR-0045); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
 | Engine dispatch | `src/tokenizer.rs` unit test `the_tokenizer_model_is_a_dispatch` (nine accepted values — `none`/`no_vocab` included, a **missing** key refused — plus `whitespace` refused by name) | `tokenizer.ggml.model` in the artifact |
@@ -443,6 +481,7 @@ fail, revert) and the mutation result is recorded in the PR.
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0019](adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md) — A chat template that cannot be rendered refuses the load
+- [ADR-0057](adr/0057-a-template-file-overrides-the-gguf-and-time-enters-through-one-clock.md) — A template file overrides the GGUF copy, and time enters a render through one injected clock
 - [ADR-0042](adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md) — The tokenizer applies the model's declared NFC normalizer
 - [ADR-0043](adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) — A special token is declared by the file, never inferred from its name
 - [ADR-0044](adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md) — The input normalizer follows the pre-tokenizer family's declaration

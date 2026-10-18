@@ -37,7 +37,7 @@ src/
 ├── tokenizer.rs     # byte-level BPE from GGUF metadata; `tokenizer.ggml.pre` splitter
 ├── sampler.rs       # SamplerConfig pipeline: penalties → DRY → grammar → top-k/typical/top-p/min-p/XTC → temp | mirostat
 ├── grammar.rs       # F2: GBNF + JSON-schema → pushdown automaton → per-state token mask
-├── template.rs      # chat templates (minijinja + Python-str hook); loud refusal, no ChatML fallback
+├── template.rs      # chat templates (minijinja + Python-str hook); loud refusal; ChatML only for a template-less GGUF; `--chat-template FILE`
 ├── conversation.rs  # multi-turn session (append-only KV; C2 overflow drops oldest + re-ropes)
 ├── server/          # OpenAI-compatible axum server; batch.rs = continuous batching, metrics.rs = /metrics
 ├── download/mod.rs  # HuggingFace + Ollama auto-download

@@ -421,7 +421,7 @@ not know which architecture it is talking to.
 | `n_layer` | loader-loop sizing here, the graph builder's per-layer loop (doc 05), the legacy KV cache above |
 | `n_head_kv`, `n_embd_head`, `n_kv_embd` | GQA (grouped-query attention: fewer K/V heads than query heads) head mapping and strides (doc 11), and the KV region width `n_kv_embd × n_ctx` (doc 07) |
 | `n_vocab` | logits width — the sampler's input size (doc 12) |
-| `special_tokens` | the sampler's stop condition: `main.rs` fetches `eos`/`im_end` ids once and checks every sampled token against them (`main.rs:882,900,1020`) |
+| `special_tokens` | the sampler's stop condition: `main.rs` fetches `eos`/`im_end` ids once and checks every sampled token against them (`main.rs:896,900,1020`) |
 | `rope_style` | doc 11: RoPE (rotary positional encoding) has two layout styles — Qwen's non-interleaved vs Llama's interleaved — and the vec-op must be told which |
 | `as_any` | lets graph code downcast to the concrete model when it needs specifics |
 | `Send + Sync` | the HTTP server shares the model across threads (`Arc<dyn ModelDef>`) |

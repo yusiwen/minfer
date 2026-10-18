@@ -119,7 +119,12 @@ path = "src/grammar.rs"
 
 [[governs]]
 adr = "0019"
-what = "a chat template that cannot be rendered refuses the load — there is no fallback"
+what = "a chat template that cannot be rendered refuses the load — the only substitute is the announced ChatML prompt for a GGUF with no template at all"
+path = "src/template.rs"
+
+[[governs]]
+adr = "0057"
+what = "one resolver picks the template (a file beats the GGUF copy) and time enters a render only through the injected clock"
 path = "src/template.rs"
 
 [[governs]]

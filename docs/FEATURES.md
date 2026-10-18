@@ -70,8 +70,13 @@ renderings for every supported model live in `tests/fixtures/chat/`
 rendered prompt must equal them byte for byte. A template the engine cannot
 render is a **loud refusal naming the construct and the template line** — checked
 at load, so the CLI exits and the server refuses to start; the generic ChatML
-renderer applies only to a GGUF with no template at all. Design + accepted and
-refused construct sets: [CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md](./CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md).
+renderer applies only to a GGUF with no template at all, and every path (including
+the single-turn CLI) renders it. `--chat-template <FILE>` replaces the GGUF's copy
+on the CLI, `serve` and `viz`, and is validated at startup on the same terms;
+`strftime_now` is available over a fixed directive subset with time injected
+through one clock, so a clock-dependent template takes the full-re-render path
+instead of an incremental delta. Design + accepted and refused construct sets:
+[CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md](./CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md).
 
 ### Constrained decoding — grammar and JSON Schema (F2)
 
