@@ -88,6 +88,10 @@ impl PreTokenizer {
             Some("qwen2") | Some("deepseek-r1-qwen") => Ok(Self::Qwen2),
             Some("qwen35") => Ok(Self::Qwen35),
             Some("llama-bpe") | Some("llama3") | Some("llama-v3") => Ok(Self::LlamaBpe),
+            // The rest of llama.cpp's `LLAMA_VOCAB_PRE_TYPE_LLAMA3` group
+            // (`llama-vocab.cpp:2158-2169`): same regex, plus `ignore_merges`.
+            Some("falcon3") | Some("falcon-h1") | Some("pixtral") | Some("midm-2.0")
+            | Some("jina-v5-nano") => Ok(Self::LlamaBpe),
             Some("lfm2") => Ok(Self::Lfm2),
             Some("whitespace") => Ok(Self::Whitespace),
             Some("jina-v1-en") => Ok(Self::JinaV1En),
@@ -106,6 +110,14 @@ impl PreTokenizer {
                     .to_string(),
             ),
         }
+    }
+
+    /// Whether llama.cpp sets `ignore_merges` for this rule: a pre-split piece that is
+    /// **itself** a vocabulary entry is emitted whole, before the merge ranks get a
+    /// say (`llama-vocab.cpp:626-630`). True for the whole `LLAMA_VOCAB_PRE_TYPE_LLAMA3`
+    /// group (`:2155-2169`), which is where `llama-bpe` and `lfm2` sit too.
+    fn ignores_merges(self) -> bool {
+        matches!(self, Self::LlamaBpe | Self::Lfm2)
     }
 
     fn include_marks(self) -> bool {
@@ -993,6 +1005,9 @@ pub struct Tokenizer {
     unk_token: u32,
     /// Unigram (`t5`): the trie, the score bound and the charsmap.
     ugm: UgmData,
+    /// Whether a pre-split piece that is a whole vocabulary entry is emitted before
+    /// the merge ranks (llama.cpp's `ignore_merges`; set from the pre rule).
+    ignore_merges: bool,
     /// `hybriddna` only; `None` for every other engine.
     dna: Option<DnaData>,
     /// Unigram (`t5`): `tokenizer.ggml.remove_extra_whitespaces` — collapse a run
@@ -1068,6 +1083,7 @@ impl Tokenizer {
             max_token_len: 0,
             unk_token: 0,
             ugm: UgmData::default(),
+            ignore_merges: false,
             dna: None,
             remove_extra_whitespaces: false,
             special_by_first: HashMap::new(),
@@ -1113,6 +1129,7 @@ impl Tokenizer {
             max_token_len: 0,
             unk_token: 0,
             ugm: UgmData::default(),
+            ignore_merges: false,
             dna: None,
             remove_extra_whitespaces: false,
             special_by_first: HashMap::new(),
@@ -1239,6 +1256,7 @@ impl Tokenizer {
         let mut add_space_prefix = false;
         let mut spm_byte_to_id: HashMap<u8, u32> = HashMap::new();
         let mut dna: Option<DnaData> = None;
+        let mut ignore_merges = false;
         let mut normalizer = NormalizerOptions::default();
         let mut max_token_len = 0;
         let mut unk_token = 0;
@@ -1306,6 +1324,7 @@ impl Tokenizer {
                         _ => {}
                     }
                 }
+                ignore_merges = pre.ignores_merges();
                 Some(pre)
             }
             TokenizerModel::Spm => {
@@ -1591,6 +1610,7 @@ impl Tokenizer {
             max_token_len,
             unk_token,
             ugm,
+            ignore_merges,
             remove_extra_whitespaces,
             special_by_first,
             bos_token,
@@ -1732,6 +1752,14 @@ impl Tokenizer {
         let mut result = Vec::new();
         for piece in pre.split(text) {
             let encoded = byte_encode(piece, &self.byte_to_unicode);
+            // `ignore_merges`: a piece that is itself a vocabulary entry is emitted
+            // whole, before the merge ranks (`llama-vocab.cpp:626-630`).
+            if self.ignore_merges {
+                if let Some(&id) = self.vocab.get(&encoded) {
+                    result.push(id);
+                    continue;
+                }
+            }
             result.extend(self.bpe_encode(&encoded));
         }
         result
