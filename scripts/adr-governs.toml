@@ -276,3 +276,8 @@ symbol = "encode_bpe"
 adr = "0054"
 what = "`jina-v1-en` is the plain GPT-2 pre rule: space-prefixed pieces, unlimited digit runs, no newline arm"
 symbol = "split"
+
+[[governs]]
+adr = "0055"
+what = "`ignore_merges` emits a whole-vocabulary piece before the merge ranks; the llama3 pre group sets it"
+symbol = "ignores_merges"
