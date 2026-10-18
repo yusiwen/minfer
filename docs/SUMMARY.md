@@ -73,6 +73,7 @@
     - [0052. none is a vocabulary-less file, and the checked entry points are how it refuses](./adr/0052-none-is-a-vocabulary-less-file-and-the-checked-entry-points-are-how-it-refuses.md)
     - [0053. whitespace is the gpt2 engine behind a whitespace cut, and it has no artifact gate](./adr/0053-whitespace-is-the-gpt2-engine-behind-a-whitespace-cut-and-has-no-artifact-gate.md)
     - [0054. jina-v1-en is the plain GPT-2 pre rule, not a Qwen variant](./adr/0054-jina-v1-en-is-the-plain-gpt2-pre-rule.md)
+    - [0055. ignore_merges is a whole-piece shortcut, and the llama3 pre group sets it](./adr/0055-ignore-merges-is-a-whole-piece-shortcut-and-the-llama3-group-sets-it.md)
 
 # Model Support
 
