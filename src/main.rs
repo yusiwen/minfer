@@ -1194,6 +1194,20 @@ fn main() {
         }
     }
 
+    // #601: the file half of the override is decided **before the model loads** —
+    // it needs no GGUF, so a missing or unrenderable template costs a file read
+    // instead of a 0.6B-weight load, and the refusal is the process's exit status.
+    let chat_template_override: Option<String> = match chat_template_file.as_deref() {
+        Some(path) => match template::load_template_file(std::path::Path::new(path)) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("Error: {}", e.message());
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     // Resolve paths, hf:/ollama: URIs, and cached model names.
     let is_uri = model_path.starts_with("hf:")
         || model_path.starts_with("ollama:")
@@ -1436,7 +1450,7 @@ fn main() {
             server_n_slots,
             server_spec,
             server_slots_file,
-            chat_template_file.as_deref().map(std::path::Path::new),
+            chat_template_override.as_deref(),
         );
         return;
     }
@@ -1454,7 +1468,7 @@ fn main() {
             viz_port,
             params.n_ctx,
             1,
-            chat_template_file.as_deref().map(std::path::Path::new),
+            chat_template_override.as_deref(),
         );
         return;
     }
@@ -1486,7 +1500,7 @@ fn main() {
             model,
             &tokenizer,
             &gguf_model.parts[0].data,
-            chat_template_file.as_deref(),
+            chat_template_override.as_deref(),
             &params,
             system_prompt,
             single_turn,
@@ -1539,7 +1553,7 @@ fn main() {
     } else {
         match template::render_single_turn(
             get_chat_template(&gguf_model.parts[0].data).as_deref(),
-            chat_template_file.as_deref().map(std::path::Path::new),
+            chat_template_override.as_deref(),
             &prompt,
             bos_text,
         ) {
@@ -2139,7 +2153,7 @@ fn run_conversation(
     model: Box<dyn models::ModelDef>,
     tokenizer: &tokenizer::Tokenizer,
     gguf_data: &[u8],
-    template_file: Option<&str>,
+    template_override: Option<&str>,
     params: &GenParams,
     system_prompt: Option<String>,
     single_turn: bool,
@@ -2156,7 +2170,7 @@ fn run_conversation(
     // GGUF's copy, and whichever wins is validated before the first turn.
     let template = match template::resolve_template(
         get_chat_template(gguf_data).as_deref(),
-        template_file.map(std::path::Path::new),
+        template_override,
     ) {
         Ok(t) => t,
         Err(e) => {

@@ -68,9 +68,9 @@ pub fn run_viz(
     port: u16,
     n_ctx: usize,
     n_slots: usize,
-    // S1 (#133): a `--chat-template <FILE>` override, resolved and validated
-    // before the worker exists.
-    template_file: Option<&std::path::Path>,
+    // S1 (#133) + #601: the `--chat-template <FILE>` override, already read and
+    // validated before the model loaded; the resolver below still re-checks it.
+    template_override: Option<&str>,
 ) {
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = super::slot::new_slots(n_slots, n_ctx);
@@ -122,12 +122,13 @@ pub fn run_viz(
     // template before the worker thread exists.
     let template = match crate::template::resolve_template(
         super::chat_template_from_gguf(&gguf.parts[0].data).as_deref(),
-        template_file,
+        template_override,
     ) {
         Ok(t) => t,
         Err(e) => {
+            // #601: a refused startup is a non-zero exit.
             eprintln!("Error: {}", e.message());
-            return;
+            std::process::exit(1);
         }
     };
     if template.is_none() {

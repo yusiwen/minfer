@@ -338,26 +338,29 @@ fn temp_template(name: &str, body: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn resolve_template_prefers_the_file_and_validates_it() {
+fn resolve_template_prefers_the_override_text_and_validates_it() {
     let tmpl = "{% for m in messages %}{{ m['role'] }}:{{ m['content'] }};{% endfor %}";
-    let path = temp_template("ok.jinja", tmpl);
-    let resolved = resolve_template(Some("EMBEDDED"), Some(&path)).unwrap();
+    let resolved = resolve_template(Some("EMBEDDED"), Some(tmpl)).unwrap();
     assert_eq!(
         resolved.as_deref(),
         Some(tmpl),
-        "the file wins over the GGUF"
+        "the override text wins over the GGUF"
     );
     assert_eq!(
         resolve_template(Some("EMBEDDED"), None).unwrap().as_deref(),
         Some("EMBEDDED")
     );
     assert_eq!(resolve_template(None, None).unwrap(), None);
+    // The resolver re-validates whatever it is handed, so a caller cannot skip the
+    // check by passing unvalidated text.
+    let err = resolve_template(None, Some("{{ messages[0]['content'].format() }}")).unwrap_err();
+    assert_eq!(err.kind, "unsupported template construct");
 }
 
 #[test]
-fn resolve_template_refuses_an_unreadable_empty_or_unrenderable_file() {
+fn load_template_file_refuses_a_missing_empty_or_unrenderable_file() {
     let missing = std::env::temp_dir().join("minfer-tpl-does-not-exist.jinja");
-    let err = resolve_template(None, Some(&missing)).unwrap_err();
+    let err = load_template_file(&missing).unwrap_err();
     assert_eq!(err.kind, "template file");
     assert!(
         err.message().contains("does-not-exist"),
@@ -366,18 +369,26 @@ fn resolve_template_refuses_an_unreadable_empty_or_unrenderable_file() {
     );
 
     let empty = temp_template("empty.jinja", "  \n");
-    let err = resolve_template(None, Some(&empty)).unwrap_err();
+    let err = load_template_file(&empty).unwrap_err();
     assert!(err.message().contains("empty"), "{}", err.message());
 
     let bad = temp_template("bad.jinja", "{{ messages[0]['content'].format() }}");
-    let err = resolve_template(None, Some(&bad)).unwrap_err();
+    let err = load_template_file(&bad).unwrap_err();
     assert_eq!(err.kind, "template file");
     assert!(err.message().contains("bad.jinja"), "{}", err.message());
+    assert!(err.message().contains("format"), "{}", err.message());
+    assert!(
+        err.message().contains("template line 1"),
+        "the file's refusal keeps the line: {}",
+        err.message()
+    );
 
-    // An embedded template's refusal is passed through unchanged (it names the
-    // construct, not a file).
-    let err = resolve_template(Some("{{ messages[0]['content'].format() }}"), None).unwrap_err();
-    assert_eq!(err.kind, "unsupported template construct");
+    // A good file round-trips its text unchanged.
+    let good = temp_template("good.jinja", "U:{{ messages[0]['content'] }}");
+    assert_eq!(
+        load_template_file(&good).unwrap(),
+        "U:{{ messages[0]['content'] }}"
+    );
 }
 
 #[test]
@@ -401,7 +412,8 @@ fn a_template_less_gguf_renders_chatml_and_the_notice_describes_it() {
 #[test]
 fn a_supplied_template_renders_without_the_chatml_notice() {
     let path = temp_template("single.jinja", "U:{{ messages[0]['content'] }}");
-    let r = render_single_turn(Some("EMBEDDED"), Some(&path), "hi", "").unwrap();
+    let text = load_template_file(&path).unwrap();
+    let r = render_single_turn(Some("EMBEDDED"), Some(&text), "hi", "").unwrap();
     assert!(!r.chatml_notice);
     assert_eq!(r.text, "U:hi");
 }

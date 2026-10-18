@@ -674,42 +674,44 @@ fn environment_with_clock(clock: fn() -> CivilTime) -> Environment<'static> {
     env
 }
 
+/// Read, reject-empty and validate a `--chat-template <FILE>`.
+///
+/// This is the **I/O half** of the override, split from the choice itself so the
+/// caller can run it before the model loads: a broken template file then costs a
+/// file read, not a 0.6B-weight load (#601). Every refusal names the file.
+pub fn load_template_file(path: &Path) -> Result<String, TemplateError> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| TemplateError::file(path, e.to_string()))?;
+    if text.trim().is_empty() {
+        return Err(TemplateError::file(path, "the template file is empty"));
+    }
+    if let Err(e) = validate(&text) {
+        let at = e
+            .line
+            .map(|n| format!(" (template line {n})"))
+            .unwrap_or_default();
+        return Err(TemplateError::file(path, format!("{}{}", e.detail, at)));
+    }
+    Ok(text)
+}
+
 /// The single place that decides which template a run uses.
 ///
-/// A `--chat-template <FILE>` override wins over the GGUF's copy; whichever is
-/// chosen is validated here, so every entry point refuses the same text at the
-/// same moment. `Ok(None)` is the documented ChatML case (no template anywhere)
-/// — the caller announces it, it is never silent.
+/// A `--chat-template <FILE>` override (its text, already loaded and validated by
+/// `load_template_file`) wins over the GGUF's copy; whichever is chosen is
+/// re-validated here, so no caller can skip the check. `Ok(None)` is the
+/// documented ChatML case (no template anywhere) — the caller announces it, it is
+/// never silent.
 pub fn resolve_template(
     embedded: Option<&str>,
-    file: Option<&Path>,
+    override_text: Option<&str>,
 ) -> Result<Option<String>, TemplateError> {
-    let chosen = match file {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| TemplateError::file(path, e.to_string()))?;
-            if text.trim().is_empty() {
-                return Err(TemplateError::file(path, "the template file is empty"));
-            }
-            Some(text)
-        }
+    let chosen = match override_text {
+        Some(text) => Some(text.to_string()),
         None => embedded.map(str::to_string),
     };
     if let Some(text) = chosen.as_deref() {
-        if let Err(e) = validate(text) {
-            // A file's refusal names the file; an embedded one already names the
-            // model's template, so it is passed through unchanged.
-            return Err(match file {
-                Some(path) => {
-                    let at = e
-                        .line
-                        .map(|n| format!(" (template line {n})"))
-                        .unwrap_or_default();
-                    TemplateError::file(path, format!("{}{}", e.detail, at))
-                }
-                None => e,
-            });
-        }
+        validate(text)?;
     }
     Ok(chosen)
 }
@@ -944,11 +946,11 @@ pub struct SingleTurnPrompt {
 /// prompt) and is refused alongside `--chat-template`.
 pub fn render_single_turn(
     embedded: Option<&str>,
-    file: Option<&Path>,
+    override_text: Option<&str>,
     prompt: &str,
     bos_token: &str,
 ) -> Result<SingleTurnPrompt, TemplateError> {
-    match resolve_template(embedded, file)? {
+    match resolve_template(embedded, override_text)? {
         Some(template) => Ok(SingleTurnPrompt {
             text: render_template(&template, prompt, true, bos_token)?,
             chatml_notice: false,

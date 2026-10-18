@@ -33,8 +33,12 @@ and then passed the raw prompt through; `--cnv`, `serve` and `viz` rendered real
 ## Decision
 
 **1. One resolver decides the template, and a file beats the GGUF.**
-`template::resolve_template(embedded, file) -> Result<Option<String>, TemplateError>`
-is the only place the choice is made and the only place either source is validated.
+`template::resolve_template(embedded, override_text) -> Result<Option<String>, TemplateError>`
+is the only place the choice is made, and it re-validates whichever copy wins.
+(#601 later split the I/O half — read, empty check, first validation — into
+`template::load_template_file` so a broken file refuses before the model loads;
+the choice and the re-validation stay in the resolver, so this decision is
+unchanged.)
 Every entry point calls it; a `--chat-template <FILE>` whose text is unreadable,
 empty, or unrenderable is a refusal that names the file (the embedded arm keeps its
 construct-and-line refusal unchanged). `Ok(None)` remains the documented ChatML case.
@@ -84,6 +88,8 @@ artifact produces one prompt (#596).
   refuses at startup, with the file named.
 - `strftime_now` renders for templates that print a date; the incremental renderer
   takes the full-re-render path for them, and the test proves it with a ticking clock.
+- A `--chat-template` refusal is a **non-zero exit on every entry point**, before the
+  model loads (#601); `serve`/`viz` used to print the refusal and exit 0.
 - The `str` method set grows by `splitlines`, `ljust`, `rjust`, each with a
   CPython-generated fixture case; `encode` and `format` stay refused **by name** (bytes
   are not a template value; `format` needs a format-spec subsystem).
