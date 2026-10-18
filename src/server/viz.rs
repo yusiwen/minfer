@@ -120,22 +120,21 @@ pub fn run_viz(
 
     // F7 (#50) + S1 (#133): one resolver, refusing to start with an unrenderable
     // template before the worker thread exists.
-    let template = match crate::template::resolve_template(
+    let startup = match crate::template::startup_template(
         super::chat_template_from_gguf(&gguf.parts[0].data).as_deref(),
         template_override,
     ) {
-        Ok(t) => t,
+        Ok(s) => s,
         Err(e) => {
             // #601: a refused startup is a non-zero exit.
             eprintln!("Error: {}", e.message());
             std::process::exit(1);
         }
     };
-    if template.is_none() {
-        eprintln!(
-            "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
-        );
+    if startup.announce_chatml {
+        eprintln!("{}", crate::template::CHATML_NOTICE);
     }
+    let template = startup.text;
 
     let worker_tokenizer = tokenizer.clone();
     // F8: the viz server publishes into the same registry shape as `minfer serve`

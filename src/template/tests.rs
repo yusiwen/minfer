@@ -410,6 +410,36 @@ fn a_template_less_gguf_renders_chatml_and_the_notice_describes_it() {
 }
 
 #[test]
+fn startup_template_pairs_the_notice_with_the_choice() {
+    let none = startup_template(None, None).unwrap();
+    assert!(
+        none.announce_chatml,
+        "no template anywhere is the announced case"
+    );
+    assert!(none.text.is_none());
+
+    let embedded = startup_template(Some("U:{{ messages[0]['content'] }}"), None).unwrap();
+    assert!(!embedded.announce_chatml);
+    assert_eq!(
+        embedded.text.as_deref(),
+        Some("U:{{ messages[0]['content'] }}")
+    );
+
+    let over = startup_template(None, Some("V:{{ messages[0]['content'] }}")).unwrap();
+    assert!(
+        !over.announce_chatml,
+        "a file override is not the ChatML case"
+    );
+    assert_eq!(over.text.as_deref(), Some("V:{{ messages[0]['content'] }}"));
+
+    let err = startup_template(None, Some("{{ messages[0]['content'].format() }}")).unwrap_err();
+    assert_eq!(err.kind, "unsupported template construct");
+
+    // One constant for four call sites, so the wording cannot drift.
+    assert!(CHATML_NOTICE.contains("no tokenizer.chat_template"));
+}
+
+#[test]
 fn a_supplied_template_renders_without_the_chatml_notice() {
     let path = temp_template("single.jinja", "U:{{ messages[0]['content'] }}");
     let text = load_template_file(&path).unwrap();
@@ -586,6 +616,62 @@ fn model_templates_render_byte_for_byte() {
             "{slug}: {names:?}"
         );
     }
+}
+
+/// The override path has its own byte-for-byte gate (#602): each model fixture's
+/// template is written to a file, loaded through the real I/O path, and rendered
+/// against the same transformers reference. A stray newline or a BOM on the way
+/// through the file would fail here, where the in-memory test above cannot.
+#[test]
+fn an_override_file_renders_the_committed_reference_byte_for_byte() {
+    let mut cases_checked = 0;
+    for (slug, raw) in CHAT_FIXTURES {
+        let fx: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let template = fx["template"].as_str().unwrap();
+        let bos = fx["bos_token"].as_str().unwrap_or("");
+        let path = temp_template(&format!("{slug}.jinja"), template);
+        let loaded = load_template_file(&path).unwrap_or_else(|e| {
+            panic!(
+                "{slug}: the fixture's own template must load: {}",
+                e.message()
+            )
+        });
+        assert_eq!(
+            loaded, template,
+            "{slug}: the file round-trip changed the template"
+        );
+        let resolved = resolve_template(None, Some(&loaded))
+            .unwrap()
+            .expect("the override is a template");
+        assert_eq!(resolved, template);
+        for case in fx["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let msgs: Vec<(String, Option<String>)> = case["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    (
+                        m["role"].as_str().unwrap().to_string(),
+                        m["content"].as_str().map(str::to_string),
+                    )
+                })
+                .collect();
+            let add_gen = case["add_generation_prompt"].as_bool().unwrap();
+            let got = render_messages(&resolved, &msgs, add_gen, bos)
+                .unwrap_or_else(|e| panic!("{slug}/{name} refused: {}", e.message()));
+            assert_eq!(
+                got,
+                case["expected"].as_str().unwrap(),
+                "{slug}/{name}: the override path rendered different bytes"
+            );
+            cases_checked += 1;
+        }
+    }
+    assert_eq!(
+        cases_checked, 28,
+        "4 fixtures x 7 cases must all be checked through the override"
+    );
 }
 
 #[test]

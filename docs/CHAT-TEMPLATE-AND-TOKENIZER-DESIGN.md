@@ -172,6 +172,12 @@ non-zero exit on every entry point (`serve`/`viz` included since #601).
 contradictory instructions about the prompt, and silently preferring one is the
 class of bug this contract exists to remove. ADR-0057.
 
+The no-template case is announced, and the announcement is a value, not an inline
+`if`: `template::startup_template` returns the text **and** `announce_chatml`, and
+`template::CHATML_NOTICE` is the one wording all four entry points print (#602).
+The single-turn path gets the same pair from `render_single_turn`, so a notice can
+never describe a prompt the render did not produce.
+
 `strftime_now(fmt)` is registered against the environment's **injected clock**.
 Production passes UTC now; every test passes a fixed clock, so no gate reads the
 wall clock. The directive subset is `%Y %y %m %d %H %M %S %F %T %%`, and
@@ -466,6 +472,9 @@ return.
 | Template provenance | unit test: the file wins over the GGUF; an unreadable, empty or unrenderable file is a refusal **naming the file**; the two flags are refused together | the resolver's contract (ADR-0057) |
 | `strftime_now` | unit test with a fixed clock: two renders are byte-identical, an unknown directive is refused by name, and a ticking clock forces `prefix_matched = false` | CPython `strftime` over the documented subset |
 | `str`-method coverage | unit test: the fixture's method set **equals** `SUPPORTED_STR_METHODS`; `python3 scripts/gen_chat_fixtures.py --check` regenerates it | CPython 3.12.3 |
+| Override path, byte for byte | unit test: each model fixture's template is written to a file, loaded through `load_template_file`, and rendered against the same transformers reference (4 × 7 cases, 28 checked) — a stray newline fails it | transformers 5.17.0 (`tests/fixtures/chat/*.json`) |
+| The notice is a returned value | unit test: `startup_template` reports `announce_chatml` with the text it describes, for none/embedded/override/refused | the pairing contract (#602) |
+| `serve` with an override | `#[ignore]`d e2e: `serve --chat-template <good file>` prints its listening banner and `/health` answers `{"status":"ok"}` | the running server |
 | Pre-tokenization split | `src/tokenizer.rs` unit test over `tests/fixtures/tokenizer/split_*.json` (4 values, 52-54 entries each) | the `tokenizer.json` regex evaluated by CPython `regex` |
 | Token-id equality | `#[ignore]`d real-model test over `tests/fixtures/tokenizer/ids_*.json` (14 cached models, eight engines; the carbon-3b fixture carries 54 shared entries **plus 8 DNA entries**, because the shared corpus would never exercise the `<dna>` rule) | transformers `AutoTokenizer.encode` (Qwen2.5/Qwen3) or llama.cpp `llama-tokenize` on the same GGUF (Qwen3.5, `llama-bpe`, `lfm2`, and the SentencePiece model — for SPM the HF file is a *BPE* rendering of the vocabulary, so llama.cpp is the only reference for this engine, ADR-0045); the two agree on all 52 corpus entries where both exist (measured for `llama-bpe` too, 2026-10-15: llama.cpp and HuggingFace `tokenizers` agree 52/52) |
 | Engine dispatch | `src/tokenizer.rs` unit test `the_tokenizer_model_is_a_dispatch` (nine accepted values — `none`/`no_vocab` included, a **missing** key refused — plus `whitespace` refused by name) | `tokenizer.ggml.model` in the artifact |

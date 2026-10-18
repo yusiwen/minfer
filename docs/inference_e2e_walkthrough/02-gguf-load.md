@@ -1015,9 +1015,9 @@ redundancy is an assertion.
 
 - **`minfer info <model>`** (`src/main.rs:1084`) runs this exact stage and
   dumps its output instead of continuing: you get the full metadata KV dump
-  (`dump_gguf_metadata`, `src/main.rs:2498` — every key with its type and
+  (`dump_gguf_metadata`, `src/main.rs:2495` — every key with its type and
   value, arrays itemized) followed by `dump_key_tensors`' name/type/shape
-  table (`src/main.rs:2553`). On the 0.5B Q4_0 file: `n_kv=26`, `n_tensors=291`,
+  table (`src/main.rs:2550`). On the 0.5B Q4_0 file: `n_kv=26`, `n_tensors=291`,
   `general.architecture = "qwen2"`, `qwen2.block_count = 24`,
   `output.weight` q8_0 `[896,151936]`, `token_embd.weight` q4_0 `[896,151936]`.
 - **The normal startup lines** are this stage's stdout: `Loading model: …`,

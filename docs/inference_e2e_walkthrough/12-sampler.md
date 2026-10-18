@@ -320,7 +320,7 @@ picks one. Three sub-steps, all in `sample_temperature`
    (`src/sampler.rs:`). The dart comes from `rng.gen()` — one
    uniform `f32` in [0, 1) per generated token — from a **seeded** random
    number generator: `StdRng::seed_from_u64(params.seed)`, default seed 42
-   (`src/main.rs:1711`). A *seed* is the starting state of a pseudo-random
+   (`src/main.rs:1709`). A *seed* is the starting state of a pseudo-random
    generator: same seed in, same sequence of "random" numbers out — which
    is why the same command produces the same text even while sampling
    (§3.3's fourth design question covers why minfer wants that).
@@ -394,7 +394,7 @@ the stage order, elided only where a stage is long; the order *is* the design:
 
 ```rust
 // src/sampler.rs:1067 — the pipeline; `sample_with_config` (:1181) is the
-// unconstrained wrapper the CLI calls (`src/main.rs:1764`)
+// unconstrained wrapper the CLI calls (`src/main.rs:1762`)
 pub fn sample_with_config_grammar<R: Rng>(
     logits: &mut [f32], cfg: &SamplerConfig, prev_tokens: &[u32],
     mirostat: &mut MirostatState, grammar: &mut Option<GrammarState>,
@@ -498,12 +498,12 @@ pub fn recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
     tokens[start..].to_vec()
 }
 
-// src/main.rs:1708-1713 — seeded once, window seeded from the PROMPT tail
+// src/main.rs:1706-1711 — seeded once, window seeded from the PROMPT tail
     let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
     const REPEAT_LAST_N: usize = 64;
     let mut prev_tokens = sampler::recent_window(&input_ids, REPEAT_LAST_N);
 
-// src/main.rs:1898-1901 — every sampled token enters the window
+// src/main.rs:1896-1899 — every sampled token enters the window
         generated.push(sampled.token_id);
         prev_tokens.push(sampled.token_id);
         if prev_tokens.len() > REPEAT_LAST_N {
@@ -925,7 +925,7 @@ run even when the stochastic stages are skipped.
 - **The sampler destroys its input buffer** (it holds probabilities after
   `sample_temperature`). The caller-side invariant that makes this safe:
   `logits` is reassigned from the next forward before it is ever read
-  again (`src/main.rs:1926`). Reading `logits` between sample and reassign
+  again (`src/main.rs:1924`). Reading `logits` between sample and reassign
   would read probabilities and call them logits.
 
 ## 4. Observe & verify

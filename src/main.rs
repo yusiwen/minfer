@@ -1559,9 +1559,7 @@ fn main() {
         ) {
             Ok(r) => {
                 if r.chatml_notice {
-                    eprintln!(
-                        "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
-                    );
+                    eprintln!("{}", template::CHATML_NOTICE);
                 }
                 r.text
             }
@@ -2168,21 +2166,20 @@ fn run_conversation(
 
     // One resolver (#133 S1): a `--chat-template <FILE>` override beats the
     // GGUF's copy, and whichever wins is validated before the first turn.
-    let template = match template::resolve_template(
+    let startup = match template::startup_template(
         get_chat_template(gguf_data).as_deref(),
         template_override,
     ) {
-        Ok(t) => t,
+        Ok(s) => s,
         Err(e) => {
             eprintln!("Error: {}", e.message());
             return 1;
         }
     };
-    if template.is_none() {
-        eprintln!(
-            "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
-        );
+    if startup.announce_chatml {
+        eprintln!("{}", template::CHATML_NOTICE);
     }
+    let template = startup.text;
     let special = model.special_tokens();
     let bos_text = tokenizer
         .id_to_token

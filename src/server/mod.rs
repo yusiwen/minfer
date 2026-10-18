@@ -122,11 +122,11 @@ pub fn run(
     // before the worker starts, so an unrenderable one refuses to serve instead
     // of 500-ing per request. A GGUF with no template at all still uses ChatML,
     // and says so once.
-    let template = match crate::template::resolve_template(
+    let startup = match crate::template::startup_template(
         chat_template_from_gguf(&gguf.parts[0].data).as_deref(),
         template_override,
     ) {
-        Ok(t) => t,
+        Ok(s) => s,
         Err(e) => {
             // #601: a refused startup is a non-zero exit, like every other one in
             // this function (the bind failure below uses the same status).
@@ -134,11 +134,10 @@ pub fn run(
             std::process::exit(1);
         }
     };
-    if template.is_none() {
-        eprintln!(
-            "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
-        );
+    if startup.announce_chatml {
+        eprintln!("{}", crate::template::CHATML_NOTICE);
     }
+    let template = startup.text;
 
     // F8: a completion signal, so `run` can wait for the worker *boundedly* after
     // a clean drain instead of joining it (see `serve_with_shutdown`).
