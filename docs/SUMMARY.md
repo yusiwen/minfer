@@ -74,6 +74,7 @@
     - [0053. whitespace is the gpt2 engine behind a whitespace cut, and it has no artifact gate](./adr/0053-whitespace-is-the-gpt2-engine-behind-a-whitespace-cut-and-has-no-artifact-gate.md)
     - [0054. jina-v1-en is the plain GPT-2 pre rule, not a Qwen variant](./adr/0054-jina-v1-en-is-the-plain-gpt2-pre-rule.md)
     - [0055. ignore_merges is a whole-piece shortcut, and the llama3 pre group sets it](./adr/0055-ignore-merges-is-a-whole-piece-shortcut-and-the-llama3-group-sets-it.md)
+    - [0056. A missing byte token is accepted only when no token can reach it](./adr/0056-a-missing-byte-token-is-accepted-only-when-no-token-can-reach-it.md)
 
 # Model Support
 
