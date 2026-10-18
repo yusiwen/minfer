@@ -325,6 +325,39 @@ fn hybriddna_wraps_the_block_in_its_tags_and_stops_at_eof() {
     assert_eq!(t.hybriddna_encode(""), Vec::<u32>::new());
 }
 
+// === S3: the plain GPT-2 pre rule (`jina-v1-en`) ===========================
+
+#[test]
+fn the_jina_v1_en_rule_is_the_plain_gpt2_split() {
+    use PreTokenizer::JinaV1En as G;
+    assert_eq!(G.split("hello world"), vec!["hello", " world"]);
+    assert_eq!(G.split("12 345"), vec!["12", " 345"]);
+    // `\s+(?!\S)`: the last space of a run before a non-space stays for the next
+    // piece; the rest is its own piece (the Qwen rules emit `\s*[\r\n]+` instead).
+    assert_eq!(G.split("a  b"), vec!["a", " ", " b"]);
+    // A run of two newlines before a letter: `\s+(?!\S)` matches only the first
+    // one (the next char is whitespace), then `\s+` takes the second.
+    assert_eq!(G.split("x\n\ny"), vec!["x", "\n", "\n", "y"]);
+    assert_eq!(G.split("it's!!!"), vec!["it", "'s", "!!!"]);
+    // Digits group without limit (Qwen: one per piece, Llama 3.x: three).
+    assert_eq!(G.split("1234567890"), vec!["1234567890"]);
+    // Every split tiles its input exactly — no character dropped or duplicated.
+    for text in [
+        "hello world",
+        "a  b",
+        "x\n\ny",
+        "it's!!!",
+        "  ",
+        "",
+        "a",
+        "\t\n",
+    ] {
+        assert_eq!(G.split(text).concat(), text, "tiling failed for {text:?}");
+    }
+    assert!(!G.applies_nfc());
+    assert_eq!(G.number_run(), usize::MAX);
+}
+
 // === #132 S4: the whitespace engine =======================================
 
 #[test]
@@ -1525,6 +1558,7 @@ impl PreTokenizer {
             Self::Lfm2 => "lfm2",
             Self::Gemma4 => "gemma4",
             Self::Whitespace => "whitespace",
+            Self::JinaV1En => "jina-v1-en",
         }
     }
 }

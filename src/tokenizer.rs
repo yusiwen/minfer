@@ -68,6 +68,12 @@ pub enum PreTokenizer {
     /// normalizer either. It is its own variant so the fixture and the refusal
     /// name the value the file actually carries.
     Lfm2,
+    /// `jina-v1-en`: the **plain GPT-2** rule —
+    /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)`.
+    /// A piece may start with **one space** (the other rules allow a preceding
+    /// non-letter instead), digits group without limit, the symbol arm has no
+    /// trailing-newline tail, and there is no `\s*[\r\n]+` arm.
+    JinaV1En,
     /// `whitespace`: Jina's rule (llama.cpp #18756) — the text is cut on Unicode
     /// whitespace, the whitespace itself is **dropped**, and each remaining run is
     /// BPE'd on its own. With this rule the engine also turns lower-casing off
@@ -84,6 +90,7 @@ impl PreTokenizer {
             Some("llama-bpe") | Some("llama3") | Some("llama-v3") => Ok(Self::LlamaBpe),
             Some("lfm2") => Ok(Self::Lfm2),
             Some("whitespace") => Ok(Self::Whitespace),
+            Some("jina-v1-en") => Ok(Self::JinaV1En),
             Some("gemma4") => Ok(Self::Gemma4),
             Some(other) => Err(format!(
                 "tokenizer.ggml.pre = \"{other}\" is not supported by minfer's byte-level BPE \
@@ -113,6 +120,8 @@ impl PreTokenizer {
             // `gemma4` and `whitespace` never reach the letter/number arms (their own
             // splits run), so this is the unused arm of an exhaustive match.
             Self::Qwen2 | Self::Qwen35 | Self::Gemma4 | Self::Whitespace => 1,
+            // The plain GPT-2 rule groups digits without limit.
+            Self::JinaV1En => usize::MAX,
         }
     }
 
@@ -135,7 +144,7 @@ impl PreTokenizer {
     pub fn applies_nfc(self) -> bool {
         match self {
             Self::Qwen2 | Self::Qwen35 => true,
-            Self::LlamaBpe | Self::Lfm2 | Self::Gemma4 | Self::Whitespace => false,
+            Self::LlamaBpe | Self::Lfm2 | Self::Gemma4 | Self::Whitespace | Self::JinaV1En => false,
         }
     }
 
@@ -149,6 +158,85 @@ impl PreTokenizer {
     /// implemented as a scan rather than a `regex` pattern because the crate has
     /// no lookahead.
     pub fn split<'a>(self, text: &'a str) -> Vec<&'a str> {
+        if self == Self::JinaV1En {
+            // `(?i:'s|'t|'re|'ve|'m|'ll|'d)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`
+            // — see the variant's doc comment for how it differs from the others.
+            let chars: Vec<(usize, char)> = text.char_indices().collect();
+            let n = chars.len();
+            let byte_of = |k: usize| chars.get(k).map(|&(b, _)| b).unwrap_or(text.len());
+            let symbol = |c: char| !c.is_whitespace() && !is_letter(c) && !is_number(c);
+            let mut out: Vec<&str> = Vec::new();
+            let mut i = 0usize;
+            while i < n {
+                let start = i;
+                let c = chars[i].1;
+                let next = chars.get(i + 1).map(|&(_, x)| x);
+                if c == '\'' {
+                    let l1 = next.map(|x| x.to_ascii_lowercase());
+                    let two = matches!(l1, Some('s' | 't' | 'm' | 'd'));
+                    let three = matches!(
+                        (l1, chars.get(i + 2).map(|&(_, x)| x.to_ascii_lowercase())),
+                        (Some('r'), Some('e')) | (Some('v'), Some('e')) | (Some('l'), Some('l'))
+                    );
+                    if two {
+                        i += 2;
+                    } else if three {
+                        i += 3;
+                    } else {
+                        i += 1;
+                        while i < n && symbol(chars[i].1) {
+                            i += 1;
+                        }
+                    }
+                } else if c == ' ' && next.map(is_letter).unwrap_or(false) {
+                    i += 1;
+                    while i < n && is_letter(chars[i].1) {
+                        i += 1;
+                    }
+                } else if is_letter(c) {
+                    i += 1;
+                    while i < n && is_letter(chars[i].1) {
+                        i += 1;
+                    }
+                } else if c == ' ' && next.map(is_number).unwrap_or(false) {
+                    i += 1;
+                    while i < n && is_number(chars[i].1) {
+                        i += 1;
+                    }
+                } else if is_number(c) {
+                    i += 1;
+                    while i < n && is_number(chars[i].1) {
+                        i += 1;
+                    }
+                } else if c == ' ' && next.map(symbol).unwrap_or(false) {
+                    i += 1;
+                    while i < n && symbol(chars[i].1) {
+                        i += 1;
+                    }
+                } else if c != ' ' && symbol(c) {
+                    i += 1;
+                    while i < n && symbol(chars[i].1) {
+                        i += 1;
+                    }
+                } else if c.is_whitespace() {
+                    let mut j = i;
+                    while j < n && chars[j].1.is_whitespace() {
+                        j += 1;
+                    }
+                    // `\s+(?!\S)`: when a non-space follows a run of **two or more**,
+                    // the last space stays for the next piece (` ?`); a single space is
+                    // its own piece (the rule's final `\s+` alternative); at end of
+                    // input the whole run goes.
+                    i = if j < n && j - i > 1 { j - 1 } else { j };
+                } else {
+                    i += 1;
+                }
+                if byte_of(i) > byte_of(start) {
+                    out.push(&text[byte_of(start)..byte_of(i)]);
+                }
+            }
+            return out;
+        }
         if self == Self::Whitespace {
             // `\s+` dropped, everything between kept: the segmenting the whitespace
             // session performs before it hands a run to the BPE tables.
