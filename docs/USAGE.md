@@ -162,17 +162,40 @@ prompt:
 
 ```
 Error: chat template error — unsupported template construct: unsupported Python str
-method `splitlines` (template line 41); minfer refuses to fall back to a generic
+method `format` (template line 41); minfer refuses to fall back to a generic
 ChatML prompt. Supported Python str methods: capitalize, count, endswith, find,
-join, lower, lstrip, replace, rfind, rsplit, rstrip, split, startswith, strip,
-title, upper.
+join, lower, ljust, lstrip, replace, rfind, rjust, rsplit, rstrip, split,
+splitlines, startswith, strip, title, upper.
 ```
 
 The CLI exits before inference, `serve`/`viz` refuse to start (checked before the
 worker thread is spawned), and a per-request refusal is an HTTP `400`. The generic
 ChatML renderer survives only for a GGUF that has no `tokenizer.chat_template` at
-all, and the startup path prints a one-line notice when that happens.
-`--no-template` still bypasses template rendering entirely.
+all, the startup path prints a one-line notice when that happens, and **every**
+path renders that ChatML — including the single-turn CLI.
+
+### Overriding the template, and time-dependent templates
+
+`--chat-template <FILE>` (on the CLI and on `serve`/`viz`) reads a template file
+and uses it instead of the GGUF's own copy. The file is validated at startup on
+the same terms as an embedded template, so one that cannot render refuses the run
+with the file named:
+
+```
+Error: chat template error — template file: /tmp/model.jinja: unsupported Python str
+method `format`; minfer refuses to fall back to a generic ChatML prompt. …
+```
+
+`--chat-template` and `--no-template` are mutually exclusive (one names the
+template, the other says use none), so giving both is an error naming both flags.
+`--no-template` on its own still bypasses template rendering entirely.
+
+`strftime_now(fmt)` is available to templates, with a fixed directive subset:
+`%Y %y %m %d %H %M %S %F %T %%`. Any other directive is refused by name rather
+than printed literally. A template that prints the current time is
+non-deterministic by nature: the conversation path detects that the turn's
+rendering does not extend the previous one and re-renders the whole history
+instead of appending a delta (see `docs/CLI-CONVERSATION-PLAN.md` §5.4).
 
 The tokenizer is byte-level BPE and is equally strict about what it does not
 implement. `tokenizer.ggml.model` selects the engine — `gpt2` (byte-level BPE), `llama`
@@ -601,4 +624,5 @@ it documents are frozen in the ADR corpus:
 - [ADR-0017](adr/0017-speculative-decoding-refuses-what-it-cannot-carry.md) — Speculative decoding refuses the features its identity contract cannot carry
 - [ADR-0018](adr/0018-the-grammar-mask-is-one-pipeline-stage.md) — The grammar mask is one stage inside the single sampler pipeline
 - [ADR-0019](adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md) — A chat template that cannot be rendered refuses the load
+- [ADR-0057](adr/0057-a-template-file-overrides-the-gguf-and-time-enters-through-one-clock.md) — A template file overrides the GGUF copy, and time enters a render through one injected clock
 - [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32

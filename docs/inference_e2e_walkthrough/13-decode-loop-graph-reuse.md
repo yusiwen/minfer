@@ -91,7 +91,7 @@ The loop also decides **when to stop**. Three gates live in (or beside) the
 loop: the sampled token is the end-of-text sentinel `is_stop_token` (`main.rs1955`),
 the generated *byte stream* now ends with a user-supplied stop string
 `match_stop_suffix` (`main.rs1722`), or the `-n` token cap is reached (the `while` condition
-itself, the loop head (`main.rs:1826`). Doc 12 introduced these; here we see them as the
+itself, the loop head (`main.rs:1869`). Doc 12 introduced these; here we see them as the
 loop's control flow.
 
 Finally, there is a longer-timescale version of the same trick: a multi-turn
@@ -161,7 +161,7 @@ Two structural things to notice before any code:
   *first*, from the logits the *previous* iteration's forward produced (or
   from prefill's logits on iteration one), and only then runs the forward
   that produces logits for the *next* iteration. The forward is the last
-  statement of the body — `ModelDef::forward` (`main.rs:1869`), not the first.
+  statement of the body — `ModelDef::forward` (`main.rs:1912`), not the first.
 - **The rebuild happens inside the first `forward`, invisibly.** The loop
   calls `model.forward(...)` on every step; the cache check
   (`try_reuse`) is inside `forward_cached`. The loop never knows whether a
@@ -385,7 +385,7 @@ instead of the next forward (§3.2 walks the code):
 
 1. **End-of-generation token.** The sampled id equals the model's `eos` or
    `<|im_end|>` (`is_stop_token`, `main.rs1955`; the ids come from
-   `special_tokens()` (`main.rs:1648`). Decided in the loop
+   `special_tokens()` (`main.rs:1691`). Decided in the loop
    `is_stop_token` (`main.rs1955`); the token is *not* appended and *not* fed to the
    graph — the run just ends. (Conversation mode deliberately does the
    opposite: it writes the EOG token into the KV before breaking, to keep
@@ -397,7 +397,7 @@ instead of the next forward (§3.2 walks the code):
    doc 12 §3 owns the matcher). The matching bytes are truncated out of the
    kept text; already-printed bytes stay in the terminal, llama.cpp-style.
 3. **The `-n` cap.** The `while` condition `generated.len() < params.n_predict`
-   the loop head (`main.rs:1826`), default 512 in `GenParams::default` (`main.rs:`). In conversation mode a
+   the loop head (`main.rs:1869`), default 512 in `GenParams::default` (`main.rs:`). In conversation mode a
    fourth gate joins: the write cursor reaching `n_ctx` stops cleanly
    instead of overflowing the KV regions (`conversation.rs:`, the cursor guard).
 
@@ -418,11 +418,11 @@ and is only read:
 | Data | Type / shape | Where it comes from | Where it goes |
 |---|---|---|---|
 | `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`src/models/qwen2/graph.rs:657`) |
-| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`main.rs:1649`) — starts at `input_ids.len()`, incremented once per step at `current_pos` (`main.rs:1793`) | same, `src/models/qwen2/graph.rs:659`; the KV store uses it as the write slot, attention as the last readable slot |
+| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`main.rs:1692`) — starts at `input_ids.len()`, incremented once per step at `current_pos` (`main.rs:1836`) | same, `src/models/qwen2/graph.rs:659`; the KV store uses it as the write slot, attention as the last readable slot |
 | K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
-| logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `src/models/qwen2/graph.rs:`) | moved into the loop's `logits` variable (`main.rs:1867-1881`, the `logits = model.forward(...)` assignment) for the next sample |
-| `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens — `recent_window` (`main.rs:1656, 1752-1757`) | the sampler's repeat/frequency/presence penalties (doc 12) |
-| `generated` | `Vec<u32>` | pushed per step (`main.rs:1851`, the `generated.push(...)` call) | stop checks, final stats; decode_bytes streams it to stdout |
+| logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `src/models/qwen2/graph.rs:`) | moved into the loop's `logits` variable (`main.rs:1910-1924`, the `logits = model.forward(...)` assignment) for the next sample |
+| `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens — `recent_window` (`main.rs:1699, 1752-1757`) | the sampler's repeat/frequency/presence penalties (doc 12) |
+| `generated` | `Vec<u32>` | pushed per step (`main.rs:1894`, the `generated.push(...)` call) | stop checks, final stats; decode_bytes streams it to stdout |
 
 Two details of this table deserve unpacking.
 
@@ -440,7 +440,7 @@ arithmetic conversion, which is why a round trip through the buffer is
 lossless.
 
 **One forward call per step, five hidden phases.** The loop's single
-`model.forward(...)` — `ModelDef::forward` (`main.rs:1869`) — expands inside `forward_cached` into:
+`model.forward(...)` — `ModelDef::forward` (`main.rs:1912`) — expands inside `forward_cached` into:
 build params (six fields) → try_reuse (usually a hit) → fill 2–3 small
 inputs → one `scheduler.execute` walk → copy the output buffer back. On a
 rebuild step the same call additionally runs build → register → assign →
@@ -488,7 +488,7 @@ hand the loop plays with on every iteration:
 - `current_pos = input_ids.len()`: the first generated token will be written
   at KV slot `nt` — the slot *after* the prompt. The KV regions were sized
   for `n_ctx` slots, and `ctx = params.n_ctx.max(input_ids.len())`
-  (`main.rs:1538-1552`, the `ctx` computation) guaranteed at prefill time that the prompt fits; from here
+  (`main.rs:1581-1595`, the `ctx` computation) guaranteed at prefill time that the prompt fits; from here
   the cursor only ever increments.
 - `special` carries the model's stop-token ids (eos, and `<|im_end|>` when
   the model defines one) — gate 1 of §2.7.
@@ -499,7 +499,7 @@ hand the loop plays with on every iteration:
   so even the first sampled token is subject to repeat penalties — doc 12's
   `recent_window` helper.
 
-The stop-string machinery follows immediately — `stop_refs` (`main.rs:1668`): user
+The stop-string machinery follows immediately — `stop_refs` (`main.rs:1711`): user
 `--stop` strings are copied to byte vectors (`stop_bytes`/`stop_refs`), and
 two cursors track output — `full`, every generated byte ever, and `emitted`,
 how many of those bytes have already been flushed to stdout. The pair exists
@@ -575,7 +575,7 @@ Reading it as a state machine, one iteration:
 5. **Gate: stop strings** — the tail of the excerpt: the token's bytes join
    `full`, and `match_stop_suffix` (`main.rs1722`) tests whether it
    now *ends* with a stop string; on a hit the text is truncated before the
-   match, else the new bytes are flushed to stdout (`main.rs:1856-1868`).
+   match, else the new bytes are flushed to stdout (`main.rs:1899-1911`).
 
 Only when all three gates pass does the iteration continue to the forward —
 the loop never runs the transformer for a token it has already decided to
@@ -1265,9 +1265,9 @@ by quota, and those are exactly the runs where the model would have kept
 going anyway.
 
 **8. `n_ctx` is computed once, before prefill, for both phases.**
-`ctx = params.n_ctx.max(input_ids.len())` (`main.rs:1538-1552`, the `ctx` computation) with the comment
+`ctx = params.n_ctx.max(input_ids.len())` (`main.rs:1581-1595`, the `ctx` computation) with the comment
 "Computed ONCE so prefill and decode size the same KV regions"
-(`main.rs:1552`, the "Computed ONCE" comment). If prefill and the first decode step disagreed on
+(`main.rs:1595`, the "Computed ONCE" comment). If prefill and the first decode step disagreed on
 `ctx`, they would disagree on `CParams`, the params comparison would fail,
 and — worse — `ensure_kv` would have sized regions from the prefill graph
 that the decode graph considers too small. One variable, computed early,
@@ -1291,9 +1291,9 @@ The decode loop and the reuse machinery are unusually observable — most of
 the evidence is on stderr of any plain run.
 
 - **The run header itself.** `Prefill: N tokens in …` vs
-  `Generated: M tokens in … (tok/s)` (`main.rs:1568-1579, 1854-1858`, the two rate headers) — two
+  `Generated: M tokens in … (tok/s)` (`main.rs:1611-1622, 1854-1858`, the two rate headers) — two
   deliberately different calibers (pure-decode rate vs blended rate,
-  `main.rs:1937-1950`, the pure-decode-vs-blended caliber comment). The gap between the two numbers *is* this
+  `main.rs:1980-1993`, the pure-decode-vs-blended caliber comment). The gap between the two numbers *is* this
   document's §2.2 argument, measured.
 - **`MINFER_TIMING=1`.** Splits the per-token wall clock into sampling vs
   forward milliseconds — `t_samp`/`t_fwd` (`main.rs1675, 1800-1804`). Expect sampling in the
@@ -1314,7 +1314,7 @@ the evidence is on stderr of any plain run.
   the other.
 - **`--dump-graph <dot>` / `--dump-graph-json <path>`.** Exits after
   exporting the graph the runtime *would* use — labeled `"decode"` when the
-  prompt is one token and `"prefill"` otherwise (`main.rs:1610-1621, 1545-1548`, the `kind` label).
+  prompt is one token and `"prefill"` otherwise (`main.rs:1653-1664, 1545-1548`, the `kind` label).
   Compare a prefill dump against a decode dump (feed a 1-token prompt) to
   see exactly which nodes the rebuild adds or removes.
 - **`MINFER_GRAPH_DUMP=<dir>`.** Writes `logits_decode.f32` plus every

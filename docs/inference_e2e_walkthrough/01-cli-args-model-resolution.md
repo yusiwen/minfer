@@ -169,7 +169,7 @@ arrives in two steps:
   of headroom costs 36 × 2 × 1024 × 4 B = **288 KB**, so the default 4096
   reserves ≈ 1.2 GB while the model's maximum (40960 tokens) would reserve
   ≈ 11.8 GB — the "12 GB+" the code comment warns about
-  (`src/main.rs:774-778`, citing `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §2).
+  (`src/main.rs:788-792`, citing `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §2).
 - **And it is clamped twice, defensively.** In `main.rs` the effective
   context is `params.n_ctx.max(input_ids.len())` — a long prompt must never
   overflow the notepad — and the model's forward pass clamps again with
@@ -186,7 +186,7 @@ number consistent for the whole run.
 ### 2.5 Modes: where the same parsed data goes
 
 The parsed state fans out into mode-specific structs, and each mode takes a
-different subset. In `run_conversation` (`src/main.rs:2095`), the
+different subset. In `run_conversation` (`src/main.rs:2138`), the
 conversation gets a `ConversationSpec` (template, special tokens, `seed`,
 `n_ctx`, system prompt) plus a `TurnParams` (all the sampling knobs *plus*
 `stop_strings`) — every field is copied out of `GenParams`, so the
@@ -344,7 +344,7 @@ fallback:
 
 (`src/main.rs:`, condensed.) Three details carry the design:
 
-- **`next_val`** (`src/main.rs:547`) is a closure that peeks at
+- **`next_val`** (`src/main.rs:554`) is a closure that peeks at
   `raw_args[i+1]` and records `parse_err = Some("missing value for …")` if
   it is absent — the error is *remembered* and reported after the whole
   parse, so the user sees one clean message, not an early exit mid-list.
@@ -669,11 +669,11 @@ while the server-like modes explicitly take an *empty* prompt — they would
 otherwise hang waiting on a stdin that nobody will write. Conversation mode
 splits the difference: an optional positional becomes the first turn, and
 further turns come from the REPL's own reader (`read_user_input`,
-`src/main.rs:1190`), never from this one-shot read.
+`src/main.rs:1218`), never from this one-shot read.
 
 #### `--n-ctx` at the moment it starts to matter
 
-The first consumer of `params.n_ctx` after load (`src/main.rs:774-787`):
+The first consumer of `params.n_ctx` after load (`src/main.rs:788-801`):
 
 ```rust
     // n_ctx (--n-ctx, default 4096) sizes the graph KV regions — NOT the
@@ -762,7 +762,7 @@ because the seed is stable.
   call site pass a different value would change KV geometry mid-run — the
   graph-reuse identity (doc 13) treats KV size as a rebuild trigger, so a
   mismatched `n_ctx` would silently reallocate and discard accumulated KV.
-- **`--cnv` rejects `--no-template` up front** (`src/main.rs:560-566`),
+- **`--cnv` rejects `--no-template` up front** (`src/main.rs:567-573`),
   before resolution: conversation history is rendered through the chat
   template, so a template-less conversation would corrupt the KV with
   un-formatted turns. Failing at parse time (not first-turn time) keeps
@@ -790,7 +790,7 @@ because the seed is stable.
   the loader co-own that convention.
 - **Server-like modes never consume stdin.** `serve`/`viz`/`--cnv` read
   prompts from requests or the REPL; the single-shot stdin read
-  (`src/main.rs:602-604`) would otherwise block startup on an empty pipe —
+  (`src/main.rs:609-611`) would otherwise block startup on an empty pipe —
   the exact hang the code comment describes for `minfer viz model`.
 
 ## 4. Observe & verify
