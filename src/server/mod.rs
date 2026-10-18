@@ -108,26 +108,33 @@ pub fn run(
     n_slots: usize,
     spec_cfg: Option<crate::spec::SpecConfig>,
     slots_file: Option<String>,
+    // S1 (#133): a `--chat-template <FILE>` override, resolved and validated by
+    // `template::resolve_template` before the worker starts.
+    template_file: Option<&std::path::Path>,
 ) {
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = slot::new_slots(n_slots, n_ctx);
     let n_ctx_slot = n_ctx / n_slots.max(1);
     let metrics = Arc::new(ServerMetrics::new());
 
-    // F7 (#50): the template is validated before the worker starts, so an
-    // unrenderable one refuses to serve instead of 500-ing per request. A GGUF
-    // with no template at all still uses ChatML, and says so once.
-    let template = chat_template_from_gguf(&gguf.parts[0].data);
-    match template.as_deref() {
-        Some(t) => {
-            if let Err(e) = crate::template::validate(t) {
-                eprintln!("Error: {}", e.message());
-                return;
-            }
+    // F7 (#50) + S1 (#133): one resolver decides the template and validates it
+    // before the worker starts, so an unrenderable one refuses to serve instead
+    // of 500-ing per request. A GGUF with no template at all still uses ChatML,
+    // and says so once.
+    let template = match crate::template::resolve_template(
+        chat_template_from_gguf(&gguf.parts[0].data).as_deref(),
+        template_file,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {}", e.message());
+            return;
         }
-        None => eprintln!(
+    };
+    if template.is_none() {
+        eprintln!(
             "Notice: this GGUF has no tokenizer.chat_template; using the generic ChatML renderer"
-        ),
+        );
     }
 
     // F8: a completion signal, so `run` can wait for the worker *boundedly* after
