@@ -281,3 +281,8 @@ symbol = "split"
 adr = "0055"
 what = "`ignore_merges` emits a whole-vocabulary piece before the merge ranks; the llama3 pre group sets it"
 symbol = "ignores_merges"
+
+[[governs]]
+adr = "0056"
+what = "a missing byte token is accepted only when no token can reach it"
+symbol = "bpe_encode"
