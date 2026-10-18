@@ -1288,14 +1288,38 @@ impl Tokenizer {
                 // The byte fallback is exact only when every byte has a token.
                 // Qwen's vocabularies have all 256; a vocabulary that does not is
                 // a load error rather than a lossy fallback.
+                // A byte that has no token is acceptable only when it cannot reach the
+                // fallback: it never occurs in the vocabulary at all (an invalid UTF-8
+                // lead byte — there is nothing to fall back to), or it **starts** an
+                // existing token, so a piece beginning with it is matched by that token
+                // first. Anything else is still a load error rather than a lossy
+                // fallback (ADR-0056; measured on Falcon3-1B, which omits 18 bytes).
                 let missing: Vec<u8> = (0u8..=255)
                     .filter(|b| !vocab.contains_key(&byte_to_unicode[b].to_string()))
                     .collect();
-                if let Some(first) = missing.first() {
+                let mut reachable: Vec<u8> = Vec::new();
+                for &b in &missing {
+                    let mut occurs = false;
+                    let mut starts_token = false;
+                    for text in id_to_token.iter() {
+                        let raw = text.as_bytes();
+                        if raw.first() == Some(&b) {
+                            starts_token = true;
+                        }
+                        if raw.contains(&b) {
+                            occurs = true;
+                        }
+                    }
+                    if occurs && !starts_token {
+                        reachable.push(b);
+                    }
+                }
+                if let Some(first) = reachable.first() {
                     return Err(format!(
-                        "vocabulary is not byte-level complete: {} of 256 byte tokens are missing \
-                         (first: <0x{first:02X}>); minfer refuses a lossy byte fallback",
-                        missing.len()
+                        "vocabulary is not byte-level complete: {} of 256 byte tokens are missing and \
+                         cannot be reached by any token (first: <0x{first:02X}>); minfer refuses a \
+                         lossy byte fallback",
+                        reachable.len()
                     ));
                 }
                 if matches!(model, TokenizerModel::HybridDna) {
