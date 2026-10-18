@@ -271,3 +271,8 @@ symbol = "encode_checked"
 adr = "0053"
 what = "`whitespace` is the gpt2 engine behind a pre rule that cuts on whitespace and drops it"
 symbol = "encode_bpe"
+
+[[governs]]
+adr = "0054"
+what = "`jina-v1-en` is the plain GPT-2 pre rule: space-prefixed pieces, unlimited digit runs, no newline arm"
+symbol = "split"
