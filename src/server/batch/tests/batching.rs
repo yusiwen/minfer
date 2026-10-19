@@ -74,18 +74,44 @@ fn assert_replies_match(what: &str, got: &[Reply], serial: &[Reply]) {
         }
     }
 }
-/// The location estimate #154's timing verdict uses (the upper median for an
-/// even count, matching `cuda_backend::tests::attn_window::median`).
+/// Median of `v` (does not reorder the caller's slice). It is the **audit**
+/// statistic of the batching gate now, no longer its verdict (issue #195).
 fn median(v: &[f64]) -> f64 {
     assert!(!v.is_empty(), "median of an empty sample");
     let mut s = v.to_vec();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
     s[s.len() / 2]
 }
+/// Matched pairs per timed round, fixed in advance (issue #195, the shape
+/// #189 gave the S4 map-window A/B).
+const PAIRS: usize = 9;
+/// The batching gate's verdict statistic, shared with the pure replay test
+/// below.
+///
+/// The timed rounds are **matched pairs**: `run_batched` and `run_serial` over
+/// the same prompts, measured next to each other on one machine state. A pair
+/// is a *refusal* when the batched arm was not faster, i.e.
+/// `serial/batched <= MIN_SPEEDUP`. The verdict is the refusal **count**, and
+/// the gate refuses only at [`SIGN_TEST_REFUSALS`] of [`PAIRS`] — the one-sided
+/// sign test at `alpha = 46/512 = 0.090`, the tail `P(X >= 7)` under "the
+/// batched arm is neither faster nor slower". A median of the same nine ratios
+/// flips once five are disturbed — a bare majority — which is why a loaded
+/// co-tenant could decide the pre-#195 verdict (issue #188's record measured
+/// exactly that: one failure in six parallel `#[ignore]`d device runs).
+const SIGN_TEST_REFUSALS: usize = 7;
+/// The bar is the pre-#154 gate's "must not be slower": 1.0x, not a margin.
+const MIN_SPEEDUP: f64 = 1.0;
+/// How many of `ratios` refuse the bar — `serial/batched <= bar` means the
+/// batched arm was not faster. Pure, so the statistic is unit-tested with no
+/// model and no device.
+fn refusals_of(ratios: &[f64], bar: f64) -> usize {
+    ratios.iter().filter(|r| **r <= bar).count()
+}
 /// E2's acceptance, measured at the engine: four requests served as one decode
 /// batch must generate exactly what four serial requests generate, and the
-/// **median** of the per-round `serial/batched` ratios over interleaved rounds
-/// must exceed 1.0 (#154).
+/// per-round `serial/batched` ratios over interleaved matched pairs must show
+/// the batched arm faster in at least `PAIRS - SIGN_TEST_REFUSALS + 1` of them
+/// (#154, #195).
 ///
 /// Ignored by default like the other real-model tests:
 ///   cargo test --release --bin minfer -- --ignored server_batch --nocapture
@@ -147,7 +173,7 @@ fn server_batch_matches_serial_and_is_faster() {
     let n_req = n_slots.min(prompts.len());
     let prompts: Vec<Vec<u32>> = prompts.into_iter().take(n_req).collect();
     let max_tokens = 16;
-    // ---- #154: the throughput verdict is a median over interleaved rounds ----
+    // ---- #154 / #195: the throughput verdict is a paired sign test ----
     //
     // The pre-#154 form measured the two whole workloads **once, sequentially**
     // (batched, then serial) and asserted the wall-clock relation
@@ -159,36 +185,45 @@ fn server_batch_matches_serial_and_is_faster() {
     // passed / 1 failed) — while the same binary serially was **0.72s vs
     // 1.07s (1.50x)**.
     //
-    // The rounds are now **interleaved** (batched, serial, batched, serial,
-    // …), so each ratio is a matched pair measured next to each other on the
-    // same machine state, and the assertion is on the **median of the
-    // per-round `serial/batched` ratios** — the location estimate that
-    // tolerates up to `rounds / 2` rounds a passing load spike disturbed.
-    // Every sample and the median are printed so a loaded box's verdict is
-    // auditable. This is the shape #123 gave
-    // `cuda_map_window_costs_no_more_than_the_span_it_replaces`.
+    // #154 then made the rounds **interleaved** (batched, serial, batched,
+    // serial, …) so each ratio is a matched pair measured next to each other on
+    // the same machine state, and asserted their **median** — a location
+    // estimate a loaded box still decides once `rounds / 2` pairs are
+    // disturbed. That is #195: the gate failed once in six parallel
+    // `#[ignore]`d device runs (#188's record), the same class #189 fixed for
+    // the S4 map-window A/B.
     //
-    // Cost, and the round count. The correctness comparison below stays a
-    // **full-length** pair (`max_tokens`); the timed rounds are a separate,
-    // shorter workload so the gate's total wall clock stays bounded. On an
-    // idle box the full-length pair is ~1.8s and the timing pair is
-    // proportionally less; on the loaded parallel harness a full-length pair
-    // reached ~31s. Seven rounds is the smallest odd count whose median
-    // tolerates three disturbed rounds; `timing_tokens` halves the timed
-    // workload's per-round cost without touching the correctness comparison.
-    // Both knobs are env-overridable so a bisect can trade cost for samples.
-    let rounds: usize = std::env::var("MINFER_BATCH_TEST_ROUNDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(7);
+    // The verdict is now the **refusal count** over [`PAIRS`] matched pairs,
+    // fixed in advance, refusing only at [`SIGN_TEST_REFUSALS`] — the one-sided
+    // sign test at alpha = 46/512 = 0.090. The bar stays [`MIN_SPEEDUP`] =
+    // 1.0x, so the mutation that doubles the timed batched arm's work still
+    // moves every pair and still fails. The median is printed for continuity
+    // but is no longer the verdict.
+    //
+    // Cost. The correctness comparison below stays a **full-length** pair
+    // (`max_tokens`); the timed rounds are a separate, shorter workload so the
+    // gate's total wall clock stays bounded. On an idle box the full-length
+    // pair is ~1.8s and the timing pair is proportionally less; on the loaded
+    // parallel harness a full-length pair reached ~31s. `timing_tokens`
+    // halves the timed workload's per-round cost without touching the
+    // correctness comparison.
     let timing_tokens: i64 = std::env::var("MINFER_BATCH_TEST_TIMING_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
+    // The mutation lever (gate-contract rule 3): multiplying the **timed
+    // batched arm's** token count makes that arm pay k times the work while the
+    // denominator stays "one round's work" — the reproducible form of "batching
+    // lost its win". Defaults to 1, i.e. no mutation; the unmutated run is the
+    // same binary with the variable unset, so there is no source edit to revert.
+    let batch_work: i64 = std::env::var("MINFER_BATCH_TEST_BATCH_WORK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     eprintln!(
         "[e2] config: {n_slots} slot(s), n_ctx {n_ctx}, {n_req} request(s), templated={templated}, \
-         prompt len {}, correctness max_tokens {max_tokens}, {rounds} interleaved timing round(s) \
-         at max_tokens {timing_tokens}",
+         prompt len {}, correctness max_tokens {max_tokens}, {PAIRS} interleaved timing round(s) \
+         at max_tokens {timing_tokens} (batched arm x{batch_work})",
         prompts[0].len()
     );
 
@@ -221,18 +256,18 @@ fn server_batch_matches_serial_and_is_faster() {
         t_serial / t_batch
     );
 
-    // ---- throughput: interleaved matched rounds, verdict on the median ----
-    let mut t_batches: Vec<f64> = Vec::with_capacity(rounds);
-    let mut t_serials: Vec<f64> = Vec::with_capacity(rounds);
-    let mut ratios: Vec<f64> = Vec::with_capacity(rounds);
-    for _ in 0..rounds {
+    // ---- throughput: interleaved matched rounds, verdict on the sign test ----
+    let mut t_batches: Vec<f64> = Vec::with_capacity(PAIRS);
+    let mut t_serials: Vec<f64> = Vec::with_capacity(PAIRS);
+    let mut ratios: Vec<f64> = Vec::with_capacity(PAIRS);
+    for _ in 0..PAIRS {
         let (_, tb) = run_batched(
             &*model,
             &tok,
             &prompts,
             n_slots,
             n_ctx,
-            timing_tokens,
+            timing_tokens * batch_work,
             false,
         );
         let (_, ts) = run_serial(&*model, &tok, &prompts, n_slots, n_ctx, timing_tokens);
@@ -243,23 +278,73 @@ fn server_batch_matches_serial_and_is_faster() {
     let med_batch = median(&t_batches);
     let med_serial = median(&t_serials);
     let med = median(&ratios);
+    let refusals = refusals_of(&ratios, MIN_SPEEDUP);
     let mut sorted = ratios.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     eprintln!(
-        "[e2] timing: {rounds} interleaved rounds at max_tokens {timing_tokens} — batched \
-         {t_batches:?} s, serial {t_serials:?} s; per-round serial/batched ratios (round order) \
-         {ratios:?}, sorted {sorted:?} — median {med:.3}x (medians {med_serial:.2}s serial vs \
-         {med_batch:.2}s batched)"
+        "[e2] timing: {PAIRS} interleaved rounds at max_tokens {timing_tokens} (batched arm \
+         x{batch_work}) — batched {t_batches:?} s, serial {t_serials:?} s; per-round \
+         serial/batched ratios (round order) {ratios:?}, sorted {sorted:?} — {refusals}/{PAIRS} at \
+         or below {MIN_SPEEDUP}x (sign test refuses at {SIGN_TEST_REFUSALS}); median {med:.3}x \
+         (audit only; medians {med_serial:.2}s serial vs {med_batch:.2}s batched)"
     );
-    // The threshold is the pre-#154 gate's "must not be slower": 1.0x, not a
-    // named margin. What changed is the statistic (a median of matched pairs
-    // instead of one sequential pair). On an idle CPU box the median is
-    // ~1.5x, so the gate still trips on a mutation that halves the batched
-    // arm's win (see the plan record's mutation check).
+    // The bar is the pre-#154 gate's "must not be slower": 1.0x, not a named
+    // margin. What changed across #154 and #195 is the statistic: one sequential
+    // pair, then the median of matched pairs, now the refusal count over a pair
+    // count fixed in advance. On an idle CPU box the median is ~1.5x, so a
+    // mutation that doubles the batched arm's work still moves every pair.
     assert!(
-        med > 1.0,
-        "batching must not be slower: median serial/batched {med:.3}x over {rounds} interleaved \
-         rounds (per-round ratios {sorted:?}; medians {med_serial:.2}s serial vs {med_batch:.2}s \
-         batched)"
+        refusals < SIGN_TEST_REFUSALS,
+        "batching must not be slower: {refusals} of {PAIRS} interleaved rounds measured \
+         serial/batched at or below {MIN_SPEEDUP}x (per-round ratios {sorted:?}; medians \
+         {med_serial:.2}s serial vs {med_batch:.2}s batched); the sign test refuses at \
+         {SIGN_TEST_REFUSALS}, so this is a systematic loss of the batching win, not a load spike"
+    );
+}
+/// The statistic, on the failure class it exists for (issue #195).
+///
+/// The pre-#195 gate asserted the **median** of the matched pairs, which a
+/// loaded co-tenant decides once a bare majority is disturbed. #188's record
+/// names the one parallel `#[ignore]`d failure but kept no per-round vector, so
+/// this replays the class rather than a transcript: six of nine rounds take a
+/// spike on the batched arm (ratios 0.58-0.79, in the shape a co-tenant
+/// produces) while the three undisturbed rounds sit at the idle margin
+/// (~1.5x). The old median is red on that vector; the sign test is green.
+///
+/// The second arm is the mutation the gate must always catch: doubling the
+/// timed batched arm's work halves every ratio, and all nine refuse.
+#[test]
+fn the_batching_sign_test_absorbs_a_loaded_run_and_still_refuses_a_doubled_batched_arm() {
+    // Three undisturbed rounds at the idle margin, six hit by the co-tenant, in
+    // a plausible interleaving.
+    let loaded = [1.52, 0.61, 1.44, 0.72, 1.49, 0.58, 0.66, 0.79, 0.70];
+    assert_eq!(loaded.len(), PAIRS, "one ratio per matched pair");
+    let refusals = refusals_of(&loaded, MIN_SPEEDUP);
+    assert_eq!(
+        refusals, 6,
+        "the loaded vector has 6 of 9 rounds at or below {MIN_SPEEDUP}x"
+    );
+    assert!(
+        median(&loaded) <= MIN_SPEEDUP,
+        "the old median statistic must be red on this vector — otherwise the class of failure \
+         #195 records could not have happened (median {:.3}x)",
+        median(&loaded)
+    );
+    assert!(
+        refusals < SIGN_TEST_REFUSALS,
+        "the sign test must absorb the loaded run ({refusals} < {SIGN_TEST_REFUSALS})"
+    );
+
+    // The mutation: the timed batched arm pays twice the work, so every ratio
+    // halves. A loss of the batching win is systematic, not a spike.
+    let doubled: Vec<f64> = loaded.iter().map(|r| r / 2.0).collect();
+    let d_refusals = refusals_of(&doubled, MIN_SPEEDUP);
+    assert_eq!(
+        d_refusals, PAIRS,
+        "a doubled batched workload must refuse every matched pair ({doubled:?})"
+    );
+    assert!(
+        d_refusals >= SIGN_TEST_REFUSALS,
+        "the sign test must refuse the mutation ({d_refusals} >= {SIGN_TEST_REFUSALS})"
     );
 }
