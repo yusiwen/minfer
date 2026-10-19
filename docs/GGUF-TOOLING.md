@@ -269,12 +269,14 @@ Targets with an implemented and byte-verified encoder:
 
   and to `f16` either way when even a 32-element block does not divide the row. A
   demotion is never a copy of the source type: an f32 or bf16 source with such a row
-  comes back `f16`. The rule is applied to the type the tensor is *asked* for, so on a
-  tied model a sub-8-bit target's shared `token_embd.weight` is asked for `q8_0` and a
-  non-32-divisible row demotes *that* to `f16` — llama.cpp resolves its mixture first
-  and applies the row-length rule second. The CLI prints the demoted list
-  (`quantize: N tensor(s) demoted from q4_K (row length not a multiple of 256;
-  llama.cpp's tensor_type_fallback): …`). This is not cosmetic: the 0.5B's hidden size
+  comes back `f16`. The rule is applied to the type the tensor is *asked* for, so a
+  tied model's shared `token_embd.weight` takes the `OUTPUT` branch first (the last
+  bullet below: `q8_0` or `q6_K`, by row length) and the row rule then demotes *that*
+  if it cannot take the row — llama.cpp resolves its mixture first and applies the
+  row-length rule second. The CLI prints the demoted list
+  (`quantize: N tensor(s) demoted to a type their row can take (llama.cpp's
+  tensor_type_fallback): …`, naming the type each tensor was asked for). This is not
+  cosmetic: the 0.5B's hidden size
   is 896 = 3.5 × 256, so **145 of its 290 tensors take the K-quant demotion** and only
   the 24 `ffn_down` tensors (`ne[0] = 4864 = 19 × 256`) reach the `q4_K`/`q5_K`/`q6_K`
   encoder. §4.2 gates a second source (hidden 1024) where every 2-D tensor does. No
@@ -342,15 +344,15 @@ minfer convert: <dir>/tokenizer_config.json has no 'chat_template'; minfer's
 
 minfer quantize: --type is required (no silent default: a wrong target would
   write wrong weights); supported: q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K,
-  q6_K, f16, f32
+  q6_K, q4_K_M, q5_K_M, f16, f32
 
 minfer quantize: target "q2_K" is a known GGUF type but minfer has no weight
   encoder for it (minfer can only read it, so writing it would emit wrong
   weights); supported encoder targets: q4_0, q4_1, q5_0, q5_1, q8_0, q4_K,
-  q5_K, q6_K, f16, f32
+  q5_K, q6_K, q4_K_M, q5_K_M, f16, f32
 
 minfer quantize: unknown quant target "banana"; supported: q4_0, q4_1, q5_0,
-  q5_1, q8_0, q4_K, q5_K, q6_K, f16, f32
+  q5_1, q8_0, q4_K, q5_K, q6_K, q4_K_M, q5_K_M, f16, f32
 
 minfer quantize: tensor 'blk.0.ffn_down.weight' has type q4_K, which minfer
   cannot decode (no dequantizer for it); re-quantizing a K-quant/I-quant source
