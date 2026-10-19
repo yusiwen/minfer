@@ -87,15 +87,18 @@ impl QuantTarget {
                 let known = KNOWN_UNSUPPORTED
                     .iter()
                     .any(|k| k.eq_ignore_ascii_case(other));
+                // The refusal quotes `s`, not `other`: the target was matched
+                // case-insensitively, so echoing the folded spelling would name a
+                // target the caller did not type (#625).
                 if known {
                     Err(format!(
-                        "minfer quantize: target {other:?} is a known GGUF type but minfer has no \
+                        "minfer quantize: target {s:?} is a known GGUF type but minfer has no \
                          weight encoder for it (minfer can only read it, so writing it would emit \
                          wrong weights); supported encoder targets: {SUPPORTED_TARGETS}"
                     ))
                 } else {
                     Err(format!(
-                        "minfer quantize: unknown quant target {other:?}; supported: \
+                        "minfer quantize: unknown quant target {s:?}; supported: \
                          {SUPPORTED_TARGETS}"
                     ))
                 }

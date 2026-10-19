@@ -62,6 +62,51 @@ fn targets_parse_and_refuse_by_name() {
     let e = QuantTarget::parse("banana").unwrap_err();
     assert!(e.contains("unknown quant target"), "{e}");
     assert!(e.contains(SUPPORTED_TARGETS), "{e}");
+    // #625: the refusal names the spelling that was typed, not the folded one it
+    // matched with. A caller who typed `--type q2_K` must be able to copy the
+    // quoted target out of the error.
+    for typed in ["q2_K", "Q2_k", "Banana"] {
+        let e = QuantTarget::parse(typed).unwrap_err();
+        assert!(e.contains(&format!("{typed:?}")), "{typed}: {e}");
+    }
+}
+
+/// The refusal texts quoted in `docs/GGUF-TOOLING.md` §3 advertise the CLI's own
+/// target list, and prose is what nothing else checks (#625): #203 added
+/// `q4_K_M`/`q5_K_M` to [`SUPPORTED_TARGETS`] and left the three quantize lists
+/// stale, while the refusal tests above kept passing because they compare against
+/// the constant, not the doc.
+///
+/// Each assertion is a whole quoted line, so the check also covers the wording and
+/// the `"q2_K"` echo, not only the list. `--outtype`'s `supported: f16, bf16, f32`
+/// is a different set ([`OutType`]) and is deliberately not asserted here.
+///
+/// `include_str!` rather than a runtime read: this is about the file in the tree,
+/// and a missing document should fail to compile rather than to run.
+///
+/// Mutation: delete `q4_K_M, q5_K_M` from any one list and this goes red.
+#[test]
+fn the_documented_target_lists_match_the_cli() {
+    let doc = include_str!("../../docs/GGUF-TOOLING.md");
+    let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+    let quoted = [
+        format!(
+            "minfer quantize: --type is required (no silent default: a wrong target would write \
+             wrong weights); supported: {SUPPORTED_TARGETS}"
+        ),
+        format!(
+            "minfer quantize: target \"q2_K\" is a known GGUF type but minfer has no weight \
+             encoder for it (minfer can only read it, so writing it would emit wrong weights); \
+             supported encoder targets: {SUPPORTED_TARGETS}"
+        ),
+        format!("minfer quantize: unknown quant target \"banana\"; supported: {SUPPORTED_TARGETS}"),
+    ];
+    for want in &quoted {
+        assert!(
+            flat.contains(want),
+            "docs/GGUF-TOOLING.md §3 must quote the CLI verbatim; this is missing:\n{want}"
+        );
+    }
 }
 
 #[test]
