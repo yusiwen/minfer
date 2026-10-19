@@ -119,17 +119,17 @@
 #                       for the `cache: 'no-cache'` that makes a regenerated sample
 #                       visible on a reload (#546). All four are dependency-free
 #                       Node, so the job needs no setup step.
-# 6. lint-workflows   : the workflow gate (#178). `scripts/lint_workflows.sh`
-#                       downloads a pinned actionlint release tarball, verifies
-#                       its per-architecture sha256, and refuses to lint with
-#                       unverified bytes. GitHub reports a workflow that does not
-#                       *parse*; an unknown `runs-on` label, a `types:` value that
-#                       is not a real pull-request activity, an `if:` that cannot
-#                       be evaluated and a `needs:` naming a missing job are all
-#                       green there and caught here. Shellcheck integration is off
-#                       on purpose (see the script's header): its presence is not
-#                       pinned, so leaving it on would make the verdict depend on
-#                       the runner image rather than on the pinned binary.
+# 6. lint-workflows   : the workflow gate (#178, #215). `scripts/lint_workflows.sh`
+#                       downloads a pinned actionlint release tarball *and* a
+#                       pinned shellcheck one, verifies each per-architecture
+#                       sha256, and refuses to lint with unverified bytes. GitHub
+#                       reports a workflow that does not *parse*; an unknown
+#                       `runs-on` label, a `types:` value that is not a real
+#                       pull-request activity, an `if:` that cannot be evaluated, a
+#                       `needs:` naming a missing job and a `run:` block shellcheck
+#                       rejects are all green there and caught here. Both tools
+#                       come from the script's own pins rather than from PATH, so
+#                       the verdict does not move with the runner image.
 # 7. check-pr-body    : the PR-body gate (#175, enforcing the gate contract's
 #                       rules 3 and 5). `scripts/check_pr_body.py --selftest` runs
 #                       the checker's own pass/fail cases, then the checker reads
@@ -559,10 +559,11 @@ jobs:
       - name: Assets must use the stamped loader, and runtime fetches must revalidate
         run: node scripts/check_viz_assets.mjs
 
-  # The workflow gate (#178). `scripts/lint_workflows.sh` pins actionlint 1.7.12
-  # by release tarball *and* per-architecture sha256 (the `scripts/build_book.sh`
-  # precedent) and refuses to lint unverified bytes; shellcheck integration is
-  # disabled there on purpose. No toolchain, no cache: one checkout and one step.
+  # The workflow gate (#178, #215). `scripts/lint_workflows.sh` pins actionlint
+  # 1.7.12 and shellcheck 0.10.0 by release tarball *and* per-architecture sha256,
+  # and refuses to lint unverified bytes; actionlint's shell integration is on,
+  # against the pinned shellcheck rather than the runner's. No toolchain, no
+  # cache: one checkout and one step.
   lint-workflows:
     if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
