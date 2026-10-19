@@ -1,0 +1,102 @@
+{
+  "provenance": {
+    "reference": "CPython json.dumps(value, ensure_ascii=False, indent=indent)",
+    "generator": "CPython 3.12.3 json.dumps",
+    "command": "scripts/gen_chat_fixtures.py",
+    "date": "2026-09-24"
+  },
+  "entries": [
+    {
+      "value": {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "unit": "c"
+          }
+        }
+      },
+      "indent": null,
+      "expected": "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"unit\": \"c\"}}}"
+    },
+    {
+      "value": {
+        "a": 1,
+        "b": [
+          1,
+          2,
+          3
+        ],
+        "c": {
+          "d": true,
+          "e": false,
+          "f": null
+        },
+        "g": 0.5,
+        "h": -2
+      },
+      "indent": null,
+      "expected": "{\"a\": 1, \"b\": [1, 2, 3], \"c\": {\"d\": true, \"e\": false, \"f\": null}, \"g\": 0.5, \"h\": -2}"
+    },
+    {
+      "value": {
+        "s": "<docs> & 'quotes' \"double\" / 检索 ünïcode"
+      },
+      "indent": null,
+      "expected": "{\"s\": \"<docs> & 'quotes' \\\"double\\\" / 检索 ünïcode\"}"
+    },
+    {
+      "value": {
+        "k": "\n\t\r\b\f\u0000"
+      },
+      "indent": null,
+      "expected": "{\"k\": \"\\n\\t\\r\\b\\f\\u0000\"}"
+    },
+    {
+      "value": {
+        "nested": [
+          [],
+          {},
+          [
+            {
+              "x": [
+                1
+              ]
+            }
+          ],
+          []
+        ]
+      },
+      "indent": null,
+      "expected": "{\"nested\": [[], {}, [{\"x\": [1]}], []]}"
+    },
+    {
+      "value": "plain string",
+      "indent": null,
+      "expected": "\"plain string\""
+    },
+    {
+      "value": 42,
+      "indent": null,
+      "expected": "42"
+    },
+    {
+      "value": null,
+      "indent": null,
+      "expected": "null"
+    },
+    {
+      "value": {
+        "a": [
+          1,
+          {
+            "b": "c"
+          }
+        ],
+        "d": {}
+      },
+      "indent": 2,
+      "expected": "{\n  \"a\": [\n    1,\n    {\n      \"b\": \"c\"\n    }\n  ],\n  \"d\": {}\n}"
+    }
+  ]
+}

@@ -2,6 +2,8 @@
 //! build does not parse it. See the parent module for the docs.
 use super::*;
 
+mod tools;
+
 fn msgs() -> Vec<(String, Option<String>)> {
     vec![
         ("system".into(), Some("You are helpful.".into())),
@@ -481,17 +483,24 @@ fn fixed_clock() -> CivilTime {
 #[test]
 fn strftime_now_uses_the_injected_clock_and_is_reproducible() {
     let tmpl = "{{ strftime_now('%Y-%m-%d') }}T{{ strftime_now('%T') }}";
-    let a = render_messages_with_clock(fixed_clock, tmpl, &msgs(), true, "").unwrap();
-    let b = render_messages_with_clock(fixed_clock, tmpl, &msgs(), true, "").unwrap();
+    let render = |t: &str| render_at(fixed_clock(), Some(t), &msgs(), None, true, "");
+    let a = render(tmpl).unwrap();
+    let b = render(tmpl).unwrap();
     assert_eq!(a, "2026-10-18T12:24:52");
     assert_eq!(a, b, "a fixed clock must render the same bytes twice");
 }
 
 #[test]
 fn strftime_now_refuses_an_unknown_directive_by_name() {
-    let err =
-        render_messages_with_clock(fixed_clock, "{{ strftime_now('%Q') }}", &msgs(), true, "")
-            .unwrap_err();
+    let err = render_at(
+        fixed_clock(),
+        Some("{{ strftime_now('%Q') }}"),
+        &msgs(),
+        None,
+        true,
+        "",
+    )
+    .unwrap_err();
     assert!(err.message().contains("%Q"), "{}", err.message());
     let err = format_civil(fixed_clock(), "%Y-%Q").unwrap_err();
     assert!(err.contains("%Q"), "{err}");
