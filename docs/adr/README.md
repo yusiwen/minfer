@@ -138,7 +138,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0018](./0018-the-grammar-mask-is-one-pipeline-stage.md) | 2026-09-24 | The grammar mask is one stage inside the single sampler pipeline | Accepted |
 | [0019](./0019-a-chat-template-that-cannot-render-refuses-the-load.md) | 2026-09-24 | A chat template that cannot be rendered refuses the load | Accepted (corrected by ADR-0042) |
 | [0006](./0006-kv-format-is-a-per-engine-gate.md) | 2026-09-25 | The KV storage format is a per-engine gate, not a process-wide global | Accepted |
-| [0020](./0020-a-quantized-file-is-byte-identical-or-wrong.md) | 2026-09-27 | A quantized file is byte-identical to `llama-quantize`, or it is wrong | Accepted (citation corrected by ADR-0024; corrected by ADR-0041) |
+| [0020](./0020-a-quantized-file-is-byte-identical-or-wrong.md) | 2026-09-27 | A quantized file is byte-identical to `llama-quantize`, or it is wrong | Accepted (citation corrected by ADR-0024; corrected by ADR-0041 and ADR-0060) |
 | [0021](./0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) | 2026-09-27 | bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32 | Accepted |
 | [0012](./0012-device-first-layering-and-no-premature-common.md) | 2026-10-04 | Device is the first axis, the layer the second — and no premature `common` | Accepted |
 | [0022](./0022-a-defect-in-a-frozen-adr-is-corrected-by-a-new-adr.md) | 2026-10-09 | A defect in a frozen ADR is corrected by a new ADR, not by editing it | Accepted (corrected by ADR-0023 and ADR-0027) |
@@ -179,6 +179,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0057](./0057-a-template-file-overrides-the-gguf-and-time-enters-through-one-clock.md) | 2026-10-18 | a template file overrides the GGUF copy, and time enters a render through one injected clock | Accepted (amends ADR-0019) |
 | [0058](./0058-tools-reach-the-prompt-as-the-client-wrote-them.md) | 2026-10-19 | a request's tools reach the prompt as the client wrote them, and a template that drops them refuses by name | Accepted (amends ADR-0019) |
 | [0059](./0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md) | 2026-10-19 | the batched worker queues a request against a bounded depth, and a run that makes no progress is failed rather than waited on | Accepted (supersedes the #121 record's reject-loudly policy) |
+| [0060](./0060-a-mixture-is-a-per-tensor-policy-and-the-output-branch-runs-for-every-ftype.md) | 2026-10-19 | a mixture is a per-tensor policy over the same encoders, and the `OUTPUT`/tied branch runs for every quantizing ftype | Accepted (corrects ADR-0020) |
 
 ## The template
 
