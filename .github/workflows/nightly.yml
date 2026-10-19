@@ -107,10 +107,12 @@ jobs:
           BASE="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo 'v0.0.0')"
           SHA="$(git rev-parse --short=7 HEAD)"
           DATE="$(date -u +%Y%m%d)"
-          echo "value=${BASE}-nightly.${DATE}(${SHA})" >> "$GITHUB_OUTPUT"
-          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
-          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
-          echo "short=${SHA}" >> "$GITHUB_OUTPUT"
+          {
+            echo "value=${BASE}-nightly.${DATE}(${SHA})"
+            echo "base=${BASE}"
+            echo "date=${DATE}"
+            echo "short=${SHA}"
+          } >> "$GITHUB_OUTPUT"
 
   create-release:
     name: Recreate the rolling nightly release
@@ -157,15 +159,21 @@ jobs:
           # of a nightly actually wants, and it stays valid as the tag moves.
           NOTES_COMMITS=5
           BASE="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          # The format's backticks are Markdown code spans around the short hash,
+          # not command substitution, so shellcheck's SC2016 is a false positive on
+          # this single-quoted literal. Disabled once here for both branches, with
+          # the reason, rather than dropped from the release notes (#215).
+          # shellcheck disable=SC2016
+          LOG_FMT='- `%h` %s'
           if [ -n "${BASE}" ]; then
             TOTAL="$(git rev-list --count --no-merges "${BASE}..HEAD")"
-            COMMITS="$(git log --format='- `%h` %s' --no-merges -n "${NOTES_COMMITS}" "${BASE}..HEAD")"
+            COMMITS="$(git log --format="${LOG_FMT}" --no-merges -n "${NOTES_COMMITS}" "${BASE}..HEAD")"
             DIFF_URL="https://github.com/${REPO}/compare/${BASE}...${SHA}"
           else
             # No release tag yet: fall back to the tip of history and the plain
             # commit list (there is no base to diff against).
             TOTAL="$(git rev-list --count --no-merges HEAD)"
-            COMMITS="$(git log --format='- `%h` %s' --no-merges -n "${NOTES_COMMITS}" HEAD)"
+            COMMITS="$(git log --format="${LOG_FMT}" --no-merges -n "${NOTES_COMMITS}" HEAD)"
             DIFF_URL="https://github.com/${REPO}/commits/${SHA}"
           fi
 
