@@ -20,6 +20,8 @@
 
 use super::*;
 
+use crate::quantize::QuantTarget;
+
 use std::fs::OpenOptions;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 

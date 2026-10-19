@@ -607,5 +607,70 @@
       "date": "2026-10-13",
       "box": "dgxspark (aarch64, GB10 sm_121)"
     }
+,
+    {
+      "path": "ref/qwen2.5-0.5b-q4_K_M.gguf",
+      "bytes": 397807424,
+      "sha256": "0c0869101629606f043537695b6ab88f2bd366038c8deab840bbf07917ad33cc",
+      "producer": "llama-quantize ~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f16.gguf ~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-q4_K_M.gguf q4_K",
+      "producer_kind": "llama-quantize",
+      "llamacpp_commit": "ca3d5a3e1",
+      "llamacpp_binary": "~/git/reading/llama.cpp/build/bin/llama-quantize",
+      "compiler": "gcc 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)",
+      "ffp_contract": "fast",
+      "cflags": "-O3 -DNDEBUG",
+      "authoritative_reference": true,
+      "producer_note": "#203's mixture reference: bare `q4_K` with no `--pure`, i.e. LLAMA_FTYPE_MOSTLY_Q4_K_M — the per-tensor selection (OUTPUT/tied branch, use_more_bits, fused-qkv) that `minfer quantize --type q4_K_M` reproduces. Type histogram 12 q4_K + 12 q6_K + 13 q8_0 + 132 q5_0, plus the 121 1-D tensors left f32. The producer is the same dgxspark build that reproduces ref/qwen2.5-0.5b-q4_K.gguf byte for byte (sha256 ab9dceff295ba566fd70577ced636adfbdb88eb60f9cf6e6e6255e3af508df8a), which is what makes it authoritative for a K-quant mixture (docs/GGUF-TOOLING.md 4.2.1); re-running the recorded command on 2026-10-19 reproduced this digest.",
+      "date": "2026-10-19",
+      "box": "dgxspark (aarch64, GB10 sm_121)"
+    },
+    {
+      "path": "ref/qwen3-0.6b-q4_K_M.gguf",
+      "bytes": 396704416,
+      "sha256": "a3ab8869e34e07516551feb63de9a92d599044e96078a1f7b78bc5bbfa2b6137",
+      "producer": "llama-quantize ~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf ~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_K_M.gguf q4_K",
+      "producer_kind": "llama-quantize",
+      "llamacpp_commit": "ca3d5a3e1",
+      "llamacpp_binary": "~/git/reading/llama.cpp/build/bin/llama-quantize",
+      "compiler": "gcc 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)",
+      "ffp_contract": "fast",
+      "cflags": "-O3 -DNDEBUG",
+      "authoritative_reference": true,
+      "producer_note": "#203's clean mixture arm: hidden 1024 is a multiple of 256, so NOTHING is demoted and the 29 q6_K are 14 ffn_down + 14 attn_v (use_more_bits) + the tied token_embd; the other 168 2-D tensors are q4_K and the 113 1-D ones stay f32. This is the arm that separates type selection from the row-length rule.",
+      "date": "2026-10-19",
+      "box": "dgxspark (aarch64, GB10 sm_121)"
+    },
+    {
+      "path": "ref/qwen3-0.6b-q5_K_M.gguf",
+      "bytes": 444414624,
+      "sha256": "145cc8e8eabd695c387e2cbeeb6aa442c4dadc9ca32017697cf9274563258ca7",
+      "producer": "llama-quantize ~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf ~/.cache/minfer/f6-src/ref/qwen3-0.6b-q5_K_M.gguf q5_K",
+      "producer_kind": "llama-quantize",
+      "llamacpp_commit": "ca3d5a3e1",
+      "llamacpp_binary": "~/git/reading/llama.cpp/build/bin/llama-quantize",
+      "compiler": "gcc 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)",
+      "ffp_contract": "fast",
+      "cflags": "-O3 -DNDEBUG",
+      "authoritative_reference": true,
+      "producer_note": "#203's second mixture: bare `q5_K` (LLAMA_FTYPE_MOSTLY_Q5_K_M) over the same Q5_K base, with the fused-qkv category at q6_K instead of q5_K. Histogram 168 q5_K + 29 q6_K + 113 f32 — the same bump set as q4_K_M, which is what the policy predicts.",
+      "date": "2026-10-19",
+      "box": "dgxspark (aarch64, GB10 sm_121)"
+    },
+    {
+      "path": "ref/qwen3-0.6b-q4_0.gguf",
+      "bytes": 381565600,
+      "sha256": "ed0f4f618fc4ddd0ed142412a8cafa2af437aeaed9a0768ea22fca93909b4963",
+      "producer": "llama-quantize ~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf ~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_0.gguf q4_0",
+      "producer_kind": "llama-quantize",
+      "llamacpp_commit": "ca3d5a3e1",
+      "llamacpp_binary": "~/git/reading/llama.cpp/build/bin/llama-quantize",
+      "compiler": "gcc 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)",
+      "ffp_contract": "fast",
+      "cflags": "-O3 -DNDEBUG",
+      "authoritative_reference": true,
+      "producer_note": "#203's ftype-independent arm: on this tied model llama.cpp's OUTPUT branch sends token_embd.weight to q6_K (1024 % 32 == 0), so the file is 196 q4_0 + 1 q6_K + 113 f32. minfer wrote q8_0 there before #203 — a divergence the 0.5B cannot show, because 896 % 256 != 0 makes the same branch answer q8_0.",
+      "date": "2026-10-19",
+      "box": "dgxspark (aarch64, GB10 sm_121)"
+    }
   ]
 }

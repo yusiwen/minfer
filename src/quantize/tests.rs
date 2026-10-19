@@ -51,9 +51,12 @@ fn targets_parse_and_refuse_by_name() {
     // The advertised list is real: every name in `SUPPORTED_TARGETS` parses back
     // to the target that spells it, so the refusal message cannot advertise a
     // target the CLI rejects. This is the other half of #616's rot — the string
-    // is hand-maintained, so something has to check it.
+    // is hand-maintained, so something has to check it. `Target` is the parser
+    // here (#203): the list also carries the two mixtures, which are a policy
+    // rather than an encoder and so are not `QuantTarget`s.
     for t in SUPPORTED_TARGETS.split(',').map(str::trim) {
-        let parsed = QuantTarget::parse(t).unwrap_or_else(|e| panic!("advertised {t}: {e}"));
+        let parsed =
+            crate::quantize::Target::parse(t).unwrap_or_else(|e| panic!("advertised {t}: {e}"));
         assert_eq!(parsed.name(), t, "advertised spelling round-trips");
     }
     let e = QuantTarget::parse("banana").unwrap_err();
@@ -526,9 +529,11 @@ fn a_zero_k_block_is_all_zero_bytes() {
     }
 }
 
-/// `q4_K`/`q5_K` are the `_M` mixtures in llama.cpp's *CLI* vocabulary, but
-/// `minfer quantize --type q4_K` writes one uniform type. The `file_type`
-/// metadata number is the ftype llama.cpp records for the same number, and the
+/// `q4_K`/`q5_K` are the `_M` mixtures in llama.cpp's *CLI* vocabulary, but the
+/// *uniform* `minfer quantize --type q4_K` is what `llama-quantize --pure`
+/// writes; the mixtures are separate spellings (`q4_K_M`/`q5_K_M`, #203). The
+/// `file_type` metadata number is the ftype llama.cpp records — the same number
+/// for the uniform and the mixed file, as llama.cpp itself writes it — and the
 /// row-length fallback is llama.cpp's `tensor_type_fallback`.
 #[test]
 fn file_types_and_row_length_fallbacks_match_llama_cpp() {
@@ -569,6 +574,6 @@ fn file_types_and_row_length_fallbacks_match_llama_cpp() {
     }
     assert_eq!(
         SUPPORTED_TARGETS,
-        "q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K, q6_K, f16, f32"
+        "q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K, q6_K, q4_K_M, q5_K_M, f16, f32"
     );
 }

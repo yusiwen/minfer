@@ -11,8 +11,20 @@
 // engine reads (Q4_K, Q5_K, Q6_K), plus the plain f16/f32 element casts. Every
 // other GGUF type has no encoder and is refused by name
 // ([`QuantTarget::parse`]), never silently approximated.
+//
+// A *mixture* (`q4_K_M`/`q5_K_M`) is not an encoder: it is llama.cpp's per-tensor
+// type policy over these encoders, and it lives in [`target`] so this module's
+// match stays total and every concrete target keeps exactly one encoder
+// (issue #203).
 
 use crate::gguf::GgmlType;
+
+mod mix;
+
+pub use mix::{
+    category as tensor_category, category_is_attn_v, layer as block_index, MixCtx, Reason,
+    Selection, Target, TensorCategory, TensorFacts,
+};
 
 /// A quantize/convert target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,8 +42,12 @@ pub enum QuantTarget {
     Q6_K,
 }
 
-/// The targets this module can actually encode, spelled as the CLI accepts them.
-pub const SUPPORTED_TARGETS: &str = "q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K, q6_K, f16, f32";
+/// The targets the CLI accepts, spelled as it accepts them.
+///
+/// The concrete encoders plus the two mixtures ([`Target`]). Every name here
+/// parses back through [`Target::parse`], which the parse test pins.
+pub const SUPPORTED_TARGETS: &str =
+    "q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K, q6_K, q4_K_M, q5_K_M, f16, f32";
 
 /// The GGUF types that exist in the format but have no encoder here. Listed so
 /// the refusal can say "known type, no encoder" instead of "unknown target" —
@@ -119,10 +135,11 @@ impl QuantTarget {
 
     /// llama.cpp's `llama_ftype` value for `general.file_type`.
     ///
-    /// `q4_K`/`q5_K` are the `_M` mixtures in llama.cpp's CLI vocabulary
-    /// (`LLAMA_FTYPE_MOSTLY_Q4_K_M` = 15, `_Q5_K_M` = 17); `q6_K` is 18. The
-    /// value describes the ftype, and a file whose tensors are all one K type
-    /// is what `--pure` writes under the same number.
+    /// A uniform `q4_K`/`q5_K` file records 15/17 — the numbers of
+    /// `LLAMA_FTYPE_MOSTLY_Q4_K_M`/`_Q5_K_M` — because that is what
+    /// `llama-quantize --pure q4_K` records too, and [`Target::file_type`] gives
+    /// the mixtures the same numbers: the metadata describes the ftype, not the
+    /// file's shape, so nothing may infer "pure" from it. `q6_K` is 18.
     pub fn file_type(self) -> u32 {
         match self {
             QuantTarget::F32 => 0,   // LLAMA_FTYPE_ALL_F32
