@@ -12,7 +12,14 @@ regex = "1"
 half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
+# `preserve_order` is a render contract, not a convenience (#597): a `tools`
+# entry reaches the prompt through the template's `| tojson`, and transformers
+# renders the client's own key order. minijinja's default `ValueMap` is a
+# `BTreeMap`, which would sort the keys the render path just preserved.
+# (`serde_json`'s matching feature is deliberately NOT enabled: the JSON-Schema
+# grammar compiler iterates a schema's `map`, and its generated grammar depends
+# on that order — a render-only concern must not move the grammar.)
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "preserve_order"] }
 
 # OpenAI-compatible HTTP server (OPENAI-CHAT-API-PLAN.md, Phase 2+)
 axum = "0.7"

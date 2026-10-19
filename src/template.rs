@@ -21,11 +21,14 @@
 //     refused. Time reaches a template through one injected clock, never a
 //     wall-clock read inside a render (ADR-0057).
 
-use minijinja::value::{Value, ValueKind};
+use minijinja::value::{Kwargs, Value, ValueKind};
 use minijinja::{context, Environment, Error, ErrorKind, State};
 use std::fmt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod tool_json;
+pub use tool_json::ToolJson;
 
 /// The Python `str` methods the unknown-method hook implements. Listed in the
 /// refusal message so an unsupported template tells the reader what *is*
@@ -96,10 +99,35 @@ impl TemplateError {
         }
     }
 
+    /// A request supplied `tools` and the template never put them in the prompt
+    /// (#597).
+    ///
+    /// The check is mechanical: the same conversation is rendered with and
+    /// without `tools`, and byte-identical output means the definitions reached
+    /// nothing. `has_template` only shapes the explanation — the ChatML fallback
+    /// has no tool format at all, a model template without a `tools` branch
+    /// ignores them.
+    fn tools_not_rendered(has_template: bool) -> Self {
+        let detail = if has_template {
+            "this model's chat template has no `tools` branch: it renders the same prompt with \
+             and without `tools`, so the tool definitions would never reach the model"
+        } else {
+            "this GGUF carries no `tokenizer.chat_template` and the generic ChatML fallback has \
+             no tool format, so the tool definitions would never reach the model"
+        };
+        Self {
+            kind: "tools not rendered",
+            detail: detail.to_string(),
+            line: None,
+        }
+    }
+
     /// The full, user-facing refusal. Names the construct, the template line
     /// and the engine's alternative, so nothing is silent.
     pub fn message(&self) -> String {
-        if self.kind == "template file" {
+        // Both engine refusals have their own complete wording: appending the
+        // `str`-method list to a tools refusal would blame the wrong construct.
+        if self.kind == "template file" || self.kind == "tools not rendered" {
             return format!("chat template error — {}: {}", self.kind, self.detail);
         }
         let at = match self.line {
@@ -657,10 +685,108 @@ pub(crate) fn format_civil(t: CivilTime, fmt: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// Python's `json.dumps` separators for `indent=None`: `", "` and `": "`.
+///
+/// serde_json's compact form uses `,`/`:` with no spaces, which is not what
+/// CPython emits, so every `| tojson` in a template would drift by a space per
+/// separator (#597). Only the three separators differ; the escaping, number and
+/// string handling are serde_json's, and those match CPython for the value forms
+/// a tool definition uses.
+struct PyJsonFormatter;
+
+impl serde_json::ser::Formatter for PyJsonFormatter {
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        writer.write_all(b": ")
+    }
+}
+
+/// The `tojson` filter transformers binds: CPython's `json.dumps` with
+/// `ensure_ascii=False`.
+///
+/// minijinja's builtin `tojson` is **not** usable as the reference here: it is
+/// compact and it HTML-escapes `<`, `>`, `&` and `'`. transformers deliberately
+/// replaces Jinja2's filter with a plain `json.dumps` for exactly that reason, so
+/// a tool definition rendered by minijinja's builtin would carry `\u003c` where
+/// the reference has `<`. The `minijinja` crate's `json` feature is also off in
+/// this build, so without this filter the Qwen2.5 tools branch refuses at the
+/// missing filter instead of rendering (#597).
+///
+/// `indent` follows the builtin (a bool or a space count); any other keyword
+/// (`ensure_ascii`, `sort_keys`, `separators`) is refused by name rather than
+/// silently ignored, because each would change the bytes a template asked for.
+fn py_tojson(value: &Value, indent: Option<Value>, args: Kwargs) -> Result<Value, Error> {
+    let indent = match indent {
+        Some(indent) => Some(indent),
+        None => args.get("indent")?,
+    };
+    args.assert_all_used()?;
+    let indent = match indent {
+        None => None,
+        Some(ref val) => match bool::try_from(val.clone()) {
+            Ok(true) => Some(2usize),
+            Ok(false) => None,
+            Err(_) => Some(usize::try_from(val.clone()).map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    "tojson: `indent` must be a bool or an integer",
+                )
+            })?),
+        },
+    };
+    let mut out = Vec::<u8>::new();
+    let written = match indent {
+        None => {
+            let mut s = serde_json::Serializer::with_formatter(&mut out, PyJsonFormatter);
+            serde::Serialize::serialize(&value, &mut s)
+        }
+        Some(indent) => {
+            let indentation = " ".repeat(indent);
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(indentation.as_bytes());
+            let mut s = serde_json::Serializer::with_formatter(&mut out, formatter);
+            serde::Serialize::serialize(&value, &mut s)
+        }
+    };
+    written.map_err(|err| {
+        Error::new(ErrorKind::InvalidOperation, "cannot serialize to JSON").with_source(err)
+    })?;
+    let text = String::from_utf8(out).map_err(|err| {
+        Error::new(ErrorKind::InvalidOperation, "tojson produced invalid UTF-8").with_source(err)
+    })?;
+    // A plain string, not `from_safe_string`: the result goes into a prompt, and
+    // claiming HTML-safety would suppress an escaping the caller may still want.
+    Ok(Value::from(text))
+}
+
 /// The environment with an explicit clock: the only way time enters a render.
-fn environment_with_clock(clock: fn() -> CivilTime) -> Environment<'static> {
+fn environment_with(clock: impl Fn() -> CivilTime + Send + Sync + 'static) -> Environment<'static> {
     let mut env = Environment::new();
     env.set_unknown_method_callback(unknown_method);
+    env.add_filter("tojson", py_tojson);
     env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
         // A template's deliberate refusal is not a fallback trigger either.
         Err(Error::new(ErrorKind::InvalidOperation, msg))
@@ -672,6 +798,13 @@ fn environment_with_clock(clock: fn() -> CivilTime) -> Environment<'static> {
         },
     );
     env
+}
+
+/// The environment as of one fixed instant. A two-pass render (the `tools`
+/// check in `render_checked_at`) must read the same time on both passes, or a
+/// `strftime_now` template would look like it changed because of `tools`.
+fn environment_at(now: CivilTime) -> Environment<'static> {
+    environment_with(move || now)
 }
 
 /// Read, reject-empty and validate a `--chat-template <FILE>`.
@@ -788,25 +921,31 @@ pub fn render_messages(
     add_generation_prompt: bool,
     bos_token: &str,
 ) -> Result<String, TemplateError> {
-    render_messages_with_clock(
-        utc_now,
-        template,
+    render_messages_opt_with_tools(
+        Some(template),
         messages,
+        None,
         add_generation_prompt,
         bos_token,
     )
 }
 
-/// `render_messages` with an explicit clock (the injection point): the
-/// environment is built from the clock, so nothing inside a render reads time.
-fn render_messages_with_clock(
-    clock: fn() -> CivilTime,
-    template: &str,
+/// The one render core: `template` (`None` = the ChatML fallback) plus the
+/// `tools` context value, as of one fixed instant.
+fn render_at(
+    now: CivilTime,
+    template: Option<&str>,
     messages: &[(String, Option<String>)],
+    tools: Option<&[ToolJson]>,
     add_generation_prompt: bool,
     bos_token: &str,
 ) -> Result<String, TemplateError> {
-    let mut env = environment_with_clock(clock);
+    let Some(template) = template else {
+        // The fallback has no tool format; `render_checked_at` is what refuses a
+        // request that brought `tools` here.
+        return Ok(fallback_chatml_messages(messages, add_generation_prompt));
+    };
+    let mut env = environment_at(now);
     if let Err(e) = env.add_template("chat", template) {
         return Err(TemplateError::classify(&e));
     }
@@ -824,15 +963,68 @@ fn render_messages_with_clock(
         })
         .collect();
 
+    // transformers passes `tools=None`; `none` keeps `{% if tools %}` and
+    // `tools is defined` behaving the way jinja2 does.
+    let tools_value = match tools {
+        Some(tools) => Value::from_serialize(tools),
+        None => Value::from(()),
+    };
+
     tmpl.render(context! {
         messages => msgs,
         add_generation_prompt => add_generation_prompt,
         bos_token => bos_token,
-        // transformers passes `tools=None`; `none` keeps `{% if tools %}` and
-        // `tools is defined` behaving the way jinja2 does.
-        tools => Value::from(()),
+        tools => tools_value,
     })
     .map_err(|e| TemplateError::classify(&e))
+}
+
+/// `render_at` with the `tools` contract applied: when a request supplies tools,
+/// the same conversation is rendered twice at one instant, and byte-identical
+/// output is a refusal — the definitions reached nothing (#597).
+///
+/// The check is mechanical on purpose. A template can drop `tools` by omitting
+/// the branch, by guarding it on a value we do not pass, or by rendering an empty
+/// block, and only the output can tell us which happened — no template-text
+/// inspection can.
+fn render_checked_at(
+    now: CivilTime,
+    template: Option<&str>,
+    messages: &[(String, Option<String>)],
+    tools: Option<&[ToolJson]>,
+    add_generation_prompt: bool,
+    bos_token: &str,
+) -> Result<String, TemplateError> {
+    let Some(tools) = tools.filter(|t| !t.is_empty()) else {
+        return render_at(
+            now,
+            template,
+            messages,
+            None,
+            add_generation_prompt,
+            bos_token,
+        );
+    };
+    let with = render_at(
+        now,
+        template,
+        messages,
+        Some(tools),
+        add_generation_prompt,
+        bos_token,
+    )?;
+    let without = render_at(
+        now,
+        template,
+        messages,
+        None,
+        add_generation_prompt,
+        bos_token,
+    )?;
+    if with == without {
+        return Err(TemplateError::tools_not_rendered(template.is_some()));
+    }
+    Ok(with)
 }
 
 /// Render with an optional template: `None` (the GGUF carries no
@@ -844,10 +1036,23 @@ pub fn render_messages_opt(
     add_generation_prompt: bool,
     bos_token: &str,
 ) -> Result<String, TemplateError> {
-    render_messages_opt_in(
-        utc_now,
+    render_messages_opt_with_tools(template, messages, None, add_generation_prompt, bos_token)
+}
+
+/// `render_messages_opt` plus the request's `tools` (the server's path, and the
+/// only place the tools contract is enforced for a template-less GGUF too).
+pub fn render_messages_opt_with_tools(
+    template: Option<&str>,
+    messages: &[(String, Option<String>)],
+    tools: Option<&[ToolJson]>,
+    add_generation_prompt: bool,
+    bos_token: &str,
+) -> Result<String, TemplateError> {
+    render_checked_at(
+        utc_now(),
         template,
         messages,
+        tools,
         add_generation_prompt,
         bos_token,
     )
@@ -861,10 +1066,14 @@ fn render_messages_opt_in(
     add_generation_prompt: bool,
     bos_token: &str,
 ) -> Result<String, TemplateError> {
-    match template {
-        Some(t) => render_messages_with_clock(clock, t, messages, add_generation_prompt, bos_token),
-        None => Ok(fallback_chatml_messages(messages, add_generation_prompt)),
-    }
+    render_at(
+        clock(),
+        template,
+        messages,
+        None,
+        add_generation_prompt,
+        bos_token,
+    )
 }
 
 /// Diff rendering result (the minfer version of `common_chat_format_single`).
