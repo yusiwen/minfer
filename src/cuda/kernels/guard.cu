@@ -149,35 +149,33 @@ static void minfer_site_report(const char* site, int kind, int code, int bytes, 
     fprintf(stderr, "minfer/cuda: %s\n", g_site_msg);
 }
 
-// Test injection (issue #147), env-gated like #145's `MINFER_TEST_LATCH_ERROR`:
-// `MINFER_TEST_CALL_FAIL` is a comma-separated list of site tokens, or `all`.
-// This is the device half of the one failure-injection seam (issue #171,
-// `src/testfail.rs` documents the Rust half and the shared matching rule); the
-// Rust matcher `testfail::injection_names_site` and this function must stay
-// exact-token identical (no substring matching).
+// Test injection (issue #147) — the device half of the one failure-injection seam
+// (issue #171). The decision is NOT made here: it is `crate::testfail::requested`,
+// reached through the C ABI export `minfer_seam_site_requested`, so the
+// `launch:*` / `attr:*` sites share the Rust matcher and the Rust scope rule
+// instead of keeping a second `getenv` parser in step with it (#619). An
+// in-process arm is thread-scoped there, which the old `getenv` read could never
+// be — a parallel harness ran one gate's deliberate failure into another gate.
+// `MINFER_TEST_CALL_FAIL` remains the command-line lever, exact-token and
+// comma-separated with `all` as the wildcard.
+//
+// The reference is **weak** because one binary links these kernels without the
+// crate: `cargo run --example cuda_graph_diag` (a standalone Rust → CUDA FFI
+// diagnostic with no `minfer` code in it). There the symbol resolves to null and
+// the seam is simply off, which is the truth — that binary has no seam to arm.
+//
 // A named site performs its REAL call with a value that makes it fail — an
-// over-limit attribute request, an over-limit dynamic-smem launch, or (Rust
-// side) `cudaGraphDestroy` on the `cudaGraphExec_t` — so the failure is a real
-// latch the site must name and clear, not a synthetic return value. That is what
-// makes "no latched error reaches sync" a meaningful assertion. The knob is off
-// in every default run, so `compute-sanitizer --tool memcheck` over the suite
-// never sees such a call. Token matching is exact (no substring surprises).
+// over-limit attribute request, an over-limit dynamic-smem launch, or (Rust side)
+// `cudaGraphDestroy` on the `cudaGraphExec_t` — so the failure is a real latch the
+// site must name and clear, not a synthetic return value. That is what makes "no
+// latched error reaches sync" a meaningful assertion. The knob is off in every
+// default run, so `compute-sanitizer --tool memcheck` over the suite never sees
+// such a call.
+extern "C" bool minfer_seam_site_requested(const char* site) __attribute__((weak));
+
 bool minfer_test_call_fails(const char* site) {
-    const char* v = getenv("MINFER_TEST_CALL_FAIL");
-    if (v == 0) return false;
-    const size_t sl = strlen(site);
-    const char* p = v;
-    while (*p != '\0') {
-        while (*p == ',' || *p == ' ') p++;
-        const char* q = p;
-        while (*q != '\0' && *q != ',') q++;
-        size_t n = (size_t)(q - p);
-        while (n > 0 && p[n - 1] == ' ') n--;
-        if ((n == 3 && strncmp(p, "all", 3) == 0) || (n == sl && strncmp(p, site, n) == 0))
-            return true;
-        p = q;
-    }
-    return false;
+    if (minfer_seam_site_requested == nullptr) return false;
+    return minfer_seam_site_requested(site);
 }
 
 // The device's `cudaDevAttrMaxSharedMemoryPerBlockOptin`, queried once.

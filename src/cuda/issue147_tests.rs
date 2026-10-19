@@ -39,28 +39,9 @@ fn issue147_gate_enabled() -> bool {
     true
 }
 
-/// Restores `MINFER_TEST_CALL_FAIL` on drop, so a panicking gate cannot
-/// leave the injection armed for the rest of the process.
-struct InjectionGuard {
-    prev: Option<String>,
-}
-
-impl InjectionGuard {
-    fn arm(site: &str) -> Self {
-        let prev = std::env::var("MINFER_TEST_CALL_FAIL").ok();
-        std::env::set_var("MINFER_TEST_CALL_FAIL", site);
-        Self { prev }
-    }
-}
-
-impl Drop for InjectionGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var("MINFER_TEST_CALL_FAIL", v),
-            None => std::env::remove_var("MINFER_TEST_CALL_FAIL"),
-        }
-    }
-}
+/// The shared arm (#171's seam): thread-scoped since #619, so this gate's
+/// injection cannot reach another gate in the same process.
+use crate::testfail::InjectionGuard;
 
 /// What one injected call reported, plus its own return value.
 struct Observed {

@@ -63,26 +63,9 @@ fn fixture() -> Vec<(String, String, String, String)> {
         })
         .collect()
 }
-/// Restores `MINFER_TEST_CALL_FAIL` on drop, so a panicking gate cannot leave
-/// the injection armed for the rest of the process.
-struct Arm {
-    prev: Option<String>,
-}
-impl Arm {
-    fn new(list: &str) -> Self {
-        let prev = std::env::var("MINFER_TEST_CALL_FAIL").ok();
-        std::env::set_var("MINFER_TEST_CALL_FAIL", list);
-        Self { prev }
-    }
-}
-impl Drop for Arm {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var("MINFER_TEST_CALL_FAIL", v),
-            None => std::env::remove_var("MINFER_TEST_CALL_FAIL"),
-        }
-    }
-}
+/// The shared arm (#171's seam): thread-scoped since #619. One dispatch can reach
+/// several sites, so `arm_all` arms the set as one scope.
+use crate::testfail::InjectionGuard;
 /// Zeroed device scratch. An injected launch never runs; the two `_opt`
 /// k-split sites the driver reaches alone run their kernel for real, so the
 /// buffers are 1 MiB each — well past every shape the driver passes.
@@ -149,7 +132,7 @@ fn run(
     let _ = s.take_last_error();
     unsafe { minfer_site_fail_reset() };
     {
-        let _g = Arm::new(&arm.join(","));
+        let _g = InjectionGuard::arm_all(arm);
         call();
     }
     let n = unsafe { minfer_site_hist_len() };

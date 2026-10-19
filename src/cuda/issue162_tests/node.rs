@@ -51,7 +51,7 @@ fn cuda_issue162_a_required_launch_failure_fails_the_node() {
     let _ = s.take_last_error();
     unsafe { minfer_site_fail_reset() };
     let err = {
-        let _arm = Arm::new("launch:add_f32");
+        let _arm = crate::testfail::InjectionGuard::arm("launch:add_f32");
         sched
             .execute(&g, &mut alloc)
             .expect_err("a required launch failure must fail the node")
@@ -114,7 +114,7 @@ fn cuda_issue162_the_err_arm_also_drains_the_sticky() {
     let _ = s.take_last_error();
     unsafe { minfer_site_fail_reset() };
     let err = {
-        let _arm = Arm::new("launch:f16_f32_matmul_vec");
+        let _arm = crate::testfail::InjectionGuard::arm("launch:f16_f32_matmul_vec");
         sched
             .execute(&g, &mut alloc)
             .expect_err("the f16 matmul launcher's Err must reach the scheduler")
