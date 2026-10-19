@@ -403,7 +403,7 @@ kernels in a profile:
   (`:690`) per weight. `warm_w16` (`src/cuda/methods/prefill_f16.rs:89`) maps
   `TensorType` → the same type ids and calls
   `w16_get`, which launches the dequant). But only for models whose matmul
-  weights total ≥ `W16_ENABLE_BYTES` (`src/cuda.rs:597`) = 2 GiB **and**
+  weights total ≥ `W16_ENABLE_BYTES` (`src/cuda.rs:599`) = 2 GiB **and**
   when the int8 MMQ prefill path is not active
   (`mmq_active` (`qwen2/loader.rs:683`)). A 0.5B Q4_0 model is far below that bar (its
   largest tensor, `tok_embd`, is 76.6 MB in Q4_0 — §4.1) and therefore runs

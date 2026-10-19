@@ -539,7 +539,7 @@ per-row on purpose. Line by line:
   03's Q4_0 block. One thread's block pointer is `row·2736 + u·18` — a
   stride-18 walk, the row streamed linearly.
 - **`d4`, `d8`** — the two f16 scales: the weight block's and the
-  activation block's (40-byte stride, `Q8PB` (`common.cuh:133`)).
+  activation block's (40-byte stride, `Q8PB` (`common.cuh:137`)).
 - **the 2-byte-loads-as-u32 trick** — Q4_0's 18-byte stride guarantees only
   2-byte alignment (family comment at `mmvq_multi.cu:440-441`), so a direct `uint32_t`
   load would be a misaligned-access fault on some devices; the kernel
@@ -557,7 +557,7 @@ per-row on purpose. Line by line:
 - **`acc += d8 * d4 * (dot - 8*sx)`** — both scales fold once per block, in
   f32. The integer accumulation is *exact*; the only rounding in the row is
   the two quantizations, which already happened.
-- **`mmvq_block_reduce`** (`src/cuda/kernels/common.cuh:193`) — the two-stage reduction
+- **`mmvq_block_reduce`** (`src/cuda/kernels/common.cuh:197`) — the two-stage reduction
   of §2.2's second mapping: 5 warp shuffles, `warp_sums[8]` in shared memory,
   `__syncthreads()`, thread 0 adds and stores `output[t*od + row]`.
 

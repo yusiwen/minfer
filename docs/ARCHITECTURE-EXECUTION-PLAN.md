@@ -10473,6 +10473,10 @@ entry (`execute_node`) and the weight registrar (`register_weight`), plus the de
 dispatch's own answer — the shape #141's f16 vectorization gate needed (`F16_SIMD_PATH_CALLS`). #147's
 matcher `injection_names_site` moved into `testfail.rs`, so there is one matcher and its exact-token
 tests now run in CI's CPU job instead of only on a `--features cuda` build.
+*(2026-10-19, [#619](https://github.com/yusiwen/minfer/issues/619): that matcher is now the only
+implementation — `guard.cu` forwards to it through a weak C ABI export instead of keeping a second
+`getenv` parser — and an in-process arm is **thread-scoped**, so one gate's injection cannot fail
+another gate in the same process. The #616/#619 record at the end of this file has the measurement.)*
 
 **Migration of the older knobs.** `MINFER_TEST_CALL_FAIL` keeps its name and semantics (the contract
 the #147 gates depend on). #145's `MINFER_TEST_LATCH_ERROR` is **left in place**: it *enables* a
@@ -11940,3 +11944,106 @@ says sign test; `docs/TEST-BASELINES.md` and `scripts/test-baselines.toml` carry
 (595 / 44 unit on aarch64, 596 / 45 derived on x86_64, and the refreshed 683 / 0 / 50 device row).
 No ADR: this moves a test's statistic, not a production contract, so the PR answers
 `ADR: none`.
+
+#### Test-infrastructure record (#616 + #619, 2026-10-19) — an unrun gate asserts yesterday's world, and a test seam scoped to the process
+
+**What the two tickets share.** Both are failures of *scope*: an assertion whose truth expired, and a
+mutation lever whose reach was larger than the gate that armed it. Both lived in tests that only the
+`#[ignore]`d real-model set exercises, which is exactly where a wrong assertion survives longest —
+CI never runs it, so nothing contradicts it until someone runs the set by hand.
+
+**#616: the arm that described a world the encoders had already left.** The F6 quantize bounds gate
+(`src/tooling/tests/quantize_bounds.rs`) asserted "a target the engine reads but cannot encode is
+refused by name" by taking `QuantTarget::parse("q4_K")` as an error. That was true when it was
+written; #140 then landed the K-quant encoders, `parse("q4_K")` became `Ok(Q4_K)`, and the gate
+started panicking on its own first assertion — `called Result::unwrap_err() on an Ok value: Q4_K` —
+before reaching any of its real work. Measured on master `8a6f4d4`, dgxspark, 2026-10-19.
+
+The category the arm described is now **empty by construction**: every weight type the engine reads
+has an encoder. Keeping a hand-picked name there would only re-arm the same trap, so the gate now
+iterates `crate::quantize::KNOWN_UNSUPPORTED` (made `pub(crate)` for it) and asserts what is still
+load-bearing — a known GGUF type with no encoder is refused **by name**, with the supported list in
+the message, never silently approximated to a neighbour. The assertion is derived from the list, so
+an encoder landing or a type being removed moves it instead of invalidating it. The half that can
+run in CI moved there: `quantize::tests::targets_parse_and_refuse_by_name` iterates the same list,
+and now also parses **every** name in `SUPPORTED_TARGETS` back to the target that spells it, so the
+advertised string (hand-maintained data) cannot drift from the parser.
+
+**#619: a seam scoped to the process, where the gates are scoped to their own work.**
+`MINFER_TEST_CALL_FAIL` was process-global: `InjectionGuard::arm` wrote the environment and
+`testfail::requested` read it from **any** thread. So while the stall gate had `forward_batch`
+armed, every other gate ticking a `BatchEngine` in that process met the injection inside the real
+forward entry. Observed 1 of 12 parallel device runs (2026-10-19): `kv_sharing::a_store_inside_a_
+shared_prefix_takes_a_private_row` failed with
+`inference panicked: [testfail] deliberate panic injected at site 'forward_batch'`. Same class as
+the `MINFER_NO_KV_SHARE` race #617 fixed with a module-level mutex, but the window is the whole seam
+gate and the victim can be *any* gate, so no module-local lock can cover it.
+
+The scope is now the **arming thread**, decided in one pure function (`testfail::decides`): an arm on
+this thread fires, `MINFER_TEST_CALL_FAIL` stays the out-of-process lever a mutation run uses from
+the command line (it fires on every thread, which is what a mutation run wants), and
+`InjectionGuard::arm` **never writes the environment** — writing it is the defect. Arms nest and
+unarm LIFO, and `arm_all` arms a multi-site dispatch as one scope (the #162 driver reaches several
+launch sites in one call).
+
+The device half stopped being a second implementation. `minfer_test_call_fails` in `guard.cu` used to
+carry its own `getenv` parser that had to "stay exact-token identical" to the Rust matcher — a
+duplication that could only ever be process-wide. It now forwards to a **weak** reference to the Rust
+export `minfer_seam_site_requested`, so `launch:*` / `attr:*` inherit the same decision, the same
+matcher and the same thread scope. Weak because `cargo run --example cuda_graph_diag` links the
+kernels without the crate: there the symbol is null and the seam is simply off (that binary has no
+seam to arm). The two CUDA-local guard copies (`issue147_tests`, `issue162_tests`) were replaced by
+the shared one.
+
+**Reproduction is a gate, not a rerun of the flake.** Five runs of the batch subset on master
+(`--ignored --test-threads=4 server::batch::tests`) did **not** reproduce it — the observed rate was
+1 of 12 on the full device set — so the fix's gate is deterministic at the seam instead:
+`testfail::tests::an_arm_reaches_only_the_arming_thread` arms on one thread, asserts the chokepoint
+fires there and does not fire on a spawned thread, and the two other new tests pin that arming never
+writes the environment and that arms unarm LIFO. On the unfixed tree those three fail (**3 passed /
+3 failed**); with the fix, and with either clause of `decides` or the environment write mutated, they
+break exactly as described below.
+
+**Verification (2026-10-19, `dgxspark`: aarch64, 20 cores, GB10 sm_121, CUDA 13.0, driver 580.178.04).**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` (CPU) | **599 / 0 / 44** unit (595/44 before the four seam tests) + **24 / 0 / 6** integration |
+| `PARALLEL=0 scripts/real_model_gates.sh` (CPU, serial) | **44 / 0** (122.49 s) — #616's gate is one of them |
+| `scripts/real_model_gates.sh` (CPU, parallel) | **44 / 0** (56.88 s) |
+| `FEATURES=cuda scripts/real_model_gates.sh` (device, serial, 0.5B) | **50 / 0** (122.28 s) |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf FEATURES=cuda scripts/real_model_gates.sh` | **50 / 0** (117.40 s) |
+| `PARALLEL=1 FEATURES=cuda scripts/real_model_gates.sh` ×3 — the configuration #619 was found in | **50 / 0** (25.41 s), **50 / 0** (28.08 s), **49 / 1** (26.00 s — #189's S4 A/B gate, see below) |
+| `scripts/cuda_test.sh` | **687 / 0 / 50** |
+| `MINFER_TEST_ISSUE147=1 MINFER_TEST_ISSUE162=1 cargo test --release --features cuda -- --test-threads=1 cuda::issue1` | **13 passed / 1 failed** — the failure is #621, below; the injected `launch:*` / `attr:*` reports are the evidence that the C++ half reaches the thread-local arm |
+| F6 gate alone, **before** (`master 8a6f4d4`) | **0 / 1 FAILED** — `called Result::unwrap_err() on an Ok value: Q4_K` at `quantize_bounds.rs:38` |
+| F6 gate alone, **after** | **1 passed**; prints `q8_0 vs f16 max |Δlogit| = 0.48125076 (mean 0.0820301) … greedy [12095, 13, 1084, 374]`, so the gate's type, f16 and logit assertions all ran |
+| Mutation 1: `parse`'s known branch answers the generic unknown-target message | F6 gate **FAILED** — `q2_K: minfer quantize: unknown quant target "q2_k"; …` (reverted, `sha256sum` identical) |
+| Mutation 2: `InjectionGuard::arm_all` writes the environment again (the pre-fix behaviour) | `testfail::tests` **3 passed / 4 failed**, including `an arm must not reach a gate on another thread (#619)` (reverted, `sha256sum` identical) |
+| Mutation 3: `decides`' environment clause dropped | `the_scope_rule_is_an_arm_or_the_environment` **FAILED** (reverted) |
+| Mutation 4: `decides`' arm clause dropped | the three arm gates and the scope-rule gate **FAILED** (reverted) |
+| `cargo test --release --bin minfer -- --test-threads=1 testfail::tests` on the **unfixed** tree | **3 passed / 3 failed** — the deterministic reproduction, taken before the fix |
+
+**Honest reading.** (1) The flake that produced #619 did **not** reproduce in five runs of the batch
+subset on master (`--ignored --test-threads=4 server::batch::tests`: 15 passed each), which is why the
+gate is a deterministic one at the seam and not a rerun of the flake — the recorded incidence stays 1
+of 12 device runs, and the transcript lives in the ticket. (2) The third parallel device run failed
+#189's S4 A/B timing gate at **7 / 9** refusals, with both arms roughly **twice** their solo cost
+(span 47.5 / map 65.6 µs/launch against 24.6 / 25.8 alone): ~50 gates on one GPU is the
+configuration [`AGENTS.md`](../AGENTS.md) tells you not to use for a device build (`[#64]`), and that
+gate alone is green **2 / 2** (0 / 9 and 1 / 9 refusals). It is device contention, not a seam or #616
+regression, and it was not introduced here. (3) The two parallel runs before it were **50 / 0** — the
+configuration the ticket asks for, with the seam gate and the `kv_sharing` gates overlapping in one
+process, green twice. (4) `cuda::issue162_tests::sites` is red on a device for a reason that predates
+this work: [#621] — #208's fixture refresh recorded three bf16 launch sites that the union driver
+never arms. Confirmed on master with this tree stashed, filed, not fixed here (it needs three new
+`go!` arms on shapes that reach those instantiations).
+
+**Docs.** `docs/GATE-CONTRACT.md` §3 gains the scope paragraph; the #171 record gains a dated
+amendment; `src/testfail.rs`, `guard.cu`, `common.cuh` and `src/cuda.rs` carry the new arrangement;
+seven `docs/cuda_tutorial/` line anchors moved with the `src/cuda.rs` / `common.cuh` edits;
+`docs/TEST-BASELINES.md` and `scripts/test-baselines.toml` carry the counts above. No ADR: the change
+moves a test seam and a test's assertions, not a production contract, so the PR answers `ADR: none`.
+
+[#64]: https://github.com/yusiwen/minfer/issues/64
+[#621]: https://github.com/yusiwen/minfer/issues/621

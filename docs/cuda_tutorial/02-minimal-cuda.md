@@ -378,8 +378,8 @@ cost: pinned memory is a scarce OS resource (over-allocating it degrades the
 whole machine, not just your process). minfer keeps small, ring-shaped pinned
 pools only where asynchrony pays — the 8-slot × 2 MB staging ring for input
 fills (`write_input_async`, `src/cuda/methods/copy.rs:29`), a grow-on-demand D2H
-readback buffer for per-step logits (`PinnedBuf`, `src/cuda.rs:415`), and the
-capture staging pool (`CaptureStaging`, `src/cuda.rs:435`) — with a
+readback buffer for per-step logits (`PinnedBuf`, `src/cuda.rs:417`), and the
+capture staging pool (`CaptureStaging`, `src/cuda.rs:437`) — with a
 synchronous pageable fallback whenever pinned allocation fails.
 `docs/GPU_SAFETY.md:238` (CUDA rule 6) states the rule that makes this safe: *same-stream
 ordering* — the async fill is safe because every consumer kernel is enqueued
@@ -433,11 +433,11 @@ Initialization — the idiom where acquiring a resource in a constructor and
 releasing it in a destructor ties the resource's lifetime to an object's, so
 drops and panics cannot leak it) is how minfer keeps the *host-side* CUDA
 resources leak-proof: every pinned allocation has a `Drop` impl calling
-`cudaFreeHost` (`PinnedPool` `src/cuda.rs:397`, `PinnedBuf` `src/cuda.rs:`,
+`cudaFreeHost` (`PinnedPool` `src/cuda.rs:399`, `PinnedBuf` `src/cuda.rs:`,
 `CaptureStaging` `src/cuda.rs:`). Device memory is the interesting
 half-exception. A *weight* buffer is not RAII-managed at all: weights live
 for the whole process, keyed by name in the registry
-(`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `CudaState::weights` (`src/cuda.rs:614`)), and
+(`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `CudaState::weights` (`src/cuda.rs:616`)), and
 the registry's replace rule deliberately leaks the stale buffer because a
 live captured CUDA Graph may still reference the old pointer
 `register_weight` (`src/cuda/methods/weights.rs:18`)) — leaking *by decision, with a bound and a comment*
