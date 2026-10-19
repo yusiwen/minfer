@@ -158,6 +158,19 @@ normal run and the `compute-sanitizer` run; the property is pinned by
 `testfail::tests::the_seam_is_off_by_default`. It is **test-only**: a chokepoint
 is an ordinary call that returns `Ok`/does nothing in production.
 
+**Scope: the arming thread.** An in-process arm is thread-local
+([#619](https://github.com/yusiwen/minfer/issues/619)), so a gate that arms a site
+cannot fail a gate on another thread — the parallel harness runs many gates in one
+process, and the previous process-global arm did exactly that: the stall gate armed
+`forward_batch` and a concurrent `kv_sharing` tick met it inside the real forward
+entry, 1 of 12 device runs. `MINFER_TEST_CALL_FAIL` stays the **out-of-process**
+lever: a mutation run names a site on the command line and every thread of that
+process sees it. There is one decision (`testfail::decides`), and
+`InjectionGuard::arm` **never writes the environment** — a gate that wrote it would
+recreate the class, which is why `testfail::tests` pins both halves. The CUDA
+`launch:*` / `attr:*` sites share that decision (their helper forwards to it), so a
+device gate's arm reaches its own thread's launches and no others.
+
 **The observation half.** A gate that must prove a path *executed* cannot read
 the path's own answer — a dispatch function naming its branch is
 self-certifying. `testfail::note_checked(site)` / `checked(site)` are bumped **by
