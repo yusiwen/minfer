@@ -352,7 +352,7 @@ grid has `od * nb` threads. Reading it line by line:
   length `id` is a multiple of 32 — the backend gates it before dispatching:
   the MatMul arm rejects `id % 32 != 0` (`src/graph/cuda_backend.rs:1481`, the quant-block gate) and the f16
   warm path requires `id % 256 == 0` (`warm_w16`, `src/cuda/methods/prefill_f16.rs:89`).
-- **`h2f(...)`** — the shared helper `h2f` (`src/cuda/kernels/common.cuh:97`): reinterpret the
+- **`h2f(...)`** — the shared helper `h2f` (`src/cuda/kernels/common.cuh:101`): reinterpret the
   2 scale bytes as `__half` and convert to f32. The scale is stored f16, read
   once per block.
 - **The unrolled loop** — each byte yields two f16 outputs: `& 0x0F` takes the
