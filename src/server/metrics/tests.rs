@@ -16,6 +16,7 @@ fn empty_snapshot() -> MetricsSnapshot {
         running: 0,
         jobs_dropped_total: 0,
         worker_stalled_total: 0,
+        requests_failed: Vec::new(),
         prompt_tokens_total: 0,
         completion_tokens_total: 0,
         completion_tokens_per_second: 0.0,
@@ -364,4 +365,48 @@ impl ServerMetrics {
     pub fn completion_tokens_per_second(&self) -> f64 {
         self.token_window.rate(now_secs())
     }
+}
+
+/// #157: a terminal error is counted by class, sorted, and rendered as one
+/// labelled series per class — and it is its **own** signal, not a reuse of the
+/// admission or completion counters.
+#[test]
+fn terminal_errors_are_counted_by_class_and_rendered_labelled() {
+    let m = ServerMetrics::new();
+    assert!(
+        m.snapshot().requests_failed.is_empty(),
+        "nothing has failed yet"
+    );
+    let text = render(&m.snapshot());
+    assert!(
+        !text.contains("minfer_requests_failed_total"),
+        "the family is absent until a class is seen: {text}"
+    );
+
+    m.record_failed("unavailable_error");
+    m.record_failed("server_error");
+    m.record_failed("unavailable_error");
+    let s = m.snapshot();
+    assert_eq!(
+        s.requests_failed,
+        vec![("server_error", 1), ("unavailable_error", 2)],
+        "counted per class and sorted, so the scrape is deterministic"
+    );
+    // Three separate signals, deliberately not one counter: this request was
+    // neither refused before queueing nor dropped at admission, and it *did*
+    // complete (with an error).
+    assert_eq!(s.requests_rejected_total, 0);
+    assert_eq!(s.jobs_dropped_total, 0);
+    assert_eq!(s.requests_completed_total, 0);
+
+    let text = render(&s);
+    assert_well_formed(&text);
+    assert!(
+        text.contains("minfer_requests_failed_total{class=\"server_error\"} 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("minfer_requests_failed_total{class=\"unavailable_error\"} 2"),
+        "{text}"
+    );
 }

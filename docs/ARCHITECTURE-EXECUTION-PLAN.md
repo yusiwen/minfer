@@ -4711,6 +4711,12 @@ channel — so the two paths document their difference instead of one of them si
 losing a request. [#150](https://github.com/yusiwen/minfer/issues/150) tracks making the
 batched path queue with a bound.
 
+> **Superseded 2026-10-19.** [#150](https://github.com/yusiwen/minfer/issues/150) landed
+> exactly that: the batched path queues with `MINFER_QUEUE_MAX` and a drain refusal, and
+> the admission policy is now [ADR-0059](adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md).
+> The measurement above stays as the record of what #121 measured; the decision it
+> records no longer holds. See the #150/#198/#157 record in §test-infrastructure.
+
 **What landed.** `src/server/batch.rs`: `reject(job, e)` sends `StreamEvent::Err` through
 the job's own sender **before** the sender drops and returns the error so the caller can
 still count the rejection; the three paths that give up on a job go through it —
@@ -5325,6 +5331,112 @@ The #160 command is unchanged:
 `ARCHITECTURE-ROADMAP.md` is untouched: no roadmap gap closes here — this is robustness inside the
 existing test-infrastructure/batching rows, the same reason the #154, #151, #158 and #160 records
 give.
+
+#### Server record (#150/#198/#157, 2026-10-19) — the batched worker queues against a bound, and liveness is per run
+
+**Decision.** The batched worker no longer refuses a request that finds every slot busy: it
+queues it, up to `MINFER_QUEUE_MAX` (default `QUEUE_MAX` = 64, the job channel's capacity),
+admits one job per idle slot oldest-first, and answers only the queue bound (`503 the queue is
+full`, the **newest** arrival) and a drain (`503 server is draining`, every
+queued-but-unadmitted job) — so a queue deeper than the drain deadline can no longer be
+abandoned unanswered. `admit` stays placement-only. Because a step that keeps *advancing* the
+work counter is invisible to #196's frozen-counter bound, each run now carries its own lag in
+work units and is answered after `RUN_STALL_STEP_LIMIT` (64) of them, freeing its slot while
+the worker carries on; a **queued** job has no run, so waiting cannot be mistaken for
+stalling. Finally, an accepted request answered with a terminal error is counted where it
+becomes a response (`collect_response`'s `Err`, the SSE frame) as
+`minfer_requests_failed_total{class="…"}`, splitting it from `requests_rejected_total`
+(before queueing), `jobs_dropped_total` (admission) and `requests_completed_total` (left the
+worker). The decision, its rejected alternatives and the costs are
+[ADR-0059](adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md);
+it supersedes the #121 record's "reject loudly; queueing is a feature", which stays above as
+the measurement it was.
+
+**What landed.** `src/server/batch.rs`: `QUEUE_MAX`, `queue_max_from_env`,
+`QUEUE_FULL_MESSAGE`, `DRAINING_MESSAGE`, `idle_slots`, the rewritten `serve_loop`
+(admit ≤ idle slots, bounded queue, drain refusal), `Run::last_progress_work` (stamped at
+admission and at every attributable progress — a row written for the run or a token it
+committed), `RUN_STALL_STEP_LIMIT`, `RUN_STALLED_MESSAGE`, `fail_lagging_runs`.
+`src/server/metrics.rs`: `requests_failed`, `record_failed`, the labelled render (one series
+per class, sorted). `src/server/mod.rs`: `collect_response` takes the metrics and counts the
+non-streaming arm; the SSE map counts the streaming arm. `src/server/chat.rs`: the startup
+line prints the queue bound. Tests: `a_job_queued_behind_a_busy_slot_is_served_when_it_frees`,
+`a_job_beyond_the_queue_bound_is_answered_with_503`, `a_drain_answers_queued_jobs_with_503`
+(real model, `src/server/batch/tests/http.rs`); the #198 gate
+`a_spinning_run_is_answered_and_the_worker_keeps_serving`
+(`src/server/batch/tests/stall.rs`, skipped unless the seam is armed); the pure
+`terminal_errors_are_counted_by_class_and_rendered_labelled`
+(`src/server/metrics/tests.rs`) and `a_streamed_error_frame_is_counted_by_class`
+(`src/server/batch/tests/http.rs`). The #121 rejection gate is replaced by the queue gate, and
+`serve_loop_publishes_the_queue_and_running_depth`'s round 2 now asserts both jobs are
+served (and reads their channels, so a `spin` mutation fails it instead of passing on
+counters that stay balanced).
+
+**A pre-existing race found by the whole-set run, fixed here.** The two KV-share gates in
+`src/server/batch/tests/kv_sharing.rs` both toggle the process-global `MINFER_NO_KV_SHARE`
+and the default `--test-threads` runs them in one process. With the new gates in the mix, the
+copy arm of `a_prefix_copied_from_another_slot_answers_identically` landed between the two
+share arms of `a_store_inside_a_shared_prefix_takes_a_private_row`, which then read
+`shared.rows == 0` and failed. Both now hold a module-level mutex for the whole measurement:
+a process-wide switch needs exclusive ownership, and the gate is deterministic instead of
+order-dependent. Mechanism named because it is a *test* fix, not a behaviour change.
+
+**Measurements (dgxspark, aarch64, CPU build, 2026-10-19).**
+
+| Command | Result |
+|---|---|
+| `cargo test --release` | **594 passed / 0 failed / 44 ignored** unit + **24 / 0 / 6** integration |
+| `scripts/real_model_gates.sh` (parallel, 0.5B) | **43 passed / 1 failed** in 48.75 s |
+| `PARALLEL=0 scripts/real_model_gates.sh` (serial, 0.5B) | **43 passed / 1 failed** in 89.19 s |
+| `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf scripts/real_model_gates.sh` (parallel) | **43 passed / 1 failed** in 59.13 s |
+| the same, `PARALLEL=0` | **43 passed / 1 failed** in 100.29 s |
+| `MINFER_TEST_TICK=spin cargo test --release --bin minfer -- --ignored` (**no `--skip`**) | **30 passed / 14 failed** in 28.02 s |
+| `MINFER_TEST_TICK=wedge` … (**no `--skip`**) | **30 passed / 14 failed** in 25.95 s |
+| `--exact` `a_job_queued_behind_a_busy_slot_is_served_when_it_frees` under `spin` | fails in **0.16 s** (was an `exit 124` hang) |
+| `--exact` `serve_loop_publishes_the_queue_and_running_depth` under `spin` | fails in **0.20 s**, message names both 500s |
+| `--exact` `a_spinning_run_is_answered_and_the_worker_keeps_serving` under `spin` | **1 / 0** in 0.15 s |
+| `python3 scripts/check_baselines.py --check`, `check_status.py --check`, `check_adr.py` | exit 0 |
+
+**The one failure is pre-existing and filed.** Every `real_model_gates.sh` run reports
+`tooling::tests::quantize_bounds::f6_quantize_end_to_end_stays_within_the_stated_bound`
+failing at its refusal arm (`QuantTarget::parse("q4_K")` is now `Ok`; the K-quant encoders
+landed). Reproduced on `aee0dbb` **before** this change, so it is not this record's
+regression; [#616](https://github.com/yusiwen/minfer/issues/616) carries the command, the
+panic and the acceptance. The baseline rows record **43 / 1**, not 43 / 0 — a red set is
+recorded as red.
+
+**Mutation evidence (#198's acceptance).** The `spin` arm previously could not be checked
+without `--skip`ping the two `serve_loop` gates, because they hung on it. They now fail in
+under a second (above), and the whole-set `spin` run needs no `--skip` while the new gate
+asserts the bound's own behaviour: two runs each answered exactly one
+`500 the run made no progress` and the loop terminating. The `wedge` arm keeps its #196
+behaviour and also needs no `--skip`.
+
+**Honest limits.**
+
+- The queue depth is a **policy** constant, not a measured one: 64 matches the channel so a
+  client meets one number, and `MINFER_QUEUE_MAX` is the knob. Nothing here measures whether
+  64 is the right depth for a given deployment.
+- The per-run bound cannot attribute a **frozen global** counter to one run (the `wedge`
+  arm), so that case still costs every live run — #196 is unchanged by design.
+- A wedge *inside* a single `tick` that never returns is still unbounded in-process; only the
+  #196/#198 loop-level bounds are claimed.
+- No CUDA or Metal run: the change is CPU-side server logic, touched by no device kernel, and
+  the device rows carry #207 projections from the CPU rows rather than a fresh measurement.
+  `build-macos` and `build-linux-cuda` compile the change; no device gate is claimed.
+- Handler-boundary counting cannot see a client that disconnects before its answer — the same
+  line `record_tokens` already draws, and the reason the counter is not "requests answered".
+
+**Docs.** `docs/USAGE.md` §"Slot saturation" (rewritten) and §"Metrics and observability"
+(the new family); `docs/FEATURES.md`'s `serve` bullet; `docs/OPENAI-CHAT-API-PLAN.md`
+§"Slot Lifecycle" step 2 and §"Error Types"; `docs/GATE-CONTRACT.md` §3/§4 (the per-run
+bound, and the `spin` arm no longer needing skips); `docs/BUILD.md` §"Tests"
+(`RUN_STALL_STEP_LIMIT`, no `--skip`); `scripts/real_model_gates.sh`'s mutation note;
+`docs/adr/0059-…` plus its index row, `scripts/adr-governs.toml` bindings (`serve_loop`,
+`record_failed`) and `docs/USAGE.md`'s map; `docs/TEST-BASELINES.md` +
+`scripts/test-baselines.toml` (both CPU unit rows and the CPU real-model row).
+`docs/status.toml` is untouched: these tickets are not phase tickets, and no phase counter
+moves.
 
 #### Test-infrastructure record (#218, 2026-09-29) — the prefill-GEMM dynamic-smem opt-in is lazy, per-instantiation, and gated
 

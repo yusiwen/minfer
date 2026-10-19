@@ -303,14 +303,8 @@ impl<'a> WorkBound<'a> {
 // ────────────────────────────────────────────────────────────────────────────
 
 impl BatchEngine {
-    /// Slots without a request (their reservation and KV stay).
-    ///
-    /// Test-only (#239): driven by the `run_batched` helper and by
-    /// `server::batch::tests::stall::{a_failed_decode_forward_answers_a_single_run_and_releases_its_slot,
-    /// the_stall_answers_every_live_run_exactly_once}`.
-    pub fn idle_slots(&self) -> usize {
-        self.slots.iter().filter(|s| s.run.is_none()).count()
-    }
+    // `idle_slots` was test-only (#239) until #150 made it the admission gate, so
+    // it now lives on the production impl in `batch.rs`.
 
     /// Admit a single request: [`BatchEngine::admit`] with one job.
     ///

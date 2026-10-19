@@ -127,16 +127,18 @@ steps, so the two gates that drive it are wedge-proof too, and a wedged server
 answers every live and queued request once and publishes
 `minfer_worker_stalled_total` instead of spinning). A wedge injected with
 `MINFER_TEST_TICK=wedge` now fails each of those gates in **seconds** instead of
-hanging the suite; `=spin` exercises the step-budget arm (the two `serve_loop`
-gates still have to be `--skip`ped there: a step that keeps moving the work
-counter is what a counter cannot catch — see the #196 record). The wall-clock
-bounds that remain are **named backstops, not verdicts**: the two `run_cli`
-child-process ceilings (1800s for the real-model sessions, 60s for the no-model
-registry cases; `MINFER_CLI_WATCHDOG_SECS` overrides both) and the `serve_loop`
-feeder's `FEEDER_POLL_BACKSTOP`, now the last resort for a worker whose published
-metrics never settle rather than the only way out of a wedge. The rules behind
-all of this are [`GATE-CONTRACT.md`](./GATE-CONTRACT.md) §3/§4 and the full
-records are
+hanging the suite; `=spin` is caught by the per-run bound
+([#198](https://github.com/yusiwen/minfer/issues/198)): a run the worker steps
+around without progress for `RUN_STALL_STEP_LIMIT` = 64 work units is answered
+`500 the run made no progress` and its slot freed, so the two `serve_loop` gates
+now fail fast there too — the `spin` mutation run no longer needs `--skip`. The
+wall-clock bounds that remain are **named backstops, not verdicts**: the two
+`run_cli` child-process ceilings (1800s for the real-model sessions, 60s for the
+no-model registry cases; `MINFER_CLI_WATCHDOG_SECS` overrides both) and the
+`serve_loop` feeder's `FEEDER_POLL_BACKSTOP`, now the last resort for a worker
+whose published metrics never settle rather than the only way out of a wedge.
+The rules behind all of this are [`GATE-CONTRACT.md`](./GATE-CONTRACT.md) §3/§4
+and the full records are
 [`ARCHITECTURE-EXECUTION-PLAN.md`](./ARCHITECTURE-EXECUTION-PLAN.md) §test-infrastructure.
 
 ## Git hooks (git-hooks.nix)

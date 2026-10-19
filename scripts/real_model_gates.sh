@@ -37,18 +37,20 @@
 # Usage:
 #   scripts/real_model_gates.sh [extra cargo test args...]
 #
-#   scripts/real_model_gates.sh                    # CPU-only: parallel, 36 passed / 0 failed
-#   PARALLEL=0 scripts/real_model_gates.sh         # CPU-only: serial, 36 passed / 0 failed
+#   scripts/real_model_gates.sh                    # CPU-only: parallel, one gate set
+#   PARALLEL=0 scripts/real_model_gates.sh         # CPU-only: serial, the same set
 #   FEATURES=cuda scripts/real_model_gates.sh      # device set, serial (correct: #64)
 #   PARALLEL=1 scripts/real_model_gates.sh         # force parallel (CPU-only; see #64 on a device)
 #
-# (The counts are as of 2026-09-27, CPU build, aarch64; `AGENTS.md` carries the dated record.)
+# (The counts are the last measured set on dgxspark; re-measure and record them where the
+# suite counts live — `docs/TEST-BASELINES.md` — rather than trusting this comment.)
 # #160: `MINFER_TEST_TICK=wedge|spin` injects a wedged/moving-but-non-terminating step into
 # `BatchEngine::tick` for the bounded-stepper mutation check — see `docs/GATE-CONTRACT.md` §3.
 # It is unset in every normal run. Since #196 the two `serve_loop`-driven gates fail fast under
 # `wedge` too — `serve_loop` itself carries the counted no-progress bound (`STALL_STEP_LIMIT`)
-# — so a whole-set `wedge` run needs no `--skip`. The `spin` arm still needs them skipped: a
-# step that keeps advancing the work counter cannot be caught by a counter (#196 record).
+# — so a whole-set `wedge` run needs no `--skip`. Since #198 the `spin` arm needs no `--skip`
+# either: the per-run bound (`RUN_STALL_STEP_LIMIT`) answers a run the worker steps around, and
+# those gates see the `500` and fail in under a second.
 #
 # The device set's second configuration is a second run of the same command:
 #   MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf \

@@ -17,15 +17,13 @@ use super::*;
 ///    and that everything settles at zero.
 ///
 ///    `queue_depth` is deliberately **not** peak-asserted: `serve_loop` calls
-///    `admit` on every iteration whether or not it is busy, so a job is
-///    placed or rejected within one loop pass and its non-zero window is
-///    shorter than a sampler's interval on dgxspark. Its arithmetic and its
-///    saturation are gated purely in `server::metrics`, and the loop's *drain*
-///    is gated here through `jobs_admitted_total`.
-/// 2. Two jobs on **one** slot, both queued before the loop starts: the
-///    "no idle slot" path is taken deterministically and its counter
-///    (`jobs_dropped_total`) must fire — while the queue arithmetic still
-///    balances, because a rejected job has also *left* the queue.
+///    `admit` only when there is an idle slot, so a queued job's non-zero window
+///    is one loop pass and shorter than a sampler's interval on dgxspark. Its
+///    arithmetic and its saturation are gated purely in `server::metrics`, and
+///    the loop's *drain* is gated here through `jobs_admitted_total`.
+/// 2. Two jobs on **one** slot, both queued before the loop starts: the second
+///    one **waits** (#150) and is served when the slot frees, so nothing is
+///    dropped while the queue arithmetic still balances.
 ///
 /// Real-model gate (`#[ignore]`: CI has no cached GGUF).
 #[test]
@@ -75,41 +73,47 @@ fn serve_loop_publishes_the_queue_and_running_depth() {
         }
         let mut peak_running = 0u64;
         // #160: `FEEDER_POLL_BACKSTOP` is **only a backstop**, not the gate's
-        // failure signal. The verdict below is `peak_running > 0` plus the
-        // queue arithmetic. Since #196 a wedge in `tick` no longer hangs the
-        // join: `serve_loop` ends itself on its counted no-progress bound, so
-        // the feeder also leaves as soon as it sees `worker_stalled_total`
-        // move — the assertion that follows needs no deadline to run, and the
-        // mutation run fails in seconds. What the terminator bounds is a
-        // worker that never settles and never trips the bound; a healthy run
-        // breaks out on `drained` within milliseconds.
+        // failure signal. The verdict below is `peak_running > 0` plus the queue
+        // arithmetic.
+        //
+        // #150/#198: the terminator is the **responses**, not a counter. A
+        // request's channel closes when its answer is complete (`Finish` or
+        // `Err`), which is the only signal that cannot fire early: `admitted`
+        // rises before the worker has published `running`, so "admitted == n,
+        // running == 0" is also the state just after admission. A counter-based
+        // break there would race the first tick — and did, on a box where the
+        // feeder thread is descheduled for the whole run.
         let deadline = Instant::now() + FEEDER_POLL_BACKSTOP;
+        let mut closed = vec![false; rxs.len()];
+        let mut finishes = vec![0usize; rxs.len()];
+        let mut errors: Vec<String> = Vec::new();
         loop {
             let s = feeder_metrics.snapshot();
             peak_running = peak_running.max(s.running);
-            let drained = s.running == 0 && s.queue_depth == 0 && s.requests_total >= n as u64;
-            // Only stop once the run has actually been *seen* running: with
-            // 256-token answers the window is seconds wide, so this is an
-            // assertion about the worker, not about sampler luck.
-            if (peak_running > 0 && drained)
-                || s.worker_stalled_total > 0
-                || Instant::now() > deadline
+            for (i, rx) in rxs.iter_mut().enumerate() {
+                if closed[i] {
+                    continue;
+                }
+                loop {
+                    match rx.try_recv() {
+                        Ok(StreamEvent::Finish { .. }) => finishes[i] += 1,
+                        Ok(StreamEvent::Text(_)) => {}
+                        Ok(StreamEvent::Err(e)) => {
+                            errors.push(format!("{} {} ({})", e.status, e.message, e.error_type));
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            closed[i] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if closed.iter().all(|c| *c) || s.worker_stalled_total > 0 || Instant::now() > deadline
             {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        // Drain the responses; the worker's `blocking_send` must never wedge.
-        // #196: a healthy `serve_loop` never trips its no-progress bound, so
-        // every response here is `Text`/`Finish`; the errors are printed so a
-        // mutation run shows the terminal answer each client actually got.
-        let mut errors: Vec<String> = Vec::new();
-        for mut rx in rxs {
-            while let Some(ev) = rx.blocking_recv() {
-                if let StreamEvent::Err(e) = ev {
-                    errors.push(format!("{} {} ({})", e.status, e.message, e.error_type));
-                }
-            }
         }
         if !errors.is_empty() {
             eprintln!(
@@ -118,10 +122,29 @@ fn serve_loop_publishes_the_queue_and_running_depth() {
                 errors.join("; ")
             );
         }
+        // #150: both jobs had a slot, so neither may be answered with an error.
+        // This is what makes a `spin` mutation fail here instead of passing on
+        // counters that stay balanced while no request is served.
+        assert!(
+            errors.is_empty(),
+            "both jobs fit the two slots, so neither may be refused: {errors:?}"
+        );
+        assert_eq!(
+            finishes,
+            vec![1usize; rxs.len()],
+            "every job gets exactly one Finish (channels closed: {closed:?})"
+        );
         peak_running
     });
 
-    super::serve_loop(&*model, &tok, job_rx, &mut engine, &metrics);
+    super::serve_loop(
+        &*model,
+        &tok,
+        job_rx,
+        &mut engine,
+        &metrics,
+        super::QUEUE_MAX,
+    );
     let peak_running = feeder.join().expect("feeder");
 
     let s = metrics.snapshot();
@@ -150,8 +173,10 @@ fn serve_loop_publishes_the_queue_and_running_depth() {
     let mut one = BatchEngine::new(&*model, 1, 512).expect("engine");
     let one_metrics = Arc::new(crate::server::metrics::ServerMetrics::new());
     let (tx1, rx1) = mpsc::channel::<Job>(64);
+    let mut one_rxs = Vec::new();
     for p in [metric_source("Alpha"), metric_source("Beta")] {
-        let (tx, _rx) = mpsc::channel::<StreamEvent>(1024);
+        let (tx, rx) = mpsc::channel::<StreamEvent>(1024);
+        one_rxs.push(rx);
         tx1.blocking_send(Job {
             input_ids: p,
             params: sampling_params(2),
@@ -161,24 +186,43 @@ fn serve_loop_publishes_the_queue_and_running_depth() {
         one_metrics.requests_total.fetch_add(1, Ordering::SeqCst);
     }
     drop(tx1); // no more senders: the loop drains and exits
-    super::serve_loop(&*model, &tok, rx1, &mut one, &one_metrics);
+    super::serve_loop(&*model, &tok, rx1, &mut one, &one_metrics, super::QUEUE_MAX);
     let s1 = one_metrics.snapshot();
     assert_eq!(
         s1.requests_total - s1.queue_depth,
         2,
-        "a rejected job still left the queue"
+        "both jobs left the queue: #150 queues the second one instead of answering it"
     );
     assert_eq!(
-        s1.jobs_dropped_total, 1,
-        "the second job cannot fit one slot and must be counted as dropped"
+        s1.jobs_dropped_total, 0,
+        "one slot with a queue depth of 64 serves both jobs; nothing is dropped"
     );
     assert_eq!(
         s1.worker_stalled_total, 0,
         "the worker tripped its counted no-progress bound on a run that must \
-         simply serve one request and reject the other (#196)"
+         simply serve one request and queue the other (#196)"
     );
     assert_eq!(s1.running, 0);
     assert_eq!(s1.worker_pending, 0);
+    // The arithmetic above says both jobs left the queue; these channels say they
+    // were *served*, which is what #150 changed. Without this, a worker that
+    // answers both with an error (the `spin` mutation) would still pass.
+    for (i, mut rx) in one_rxs.into_iter().enumerate() {
+        let mut finishes = 0usize;
+        let mut errs: Vec<String> = Vec::new();
+        while let Some(ev) = rx.blocking_recv() {
+            match ev {
+                StreamEvent::Finish { .. } => finishes += 1,
+                StreamEvent::Err(e) => errs.push(e.message),
+                StreamEvent::Text(_) => {}
+            }
+        }
+        assert!(
+            errs.is_empty(),
+            "job {i} was answered with an error instead of being served: {errs:?}"
+        );
+        assert_eq!(finishes, 1, "job {i}: exactly one Finish");
+    }
 
     eprintln!(
         "[f8] serve_loop: peak running {peak_running}, layers {} region {} B owned {} \

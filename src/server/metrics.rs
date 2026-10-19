@@ -304,6 +304,22 @@ pub struct ServerMetrics {
     pub in_flight: AtomicU64,
     /// Responses that finished (body sent, stream closed, or client gone).
     pub requests_completed_total: AtomicU64,
+    /// #157: accepted requests answered with a **terminal error**, by
+    /// `ApiError::error_type` (`unavailable_error`, `server_error`, …).
+    ///
+    /// Bumped where the error becomes a response — `collect_response`'s `Err`
+    /// and the SSE error frame — so it covers the batched and the serial path
+    /// alike and cannot drift when a new send site appears. `requests_completed`
+    /// still counts these too (they did leave the worker); this is the mirror
+    /// signal that says *how* they ended, which `requests_completed_total`
+    /// deliberately does not. A request refused **before** queueing is
+    /// `requests_rejected_total`, not this.
+    ///
+    /// The table is a short `Mutex<Vec<…>>` rather than a fixed-index array
+    /// because `error_type` is an open `&'static str`: a new class must appear in
+    /// `/metrics` without a second list to keep in sync. The lock is taken once
+    /// per failed request, never per token.
+    pub requests_failed: std::sync::Mutex<Vec<(&'static str, u64)>>,
     /// 1 once a shutdown signal was received and new work is refused.
     pub draining: AtomicBool,
     /// Requests still in flight when the drain deadline expired — 0 is a clean
@@ -357,6 +373,9 @@ pub struct MetricsSnapshot {
     pub running: u64,
     pub jobs_dropped_total: u64,
     pub worker_stalled_total: u64,
+    /// #157: terminal errors by `ApiError::error_type`, sorted by class so a
+    /// scrape is deterministic.
+    pub requests_failed: Vec<(&'static str, u64)>,
     pub prompt_tokens_total: u64,
     pub completion_tokens_total: u64,
     /// Generated tokens/s over the trailing [`TOKEN_RATE_WINDOW_SECS`] (f64: it
@@ -394,6 +413,24 @@ impl ServerMetrics {
         }
     }
 
+    /// #157: record that an accepted request was answered with a terminal error.
+    ///
+    /// Called at the two places an error becomes a response (the non-streaming
+    /// collection and the streaming frame), which is the only boundary that sees
+    /// every worker path — batched, serial, #151's failed forward, #196's stall,
+    /// #150's queue bound. Counting at the individual send sites instead would
+    /// make a new send site a silently uncounted error.
+    pub fn record_failed(&self, error_type: &'static str) {
+        let mut table = self
+            .requests_failed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match table.iter_mut().find(|(class, _)| *class == error_type) {
+            Some((_, n)) => *n += 1,
+            None => table.push((error_type, 1)),
+        }
+    }
+
     /// Read every atomic into one snapshot (relaxed; see the module docs).
     pub fn snapshot(&self) -> MetricsSnapshot {
         let r = Ordering::Relaxed;
@@ -411,6 +448,15 @@ impl ServerMetrics {
             running: self.running.load(r),
             jobs_dropped_total: self.jobs_dropped_total.load(r),
             worker_stalled_total: self.worker_stalled_total.load(r),
+            requests_failed: {
+                let mut failed = self
+                    .requests_failed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                failed.sort_by_key(|(class, _)| *class);
+                failed
+            },
             prompt_tokens_total: self.prompt_tokens_total.load(r),
             completion_tokens_total: self.completion_tokens_total.load(r),
             completion_tokens_per_second: self.token_window.rate(now_secs()),
@@ -481,6 +527,24 @@ pub fn render(m: &MetricsSnapshot) -> String {
         "counter",
         m.requests_rejected_total,
     );
+    // #157: a counter family with one series per terminal-error class. Emitted
+    // only once a class has been seen: an absent label describes "no such error
+    // yet", and inventing zero series for classes this build can never answer
+    // would be a second list to keep in sync.
+    if !m.requests_failed.is_empty() {
+        out.push_str(
+            "# HELP minfer_requests_failed_total Accepted requests answered with a terminal \
+             error, by class.\n",
+        );
+        out.push_str("# TYPE minfer_requests_failed_total counter\n");
+        for (class, n) in &m.requests_failed {
+            out.push_str("minfer_requests_failed_total{class=\"");
+            out.push_str(class);
+            out.push_str("\"} ");
+            out.push_str(&n.to_string());
+            out.push('\n');
+        }
+    }
     sample(
         &mut out,
         "minfer_requests_in_flight",

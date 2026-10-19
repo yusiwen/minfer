@@ -771,7 +771,21 @@ pub fn worker_loop(
                     );
                     engine.set_slots_file(Some(p.to_path_buf()));
                 }
-                super::batch::serve_loop(&*model, &tokenizer, job_rx, &mut engine, &metrics);
+                // #150: the queue bound, printed for the same reason as the mode:
+                // a request that waits (or is refused) is a policy decision.
+                let queue_max = super::batch::queue_max_from_env();
+                eprintln!(
+                    "[server] queue: up to {queue_max} request(s) wait for a slot \
+                     (MINFER_QUEUE_MAX); beyond that the newest is answered 503"
+                );
+                super::batch::serve_loop(
+                    &*model,
+                    &tokenizer,
+                    job_rx,
+                    &mut engine,
+                    &metrics,
+                    queue_max,
+                );
             }
             Err(e) => {
                 eprintln!("[server] continuous batching unavailable ({e}); serving serially");
