@@ -74,7 +74,12 @@ jobs:
           fi
 
           # Commits in range (all history for the first release), one line each.
-          ALL="$(git log --format='%h %s' --no-merges ${RANGE})"
+          # An empty RANGE must add *no* revision argument, and `git log` then
+          # defaults to HEAD — exactly the first release's full history. Spelling
+          # that default out keeps the expansion quoted instead of relying on a
+          # bare ${RANGE} word (shellcheck SC2086, #215).
+          REV="${RANGE:-HEAD}"
+          ALL="$(git log --format='%h %s' --no-merges "${REV}")"
 
           # Group by conventional-commit prefix; everything else → Other.
           CAT_FEATURES="$(printf '%s\n' "${ALL}" | grep -Ei '^[0-9a-f]+ feat' || true)"
