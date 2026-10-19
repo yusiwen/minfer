@@ -187,7 +187,8 @@ touch behavior):
 | KV context shift | llama.cpp's default overflow handling; MVP rejects with 400 `exceed_context_size_error` (§Error Handling) |
 | Prompt caching / KV reuse across requests | Slots keep their KV between requests; a shared-prefix matcher is future work |
 | SSE `stream_options.include_usage` | OpenAI extension, not in MVP scope |
-| Multimodal content arrays / embeddings / tools | Non-goals (MVP) |
+| Multimodal content arrays / embeddings | Non-goals (MVP) |
+| Tool-call **extraction** (the prompt side shipped — §Tool Calling) | [#614](https://github.com/yusiwen/minfer/issues/614); message-shaped `tool_calls` is [#613](https://github.com/yusiwen/minfer/issues/613) |
 
 > **Update (2026-09-15):** the f16 KV cache, listed as deferred in rev 5, has
 > since shipped — `MINFER_CACHE_TYPE=f16` with auto-selection for 7B-class
@@ -265,7 +266,9 @@ numbers — the file was restructured) defines the request format. Our parser mu
 > divergence from OpenAI; clients that care should pass explicit values.
 
 **Non-goals (MVP):**
-- `tools` / `tool_choice`
+- `tools` / `tool_choice` — **shipped for the prompt side**, see §Tool Calling below; the
+  output side (parsing the model's `<tool_call>` into `choices[].message.tool_calls`) is
+  still a non-goal
 - `response_format` (json_schema mode)
 - `logprobs` / `top_logprobs`
 - `reasoning_effort`
@@ -295,6 +298,37 @@ Sampler chain order stays: penalties → top-k → top-p → temperature (llama.
 penalty pass avoids two scans of the 64-token window. Cost is bounded by the window: count distinct
 tokens in the last 64 once (HashMap, O(64)), then apply per distinct token — the same cost class as
 llama.cpp's penalties sampler (no full-vocab scan needed).
+
+### Tool Calling (#597, 2026-10-19)
+
+The **prompt side** is implemented; the **output side** is not. ADR-0058 holds the decision, the
+rejected alternatives and the measured consequences; this section is the wire contract.
+
+Request fields:
+
+| Field | Shape | Behaviour |
+|---|---|---|
+| `tools` | OpenAI's array, e.g. `[{"type":"function","function":{"name":…,"parameters":{…}}}]` | every entry must be an object with `type == "function"` and a non-empty `function.name`; anything else is a 400 naming the index. The array is **not** re-typed: unknown keys (`strict`, a vendor extension) and the client's key order reach the prompt through the template's `| tojson` |
+| `tool_choice` | absent / `"auto"` | the definitions are rendered |
+| | `"none"` | rendered **without** them — no extraction exists, so a prompt that still described the tools would invite a call the server returns as ordinary content |
+| | `"required"`, `{"type":"function","function":{"name":…}}` | 400 naming the missing extraction |
+| an empty `tools: []` | 400 | "no tools" is the absence of the field |
+
+Rendering rules (all gated):
+
+- `| tojson` is CPython's `json.dumps(..., ensure_ascii=False)`: `", "`/`": "` separators, no HTML
+  escaping, `indent` honoured, other keywords refused by name.
+- Key order survives `serde_json`'s and minijinja's sorted maps (`template::ToolJson` +
+  minijinja's `preserve_order`); `serde_json`'s `preserve_order` is deliberately off (the
+  JSON-Schema grammar compiler reads a schema's map order).
+- A template that renders the **same bytes** with and without `tools` — or the no-template ChatML
+  fallback, which has no tool format — is a 400 naming the cause, never a silently tools-free
+  prompt.
+
+Not implemented: parsing `<tool_call>` out of the model's output, `tool_choice: "required"`, a
+forced function, and `tool_calls` on a **request** message (a replayed assistant call renders as
+its `content`, because `ChatMessage` is `(role, content)`). Those are
+[#613](https://github.com/yusiwen/minfer/issues/613) and [#614](https://github.com/yusiwen/minfer/issues/614).
 
 ### Stop Strings
 
@@ -693,8 +727,9 @@ Input validation before rendering (returns 400 `invalid_request_error` on failur
 1. Parse request into Vec of ChatMessage (validated)
 2. Load template from GGUF metadata (`tokenizer.chat_template`)
 3. Create context with messages array
-4. Render via minijinja (`tools` is passed as UNDEFINED — already handled in `template.rs`, matching
-   llama.cpp's behavior of skipping the tools block when none are supplied)
+4. Render via minijinja. `tools` is `none` when the request supplies none (transformers'
+   `tools=None`, so `{% if tools %}` and `tools is defined` behave as jinja2 defines them); a
+   request that does supply them passes the array through verbatim — see §Tool Calling
 5. Fallback to ChatML if template fails
 
 Minor: the template is recompiled per request today (`Environment::new()` per call); fine for MVP, but

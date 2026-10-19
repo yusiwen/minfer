@@ -177,6 +177,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0055](./0055-ignore-merges-is-a-whole-piece-shortcut-and-the-llama3-group-sets-it.md) | 2026-10-17 | ignore_merges is a whole-piece shortcut, and the llama3 pre group sets it | Accepted |
 | [0056](./0056-a-missing-byte-token-is-accepted-only-when-no-token-can-reach-it.md) | 2026-10-17 | a missing byte token is accepted only when no token can reach it | Accepted (amends ADR-0045) |
 | [0057](./0057-a-template-file-overrides-the-gguf-and-time-enters-through-one-clock.md) | 2026-10-18 | a template file overrides the GGUF copy, and time enters a render through one injected clock | Accepted (amends ADR-0019) |
+| [0058](./0058-tools-reach-the-prompt-as-the-client-wrote-them.md) | 2026-10-19 | a request's tools reach the prompt as the client wrote them, and a template that drops them refuses by name | Accepted (amends ADR-0019) |
 
 ## The template
 

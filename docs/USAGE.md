@@ -195,6 +195,11 @@ method `format`; minfer refuses to fall back to a generic ChatML prompt. …
 template, the other says use none), so giving both is an error naming both flags.
 `--no-template` on its own still bypasses template rendering entirely.
 
+A request's `tools` reach the template as the client wrote them (§Tool calling), and the
+template's `| tojson` emits CPython's `json.dumps` bytes — `", "`/`": "` separators, no HTML
+escaping, `indent` honoured, any other keyword refused by name. A tools-free render is unchanged
+(transformers' `tools=None`).
+
 `strftime_now(fmt)` is available to templates, with a fixed directive subset:
 `%Y %y %m %d %H %M %S %F %T %%`. Any other directive is refused by name rather
 than printed literally. A template that prints the current time is
@@ -421,6 +426,42 @@ or batch slot) carries its own position, so slots cannot perturb each other. A r
 ends mid-character: if a generation stops with a partial UTF-8 sequence pending, those bytes are
 dropped (with a printed note) rather than decoded to `U+FFFD`.
 
+### Tool calling (#597)
+
+`/v1/chat/completions` accepts OpenAI's `tools` and `tool_choice` on the **prompt** side: the
+definitions are rendered into the prompt by the model's own template, exactly as the client wrote
+them.
+
+| Field | Effect |
+|---|---|
+| `"tools": [{"type":"function","function":{"name":"get_weather","parameters":{…}}}]` | the array is passed through verbatim — the client's key order and any unknown key included, because the template echoes each entry with `| tojson` |
+| `"tool_choice": "auto"` (or absent) | the definitions are rendered |
+| `"tool_choice": "none"` | the prompt is rendered **without** them (this server does not parse tool calls out of the output, so describing them would invite a call it cannot report) |
+| `"tool_choice": "required"` or `{"type":"function","function":{"name":…}}` | `400`: those need tool calls to be extracted from the model's output |
+| `"tools": []` | `400` — "no tools" is the absence of the field |
+
+A malformed entry (not an object, `type` other than `"function"`, a missing or empty
+`function.name`) is a `400` naming the index, and `tool_choice` without `tools` is a `400` too.
+The prompt bytes are the reference's: `| tojson` emits CPython's `json.dumps` (`", "`/`": "`
+separators, `ensure_ascii=False`, no HTML escaping) and object key order survives the parse.
+
+```bash
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role":"user","content":"Weather in Paris?"}],
+  "max_tokens": 64,
+  "tools": [{"type":"function","function":{"name":"get_weather","description":"Weather.",
+             "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
+  "tool_choice": "auto"}'
+```
+
+A template that never puts the definitions into the prompt — a model whose template has no `tools`
+branch, or a GGUF with no `tokenizer.chat_template` at all (the ChatML fallback has no tool format)
+— is refused **by name** with a `400`, never answered `200` with a prompt that silently dropped
+them. **Not implemented:** parsing `<tool_call>` out of the model's output into
+`choices[].message.tool_calls`, `tool_choice: "required"`, a forced function, and `tool_calls` on a
+request message (a replayed assistant call renders as its `content`). Those are
+[#613](https://github.com/yusiwen/minfer/issues/613) (message objects) and [#614](https://github.com/yusiwen/minfer/issues/614) (output extraction).
+
 ### Metrics and observability (F8)
 
 `GET /metrics` returns a [Prometheus text](https://prometheus.io/docs/instrumenting/exposition_formats/)
@@ -629,5 +670,6 @@ it documents are frozen in the ADR corpus:
 - [ADR-0017](adr/0017-speculative-decoding-refuses-what-it-cannot-carry.md) — Speculative decoding refuses the features its identity contract cannot carry
 - [ADR-0018](adr/0018-the-grammar-mask-is-one-pipeline-stage.md) — The grammar mask is one stage inside the single sampler pipeline
 - [ADR-0019](adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md) — A chat template that cannot be rendered refuses the load
+- [ADR-0058](adr/0058-tools-reach-the-prompt-as-the-client-wrote-them.md) — A request's tools reach the prompt as the client wrote them, and a template that drops them refuses by name
 - [ADR-0057](adr/0057-a-template-file-overrides-the-gguf-and-time-enters-through-one-clock.md) — A template file overrides the GGUF copy, and time enters a render through one injected clock
 - [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32
