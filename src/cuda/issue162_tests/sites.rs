@@ -78,8 +78,14 @@ fn cuda_issue162_every_launch_site_names_itself_and_leaves_no_latch() {
     go!(&["launch:embed_rows_f16"], || unsafe {
         launch_embed_rows_f16(ctx.u(0), ctx.cf(1), ctx.f(2), 256, 2, st);
     });
+    // #621: #208's bf16 gather. The fixture recorded this site when the launcher
+    // landed, but the driver never reached it, so the union assertion below was
+    // red for a *missing arm* rather than a missing report.
+    go!(&["launch:embed_rows_bf16"], || unsafe {
+        launch_embed_rows_bf16(ctx.u(0), ctx.cf(1), ctx.f(2), 256, 2, st);
+    });
 
-    // ── f32 / f16 matmul shape branches ─────────────────────────────
+    // ── f32 / f16 / bf16 matmul shape branches ──────────────────────
     for (id, token) in [
         (8, "launch:f32_f32_matmul__vec"),
         (7, "launch:f32_f32_matmul__scalar"),
@@ -94,6 +100,16 @@ fn cuda_issue162_every_launch_site_names_itself_and_leaves_no_latch() {
     ] {
         go!(&[token], || unsafe {
             launch_f16_f32_matmul(ctx.u(0), ctx.cf(1), ctx.f(2), 8, id, 2, st);
+        });
+    }
+    // #621: the bf16 sibling splits on the same `id % 8 == 0` (`ops_misc.cu`), so
+    // the vec arm needs an aligned `id` and the scalar arm an unaligned one.
+    for (id, token) in [
+        (8, "launch:bf16_f32_matmul_vec"),
+        (7, "launch:bf16_f32_matmul_scalar"),
+    ] {
+        go!(&[token], || unsafe {
+            launch_bf16_f32_matmul(ctx.u(0), ctx.cf(1), ctx.f(2), 8, id, 2, st);
         });
     }
 
