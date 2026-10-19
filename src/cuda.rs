@@ -322,7 +322,9 @@ pub fn graph_destroy_failure_message(err: i32) -> String {
 /// sites, with its exact-token tests in `src/testfail.rs` — so this is a thin
 /// alias. Its direct reader is production `graph_end_capture_to_exec` (the
 /// `destroy:graph_destroy` injection); the #147 device gates are other call
-/// sites, not the only ones.
+/// sites, not the only ones. Since #619 the device sites reach the *same*
+/// decision through `testfail::minfer_test_call_fails` (a C ABI export of
+/// `requested`), so both halves also share the seam's thread-scoped arm.
 fn test_call_failure_requested(site: &str) -> bool {
     crate::testfail::requested(site)
 }

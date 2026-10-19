@@ -24,7 +24,7 @@ fn cuda_issue162_required_sites_set_the_sticky_opt_sites_do_not() {
     let _ = s.take_last_error();
     unsafe { minfer_site_fail_reset() };
     {
-        let _g = Arm::new("launch:add_f32");
+        let _g = crate::testfail::InjectionGuard::arm("launch:add_f32");
         unsafe { launch_add_f32(ctx.cf(0), ctx.cf(1), ctx.f(2), 64, st) };
     }
     let msg = s
@@ -43,7 +43,7 @@ fn cuda_issue162_required_sites_set_the_sticky_opt_sites_do_not() {
     let _ = s.take_last_error();
     unsafe { minfer_site_fail_reset() };
     let rc = {
-        let _g = Arm::new("launch:fa_prefill_kv__f16_causal");
+        let _g = crate::testfail::InjectionGuard::arm("launch:fa_prefill_kv__f16_causal");
         unsafe {
             launch_fa_prefill_kv(
                 ctx.cf(0),

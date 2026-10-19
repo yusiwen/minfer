@@ -81,9 +81,13 @@ dim3 minfer_launch_block(const char* site, unsigned block);
 // is the single place a `cudaFuncSetAttribute` return value is read (called by
 // the MMQ/GEMM launchers' opt-ins), `minfer_optin_limit` is the device's
 // queried `cudaDevAttrMaxSharedMemoryPerBlockOptin`, and `minfer_test_call_fails`
-// is the `MINFER_TEST_CALL_FAIL` matcher `gemm_smem_optin` shares.
+// is the `MINFER_TEST_CALL_FAIL` seam query `gemm_smem_optin` shares.
 bool minfer_smem_optin(const char* site, const char* kernel_name, const void* fn, int bytes);
 int minfer_optin_limit(void);
+// #619: the decision is Rust's (`crate::testfail::requested`, reached through the
+// C ABI export `minfer_seam_site_requested`); `guard.cu` defines this as a
+// forwarder, so the CUDA sites inherit the seam's thread-scoped arms and its one
+// exact-token matcher instead of re-reading `getenv`.
 bool minfer_test_call_fails(const char* site);
 
 // ─── Helper: warp-level sum reduction ─────────────────────────

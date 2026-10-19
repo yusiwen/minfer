@@ -30,9 +30,25 @@
 //! fires those two sites, `all` fires every Rust chokepoint, and a token that
 //! is a superstring of a site (`launch:gemm` against `launch:gemm_f16_f16`)
 //! never matches. The device-side helper `minfer_test_call_fails` in
-//! `src/cuda/kernels/*.cu` implements the identical rule for the CUDA launch and
-//! attribute sites (`launch:*`, `attr:*`), because a C++ kernel cannot call
-//! into Rust; the Rust half is the one that is unit-tested.
+//! `src/cuda/kernels/*.cu` (the CUDA launch and attribute sites `launch:*` /
+//! `attr:*`) **calls back into this module** ([`minfer_seam_site_requested`]) instead
+//! of re-reading the environment, so there is one matcher and one scope rule for
+//! both halves — the C++ side cannot own the scope, because the scope is a
+//! thread-local (#619).
+//!
+//! # Scope: the arming thread
+//!
+//! An in-process arm is **thread-scoped** (#619). `MINFER_TEST_CALL_FAIL` stays
+//! the *out-of-process* lever — a mutation run names a site on the command line
+//! and every thread of that process sees it — but a gate arming the seam for its
+//! own scope must not reach another gate: a parallel harness
+//! (`cargo test --release …`, the `#[ignore]`d real-model sets, [#195]'s device
+//! repeats) ticks engines in one process, and a process-global arm made one
+//! gate's deliberate failure fail a different gate. The rule is [`decides`]: an
+//! arm on this thread fires, or the environment fires; [`InjectionGuard::arm`]
+//! therefore **never writes the environment**.
+//!
+//! [#195]: https://github.com/yusiwen/minfer/issues/195
 //!
 //! # Chokepoints
 //!
@@ -79,10 +95,55 @@ pub fn injection_names_site(value: &str, site: &str) -> bool {
     })
 }
 
-/// Is the injection switch asking for `site`? `false` when the variable is
-/// unset — the default in every non-mutation run.
+/// The scope rule, pure: `site` fires if it is armed **on this thread** or if the
+/// process environment names it.
+///
+/// The two levers answer different questions and neither implies the other. An
+/// arm is a gate saying "this scope is mine" and must not cross a thread
+/// (`#619`); the environment is a whole-process mutation run and is deliberately
+/// global. Pure, so the rule is unit-tested without mutating the environment or
+/// spawning anything — and so a mutation of either clause is a one-line edit.
+fn decides(armed_here: bool, env: Option<&str>, site: &str) -> bool {
+    armed_here || env.map_or(false, |v| injection_names_site(v, site))
+}
+
+/// Is the injection switch asking for `site`? `false` when nothing is armed and
+/// the variable is unset — the default in every non-mutation run.
+///
+/// Reads the caller's thread-local arms first (the same thread-local the
+/// chokepoints and the CUDA helper share), then the environment.
 pub fn requested(site: &str) -> bool {
-    std::env::var(ENV).map_or(false, |v| injection_names_site(&v, site))
+    let armed_here = ARMED.with(|a| a.borrow().iter().any(|s| s == site));
+    let env = std::env::var(ENV).ok();
+    decides(armed_here, env.as_deref(), site)
+}
+
+/// The C++ half of the seam: `src/cuda/kernels/guard.cu` declares this **weak**
+/// and forwards its `minfer_test_call_fails` to it, so the `launch:*` / `attr:*`
+/// sites reach [`requested`] — the same decision, matcher and thread-scoped arms
+/// as the Rust chokepoints, instead of a second `getenv` parser that could only
+/// ever be process-wide (#619). Weak because `cargo run --example
+/// cuda_graph_diag` links the kernels without the crate; there the symbol is null
+/// and `guard.cu` answers "not injected".
+#[cfg(feature = "cuda")]
+#[no_mangle]
+pub extern "C" fn minfer_seam_site_requested(site: *const std::ffi::c_char) -> bool {
+    if site.is_null() {
+        return false;
+    }
+    // SAFETY: every caller in `src/cuda/kernels/` passes a string literal, which
+    // is NUL-terminated and alive for the whole program.
+    let site = unsafe { std::ffi::CStr::from_ptr(site) };
+    // A non-UTF-8 site cannot equal a Rust site token; treating it as "not
+    // injected" keeps the seam off rather than guessing.
+    site.to_str().map_or(false, |s| requested(s))
+}
+
+thread_local! {
+    /// The sites armed **on this thread** ([`InjectionGuard::arm`], #619). Not
+    /// the environment: writing that is what made one gate's arm reach every
+    /// other gate in the process.
+    static ARMED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The error-returning chokepoint: `Ok(())` unless `site` is requested.
@@ -157,33 +218,46 @@ pub(crate) fn reset_checked() {
     CHECKED.with(|c| c.borrow_mut().clear());
 }
 
-/// Test-only RAII arm/disarm of the switch, so a panicking gate cannot leave
-/// the injection armed for the rest of the process.
+/// Test-only RAII arm/disarm of the switch for **this thread**, so a panicking
+/// gate cannot leave the injection armed for the rest of the run.
 ///
-/// This mirrors `cuda::tests::InjectionGuard`, which the #147 device gates keep
-/// for their own scoped arm; a new gate should use this one.
+/// The scope is the thread (#619): `arm` writes the thread-local, never
+/// `MINFER_TEST_CALL_FAIL`, because the environment is process-wide and a
+/// parallel harness runs the gates in one process. The CUDA `launch:*` / `attr:*`
+/// sites see it too — their helper forwards to [`requested`]
+/// — so a device gate arms and launches on its own thread and stays inside it.
 #[cfg(test)]
 pub(crate) struct InjectionGuard {
-    prev: Option<String>,
+    /// How long [`ARMED`] was before this arm: dropping truncates back to it, so
+    /// nested arms unarm innermost-first.
+    depth: usize,
 }
 
 #[cfg(test)]
 impl InjectionGuard {
-    /// Arm `site` until the returned guard drops.
+    /// Arm `site` on this thread until the returned guard drops.
     pub(crate) fn arm(site: &str) -> Self {
-        let prev = std::env::var(ENV).ok();
-        std::env::set_var(ENV, site);
-        Self { prev }
+        Self::arm_all(&[site])
+    }
+
+    /// Arm several sites as **one** scope: a device dispatch that reaches more
+    /// than one site in a single call arms them together, and one drop disarms
+    /// the set.
+    pub(crate) fn arm_all(sites: &[&str]) -> Self {
+        let depth = ARMED.with(|a| {
+            let mut v = a.borrow_mut();
+            let depth = v.len();
+            v.extend(sites.iter().map(|s| s.to_string()));
+            depth
+        });
+        Self { depth }
     }
 }
 
 #[cfg(test)]
 impl Drop for InjectionGuard {
     fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(ENV, v),
-            None => std::env::remove_var(ENV),
-        }
+        ARMED.with(|a| a.borrow_mut().truncate(self.depth));
     }
 }
 

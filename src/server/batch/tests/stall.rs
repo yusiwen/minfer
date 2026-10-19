@@ -385,9 +385,10 @@ fn the_stall_answers_every_queued_job_exactly_once() {
 ///
 /// The gate above needs [`FailingForward`], a test-local `ModelDef`, because a
 /// failed batch forward has no other deterministic trigger. The
-/// failure-injection seam makes that mock one environment variable: this gate
-/// loads the **real** cached 0.5B, arms `MINFER_TEST_CALL_FAIL=forward_batch`
-/// for the scope, and asserts the #151 contract still holds — exactly one
+/// failure-injection seam makes that mock one variable: this gate loads the
+/// **real** cached 0.5B, arms `forward_batch` on its own thread (#619 — the arm
+/// is thread-local, so it cannot fail a concurrent gate), and asserts the #151
+/// contract still holds — exactly one
 /// `500` to the run's own sender, the slot released, no retry — plus that the
 /// chokepoint's observation counter proves the real forward entry was reached.
 ///
@@ -405,8 +406,10 @@ fn the_seam_fails_the_batch_forward_without_a_bespoke_mock() {
     let model = crate::models::load_model(&gguf).expect("load model");
     let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
-    // Arm the seam for exactly this scope; the guard restores the process
-    // value on drop, so a panicking gate cannot leave the switch on.
+    // Arm the seam for exactly this scope — **this thread** (#619): the arm is a
+    // thread-local, so a concurrent gate ticking an engine in the same process
+    // cannot meet this injection. `tick` runs on this thread, so the chokepoint
+    // sees it.
     let _seam = crate::testfail::InjectionGuard::arm("forward_batch");
     crate::testfail::reset_checked();
 
