@@ -5,6 +5,8 @@
 
 use super::*;
 
+use crate::quantize::QuantTarget;
+
 // === #169: the 1-D rule per quantize target, read back from the output ===
 
 /// A miniature stand-in for the files the converters produce: 2-D matmul

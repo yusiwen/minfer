@@ -13,12 +13,15 @@
 
 use super::*;
 
+use crate::quantize::QuantTarget;
+
 /// One file that exercises every arm of the rule at once, on a tied model (no
 /// `output.weight`):
 ///
-/// * `token_embd.weight` [60,4] — the shared embedding, asked for q8_0 by a
-///   sub-8-bit target, with a row q8_0 cannot encode: it demotes to F16 and is
-///   **not** reported as the tied-embedding retarget it did not get;
+/// * `token_embd.weight` [60,4] — the shared embedding; the `OUTPUT`/tied branch
+///   asks for q8_0 (a 32-block cannot divide 60) and q8_0 cannot encode the row
+///   either, so it demotes to F16 and is **not** reported as the retarget it did
+///   not get;
 /// * `blk.0.attn_q.weight` [64,2] — a multiple of 32 but not of 256: the
 ///   target's own type for a legacy target, and the 32-block fallback for a
 ///   K-quant;
@@ -95,8 +98,8 @@ fn a_non_block_aligned_2d_row_is_demoted_for_every_quant_target() {
                 GgmlType::F32,  // output_norm.weight — 1-D
             ],
             vec![
-                "token_embd.weight -> f16 (row % 32 != 0)".to_string(),
-                "blk.0.ffn_down.weight -> f16 (row % 32 != 0)".to_string(),
+                "token_embd.weight -> f16 (asked q8_0, row % 32 != 0)".to_string(),
+                "blk.0.ffn_down.weight -> f16 (asked q4_0, row % 32 != 0)".to_string(),
             ],
         ),
         (
@@ -110,9 +113,11 @@ fn a_non_block_aligned_2d_row_is_demoted_for_every_quant_target() {
                 GgmlType::F32,  // output_norm.weight — 1-D
             ],
             vec![
-                "token_embd.weight -> f16 (no encoder block size divides the row)".to_string(),
-                "blk.0.attn_q.weight -> q8_0 (row % 256 != 0)".to_string(),
-                "blk.0.ffn_down.weight -> f16 (no encoder block size divides the row)".to_string(),
+                "token_embd.weight -> f16 (asked q6_K, no encoder block size divides the row)"
+                    .to_string(),
+                "blk.0.attn_q.weight -> q8_0 (asked q6_K, row % 256 != 0)".to_string(),
+                "blk.0.ffn_down.weight -> f16 (asked q6_K, no encoder block size divides the row)"
+                    .to_string(),
             ],
         ),
     ];
@@ -145,34 +150,53 @@ fn a_non_block_aligned_2d_row_is_demoted_for_every_quant_target() {
             "{}: only 1-D tensors may be preserved",
             target.name()
         );
-        // The tied embedding was asked for q8_0 and then demoted, so the run
-        // must not claim the tied-embedding retarget happened (it did not).
+        // The tied embedding was asked for a type its row cannot take and was
+        // then demoted, so the run must not claim the `OUTPUT`-branch retarget
+        // happened (it did not).
         assert!(
             plan.retargeted.is_empty(),
-            "{}: a demoted tied embedding is not a q8_0 retarget: {:?}",
+            "{}: a demoted tied embedding is not an OUTPUT-branch retarget: {:?}",
             target.name(),
             plan.retargeted
         );
     }
 }
 
-/// The tied-embedding retarget is reported only when it survived the row-length
-/// rule: [64,4] fits q8_0 and is retargeted, [60,4] does not and is demoted.
+/// The `OUTPUT`/tied-embedding branch is a row-length question, and it is the
+/// ftype-independent half of #203: on a tied model the shared embedding is asked
+/// for `q6_K` when the requested type's block divides the row (`q4_0` on the
+/// 0.6B's 1024 — llama.cpp's answer, which the pre-#203 rule missed), for `q8_0`
+/// when it does not while a 32-block still does (the 0.5B's 896, with no
+/// demotion at all), and for `f16` when not even a 32-block fits.
 ///
 /// Before #204 the unaligned case was *preserved* (so the file held f32) while
 /// the CLI still printed it under "tied embedding quantized at q8_0" — the
-/// report and the bytes disagreed.
+/// report and the bytes disagreed. #203 changed the *asked* type from a blanket
+/// `q8_0` to llama.cpp's branch, and the demotion report says which type was
+/// asked, so the two can no longer drift apart.
 #[test]
-fn a_tied_embedding_is_retargeted_to_q8_0_only_when_its_row_fits() {
+fn the_tied_embedding_takes_llama_cpps_output_branch() {
     let dir = work_dir("quantize-row-tied");
     let kv = vec![
         crate::gguf::GgufKv::new_string("general.architecture".into(), "qwen2".into()),
         crate::gguf::GgufKv::new_u32("general.file_type".into(), 1),
     ];
+    let q4_0 = crate::quantize::Target::from(QuantTarget::Q4_0);
+    let q4_k_m = crate::quantize::Target::parse("q4_K_M").unwrap();
 
-    for (tag, row, want_type, want_retargeted, want_demoted) in [
-        ("aligned", 64i64, GgmlType::Q8_0, 1usize, 0usize),
-        ("unaligned", 60, GgmlType::F16, 0, 1),
+    for (tag, row, target, want_type, want_retargeted, want_embed_demoted) in [
+        // The 0.6B's hidden size: 1024 % 32 == 0 and 1024 % 256 == 0, so the
+        // branch's q6_K survives.
+        ("aligned-256", 1024i64, q4_0, GgmlType::Q6_K, 1usize, false),
+        // A row the 32-block type fits but a 256-block does not: the branch
+        // answers q6_K, which the row rule demotes to q8_0.
+        ("row-not-256", 64, q4_0, GgmlType::Q8_0, 0, true),
+        // The 0.5B's hidden size and a mixture: the branch answers q8_0 itself,
+        // so the embedding is not demoted — the measured 13th q8_0 of the
+        // reference file (the other 12 are demoted attn_v).
+        ("the-0.5b", 896, q4_k_m, GgmlType::Q8_0, 1, false),
+        // No block divides the row: f16, reported as a demotion.
+        ("unaligned", 60, q4_0, GgmlType::F16, 0, true),
     ] {
         let specs = vec![
             gguf_write::TensorSpec::new("token_embd.weight", [row, 4, 1, 1], GgmlType::F32),
@@ -187,11 +211,16 @@ fn a_tied_embedding_is_retargeted_to_q8_0_only_when_its_row_fits() {
         let model = crate::gguf::load_gguf_model(&src).expect("source parses");
         let out = dir.join(format!("out-tied-{tag}.gguf"));
         let _ = std::fs::remove_file(&out);
-        let plan = QuantizePlan::plan(&model, QuantTarget::Q4_0).expect("plan");
+        let plan = QuantizePlan::plan(&model, target).expect("plan");
         plan.write_single(&model, &out).expect("write");
         let got = crate::gguf::load_gguf_model(&out).expect("output parses");
 
-        assert_eq!(type_of(&got, "token_embd.weight"), want_type, "{tag}");
+        assert_eq!(
+            type_of(&got, "token_embd.weight"),
+            want_type,
+            "{tag} at {}",
+            target.name()
+        );
         assert_eq!(
             plan.retargeted.len(),
             want_retargeted,
@@ -199,9 +228,11 @@ fn a_tied_embedding_is_retargeted_to_q8_0_only_when_its_row_fits() {
             plan.retargeted
         );
         assert_eq!(
-            plan.demoted.len(),
-            want_demoted,
-            "{tag}: {:?}",
+            plan.demoted
+                .iter()
+                .any(|d| d.starts_with("token_embd.weight")),
+            want_embed_demoted,
+            "{tag}: the embedding's demotion must be reported exactly when the row rule did it: {:?}",
             plan.demoted
         );
     }

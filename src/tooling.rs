@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::convert::{Conversion, OutType, QuantizePlan};
 use crate::gguf_write;
-use crate::quantize::QuantTarget;
+use crate::quantize::Target;
 
 /// Parse a byte size with an optional binary suffix: `1073741824`, `1G`, `512M`, `300k`.
 pub fn parse_size(s: &str) -> Result<u64, String> {
@@ -48,14 +48,24 @@ fn usage_quantize(prog: &str) -> String {
         "Usage: {prog} quantize <in.gguf> <out.gguf> --type <target> [--split-max-size BYTES]\n\
          \n\
          Re-encodes a single-file GGUF's 2-D float weights to <target>. One-dimensional\n\
-         tensors (norms, biases) keep their source type. A 2-D tensor whose row length\n\
-         is not a multiple of the target's block is demoted the way llama.cpp's\n\
-         tensor_type_fallback does it: a K-quant (q4_K/q5_K/q6_K, 256-element block)\n\
-         to q5_0/q5_1/q8_0, a legacy target (q4_0/q4_1/q5_0/q5_1/q8_0, 32-element\n\
-         block) to f16, and f16 either way when even a 32-element block does not\n\
-         divide the row.\n\
-         The K-quant targets write ONE uniform type (`llama-quantize --pure`); they are\n\
-         not llama.cpp's `Q4_K_M`/`Q5_K_M` mixtures. Supported targets: {}.",
+         tensors (norms, biases) keep their source type.\n\
+         \n\
+         Two kinds of target. A concrete type puts one encoder on every 2-D tensor:\n\
+         q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K, q6_K, and the f16/f32 element\n\
+         casts. That is what `llama-quantize --pure` writes, and here q4_K/q5_K are\n\
+         UNIFORM — llama.cpp's bare `q4_K`/`q5_K` mean the mixture, so those spellings\n\
+         are `q4_K_M`/`q5_K_M` here. A mixture is llama.cpp's per-tensor policy: the\n\
+         `output.weight` (or a tied `token_embd.weight`) goes to q6_K, or q8_0 when\n\
+         the row cannot take the requested type's block, and use_more_bits bumps\n\
+         `attn_v` and `ffn_down` on the first and last eighth of the layers plus every\n\
+         third layer between them (the fused-qkv category too).\n\
+         \n\
+         A 2-D row that cannot take the type a tensor was asked for is demoted the way\n\
+         llama.cpp's tensor_type_fallback does it: a K-quant (256-element block) to\n\
+         q5_0/q5_1/q8_0, a legacy target (32-element block) to f16, and f16 either way\n\
+         when even a 32-element block does not divide the row.\n\
+         \n\
+         Supported targets: {}.",
         crate::quantize::SUPPORTED_TARGETS
     )
 }
@@ -197,7 +207,7 @@ pub fn run_convert(prog: &str, args: &[String]) -> i32 {
 /// `minfer quantize …`
 pub fn run_quantize(prog: &str, args: &[String]) -> i32 {
     let mut positional: Vec<String> = Vec::new();
-    let mut target: Option<QuantTarget> = None;
+    let mut target: Option<Target> = None;
     let mut split_max: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
@@ -211,7 +221,7 @@ pub fn run_quantize(prog: &str, args: &[String]) -> i32 {
                     eprintln!("Error: --type needs a value");
                     return 1;
                 };
-                match QuantTarget::parse(v) {
+                match Target::parse(v) {
                     Ok(t) => target = Some(t),
                     Err(e) => {
                         eprintln!("Error: {e}");
@@ -286,6 +296,14 @@ pub fn run_quantize(prog: &str, args: &[String]) -> i32 {
         );
         return 1;
     }
+    if target.is_mixture() {
+        eprintln!(
+            "quantize: {} is llama.cpp's per-tensor mixture policy; the uniform type is spelled \
+             `{}` (what `llama-quantize --pure` writes)",
+            target.name(),
+            target.base().name()
+        );
+    }
     let plan = match QuantizePlan::plan(&model, target) {
         Ok(p) => p,
         Err(e) => {
@@ -305,20 +323,37 @@ pub fn run_quantize(prog: &str, args: &[String]) -> i32 {
     }
     if !plan.retargeted.is_empty() {
         eprintln!(
-            "quantize: tied embedding quantized at q8_0 (llama.cpp's sub-8-bit policy): {}",
+            "quantize: {} tensor(s) through llama.cpp's OUTPUT/tied-embedding branch: {}",
+            plan.retargeted.len(),
             plan.retargeted.join(", ")
+        );
+    }
+    if !plan.promoted.is_empty() {
+        eprintln!(
+            "quantize: {} tensor(s) bumped by {} on llama.cpp's per-tensor policy: {}",
+            plan.promoted.len(),
+            target.name(),
+            plan.promoted.join(", ")
         );
     }
     if !plan.demoted.is_empty() {
         eprintln!(
-            "quantize: {} tensor(s) demoted from {} (row length not a multiple of {}; \
-             llama.cpp's tensor_type_fallback): {}",
+            "quantize: {} tensor(s) demoted to a type their row can take (llama.cpp's \
+             tensor_type_fallback): {}",
             plan.demoted.len(),
-            target.name(),
-            target.blck_size(),
             plan.demoted.join(", ")
         );
     }
+    // How much of the file each encoder actually saw. Printed for every target:
+    // on a mixture it is the only compact summary of the per-tensor policy, and
+    // on a uniform target it is the receipt that a demotion happened.
+    let hist = plan
+        .by_type
+        .iter()
+        .map(|(t, c)| format!("{}: {c}", t.type_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("quantize: file types: {hist}");
     let result = match split_max {
         None => plan
             .write_single(&model, out)

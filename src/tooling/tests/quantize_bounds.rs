@@ -5,6 +5,8 @@
 
 use super::*;
 
+use crate::quantize::QuantTarget;
+
 /// G4: quantizing the converted f16 model to q8_0 produces a file that
 /// loads, runs, and stays within a stated bound of the f16 source.
 #[test]
@@ -239,19 +241,24 @@ fn f6_k_quant_output_runs_within_the_stated_bound() {
 /// G4b: every weight encoder is byte-identical to llama.cpp's.
 ///
 /// `MINFER_F6_F16_GGUF` is the common f16 source and
-/// `MINFER_F6_LLAMACPP_QUANT` is the file
-/// `llama-quantize --pure <src> <out> <type>` produced for the target named
-/// by `MINFER_F6_QUANT_TYPE` (default q4_0; `q4_K`, `q5_K` and `q6_K` all
-/// pass — `--pure` disables llama.cpp's k-quant *mixture* so every
-/// 256-aligned 2-D tensor goes through the one reference encoder this gate
-/// is about; a bare `q4_K` is the `Q4_K_M` mixture, see
-/// `docs/GGUF-TOOLING.md` §4.2). A single-nibble difference is a wrong
-/// file, so this is per-tensor byte equality (the same comparison used for
-/// the HF conversion). The gate prints how many tensors each encoder
-/// actually encoded — on the 0.5B (hidden 896) only 24 per K type, because
-/// 145 rows are not a multiple of 256 and take llama.cpp's
-/// `tensor_type_fallback`; the 0.6B (hidden 1024) is the arm where every
-/// 2-D tensor goes through the K encoder.
+/// `MINFER_F6_LLAMACPP_QUANT` is the file `llama-quantize` produced for the
+/// target named by `MINFER_F6_QUANT_TYPE` (default q4_0). Two families:
+///
+/// * a **uniform** type (`--pure`, and `q4_0`/`q4_1`/`q5_0`/`q5_1`/`q8_0`,
+///   which have no mixture): every 2-D tensor goes through the one reference
+///   encoder this gate is about, except the legacy targets' `OUTPUT`/tied
+///   branch (#203);
+/// * a **mixture** (`q4_K_M`, `q5_K_M`): the reference is the bare spelling
+///   without `--pure` (`llama-quantize <src> <out> q4_K`), and the file is
+///   llama.cpp's per-tensor selection over the same encoders — so this arm
+///   pins the planner *and* the bytes at once.
+///
+/// A single-nibble difference is a wrong file, so this is per-tensor byte
+/// equality (the same comparison used for the HF conversion). The gate prints
+/// how many tensors each encoder actually encoded — on the 0.5B (hidden 896)
+/// only 24 per K type, because 145 rows are not a multiple of 256 and take
+/// llama.cpp's `tensor_type_fallback`; the 0.6B (hidden 1024) is the arm where
+/// every 2-D tensor goes through the K encoder.
 ///
 /// **The claim is conditional on the reference's build, and the gate names which
 /// one it is looking at** (issues #334, #342, #349). Three things have to hold at
@@ -309,7 +316,7 @@ fn f6_quantize_encoder_is_byte_identical_to_llamacpp() {
         return;
     };
     let tname = std::env::var("MINFER_F6_QUANT_TYPE").unwrap_or_else(|_| "q4_0".to_string());
-    let target = QuantTarget::parse(&tname).expect("supported target");
+    let target = crate::quantize::Target::parse(&tname).expect("supported target");
     let dir = work_dir("quant-parity");
     let out = dir.join(format!("{tname}.gguf"));
     let _ = std::fs::remove_file(&out);
@@ -349,10 +356,14 @@ fn f6_quantize_encoder_is_byte_identical_to_llamacpp() {
             "none recorded for this path (no entry is marked authoritative_reference)".to_string()
         }
     };
-    let is_kquant = matches!(
-        target,
-        QuantTarget::Q4_K | QuantTarget::Q5_K | QuantTarget::Q6_K
-    );
+    // A mixture is a K-quant claim too: its K-quant tensors are the same
+    // compiler-sensitive encoders (§4.2.1), so a mismatch on one gets the same
+    // SKIP-vs-fail verdict as a uniform K-quant's.
+    let is_kquant = target.is_mixture()
+        || matches!(
+            target.base(),
+            QuantTarget::Q4_K | QuantTarget::Q5_K | QuantTarget::Q6_K
+        );
     match tensor_payloads_equal(&out, &reff) {
         Ok(n) => {
             eprintln!(
@@ -460,6 +471,104 @@ fn f6_quantize_encoder_is_byte_identical_to_llamacpp() {
             }
         }
     }
+}
+
+/// #203: the planner's per-tensor **type selection** equals the reference
+/// file's, tensor for tensor.
+///
+/// The byte gate above fails with "tensor X payload differs", which cannot say
+/// whether the planner picked the wrong type or the encoder wrote the wrong bytes
+/// at the right type. This arm answers the first question directly, and it is
+/// cheap — no encoding runs. It is the gate for the mixture rules
+/// (`use_more_bits`, the fused-qkv category) and for the ftype-independent
+/// `OUTPUT`/tied branch; the numbers it prints are the ones recorded in
+/// `docs/GGUF-TOOLING.md` §2.2.
+///
+/// Three recorded invocations (all on `dgxspark`):
+///
+/// ```text
+/// # the 0.6B clean arm: no row-length demotion at all
+/// MINFER_F6_F16_GGUF=~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf \
+/// MINFER_F6_LLAMACPP_QUANT=~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_K_M.gguf \
+/// MINFER_F6_QUANT_TYPE=q4_K_M cargo test --release -- --ignored f6_mixture_type
+///
+/// # the 0.5B arm: 12 of the bumped attn_v demote to q8_0, the tied embedding
+/// # is asked for q8_0 by the branch itself (896 % 256 != 0)
+/// MINFER_F6_F16_GGUF=~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f16.gguf \
+/// MINFER_F6_LLAMACPP_QUANT=~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-q4_K_M.gguf \
+/// MINFER_F6_QUANT_TYPE=q4_K_M ...
+///
+/// # the legacy arm of the same branch: token_embd.weight is q6_K (pre-#203
+/// # minfer wrote q8_0 here)
+/// MINFER_F6_F16_GGUF=~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf \
+/// MINFER_F6_LLAMACPP_QUANT=~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_0.gguf \
+/// MINFER_F6_QUANT_TYPE=q4_0 ...
+/// ```
+#[test]
+#[ignore = "requires an f16 GGUF plus a recorded llama-quantize reference (tests/fixtures/f6-fixtures.json)"]
+fn f6_mixture_type_selection_matches_the_reference() {
+    let Some(src) = env_path(
+        "MINFER_F6_F16_GGUF",
+        "~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf",
+    ) else {
+        return;
+    };
+    let Some(reff) = env_path(
+        "MINFER_F6_LLAMACPP_QUANT",
+        "~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_K_M.gguf",
+    ) else {
+        return;
+    };
+    let tname = std::env::var("MINFER_F6_QUANT_TYPE").unwrap_or_else(|_| "q4_K_M".to_string());
+    let target = crate::quantize::Target::parse(&tname).expect("supported target");
+    let src_gguf = crate::gguf::load_gguf_model(&src).expect("f16 source");
+    let plan = QuantizePlan::plan(&src_gguf, target).expect("plan");
+    let ref_gguf = crate::gguf::load_gguf_model(&reff).expect("reference parses");
+    let ref_types: std::collections::HashMap<&str, crate::gguf::GgmlType> = ref_gguf.parts[0]
+        .ctx
+        .info
+        .iter()
+        .map(|ti| (ti.name.as_str(), ti.type_))
+        .collect();
+    let mut mismatched: Vec<String> = Vec::new();
+    for spec in &plan.specs {
+        match ref_types.get(spec.name.as_str()) {
+            Some(want) if *want == spec.type_ => {}
+            Some(want) => mismatched.push(format!(
+                "{}: plan {} != reference {}",
+                spec.name,
+                spec.type_.type_name(),
+                want.type_name()
+            )),
+            None => mismatched.push(format!("{}: not in the reference file", spec.name)),
+        }
+    }
+    assert!(
+        mismatched.is_empty(),
+        "f6 mixture selection: {} of {} tensors disagree with {}: {:?}",
+        mismatched.len(),
+        plan.specs.len(),
+        reff.display(),
+        &mismatched[..mismatched.len().min(8)]
+    );
+    let breakdown = plan
+        .by_type
+        .iter()
+        .map(|(t, c)| format!("{}: {c}", t.type_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let built = f6_fixtures::reference_record(&reff)
+        .authoritative
+        .map(|b| b.describe())
+        .unwrap_or_else(|| "no authoritative build recorded".to_string());
+    eprintln!(
+        "f6 mixture selection: {tname} matches {} on {} tensors ({breakdown}; {} 1-D preserved) \
+         [source {}, authoritative reference {built}]",
+        reff.display(),
+        plan.specs.len(),
+        plan.preserved.len(),
+        src.display(),
+    );
 }
 
 /// The C compiler this box would build `llama-quantize` with, for the gate's
