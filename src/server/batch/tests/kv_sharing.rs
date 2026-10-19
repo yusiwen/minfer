@@ -9,6 +9,15 @@ use super::*;
 /// the text the client would have streamed. (The E2 acceptance paragraph that used
 /// to sit above this helper documents `server_batch_matches_serial_and_is_faster`
 /// and now lives on it.)
+/// The two real-model gates in this file own a **process-global** switch
+/// (`MINFER_NO_KV_SHARE`), and the default `--test-threads` runs them in one
+/// process. One gate setting it while the other measured the *share* arm made
+/// `shared.rows` read 0 — seen on 2026-10-19 in the whole `#[ignore]`d set, where
+/// the copy arm of `a_prefix_copied_from_another_slot_answers_identically` ran
+/// between the share arms of this file's other gate. A process-wide switch needs
+/// exclusive ownership for the whole measurement, so both hold this lock.
+static KV_SHARE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn serve_on(
     engine: &mut BatchEngine,
     model: &dyn ModelDef,
@@ -60,6 +69,9 @@ fn serve_on(
 #[test]
 #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
 fn a_prefix_copied_from_another_slot_answers_identically() {
+    let _env = KV_SHARE_ENV
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(path) = cached_model() else {
         eprintln!("0.5B q4_0 not cached; skipping the C8a gate");
         return;
@@ -122,6 +134,9 @@ fn a_prefix_copied_from_another_slot_answers_identically() {
 #[test]
 #[ignore = "requires the cached 0.5B model (~/.cache/minfer/models)"]
 fn a_store_inside_a_shared_prefix_takes_a_private_row() {
+    let _env = KV_SHARE_ENV
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(path) = cached_model() else {
         eprintln!("0.5B q4_0 not cached; skipping the C8b S3 gate");
         return;
