@@ -5314,6 +5314,9 @@ The #160 command is unchanged:
   definition, so the two gates remain skipped in that mutation run. Filed as
   [#198](https://github.com/yusiwen/minfer/issues/198) — a production bound for the
   moving-but-non-terminating step, which must not false-positive a legitimately long generation.
+  **Landed 2026-10-19 ([#617](https://github.com/yusiwen/minfer/pull/617)):** the per-run lag bound
+  answers it, the two `serve_loop` gates fail in 0.16–0.20 s under `=spin`, and the whole-set `spin`
+  run needs no `--skip` (the #150/#198/#157 record below).
 - The CUDA unit row of `docs/status.toml` (546, GB10 sm_121, 2026-09-27) was **not** re-measured:
   this ticket's two new CI tests are feature-independent, so a CUDA build would read **+2**; the row
   stays the dated device record and is not claimed to include them (the GPU rows were out of scope).
@@ -8493,7 +8496,8 @@ channel and keeps answering while the model is busy. Metric families and units:
 | `minfer_requests_completed_total` | counter | requests | response finished (body sent, stream closed, client gone) |
 | `minfer_requests_rejected_total` | counter | requests | refused before queueing (draining / worker gone) |
 | `minfer_requests_in_flight` | gauge | requests | accepted, not yet finished — the drain surface |
-| `minfer_jobs_dropped_total` | counter | jobs | the worker could not place the job in a slot |
+| `minfer_jobs_dropped_total` | counter | jobs | the worker could not place the job in a slot — since [#150](https://github.com/yusiwen/minfer/issues/150) this includes the queue bound, so it is an **admission** signal, not the only refusal one |
+| `minfer_requests_failed_total{class="…"}` | counter | requests | an **accepted** request answered with a terminal error, one series per `ApiError::error_type` (**added by [#157](https://github.com/yusiwen/minfer/issues/157)**; counted where the error becomes a response, so it is disjoint from `requests_rejected_total`, `jobs_dropped_total` and `requests_completed_total`) |
 | `minfer_worker_stalled_total` | counter | events | the worker's counted no-progress bound tripped and ended the loop, answering every live and queued request `500` (**added by [#196](https://github.com/yusiwen/minfer/issues/196)**) |
 | `minfer_queue_depth` | gauge | jobs | `accepted - admitted`: channel backlog + the worker's `pending` deque |
 | `minfer_worker_pending_jobs` | gauge | jobs | the worker's own deque right now |
@@ -8564,6 +8568,15 @@ reservation and killed both requests. The gate now asks for 128-token answers ov
 every iteration and a job is placed or rejected within that pass, so the non-zero
 window after a send is shorter than a sampler's interval — the arithmetic is gated
 purely and the loop's drain through `accepted - queue_depth == n`.
+
+> **Amended 2026-10-19 ([#150](https://github.com/yusiwen/minfer/issues/150)).** The paragraph
+> above describes the gate as #51 wrote it, and its premise no longer holds: `serve_loop` now
+> admits only while a slot is **idle** and queues the rest, so `queue_depth` is the real backlog
+> (the worker's deque is a surviving gauge) rather than a one-pass transient. Round 2 of
+> `serve_loop_publishes_the_queue_and_running_depth` now asserts both jobs are **served** and
+> reads their response channels, and the feeder's terminator is the channels closing, not a
+> counter — a counter-based terminator let the `spin` mutation pass. The current contract is
+> `docs/USAGE.md` §"Slot saturation"; the per-ticket history is the #150/#198/#157 record below.
 
 **Issue #51's own acceptance, item by item.** (i) *"Metrics are exposed in a
 standard scrapeable format"* — Prometheus text 0.0.4 with `# HELP`/`# TYPE` per

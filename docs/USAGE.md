@@ -325,6 +325,10 @@ n_slots` cells.
   experiments or for a machine where your own measurement says it wins).
 - `MINFER_BATCH=0` forces it off.
 - Any other value warns and uses the device default.
+- `MINFER_QUEUE_MAX` bounds how many accepted requests may **wait** for a slot on the
+  batched path (default 64, the job channel's capacity, clamped to at least 1). It is a
+  policy knob — how long a client may wait — so it is documented with the policy in
+  §"Slot saturation" rather than here.
 - `MINFER_N_BATCH` sizes the **prefill chunk** (E3): default 2048 tokens, a no-op for a
   prompt that fits, remainder-last so the final forward carries the tail row, and the
   other slots take a decode step *between* chunks. `MINFER_N_BATCH=0` disables chunking
@@ -547,14 +551,19 @@ curl -s http://127.0.0.1:8080/metrics
 
 ### Graceful shutdown (F8)
 
-On `SIGINT` or `SIGTERM` the server stops accepting new work and lets the
-requests already accepted finish, up to `MINFER_DRAIN_MS`:
+On `SIGINT` or `SIGTERM` the server stops accepting new work, lets the requests
+already **admitted to a slot** finish, and answers the ones still queued, up to
+`MINFER_DRAIN_MS`:
 
 1. the listener is closed (a brand-new connection gets a connection error), and
    a request that arrives on an already-accepted connection gets
    `503` — it is counted in `minfer_requests_rejected_total`;
-2. in-flight responses are allowed to complete;
-3. at the deadline the server logs how many requests were still in flight,
+2. a job that was accepted but is still waiting in the worker's queue is answered
+   `503 "server is draining"` (counted in `minfer_jobs_dropped_total` and in
+   `minfer_requests_failed_total{class="unavailable_error"}`) instead of being
+   abandoned when the deadline expires — see §"Slot saturation";
+3. admitted responses are allowed to complete;
+4. at the deadline the server logs how many requests were still in flight,
    records that count in `minfer_drain_abandoned_requests`, and exits. It never
    waits on the worker indefinitely — an SSE client that never disconnects cannot
    keep the process alive.
