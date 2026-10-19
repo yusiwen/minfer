@@ -306,3 +306,13 @@ symbol = "serve_loop"
 adr = "0059"
 what = "a terminal error is counted where it becomes a response, by `ApiError::error_type`"
 symbol = "record_failed"
+
+[[governs]]
+adr = "0060"
+what = "a mixture is a per-tensor selection policy, not an encoder, and it runs before the row-length demotion"
+path = "src/quantize/mix.rs"
+
+[[governs]]
+adr = "0060"
+what = "the `OUTPUT`/tied-embedding branch runs for every quantizing ftype and answers from the row length"
+symbol = "output_branch"

@@ -620,7 +620,8 @@ completes; the PASS/FAIL verdict is in the JSON.
 # HuggingFace Qwen2 checkpoint -> GGUF (f16, or f32 for a lossless archive)
 ./target/release/minfer convert /path/to/Qwen2.5-0.5B-Instruct out.gguf --outtype f16
 # quantize an existing single-file GGUF (--type q4_0, q4_1, q5_0, q5_1, q8_0,
-#                                             q4_K, q5_K, q6_K, f16, f32)
+#          q4_K, q5_K, q6_K for one uniform type — llama-quantize --pure — or
+#          q4_K_M, q5_K_M for llama.cpp's mixture, plus f16, f32)
 ./target/release/minfer quantize out.gguf out-q4_0.gguf --type q4_0
 # split a single file into transport-sized parts (any type; tensor bytes copied verbatim)
 ./target/release/minfer split out-q4_0.gguf /tmp/parts --max-size 200M
@@ -635,15 +636,22 @@ architectures: `Qwen2ForCausalLM` only. 1-D tensors stay f32 under `--outtype
 f16` (llama.cpp's rule); `--outtype f32` is exact for bf16/f16 sources.
 
 `quantize` re-encodes 2-D float weights; 1-D norms/biases keep their source
-type, and on a tied model a sub-8-bit target quantizes the shared
-`token_embd.weight` at q8_0 (both are printed). A 2-D row that is not a multiple
-of the target's block is **demoted** the way llama.cpp's `tensor_type_fallback`
-does it — a K-quant to `q5_0`/`q5_1`/`q8_0`, a legacy target to `f16` — never
-copied, so an f32 source with such a row comes back f16. The encodable targets are
-`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q4_K`, `q5_K`, `q6_K`, `f16` and `f32`,
-and the K-quant encoders are byte-identical to `llama-quantize`'s on the same
-source ([`docs/SUPPORT-MATRIX.md`](./SUPPORT-MATRIX.md)). The K-quants with no
-encoder here (`q2_K`, `q3_K`, `q8_K`) and the I-quants are refused by name.
+type, and `output.weight` (or a tied `token_embd.weight`) takes llama.cpp's
+`OUTPUT` branch — `q6_K`, or `q8_0` when the requested type's block cannot divide
+the row. Everything the plan changes is printed: the preserved tensors, the ones
+the branch moved, the mixture's bumps and the demotions, plus a final file-type
+histogram. A 2-D row that is not a multiple of the type a tensor was *asked* for
+is **demoted** the way llama.cpp's `tensor_type_fallback` does it — a K-quant to
+`q5_0`/`q5_1`/`q8_0`, a legacy target to `f16` — never copied, so an f32 source
+with such a row comes back f16. The encodable targets are `q4_0`, `q4_1`, `q5_0`,
+`q5_1`, `q8_0`, `q4_K`, `q5_K`, `q6_K` (one uniform type, what
+`llama-quantize --pure` writes), the mixtures `q4_K_M`/`q5_K_M` (llama.cpp's
+per-tensor policy, what `llama-quantize … q4_K` writes), `f16` and `f32`, and both
+families are per-tensor byte-identical to `llama-quantize`'s output on the same
+source ([`docs/SUPPORT-MATRIX.md`](./SUPPORT-MATRIX.md),
+[`docs/GGUF-TOOLING.md`](./GGUF-TOOLING.md) §2.2). The K-quants with no encoder
+here (`q2_K`, `q3_K`, `q8_K`), the `_S` ftypes and the I-quants are refused by
+name.
 
 `split` writes `{stem}-NNNNN-of-MMMMM.gguf` parts with
 `split.no`/`split.count`/`split.tensors.count`; the loader reads part 0 and

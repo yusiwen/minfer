@@ -115,8 +115,9 @@ language.
 checkpoint with the metadata the strict tokenizer/template loader requires
 (`tokenizer.ggml.model`/`pre`, the 256 byte tokens, merges, special ids and
 `tokenizer.chat_template`); `minfer quantize in.gguf out.gguf --type …`
-re-encodes weights to q4_0/q4_1/q5_0/q5_1/q8_0, the K-quants q4_K/q5_K/q6_K
-(all byte-identical to `llama-quantize` on the same source) or f16/f32;
+re-encodes weights to q4_0/q4_1/q5_0/q5_1/q8_0, the K-quants q4_K/q5_K/q6_K, the
+mixtures q4_K_M/q5_K_M (all per-tensor byte-identical to `llama-quantize` on the
+same source) or f16/f32;
 `minfer split in.gguf dir
 --max-size N` writes `split.no`/`split.count` parts the loader merges back into
 one tensor index. Unsupported architectures, tensor names, dtypes and quant

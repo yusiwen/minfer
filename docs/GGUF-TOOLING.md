@@ -231,16 +231,32 @@ Targets with an implemented and byte-verified encoder:
 - For a **quant** target only 2-D float tensors are quantized. 1-D tensors (norms,
   biases) keep their source type, and the CLI prints the list — llama.cpp's rule, not
   a silent choice.
-- **The K-quant targets write one uniform type — they are not llama.cpp's
-  `_M` mixtures.** `q4_K`/`q5_K` are the *CLI aliases* for `LLAMA_FTYPE_MOSTLY_Q4_K_M`
-  / `_Q5_K_M` in `llama-quantize` (and their `general.file_type` numbers here are
-  llama.cpp's 15/17/18), but `minfer quantize --type q4_K` puts **every**
-  encodable 2-D tensor at `q4_K`. That is what `llama-quantize --pure` writes, and
-  it is the reference the byte-parity gate uses; the mixture planner (per-layer
-  Q6_K bumps, the OUTPUT/tied-embedding branch, `use_more_bits`) is **not**
-  implemented — [#203](https://github.com/yusiwen/minfer/issues/203). A file from
-  `llama-quantize … q4_K` without `--pure` is therefore *not* what this command
-  produces.
+- **Two families of K-quant target, and the bare spelling is the uniform one.**
+  `--type q4_K` / `q5_K` put **every** encodable 2-D tensor at that type — exactly
+  what `llama-quantize --pure` writes, and the reference the byte-parity gate
+  uses. `--type q4_K_M` / `q5_K_M` are llama.cpp's *mixtures*
+  (`LLAMA_FTYPE_MOSTLY_Q4_K_M`/`_Q5_K_M`): the file `llama-quantize … q4_K` (no
+  `--pure`) writes, selected tensor by tensor by
+  `llama_tensor_get_type_impl` ([ADR-0060](adr/0060-a-mixture-is-a-per-tensor-policy-and-the-output-branch-runs-for-every-ftype.md)).
+  llama.cpp's CLI aliases the *bare* `q4_K` to the mixture, so the two CLIs spell
+  the same file differently — deliberately: a spelling that produced a uniform file
+  before #203 still does. Both spellings record the ftype number
+  (`general.file_type` 15/17, as `--pure` does), so the metadata cannot tell them
+  apart and nothing may infer "uniform" from it.
+- **The mixture's selection order is llama.cpp's, and it is the load-bearing
+  part.** Per 2-D tensor: the `OUTPUT`/tied-embedding branch first (below), then
+  `use_more_bits(i, n)` — `i < n/8 || i >= 7n/8 || (i - n/8) % 3 == 2` — which
+  bumps `attn_v` and `ffn_down` to `Q6_K`, and the fused-`qkv` category, which
+  goes to `Q5_K` under `q4_K_M` and `Q6_K` under `q5_K_M`; everything else is the
+  base type. The row-length demotion then runs on the type each tensor was
+  **asked** for, which is why the selection and the demotion cannot be reordered.
+  Measured 2026-10-19 on `dgxspark` against the recorded references: on the 0.5B
+  (hidden 896) `q4_K_M` is **12 `q4_K` + 12 `q6_K` + 13 `q8_0` + 132 `q5_0`**
+  (plus the 121 1-D tensors at f32) — the 12 bumped `attn_v` asked for `Q6_K` are
+  demoted to `q8_0`, the 12 un-bumped ones asked for `q4_K` to `q5_0`, and the
+  13th `q8_0` is the tied embedding the branch itself answers `q8_0`; on the 0.6B
+  (hidden 1024, every row 256-divisible) it is **168 `q4_K` + 29 `q6_K`** with
+  **no demotion** (the 29 are 14 `ffn_down` + 14 `attn_v` + the tied embedding).
 - **A row that cannot take the target's block is demoted, never copied.** A 2-D
   tensor whose `ne[0]` is not a multiple of the target's block size cannot be
   encoded at the requested type, and minfer **demotes** it exactly the way
@@ -273,10 +289,17 @@ Targets with an implemented and byte-verified encoder:
   ([#169](https://github.com/yusiwen/minfer/issues/169)).
 - The `f32` cast is the one target that converts **every** tensor, 1-D included,
   to f32.
-- On a **tied** model (no `output.weight`), a sub-8-bit legacy target quantizes the
-  shared `token_embd.weight` at **q8_0** — llama.cpp's tied-embedding policy.
-  The CLI prints this too. (A K-quant target skips the mixture, so its tied
-  embedding goes to the requested type and then to that type's fallback.)
+- **`output.weight` and a tied `token_embd.weight` take llama.cpp's `OUTPUT`
+  branch, for every quantizing target** — the five legacy types and the two
+  mixtures; the uniform K-quants are `--pure` and skip it, as `llama-quantize
+  --pure` does. The branch is a row-length question: when the requested type's
+  block cannot divide the row it answers **`q8_0`**, and when it can it answers
+  **`q6_K`**. The row rule then runs on that answer, so the 0.5B's tied embedding
+  is `q8_0` with no demotion (896 % 256 != 0) while the 0.6B's is `q6_K`; on a
+  legacy target with a 32-block-fittable row (the 0.6B) the answer is `q6_K` too.
+  The CLI reports each tensor it moved this way. Before #203 this rule asked for
+  `q8_0` unconditionally, which matched llama.cpp only where the hidden size is
+  not a multiple of 256.
 - A multi-part source is refused (quantize one file, then split).
 - K-quant/I-quant sources are refused: there is no dequantizer, so re-encoding
   them would produce wrong weights.
@@ -628,6 +651,37 @@ K-quant rows above are against that same build, and their per-expression fusion 
 *not* reproducible by the `Off` variant — that variant is the gate's provenance
 probe, not a second encoder).
 
+**Reference procedure (mixtures, [#203](https://github.com/yusiwen/minfer/issues/203)).**
+A mixture's reference is the bare spelling **without** `--pure`, and it has to come
+from the same recorded build: the K-quant tensors it contains are the same
+compiler-sensitive encoders, so a Mac build's file is a foreign build and the gate
+skips it loudly (§4.2.2's rule).
+
+```bash
+llama-quantize ~/.cache/minfer/f6-src/qwen2.5-0.5b-instruct-f16.gguf \
+  ~/.cache/minfer/f6-src/ref/qwen2.5-0.5b-q4_K_M.gguf q4_K
+llama-quantize ~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf \
+  ~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_K_M.gguf q4_K
+llama-quantize ~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf \
+  ~/.cache/minfer/f6-src/ref/qwen3-0.6b-q5_K_M.gguf q5_K
+# the ftype-independent OUTPUT branch: a legacy target on a tied model whose row
+# the 32-block type fits (the 0.5B's 896 does not, which is why it cannot show it)
+llama-quantize ~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf \
+  ~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_0.gguf q4_0
+```
+
+**Results (measured 2026-10-19, `dgxspark`, the build of §4.2).** `minfer quantize
+--type q4_K_M` is per-tensor byte-identical on **290/290** tensors of the 0.5B and
+**310/310** of the 0.6B, `q5_K_M` on **310/310**, and the 0.6B `q4_0`
+(`token_embd.weight` at `q6_K`) on **310/310**. The 0.6B `q4_K_M` output is
+identical whole-file, not only per tensor: `396 704 416 B`, `sha256
+a3ab8869e34e07516551feb63de9a92d599044e96078a1f7b78bc5bbfa2b6137`. The gate also
+compares the **picked types** tensor for tensor
+(`src/tooling/tests/quantize_bounds.rs::f6_mixture_type_selection_matches_the_reference`),
+so a planner defect and an encoder defect fail with different messages. The four
+references are recorded in `tests/fixtures/f6-fixtures.json` with their producer
+(§4.2.2).
+
 **The K-quant claim is compiler-sensitive, and the record says which compiler.**
 Measured 2026-10-07 on `macbook (macOS 27.0.1, Apple M4 Pro)`: after rebuilding
 `llama-quantize` from `c479922ac` with
@@ -922,13 +976,12 @@ network is used.
 
 ## 6. Known gaps (follow-ups)
 
-- **No K-quant *mixture* planner.** The three encoders landed in
-  [#140](https://github.com/yusiwen/minfer/issues/140) and `minfer quantize
-  --type q4_K` writes a uniform file (`llama-quantize --pure`). llama.cpp's
-  `Q4_K_M`/`Q5_K_M` per-tensor policy — the `OUTPUT`/tied-embedding branch, the
-  `use_more_bits` Q6_K bumps for `attn_v` and `ffn_down`, the fused-QKV rule — is
-  not implemented, so `llama-quantize … q4_K` (no `--pure`) is not reproduced.
-  Tracked as [#203](https://github.com/yusiwen/minfer/issues/203).
+- **`Q4_K_S`/`Q5_K_S`, imatrix and the per-tensor overrides are absent.** The
+  `_M` mixtures landed with [#203](https://github.com/yusiwen/minfer/issues/203)
+  (§2.2, §4.2.1), but the `_S` variants (which differ only in the per-layer
+  rules), an imatrix input and `llama-quantize`'s
+  `--tensor-type`/`--output-tensor-type`/`--token-embedding-type` overrides are
+  not implemented and are refused by name, not approximated.
 - **The byte-parity chain is a recipe, not a script.** The f16 sources and the
   `llama-quantize` references live in `~/.cache/minfer/f6-src/` and are
   regenerated by the recipe in §4.2.1; nothing checks that they are the ones the
@@ -1000,10 +1053,15 @@ network is used.
 - **`general.size_label` is not written** (cosmetic; llama.cpp derives it from
   the parameter count). Every other key llama.cpp writes for this architecture is
   written, with the same value.
-- **Tied-embedding policy follows llama.cpp for the legacy quants only.**
-  For an *untied* model, llama.cpp promotes `output.weight` to Q6_K under a
-  sub-8-bit target; minfer keeps it at the requested target (Q6_K has no encoder
-  yet). Documented, not silently different-by-accident.
+- **The `OUTPUT`/tied-embedding branch is implemented — and the earlier wording of
+  this bullet was wrong.** It claimed minfer followed llama.cpp for the legacy
+  quants only and left an untied `output.weight` at the requested target "because
+  Q6_K has no encoder yet": stale once
+  [#140](https://github.com/yusiwen/minfer/issues/140) landed the encoder, and
+  wrong for a tied model whose hidden size *is* a multiple of 256, where the
+  pre-#203 rule wrote `q8_0` and llama.cpp writes `q6_K` (measured on the 0.6B,
+  §4.2.1). Both `output.weight` and a tied `token_embd.weight` take the branch for
+  every quantizing target; its answer is recorded in §2.2.
 - **`minfer convert` holds one tensor in memory at a time** (it streams from
   the safetensors file into the writer), so its footprint is the largest single
   tensor, not the model. `quantize` and `split` stream through the mmap. The
@@ -1034,6 +1092,7 @@ minfer split /tmp/model-q4_0.gguf /tmp/rewrite --max-size 4G   # one part -> a p
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0041](adr/0041-a-row-that-cannot-take-the-targets-block-is-demoted.md) — A row that cannot take the target's block is demoted, the legacy targets included
+- [ADR-0060](adr/0060-a-mixture-is-a-per-tensor-policy-and-the-output-branch-runs-for-every-ftype.md) — A mixture is a per-tensor policy over the same encoders, and the `OUTPUT`/tied branch runs for every quantizing ftype
 - [ADR-0020](adr/0020-a-quantized-file-is-byte-identical-or-wrong.md) — A quantized file is byte-identical to `llama-quantize`, or it is wrong
 - [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32
 - [ADR-0024](adr/0024-a-machine-read-record-is-not-book-content.md) — A machine-read record is not book content
