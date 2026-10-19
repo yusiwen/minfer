@@ -867,6 +867,12 @@ Each slot contains (see the `Slot` struct in [Data Structures](#data-structures)
    counted `STALL_STEP_LIMIT` (64) consecutive such steps: every live run and every
    queued-but-unadmitted job gets exactly one `500 the worker stalled`, and
    `minfer_worker_stalled_total` moves ([#196](https://github.com/yusiwen/minfer/issues/196)).
+   The sibling case — the worker keeps advancing `work_units` while a **run** never completes —
+   is bounded per run: a run with no attributable progress (a row written for it, or a token it
+   committed) for `RUN_STALL_STEP_LIMIT` (64) work units gets exactly one
+   `500 the run made no progress` and its slot is freed, while the worker carries on with the
+   queue. A **queued** job has no run, so waiting is never mistaken for stalling
+   ([#198](https://github.com/yusiwen/minfer/issues/198)).
 6. On completion -> state becomes Idle, KV regions and sampling state are reset for the next request
 7. Return response -> slot available for next request
 
@@ -941,6 +947,7 @@ All errors follow OpenAI's error format:
 | Model not loaded | 503 | unavailable_error |
 | Internal server error | 500 | server_error |
 | A decode step's forward fails (kernel invariant, activation budget, KV format, panic) | 500 | server_error — answered to every run whose row was in the failed batch ([#151](https://github.com/yusiwen/minfer/issues/151)); the step failure is not the saturation refusal, so it is never a 503 |
+| A run makes no progress for `RUN_STALL_STEP_LIMIT` (64) work units | 500 | server_error — that run is answered once and its slot freed; the worker keeps serving ([#198](https://github.com/yusiwen/minfer/issues/198)) |
 
 **Note:** both paths **wait** when every slot is busy — the batched one in the worker's
 bounded queue (`MINFER_QUEUE_MAX`, default 64; a job beyond it is `503 unavailable_error`
