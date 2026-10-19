@@ -1,5 +1,8 @@
 /target/
 *.gguf
+# The toy test model is a fixture, not a model download (#609): 113 KB, generated
+# by `scripts/gen_toy_gguf.py`, and the template/startup e2e run against it.
+!tests/fixtures/toy/*.gguf
 /tmp/
 *.npy
 *.f32
