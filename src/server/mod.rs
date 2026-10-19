@@ -455,15 +455,24 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
         .iter()
         .map(|m| (m.role.clone(), m.content.clone()))
         .collect();
-    let prompt = match crate::template::render_messages_opt(
+    // #597: `tools` reaches the template, and `tool_choice` is resolved here so
+    // an unimplemented mode is a 400 rather than a silently ignored field.
+    let tools = match req.prompt_tools() {
+        Ok(t) => t,
+        Err(e) => return error_response(&e),
+    };
+    let prompt = match crate::template::render_messages_opt_with_tools(
         state.chat_template.as_deref(),
         &messages,
+        tools,
         true,
         &bos,
     ) {
         Ok(p) => p,
         // F7 (#50): a template refusal is a client-visible error naming the
-        // construct; the startup gate above means this is a backstop.
+        // construct; the startup gate above means this is a backstop. #597: the
+        // same arm carries "tools not rendered" when the model's template has no
+        // tools branch.
         Err(e) => return error_response(&ApiError::invalid_request(e.message())),
     };
     let input_ids = state.tokenizer.encode(&prompt);

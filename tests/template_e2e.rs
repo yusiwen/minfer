@@ -202,12 +202,25 @@ const MARKER_TEMPLATE: &str = "{% if messages|length == 1 %}{{ raise_exception(\
 /// which surfaced as "the template file is empty" (#611's first CI run passed, the
 /// full suite raced).
 fn marker_file(name: &str) -> PathBuf {
+    template_file(name, MARKER_TEMPLATE)
+}
+
+/// Any template in its own file (`name` unique per test, same reason as above).
+fn template_file(name: &str, text: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("minfer-template-e2e");
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let path = dir.join(name);
-    std::fs::write(&path, MARKER_TEMPLATE).expect("write marker template");
+    std::fs::write(&path, text).expect("write template");
     path
 }
+
+/// A template with no `tools` branch at all: whatever the request sends cannot
+/// reach the prompt (#597).
+const NO_TOOLS_BRANCH_TEMPLATE: &str = "U:{{ messages[0][\"content\"] }}";
+
+/// A template that does render `tools`, so a request carrying them is served.
+const TOOLS_BRANCH_TEMPLATE: &str =
+    "{% if tools %}T:{{ tools|length }}|{% endif %}U:{{ messages[0][\"content\"] }}";
 
 #[test]
 fn serve_starts_and_answers_health_with_an_override_file() {
@@ -365,4 +378,80 @@ fn conversation_announces_chatml_once_without_reading_stdin() {
         "the notice must be printed exactly once; stderr:\n{stderr}"
     );
     assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+/// #597: the request field reaches the renderer, and what the renderer does with
+/// it is visible over HTTP.
+///
+/// Three states, one server run each: a template without a `tools` branch is a
+/// 400 that names the missing branch (never a silently tools-free prompt) while
+/// the same request without tools is a 200; a template *with* a branch serves the
+/// request; and a `tool_choice` mode that needs output extraction is the
+/// handler's own 400. The prompt bytes themselves are gated in
+/// `src/template/tests/tools.rs` against the transformers reference — a toy model
+/// cannot show them here.
+#[test]
+fn serve_refuses_tools_a_template_cannot_render_and_serves_the_ones_it_can() {
+    let model = test_model();
+    let tools = r#","tools":[{"type":"function","function":{"name":"get_weather"}}]"#;
+    let with_tools =
+        format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"max_tokens":1{tools}}}"#);
+    let without_tools = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#;
+
+    // (a) no tools branch: refused by name, and the same request without tools
+    //     still works — the 400 is about the definitions, not the template.
+    let plain = template_file("tools-none.jinja", NO_TOOLS_BRANCH_TEMPLATE);
+    let mut server = Server::spawn("serve", &model.to_string_lossy(), 18106, Some(&plain));
+    assert!(
+        server.wait_listening(),
+        "no banner; log so far:\n{}",
+        server.log()
+    );
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(&with_tools));
+    assert_eq!(
+        status, 400,
+        "tools against a template with no tools branch must be 400; body:\n{response}"
+    );
+    assert!(
+        response.contains("no `tools` branch"),
+        "the refusal must name the missing branch; body:\n{response}"
+    );
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(without_tools));
+    assert_eq!(
+        status, 200,
+        "the same request without tools must render; body:\n{response}"
+    );
+
+    // (b) a template that renders tools serves the request.
+    let branch = template_file("tools-branch.jinja", TOOLS_BRANCH_TEMPLATE);
+    let mut server = Server::spawn("serve", &model.to_string_lossy(), 18107, Some(&branch));
+    assert!(
+        server.wait_listening(),
+        "no banner; log so far:\n{}",
+        server.log()
+    );
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(&with_tools));
+    assert_eq!(
+        status, 200,
+        "a template with a tools branch must serve the request; body:\n{response}"
+    );
+    assert!(
+        response.contains("\"content\""),
+        "a completion shape is expected; body:\n{response}"
+    );
+
+    // (c) `tool_choice: "required"` is refused before the render: it needs the
+    //     model's output to be parsed, which this server does not do.
+    let required = format!(
+        r#"{{"messages":[{{"role":"user","content":"hi"}}],"max_tokens":1{tools},"tool_choice":"required"}}"#
+    );
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(&required));
+    assert_eq!(
+        status, 400,
+        "tool_choice \"required\" must be refused; body:\n{response}"
+    );
+    assert!(
+        response.contains("extracted from the model's output"),
+        "the refusal must name what is missing; body:\n{response}"
+    );
 }

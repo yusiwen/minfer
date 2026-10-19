@@ -58,6 +58,47 @@ pub struct ChatCompletionRequest {
     /// non-text `response_format` (one grammar per request, never a precedence
     /// rule).
     pub grammar: Option<String>,
+    // === Tool calling (#597). Absent means the template's `tools` is `none`,
+    // which is the pinned behaviour every byte-for-byte gate renders. ===
+    /// OpenAI `tools`: the request's own array of tool definitions, key order
+    /// and unknown keys included, because the template echoes each entry into
+    /// the prompt (`src/template/tool_json.rs`).
+    pub tools: Option<Vec<crate::template::ToolJson>>,
+    /// OpenAI `tool_choice`. See [`ChatCompletionRequest::prompt_tools`] for
+    /// which modes this server can honour, and what the others mean.
+    pub tool_choice: Option<ToolChoice>,
+}
+
+/// OpenAI `tool_choice`, in the two shapes the API defines.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    /// `"auto"` / `"none"` / `"required"`.
+    Mode(ToolChoiceMode),
+    /// `{"type":"function","function":{"name":"…"}}` — a forced call.
+    Function(ForcedToolChoice),
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ForcedToolChoice {
+    /// OpenAI spells this `"function"`; kept so an unknown type is a `400` with
+    /// the value named rather than a deserialization failure with no context.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ForcedToolName,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ForcedToolName {
+    pub name: String,
 }
 
 /// OpenAI `response_format` (the subset this server implements).
@@ -272,7 +313,55 @@ impl ChatCompletionRequest {
             // content: Option<String> — an array (multimodal) fails serde with
             // a clear error; we surface it as invalid_request_error.
         }
+        if let Some(tools) = &req.tools {
+            // "No tools" is the absence of the field, not an empty array: an
+            // empty array is a client bug that would otherwise render as a
+            // tools branch with nothing in it (#597).
+            if tools.is_empty() {
+                return Err(ApiError::invalid_request(
+                    "tools must not be empty; omit the field to send none".to_string(),
+                ));
+            }
+            for (index, tool) in tools.iter().enumerate() {
+                validate_tool(index, tool)?;
+            }
+        }
+        if req.tool_choice.is_some() && req.tools.is_none() {
+            return Err(ApiError::invalid_request(
+                "`tool_choice` requires `tools`".to_string(),
+            ));
+        }
         Ok(req)
+    }
+
+    /// The `tools` this request puts in the prompt, or `None` (#597).
+    ///
+    /// `tool_choice` is honoured where a *prompt* can express it. `auto` (the
+    /// default) renders the definitions; `"none"` renders without them, because
+    /// this server does not parse tool calls out of the model's output, so
+    /// showing the schemas while promising not to call would invite exactly the
+    /// call it cannot report. `"required"` and a forced function name are
+    /// refused by name for the same reason — accepting them and then returning
+    /// a `<tool_call>` block as ordinary content is the silent substitution
+    /// ADR-0019 forbids.
+    pub fn prompt_tools(&self) -> Result<Option<&[crate::template::ToolJson]>, ApiError> {
+        let tools = self.tools.as_deref();
+        match &self.tool_choice {
+            None | Some(ToolChoice::Mode(ToolChoiceMode::Auto)) => Ok(tools),
+            Some(ToolChoice::Mode(ToolChoiceMode::None)) => Ok(None),
+            Some(ToolChoice::Mode(ToolChoiceMode::Required)) => Err(ApiError::invalid_request(
+                "tool_choice \"required\" needs tool calls to be extracted from the model's \
+                 output, which this server does not implement yet: the call would come back as \
+                 ordinary content"
+                    .to_string(),
+            )),
+            Some(ToolChoice::Function(forced)) => Err(ApiError::invalid_request(format!(
+                "tool_choice forcing function '{}' needs tool calls to be extracted from the \
+                 model's output, which this server does not implement yet: the call would come \
+                 back as ordinary content",
+                forced.function.name
+            ))),
+        }
     }
 
     /// Resolve request options into concrete sampling params. `rng_seed` is the
@@ -381,8 +470,54 @@ impl ChatCompletionRequest {
     }
 }
 
-// === Response Types ===
+/// One OpenAI tool definition: `{"type":"function","function":{"name":…}}`
+/// (#597).
+///
+/// Only the structure the prompt depends on is validated. The `function` object
+/// is passed through verbatim — an unknown key (OpenAI's `strict`, a vendor
+/// extension) must survive into the prompt, so this is not a typed subset.
+fn validate_tool(index: usize, tool: &crate::template::ToolJson) -> Result<(), ApiError> {
+    use crate::template::ToolJson;
+    if tool.as_object().is_none() {
+        return Err(ApiError::invalid_request(format!(
+            "tools[{index}] must be an object with `type` and `function`"
+        )));
+    }
+    match tool.get("type").and_then(ToolJson::as_str) {
+        Some("function") => {}
+        Some(other) => {
+            return Err(ApiError::invalid_request(format!(
+                "tools[{index}].type is '{other}'; this server implements 'function' only"
+            )))
+        }
+        None => {
+            return Err(ApiError::invalid_request(format!(
+                "tools[{index}] has no string `type` (expected \"function\")"
+            )))
+        }
+    }
+    let Some(function) = tool.get("function") else {
+        return Err(ApiError::invalid_request(format!(
+            "tools[{index}] has no `function` object"
+        )));
+    };
+    if function.as_object().is_none() {
+        return Err(ApiError::invalid_request(format!(
+            "tools[{index}].function must be an object"
+        )));
+    }
+    match function.get("name").and_then(ToolJson::as_str) {
+        Some(name) if !name.trim().is_empty() => {}
+        _ => {
+            return Err(ApiError::invalid_request(format!(
+                "tools[{index}].function.name must be a non-empty string"
+            )))
+        }
+    }
+    Ok(())
+}
 
+// === Response Types ===
 #[derive(Serialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
