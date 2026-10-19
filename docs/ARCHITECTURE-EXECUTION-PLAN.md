@@ -12030,7 +12030,7 @@ gate is a deterministic one at the seam and not a rerun of the flake — the rec
 of 12 device runs, and the transcript lives in the ticket. (2) The third parallel device run failed
 #189's S4 A/B timing gate at **7 / 9** refusals, with both arms roughly **twice** their solo cost
 (span 47.5 / map 65.6 µs/launch against 24.6 / 25.8 alone): ~50 gates on one GPU is the
-configuration [`AGENTS.md`](../AGENTS.md) tells you not to use for a device build (`[#64]`), and that
+configuration the repository's `AGENTS.md` tells you not to use for a device build (`[#64]`), and that
 gate alone is green **2 / 2** (0 / 9 and 1 / 9 refusals). It is device contention, not a seam or #616
 regression, and it was not introduced here. (3) The two parallel runs before it were **50 / 0** — the
 configuration the ticket asks for, with the seam gate and the `kv_sharing` gates overlapping in one
