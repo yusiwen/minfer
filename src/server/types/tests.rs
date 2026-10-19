@@ -376,3 +376,150 @@ fn a_breaker_string_that_matches_no_token_is_a_400() {
         "a refused breaker leaves no sequence behind"
     );
 }
+
+// === Tool calling (#597) ==================================================
+//
+// The wire contract: the OpenAI shapes are accepted, everything this server
+// cannot honour is a 400 that names the field, and a request without `tools`
+// keeps the pinned `none` the byte-for-byte gates render.
+
+const WEATHER_TOOL: &str = r#"{"type":"function","function":{"name":"get_weather","description":"Weather.","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}"#;
+
+fn body_with_tools(extra: &str) -> String {
+    format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER_TOOL}]{extra}}}"#)
+}
+
+#[test]
+fn tools_are_parsed_in_the_client_key_order() {
+    let req = ChatCompletionRequest::parse(body_with_tools("").as_bytes()).expect("parse");
+    let tools = req.tools.as_ref().expect("tools");
+    assert_eq!(tools.len(), 1);
+    let keys: Vec<&str> = tools[0]
+        .as_object()
+        .expect("object")
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        ["type", "function"],
+        "the client's order must survive the request parse"
+    );
+    // Unknown keys survive too: `| tojson` echoes the object, so a typed subset
+    // would change the prompt.
+    assert!(tools[0]
+        .get("function")
+        .unwrap()
+        .get("description")
+        .is_some());
+}
+
+#[test]
+fn no_tools_leaves_the_field_absent() {
+    let req = ChatCompletionRequest::parse(br#"{"messages":[{"role":"user","content":"hi"}]}"#)
+        .expect("parse");
+    assert!(req.tools.is_none());
+    assert!(req.prompt_tools().expect("no tool_choice").is_none());
+}
+
+#[test]
+fn parse_rejects_an_empty_tools_array() {
+    let err = ChatCompletionRequest::parse(
+        br#"{"messages":[{"role":"user","content":"hi"}],"tools":[]}"#,
+    )
+    .unwrap_err();
+    assert_eq!(err.status, 400);
+    assert!(err.message.contains("must not be empty"), "{}", err.message);
+}
+
+#[test]
+fn parse_rejects_a_malformed_tool_by_index() {
+    for (body, needle) in [
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":["get_weather"]}"#,
+            "tools[0] must be an object",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"code_interpreter","function":{"name":"x"}}]}"#,
+            "implements 'function' only",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"function":{"name":"x"}}]}"#,
+            "no string `type`",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}"#,
+            "no `function` object",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"  "}}]}"#,
+            "function.name must be a non-empty string",
+        ),
+    ] {
+        let err = ChatCompletionRequest::parse(body.as_bytes()).unwrap_err();
+        assert_eq!(err.status, 400, "{body}");
+        assert!(err.message.contains(needle), "{body} -> {}", err.message);
+    }
+}
+
+#[test]
+fn tool_choice_requires_tools() {
+    let err = ChatCompletionRequest::parse(
+        br#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":"auto"}"#,
+    )
+    .unwrap_err();
+    assert_eq!(err.status, 400);
+    assert!(err.message.contains("requires `tools`"), "{}", err.message);
+}
+
+#[test]
+fn auto_and_absent_tool_choice_render_the_tools() {
+    for extra in ["", r#","tool_choice":"auto""#] {
+        let req = ChatCompletionRequest::parse(body_with_tools(extra).as_bytes()).expect("parse");
+        let rendered = req.prompt_tools().expect("auto");
+        assert_eq!(rendered.map(|t| t.len()), Some(1), "extra={extra:?}");
+    }
+}
+
+#[test]
+fn tool_choice_none_drops_the_tools_from_the_prompt() {
+    // No output extraction exists, so "do not call a tool" can only be honoured
+    // by not describing the tools: rendering them would invite a call this
+    // server would return as ordinary content.
+    let req = ChatCompletionRequest::parse(body_with_tools(r#","tool_choice":"none""#).as_bytes())
+        .expect("parse");
+    assert!(req.prompt_tools().expect("none").is_none());
+}
+
+#[test]
+fn tool_choice_required_and_a_forced_function_are_refused_by_name() {
+    for (extra, needle) in [
+        (r#","tool_choice":"required""#, "required"),
+        (
+            r#","tool_choice":{"type":"function","function":{"name":"get_weather"}}"#,
+            "get_weather",
+        ),
+    ] {
+        let req = ChatCompletionRequest::parse(body_with_tools(extra).as_bytes()).expect("parse");
+        let err = req.prompt_tools().unwrap_err();
+        assert_eq!(err.status, 400);
+        assert!(
+            err.message.contains("extracted from the model's output"),
+            "extra={extra:?} -> {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(needle),
+            "extra={extra:?} -> {}",
+            err.message
+        );
+    }
+}
+
+#[test]
+fn an_unknown_tool_choice_shape_is_a_body_error() {
+    let err =
+        ChatCompletionRequest::parse(body_with_tools(r#","tool_choice":"sometimes""#).as_bytes())
+            .unwrap_err();
+    assert_eq!(err.status, 400);
+}
