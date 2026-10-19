@@ -1733,6 +1733,23 @@ on the tree is **122**; two of those are the `<<<>>>` in prose comments, so the 
 | CUDA serial ignored, 0.5B config | 37 / 0 | **37 / 0** |
 | CUDA serial ignored, Qwen3-0.6B Q8_0 | 37 / 0 | **37 / 0** |
 
+**2026-10-19, [#621](https://github.com/yusiwen/minfer/issues/621): three bf16 sites had no arm.**
+[#208](https://github.com/yusiwen/minfer/issues/208)'s launchers landed with a fixture refresh
+(`97f8450`) that recorded `launch:bf16_f32_matmul_vec`, `launch:bf16_f32_matmul_scalar` and
+`launch:embed_rows_bf16`, but the union driver gained no `go!` for them, so the assertion below
+refused on **every** device run since — invisibly, because the gate is env-gated
+(`MINFER_TEST_ISSUE162=1`) and CI has no GPU: `the driver never reached 3 audited <<< site(s):
+["launch:bf16_f32_matmul_scalar", "launch:bf16_f32_matmul_vec", "launch:embed_rows_bf16"]`
+(reproduced on master `8a6f4d4`). The two matmul arms split the way `ops_misc.cu` splits them —
+`id % 8 == 0` picks the vec kernel — so the vec arm passes `id = 8` and the scalar arm `id = 7`,
+exactly like the f16 pair beside them, and the embed arm mirrors `launch_embed_rows_f16`. All **133**
+fixture rows are now reached: `MINFER_TEST_ISSUE162=1 cargo test --release --features cuda --
+--test-threads=1 cuda::issue162_tests::sites` → **1 passed / 0 failed**, each of the three sites
+printing its own `#162/launch:…` report. Mutation: deleting the embed arm reproduces the refusal for
+one site (`never reached 1 audited <<< site(s): ["launch:embed_rows_bf16"]`; reverted,
+`sha256sum` identical). The general lesson is the one [#616](https://github.com/yusiwen/minfer/issues/616)
+records: a gate CI never runs does not announce that its coverage went stale.
+
 The sanitizer row's command is
 `compute-sanitizer --tool memcheck --target-processes all target/release/deps/minfer-<hash> --test-threads=1`
 (wrapping the **test binary**, not `cargo` — the cargo/test build tree is not instrumented and
