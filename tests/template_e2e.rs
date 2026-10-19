@@ -195,10 +195,16 @@ fn model_without_template() -> Option<PathBuf> {
 /// one-message request — the shape both the single-turn CLI and `/viz/run` send.
 const MARKER_TEMPLATE: &str = "{% if messages|length == 1 %}{{ raise_exception(\"override-marker\") }}{% endif %}U:{{ messages[0][\"content\"] }}";
 
-fn marker_file() -> PathBuf {
+/// The marker template in its own file.
+///
+/// `name` must be unique per test: the tests run in parallel threads, and a shared
+/// path means one test's `File::create` truncates the file another is reading —
+/// which surfaced as "the template file is empty" (#611's first CI run passed, the
+/// full suite raced).
+fn marker_file(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("minfer-template-e2e");
     std::fs::create_dir_all(&dir).expect("scratch dir");
-    let path = dir.join("marker.jinja");
+    let path = dir.join(name);
     std::fs::write(&path, MARKER_TEMPLATE).expect("write marker template");
     path
 }
@@ -206,7 +212,7 @@ fn marker_file() -> PathBuf {
 #[test]
 fn serve_starts_and_answers_health_with_an_override_file() {
     let model = test_model();
-    let template = marker_file();
+    let template = marker_file("serve-health.jinja");
     // The marker only fires on a one-message request; a plain /health never renders.
     let mut server = Server::spawn("serve", &model.to_string_lossy(), 18099, Some(&template));
     assert!(
@@ -222,7 +228,7 @@ fn serve_starts_and_answers_health_with_an_override_file() {
 #[test]
 fn serve_renders_from_the_override_at_request_time() {
     let model = test_model();
-    let template = marker_file();
+    let template = marker_file("serve-request.jinja");
     let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":1}"#;
 
     let mut with = Server::spawn("serve", &model.to_string_lossy(), 18100, Some(&template));
@@ -260,7 +266,7 @@ fn serve_renders_from_the_override_at_request_time() {
 #[test]
 fn viz_renders_from_the_override_at_request_time() {
     let model = test_model();
-    let template = marker_file();
+    let template = marker_file("viz-request.jinja");
     let body = r#"{"prompt":"hi","max_tokens":1}"#;
 
     let mut with = Server::spawn("viz", &model.to_string_lossy(), 18102, Some(&template));
