@@ -376,23 +376,33 @@ Two environment switches around the GPU are easy to get wrong:
 
 ### Slot saturation
 
-A request that arrives while **every** engine slot is busy is **rejected loudly**, not
-queued (the decision [#121](https://github.com/yusiwen/minfer/issues/121) pinned down).
-The worker answers
+A request that arrives while **every** engine slot is busy **waits** for one, up to a
+bounded queue depth: `MINFER_QUEUE_MAX`, default 64 (the job channel's own capacity).
+The worker admits one job per idle slot, oldest first, so a queued request is served as
+soon as a slot frees and a younger arrival cannot overtake it. While it waits,
+`minfer_queue_depth` (`requests_total - jobs_admitted_total`) is the real backlog and
+`minfer_worker_pending_jobs` is the worker's own share of it (the decision is
+[ADR-0059](adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md)).
 
-- non-streaming: `503 Service Unavailable` with
-  `{"error":{"code":503,"message":"no idle slot","type":"unavailable_error"}}`;
-- streaming: the event stream has already started, so the status line is `200` and the
-  signal is a `data:` **error frame** carrying the same error object (followed by
-  `[DONE]`) — not an empty stream a client could mistake for a generation that produced
-  nothing.
+Only two cases answer an error, both `503 unavailable_error`:
 
-`minfer_jobs_dropped_total` moves by exactly one per rejected request. The alternative —
-holding the request until a slot frees, which `minfer_queue_depth` would then measure and
-which the pre-E2 plan assumed (see `OPENAI-CHAT-API-PLAN.md` §"Slot Lifecycle") — is a
-feature request, [#150](https://github.com/yusiwen/minfer/issues/150); the serial path
-(`MINFER_BATCH=0`) still queues, because its single worker pulls one job at a time from
-the same channel.
+- the queue is full: the **newest** arrival is refused
+  (`{"error":{"code":503,"message":"the queue is full","type":"unavailable_error"}}`),
+  so the oldest waiters keep their place;
+- the server is draining: a job accepted but not yet admitted is answered
+  (`"server is draining"`) instead of being abandoned when `MINFER_DRAIN_MS` expires.
+
+On the streaming transport the status line is already `200`, so the signal is a `data:`
+**error frame** carrying the same error object (followed by `[DONE]`) — not an empty
+stream a client could mistake for a generation that produced nothing.
+
+`minfer_jobs_dropped_total` moves by exactly one per refused request, and
+`minfer_requests_failed_total{class="unavailable_error"}` moves too: the request was
+accepted, so its terminal error is a *failed* request. `minfer_requests_rejected_total`
+is the different, earlier signal — a refusal **before** queueing (draining, or the
+worker gone). The serial path (`MINFER_BATCH=0`) has no worker-side queue: its one
+worker pulls a job at a time and the handler's `send().await` is the backpressure, so
+requests wait in the channel. Same policy, different mechanism.
 
 ### Structured output (F2)
 
@@ -477,7 +487,13 @@ the per-op family is **seconds**, everything else is a count):
   `minfer_requests_completed_total`, `minfer_requests_rejected_total` (refused
   before queueing: the server is draining, or the worker is gone),
   `minfer_requests_in_flight` (accepted and not yet finished — the drain
-  surface), `minfer_jobs_dropped_total` (the worker could not place the job),
+  surface), `minfer_jobs_dropped_total` (the worker could not place the job —
+  including the queue bound of
+  [ADR-0059](adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md)),
+  `minfer_requests_failed_total{class="…"}` (an **accepted** request answered with
+  a terminal error; one series per `ApiError` class, counted where the error
+  becomes a response —
+  [#157](https://github.com/yusiwen/minfer/issues/157)),
   `minfer_worker_stalled_total` (the worker's counted no-progress bound tripped:
   every live and queued request was answered `500 the worker stalled` and the
   worker stopped —
@@ -672,4 +688,5 @@ it documents are frozen in the ADR corpus:
 - [ADR-0019](adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md) — A chat template that cannot be rendered refuses the load
 - [ADR-0058](adr/0058-tools-reach-the-prompt-as-the-client-wrote-them.md) — A request's tools reach the prompt as the client wrote them, and a template that drops them refuses by name
 - [ADR-0057](adr/0057-a-template-file-overrides-the-gguf-and-time-enters-through-one-clock.md) — A template file overrides the GGUF copy, and time enters a render through one injected clock
+- [ADR-0059](adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md) — The batched worker queues against a bounded depth, and a run that makes no progress is failed rather than waited on
 - [ADR-0021](adr/0021-bf16-is-round-to-nearest-even-and-1d-stays-f32.md) — bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32

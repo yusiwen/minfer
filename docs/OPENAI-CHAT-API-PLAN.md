@@ -840,14 +840,17 @@ Each slot contains (see the `Slot` struct in [Data Structures](#data-structures)
 ### Slot Lifecycle
 
 1. Request arrives -> find idle slot
-2. If no idle slot -> **reject with `503`** (`ApiError::unavailable("no idle slot")`, an SSE
-   error frame on the streaming transport, `minfer_jobs_dropped_total` +1) — the batched
-   worker calls `admit` on every pass and does not defer
-   ([#121](https://github.com/yusiwen/minfer/issues/121)). The serial path
-   (`MINFER_BATCH=0`) does queue, one job at a time, from the same channel. This replaces the
-   pre-E2 plan's *"defer the task in the request queue (never reject with 503)"*, which the
-   batched path never implemented; queueing it (with a bound) is
-   [#150](https://github.com/yusiwen/minfer/issues/150).
+2. If no idle slot -> **wait**, up to `MINFER_QUEUE_MAX` (default 64) jobs. The batched
+   worker admits one job per idle slot, oldest first, and keeps the rest in its queue; a
+   job that finds the queue full is answered `503` (`ApiError::unavailable("the queue is
+   full")`, an SSE error frame on the streaming transport, `minfer_jobs_dropped_total`
+   +1, `minfer_requests_failed_total{class="unavailable_error"}` +1) and a drain answers
+   everything still queued the same way (`"server is draining"`). This is the pre-E2
+   plan's *defer the task in the request queue*, now with a bound — the decision, the
+   rejected alternatives and the cost are [ADR-0059](./adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md)
+   ([#150](https://github.com/yusiwen/minfer/issues/150)); before it, #121 made the
+   refusal visible and the batched path did not defer. The serial path
+   (`MINFER_BATCH=0`) waits in the channel instead, one job at a time.
 3. Assign task to slot -> state becomes Processing; seed `prev_tokens` from the prompt tail
 4. Run prefill on the slot's KV regions (positions 0..nt); if prompt length exceeds the slot's
    remaining context, see [Context Overflow Handling](#context-overflow-handling)
@@ -939,12 +942,16 @@ All errors follow OpenAI's error format:
 | Internal server error | 500 | server_error |
 | A decode step's forward fails (kernel invariant, activation budget, KV format, panic) | 500 | server_error — answered to every run whose row was in the failed batch ([#151](https://github.com/yusiwen/minfer/issues/151)); the step failure is not the saturation refusal, so it is never a 503 |
 
-**Note:** the **batched** path does **not** defer a job when every slot is busy — it rejects with
-`503 unavailable_error` ([#121](https://github.com/yusiwen/minfer/issues/121)), and queueing it
-(with a bound) is [#150](https://github.com/yusiwen/minfer/issues/150). The **serial** path
-(`MINFER_BATCH=0`) queues, one job at a time, from the same channel. (The pre-E2 note here claimed
-busy slots defer in the request queue, matching llama.cpp's unbounded task queue; the batched path
-never implemented that.)
+**Note:** both paths **wait** when every slot is busy — the batched one in the worker's
+bounded queue (`MINFER_QUEUE_MAX`, default 64; a job beyond it is `503 unavailable_error`
+`"the queue is full"`, and a drain answers what it will not run —
+[#150](https://github.com/yusiwen/minfer/issues/150),
+[ADR-0059](./adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md)),
+the serial one in the job channel. This differs from llama.cpp's **unbounded** task queue in
+one respect only: the depth is a documented bound, so the refusal is reachable and nameable
+instead of a client waiting indefinitely. An accepted request answered with an error is
+counted as `minfer_requests_failed_total{class="…"}`
+([#157](https://github.com/yusiwen/minfer/issues/157)).
 
 ### Context Overflow Handling
 

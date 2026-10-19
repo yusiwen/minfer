@@ -170,9 +170,12 @@ advanced instead of trusting the dispatch's report.
 mutation lever: `MINFER_TEST_TICK` drives `BatchEngine::tick` into one of two
 faults. `=wedge` returns from the step without advancing `work_units`, so the
 per-step progress assertion fires on the step that wedged the engine; `=spin`
-advances the counter but never completes a run, so only `step_budget` catches
-it. Both are read once per process and unset in every production, CI and
-default run, exactly like `MINFER_TEST_CALL_FAIL`.
+advances the counter but never completes a run, so a counter of *frozen* steps
+cannot see it — it is caught by a gate's `step_budget`, and in production by the
+per-run bound ([#198](https://github.com/yusiwen/minfer/issues/198): a run with no
+attributable progress for `RUN_STALL_STEP_LIMIT` work units is answered and its
+slot freed). Both arms are read once per process and unset in every production,
+CI and default run, exactly like `MINFER_TEST_CALL_FAIL`.
 
 **Honest scope — presence is checkable, truth is not.** A script can require
 that a mutation transcript *exists* in a PR body or a record; it cannot check
@@ -225,7 +228,12 @@ that left the engine busy without advancing `BatchEngine::work_units` end the
 loop, answer every live **and** queued request once with a `500 server_error`, and
 move the `minfer_worker_stalled_total` counter — so both gates are wedge-proof
 with no test-side deadline, and a wedged server no longer spins at 100% CPU with
-clients left hanging. The wall-clock bounds that remain are *named* and say at
+clients left hanging. The sibling arm — a step that keeps *advancing* the counter
+while no run completes — is [#198](https://github.com/yusiwen/minfer/issues/198):
+each run carries its own lag in work units and is answered after
+`RUN_STALL_STEP_LIMIT` (64) of them, so the bound is per request instead of global
+and a **queued** job (which has no run yet) can never be mistaken for a stalled
+one. That is what lets the `spin` mutation run drop its two `--skip`s. The wall-clock bounds that remain are *named* and say at
 the call site why each is only a backstop: the `serve_loop` feeder's poll
 terminator (`FEEDER_POLL_BACKSTOP`, now the last resort for a worker whose
 published metrics never settle rather than the only way out of a wedge), and the

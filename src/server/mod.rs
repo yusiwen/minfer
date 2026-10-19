@@ -525,7 +525,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
         )
     } else {
         let _guard = guard;
-        match collect_response(rx).await {
+        match collect_response(rx, &state.metrics).await {
             Ok((text, reason, completion_tokens)) => {
                 // F8: token accounting happens where the response is *produced*,
                 // so it covers the batched and serial paths uniformly and needs
@@ -544,6 +544,8 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
                 );
                 (StatusCode::OK, axum::Json(resp)).into_response()
             }
+            // #157: `collect_response` counted it as a terminal error; the status
+            // and the body are all that is left to do here.
             Err(e) => error_response(&e),
         }
     }
@@ -573,6 +575,7 @@ impl Drop for InFlight {
 /// Drain a job's event stream to a single non-streaming response.
 async fn collect_response(
     mut rx: mpsc::Receiver<StreamEvent>,
+    metrics: &ServerMetrics,
 ) -> Result<(String, String, usize), ApiError> {
     let mut text = String::new();
     let mut reason = String::from("stop");
@@ -584,7 +587,13 @@ async fn collect_response(
                 reason = r;
                 completion_tokens = tokens;
             }
-            StreamEvent::Err(e) => return Err(e),
+            StreamEvent::Err(e) => {
+                // #157: the non-streaming half of the terminal-error boundary —
+                // here the error *is* the response, so it is counted here rather
+                // than at any worker send site.
+                metrics.record_failed(e.error_type);
+                return Err(e);
+            }
         }
     }
     Ok((text, reason, completion_tokens))
@@ -618,6 +627,12 @@ fn stream_response(
                 // counted — they were never delivered.
                 if let StreamEvent::Finish { tokens: n, .. } = &ev {
                     tokens.record_tokens(prompt_tokens, *n as u64);
+                }
+                // #157: the streaming half of the terminal-error boundary — the
+                // error frame is this request's answer, so it is counted here and
+                // not at the worker's send site.
+                if let StreamEvent::Err(e) = &ev {
+                    tokens.record_failed(e.error_type);
                 }
                 to_event(&id_owned, &model_owned, created, ev)
             }),

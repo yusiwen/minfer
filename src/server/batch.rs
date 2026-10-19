@@ -134,6 +134,12 @@ struct Run {
     /// A committed token whose row has not been written yet: the next step's
     /// forward carries it (that is what makes the step batched).
     needs_forward: Option<u32>,
+    /// #198: the engine's `work_units` at this run's last attributable progress
+    /// (a row written for it, or a token it committed). `work_units - this` is how
+    /// much work the engine has done without the run moving, which is the quantity
+    /// [`BatchEngine::fail_lagging_runs`] bounds. A **queued** job has no `Run`, so
+    /// it cannot accumulate lag: waiting is not stalling.
+    last_progress_work: u64,
     live_on: bool,
 }
 
@@ -651,11 +657,22 @@ impl BatchEngine {
         self.slots.iter().any(|s| s.run.is_some())
     }
 
+    /// #150: slots no run occupies — exactly how many jobs `admit` can place in
+    /// one pass, which is why `serve_loop` hands it that many and queues the rest.
+    pub fn idle_slots(&self) -> usize {
+        self.n_slots() - self.running_slots()
+    }
+
     /// Admit a group of requests that arrived together: place each one on an
     /// idle slot (reuse-aware) and prefill it, or — when every slot is busy —
-    /// answer it `unavailable("no idle slot")` through [`reject`], which is the
-    /// #121 semantics: a saturated server rejects **loudly** (503), it does not
-    /// queue and it never answers an empty 200.
+    /// answer it `unavailable("no idle slot")` through [`reject`], which is #121's
+    /// semantics *for this call*: it never answers an empty 200.
+    ///
+    /// `admit` is **not** the admission policy (#150): `serve_loop` owns the
+    /// queue, hands this function at most one job per idle slot, and answers a
+    /// request the queue cannot hold. When this function's no-idle-slot arm does
+    /// fire, the caller is the one that broke that contract (a test, or a future
+    /// caller that skipped the queue).
     ///
     /// Requests are placed first (reuse-aware), then their prefills go through
     /// **one** forward where that pays: prefill is a weight-bound share of a
@@ -1133,6 +1150,9 @@ impl BatchEngine {
             current_pos: nt,
             last_logits,
             needs_forward: None,
+            // #198: admission is not progress the run has to earn back — the
+            // prefill happened synchronously above, before the first tick.
+            last_progress_work: self.work_units,
             live_on: crate::live::enabled(),
         });
     }
@@ -1157,6 +1177,11 @@ impl BatchEngine {
         let mut tokens: Vec<u32> = Vec::new();
         let mut positions: Vec<usize> = Vec::new();
         let mut seq_ids: Vec<SeqId> = Vec::new();
+        // #198: which runs this step actually moved. A row written for a run, or a
+        // token it commits below, is attributable progress; the `spin` seam above
+        // returns before here, so an injected step that does no work marks nothing
+        // and every live run accumulates lag.
+        let mut progressed: Vec<bool> = vec![false; self.slots.len()];
         let mut rows: Vec<usize> = Vec::new(); // slot index per batch row
         for (i, slot) in self.slots.iter().enumerate() {
             if let Some(run) = &slot.run {
@@ -1243,6 +1268,7 @@ impl BatchEngine {
                 if let Some(run) = slot.run.as_mut() {
                     run.current_pos = pos + 1;
                 }
+                progressed[slot_idx] = true;
                 if live_on {
                     crate::live::attach_step(&slot.run.as_ref().expect("run").last_logits);
                 }
@@ -1258,9 +1284,23 @@ impl BatchEngine {
                 // #158: a `Continue` committed exactly one token (every other
                 // `advance` outcome ends the run and takes it), so this is the
                 // second half of the work counter.
-                Ok(StepOutcome::Continue) => self.work_units += 1,
+                Ok(StepOutcome::Continue) => {
+                    self.work_units += 1;
+                    progressed[idx] = true;
+                }
                 Ok(StepOutcome::Finish(reason)) => self.finish(idx, reason),
                 Err(e) => self.fail(idx, e),
+            }
+        }
+        // #198: stamp the runs this step moved. Doing it here, after the whole
+        // step, means a run counts as progressing if *any* part of the step went
+        // its way — the same granularity a client observes.
+        let now = self.work_units;
+        for (idx, &moved) in progressed.iter().enumerate() {
+            if moved {
+                if let Some(run) = self.slots[idx].run.as_mut() {
+                    run.last_progress_work = now;
+                }
             }
         }
         Ok(())
@@ -1438,6 +1478,37 @@ impl BatchEngine {
         answered
     }
 
+    /// #198: answer every run that has not advanced for `limit` work units.
+    ///
+    /// [`Self::work_units`] is monotone, and each live run records the value it had
+    /// at its last attributable progress (`Run::last_progress_work`). A run
+    /// whose lag reaches `limit` is one the worker kept stepping *around*: the
+    /// shape #196's frozen-counter bound cannot see, because the engine as a whole
+    /// is moving. It is answered through [`Self::fail`] — one `StreamEvent::Err`,
+    /// the run taken so the slot frees, `cached_tokens` cleared — and the loop
+    /// carries on, so a wedged slot costs only its own request.
+    ///
+    /// **A queued job cannot trip this.** It has no `Run` until `admit` places it,
+    /// and admission stamps `last_progress_work` with the current counter, so
+    /// waiting in #150's queue is never mistaken for stalling. That is the
+    /// distinction #198 asks for, and it is structural rather than a timeout.
+    ///
+    /// Returns how many runs it answered, for the log line and the gate.
+    fn fail_lagging_runs(&mut self, limit: u64, e: &ApiError) -> usize {
+        let now = self.work_units;
+        let mut answered = 0;
+        for idx in 0..self.slots.len() {
+            let lagging = self.slots[idx].run.as_ref().map_or(false, |run| {
+                now.saturating_sub(run.last_progress_work) >= limit
+            });
+            if lagging {
+                self.fail(idx, e.clone());
+                answered += 1;
+            }
+        }
+        answered
+    }
+
     /// Close a request: flush the tail, send `Finish`, and free the slot (its
     /// KV and `cached_tokens` stay, so the next request can reuse the prefix).
     fn finish(&mut self, idx: usize, reason: &str) {
@@ -1509,6 +1580,54 @@ impl BatchEngine {
 /// the gate contract (`docs/GATE-CONTRACT.md`).
 pub const STALL_STEP_LIMIT: u64 = 64;
 
+/// #198: how many **consecutive** steps a live run may take without advancing
+/// before [`BatchEngine::fail_lagging_runs`] answers it and frees its slot.
+///
+/// [`STALL_STEP_LIMIT`] catches a step that freezes [`BatchEngine::work_units`];
+/// this one catches the other arm — a step that *keeps advancing* the counter
+/// while no request ever completes (#160's `MINFER_TEST_TICK=spin` seam is its
+/// reproducible form). A healthy decode run moves the counter on every step it is
+/// part of (a row written or a token committed), so a healthy engine never gets
+/// near the limit. A run that is **queued** is not counted at all: it has no
+/// `Run` yet, which is exactly the distinction #150's queue makes necessary.
+///
+/// The number is a **count** (steps), never a wall-clock number, per rule 4 of
+/// the gate contract (`docs/GATE-CONTRACT.md`). 64 matches `STALL_STEP_LIMIT`'s
+/// slack: far above the longest legitimate stall (a run whose row waits for
+/// `MAX_BATCH`), and 64 no-op steps cost microseconds.
+pub const RUN_STALL_STEP_LIMIT: u64 = 64;
+
+/// The error a run receives when [`RUN_STALL_STEP_LIMIT`] trips (#198): a
+/// `500 server_error`, like the worker-stall answer, because the worker failed the
+/// request and the client did nothing wrong.
+pub const RUN_STALLED_MESSAGE: &str = "the run made no progress";
+
+/// #150: the default number of jobs that may wait for a slot. Deliberately the
+/// same number as the job channel's capacity (`server::mod`): one number is easier
+/// to reason about than two, and a client refused by the worker's bound and one
+/// refused by the transport's block at the same depth.
+pub const QUEUE_MAX: usize = 64;
+
+/// `MINFER_QUEUE_MAX`, clamped to at least 1. Read once when the worker starts.
+///
+/// This is a **policy** knob (how long a client may wait for a slot), not a
+/// property of the machine, which is why it is an env switch rather than a
+/// constant the gates would have to guess. The gates pass the depth explicitly
+/// instead of setting the variable, so parallel tests cannot race it.
+pub fn queue_max_from_env() -> usize {
+    std::env::var("MINFER_QUEUE_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(QUEUE_MAX)
+        .max(1)
+}
+
+/// The answer for a job refused because the queue is already full (#150).
+pub const QUEUE_FULL_MESSAGE: &str = "the queue is full";
+
+/// The answer for a job accepted but not admitted before a drain (#150).
+pub const DRAINING_MESSAGE: &str = "server is draining";
+
 /// The error every stuck request receives when `serve_loop`'s no-progress bound
 /// trips (#196): a `500 server_error`, the same attribution #151 gave a failed
 /// decode step — the *worker* stalled, which is not the client's fault and not the
@@ -1548,10 +1667,21 @@ fn reject_queued(
     answered
 }
 
-/// Drain jobs (blocking only when nothing is in flight) and step the batch.
+/// Drain jobs and step the batch, queueing what does not fit (#150).
 ///
 /// F8: `metrics` is written on every pass — the queue/engine counters here, the
 /// KV/allocator reading through `BatchEngine::publish_metrics`.
+///
+/// **Admission (#150).** A request that arrives while every slot is busy is no
+/// longer rejected. The loop takes the transport's backlog, admits at most one job
+/// per **idle** slot from the oldest end (`admit` still places the group together,
+/// so their prefills can share a forward), and keeps the rest in `pending` — the
+/// deque `minfer_worker_pending_jobs` measures and the other half of
+/// `minfer_queue_depth` (`requests_total - jobs_admitted_total`). A drain answers
+/// every queued-but-unadmitted job at once instead of letting the drain deadline
+/// abandon it, and a queue deeper than `queue_max` answers the newest arrivals
+/// `503 unavailable`: an unbounded backlog would only make every client wait longer
+/// for the same slots, and #121's rule is that a refusal must reach the client.
 ///
 /// #196: the loop carries a **counted no-progress bound**. A `tick` that leaves
 /// the engine busy without advancing `BatchEngine::work_units` is counted; after
@@ -1564,21 +1694,29 @@ fn reject_queued(
 /// work (`blocking_recv`), a step that moved the counter, and #151's `Err` step,
 /// which answered its batch and released its slots — so a long-lived server never
 /// accumulates toward the limit.
+///
+/// #198: the complementary bound. A step that *keeps advancing* the counter while
+/// a run never completes cannot trip a counter of frozen steps, so every live run
+/// also carries [`BatchEngine::fail_lagging_runs`]'s per-run progress count. The
+/// two bounds answer different wedges and one request gets exactly one answer:
+/// the per-run one frees that slot and the loop carries on.
 pub fn serve_loop(
     model: &dyn ModelDef,
     tokenizer: &Tokenizer,
     mut job_rx: mpsc::Receiver<Job>,
     engine: &mut BatchEngine,
     metrics: &super::metrics::ServerMetrics,
+    queue_max: usize,
 ) {
     let mut pending: VecDeque<Job> = VecDeque::new();
+    let queue_max = queue_max.max(1);
     // #196: consecutive steps that left the engine busy with a frozen work
     // counter. See the doc comment above; a healthy engine never gets past 0.
     let mut stalled_steps: u64 = 0;
     loop {
-        if !engine.busy() {
-            // Nothing to step: wait for work. An idle wait is not a spin, so any
-            // earlier no-progress run of steps is over.
+        if !engine.busy() && pending.is_empty() {
+            // Nothing to step and nothing waiting: an idle wait is not a spin, so
+            // any earlier no-progress run of steps is over.
             stalled_steps = 0;
             let Some(job) = job_rx.blocking_recv() else {
                 // No senders left: publish the final reading (idle slots, nothing
@@ -1592,45 +1730,80 @@ pub fn serve_loop(
             };
             pending.push_back(job);
         }
-        // Admit as many as fit, then run one step.
-        loop {
-            match job_rx.try_recv() {
-                Ok(job) => pending.push_back(job),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+        // Take the transport's backlog. The channel is bounded (64), so one pass
+        // is bounded by `queue_max + 64` however long the server has been busy.
+        while let Ok(job) = job_rx.try_recv() {
+            pending.push_back(job);
+        }
+        if metrics.draining.load(std::sync::atomic::Ordering::Relaxed) {
+            // #150: a drain answers what it will not run. Letting a queued job sit
+            // here would outlive the drain deadline and be abandoned without an
+            // answer — the silent drop #121 went to some trouble to remove.
+            let e = ApiError::unavailable(DRAINING_MESSAGE);
+            let queued = reject_queued(&mut pending, &mut job_rx, &e);
+            if queued > 0 {
+                // Both counters move, exactly as for a bound refusal: the job left
+                // the queue (so `queue_depth` stays `accepted - admitted`) and it
+                // could not be placed.
+                metrics
+                    .jobs_admitted_total
+                    .fetch_add(queued, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .jobs_dropped_total
+                    .fetch_add(queued, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[server] drain: answered {queued} queued job(s) with 503");
+            }
+        } else {
+            // Admit at most one job per idle slot, oldest first, so every admitted
+            // job finds a slot and a younger arrival cannot overtake an older one.
+            let take = engine.idle_slots().min(pending.len());
+            if take > 0 {
+                let group: Vec<Job> = pending.drain(..take).collect();
+                // `admitted` counts every job that *left* the queue (whether the
+                // engine could place it or not), so `requests_total - admitted` is
+                // exactly what is still waiting and cannot drift on a rejection.
+                metrics
+                    .jobs_admitted_total
+                    .fetch_add(take as u64, std::sync::atomic::Ordering::Relaxed);
+                let answers = engine.admit(model, tokenizer, group);
+                let dropped = answers.iter().filter(|r| r.is_err()).count() as u64;
+                for r in answers {
+                    if let Err(e) = r {
+                        // The engine could not place the request (no idle slot).
+                        eprintln!("[server] job rejected: {}", e.message);
+                    }
+                }
+                if dropped > 0 {
+                    metrics
+                        .jobs_dropped_total
+                        .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            // #150: the queue bound. Keep the oldest `queue_max` jobs waiting and
+            // answer the rest, newest first: a deeper backlog would only make every
+            // client wait longer for the same slots, and #121's rule is that a
+            // refusal must reach the client rather than disappear into a deque.
+            if pending.len() > queue_max {
+                let overflow = pending.len() - queue_max;
+                let e = ApiError::unavailable(QUEUE_FULL_MESSAGE);
+                for _ in 0..overflow {
+                    let job = pending.pop_back().expect("overflow counted");
+                    reject(job, e.clone());
+                }
+                metrics
+                    .jobs_admitted_total
+                    .fetch_add(overflow as u64, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .jobs_dropped_total
+                    .fetch_add(overflow as u64, std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "[server] queue full ({queue_max} waiting): answered {overflow} job(s) with 503"
+                );
             }
         }
         metrics
             .worker_pending
             .store(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        // Admit everything that arrived as one group, so their prefills can
-        // share a forward (`admit` places each request on its own slot and
-        // combines the prefills when they fit).
-        let group: Vec<Job> = pending.drain(..).collect();
-        if !group.is_empty() {
-            // `admitted` counts every job that *left* the queue (whether the
-            // engine could place it or not), so `requests_total - admitted` is
-            // exactly what is still waiting and cannot drift on a rejection.
-            metrics
-                .jobs_admitted_total
-                .fetch_add(group.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            metrics
-                .worker_pending
-                .store(0, std::sync::atomic::Ordering::Relaxed);
-            let answers = engine.admit(model, tokenizer, group);
-            let dropped = answers.iter().filter(|r| r.is_err()).count() as u64;
-            for r in answers {
-                if let Err(e) = r {
-                    // The engine could not place the request (no idle slot).
-                    eprintln!("[server] job rejected: {}", e.message);
-                }
-            }
-            if dropped > 0 {
-                metrics
-                    .jobs_dropped_total
-                    .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
         if engine.busy() {
             let work_before = engine.work_units();
             match engine.tick(model, tokenizer) {
@@ -1681,6 +1854,19 @@ pub fn serve_loop(
                     // though `work_units` did not. That is progress, not a wedge.
                     stalled_steps = 0;
                 }
+            }
+            // #198: the per-run bound, after the per-step one. A step that keeps
+            // advancing the work counter cannot trip #196's count, so a run that
+            // has not advanced for `RUN_STALL_STEP_LIMIT` steps is answered here
+            // and its slot freed — the loop carries on, and a queued job never
+            // enters this count because it has no `Run` yet.
+            let lagging = engine
+                .fail_lagging_runs(RUN_STALL_STEP_LIMIT, &ApiError::server(RUN_STALLED_MESSAGE));
+            if lagging > 0 {
+                eprintln!(
+                    "[server] {lagging} run(s) made no progress for {RUN_STALL_STEP_LIMIT} \
+                     step(s); answered 500 and released their slot(s)"
+                );
             }
         }
         engine.publish_metrics(metrics);

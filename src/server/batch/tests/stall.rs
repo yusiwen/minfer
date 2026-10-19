@@ -122,6 +122,8 @@ fn install_pending_run(
         current_pos: 3,
         last_logits: vec![0.0; 4],
         needs_forward: Some(tok),
+        // #198: a fresh run is not lagging — stamp the counter the engine is at.
+        last_progress_work: engine.work_units(),
         live_on: false,
     });
 }
@@ -454,5 +456,108 @@ fn the_seam_fails_the_batch_forward_without_a_bespoke_mock() {
         "[#171] forward_batch seam: one 500, slot released, no retry, \
          {} observed forward entries",
         1
+    );
+}
+
+/// #198: a run the worker keeps stepping *around* is answered, and the worker
+/// carries on with the next queued job.
+///
+/// `MINFER_TEST_TICK=spin` makes `tick` advance `work_units` and do nothing else,
+/// which is exactly the shape #196's frozen-counter bound cannot see. The per-run
+/// bound answers the run with `500 the run made no progress` after
+/// [`super::RUN_STALL_STEP_LIMIT`] steps, frees the slot, and the worker admits
+/// the job behind it — so one wedged run costs one request, not the queue.
+///
+/// **Skipped unless the seam is armed.** Under `=wedge` the engine's work counter
+/// freezes, so `#196`'s bound owns that arm and this gate would test nothing; the
+/// unmutated set has the seam off. This gate is the `spin` run's own evidence.
+///
+/// Real-model gate (`#[ignore]`: CI has no cached GGUF).
+#[test]
+#[ignore = "needs the cached 0.5B GGUF and MINFER_TEST_TICK=spin"]
+fn a_spinning_run_is_answered_and_the_worker_keeps_serving() {
+    if super::tick_seam() != super::TickSeam::Spin {
+        eprintln!("[#198] MINFER_TEST_TICK=spin is not set; skipping");
+        return;
+    }
+    let Some(path) = cached_model() else {
+        eprintln!("[#198] no cached model; skipping");
+        return;
+    };
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+    let model = crate::models::load_model(&gguf).expect("load model");
+    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+
+    let mut engine = BatchEngine::new(&*model, 1, 512).expect("engine");
+    let metrics = Arc::new(crate::server::metrics::ServerMetrics::new());
+    let (job_tx, job_rx) = mpsc::channel::<Job>(64);
+    let mut rxs = Vec::new();
+    for prompt in ["Alpha", "Beta"] {
+        let (tx, rx) = mpsc::channel::<StreamEvent>(1024);
+        rxs.push(rx);
+        job_tx
+            .blocking_send(Job {
+                input_ids: tok.encode(prompt),
+                params: sampling_params(8),
+                tx,
+            })
+            .expect("queue job");
+        metrics.requests_total.fetch_add(1, Ordering::SeqCst);
+        metrics.in_flight.fetch_add(1, Ordering::SeqCst);
+    }
+    drop(job_tx);
+    // The gate's verdict is that this returns at all: before #198 the loop spun
+    // here forever, because every step moved the counter the #196 guard watches.
+    super::serve_loop(
+        &*model,
+        &tok,
+        job_rx,
+        &mut engine,
+        &metrics,
+        super::QUEUE_MAX,
+    );
+
+    let s = metrics.snapshot();
+    assert_eq!(
+        s.worker_stalled_total, 0,
+        "the frozen-counter bound must not fire here: every step advanced work"
+    );
+    assert_eq!(
+        s.jobs_dropped_total, 0,
+        "a queued job is not a dropped job, and it is not stalled either"
+    );
+    assert_eq!(
+        s.running, 0,
+        "both runs were answered and their slots freed"
+    );
+    assert_eq!(s.worker_pending, 0, "the queue drained");
+
+    let mut answered = 0usize;
+    for (i, mut rx) in rxs.into_iter().enumerate() {
+        let mut errs = Vec::new();
+        let mut finishes = 0usize;
+        while let Some(ev) = rx.blocking_recv() {
+            match ev {
+                StreamEvent::Err(e) => errs.push(e),
+                StreamEvent::Finish { .. } => finishes += 1,
+                StreamEvent::Text(_) => {}
+            }
+        }
+        assert_eq!(
+            finishes, 0,
+            "job {i}: an injected spin never finishes a run"
+        );
+        assert_eq!(errs.len(), 1, "job {i}: exactly one answer");
+        assert_eq!(errs[0].status, 500, "job {i}: {}", errs[0].message);
+        assert_eq!(errs[0].message, super::RUN_STALLED_MESSAGE, "job {i}");
+        answered += 1;
+    }
+    assert_eq!(
+        answered, 2,
+        "the run *behind* the stalled one was admitted and answered: queueing \
+         survived the stall (#198's queued-is-not-stalled property)"
     );
 }
