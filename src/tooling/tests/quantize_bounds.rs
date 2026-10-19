@@ -34,9 +34,26 @@ fn f6_quantize_end_to_end_stays_within_the_stated_bound() {
         };
         assert_eq!(ti.type_, want, "tensor {} type", ti.name);
     }
-    // A target the engine reads but cannot encode is refused by name.
-    let err = QuantTarget::parse("q4_K").unwrap_err();
-    assert!(err.contains("no weight encoder"), "{err}");
+    // Refusals that stay refusals. This arm used to name `q4_K` as "a target the
+    // engine reads but cannot encode" — true until #140 landed the K-quant
+    // encoders, after which it was a false assumption inside a gate CI never runs
+    // (#616). The category is empty now: every weight type the engine reads has
+    // an encoder (`testfail`-free, asserted where it belongs, in
+    // `quantize::tests::targets_parse_and_refuse_by_name`). What this gate pins
+    // is the *other* half of the promise — a known GGUF type with no encoder is
+    // refused **by name**, never silently approximated to a nearby target — and
+    // it iterates `KNOWN_UNSUPPORTED` itself, so it cannot go stale the same way.
+    // Mutation: make `parse`'s unknown-target branch answer these types too (drop
+    // the `known` distinction) and this arm goes red for every entry.
+    assert!(!crate::quantize::KNOWN_UNSUPPORTED.is_empty());
+    for t in crate::quantize::KNOWN_UNSUPPORTED {
+        let err = QuantTarget::parse(t).unwrap_err();
+        assert!(err.contains("no weight encoder"), "{t}: {err}");
+        assert!(
+            err.contains(crate::quantize::SUPPORTED_TARGETS),
+            "{t}: the refusal must name the supported targets: {err}"
+        );
+    }
 
     let (lf, gf) = logits_greedy(&src, PROMPT, 4, 512);
 

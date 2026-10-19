@@ -39,12 +39,22 @@ fn targets_parse_and_refuse_by_name() {
     assert_eq!(QuantTarget::parse("q4_K").unwrap(), QuantTarget::Q4_K);
     assert_eq!(QuantTarget::parse("q5_K").unwrap(), QuantTarget::Q5_K);
     assert_eq!(QuantTarget::parse("q6_K").unwrap(), QuantTarget::Q6_K);
-    // Still refused by name: the K-quants with no encoder, every I-quant and
-    // the other non-float GGUF types.
-    for t in ["q2_K", "q3_K", "q8_K", "iq2_xxs", "tq1_0", "bf16", "q8_1"] {
+    // Still refused by name: every known GGUF type without an encoder. The list
+    // is the source of truth (#616) — iterating it means adding or removing an
+    // encoder moves this test with it instead of leaving a stale name behind.
+    assert!(!KNOWN_UNSUPPORTED.is_empty());
+    for t in KNOWN_UNSUPPORTED {
         let e = QuantTarget::parse(t).unwrap_err();
         assert!(e.contains("no weight encoder"), "{t}: {e}");
         assert!(e.contains(SUPPORTED_TARGETS), "{t}: {e}");
+    }
+    // The advertised list is real: every name in `SUPPORTED_TARGETS` parses back
+    // to the target that spells it, so the refusal message cannot advertise a
+    // target the CLI rejects. This is the other half of #616's rot — the string
+    // is hand-maintained, so something has to check it.
+    for t in SUPPORTED_TARGETS.split(',').map(str::trim) {
+        let parsed = QuantTarget::parse(t).unwrap_or_else(|e| panic!("advertised {t}: {e}"));
+        assert_eq!(parsed.name(), t, "advertised spelling round-trips");
     }
     let e = QuantTarget::parse("banana").unwrap_err();
     assert!(e.contains("unknown quant target"), "{e}");
