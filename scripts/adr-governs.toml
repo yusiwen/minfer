@@ -291,3 +291,8 @@ symbol = "ignores_merges"
 adr = "0056"
 what = "a missing byte token is accepted only when no token can reach it"
 symbol = "bpe_encode"
+
+[[governs]]
+adr = "0058"
+what = "a request's `tools` are carried verbatim into the prompt (client key order, CPython `tojson`), and a template that renders the same bytes with and without them is a by-name refusal"
+path = "src/template/tool_json.rs"

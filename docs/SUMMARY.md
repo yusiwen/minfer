@@ -76,6 +76,7 @@
     - [0055. ignore_merges is a whole-piece shortcut, and the llama3 pre group sets it](./adr/0055-ignore-merges-is-a-whole-piece-shortcut-and-the-llama3-group-sets-it.md)
     - [0056. A missing byte token is accepted only when no token can reach it](./adr/0056-a-missing-byte-token-is-accepted-only-when-no-token-can-reach-it.md)
     - [0057. A template file overrides the GGUF copy, and time enters a render through one injected clock](./adr/0057-a-template-file-overrides-the-gguf-and-time-enters-through-one-clock.md)
+    - [0058. A request's tools reach the prompt as the client wrote them, and a template that drops them refuses by name](./adr/0058-tools-reach-the-prompt-as-the-client-wrote-them.md)
 
 # Model Support
 
