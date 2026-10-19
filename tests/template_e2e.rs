@@ -332,3 +332,35 @@ fn the_chatml_notice_is_printed_once_before_the_banner_on_serve_and_viz() {
         );
     }
 }
+
+/// `--cnv` shares `startup_template` with `serve`/`viz`, so the printed-once
+/// property is the only part not covered. No stdin session is involved:
+/// `-st` ends the loop after the first turn, so a closed stdin is enough —
+/// and passing one keeps the test from depending on an interactive terminal.
+#[test]
+#[ignore = "needs a cached model; run with scripts/real_model_gates.sh"]
+fn conversation_announces_chatml_once_without_reading_stdin() {
+    let Some(model) = template_less_model() else {
+        eprintln!("skipped: no cached model");
+        return;
+    };
+    let out = Command::new(env!("CARGO_BIN_EXE_minfer"))
+        .args(["--cnv", "-st", "-n", "1"])
+        .arg(&model)
+        .arg("hi")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn minfer --cnv -st");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "one turn must succeed; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches(CHATML_NOTICE).count(),
+        1,
+        "the notice must be printed exactly once; stderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
