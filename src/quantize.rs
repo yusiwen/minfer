@@ -36,7 +36,12 @@ pub const SUPPORTED_TARGETS: &str = "q4_0, q4_1, q5_0, q5_1, q8_0, q4_K, q5_K, q
 /// The GGUF types that exist in the format but have no encoder here. Listed so
 /// the refusal can say "known type, no encoder" instead of "unknown target" —
 /// the two are different failures and deserve different messages.
-const KNOWN_UNSUPPORTED: &[&str] = &[
+///
+/// `pub(crate)` so the `#[ignore]`d end-to-end gate can assert over the list
+/// itself rather than over one hand-picked name: #616 was a gate that pinned
+/// `q4_K` as unencodable and silently became a false assumption once the
+/// K-quant encoders landed (#140), in a gate CI never runs.
+pub(crate) const KNOWN_UNSUPPORTED: &[&str] = &[
     "q2_K", "q3_K", "q8_K", "q8_1", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl", "iq3_s",
     "iq2_s", "iq4_xs", "iq1_m", "tq1_0", "tq2_0", "mxfp4", "nvfp4", "q1_0", "bf16", "f64", "i8",
     "i16", "i32", "i64",
