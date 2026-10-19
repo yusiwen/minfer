@@ -4919,6 +4919,16 @@ and the whole parallel set **~41-44s** (34.36s before). The ticket's cost note (
 describes the *loaded* harness, where a full-length pair reached ~31s; the idle pair is ~1.8s, which
 is what made 7 full-length rounds affordable-ish and 7 shorter ones clearly so.
 
+> **Amended 2026-10-19 ([#195](https://github.com/yusiwen/minfer/issues/195)).** The `rounds / 2`
+> tolerance is exactly what let a loaded co-tenant decide the verdict: this gate failed once in six
+> parallel `#[ignore]`d device runs (#188's record). The bar is still **1.0x** and the rounds are
+> still interleaved matched pairs, but the verdict is now a **paired sign test** over **nine** pairs,
+> refusing only at **seven** refusals — so `MINFER_BATCH_TEST_ROUNDS` is gone (the count is fixed in
+> advance, the shape #189 gave the S4 map-window A/B), and the median is printed for continuity only.
+> The `rounds = 7` sentence, the `8.92s` cost and the ratio tables below are the 2026-09-25
+> measurement and stay as recorded; the statistic, its alpha, the mutation lever and the 2026-10-19
+> device runs are in the #195 record at the end of this file.
+
 **Verification (2026-09-25, CPU build, dgxspark; `--bin minfer` for the gate set).**
 
 | Command | Result |
@@ -11828,3 +11838,105 @@ live files; `README.md`'s mention too, even though the checker does not watch it
 `cuda_optimization_steps/*`) keep their pre-split anchors. The five `cuda_tutorial` anchors that cited
 `src/metal.rs` for CUDA symbols were re-pointed at the CUDA files (`cuda/methods/elementwise.rs`,
 `cuda/methods.rs`, `graph/kvformat.rs`) instead of the new Metal ones.
+
+#### Test-infrastructure record (#195, 2026-10-19) — the batching gate's throughput verdict is a paired sign test
+
+**The defect.** `server::batch::tests::batching::server_batch_matches_serial_and_is_faster` — the
+E2 acceptance gate — asserted the **median** of seven interleaved matched pairs (`serial/batched`
+> 1.0, #154's shape). A median of seven flips once four pairs are disturbed, a bare majority, so a
+loaded co-tenant decides the verdict: the gate failed once in six parallel `#[ignore]`d device runs
+(#188's record). That is the class #189 fixed for the S4 map-window A/B; the ticket
+([#195](https://github.com/yusiwen/minfer/issues/195)) asked for the same statistic there. No
+per-round transcript of the failure was kept, so the record below replays the **class** and the
+device runs measure the margin the new statistic has.
+
+**The fix — the statistic (rule 4: a count, not a wall-clock location).** The timed rounds are still
+matched pairs measured next to each other on one machine state, and the bar is still the pre-#154
+gate's **1.0x** ("must not be slower") — no margin was invented. What changed is the verdict: the
+**refusal count** over `PAIRS = 9` pairs, fixed in advance, where a refusal is
+`serial/batched <= 1.0`, and the gate refuses only at `SIGN_TEST_REFUSALS = 7` — the one-sided sign
+test at `alpha = 46/512 = 0.090`, the same threshold #189 uses. `MINFER_BATCH_TEST_ROUNDS` is gone
+(the pair count is fixed in advance); the median is printed for continuity and is no longer the
+verdict. Every per-round ratio, the sorted vector and the refusal count are printed.
+
+Refuse-at-7 rather than a wins-supermajority (refuse at 4) is deliberate, and it is the same
+trade-off #189 documents: at a bar of exactly 1.0x the statistic's job is to convict a
+**systematic** loss of the batching win — which is what doubling the timed batched arm produces, all
+nine pairs — not to read a margin. The stricter form was rejected by measurement, not taste: with the
+parallel co-tenant the refusal count already reached **3 of 9** (run 7), so a threshold of 4 would
+have had zero headroom and would have re-created the flake it removes.
+
+**The mutation lever.** `MINFER_BATCH_TEST_BATCH_WORK=k` multiplies the **timed batched arm's**
+token count, so that arm pays `k` times the work while the denominator stays "one round's work" —
+the reproducible form of "batching lost its win", and an env switch, so the unmutated run is the
+same binary with the variable unset and there is no source edit to revert.
+
+**The pure replay test.** `the_batching_sign_test_absorbs_a_loaded_run_and_still_refuses_a_doubled_batched_arm`
+(platform-neutral, always-run) holds the statistic on the failure class: a nine-ratio vector with six
+disturbed pairs (the co-tenant spike shape) is **red under the old median** (0.72x) and **green under
+the sign test** (6 < 7), while the doubled batched arm halves every ratio and refuses all nine. It is
+the arm that shows the new verdict rescuing a median-red run; the device runs below show the margin.
+
+**Verification (rule 5 numbers).** `dgxspark`, GB10 sm_121, CUDA 13.0, driver 580.178.04, 2026-10-19.
+
+| Command | Result |
+|---|---|
+| gate alone, device: `cargo test --release --features cuda --bin minfer -- --ignored --exact server::batch::tests::batching::server_batch_matches_serial_and_is_faster --nocapture --test-threads=1` | **0 / 9** refusals, median 1.501x (audit), 5.15s |
+| gate alone, CPU: same command without `--features cuda` | **0 / 9**, median 1.485x, 10.17s |
+| parallel `#[ignore]`d, device: `cargo test --release --features cuda --bin minfer -- --ignored --nocapture`, **12 runs** | gate **12 / 12 green**, 0–3 refusals of 9; suite 49 / 1 each (the failure is #616, pre-existing) except run 6 (48 / 2, #616 + the #619 env race) |
+| mutation, CPU: `MINFER_BATCH_TEST_BATCH_WORK=2` + the gate-alone command | **0 passed / 1 failed**, 9/9 refusals, median 0.803x |
+| mutation, device: same with `--features cuda` | **0 / 1**, 9/9 refusals, median 0.884x |
+| `scripts/cuda_test.sh` | **683 / 0 / 50** (the row it refreshes read 651 / 0 / 47 on 2026-10-07) |
+| `cargo test --release` (CPU, dgxspark) | **595 / 0 / 44** unit + **24 / 0 / 6** integration |
+| `python3 scripts/check_status.py --check` | exit 0 |
+
+**Measured — the gate alone.** Device (batched 0.122–0.130 s, serial 0.179–0.190 s per round):
+
+```text
+[e2] timing: 9 interleaved rounds at max_tokens 8 (batched arm x1) — per-round ratios
+[1.477, 1.501, 1.493, 1.515, 1.530, 1.539, 1.412, 1.536, 1.459] — 0/9 at or below 1x
+(sign test refuses at 7); median 1.501x (audit only)
+```
+
+CPU: batched 0.314–0.386 s, serial 0.472–0.683 s; ratios
+`[1.493, 1.864, 1.227, 1.413, 1.573, 1.575, 1.485, 1.483, 1.400]`, **0 / 9**, median 1.485x.
+
+**Measured — the parallel `#[ignore]`d configuration (the one that produced the failure), twelve
+runs** (`--ignored --nocapture`, default parallel harness). Refusals at 1.0x, the lowest and highest
+per-round ratio, and the whole set:
+
+| run | refusals | lowest pair | highest pair | suite |
+|---|---|---|---|---|
+| 1 | 1 / 9 | 0.824 | 1.784 | 49 passed / 1 failed |
+| 2 | 1 / 9 | 0.596 | 5.158 | 49 / 1 |
+| 3 | 0 / 9 | 1.003 | 3.962 | 49 / 1 |
+| 4 | 0 / 9 | 1.214 | 3.622 | 49 / 1 |
+| 5 | 2 / 9 | 0.565 | 1.578 | 49 / 1 |
+| 6 | 1 / 9 | 0.566 | 8.361 | 48 / **2** (see #619) |
+| 7 | 3 / 9 | 0.586 | 3.924 | 49 / 1 |
+| 8 | 2 / 9 | 0.830 | 4.335 | 49 / 1 |
+| 9 | 1 / 9 | 0.630 | 4.289 | 49 / 1 |
+| 10 | 0 / 9 | 1.093 | 3.186 | 49 / 1 |
+| 11 | 1 / 9 | 0.908 | 8.298 | 49 / 1 |
+| 12 | 2 / 9 | 0.626 | 7.655 | 49 / 1 |
+
+The one failure in every run is `tooling::tests::quantize_bounds::f6_quantize_end_to_end_stays_within_the_stated_bound`
+— the pre-existing stale refusal arm filed as [#616](https://github.com/yusiwen/minfer/issues/616),
+not a timing gate. Run 6's second failure is
+`server::batch::tests::kv_sharing::a_store_inside_a_shared_prefix_takes_a_private_row`: the
+`MINFER_TEST_CALL_FAIL=forward_batch` seam of the stall gate is **process-global**, so it reached a
+concurrent tick — the same class as the `MINFER_NO_KV_SHARE` race #617 fixed with a module mutex, but
+wider; filed as [#619](https://github.com/yusiwen/minfer/issues/619) (1 of 12 runs).
+
+**Honest reading.** The co-tenant moved up to **3 of 9** pairs below the bar with single pairs as low
+as 0.565 and as high as 8.361 (spikes hit both arms), and the sign test stayed green in all twelve
+runs, with four refusals of headroom (the worst run reached 3 of the 7 it needs to convict). In these
+runs no median would have been red either (a median of nine needs five disturbed pairs), so the twelve
+runs prove the verdict is **not decided by the co-tenant**; the arm that shows it **rescuing a median-red run** is the pure replay
+test, whose six-refusal vector the old statistic calls 0.72x.
+
+**Docs.** The #154 record above gains a dated amendment; `docs/BUILD.md`'s parallel-harness bullet
+says sign test; `docs/TEST-BASELINES.md` and `scripts/test-baselines.toml` carry the new counts
+(595 / 44 unit on aarch64, 596 / 45 derived on x86_64, and the refreshed 683 / 0 / 50 device row).
+No ADR: this moves a test's statistic, not a production contract, so the PR answers
+`ADR: none`.

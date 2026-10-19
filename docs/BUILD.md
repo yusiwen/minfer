@@ -113,10 +113,11 @@ change runs the doc gates instead, and the suite still runs whenever the suite l
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
 longer makes one gate size another gate's KV regions. The current counts live in
 [`TEST-BASELINES.md`](./TEST-BASELINES.md) and its ledger `scripts/test-baselines.toml`, each
-record dated, box-labelled and command-labelled. Four fixes now make the
+record dated, box-labelled and command-labelled. Five fixes now make the
 parallel form trustworthy: the [server batching
-gate](https://github.com/yusiwen/minfer/issues/154) (interleaved matched rounds,
-a median verdict), [#158](https://github.com/yusiwen/minfer/issues/158) (a work
+gate](https://github.com/yusiwen/minfer/issues/154) (interleaved matched pairs,
+a **sign-test** verdict since [#195](https://github.com/yusiwen/minfer/issues/195)
+— nine pairs, refusing only at seven), [#158](https://github.com/yusiwen/minfer/issues/158) (a work
 bound instead of absolute wall-clock deadlines),
 [#160](https://github.com/yusiwen/minfer/issues/160) (every `while engine.busy()`
 stepper in the server gates routed through one shared per-step `WorkBound` —
