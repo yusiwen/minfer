@@ -38,7 +38,7 @@ kernel family is the entry point (mmq.cuh:952-1237).
 **When it dispatches.** `ggml_cuda_should_use_mmq` (mmq.cu:259-386) decides. For Q4_K the type is
 in the supported switch (mmq.cu:277). The decisive rule on NVIDIA is **Turing+**: `if
 (turing_mma_available(cc)) return true;` (mmq.cu:312-314) — i.e. on GB10 (Blackwell, sm_121;
-`turing_mma_available` = NVIDIA && highest-compiled-arch ≥ Turing, common.cuh:348-350) MMQ is
+`turing_mma_available` = NVIDIA && highest-compiled-arch ≥ Turing, common.cuh:352-354) MMQ is
 chosen **unconditionally** for every supported quantized type, for any batch size. (Unconditionally
 *for the MMQ-vs-cuBLAS question* — the `ggml_cuda_mul_mat` chain upstream asks MMVQ first for
 ne11 ≤ 8, so small batches never reach this predicate; see §12 for the full chain and the MMVQ
