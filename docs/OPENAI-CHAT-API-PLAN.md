@@ -22,7 +22,10 @@
 > - **Defaults now match llama.cpp** (`max_tokens` = no limit, `temperature` 0.8, `top_p` 0.95, `top_k` 40,
 >   `repeat_penalty` 1.1, random seed default) instead of rev 1's `max_tokens: 16` / `temperature: 1.0`.
 > - **Busy slots are queued (deferred), never rejected with 503** — matching llama.cpp's unbounded task
->   queue; the rev-1 error table contradicted its own lifecycle section.
+>   queue; the rev-1 error table contradicted its own lifecycle section. *(Rev 2's intent; the shipped
+>   policy bounds the queue at `MINFER_QUEUE_MAX` and refuses only there and during a drain —
+>   [#150](https://github.com/yusiwen/minfer/issues/150)/[ADR-0059](./adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md).
+>   See §"Slot Lifecycle" for the current contract.)*
 >
 > **Revision 3 (2026-08-22) — Phase 0 implemented.** Architecture prerequisites are done, each with
 > tests (green; the two failures noted in later revisions were fixed in rev 7):
@@ -914,10 +917,16 @@ quantized KV would be the next one (not implemented).
 
 ### Concurrency Model
 
-- Requests can arrive concurrently
-- Task queue + slot assignment is serialized via a Mutex; busy slots defer tasks (see lifecycle)
-- Inference is serial (one slot at a time) on a dedicated worker thread
-- This matches llama.cpp's `--parallel N` behavior (minus batching, which is a non-goal)
+- Requests arrive concurrently on the HTTP side (axum) and are handed to one worker thread
+  through the job channel; the worker owns the model and every slot's state.
+- The **batched** worker (the default when batching is available) admits one job per idle slot,
+  oldest first, and queues the rest up to `MINFER_QUEUE_MAX` (default 64). A request beyond the
+  bound, and one still queued when a drain starts, is answered `503` — see §"Slot Lifecycle".
+  One step is one batched forward over every ready slot (E2), and liveness is bounded both per
+  run (`RUN_STALL_STEP_LIMIT`) and per worker step (`STALL_STEP_LIMIT`).
+- The **serial** worker (`MINFER_BATCH=0`) serves one request at a time; its queue is the
+  channel itself, and the handler's `send().await` is the backpressure.
+- Queueing and slot assignment both happen on the worker thread, so neither needs a mutex.
 
 ---
 
@@ -1042,8 +1051,11 @@ split-across-tokens stop fix); curl-verified.
 ### Phase 5: Multi-Slot
 
 **Status: implemented (rev 5).** `Slot` owns a `GraphCache` + `n_ctx_slot`; the serial worker drains
-the unbounded job queue one slot at a time (busy slots defer — no 503); concurrent requests
-curl-verified (serialized).
+the job queue one slot at a time (busy slots defer — no 503 there); concurrent requests
+curl-verified (serialized). *(Rev 5 history: the queue was unbounded on both paths then. Since
+[#150](https://github.com/yusiwen/minfer/issues/150)/[ADR-0059](./adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md)
+the batched path bounds it at `MINFER_QUEUE_MAX` and refuses at the bound and during a drain; the
+serial path still waits in the channel.)*
 
 ### Phase 6: Polish
 
