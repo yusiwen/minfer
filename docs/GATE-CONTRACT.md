@@ -656,7 +656,13 @@ which the checker opens, requires to be a live document rather than one of the d
 requires to *name* the knob — or to `[internal]` with a reason, where the checker fails if any live
 document does name it (the exemption must stay necessary). Both tables ratchet, and a knob in neither
 is reported with the source file that reads it, which is how `MINFER_N_BATCH` (read and printed at
-every server start) was found. And the job also runs three audits that are pure and offline like the rest:
+every server start) was found. The ledger's own totals line states the counts, and the checker
+*compares* it with what it just counted rather than trusting it — the `check_baselines.py` pattern,
+where the prose carries the number and the code holds the source of truth — with a missing line a
+failure too, so the comparison cannot be dropped by deleting a comment. It needed that: between #531
+and [#628](https://github.com/yusiwen/minfer/issues/628) the line trailed the code by one knob
+(`MINFER_QUEUE_MAX`), because it was the only place the counts lived and nothing recomputed them.
+And the job also runs three audits that are pure and offline like the rest:
 `scripts/check_agents_size.py` (the cap on `AGENTS.md`), `scripts/check_source_layout.py` (the test-file
 and module-declaration rules) and `scripts/check_cuda_launch_returns.py` (every CUDA launch reads its
 own error and carries an injection lever, #162). **Open doc
