@@ -255,16 +255,23 @@ set-valued `kv_map` attention window (`Device::gathers_attn_map`), and a packed
 | `RoPE` interleaved | ✅ | ✅ | ❌ |
 | `FusedQKV` (decode) | ❌ | ✅ | ✅ |
 | `FusedFFN` (decode) | ❌ | ✅ | ✅ |
-| `FusedQkvNorm` (Qwen3 decode) | ❌ | ✅ | ❌ |
+| `FusedQkvNorm` (Qwen3 decode) | ❌ | ✅ | ✅ |
 | `QkvBiasRopeStore` (mixed-quant decode) | ❌ | ❌ | ✅ |
 | `Scale`, `Softmax`, `BatchMatMul` | ✅ / ✅ / ❌ | ❌ / ❌ / ❌ | ❌ / ❌ / ❌ |
 
 Notes on the asymmetries — these are the rows where a model's decode path
 differs by platform:
 
-- **`FusedQkvNorm` is Metal-only.** Qwen3 decode on CUDA takes the unfused
-  `QkNorm` path, which is numerically equivalent but issues more dispatches.
-  Making CUDA fused is a Phase G / CUDA-verifiable ticket, not a correctness gap.
+- **`FusedQkvNorm` is now on both devices ([#200](https://github.com/yusiwen/minfer/issues/200)).**
+  Qwen3 decode fuses one concat matmul + two in-place per-head `rms_norm` launches +
+  the no-bias rope/store epilogue (9 dispatches → 4 per layer), on Metal
+  (`rms_norm_256` + `attn_rope_store`) and on CUDA (`rms_norm` + `attn_rope_store*`,
+  the packed arm included since Qwen3 can run a q8_0 cache on CUDA). The CPU column
+  stays ❌ — no fused arm has a CPU kernel — so a CPU-only engine keeps the unfused
+  chain. The logits are **not** bit-identical to the unfused chain on Q8_0 (the
+  concat matmul groups its per-row reduction differently, ~1e-3 on the final
+  logits); the pinned contract is the same greedy token with a 1e-2 bound, exactly
+  as the Metal gate records.
 - **`QkvBiasRopeStore` is CUDA-only — a recorded decision ([#52](https://github.com/yusiwen/minfer/issues/52)),
   not a gap.** It is the *mixed-quant* decode epilogue: q/k/v use different quant
   types (so they cannot share `FusedQKV`'s single concat weight), so three separate

@@ -498,10 +498,11 @@ Pool rules worth restating because they carry correctness weight:
 
 - **Unconditionally supported**: `Input`, `Add`, `Mul`, `Silu`, `SwiGLU`, `RmsNorm`, `QkNorm`,
   `MatMul`, `Attn`, `KvcacheStore`, `KvcacheLoad`, `View`, `Reshape`, `Permute`, `GetRows`,
-  `FusedQKV`, `QkvBiasRopeStore`, `FusedFFN`.
+  `FusedQKV`, `QkvBiasRopeStore`, `FusedQkvNorm`, `FusedFFN`.
 - **Conditional**: `RoPE` only for `RopeStyle::NonInterleaved` (the neox layout; the only style the
   supported architectures emit).
-- **Everything else** (`Scale`, `Softmax`, `BatchMatMul`, `FusedQkvNorm`) stays on CPU.
+- **Everything else** (`Scale`, `Softmax`, `BatchMatMul`) stays on CPU — and so does every fused
+  arm on a CPU-only engine, because no fused op has a CPU kernel.
 
 Two layers of checks are deliberately *not* in `supports_op`:
 
@@ -635,17 +636,19 @@ CParams.gpu = metal_on || cuda_on
   registry only): `cuda.register_weight` per tensor, `register_weight_q6k_padded` for Q6_K,
   `register_weight_q80_p32` for the q8_0 split plane, and the `_exp`/`_dsc`/`__dpl` planes under
   their gates. The loaders also build the fused concat weights with `cuda::concat_rows` and register
-  them: `blk.{i}.attn_qkv` (Qwen2 only — the Qwen3 fused-QKV path is Metal-only, so CUDA registers no
-  Qwen3 attn_qkv) and `blk.{i}.ffn_gu` (both models, gated on `nf <= 16384`).
-- **Concat availability**: Qwen2's `qkv_concat_available` / `gu_concat_available` use the
-  **metadata-only** `cuda::concat_rows_feasible` probe on the CUDA arm, because rebuilding the concat
-  bytes during graph construction measured a ~920 ms stall per decode graph build. Qwen3's
-  `gu_concat_available` uses the eager `cuda::concat_rows` (its concat is built once per layer at
-  load either way); Qwen3's `qkv_concat_available` has no CUDA arm.
+  them: `blk.{i}.attn_qkv` (Qwen2 and, since #200, Qwen3 — the same block, Q6_K repack included) and
+  `blk.{i}.ffn_gu` (both models, gated on `nf <= 16384`).
+- **Concat availability**: `qkv_concat_available` / `gu_concat_available` use the **metadata-only**
+  `cuda::concat_rows_feasible` probe on the CUDA arm, because rebuilding the concat bytes during graph
+  construction measured a ~920 ms stall per decode graph build (Qwen3's `gu_concat_available` keeps
+  its eager `cuda::concat_rows`: its concat is built once per layer at load either way).
 - **Fused nodes per model**: Qwen2 builds `FusedQKV` (concat class) or `QkvBiasRopeStore` (mixed-quant
-  class, CUDA-only) for decode QKV, and `FusedFFN` when `nf <= 16384`. Qwen3 builds `FusedFFN` but
-  **not** its `FusedQkvNorm` on CUDA: that fused path is Metal-only (the Qwen3 concat probe has no
-  CUDA arm), so CUDA Qwen3 runs the unfused `qk_norm` chain.
+  class, CUDA-only) for decode QKV, and `FusedFFN` when `nf <= 16384`. Qwen3 builds `FusedFFN` and,
+  since #200, `FusedQkvNorm`: one concat matmul + two in-place `rms_norm` launches (q rows at offset 0,
+  k rows at `nqt`, so the norm is bitwise the unfused `Op::QkNorm`) + the no-bias
+  `attn_rope_store*` epilogue (f32/f16 or packed q8_0) — 9 launches → 4 per layer. The node takes the
+  `cells` input, so a CUDA Qwen3 keeps the fused chain under an explicit span exactly as Qwen2 does;
+  Metal's arm keeps the pre-C6 single-sequence gate.
 - **FusionPass** receives the enabled backends in its `Vec<&dyn Backend>` (F4:
   `GraphAllocator::fusion_backends`) and its node → index map is
   `GraphAllocator::fusion_backend_index`, so the SwiGLU rewrite is gated by CUDA's own
@@ -945,8 +948,9 @@ Model-level CUDA coverage:
 the decode graph and appended KV produces the same turn-2 text as a fresh conversation that
 re-prefills. `graph_logits_match_forward_real_model`'s comparison helper switches to greedy-token
 equality when a CUDA device is present (the 7e① path-identity artifact). The Metal-only tests
-(`fused_qkv_matches_unfused_decode`, `fused_qkv_norm_matches_unfused_decode`,
-`graph_metal_*`) skip on a Linux CUDA build.
+(`fused_qkv_matches_unfused_decode`, `fused_qkv_norm_matches_unfused_decode`, `graph_metal_*`) skip
+on a Linux CUDA build; `fused_qkv_norm_matches_unfused_decode_on_cuda` is the #200 arm of the Qwen3
+one, run on two engines (f32 and q8_0 KV) with the same contract.
 
 ### 7.2 Acceptance gates
 

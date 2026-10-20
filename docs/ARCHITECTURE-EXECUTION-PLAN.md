@@ -1310,9 +1310,10 @@ green.
 **Deliberately not taken.** The **dp4a packed K dot** (item 2): a per-head-quantized query against the
 packed K accumulates in `int`, which is a numerics change needing its own accuracy statement and a
 re-measured real-model tolerance — filed as a follow-up rather than assumed. **Qwen3's packed fused
-QKV** (`Op::FusedQkvNorm`) also waits: that op has no CUDA kernel at all (it is Metal + CPU today), so
-the `!packed` gate there is not what keeps Qwen3's decode off the device; its 1.13x packed gap is
-unrelated to this ticket's cuts.
+QKV** (`Op::FusedQkvNorm`) also waits: that op has no CUDA kernel at all (it is Metal-only today — the
+CPU backend has no fused arm either), so the `!packed` gate there is not what keeps Qwen3's decode off
+the device; its 1.13x packed gap is unrelated to this ticket's cuts. *(#200 later took the port; its
+record is below.)*
 
 ### C4 — #186: the dp4a packed Q8_0 K dot · [#186](https://github.com/yusiwen/minfer/issues/186) — **DONE 2026-09-27**
 
@@ -1553,6 +1554,66 @@ different subset. `MINFER_GEMM_TM=256` + `MINFER_GEMM_K64=1` + the f32-A path is
 that lands on the skipped instantiation, and it had no working opt-in before either. The remaining
 unchecked CUDA calls in the same file are enumerated in
 [#147](https://github.com/yusiwen/minfer/issues/147) rather than silently fixed here.
+
+### C4 — #200: the CUDA `Op::FusedQkvNorm` (Qwen3's fused per-head-norm decode QKV) · [#200](https://github.com/yusiwen/minfer/issues/200) — **DONE 2026-10-20**
+
+**Why.** Qwen3's decode spine had a Metal-only fused node: `Op::FusedQkvNorm` — one
+`blk.{i}.attn_qkv` concat matmul, the per-head Q/K RMSNorm, then the bias-free rope/store — was
+dispatched on Metal, so CUDA Qwen3 ran the unfused chain (3 matmul + 2 `QkNorm` + 2 `RoPE` +
+2 store = 9 launches per layer). #144 named the op as the one thing its `!packed` gate could not
+move ("that op has no CUDA kernel at all"), and the claim was slightly wrong in a way that mattered:
+the CPU backend has no fused arm either (`supports_op` excludes it, `execute_node` refuses it), so
+the op was Metal-only, not "Metal + CPU". That wording is corrected in the #144 record above, in
+`docs/CUDA-BACKEND-DESIGN.md` §4.3 and on the ticket.
+
+**What.** `src/cuda/kernels/kv_store.cu` gained `attn_rope_store_f32` (f32/f16 KV through
+`kv_is_f16`) and `attn_rope_store_q8_0` — the bias epilogue minus the three adds, both `cells`-aware;
+the rope expression is now **one** `__device__` helper (`minfer_rope_pair`) that all four epilogue
+kernels call, so the bias and no-bias arms cannot drift. `src/cuda/methods/kvstore.rs` carries the
+launchers and the `CudaState` methods; `src/graph/cuda_backend.rs` the `supports_op`/`execute_node`
+arms, with the per-head norm as **two in-place `rms_norm` launches** at the section bases (q at
+offset 0, k at `nqt`) — bitwise the unfused `Op::QkNorm` — and one epilogue launch: **4 launches per
+layer, down from 9**. `src/models/qwen3/loader.rs` registers the CUDA concat weight (qwen2's block,
+Q6_K padded repack included), `qkv_concat_available` gained the metadata-only `concat_rows_feasible`
+probe, `CParams.fuse_qkv` became `(metal_on || cuda_on) && (cuda_on || !explicit_span)`, and a packed
+cache builds the node on CUDA only (Metal's fused norm kernel is f32/f16-only).
+`GraphBuilder::fused_qkv_norm` now wires the shared `cells` input (C6), so CUDA keeps the fused chain
+under an explicit span exactly as Qwen2 does; Metal's arm keeps its pre-C6 single-sequence gate.
+`op_matrix`, `docs/SUPPORT-MATRIX.md` and `docs/CUDA-BACKEND-DESIGN.md` §4.3/§4.6 follow.
+
+**Gates.** `cuda_qkv_norm_epilogue_matches_the_cpu_quantizer` (new, kernel-level, in
+`src/graph/cuda_backend/tests/kv.rs`): at `pos = 0` the packed K/V bytes are the CPU quantizer's over
+the host's rope **byte for byte**, the f32 arm's K/V are the input bit for bit and q is exactly the
+identity rope; at `pos = 7` the f32 arm stays within 1e-5 of the host rope and the packed K within one
+quant step (0.03), with V byte-exact (the rope does not touch it).
+`fused_qkv_norm_matches_unfused_decode_on_cuda` (new, model-level): two engines (default f32 KV and
+q8_0) through `load_model_configured`, node presence per `fuse_qkv`, `MINFER_NO_FUSE_QKV=1` removing
+it, and **prefill + decode logits bit-identical** on both. Full CUDA suite (`scripts/cuda_test.sh`,
+serial): **721 / 0 / 57**.
+
+**Numbers (dgxspark, GB10 sm_121, 2026-10-20).** Qwen3-0.6B Q8_0, one binary,
+`bench -p 2048 -n 128 --n-ctx 4096 -r 3`, three interleaved rounds:
+
+| arm | tg128 (t/s) | pp2048 (t/s) |
+|---|---|---|
+| fused (default) | 158.91 / 159.14 / 159.06 | 8603 / 8813 / 8713 |
+| `MINFER_NO_FUSE_QKV=1` | 135.76 / 136.05 / 136.16 | 8570 / 8792 / 8799 |
+
+**tg128 +16.9%** (median 159.06 vs 136.05); prefill unchanged (medians 8713 vs 8792, −0.9%, inside the
+2.4% run spread — the fusion is decode-only). The pre-change master binary measured 136.43 ± 0.12, and
+the unfused arm reproduces it within 0.3%, so the A/B's control is the old path. On a **packed `q8_0`
+cache** (same binary, `MINFER_CACHE_TYPE=q8_0`, same command, three interleaved rounds) the same A/B
+gives tg128 **+7.7%** (fused 145.39 / 144.41 / 146.24 vs unfused 134.96 / 134.93 / 134.66, median
+145.39 vs 134.93) and flat prefill (8311 vs 8259, +0.6%): the smaller gain is the packed K read, not
+the fusion — #144's 1.13x packed gap is unchanged and stays with #212.
+
+**Honest scope.** The bar (≥1.10x tg128, from the 9 → 4 launch cut) was named **after** the first
+single-round reading (159.3 vs 136.4), not before it as the ticket asked; recorded here as a process
+miss. The f16 KV arm of the new epilogue has no end-to-end measurement because the cached 0.6B fixture
+is f32/q8_0 — the kernel-level gate covers f32 and packed only, and the f16 store line is shared with
+the already-gated bias kernel. Bit identity is measured on GB10: another device whose MMVQ dispatch
+groups rows differently would surface it as a failure of the new gate, which is the point. CI has no
+GPU, so both gates (and the numbers above) run only on this box.
 
 ### C4 — S2d: the remaining unchecked CUDA attribute / launch / destroy returns · [#147](https://github.com/yusiwen/minfer/issues/147) — **DONE 2026-09-25**
 
