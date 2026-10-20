@@ -27,7 +27,9 @@
 # chapters and the tutorials are homes too, and `AGENTS.md`/`README.md` carry the
 # build-and-run examples.
 #
-# Measured 2026-10-11: 84 production reads — 72 documented, 12 internal.
+# The line below states what the checker counts, and the checker compares it: refresh it in
+# the same change that adds a knob or moves one between the tables (#628).
+# Measured 2026-10-20: 85 production reads — 73 documented, 12 internal.
 
 [documented]
 
