@@ -47,6 +47,11 @@ impl Qwen3Graph {
         let nf = hp.n_ff as usize;
         let eps = hp.f_norm_rms_eps;
         let n_ctx = params.cparams.n_ctx;
+        // #200: whether this engine's device has the whole-block quantizing
+        // epilogue a packed KV cell needs (CUDA alone today). Resolved once per
+        // build — `device()` re-checks the weight registry, so it is not a
+        // per-layer call.
+        let fused_norm_packed_ok = Self::device(model) == crate::models::Device::Cuda;
 
         let mut b = crate::graph::builder::GraphBuilder::new();
 
@@ -105,13 +110,18 @@ impl Qwen3Graph {
             // 2 qk_norm + 2 rope + 2 store dispatches. Qwen3 has no attention
             // biases, so the fused kernel applies the per-head norm (which the
             // Qwen2 bias+rope+store kernel cannot express).
-            // C6/S1: the fused QKV family writes K/V at `positions`, which are
-            // sequence-relative once the span is explicit, so it is gated off
-            // until S3 gives the kernels a `cells` pointer.
+            //
+            // C6/#200: the fused family writes K/V at allocator-resolved cells,
+            // not at `positions` — the epilogue takes the same `cells` input the
+            // unfused store does. A packed cell is only expressible where the
+            // epilogue has a whole-block quantizing arm, and that is CUDA alone
+            // (#144's packed epilogue; Metal's fused norm kernel is f32/f16-only,
+            // so a packed Metal cache keeps the unfused chain). The device is
+            // resolved once at the top of this build.
             let fuse_qkv_norm = nt == 1
                 && layer_gpu
                 && params.cparams.fuse_qkv
-                && !b.kv_is_packed()
+                && (!b.kv_is_packed() || fused_norm_packed_ok)
                 && l.q_norm.is_some()
                 && l.k_norm.is_some()
                 && Self::qkv_concat_available(&l.wq, &l.wk, &l.wv);
@@ -291,7 +301,17 @@ impl Qwen3Graph {
         {
             crate::metal::concat_rows(&[wq, wk, wv]).is_some()
         }
-        #[cfg(not(target_os = "macos"))]
+        // #200: CUDA arm — metadata-only probe, mirroring qwen2's D3-8 arm.
+        // `concat_rows_feasible` applies exactly `concat_rows`' preconditions, and
+        // the loader performs the real concatenation once at model load (see
+        // `register_weight`/`register_weight_q6k_padded` there), so building the
+        // graph does not rebuild the concat bytes: doing that here measured a
+        // ~920 ms stall per decode graph build on the 14B.
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        {
+            crate::cuda::concat_rows_feasible(&[wq, wk, wv])
+        }
+        #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
         {
             let _ = (wq, wk, wv);
             false
@@ -494,10 +514,14 @@ impl Qwen3Graph {
                 // decode (nt==1) QKV fusion (Op::FusedQkvNorm — per-head Q/K norm
                 // + no-bias rope+store) is part of the topology; the env toggle
                 // forces a rebuild so it can be A/B'd reliably (like qwen2's
-                // FusedQKV). Prefill (nt>1) never uses it.
+                // FusedQKV). Prefill (nt>1) never uses it. #200 opened the CUDA
+                // arm: the no-bias epilogue takes `cells`, so CUDA keeps the fused
+                // chain under an explicit span exactly as qwen2 does; Metal's arm
+                // keeps the pre-C6 single-sequence gate (it has no explicit-span
+                // attention at all, G5).
                 fuse_qkv: nt == 1
-                    && metal_on
-                    && !explicit_span
+                    && (metal_on || cuda_on)
+                    && (cuda_on || !explicit_span)
                     && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
                 fuse_ffn: nt == 1
                     && (metal_on || cuda_on)

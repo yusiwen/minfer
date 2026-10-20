@@ -71,6 +71,21 @@ __device__ __forceinline__ void q8_0_quantize_block(const float* x, unsigned cha
     }
 }
 
+// C6: one rope pair's rotation — the SAME expression as `rope_f32` (neox
+// pairing d <-> d + hd/2, one `freq = freq_scale / powf(freq_base, 2d/hd)` and
+// one cosf/sinf per pair). Every fused decode epilogue calls this instead of
+// restating the math, so the fused node and the unfused `Op::RoPE` kernel cannot
+// drift: the Qwen3 gate compares the fused node against `Op::RoPE` +
+// `Op::KvcacheStore` and would see any difference as a logit delta.
+__device__ __forceinline__ float2 minfer_rope_pair(
+    float x0, float x1, int d, int hd, int pos, float freq_base, float freq_scale
+) {
+    float freq = freq_scale / powf(freq_base, (2.0f * d) / hd);
+    float theta = pos * freq;
+    float cs = cosf(theta), sn = sinf(theta);
+    return make_float2(x0 * cs - x1 * sn, x0 * sn + x1 * cs);
+}
+
 // C4 S2b: quantize nt f32 rows into packed Q8_0 cells. One thread per
 // (row, 32-element block); `row_bytes` is the packed cell's byte width
 // (`KvFormat::Q8_0.row_bytes(nkt)` = ceil(nkt/32*34 / 4) * 4 words).
@@ -150,13 +165,10 @@ __global__ void attn_bias_rope_store_f32(
         const int base = head * hd;
         const int j  = base + d;
         const int j2 = j + half_dim;
-        float x0 = q[j]  + bias_q[j];
-        float x1 = q[j2] + bias_q[j2];
-        float freq = freq_scale / powf(freq_base, (2.0f * d) / hd);
-        float theta = pos * freq;
-        float cs = cosf(theta), sn = sinf(theta);
-        q[j]  = x0 * cs - x1 * sn;
-        q[j2] = x0 * sn + x1 * cs;
+        const float2 r = minfer_rope_pair(
+            q[j] + bias_q[j], q[j2] + bias_q[j2], d, hd, pos, freq_base, freq_scale);
+        q[j]  = r.x;
+        q[j2] = r.y;
     } else if (u < qpairs + kpairs) {
         // k section: bias + rope in place + store into the K region
         const int u2   = u - qpairs;
@@ -165,13 +177,10 @@ __global__ void attn_bias_rope_store_f32(
         const int base = head * hd;
         const int j  = base + d;
         const int j2 = j + half_dim;
-        float x0 = k[j]  + bias_k[j];
-        float x1 = k[j2] + bias_k[j2];
-        float freq = freq_scale / powf(freq_base, (2.0f * d) / hd);
-        float theta = pos * freq;
-        float cs = cosf(theta), sn = sinf(theta);
-        const float r0 = x0 * cs - x1 * sn;
-        const float r1 = x0 * sn + x1 * cs;
+        const float2 r = minfer_rope_pair(
+            k[j] + bias_k[j], k[j2] + bias_k[j2], d, hd, pos, freq_base, freq_scale);
+        const float r0 = r.x;
+        const float r1 = r.y;
         k[j]  = r0;
         k[j2] = r1;
         if (kv_is_f16) {
@@ -244,13 +253,10 @@ __global__ void attn_bias_rope_store_q8_0(
         const int base = head * hd;
         const int j  = base + d;
         const int j2 = j + half_dim;
-        float x0 = q[j]  + bias_q[j];
-        float x1 = q[j2] + bias_q[j2];
-        float freq = freq_scale / powf(freq_base, (2.0f * d) / hd);
-        float theta = pos * freq;
-        float cs = cosf(theta), sn = sinf(theta);
-        q[j]  = x0 * cs - x1 * sn;
-        q[j2] = x0 * sn + x1 * cs;
+        const float2 r = minfer_rope_pair(
+            q[j] + bias_q[j], q[j2] + bias_q[j2], d, hd, pos, freq_base, freq_scale);
+        q[j]  = r.x;
+        q[j2] = r.y;
     } else if (u < qpairs + kblks) {
         // K section: one (head, block). `b` is also the block's index inside the
         // packed row (blocks are laid out in flat element order).
@@ -268,12 +274,9 @@ __global__ void attn_bias_rope_store_q8_0(
             const int dd = (d < half_dim) ? d : d - half_dim;
             const int ja = head * hd + dd;
             const int jb = ja + half_dim;
-            float x0 = k[ja] + bias_k[ja];
-            float x1 = k[jb] + bias_k[jb];
-            float freq = freq_scale / powf(freq_base, (2.0f * dd) / hd);
-            float theta = pos * freq;
-            float cs = cosf(theta), sn = sinf(theta);
-            x[i] = (d < half_dim) ? (x0 * cs - x1 * sn) : (x0 * sn + x1 * cs);
+            const float2 r = minfer_rope_pair(
+                k[ja] + bias_k[ja], k[jb] + bias_k[jb], dd, hd, pos, freq_base, freq_scale);
+            x[i] = (d < half_dim) ? r.x : r.y;
         }
         q8_0_quantize_block(x, kv_k + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
     } else {
@@ -286,6 +289,144 @@ __global__ void attn_bias_rope_store_q8_0(
         float x[Q8_0_BLOCK_ELEMS];
         #pragma unroll
         for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) x[i] = v[base + i] + bias_v[base + i];
+        q8_0_quantize_block(x, kv_v + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
+    }
+}
+
+// ─── Qwen3 (#200): the NO-BIAS arm of the fused decode epilogue ──────────────
+// `Op::FusedQkvNorm` is Qwen3's decode QKV spine: one concat matmul
+// (wq|wk|wv), the per-head Q/K RMSNorm, then the rope+store epilogue. Qwen3 has
+// no attention biases, and the per-head norm is the `rms_norm_f32` kernel itself
+// (two in-place launches at the q and k section bases, so the norm is bitwise
+// the unfused `Op::QkNorm`'s), which leaves exactly the bias kernels minus the
+// three adds: same thread mapping, same rope expression (`minfer_rope_pair`),
+// same store addresses and conversions. The one observable difference against
+// the unfused chain is therefore the *matmul grouping* (od_total rows in one
+// launch vs three), which is why the Q8_0 gate pins greedy identity and a 1e-2
+// logit bound rather than bit equality — the same contract Metal records.
+__global__ void attn_rope_store_f32(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    float* __restrict__ kv_k,
+    float* __restrict__ kv_v,
+    int nqt, int nkt, int hd,
+    float freq_base, float freq_scale,
+    const int* positions,
+    const int* cells,
+    int kv_is_f16
+) {
+    const int half_dim = hd / 2;
+    const int qpairs = nqt / 2;
+    const int kpairs = nkt / 2;
+    const int total = qpairs + kpairs + nkt;
+    const int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= total) return;
+    // C6: `positions[0]` is the rope angle's sequence-relative index, `cells[0]`
+    // the allocator-resolved KV row — they differ whenever the run does not start
+    // at cell 0, and the store addresses by the row, never by the position.
+    const int pos = positions[0];
+    const int row = cells[0];
+
+    if (u < qpairs) {
+        // q section: rope in place (the norm already ran)
+        const int head = u / half_dim;
+        const int d    = u % half_dim;
+        const int base = head * hd;
+        const int j  = base + d;
+        const int j2 = j + half_dim;
+        const float2 r = minfer_rope_pair(q[j], q[j2], d, hd, pos, freq_base, freq_scale);
+        q[j]  = r.x;
+        q[j2] = r.y;
+    } else if (u < qpairs + kpairs) {
+        // k section: rope + store into the K region
+        const int u2   = u - qpairs;
+        const int head = u2 / half_dim;
+        const int d    = u2 % half_dim;
+        const int base = head * hd;
+        const int j  = base + d;
+        const int j2 = j + half_dim;
+        const float2 r = minfer_rope_pair(k[j], k[j2], d, hd, pos, freq_base, freq_scale);
+        k[j]  = r.x;
+        k[j2] = r.y;
+        if (kv_is_f16) {
+            ((__half*)kv_k)[(size_t)row * nkt + j]  = __float2half(r.x);
+            ((__half*)kv_k)[(size_t)row * nkt + j2] = __float2half(r.y);
+        } else {
+            kv_k[(size_t)row * nkt + j]  = r.x;
+            kv_k[(size_t)row * nkt + j2] = r.y;
+        }
+    } else {
+        // v section: store into the V region
+        const int j = u - qpairs - kpairs;
+        if (kv_is_f16) {
+            ((__half*)kv_v)[(size_t)row * nkt + j] = __float2half(v[j]);
+        } else {
+            kv_v[(size_t)row * nkt + j] = v[j];
+        }
+    }
+}
+
+// The packed arm of the no-bias epilogue: K and V become whole Q8_0 blocks, the
+// same remapping `attn_bias_rope_store_q8_0` makes (one thread per (head, block)
+// for K, one per V block). Neither K nor V is written back — a block-owning
+// thread cannot write the buffer the pair partner reads — and both sections feed
+// `q8_0_quantize_block`, the store's own quantizer, so the packed bytes are the
+// unfused `rope` + `store_kv_q8_0` chain's.
+__global__ void attn_rope_store_q8_0(
+    float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    unsigned char* __restrict__ kv_k,
+    unsigned char* __restrict__ kv_v,
+    int nqt, int nkt, int hd,
+    float freq_base, float freq_scale,
+    const int* positions,
+    const int* cells,
+    size_t row_bytes
+) {
+    const int half_dim = hd / 2;
+    const int qpairs = nqt / 2;
+    const int kblks = nkt / Q8_0_BLOCK_ELEMS;
+    const int total = qpairs + 2 * kblks;
+    const int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= total) return;
+    const int pos = positions[0];
+    const int row = cells[0];
+
+    if (u < qpairs) {
+        // q section: rope in place (verbatim attn_rope_store_f32)
+        const int head = u / half_dim;
+        const int d    = u % half_dim;
+        const int base = head * hd;
+        const int j  = base + d;
+        const int j2 = j + half_dim;
+        const float2 r = minfer_rope_pair(q[j], q[j2], d, hd, pos, freq_base, freq_scale);
+        q[j]  = r.x;
+        q[j2] = r.y;
+    } else if (u < qpairs + kblks) {
+        // K section: one (head, block), roped then quantized as a whole block.
+        const int b = u - qpairs;
+        const int blk = b % (hd / Q8_0_BLOCK_ELEMS);
+        const int head = b / (hd / Q8_0_BLOCK_ELEMS);
+        float x[Q8_0_BLOCK_ELEMS];
+        #pragma unroll
+        for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) {
+            const int d = blk * Q8_0_BLOCK_ELEMS + i;
+            const int dd = (d < half_dim) ? d : d - half_dim;
+            const int ja = head * hd + dd;
+            const int jb = ja + half_dim;
+            const float2 r = minfer_rope_pair(k[ja], k[jb], dd, hd, pos, freq_base, freq_scale);
+            x[i] = (d < half_dim) ? r.x : r.y;
+        }
+        q8_0_quantize_block(x, kv_k + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
+    } else {
+        // V section: one block, quantized as-is (no bias in Qwen3).
+        const int b = u - qpairs - kblks;
+        const int base = b * Q8_0_BLOCK_ELEMS;
+        float x[Q8_0_BLOCK_ELEMS];
+        #pragma unroll
+        for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) x[i] = v[base + i];
         q8_0_quantize_block(x, kv_v + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
     }
 }
@@ -378,6 +519,46 @@ void launch_attn_bias_rope_store_q8_0(
         (unsigned char*)kv_k, (unsigned char*)kv_v,
         nqt, nkt, hd, freq_base, freq_scale, positions, cells, row_bytes);
     minfer_launch_ok("launch:attn_bias_rope_store_q8_0", "attn_bias_rope_store_q8_0");
+}
+
+// #200: the Qwen3 no-bias epilogue launchers. Same 256-thread flat mapping as
+// the bias arms (`nqt/2 + nkt/2 + nkt` for f32/f16, `nqt/2 + 2*(nkt/32)` for the
+// packed arm); the per-head Q/K norm is two `rms_norm_f32` launches the caller
+// issues first, in place at the section bases.
+void launch_attn_rope_store(
+    float* q, float* k, float* v,
+    void* kv_k, void* kv_v,
+    int nqt, int nkt, int hd,
+    float freq_base, float freq_scale,
+    const int* positions, const int* cells, int kv_is_f16,
+    cudaStream_t stream
+) {
+    const int total = nqt / 2 + nkt / 2 + nkt;
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    minfer_launch_prelude("launch:attn_rope_store", "attn_rope_store_f32");
+    attn_rope_store_f32<<<grid, minfer_launch_block("launch:attn_rope_store", block), 0, stream>>>(
+        q, k, v, (float*)kv_k, (float*)kv_v,
+        nqt, nkt, hd, freq_base, freq_scale, positions, cells, kv_is_f16);
+    minfer_launch_ok("launch:attn_rope_store", "attn_rope_store_f32");
+}
+
+void launch_attn_rope_store_q8_0(
+    float* q, const float* k, const float* v,
+    void* kv_k, void* kv_v,
+    int nqt, int nkt, int hd,
+    float freq_base, float freq_scale,
+    const int* positions, const int* cells, size_t row_bytes,
+    cudaStream_t stream
+) {
+    const int total = nqt / 2 + 2 * (nkt / Q8_0_BLOCK_ELEMS);
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    minfer_launch_prelude("launch:attn_rope_store_q8_0", "attn_rope_store_q8_0");
+    attn_rope_store_q8_0<<<grid, minfer_launch_block("launch:attn_rope_store_q8_0", block), 0, stream>>>(
+        q, k, v, (unsigned char*)kv_k, (unsigned char*)kv_v,
+        nqt, nkt, hd, freq_base, freq_scale, positions, cells, row_bytes);
+    minfer_launch_ok("launch:attn_rope_store_q8_0", "attn_rope_store_q8_0");
 }
 }
 

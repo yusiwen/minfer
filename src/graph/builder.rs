@@ -525,6 +525,11 @@ impl GraphBuilder {
     /// backend normalizes q/k per head (llama `attn_q_norm`/`attn_k_norm`),
     /// then ropes q in place, ropes + stores K, and stores V into the layer's
     /// persistent regions (kv_pair). Output shape = [nqt+nkt+nkt, nt].
+    ///
+    /// C6/#200: the epilogue stores K/V at allocator-resolved rows, so the node
+    /// takes the same shared `cells` input `kvcache_store` and `fused_qkv` do.
+    /// Metal ignores it (its fused-norm arm keeps the pre-C6 gate and never runs
+    /// under an explicit span); CUDA reads it.
     pub fn fused_qkv_norm(
         &mut self,
         x: NodeId,
@@ -534,10 +539,11 @@ impl GraphBuilder {
     ) -> NodeId {
         let nt = self.graph.nodes[x].out_shape[1];
         let od_total = meta.nqt + 2 * meta.nkt;
+        let cells = self.cells_input(nt);
         self.node(
             "fused_qkv_norm",
             Op::FusedQkvNorm { layer },
-            &[x, pos],
+            &[x, pos, cells],
             [od_total, nt, 1, 1],
             DType::F32,
             NodeMeta::FusedQkvNorm(meta),

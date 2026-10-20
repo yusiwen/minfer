@@ -503,6 +503,35 @@ pub fn load(
                 }
             }
         }
+        // #200: the CUDA registration — the mirror of the Metal block above, in
+        // qwen2's form (`src/models/qwen2/loader.rs`): a Q6_K concat needs the
+        // padded repack (the 210→224-byte slots `matmul_f32_ptr_layout`
+        // dispatches on through `is_weight_padded`), everything else registers
+        // the byte-level concat. Gated on MINFER_NO_FUSE_QKV like the build-side
+        // decision, so the A/B control also skips the concat weights.
+        #[cfg(feature = "cuda")]
+        if plan.on_device(i) {
+            if let Some(cuda) = crate::cuda::CudaState::get() {
+                if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
+                    let fuse = !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+                    if fuse {
+                        if let Some(data) = crate::cuda::concat_rows(&[wq, wk, wv]) {
+                            let name = format!("{ns}blk.{i}.attn_qkv");
+                            if wq.ttype == crate::tensor::TensorType::Q6_K {
+                                cuda.register_weight_q6k_padded(
+                                    &name,
+                                    &data,
+                                    (wq.shape[1] + wk.shape[1] + wv.shape[1]) as usize,
+                                    wq.shape[0] as usize,
+                                );
+                            } else {
+                                cuda.register_weight(&name, &data);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Some(ti) = tensor_map.get(&tn::attn_out(i)) {
             layer.wo = Some(load_ti(ti));
         }
