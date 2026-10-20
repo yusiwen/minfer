@@ -34,7 +34,7 @@ Flash attention (single fused kernel for decode + prefill), simdgroup GEMM prefi
 
 The performance headline of the project. The int8 tensor-core MMQ path is **default-on** in CUDA builds (opt-out per gate with `"0"`; `MINFER_MMQ=0` restores the legacy f16 path):
 
-- **Default prefill: ~3581 tok/s** (7B q4_K_m @3314-token prompt) = **1.080× llama.cpp** (llama-bench 3323.3 same shape) — from 441 tok/s when the path first landed, an 8.1× campaign documented step-by-step in [CUDA_OPTIMIZATION.md](./CUDA_OPTIMIZATION.md) (109 numbered step records, indexed in [`cuda_optimization_steps/index.md`](./cuda_optimization_steps/index.md)).
+- **Default prefill: ~3581 tok/s** (7B q4_K_m @3314-token prompt) = **1.080× llama.cpp** (llama-bench 3323.3 same shape) — from 441 tok/s when the path first landed, an 8.1× campaign documented step-by-step in [CUDA_OPTIMIZATION.md](./CUDA_OPTIMIZATION.md) (110 numbered step records, indexed in [`cuda_optimization_steps/index.md`](./cuda_optimization_steps/index.md)).
 - Raw-nibble int8 `mma.m16n8k32` GEMMs for q4_K and q6_K with producer-fused activation quantization (rms-norm/swiglu emit the transposed q8 plane directly, skipping intermediate writes), registration-time weight-expansion planes (W_exp / W_dsc) staged by `cp.async`, and flash attention with register-resident softmax (2.43× kernel).
 - CUDA Graph capture/replay for repeated identical-length prefills; decode uses the MMVQ weight-streaming path.
 - Memory/speed knobs: the weight-expansion planes cost ~3.3 GB device for ~+6% prefill; `MINFER_MMQ_Q6K_EXP=0` / `MINFER_MMQ_Q4K_DSC=0` return the memory.

@@ -1605,7 +1605,7 @@ the unfused arm reproduces it within 0.3%, so the A/B's control is the old path.
 cache** (same binary, `MINFER_CACHE_TYPE=q8_0`, same command, three interleaved rounds) the same A/B
 gives tg128 **+7.7%** (fused 145.39 / 144.41 / 146.24 vs unfused 134.96 / 134.93 / 134.66, median
 145.39 vs 134.93) and flat prefill (8311 vs 8259, +0.6%): the smaller gain is the packed K read, not
-the fusion — #144's 1.13x packed gap is unchanged and stays with #212.
+the fusion — #144's 1.13x packed gap is unchanged; it was attributed and closed with [#212](https://github.com/yusiwen/minfer/issues/212) (record [110](./cuda_optimization_steps/110-c4-pack-q8-decode-stall-attribution.md): a long-scoreboard chain, not a load-shape cost).
 
 **Honest scope.** The bar (≥1.10x tg128, from the 9 → 4 launch cut) was named **after** the first
 single-round reading (159.3 vs 136.4), not before it as the ticket asked; recorded here as a process
@@ -7583,11 +7583,14 @@ the two boxes instead, per the §14 hardware row: on **macbook** the macOS round
 tickets tracked in [#333](https://github.com/yusiwen/minfer/issues/333) — the
 Metal-only list and the order, with [#310](https://github.com/yusiwen/minfer/issues/310)
 since landed (its last capability gap closed) and the round itself closed 2026-10-09;
-on **dgxspark** the one open Linux-side ticket,
-[#212](https://github.com/yusiwen/minfer/issues/212) (the packed Q8_0 decode
-residual), since [#200](https://github.com/yusiwen/minfer/issues/200) landed its CUDA
-`Op::FusedQkvNorm` kernel on 2026-10-20. No schedule is attached to
-either lane; this is a statement about which machine each one needs. (The list is
+on **dgxspark** no Linux-side ticket is open: [#200](https://github.com/yusiwen/minfer/issues/200)
+landed its CUDA `Op::FusedQkvNorm` kernel on 2026-10-20 and
+[#212](https://github.com/yusiwen/minfer/issues/212) (the packed Q8_0 decode residual)
+**closed the same day with a recorded refutation** (record
+[110](./cuda_optimization_steps/110-c4-pack-q8-decode-stall-attribution.md) — a
+long-scoreboard chain, and neither load width nor load scheduling moves it). No
+schedule is attached to either lane; this is a statement about which machine each
+one needs. (The list is
 re-read from the tracker when a ticket closes —
 [#354](https://github.com/yusiwen/minfer/issues/354) and
 [#356](https://github.com/yusiwen/minfer/issues/356) closed in October and had
@@ -10530,7 +10533,7 @@ Earlier text (kept for the record of how the diagnosis narrowed): a focused devi
 | 5 | ~~**Batching is opt-in** even where it is measured faster.~~ **Closed by E6 (2026-09-19)**: the default follows the device, with `=1`/`=0` as the override — **amended 2026-10-06**: [#44](https://github.com/yusiwen/minfer/issues/44) part (b) made Metal batched too, so it is CUDA **and Metal** on, CPU off. | product | done |
 | 6 | **`conversation_real_model_smoke` and `dump_real_q4k/q5k_tensor` are red** (ignored tests). Attribution done: the first fails identically on master + device, the others are pre-existing debug dumps. They are not gates, but a red ignored test is easy to mistake for noise. | pre-existing | Either fix their assertions/artifacts or mark them clearly in their doc comments; not caused by any PR in this campaign. |
 | 7 | **Roadmap item 25 (metrics/observability) had no ticket** — the only orphan from the A-era batch. | planning | **F8**, added with this section. |
-| 8 | **The hardware lane: F1 (AVX2/AVX-512 K-quant dots, [#56](https://github.com/yusiwen/minfer/issues/56)) needs an x86 host, which neither box this project owns is** — `dgxspark (aarch64, GB10 sm_121)` and `macbook (macOS 27.0.1, Apple M4 Pro)` are the two machines, and the `x86_64 (CI runner)` is ephemeral and cannot host interactive work. Phase G's half of this row is **closed** (complete on a Mac 2026-10-06). | hardware | Sequencing §11 ("Hardware lanes") and §9's F table; **what `next:` points at instead** (#335): the macOS round-2 tickets tracked in [#333](https://github.com/yusiwen/minfer/issues/333) on macbook, and the open Linux-side tickets — [#212](https://github.com/yusiwen/minfer/issues/212) (the packed Q8_0 decode residual; [#200](https://github.com/yusiwen/minfer/issues/200)'s CUDA `Op::FusedQkvNorm` landed 2026-10-20) — on dgxspark; no schedule is attached to either lane. F1 is the largest single CPU win and stays queued behind the x86 host. |
+| 8 | **The hardware lane: F1 (AVX2/AVX-512 K-quant dots, [#56](https://github.com/yusiwen/minfer/issues/56)) needs an x86 host, which neither box this project owns is** — `dgxspark (aarch64, GB10 sm_121)` and `macbook (macOS 27.0.1, Apple M4 Pro)` are the two machines, and the `x86_64 (CI runner)` is ephemeral and cannot host interactive work. Phase G's half of this row is **closed** (complete on a Mac 2026-10-06). | hardware | Sequencing §11 ("Hardware lanes") and §9's F table; **what `next:` points at instead** (#335): the macOS round-2 tickets tracked in [#333](https://github.com/yusiwen/minfer/issues/333) on macbook, and on dgxspark the last Linux-side ticket, [#212](https://github.com/yusiwen/minfer/issues/212) (the packed Q8_0 decode residual), which **closed 2026-10-20 with a recorded refutation** (record [110](./cuda_optimization_steps/110-c4-pack-q8-decode-stall-attribution.md)) after [#200](https://github.com/yusiwen/minfer/issues/200)'s CUDA `Op::FusedQkvNorm` landed; no schedule is attached to either lane. F1 is the largest single CPU win and stays queued behind the x86 host. |
 | 9 | **A sequence's logits' tail depended on its absolute arena offset — resolved by C6 (2026-09-19)** (found while gating C3). The pre-C6 measurements stand and are what justified the fix: at cell 0 vs cell 8 the max |Δ| over the vocabulary was 2.6% relative with the greedy token unchanged and the run deterministic; the hand-built `q`/`k`/`v` → rope → store → attn graph is exact to ≤ 1.2e-7 at the model's own shape *and* equal for a 1-cell and an 8-cell offset; the arena layout is irrelevant (a split reservation is bit-identical per layer); `positions` had exactly four consumers per layer (96 = 24×4); a layer bisect put the entry at layer 0's attention output; and the **rope-injection intervention** proved the entry is RoPE alone (injecting run A's 48 rope outputs into run B made the logits bitwise identical), while a distributed ~1e-6 rope perturbation already saturates the tail (0.44 vs 0.43) with the greedy token stable from 1e-6 to 1e-2. **C6 removed the coupling** — `positions` are sequence-relative and the allocator resolves `cells` — so a cell move changes no angle: the offset tests now assert bitwise equality, C3's acceptance tightens from the named amplified-rounding class to bit-identical, and a compaction no longer re-ropes. Three method notes earned here: a zero from a perturbation probe means nothing without a loud control; **a control validates the path, not the equivalence of the perturbation** (a single element nudged by 1e-5 is not the offset's distributed 1.5e-5 — the earlier "refutation" was an over-read); and **an intermediate buffer may only be read immediately after its own node runs** (`graph.outputs` does not extend liveness). | measurement | Done by C6; the logical-positions design, its gates and the CUDA fused-op port (S3) are in §5. |
 
 #### Test-infrastructure record (#171, 2026-09-26) — one home for the gate contract, and one failure-injection seam

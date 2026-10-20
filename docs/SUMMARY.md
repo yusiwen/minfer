@@ -242,6 +242,7 @@
         - [107 — C4: the packed Q8_0 KV routes on CUDA (#144)](./cuda_optimization_steps/107-c4-packed-q8-kv-cuda.md)
         - [108 — #186: the dp4a packed Q8_0 K dot on CUDA (LANDED)](./cuda_optimization_steps/108-c4-dp4a-packed-q8-kv-cuda.md)
         - [109 — #202: the packed Q8_0 KV cell's L1 request count (counter-only)](./cuda_optimization_steps/109-c4-packed-q8-kv-l1-request.md)
+        - [110 — #212: the packed Q8_0 decode residual is a long-scoreboard chain (refuted lever)](./cuda_optimization_steps/110-c4-pack-q8-decode-stall-attribution.md)
 
 # Sampling and Chat Templates
 

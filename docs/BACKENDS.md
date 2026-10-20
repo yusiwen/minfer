@@ -119,7 +119,7 @@ An unknown value is refused on every device, and a backend without a packed-read
 for the CPU (C4 S1/S2a), CUDA (C4 S2b) and Metal ([#310](https://github.com/yusiwen/minfer/issues/310) enabled Metal's
 packed read, whose attention window rides [#44](https://github.com/yusiwen/minfer/issues/44); the three C4 items left on
 [#87](https://github.com/yusiwen/minfer/issues/87) — the packed fused epilogue, the packed FA prefill
-and the dp4a packed dot — **landed** ([#144](https://github.com/yusiwen/minfer/issues/144) items 1+3, [#186](https://github.com/yusiwen/minfer/issues/186) item 2; the CUDA residual is [#212](https://github.com/yusiwen/minfer/issues/212)). A physical context shift
+and the dp4a packed dot — **landed** ([#144](https://github.com/yusiwen/minfer/issues/144) items 1+3, [#186](https://github.com/yusiwen/minfer/issues/186) item 2; the CUDA residual is [#212](https://github.com/yusiwen/minfer/issues/212), attributed and closed 2026-10-20 (record [110](./cuda_optimization_steps/110-c4-pack-q8-decode-stall-attribution.md))). A physical context shift
 (`kv_rm`/`kv_shift`) works on a packed region: the survivors move verbatim and are
 re-rope/re-quantized one row at a time. `MINFER_NO_FUSED_Q8_KV=1` restores the S1 read path
 (the A/B of standing rule 3; measured 1.16× at ctx 512 and 1.31× at ctx 2048 in the fused
