@@ -367,17 +367,17 @@ projection matmuls, three small jobs remain before attention can run: add the
 attention biases (if the model has them), rotate q and k by RoPE, and write k/v
 into the persistent KV cache. The unfused graph spent **seven launches** on
 these (`add_bias` ×3, `rope` ×2, `store_kv` ×2 — the count in the kernel's
-header comment, `kv_store.cu:100-117`; TECH-PRIMER §6.4 prices the whole
+header comment, `kv_store.cu:115-132`; TECH-PRIMER §6.4 prices the whole
 campaign at "−310 launches/step"). This kernel is one launch that does all of
 it, ending with K/V in exactly the layout the next kernel reads.
 
-**Thread mapping.** The launcher `launch_attn_bias_rope_store` (`kv_store.cu:338`) is a flat 1-D
+**Thread mapping.** The launcher `launch_attn_bias_rope_store` (`kv_store.cu:479`) is a flat 1-D
 grid of 256-thread blocks over `total = nqt/2 + nkt/2 + nkt` — one thread per
 *RoPE pair* for q (`nqt/2`), one per RoPE pair for k (`nkt/2`), one per element
 for v (`nkt`); `nqt = nh·hd` and `nkt = nk·hd` are the q and k section widths
 of the (single) token's QKV output. Each thread branches on which section its
 linear id `u` falls in — three sections, one kernel
-`attn_bias_rope_store_f32` (`kv_store.cu:118`):
+`attn_bias_rope_store_f32` (`kv_store.cu:133`):
 
 ```c
 __global__ void attn_bias_rope_store_f32(
@@ -399,11 +399,11 @@ __global__ void attn_bias_rope_store_f32(
     const int row = cells[0];              // C6: the row the store lands on
 ```
 
-`positions[0]`/`cells[0]` are read *on the device* — the comment at `kv_store.cu:116-117` calls
+`positions[0]`/`cells[0]` are read *on the device* — the comment at `kv_store.cu:131-132` calls
 this out: "no host scalar crosses the launch — CUDA Graph capture/replay safe". A captured graph
 freezes its kernel arguments, so a host-side `n_past` would be baked in and wrong on every replay; device data is re-read each time.
 
-**Section 1 — q: bias + RoPE in place** `attn_bias_rope_store_f32` (`kv_store.cu:118`):
+**Section 1 — q: bias + RoPE in place** `attn_bias_rope_store_f32` (`kv_store.cu:133`):
 
 ```c
 if (u < qpairs) {
@@ -427,12 +427,12 @@ This is verbatim `rope_f32` (`ops_elementwise.cu:263`) with the bias add
 folded into the loads — same NEOX pairing `(j, j + hd/2)`, same frequency
 expression, same `cosf/sinf`. "Verbatim" is a hard requirement: the fused
 kernel had to be *bit-identical* to the seven-kernel chain it replaced (the
-header comment, `kv_store.cu:100-117`, lists each correspondence) —
+header comment, `kv_store.cu:115-132`, lists each correspondence) —
 fusion is only free when the answer does not change. The A/B proof lives in
-the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1011`
+the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1246`
 exercises the f16 round trip end to end).
 
-**Section 2 — k: bias + RoPE + store into the cache** `attn_bias_rope_store_f32` (`kv_store.cu:118`).
+**Section 2 — k: bias + RoPE + store into the cache** `attn_bias_rope_store_f32` (`kv_store.cu:133`).
 The first twelve lines are the q-section math with `bias_k`/`k` swapped — same
 pairing, same frequency, same rotation. The new part is what happens after the
 rotation: the rotated values are written *both* back to the k buffer *and* into
@@ -461,7 +461,7 @@ in the standalone `store_kv_f32` (`kv_store.cu:11`); the f16 branch converts on 
 with `__float2half` (round-to-nearest), the identical conversion the unfused
 `store_kv_f16` path uses — again for bit-identity.
 
-**Section 3 — v: bias + store** `attn_bias_rope_store_f32` (`kv_store.cu:118`): v gets no RoPE
+**Section 3 — v: bias + store** `attn_bias_rope_store_f32` (`kv_store.cu:133`): v gets no RoPE
 (only q and k are rotated), so its threads add the bias and store one element
 each, same `row * nkt + j` addressing into the V region.
 
@@ -490,7 +490,7 @@ launches it.
 
 **Two ways to call the same kernel.** The `q/k/v` parameters are *pointer-form
 section bases*, which lets one kernel serve both decode layer classes
-`attn_bias_rope_store_f32` (`kv_store.cu:118`): the **concat class** points all three into one
+`attn_bias_rope_store_f32` (`kv_store.cu:133`): the **concat class** points all three into one
 concatenated matmul output (`q = base`, `k = base + nqt`, `v = base + 2·nkt`;
 the Rust arm does this pointer arithmetic at (`cuda_backend.rs:`, the `Op::FusedQKV` section bases), and
 the **mixed-quant class** (e.g. a model where `attn_v` is Q6_K and cannot join
@@ -579,7 +579,7 @@ read bandwidth", and the Rust `store_kv_f16` doc comment (`src/cuda/methods/kvst
 print — *the region stays f32-sized; the f16 view uses the first half of the bytes*:
 allocation does not shrink, the bytes written per store and read per attention call do
 (§4 does the arithmetic). The correctness story for the f16 round trip is test
-`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1011`).
+`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1246`).
 
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
 copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1092`) maps the node to
@@ -625,7 +625,7 @@ is load-bearing for §3.5: a captured graph bakes in device *pointers*, so any
 pool churn invalidates every capture, and `pool_gen` detects that.
 
 **`execute_node`: the dispatch.** The trait method
-(`execute_node` (`cuda_backend.rs:2174`)) is a thin wrapper: it calls
+(`execute_node` (`cuda_backend.rs:2344`)) is a thin wrapper: it calls
 `execute_node_inner` and, if the node failed *while a capture window was
 open*, aborts the window first (`abort_capture` (`cuda_backend.rs:900`) — a doomed window
 must never be closed into a cached graph). The real dispatch is one big match
@@ -687,7 +687,7 @@ fn alloc_buffer(&mut self, size: usize) -> usize {
 }
 ```
 
-(`alloc_buffer` (`cuda_backend.rs:2121`).) Three conventions to notice. *Exact-size
+(`alloc_buffer` (`cuda_backend.rs:2291`).) Three conventions to notice. *Exact-size
 reuse*: the free list matches byte length, so a recycled buffer is always big
 enough. *`pool_gen` on every path*: fresh alloc or reuse, both bump it, because
 both can change the node→pointer mapping a captured graph depends on. *No
@@ -695,9 +695,9 @@ panics on OOM*: `cuda_malloc` logs and returns null, and the null buffer fails
 cleanly as an `Err` from `ptr_of` at execute time — never a panic inside the
 allocator (`ptr_of` (`cuda_backend.rs:630`); `stream_guard` is a shim, not a lock).
 `free_buffer` never calls `cudaFree` — it recycles
-(`free_buffer` (`cuda_backend.rs:2148`)), which is what lets the persistent KV regions
+(`free_buffer` (`cuda_backend.rs:2318`)), which is what lets the persistent KV regions
 and the per-step scratch share one arena; `alloc_fresh`
-(`alloc_fresh` (`cuda_backend.rs:2158`)) bypasses the free list when a buffer's *id* is
+(`alloc_fresh` (`cuda_backend.rs:2328`)) bypasses the free list when a buffer's *id* is
 still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
 (`cuda_backend.rs:859`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
@@ -716,10 +716,10 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
     None
 }
 ```
-(`read_host` (`cuda_backend.rs:2268`).) Reading device memory back to the host is
+(`read_host` (`cuda_backend.rs:2438`).) Reading device memory back to the host is
 *always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:642`:
 `state.sync()` then a pinned-staging readback); `write_host`
-(`write_host` (`cuda_backend.rs:2275`)) is the input-fill path — a pinned-staged *async*
+(`write_host` (`cuda_backend.rs:2445`)) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
 The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — is
 AGENTS rule 5 (`AGENTS.md:117` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
@@ -906,7 +906,7 @@ per position *touched*, though the regions stay f32-sized in allocation
 (§3.3). The flip side is precision: K/V are rounded to f16 on store and every
 downstream kernel reads the rounded values — which is why the parity tests
 compare against the *f16-rounded* reference, not f32
-(`cuda_kv_f16_roundtrip_attn`, `cuda_backend/tests/kv.rs:1011`).
+(`cuda_kv_f16_roundtrip_attn`, `cuda_backend/tests/kv.rs:1246`).
 
 **Prefill attention: the tiling win in one number.** The legacy per-(token,
 head) kernel re-read the K history once per query token per head: at 7B @2K

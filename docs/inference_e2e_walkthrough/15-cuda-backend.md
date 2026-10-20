@@ -567,7 +567,7 @@ the ops it has no kernel for (a standalone `Softmax` node; the `Scale` node)
 and RoPE in a layout it does not implement:
 
 ```rust
-// src/graph/cuda_backend.rs:2104 (`supports_op`) (abridged to the decision arms)
+// src/graph/cuda_backend.rs:2274 (`supports_op`) (abridged to the decision arms)
 fn supports_op(&self, op: &Op, dtype: DType) -> bool {
     if dtype != DType::F32 {
         return false;
@@ -640,7 +640,7 @@ kernel's structural invariants, and launches. The wrapper adds one
 capture-window duty:
 
 ```rust
-// src/graph/cuda_backend.rs:2174 (`execute_node`)
+// src/graph/cuda_backend.rs:2344 (`execute_node`)
 fn execute_node(
     &mut self,
     node: &CNode,
@@ -1039,7 +1039,7 @@ The pool mirrors Metal's (doc 14): a `Vec<CudaBuf>` plus a byte-length-matched
 free list. Two details are CUDA-specific:
 
 ```rust
-// src/graph/cuda_backend.rs:2121 (`alloc_buffer`) (alloc_buffer)
+// src/graph/cuda_backend.rs:2291 (`alloc_buffer`) (alloc_buffer)
 fn alloc_buffer(&mut self, size: usize) -> usize {
     let _sg = self.stream_guard(); // cudaMalloc syncs the device
     let bytes = size * 4;

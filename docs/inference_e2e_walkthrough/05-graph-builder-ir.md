@@ -832,7 +832,7 @@ comment — and asserted by the unit test `kv_nodes_carry_layer_only`
    "real" operations.
 6. **Attention's output shape comes from metadata, not from Q.** With
    `FusedQKV`, Q is a slice of a wider concat buffer, so `attn` sizes its
-   output from `AttnMeta` (`builder.rs:607`). Shapes in this IR are
+   output from `AttnMeta` (`builder.rs:613`). Shapes in this IR are
    declared facts, not derived ones.
 7. **GPU participation and fusion toggles are part of the reuse identity**
    (`CParams.gpu`, `fuse_qkv`, `fuse_ffn`): they change the topology, so

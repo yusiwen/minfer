@@ -387,7 +387,7 @@ add_bias×3 + rope×2 + store_kv×2 (7 launches) became one kernel, and nsys
 counted the difference.
 
 - **Where minfer uses it**: `attn_bias_rope_store_f32`
-  `attn_bias_rope_store_f32` (`src/cuda/kernels/kv_store.cu:118`) — one launch replaces the 7-launch decode tail;
+  `attn_bias_rope_store_f32` (`src/cuda/kernels/kv_store.cu:133`) — one launch replaces the 7-launch decode tail;
   the graph ops `Op::FusedQKV` (concat matmul + fused epilogue) and
   `Op::FusedFFN` (gate|up concat matmul + in-place swiglu) are declared in
   `Op::FusedQKV` (`src/graph/ops.rs:158`), `Op::FusedFFN` (`:177`), executed in `execute_node_inner` (`src/graph/cuda_backend.rs:916`; the `Op::FusedFFN` arm `:1236`, the `Op::FusedQKV` arm `:1365`),
