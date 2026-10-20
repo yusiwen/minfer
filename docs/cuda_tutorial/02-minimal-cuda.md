@@ -633,7 +633,7 @@ a split run as plain launches (warmup — llama.cpp's protocol), the 3rd opens
 the capture window, `synchronize()` closes it (instantiate + launch once +
 cache, `close_capture_or_sync` (`src/graph/cuda_backend.rs:573`)), and every later execution is a
 single `graph_launch_exec` (`src/graph/cuda_backend.rs:496`). The
-backend's `CudaBackend::synchronize` (`src/graph/cuda_backend.rs:2307`) is the
+backend's `CudaBackend::synchronize` (`src/graph/cuda_backend.rs:2477`) is the
 split-boundary drain point from §2.2: bind its own stream, clear the
 per-execution memos, then `close_capture_or_sync`. Replay is gated by
 `MINFER_NO_CUDA_GRAPH=1` (falls back to per-kernel launches — §5 makes the
@@ -784,7 +784,7 @@ under the alias rule (sole consumer + same backend); when the liveness
 allocator did *not* alias the two buffers (they are distinct pool slots), the
 backend stages a device-to-device copy first so the in-place kernel can never
 write a buffer some other node still needs. `copy_d2d`
-`copy_d2d` (`src/graph/cuda_backend.rs:1795`) resolves both pool slots to device
+`copy_d2d` (`src/graph/cuda_backend.rs:1949`) resolves both pool slots to device
 pointers, refuses on a byte-size mismatch (`Err` — the §2.2 contract), and
 enqueues `cudaMemcpyDeviceToDevice` on the backend's bound stream. Two GPU operations
 (copy + kernel) for the price of one node, both asynchronous, both ordered by

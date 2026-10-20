@@ -294,7 +294,7 @@ first time any node of that layer mentions the layer and then **never freed
 and never recycled** `ensure_kv` (`alloc.rs:995`). `n_kv_embd` is the KV width —
 128 for Qwen2.5-0.5B (2 KV heads × head-dim 64), 1024 for Qwen3-4B — and
 `n_ctx` is the context budget from the CLI (`--n-ctx`, default 4096). The
-store/load node shapes carry the size `kvcache_store` (`builder.rs:655`) builds the store
+store/load node shapes carry the size `kvcache_store` (`builder.rs:661`) builds the store
 node with shape `[n_embd, n_ctx, 1, 1]`, "shape mirrors the persistent region
 so the allocator can size it").
 

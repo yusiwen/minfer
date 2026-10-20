@@ -1,7 +1,7 @@
 # 11 · Attention, vec ops, and the KV cache
 
 > **Stage**: CPU matmul kernels (doc 10) → **this stage: every non-matmul op of the layer** → the sampler (doc 12).
-> **Code**: `src/vec_ops.rs` (`rms_norm_f32`, `vec_soft_max_f32`, `vec_silu_f32`, `mat_mul_f32`), `src/graph/cpu_backend.rs` (`cpu_rope`:857, the `KvcacheStore`/`KvcacheLoad`/`Attn` arms, `cpu_gqa_attn`:980, `attn_heads`:1101), `src/graph/builder.rs:601` (the `attn` node builder).
+> **Code**: `src/vec_ops.rs` (`rms_norm_f32`, `vec_soft_max_f32`, `vec_silu_f32`, `mat_mul_f32`), `src/graph/cpu_backend.rs` (`cpu_rope`:857, the `KvcacheStore`/`KvcacheLoad`/`Attn` arms, `cpu_gqa_attn`:980, `attn_heads`:1101), `src/graph/builder.rs:607` (the `attn` node builder).
 
 ## 1. Background — where this stage sits
 

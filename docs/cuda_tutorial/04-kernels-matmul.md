@@ -66,7 +66,7 @@ Three things the table does not show:
 1. **The `nt` regimes share one dispatch function.** Rust-side, one place
    decides GEMV-vs-GEMM:
    `CudaState::matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`). Every MatMul-shaped node goes through it — the
-   plain `Op::MatMul` (`src/graph/cuda_backend.rs:1454`) arm *and* the
+   plain `Op::MatMul` (`src/graph/cuda_backend.rs:1608`) arm *and* the
    decode-fused `Op::FusedQKV` concat matmul (`matmul_f32_ptr_layout`, `cuda_backend.rs:1399`).
 2. **The v2/multi/pf suffixes are variants, not new algorithms.**
    `q4_k_q8_mmvq_v2` (`mmvq_skipwrite.cu:376`) is the same dp4a structure reorganized for
@@ -374,7 +374,7 @@ gain class, same ceiling.
 
 Here is the section to bookmark: every MatMul-shaped node reaches the same
 match arm, and the arm hands everything to one function. The
-`Op::MatMul` arm (`src/graph/cuda_backend.rs:1454`), abridged to the calls that matter:
+`Op::MatMul` arm (`src/graph/cuda_backend.rs:1608`), abridged to the calls that matter:
 
 ```rust
 Op::MatMul { transpose_b } => {
@@ -433,7 +433,7 @@ each with an env opt-out for A/B. **Tier 3 — the F32 fallback**:
 
 The one-line answer to "which kernel does decode's Matmul dispatch to?":
 
-- **decode (`nt == 1`)**: `Op::MatMul` (`cuda_backend.rs:1454`) →
+- **decode (`nt == 1`)**: `Op::MatMul` (`cuda_backend.rs:1608`) →
   `matmul_f32_ptr_layout` (`src/cuda/methods/dispatch.rs:162`) → per-type MMVQ — for Q4_0 with
   `id ≥ 2048`: `q4_0_decode_mmvq` (`src/cuda/methods/mmvq.rs:224`) →
   `launch_q4_0_q8_mmvq` (`mmvq_multi.cu:603`) → **`q4_0_q8_mmvq`** (`mmvq_multi.cu:446`),
@@ -465,7 +465,7 @@ gates give your model's truth.**
 
 One more dispatch consumer: the decode fused path. Chapter 05 documented
 `Op::FusedQKV` (`cuda_backend.rs:1365`) as concat-matmul then a fused
-bias+rope+store (`attn_bias_rope_store_f32`, `kv_store.cu:118`); the concat matmul inside it is the *same*
+bias+rope+store (`attn_bias_rope_store_f32`, `kv_store.cu:133`); the concat matmul inside it is the *same*
 `matmul_f32_ptr_layout` (`cuda_backend.rs:1399`) call, so the fused node and
 the plain `Op::MatMul` node make identical kernel choices at identical
 shapes — the fusion is in the epilogue, not the matvec.

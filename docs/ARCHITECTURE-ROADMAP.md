@@ -200,8 +200,8 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    practice this is masked today because the supported models build a *single*
    GPU split on both GPU backends (`CUDA-BACKEND-DESIGN.md:313-315`), but it is
    exactly what breaks the first time an op is unsupported — e.g. interleaved
-   RoPE on CUDA (`cuda_backend.rs:1522`), or `FusedQkvNorm`, which CUDA does
-   not advertise (`cuda_backend.rs:1905`) while Metal does (`metal_backend.rs:686`).
+   RoPE on CUDA (`cuda_backend.rs:1676`), or `QkvBiasRopeStore`, which only CUDA
+   advertises (`cuda_backend.rs:2110`) while Metal refuses it (`metal_backend.rs:700`).
 2. **Synchronous, host-mediated cross-backend movement.** — **partly closed by
    F5** ([#58](https://github.com/yusiwen/minfer/issues/58), 2026-09-24): the
    boundary is now two registered phases. Phase A (`copy_across` →
@@ -662,8 +662,8 @@ precisely to break reuse on a weight swap, but nothing produces such a swap. �
 parity-only stubs that no architecture emits (`Scale`, `Softmax`, `View`,
 `Reshape`, `Permute`, `AttnMode::Mha` — `COMPUTE-GRAPH-DESIGN.md §1.3`), and
 `View`/`Reshape`/`Permute` execute as copies. CUDA additionally refuses
-`transpose_b` matmul (`cuda_backend.rs:`) and `FusedQkvNorm`
-(`cuda_backend.rs:1905`), and Metal refuses `QkvBiasRopeStore` (`metal_backend.rs:700`) —
+`transpose_b` matmul (`cuda_backend.rs:1608`), and Metal refuses
+`QkvBiasRopeStore` (`metal_backend.rs:700`) —
 so the two GPU backends do not implement the same op set, and a model's decode
 path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
 **Fixed in A8**: `SUPPORT-MATRIX.md` now carries an "Operator Coverage by
@@ -794,7 +794,7 @@ behavioural defects found while executing the plan, already fixed.
    (`MetalBackend::supports_op` returns `false` for it). Neither is documented in `SUPPORT-MATRIX.md`.~~
    **Documented in A8**: `SUPPORT-MATRIX.md` now has an "Operator Coverage by
    Backend" table; the asymmetry is visible rather than silent.
-6. **CUDA RoPE is non-interleaved only** (`cuda_backend.rs:1522`), so any model
+6. **CUDA RoPE is non-interleaved only** (`cuda_backend.rs:1676`), so any model
    needing the interleaved style splits every layer between CUDA and CPU,
    producing two host round trips per layer (§2.2); `docs/ARCHITECTURE.md:409-413`
    now states that limitation rather than advertising both styles.
@@ -811,7 +811,7 @@ behavioural defects found while executing the plan, already fixed.
 9. ~~**Single-entry cross-backend staging** (`GraphAllocator::cross_staging`), mitigated by
    the consumer-side filter at `scheduler::cross_input_ready`.~~ **Fixed in A5** — keyed
    by `(graph uid, node, dst_backend)`; two foreign consumers can now be served.
-10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2268`), so the
+10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2438`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
     with `copy_to_host` (`alloc.rs:`).
 11. **CUDA pool never releases device memory** (`cuda_backend.rs:`),
