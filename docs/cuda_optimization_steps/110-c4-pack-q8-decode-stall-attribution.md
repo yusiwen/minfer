@@ -8,10 +8,12 @@
 > the byte-load control issues **1.66x** the load instructions and **1.74x** the L1
 > sectors for the same bytes and runs **+2.4% slower** (nsys), and a
 > deferred-conversion staging form — loads kept raw, conversions moved into the
-> consumer — is **bit-identical** (123/123 dump files) and **+0.09%** on `tg128`
-> (5 interleaved rounds). Both levers were measured against a bar named first; the
-> staging arm was then **reverted**, because it bought nothing and cost 10% more
-> executed instructions through the runtime branch. What remains is the per-lane
+> consumer — is **bit-identical** (123/123 dump files), **+0.09%** on `tg128` in its
+> runtime-gated form (5 interleaved rounds), and **−2.98%** when rebuilt clean
+> without the gating branch, its kernel **+17.7%** slower (nsys median 46 592 vs
+> 39 584 ns). Both levers were measured against a bar named first; the staging arm
+> was then **reverted**, because it buys nothing and the clean form is a
+> regression. What remains is the per-lane
 > chain itself inside a 1-warp block at ~9.3 warps/SM, and closing it needs a
 > numerics- or format-changing reshape, which is a different ticket's decision.
 > **Date**: 2026-10-20. **Box**: dgxspark (aarch64, GB10 sm_121, driver 580.178.04,
@@ -142,7 +144,7 @@ the arithmetic is bit-identical by construction.
 with the staged arm and with the control: **123 / 123 dump files identical**
 (`diff -rq` over `logits_*`, `node*`, `kv*layer{k,v}`), same generated tokens.
 
-**Result: null.**
+**Result in the gated form: null.**
 
 | metric | control (off) | staged (on) |
 |---|---|---|
@@ -152,23 +154,40 @@ with the staged arm and with the control: **123 / 123 dump files identical**
 | long-scoreboard | 10.06 | 9.60 |
 | ncu duration (same run set) | 93.2 us | 92.4 us |
 
-Bar (a) not met (the same-run-set duration moved 0.9%, inside the spread; no nsys
-run was taken on this arm because (b) had already failed and the arm was reverted)
-and bar (b) not met (+0.09% vs +2%).
+Bar (a) is not assessable from this pair — the runtime branch taxes **both** arms
+(the kernel grows to 1 032 instructions, the control path alone executes 3 037 902
+against the pre-change 2 687 888), so the two durations sit under the same overhead
+— and bar (b) missed at +0.09% against +2%.
 
-**Why it was reverted rather than kept as a free arm.** The runtime branch
-duplicates the body: the kernel went **728 -> 1 032 instructions**, and the
-*control* path of the new binary executed **3 037 902** instructions against the
-pre-change **2 687 888** — a 13% tax on the path that ships. Keeping a null lever
-at a 13% instruction cost is strictly worse than the incumbent, so `q8_0_load4_bits`,
-`kv4_q8_0_raw`, the `q8stage` argument and `q8_kv_stage_enabled` were all removed;
-the tree difference of this record is documentation only.
+**The clean rebuild — the number the gated arm could not give.** After the revert,
+the same staging was rebuilt **without** the runtime switch (staged form
+unconditional, kernel **776** instructions) and measured against the master binary
+in one session, interleaved:
 
-**What the null proves.** Deferring the conversions moved long-scoreboard by 0.46
-cycles out of 10.06 and the duration not at all: the wait is at the chain's first
-consumer regardless of when the conversions are written, and the chain is long
-enough that four rows of overlap are not enough to hide it at 9.3 warps/SM. That is
-the same conclusion the byte/wide pair reaches from the other side.
+| metric | master (728 instr) | staged, no branch (776 instr) | delta |
+|---|---|---|---|
+| nsys kernel avg / median, 9 216 instances | 40 317 / **39 584** ns | 47 373 / **46 592** ns | **+17.5% / +17.7%** |
+| `tg128` median, 3 interleaved rounds | **193.83** | 188.06 | **−2.98%** |
+| `pp2048` median | 2 156.96 | 2 173.22 | +0.8% |
+| bitwise dumps (both binaries) | — | 123 / 123 identical | — |
+
+So the deferral is not neutral: it makes the kernel **~18% slower**, and the
+step-level cost (~3%) is exactly the 19% kernel share times 18%. The earlier +0.09%
+could not show this because the branch overhead sat on both arms.
+
+**Why it is a regression, not a shorter chain.** The staging keeps four rows' raw
+words live (four `int` + four `u16` for K, the same again for V, on top of the
+existing `float4` staging) and moves every conversion *after* the whole load phase,
+so the `cvt`/int8 work no longer overlaps the loads that produce it — the dependent
+chain gets longer, and the register pressure rises. The incumbent's "convert right
+after each load" is what lets the next row's loads issue while the previous row's
+values are being built. That is the opposite of what the hypothesis assumed, and it
+is the third independent confirmation that this kernel's cost is the chain, not the
+loads.
+
+**Reverted.** Both forms are gone: `q8_0_load4_bits`, `kv4_q8_0_raw`, the `q8stage`
+argument and `q8_kv_stage_enabled` were removed after the measurement; the tree
+difference of this record is documentation only.
 
 ## 4. What is left, and why neither is a kernel tweak
 
@@ -202,8 +221,12 @@ the tolerance class.
 ## 5. Verification
 
 - **Bitwise (the staging arm, before it was reverted)**: 123/123 dump files
-  identical between `MINFER_NO_Q8_KV_STAGE=1` and the staged arm; generated tokens
-  identical; `diff -rq` clean.
+  identical between the control and the staged arm, and again between the clean
+  rebuild and the master binary; generated tokens identical; `diff -rq` clean.
+- **The clean rebuild**: `cargo build --release --features cuda` twice (staging,
+  then master after `git checkout --`), each binary copied out and measured in the
+  same session — `nsys` twice per binary (`bench -p 2048 -n 128 -r 1`), 3
+  interleaved `bench` rounds per binary.
 - **ncu**: medians of 3 per arm, `--kernel-name 'regex:gqa_attn_split_partial$'`
   (anchored — the unanchored regex also matches `_bt`, `_hybrid` and `_combine`;
   record 109's pitfall), `sudo` because `RmProfilingAdminOnly = 1` on this box.
@@ -225,8 +248,8 @@ the tolerance class.
 2. **"Stages four rows" is a comment, not a guarantee.** The accessor's inline
    conversion ended the load phase after every row; the SASS was the only place
    that was visible. Read the SASS before trusting a staging comment — and note
-   that deferring the conversion did not help either, because the consumer's wait
-   is the same wait.
+   that deferring the conversion is not a fix either: rebuilt clean it costs
+   **+18% kernel**, because the conversion stops overlapping the next row's loads.
 3. **Measure the arm you would ship.** The staged form was bit-identical and
    neutral, but the runtime branch made the *shipping* path 13% more instructions.
    A same-binary A/B measures the arms; the binary's own code growth is a second
