@@ -3,6 +3,9 @@
 use super::*;
 use crate::models::ModelDef;
 
+#[cfg(feature = "cuda")]
+mod cuda_fused;
+
 /// Path to the locally cached Qwen3-0.6B Q8_0.
 fn cached_model_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;

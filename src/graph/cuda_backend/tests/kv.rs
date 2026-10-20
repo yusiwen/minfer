@@ -820,6 +820,241 @@ fn cuda_q8_0_fused_epilogue_matches_the_cpu_quantizer() {
         "the packed K cell is all zeros; the comparison would be vacuous"
     );
 }
+
+/// #200: the **no-bias** (Qwen3 `Op::FusedQkvNorm`) decode epilogue must write
+/// the unfused chain's bytes, in both store arms. The oracle is the packed bias
+/// test's, minus the bias: the host's rope expression feeding the CPU quantizer
+/// (`quants::quantize_row_q8_0`) — an implementation the kernel does not share —
+/// so a wrong block index, rope pairing, scale offset or quant offset moves a
+/// value by whole quant steps. The per-head norm is not this kernel's job (it is
+/// two `rms_norm` launches, gated by the CPU-parity tests); this test feeds the
+/// epilogue its input directly and pins exactly what it owns.
+#[test]
+fn cuda_qkv_norm_epilogue_matches_the_cpu_quantizer() {
+    use crate::graph::kvformat::KvFormat;
+    let Some(mut cb) = pool() else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    let _guard = crate::cuda::CudaState::model_load_guard();
+    let (nh, nk_h, hd) = (4usize, 2usize, 64usize);
+    let (nqt, nkt) = (nh * hd, nk_h * hd);
+    let row_words = KvFormat::Q8_0.row_elems(nkt);
+    let row_bytes = KvFormat::Q8_0.row_bytes(nkt);
+    let half = hd / 2;
+    let (fb, fs) = (10000.0f32, 1.0f32);
+
+    let vals = |seed: usize, n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i * seed + 7) % 17) as f32 / 4.0 - 2.0)
+            .collect()
+    };
+    let (qs, ks, vs) = (vals(37, nqt), vals(41, nkt), vals(57, nkt));
+
+    // the f32/f16 arm's inputs and 2-row regions
+    let (fq, fk, fv) = (
+        cb.alloc_buffer(nqt),
+        cb.alloc_buffer(nkt),
+        cb.alloc_buffer(nkt),
+    );
+    let (fk_reg, fv_reg) = (cb.alloc_buffer(2 * nkt), cb.alloc_buffer(2 * nkt));
+    // the packed arm's inputs and 2 packed rows
+    let (b_q, b_k, b_v) = (
+        cb.alloc_buffer(nqt),
+        cb.alloc_buffer(nkt),
+        cb.alloc_buffer(nkt),
+    );
+    let (kreg, vreg) = (
+        cb.alloc_buffer(2 * row_words),
+        cb.alloc_buffer(2 * row_words),
+    );
+    let b_p = cb.alloc_buffer(1);
+    let b_c = cb.alloc_buffer(1);
+    cb.write_host(fk_reg, &vec![0f32; 2 * nkt]).unwrap();
+    cb.write_host(fv_reg, &vec![0f32; 2 * nkt]).unwrap();
+    cb.write_host(kreg, &vec![0f32; 2 * row_words]).unwrap();
+    cb.write_host(vreg, &vec![0f32; 2 * row_words]).unwrap();
+
+    // The host's rope, per head (neox pairing d <-> d + hd/2), no bias.
+    let roped = |src: &[f32], heads: usize, pos: usize| -> Vec<f32> {
+        let mut out = vec![0f32; heads * hd];
+        for h in 0..heads {
+            for d in 0..hd {
+                let dd = if d < half { d } else { d - half };
+                let ja = h * hd + dd;
+                let jb = ja + half;
+                let theta = pos as f32 * fs / fb.powf((2.0 * dd as f32) / hd as f32);
+                let (cs, sn) = (theta.cos(), theta.sin());
+                out[h * hd + d] = if d < half {
+                    src[ja] * cs - src[jb] * sn
+                } else {
+                    src[ja] * sn + src[jb] * cs
+                };
+            }
+        }
+        out
+    };
+    let pack = |v: &[f32]| -> Vec<u8> {
+        let nblk = v.len() / 32;
+        let mut raw = vec![0u8; nblk * 34];
+        for b in 0..nblk {
+            let q = crate::quants::quantize_row_q8_0(&v[b * 32..(b + 1) * 32]);
+            raw[b * 34..(b + 1) * 34].copy_from_slice(&q);
+        }
+        raw
+    };
+    let cell_bytes = |region: &[f32], row: usize, words_per_row: usize| -> Vec<u8> {
+        let words = &region[row * words_per_row..(row + 1) * words_per_row];
+        let mut out = Vec::with_capacity(words.len() * 4);
+        for w in words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    };
+
+    // f32 arm: q is roped IN PLACE (each call starts from the input), K/V are
+    // stored into the region at `cells[0]`.
+    let run_f32 = |cb: &mut CudaBackend, pos: usize, row: usize| {
+        let _bound = cb.bind();
+        cb.write_host(fq, &qs).unwrap();
+        cb.write_host(fk, &ks).unwrap();
+        cb.write_host(fv, &vs).unwrap();
+        cb.write_host(b_p, &[f32::from_bits(pos as u32)]).unwrap();
+        cb.write_host(b_c, &[f32::from_bits(row as u32)]).unwrap();
+        cb.state.attn_rope_store(
+            cb.ptr_of(fq).unwrap(),
+            cb.ptr_of(fk).unwrap(),
+            cb.ptr_of(fv).unwrap(),
+            cb.ptr_of(fk_reg).unwrap(),
+            cb.ptr_of(fv_reg).unwrap(),
+            nqt,
+            nkt,
+            hd,
+            fb,
+            fs,
+            cb.ptr_of(b_p).unwrap(),
+            cb.ptr_of(b_c).unwrap(),
+            crate::cuda::KV_LAYOUT_F32,
+        );
+        cb.synchronize();
+        (
+            cb.copy_to_host(fq).unwrap(),
+            cb.copy_to_host(fk_reg).unwrap(),
+            cb.copy_to_host(fv_reg).unwrap(),
+        )
+    };
+    // packed arm: one thread per (head, 32-element K block) and per V block.
+    let run_q8 = |cb: &mut CudaBackend, pos: usize, row: usize| {
+        let _bound = cb.bind();
+        cb.write_host(b_q, &qs).unwrap();
+        cb.write_host(b_k, &ks).unwrap();
+        cb.write_host(b_v, &vs).unwrap();
+        cb.write_host(b_p, &[f32::from_bits(pos as u32)]).unwrap();
+        cb.write_host(b_c, &[f32::from_bits(row as u32)]).unwrap();
+        cb.state.attn_rope_store_q8_0(
+            cb.ptr_of(b_q).unwrap(),
+            cb.ptr_of(b_k).unwrap(),
+            cb.ptr_of(b_v).unwrap(),
+            cb.ptr_of(kreg).unwrap(),
+            cb.ptr_of(vreg).unwrap(),
+            nqt,
+            nkt,
+            hd,
+            fb,
+            fs,
+            cb.ptr_of(b_p).unwrap(),
+            cb.ptr_of(b_c).unwrap(),
+            row_bytes,
+        );
+        cb.synchronize();
+        (
+            cb.copy_to_host(b_q).unwrap(),
+            cb.copy_to_host(kreg).unwrap(),
+            cb.copy_to_host(vreg).unwrap(),
+        )
+    };
+
+    // ── f32 arm, pos = 0: identity rope — K/V must be the input, bit for bit ──
+    let (q0, k0, v0) = run_f32(&mut cb, 0, 0);
+    assert_eq!(
+        &k0[..nkt],
+        &ks[..],
+        "f32 K row is not the identity-roped input at pos = 0"
+    );
+    assert_eq!(&v0[..nkt], &vs[..], "f32 V row is not the input at pos = 0");
+    assert_eq!(
+        &q0[..],
+        &qs[..],
+        "f32 q in place is not the identity-roped input at pos = 0"
+    );
+
+    // ── f32 arm, pos = 7: the angle is real, compare as values ──
+    let (q7, k7, v7) = run_f32(&mut cb, 7, 1);
+    let want_q7 = roped(&qs, nh, 7);
+    let want_k7 = roped(&ks, nk_h, 7);
+    let dq = q7
+        .iter()
+        .zip(&want_q7)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let dk = k7[nkt..2 * nkt]
+        .iter()
+        .zip(&want_k7)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        dq <= 1e-5,
+        "f32 q diverges from the host's rope: max |Δ| = {dq}"
+    );
+    assert!(
+        dk <= 1e-5,
+        "f32 K row diverges from the host's rope: max |Δ| = {dk}"
+    );
+    assert_eq!(
+        &v7[nkt..2 * nkt],
+        &vs[..],
+        "f32 V is rope-independent and must match"
+    );
+
+    // ── packed arm, pos = 0: K and V byte for byte ──
+    let (_, pk0, pv0) = run_q8(&mut cb, 0, 0);
+    let want_pk = pack(&ks);
+    let want_pv = pack(&vs);
+    assert_eq!(
+        &cell_bytes(&pk0, 0, row_words)[..want_pk.len()],
+        &want_pk[..],
+        "the packed K cell is not the CPU quantizer's bytes of the identity-roped input"
+    );
+    assert_eq!(
+        &cell_bytes(&pv0, 0, row_words)[..want_pv.len()],
+        &want_pv[..],
+        "the packed V cell is not the CPU quantizer's bytes of the input"
+    );
+
+    // ── packed arm, pos = 7: K at one quant step's class, V still byte-exact ──
+    let (_, pk7, pv7) = run_q8(&mut cb, 7, 1);
+    assert_eq!(
+        &cell_bytes(&pv7, 1, row_words)[..want_pv.len()],
+        &want_pv[..],
+        "V does not depend on the rope angle, so its bytes must still match"
+    );
+    let mut got_k7 = vec![0f32; nkt];
+    crate::graph::kvformat::unpack_q8_0_cells(&pk7, nkt, 1, 1, &mut got_k7);
+    let dk7 = got_k7
+        .iter()
+        .zip(&want_k7)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        dk7 <= 0.03,
+        "the packed K cell is not the host's roped values at one quant step's class: \
+         max |Δ| = {dk7}"
+    );
+    assert!(
+        got_k7.iter().any(|x| x.abs() > 1e-3),
+        "the packed K cell is all zeros; the comparison would be vacuous"
+    );
+}
 #[test]
 fn cuda_rope_kv_attn_roundtrip() {
     let Some(mut cb) = pool() else {
