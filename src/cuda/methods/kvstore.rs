@@ -92,6 +92,41 @@ extern "C" {
         elems: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
+    // #200: the Qwen3 no-bias epilogue (f32/f16 and packed arms). The per-head
+    // Q/K norm is not here: the caller runs `rms_norm` in place first, so this
+    // kernel is the bias arm minus the three adds.
+    pub(crate) fn launch_attn_rope_store(
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        kv_k: *mut std::ffi::c_void,
+        kv_v: *mut std::ffi::c_void,
+        nqt: i32,
+        nkt: i32,
+        hd: i32,
+        freq_base: f32,
+        freq_scale: f32,
+        positions: *const i32,
+        cells: *const i32,
+        kv_is_f16: i32,
+        stream: *mut std::ffi::c_void,
+    );
+    pub(crate) fn launch_attn_rope_store_q8_0(
+        q: *mut f32,
+        k: *const f32,
+        v: *const f32,
+        kv_k: *mut std::ffi::c_void,
+        kv_v: *mut std::ffi::c_void,
+        nqt: i32,
+        nkt: i32,
+        hd: i32,
+        freq_base: f32,
+        freq_scale: f32,
+        positions: *const i32,
+        cells: *const i32,
+        row_bytes: usize,
+        stream: *mut std::ffi::c_void,
+    );
 }
 
 impl CudaState {
@@ -312,6 +347,102 @@ impl CudaState {
                 bias_q as *const std::ffi::c_void,
                 bias_k as *const std::ffi::c_void,
                 bias_v as *const std::ffi::c_void,
+                kv_k,
+                kv_v,
+                nqt as i32,
+                nkt as i32,
+                hd as i32,
+                freq_base,
+                freq_scale,
+                positions as *const i32,
+                cells as *const i32,
+                row_bytes,
+                stream,
+            );
+        }
+    }
+
+    /// #200: the Qwen3 no-bias decode epilogue — rope q/k in place and store k/v
+    /// into the persistent regions, f32 or f16 per `layout`.
+    ///
+    /// Unlike [`Self::attn_bias_rope_store`] there is no bias section (Qwen3 has
+    /// no attention biases) and no per-head norm: the caller runs `rms_norm` on
+    /// the q and k section bases first, so this is the same kernel with the three
+    /// adds removed. The rope math, store addresses and conversions are shared
+    /// with the bias arm through `minfer_rope_pair`, so the two cannot drift.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_rope_store(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        v: *mut std::ffi::c_void,
+        kv_k: *mut std::ffi::c_void,
+        kv_v: *mut std::ffi::c_void,
+        nqt: usize,
+        nkt: usize,
+        hd: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        positions: *mut std::ffi::c_void,
+        cells: *mut std::ffi::c_void,
+        layout: i32,
+    ) {
+        assert!(
+            layout != KV_LAYOUT_Q8_0,
+            "cuda: the f32/f16 no-bias epilogue has no packed store (a Q8_0 block needs all 32 \
+             elements) — a packed engine must call attn_rope_store_q8_0 (issue #200)"
+        );
+        let stream = self.stream();
+        unsafe {
+            launch_attn_rope_store(
+                q as *mut f32,
+                k as *mut f32,
+                v as *mut f32,
+                kv_k,
+                kv_v,
+                nqt as i32,
+                nkt as i32,
+                hd as i32,
+                freq_base,
+                freq_scale,
+                positions as *const i32,
+                cells as *const i32,
+                (layout == KV_LAYOUT_F16) as i32,
+                stream,
+            );
+        }
+    }
+
+    /// #200: the packed arm of the Qwen3 no-bias epilogue. K is roped per
+    /// (head, 32-element block) and quantized as a whole block; V is quantized
+    /// as-is. Neither buffer is written back — its readers are gone once the
+    /// packed region is the attention input.
+    ///
+    /// `row_bytes` is `KvFormat::Q8_0.row_bytes(nkt)`, the same width
+    /// [`Self::store_kv_q8_0`] and `ensure_kv` use.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_rope_store_q8_0(
+        &self,
+        q: *mut std::ffi::c_void,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        kv_k: *mut std::ffi::c_void,
+        kv_v: *mut std::ffi::c_void,
+        nqt: usize,
+        nkt: usize,
+        hd: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        positions: *mut std::ffi::c_void,
+        cells: *mut std::ffi::c_void,
+        row_bytes: usize,
+    ) {
+        let stream = self.stream();
+        unsafe {
+            launch_attn_rope_store_q8_0(
+                q as *mut f32,
+                k as *const f32,
+                v as *const f32,
                 kv_k,
                 kv_v,
                 nqt as i32,

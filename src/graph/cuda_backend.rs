@@ -1451,6 +1451,160 @@ impl CudaBackend {
                 );
                 Ok(())
             }
+            // #200: Qwen3's fused decode QKV spine — one concat matmul
+            // (blk.{i}.attn_qkv), the per-head Q/K RMSNorm, then the no-bias
+            // rope + KV store. The norm runs as two in-place `rms_norm` launches
+            // at the q and k section bases, so it is bitwise the unfused
+            // `Op::QkNorm`'s; the epilogue is the bias arm minus the three adds
+            // (`attn_rope_store` / `attn_rope_store_q8_0`), sharing the rope
+            // expression through `minfer_rope_pair`. 9 launches → 4 per layer.
+            Op::FusedQkvNorm { layer } => {
+                let meta = match &node.meta {
+                    NodeMeta::FusedQkvNorm(m) => m,
+                    other => {
+                        return Err(format!(
+                            "fused_qkv_norm node missing FusedQkvNormMeta: {other:?}"
+                        ))
+                    }
+                };
+                let nt = node.out_shape[1];
+                if nt != 1 {
+                    return Err(format!(
+                        "cuda: {}: FusedQkvNorm is decode (nt==1) only, got nt={nt}",
+                        node.name
+                    ));
+                }
+                if !matches!(meta.rope_style, RopeStyle::NonInterleaved) {
+                    return Err(format!(
+                        "cuda: {}: fused qkv norm rope style {:#?} not supported (rope_f32 is \
+                         neox/non-interleaved only)",
+                        node.name, meta.rope_style
+                    ));
+                }
+                // The per-head norm reuses the float4 `rms_norm` kernel, so a
+                // head dim it cannot stride is refused here (the same guard as
+                // `Op::QkNorm`'s arm), never silently scalarized.
+                if meta.hd == 0 || meta.hd % 4 != 0 {
+                    return Err(format!(
+                        "cuda: {}: fused qkv norm head dim {} must be a nonzero multiple of 4 \
+                         (float4 rms_norm kernel)",
+                        node.name, meta.hd
+                    ));
+                }
+                if meta.nqt != meta.nh * meta.hd || meta.nkt != meta.nk * meta.hd {
+                    return Err(format!(
+                        "cuda: {}: fused qkv norm sections nqt={} nkt={} do not match nh*hd={} \
+                         nk*hd={}",
+                        node.name,
+                        meta.nqt,
+                        meta.nkt,
+                        meta.nh * meta.hd,
+                        meta.nk * meta.hd
+                    ));
+                }
+                // The packed epilogue quantizes whole 32-element blocks, so a
+                // width that is not a multiple of 32 would silently drop its
+                // tail. `ensure_kv`'s `check_width` already refuses such a
+                // region for the store node; this arm is its own consumer, so it
+                // repeats the invariant rather than trusting the caller.
+                if self.kv_layout == crate::cuda::KV_LAYOUT_Q8_0 && meta.nkt % 32 != 0 {
+                    return Err(format!(
+                        "cuda: {}: packed KV needs a cell width that is a multiple of 32 \
+                         (32-element Q8_0 blocks), got nkt={} (hd={} nk={})",
+                        node.name, meta.nkt, meta.hd, meta.nk
+                    ));
+                }
+                let wptr = self.state.get_weight_ptr(&meta.qkv_weight).ok_or_else(|| {
+                    format!(
+                        "cuda: qkv weight '{}' not registered on CUDA ({})",
+                        meta.qkv_weight, node.name
+                    )
+                })?;
+                let qn = self.norm_weight_named(
+                    &node.name,
+                    meta.q_norm_name.as_deref(),
+                    meta.hd,
+                    "attn_q_norm",
+                )?;
+                let kn = self.norm_weight_named(
+                    &node.name,
+                    meta.k_norm_name.as_deref(),
+                    meta.hd,
+                    "attn_k_norm",
+                )?;
+                let od_total = meta.nqt + 2 * meta.nkt;
+                // 1) concat matmul: x × [wq|wk|wv] → q|k|v concat buffer
+                self.state.matmul_f32_ptr_layout(
+                    wptr,
+                    meta.weight_ttype,
+                    self.ptr_of_ref(in_bufs[0])?,
+                    self.ptr_of_ref(out_buf)?,
+                    od_total,
+                    meta.in_dim,
+                    nt,
+                    self.state.is_weight_padded(&meta.qkv_weight),
+                )?;
+                // 2) per-head Q/K RMSNorm IN PLACE on the concat buffer: the q
+                //    rows start at offset 0, the k rows at `nqt` f32 words.
+                let q_ptr = self.ptr_of_ref(out_buf)? as *mut f32;
+                let (k_sec, v_sec) =
+                    unsafe { (q_ptr.add(meta.nqt), q_ptr.add(meta.nqt + meta.nkt)) };
+                self.state.rms_norm(
+                    q_ptr as *mut std::ffi::c_void,
+                    Some(qn),
+                    q_ptr as *mut std::ffi::c_void,
+                    meta.hd,
+                    meta.nh,
+                    meta.eps,
+                );
+                self.state.rms_norm(
+                    k_sec as *mut std::ffi::c_void,
+                    Some(kn),
+                    k_sec as *mut std::ffi::c_void,
+                    meta.hd,
+                    meta.nk,
+                    meta.eps,
+                );
+                // 3) no-bias rope + KV store
+                let (k_id, v_id) =
+                    kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                let pos = self.positions_i32(in_bufs[1].id)?;
+                let cells = self.positions_i32(in_bufs[2].id)?;
+                if self.kv_layout == crate::cuda::KV_LAYOUT_Q8_0 {
+                    self.state.attn_rope_store_q8_0(
+                        q_ptr as *mut std::ffi::c_void,
+                        k_sec as *const std::ffi::c_void,
+                        v_sec as *const std::ffi::c_void,
+                        self.ptr_of(k_id)?,
+                        self.ptr_of(v_id)?,
+                        meta.nqt,
+                        meta.nkt,
+                        meta.hd,
+                        meta.freq_base,
+                        meta.freq_scale,
+                        pos,
+                        cells,
+                        self.kv_row_bytes(meta.nkt),
+                    );
+                } else {
+                    self.state.attn_rope_store(
+                        q_ptr as *mut std::ffi::c_void,
+                        k_sec as *mut std::ffi::c_void,
+                        v_sec as *mut std::ffi::c_void,
+                        self.ptr_of(k_id)?,
+                        self.ptr_of(v_id)?,
+                        meta.nqt,
+                        meta.nkt,
+                        meta.hd,
+                        meta.freq_base,
+                        meta.freq_scale,
+                        pos,
+                        cells,
+                        self.kv_layout,
+                    );
+                }
+                Ok(())
+            }
             Op::MatMul { transpose_b } => {
                 if *transpose_b {
                     return Err(format!(
@@ -1866,27 +2020,38 @@ impl CudaBackend {
                 ))
             }
         };
+        self.norm_weight_named(&node.name, name, elems, "norm")
+    }
+
+    /// [`Self::norm_weight`] for a weight the node names inside its own metadata
+    /// instead of a `NormMeta` (the fused QKV spine's `attn_q_norm` /
+    /// `attn_k_norm`, #200). Same invariant: the weight must be registered and
+    /// exactly `elems` f32.
+    fn norm_weight_named(
+        &self,
+        node_name: &str,
+        name: Option<&str>,
+        elems: usize,
+        what: &str,
+    ) -> Result<*mut std::ffi::c_void, String> {
         let Some(name) = name else {
             return Err(format!(
-                "cuda: {} has no norm weight (the CUDA rms_norm kernel requires one)",
-                node.name
+                "cuda: {node_name} has no {what} weight (the CUDA rms_norm kernel requires one)"
             ));
         };
-        let ptr = self.state.get_weight_ptr(name).ok_or_else(|| {
-            format!(
-                "cuda: weight '{name}' not registered on CUDA ({})",
-                node.name
-            )
-        })?;
+        let ptr = self
+            .state
+            .get_weight_ptr(name)
+            .ok_or_else(|| format!("cuda: weight '{name}' not registered on CUDA ({node_name})"))?;
         let want = elems * 4;
         let got = self.state.weight_size(name);
         if got != Some(want) {
             return Err(format!(
-                "cuda: norm weight '{name}' is {} B but the rms_norm kernel reads {elems} f32 \
-                 elements ({want} B) for '{}'; the f16 weight path has no f16-norm kernel (#169)",
+                "cuda: {what} weight '{name}' is {} B but the rms_norm kernel reads {elems} f32 \
+                 elements ({want} B) for '{node_name}'; the f16 weight path has no f16-norm \
+                 kernel (#169)",
                 got.map(|n| n.to_string())
                     .unwrap_or_else(|| "unregistered".to_string()),
-                node.name
             ));
         }
         Ok(ptr)
@@ -1901,9 +2066,9 @@ impl CudaBackend {
 ///
 /// Capability matrix (docs/CUDA-BACKEND-DESIGN.md §4.3): the full per-layer
 /// chain runs on CUDA, including the embedding/tail gather (7e③) and the
-/// decode fusions FusedQKV/QkvBiasRopeStore/FusedFFN. Scale, Softmax,
-/// BatchMatMul and the Qwen3-only FusedQkvNorm have no kernels and stay on
-/// the CPU backend; weight-quant eligibility is the model-level
+/// decode fusions FusedQKV/QkvBiasRopeStore/FusedQkvNorm/FusedFFN. Scale,
+/// Softmax and BatchMatMul have no kernels and stay on the CPU backend;
+/// weight-quant eligibility is the model-level
 /// all-weights-registered gate. RoPE is gated to the neox
 /// (non-interleaved) layout — the only style the supported architectures
 /// emit.
@@ -1943,6 +2108,11 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         // D3-8: mixed-quant QKV epilogue (class 2) — same pointer-form
         // kernel as FusedQKV's epilogue on three separate matmul outputs
         | Op::QkvBiasRopeStore { .. }
+        // #200: Qwen3's per-head Q/K-norm decode spine — concat matmul + two
+        // in-place `rms_norm` launches at the q/k section bases + the no-bias
+        // rope/store epilogue (f32/f16 or packed q8_0). Until this ticket the
+        // op was Metal-only, so CUDA Qwen3 decode ran the unfused chain.
+        | Op::FusedQkvNorm { .. }
         | Op::FusedFFN => true,
         // MatMul ttype gating happens at the model level (weights must all
         // be registered on CUDA — same all-or-nothing rule as Metal).

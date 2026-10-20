@@ -978,11 +978,14 @@ fn support_table_matches_support_matrix_doc() {
         ("FusedQKV", Op::FusedQKV { layer: 0 }, false, true, true),
         ("FusedFFN", Op::FusedFFN, false, true, true),
         (
+            // #200: CUDA gained the no-bias (per-head Q/K norm) epilogue, so the
+            // support table is true on both device columns; the CPU column stays
+            // false — it has no kernel for any fused QKV arm.
             "FusedQkvNorm",
             Op::FusedQkvNorm { layer: 0 },
             false,
             true,
-            false,
+            true,
         ),
         (
             "QkvBiasRopeStore",
