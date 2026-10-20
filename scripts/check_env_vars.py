@@ -24,6 +24,14 @@ contain the name fails — and a knob in neither table fails with the file that 
 which is the #521 class exactly (`MINFER_N_BATCH` was read and printed at every server
 start while nothing a user reads named it).
 
+The ledger also states its own totals (`# Measured <date>: N production reads — D
+documented, I internal`), and the checker compares that line with what it just counted
+rather than trusting it — the `check_baselines.py` pattern, where the prose carries the
+numbers and the code is the source of truth. The line is *required*: a missing one fails,
+so the comparison cannot be dropped by deleting a comment. It existed because the line
+had trailed the code by one knob from #531 to #628 (the totals were the only place the
+counts lived, and nothing recomputed them).
+
 Usage:
 
     python3 scripts/check_env_vars.py [--root .] [--list]
@@ -45,6 +53,14 @@ LEDGER = "scripts/env-vars.toml"
 USAGE = "docs/USAGE.md"
 #: A `MINFER_…` name passed to `env::var`/`env::var_os`.
 READ = re.compile(r'env::var(?:_os)?\(\s*"(MINFER_[A-Z0-9_]+)"')
+#: The ledger's own totals line. Its numbers are prose; the code is the source of truth,
+#: so they are compared (the `check_baselines.py` pattern), and a missing line fails.
+TOTALS = re.compile(
+    r"^#\s*Measured\s+(?P<date>\d{4}-\d{2}-\d{2}):\s*"
+    r"(?P<reads>\d+)\s+production\s+reads?\s*—\s*"
+    r"(?P<documented>\d+)\s+documented,\s*(?P<internal>\d+)\s+internal\b",
+    re.MULTILINE,
+)
 #: The dated-record documents: history, not a place a reader looks up a knob. Each
 #: entry is a path fragment; the ADR corpus and the campaign records are whole trees.
 RECORDS = (
@@ -135,6 +151,35 @@ def check(root: Path, list_all: bool = False) -> int:
     reads = production_reads(root)
     live = documents(root)
     problems: list[str] = []
+    # The counts the ledger's prose line must agree with: per *read* knob, so a stale
+    # table entry cannot make the header look right while a knob has no home.
+    counted = (
+        len(reads),
+        sum(1 for name in reads if name in documented),
+        sum(1 for name in reads if name in internal),
+    )
+
+    # The ledger's totals line: compared, not trusted (the `check_baselines.py` pattern).
+    # Required, so deleting the comment cannot delete the check (#628).
+    ledger_text = ledger_path.read_text(encoding="utf-8", errors="replace")
+    totals = TOTALS.search(ledger_text)
+    if totals is None:
+        plural = "" if counted[0] == 1 else "s"
+        problems.append(
+            f"{LEDGER}: no totals line — state what the checker counted, on a comment line: "
+            f"`# Measured <date>: {counted[0]} production read{plural} — {counted[1]} "
+            f"documented, {counted[2]} internal.`"
+        )
+    else:
+        stated = (int(totals["reads"]), int(totals["documented"]), int(totals["internal"]))
+        if stated != counted:
+            line = ledger_text.count("\n", 0, totals.start()) + 1
+            problems.append(
+                f"{LEDGER}:{line}: the totals line says {stated[0]} production reads — "
+                f"{stated[1]} documented, {stated[2]} internal, but the code reads "
+                f"{counted[0]} — {counted[1]} documented, {counted[2]} internal; update "
+                "the line"
+            )
 
     # Every knob's home, and the file that reads it — the two facts a reader wants.
     where: dict[str, str] = {}
@@ -188,8 +233,8 @@ def check(root: Path, list_all: bool = False) -> int:
         )
         return 1
     print(
-        f"check_env_vars: {len(reads)} production `MINFER_*` read(s), every one with a home "
-        f"— {len(documented)} in a named document, {len(internal)} internal with a reason"
+        f"check_env_vars: {counted[0]} production `MINFER_*` read(s), every one with a home "
+        f"— {counted[1]} in a named document, {counted[2]} internal with a reason"
     )
     return 0
 
@@ -219,9 +264,26 @@ def selftest() -> int:
         path.write_text(ledger, encoding="utf-8")
         return root
 
-    def run(ledger: str, **kw) -> int:
+    def run(ledger: str, header_text: str | None = None, **kw) -> int:
+        """Run the checker over a temp tree; the totals line defaults to the right one."""
+        read = kw.get("read", "")
+        data = tomllib.loads(ledger) if ledger.strip() else {}
+        if header_text is None:
+            header_text = header(
+                1,
+                1 if read in data.get("documented", {}) else 0,
+                1 if read in data.get("internal", {}) else 0,
+            )
         with tempfile.TemporaryDirectory() as tmp:
-            return check(build(tmp, ledger=ledger, **kw))
+            return check(build(tmp, ledger=header_text + ledger, **kw))
+
+    def header(reads: int, documented: int, internal: int) -> str:
+        """The totals line a tree with these counts must carry."""
+        plural = "" if reads == 1 else "s"
+        return (
+            f"# Measured 2026-10-20: {reads} production read{plural} — "
+            f"{documented} documented, {internal} internal.\n\n"
+        )
 
     def tab(kind: str, name: str, value: str) -> str:
         return f'[{kind}]\n{name} = "{value}"\n'
@@ -280,16 +342,50 @@ def selftest() -> int:
     )
     cases.append(("an empty reason is a usage error", run(tab("internal", V, ""), read=V) == 2))
     cases.append(("an empty home is a usage error", run(tab("documented", V, ""), read=V) == 2))
+    cases.append(
+        (
+            "a totals line that matches the counts passes",
+            run(tab("documented", V, "docs/design.md"), read=V, design=DESIGN) == 0,
+        )
+    )
+    cases.append(
+        (
+            "a totals line one read off fails",
+            run(
+                tab("documented", V, "docs/design.md"),
+                header_text=header(2, 1, 0),
+                read=V,
+                design=DESIGN,
+            )
+            == 1,
+        )
+    )
+    cases.append(
+        (
+            "a ledger without a totals line fails",
+            run(
+                tab("documented", V, "docs/design.md"),
+                header_text="",
+                read=V,
+                design=DESIGN,
+            )
+            == 1,
+        )
+    )
     with tempfile.TemporaryDirectory() as tmp:
         root = build(tmp, read="MINFER_ONLY_IN_TESTS", ledger="")
         (root / "src" / "engine.rs").write_text("// no reads here\n", encoding="utf-8")
         (root / "src" / "tests.rs").write_text('env::var("MINFER_ONLY_IN_TESTS");\n', encoding="utf-8")
+        (root / LEDGER).write_text(header(0, 0, 0), encoding="utf-8")
         cases.append(("a test-file read is not enumerated", check(root) == 0))
     with tempfile.TemporaryDirectory() as tmp:
         root = build(tmp, read="MINFER_OTHER", ledger="")
         (root / "src" / "engine.rs").write_text('env::var_os("MINFER_VAR_OS");\n', encoding="utf-8")
+        (root / LEDGER).write_text(header(1, 0, 0), encoding="utf-8")
         cases.append(("`env::var_os` needs an entry too", check(root) == 1))
-        (root / LEDGER).write_text(tab("internal", "MINFER_VAR_OS", "reason"), encoding="utf-8")
+        (root / LEDGER).write_text(
+            header(1, 0, 1) + tab("internal", "MINFER_VAR_OS", "reason"), encoding="utf-8"
+        )
         cases.append(("and passes once the entry exists", check(root) == 0))
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

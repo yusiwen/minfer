@@ -417,6 +417,8 @@ jobs:
       # documents it — opened, required to be a live document, and required to name the
       # knob — or to `[internal]` with a reason, which fails if any live document does
       # name it. A knob in neither table fails with the source file that reads it.
+      # The ledger's own totals line is compared with what the checker counted (#628),
+      # so the numbers there cannot trail the code the way they did from #531 to #628.
       - name: Every runtime environment variable must be documented
         run: python3 scripts/check_env_vars.py
       - name: The env-var checker's own pass/fail cases
