@@ -632,7 +632,19 @@ fn a_mixed_offload_plan_refuses_to_resume_a_session() {
 /// a sequence without a run is the refusal that names it.
 #[test]
 fn a_sequence_without_a_reserved_run_is_refused_by_the_cell_resolver() {
-    // The shape the deleted fallback resolved: no arena, no reservation.
+    // The shape the deleted fallback resolved silently: an arena with room, but
+    // no reservation at all. The old code returned `cell == position` here.
+    let mut unclaimed = GraphAllocator::new();
+    unclaimed.kv_set_capacity(8);
+    assert_eq!(unclaimed.kv_arena_stats().sequences, 0);
+    let err = unclaimed.kv_cells_for_seq(&[0], &[3]).unwrap_err();
+    assert!(
+        err.contains("query 0 has no reserved run (seq 0)"),
+        "got: {err}"
+    );
+
+    // No arena at all: the old `no KV arena allocated` arm is gone; the same
+    // named refusal covers this shape too.
     let fresh = GraphAllocator::new();
     let err = fresh.kv_cells_for_seq(&[0], &[3]).unwrap_err();
     assert!(
