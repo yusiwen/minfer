@@ -94,6 +94,18 @@ already fails. Measured on the day it landed: **26** anchors were bare, 15 of th
 frozen records (which the exemption covers whole, so rule F does not judge them) and 11
 in live documents, all re-pointed in the same change.
 
+``G`` **a doc-cited test path names an item that exists.** A backticked
+``module::tests::name`` carries no `path:NNN`, so rules A–F never see it — it is how the
+docs cite a gate by the name a reader can search for, and it is exactly the shape that
+rotted in [#219] (the docs named an injection matcher that [#171] had moved to
+`src/testfail.rs`). Rule G resolves the token's last segment to a `fn` **or** a `mod`
+under `src/` or `tests/`; the module arm is not optional, because
+``graph::metal_backend::tests::packed_kv`` cites `mod packed_kv` in
+`src/graph/metal_backend/tests.rs`, not a function. A miss is ``test-missing`` and
+**fails**; frozen records are exempt whole. Its boundary is rule C's: the checker proves
+the identifier exists, never that the test still asserts the claim the sentence
+attributes to it.
+
 ``E`` **the range holds the symbol too** — a *failure* since [#371]; it was a *note*
 from [#339] until that sweep landed. Rule C's window is deliberately loose (±25 lines),
 so an anchor like `` `metal_available()` (`metal_backend.rs:1054-1056`) `` passes while
@@ -236,6 +248,14 @@ FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 #: there is no file to attribute the number to. The `ANCHOR` grammar requires the
 #: path, which is why the continuation was invisible before issue #355.
 CONTINUATION = re.compile(r"^:(\d+)(?:-(\d+))?$")
+
+#: A doc-cited **test path** (rule G): any `…::tests::…` token whose last segment names
+#: the item. The leading group is optional (`tests::name` is valid), and the segment
+#: after `tests` may itself be a module (`cuda_backend::tests::weights::gate`), which is
+#: why the tail is `(::segment)+` rather than a single segment.
+TEST_PATH = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_]*::)*tests(?:::[A-Za-z_][A-Za-z0-9_]*)+$"
+)
 
 #: A symbol-shaped token: a bare identifier or a `Type::item` path, starting with a
 #: letter (never `_foo`) and looking like code rather than prose — it must carry an
@@ -426,8 +446,32 @@ class Anchor:
 
 
 @dataclass
+class TestRef:
+    """One doc-cited `…::tests::…` path (rule G) and whether its item exists.
+
+    ``token`` keeps the written form (``cuda_backend::tests::weights::gate``);
+    ``verdict`` is ``ok``, ``test-missing`` or ``frozen``.
+    """
+
+    doc: str
+    line: int
+    token: str
+    verdict: str = "ok"
+    detail: str = ""
+
+    def where(self) -> str:
+        return f"{self.doc}:{self.line}"
+
+    def is_violation(self) -> bool:
+        return self.verdict == "test-missing"
+
+
+@dataclass
 class Report:
     anchors: list[Anchor] = field(default_factory=list)
+    #: Rule G: doc-cited `…::tests::…` paths. Separate from ``anchors`` because they
+    #: carry no locator — the name *is* the claim.
+    tests: list[TestRef] = field(default_factory=list)
     stale_frozen: list[tuple[str, str]] = field(default_factory=list)
     unused_frozen: list[tuple[str, str]] = field(default_factory=list)
     #: Bare continuations that attach to no preceding anchor on their line: the
@@ -436,6 +480,10 @@ class Report:
 
     def violations(self, strict_symbols: bool = False) -> list[Anchor]:
         return [a for a in self.anchors if a.is_violation(strict_symbols)]
+
+    def missing_tests(self) -> list[TestRef]:
+        """Rule G's violations: citations whose `fn`/`mod` is nowhere in the tree."""
+        return [t for t in self.tests if t.is_violation()]
 
     def count(self, verdict: str) -> int:
         return sum(1 for a in self.anchors if a.verdict == verdict)
@@ -600,6 +648,7 @@ class Checker:
         self.frozen = dict(FROZEN if frozen is None else frozen)
         self._lines: dict[str, list[str]] = {}
         self._src_text: str | None = None
+        self._test_defs: set[str] | None = None
         self._unattached = 0
 
     # -- helpers ---------------------------------------------------------------
@@ -622,6 +671,45 @@ class Checker:
                     )
             self._src_text = "\n".join(chunks)
         return self._src_text
+
+    def test_defs(self) -> set[str]:
+        """Every `fn` / `mod` name under `src/` and `tests/` — rule G's existence probe.
+
+        The whole tree is the unit, not the module path in the citation: the docs write
+        `cuda_backend::tests::weights::gate` for a `fn gate` that lives in
+        `src/graph/cuda_backend/tests/weights.rs`, and resolving the prefix to a
+        directory would guess at a layout the crate does not guarantee.
+        """
+        if self._test_defs is None:
+            chunks = []
+            for rel in self.paths:
+                if rel.startswith(("src/", "tests/")):
+                    chunks.append(
+                        (self.root / rel).read_text(encoding="utf-8", errors="replace")
+                    )
+            self._test_defs = set(
+                re.findall(r"\b(?:fn|mod)\s+([A-Za-z_][A-Za-z0-9_]*)", "\n".join(chunks))
+            )
+        return self._test_defs
+
+    def test_refs_on_line(
+        self, rel: str, number: int, text: str, starts_inside: bool = False
+    ) -> list[TestRef]:
+        """The `…::tests::…` citations one doc line carries (rule G)."""
+        refs: list[TestRef] = []
+        for _start, _end, content in code_spans(text, starts_inside):
+            token = CALL_SUFFIX.sub("", content.strip())
+            if not TEST_PATH.match(token):
+                continue
+            ref = TestRef(doc=rel, line=number, token=token)
+            base = token.split("::")[-1]
+            if base in self.test_defs():
+                ref.verdict = "ok"
+            else:
+                ref.verdict = "test-missing"
+                ref.detail = f"no `fn {base}` and no `mod {base}` under src/ or tests/"
+            refs.append(ref)
+        return refs
 
     def frozen_reason(self, doc: str) -> str | None:
         for pattern, reason in self.frozen.items():
@@ -697,6 +785,7 @@ class Checker:
             reason = self.frozen_reason(rel)
             lines = path.read_text(encoding="utf-8").splitlines()
             here: list[Anchor] = []
+            here_tests: list[TestRef] = []
             # Whether the line begins inside a code span the previous line left open
             # (a wrapped span). Rule C and rule D both read spans, so both get it. The
             # state is *inline* markdown state: a fence's backticks are literal, and a
@@ -713,6 +802,12 @@ class Checker:
                         anchor.symbol = symbol_of(text, span, inside_span)
                     self._judge(anchor)
                     here.append(anchor)
+                # Rule G reads code spans, so a fenced block is a sample, not a citation:
+                # the fence branch below skips the line entirely for every other rule too.
+                if fence is None:
+                    here_tests.extend(
+                        self.test_refs_on_line(rel, number, text, inside_span)
+                    )
                 if fence is not None:
                     if closes_fence(text, fence):
                         fence = None
@@ -736,7 +831,13 @@ class Checker:
                     # judgement about a *live* citation, which this is not (#528).
                     anchor.range_miss = None
                     anchor.bare_range = False
+                # Rule G is a judgement about a live citation; a record's test names
+                # name the tests of the revision it was written against.
+                for ref in here_tests:
+                    ref.verdict = "frozen"
+                    ref.detail = reason
             report.anchors.extend(here)
+            report.tests.extend(here_tests)
         report.unattached = self._unattached
         # The ratchet. An entry whose files no longer carry a single anchor names a
         # record that is gone or emptied, so the exemption must go with it. An entry
@@ -848,6 +949,9 @@ def print_list(report: Report) -> None:
             f"{anchor.where()} → {target}:{rng} [{anchor.verdict}]{symbol}{bare}"
             f"{bare_range}{miss}"
         )
+    # Rule G: the test citations carry no locator, so they get a row of their own.
+    for ref in report.tests:
+        print(f"{ref.where()} → `{ref.token}` [{ref.verdict}]")
 
 
 def summarize(report: Report, strict_symbols: bool) -> None:
@@ -860,11 +964,14 @@ def summarize(report: Report, strict_symbols: bool) -> None:
     bare = sum(1 for a in report.anchors if a.bare_range)
     misses = sum(1 for a in report.anchors if a.range_miss is not None)
     continuations = sum(1 for a in report.anchors if a.continuation)
+    refs = len(report.tests)
+    missing_tests = len(report.missing_tests())
     print(
         f"check_doc_line_anchors: {total} anchors ({continuations} bare continuations, "
         f"{report.unattached} unattached) · {frozen} frozen · {external} external · "
         f"{ambiguous} ambiguous · {checked} checked · {notes} symbol notes · "
-        f"{bare} bare ranges · {misses} range misses"
+        f"{bare} bare ranges · {misses} range misses · "
+        f"{refs} test refs · {missing_tests} missing"
     )
     for pattern, reason in report.stale_frozen:
         print(
@@ -937,11 +1044,16 @@ def main(argv: list[str]) -> int:
             f"→ {anchor.target or '?'} — {anchor.detail}{miss}",
             file=sys.stderr,
         )
-    if violations or report.stale_frozen:
+    bad_tests = report.missing_tests()
+    for ref in sorted(bad_tests, key=lambda r: r.where()):
+        print(f"TEST-MISSING  {ref.where()}: `{ref.token}` — {ref.detail}", file=sys.stderr)
+    if violations or report.stale_frozen or bad_tests:
         print(
             f"check_doc_line_anchors: {len(violations)} bad anchors"
             + (f", {len(report.stale_frozen)} stale frozen entries" if report.stale_frozen else "")
-            + " — anchor to a symbol where the number was only a locator, or fix the number",
+            + (f", {len(bad_tests)} missing test citations" if bad_tests else "")
+            + " — anchor to a symbol where the number was only a locator, fix the number, "
+            "or name the test that exists",
             file=sys.stderr,
         )
         return 1
@@ -969,7 +1081,7 @@ FIXTURE_FILES = {
     )
     + "\n",
     "src/other.rs": "pub fn moved_symbol() {}\n",
-    "src/nested/tests.rs": "fn alpha() {}\n",
+    "src/nested/tests.rs": "mod gamma;\nfn alpha() {}\n",
     "src/elsewhere/tests.rs": "fn beta() {}\n",
     # Rule E (#339): the definition sits on line 1 and is *called* on line 33, so
     # the two citations below are 32 lines apart — outside ``SYMBOL_WINDOW`` from
@@ -1100,6 +1212,39 @@ def selftest() -> int:
         [a.bare_range for a in report.anchors if a.doc == "docs/ok2.md"] == [False],
         "a line that holds code is not a bare range",
     )
+
+    # 1d. Rule G: a `…::tests::…` citation must name a `fn` or a `mod` in the tree.
+    report = _run_case(
+        {"docs/tests.md": "See `nested::tests::alpha` and `elsewhere::tests::beta`.\n"}
+    )
+    expect(
+        [t.verdict for t in report.tests] == ["ok", "ok"],
+        "a cited test that exists must pass (the fn arm)",
+    )
+    report = _run_case({"docs/tests.md": "See `nested::tests::gone`.\n"})
+    expect(
+        [t.verdict for t in report.tests] == ["test-missing"],
+        "a cited test that does not exist must be test-missing",
+    )
+    expect(
+        [t.token for t in report.missing_tests()] == ["nested::tests::gone"],
+        "the missing citation must be reported with its written token",
+    )
+    report = _run_case({"docs/tests.md": "See `nested::tests::gamma`.\n"})
+    expect(
+        not report.missing_tests(),
+        "a cited `mod` must pass (the module arm: `<module>::tests::<mod>`)",
+    )
+    report = _run_case(
+        {"docs/record.md": "See `nested::tests::gone`.\n"},
+        {"docs/record.md": "a record of a past revision"},
+    )
+    expect(
+        [t.verdict for t in report.tests] == ["frozen"] and not report.missing_tests(),
+        "a frozen record's test citations are exempt (rule G abstains)",
+    )
+    report = _run_case({"docs/fenced.md": "```\n`nested::tests::gone`\n```\n"})
+    expect(not report.tests, "a fenced sample is not a citation")
 
     # 2. The synthetic stale anchor: out of range, both ends of a range, reversed.
     report = _run_case({"docs/bad.md": f"See `src/thing.rs:999`.\n"})

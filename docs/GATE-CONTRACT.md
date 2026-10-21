@@ -386,6 +386,11 @@ So the convention is:
 - **A range that quotes prose is the weakest form.** Do not backtick the quoted
   words to "make them checkable": the adjacency rule was written for identifiers,
   and applying it to prose judges the neighbouring sentence (measured above).
+- **A test citation is a path, not a phrase.** Write the whole path
+  (`testfail::tests::the_matcher_is_exact_and_comma_separated`, never "the matcher
+  test"): rule G resolves the last segment to a `fn` or a `mod`, and a phrase is
+  invisible to every gate — that is how #219's second item survived, naming a
+  matcher that #171 had moved with no `path:NNN` in the sentence.
 
 Rule E shipped as a **note** from [#339] to [#371] because of what a failure would have
 cost then *and* because it does not catch the whole class. Measured on `7991218`, **79**
@@ -644,7 +649,11 @@ set can only shrink. Then `scripts/check_doc_line_anchors.py` (#266), which
 fails on a `path:NNN` anchor whose file or line is gone — and, when the anchor names a backticked
 symbol, on a symbol that has left the file it points at; a bare `:NNN` continuation attaches to the
 nearest *preceding* `path:NNN` on its own doc line and is resolved and range-checked against that
-file the same way, while one that follows no anchor on its line stays silent (#355); the historical
+file the same way, while one that follows no anchor on its line stays silent (#355); and a
+doc-cited `…::tests::…` path must name a `fn` or a `mod` that exists under `src/` or `tests/`
+(rule G) — the one locator class that carries no `path:NNN` at all, and the shape that let #219's
+item 2 name a matcher #171 had moved. It proves the identifier exists, never that the test still
+asserts the claim; the historical
 records whose anchors cite a
 pre-split revision are frozen inside it, one reason apiece, and an exemption that no longer covers a
 failure fails too. Resolving is not pointing, so the same job runs
@@ -653,7 +662,11 @@ failure fails too. Resolving is not pointing, so the same job runs
 file's old→new lines, and fails an anchor the range moved without re-pointing — naming it
 `doc:line → target:old (now new)`, and for a bare continuation
 `doc:line (bare continuation) → target:old (now new)`. A cited line the range *deleted* has no image in the map, so it is
-reported for a human instead of guessed, and the same `FROZEN` set exempts the same records. It named
+reported for a human instead of guessed, and the same `FROZEN` set exempts the same records. On a
+push to the default branch the same checker diffs against the event's pre-push tip
+(`github.event.before`), which is the only way to see the *combination* of two PRs that each passed
+against their own base; a force-push has no linear ancestor, so a guard fails loudly naming both
+SHAs instead of building a map that cannot exist. It named
 **73** anchors over #299's range, the 69 its re-point commit fixed plus 4 it missed. It also runs
 `scripts/check_f6_fixtures.py` (#205), which checks the shape of the F6 fixture manifest `tests/fixtures/f6-fixtures.json`,
 cross-checks every `~/.cache/minfer/f6-src/…` fixture the source tree names against it (and every `.gguf` path a
