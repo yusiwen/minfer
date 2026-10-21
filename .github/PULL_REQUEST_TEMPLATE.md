@@ -1,7 +1,8 @@
 <!--
 Fill every section. The CI `check-pr-body` job (scripts/check_pr_body.py)
-requires all eight headings, and refuses a body whose three checked sections
-are empty or left at their `FILL-ME:` placeholder. The rules these sections
+requires all eight headings (plus `Doc impact` when a live document cites a
+changed file), and refuses a body whose checked sections are empty or left at
+their `FILL-ME:` placeholder. The rules these sections
 serve live in docs/GATE-CONTRACT.md — the `Mac verification` convention is
 stated in its §5, next to the box-label rule it reuses; a stated
 `N/A — <reason>` is a filled section. The checker can force the sentence to
@@ -48,6 +49,15 @@ FILL-ME: the mutation command, its non-zero exit and its message
 <!-- Issues filed for what this leaves open, or `N/A — <reason>`. -->
 
 Closes #
+
+## Doc impact
+
+<!-- When the `changes` job reports `doc_cited=true`, a live document anchors into
+     a file this PR changes; `scripts/doc_impact.py --base origin/master` prints the
+     paragraphs. State what happened to them: re-read and still true / updated in this
+     PR / `N/A — <reason>`. The section is required only when `doc_cited` is true. -->
+
+FILL-ME: what happened to the citing paragraphs, or `N/A — <reason>`
 
 ## Mac verification
 
