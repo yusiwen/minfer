@@ -457,7 +457,7 @@ priority, capability matrix and pool hooks; consumers read it instead of matchin
 Before F4, adding a backend meant teaching nine `#[cfg]`-laden match sites
 about it: `GraphAllocator::supports` (`alloc.rs:`),
 `alloc_in_pool`/`alloc_fresh_in`/`free_in_pool` (`:819`, `:955`, `:959`),
-`sync_backend` (`alloc.rs:2400`), `copy_across` (`alloc.rs:2449`), and the
+`sync_backend` (`alloc.rs:2391`), `copy_across` (`alloc.rs:2440`), and the
 scheduler's execute match (`scheduler.rs:`); the functions are registry-driven now.
 
 GPU participation is decided by an all-or-nothing model-level gate: every weight
