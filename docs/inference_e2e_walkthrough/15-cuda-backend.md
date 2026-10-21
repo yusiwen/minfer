@@ -476,40 +476,7 @@ participates in the legacy default stream's implicit global synchronization —
 exactly the call that invalidated the capture before #188.
 
 ```rust
-// src/cuda/methods/weights.rs: (core of register_weight)
-let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-let err = unsafe { cudaMalloc(&mut ptr, data.len()) };
-if err != 0 || ptr.is_null() {
-    eprintln!("CUDA: failed to allocate {} bytes for '{}'", data.len(), name);
-    return;
-}
-let err = unsafe {
-    // Issue #188: stream-ordered, not the legacy-null-stream blocking
-    // `cudaMemcpy`. ... Queuing the copy on the context's own stream
-    // and waiting on that stream keeps the registration a bounded,
-    // stream-scoped operation.
-    cudaMemcpyAsync(
-        ptr,
-        data.as_ptr() as *const std::ffi::c_void,
-        data.len(),
-        CUDA_MEMCPY_HOST_TO_DEVICE,
-        self.context_stream(),
-    )
-};
-if err == 0 {
-    let serr = unsafe { cudaStreamSynchronize(self.context_stream()) };
-    // ... a non-zero `serr` names the error and frees the buffer
-}
-if err != 0 {
-    eprintln!("CUDA: failed to copy '{}' to device", name);
-    unsafe { cudaFree(ptr) };
-    return;
-}
-// a plain (unpadded) registration must clear any stale padded flag
-// for the same name ...
-self.padded_weights.lock().unwrap().remove(name);
-self.weights.lock().unwrap()
-    .insert(name.to_string(), (CudaPtr(ptr), data.len()));
+{{#rustdoc_include ../../src/cuda/methods/weights.rs:register_weight}}
 ```
 
 The pre-#188 blocking form survives only as the test-only
@@ -517,14 +484,18 @@ The pre-#188 blocking form survives only as the test-only
 acceptance probe needs in order to measure the capture mode against the
 *historical* setup.
 
-The comment lines this excerpt elides contain two ownership rules that
-matter: a re-registration with the **same name and size reuses the existing
+The listing is the source itself (an `ANCHOR` block, included by mdBook, so it
+cannot drift from `weights.rs`). Two ownership rules sit just above the
+anchor: a re-registration with the **same name and size reuses the existing
 device copy** (unit tests reload the same file; weights are immutable, so
 there is nothing to refresh), while a *different* size replaces the entry and
 **deliberately leaks the stale buffer** — a live captured CUDA Graph may
 still reference the old address, and the leak is bounded by the number of
 distinct tensor shapes ever loaded. Device memory ownership is serious
-enough that this one rule got its own bullet in `docs/GPU_SAFETY.md`.
+enough that this rule got its own bullet in `docs/GPU_SAFETY.md`. Inside the
+listing, the padded-flag comment states the third: a plain re-registration
+must clear a stale Q6_K marker, or the padded-224 kernel would read a raw-210
+buffer.
 
 Special layouts register through special entries. The important one is Q6_K:
 the raw 210-byte block stride forces 1-byte-per-instruction weight loads that

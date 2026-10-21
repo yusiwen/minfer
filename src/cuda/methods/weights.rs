@@ -36,6 +36,7 @@ impl CudaState {
                 // distinct (arch, tensor) shapes ever loaded.
             }
         }
+        // ANCHOR: register_weight
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let err = unsafe { cudaMalloc(&mut ptr, data.len()) };
         if err != 0 || ptr.is_null() {
@@ -94,6 +95,7 @@ impl CudaState {
             .lock()
             .unwrap()
             .insert(name.to_string(), (CudaPtr(ptr), data.len()));
+        // ANCHOR_END: register_weight
     }
 
     /// Issue #188 probe, **test-only**: the pre-#188 registration H2D path, a
