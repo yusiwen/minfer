@@ -174,6 +174,9 @@ Two honest wrinkles:
   130 on `6b6d94f`). The banner naming the deleted `CudaCommandBuffer` was rewritten to
   `src/cuda/methods/dispatch.rs:124` by Step 1 ([#262](https://github.com/yusiwen/minfer/issues/262)),
   the step that moved it. If #219 is not widened, the rest become ticket 7 in §7.4.
+  Later still, [#636](https://github.com/yusiwen/minfer/issues/636) removed the `AGENTS.md` and
+  walkthrough counts rather than re-measuring them a third time: a live document states structure,
+  not a derived number (`docs/GATE-CONTRACT.md` §"Counts").
 - Add the interface-eligibility rule (§1.3) and the layer definition (§2) to `docs/ARCHITECTURE.md`.
 - Acceptance: `check-docs` green (`check_docs_links.py`, `check_status.py --check`, book build).
   No counter in `docs/status.toml` changes (the suite counts do not move in this step).
