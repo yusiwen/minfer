@@ -558,6 +558,16 @@ So:
 - **An index is the worst place for a number.** `AGENTS.md` is loaded into every session and read
   before anything else: a size there is a claim repeated thousands of times and re-measured never.
 
+**The half a checker can do.** `scripts/check_doc_counts.py` (#641) fails a claim that names no
+revision: a repository path next to a line count, a bare "N lines of Rust" / "N LOC" / "~Nk LOC",
+or an "N test functions". A stamp is accepted on the claim's own line or a neighbour, and — because
+the walkthrough pages have opened with a `Code:` block ending `lines verified at commit <sha>`
+since #266 — in the document's header as well, which makes the whole page a snapshot of that
+revision. It cannot check that the number is *right*; it checks that the sentence says which tree
+it is right about. The ledger beside it (`scripts/doc-counts.toml`, ADR-0023) is the escape hatch
+and ratchets both ways: an entry that exempts no claim fails, and it ships empty because, measured
+when the checker landed, all 62 claims in the tree already named their revision.
+
 ## Writing the next gate — checklist
 
 1. What **value** does it assert, and how is that value computed independently
@@ -656,7 +666,11 @@ item 2 name a matcher #171 had moved. It proves the identifier exists, never tha
 asserts the claim; the historical
 records whose anchors cite a
 pre-split revision are frozen inside it, one reason apiece, and an exemption that no longer covers a
-failure fails too. Resolving is not pointing, so the same job runs
+failure fails too. `scripts/check_doc_counts.py` (#641) then carries the half no anchor can: a
+derived count in a live document must name the revision it measured, or the claim fails — a number
+is the one claim a gate cannot verify for truth (§"Counts"). Its ledger
+(`scripts/doc-counts.toml`) is the escape hatch, ratcheted both ways and empty today. Resolving is
+not pointing, so the same job runs
 `scripts/check_anchor_drift.py` (#344) on `pull_request`: it diffs `HEAD` against the PR's merge base
 (`origin/<base_ref>...HEAD`, the second reason the checkout is `fetch-depth: 0`), maps every anchored
 file's old→new lines, and fails an anchor the range moved without re-pointing — naming it

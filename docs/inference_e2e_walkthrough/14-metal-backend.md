@@ -2,6 +2,7 @@
 
 > **Stage**: decode loop running (docs 09–13) → **this stage: the same graph, executed on the Apple GPU instead of the CPU kernels of docs 10/11** → the CUDA backend (doc 15).
 > **Code**: `src/graph/metal_backend.rs` (`MetalBackend`, the `Backend` trait implementation — `supports_op` at :265, `execute_node` at :843, `synchronize` at :1750), `src/metal/` (`MpsState` device layer, `MpsCommandBuffer`, `submit` at :1935), `src/metal/kernels/` (the Metal Shading Language kernels).
+> **Sizes**: the line counts in this page are measured at `c252e24`.
 
 ## 1. Background — where this stage sits
 

@@ -1,0 +1,23 @@
+# Live-document exemption ledger for `scripts/check_doc_counts.py` (#641).
+#
+# `docs/GATE-CONTRACT.md` §"Counts" states the rule: a live document describes
+# structure, and a count that is the point of a record carries the revision it
+# measured. The checker accepts two forms of that stamp — one on the claim's own line
+# (or a neighbour), and one in the document's header (its first 30 lines), which is how
+# the walkthrough's `Code:`/`Sizes:` block and every dated record declare their base.
+#
+# **This ledger is empty on purpose.** Measured when the checker landed, all 52 claims
+# in the tree were covered by one of the two stamp forms: every record states its
+# baseline in its header (`Status: … (2026-09-15)`, `Baseline: HEAD = 293eb19`,
+# `Commit: 6df3245`), and the live pages that quote sizes now say which revision those
+# sizes are from. An entry here would be a way to *hide* a number rather than to date
+# it, so there is none.
+#
+# It is kept as the escape hatch, under the same constraints as the other ledgers
+# (ADR-0023): `glob` + `reason`, both non-empty, and an entry that exempts no claim is
+# a failure — the ledger may not rot. A document that genuinely cannot stamp its
+# numbers (a table of past sizes with no single base) gets an entry **and** a reason
+# that says why a stamp is impossible, not merely inconvenient.
+#
+# `glob` is over the repository-relative path and is matched with `fnmatch`, so `*`
+# spans `/`.
