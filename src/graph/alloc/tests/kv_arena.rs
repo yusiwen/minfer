@@ -625,3 +625,36 @@ fn a_mixed_offload_plan_refuses_to_resume_a_session() {
         assert!(!err.contains("offload plan"), "{plan:?}: {err}");
     }
 }
+
+/// #229: a cell exists only inside a reserved run. The resolver used to fall back to
+/// `cell == position` when the arena held no reservation at all; that arm was
+/// unreachable from production and from this suite, and is gone. The only answer for
+/// a sequence without a run is the refusal that names it.
+#[test]
+fn a_sequence_without_a_reserved_run_is_refused_by_the_cell_resolver() {
+    // The shape the deleted fallback resolved: no arena, no reservation.
+    let fresh = GraphAllocator::new();
+    let err = fresh.kv_cells_for_seq(&[0], &[3]).unwrap_err();
+    assert!(
+        err.contains("query 0 has no reserved run (seq 0)"),
+        "got: {err}"
+    );
+
+    // A neighbouring reservation is not a fallback either: only the named
+    // sequence's own run can answer.
+    let mut alloc = GraphAllocator::new();
+    alloc.kv_set_capacity(8);
+    let slot = alloc.kv_reserve_seq(0, 4).unwrap();
+    let err = alloc.kv_cells_for_seq(&[1], &[0]).unwrap_err();
+    assert!(
+        err.contains("query 0 has no reserved run (seq 1)"),
+        "got: {err}"
+    );
+
+    // Control: the reserved run still resolves, so the refusal is not a blanket
+    // error and the fixture is live.
+    assert_eq!(
+        alloc.kv_cells_for_seq(&[0], &[3]).unwrap(),
+        vec![(slot.start + 3) as u32]
+    );
+}
