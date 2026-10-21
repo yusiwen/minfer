@@ -2,7 +2,7 @@
 
 **Campaign**: T-series · Device Adaptation Layer — design record
 [`docs/DEVICE-ADAPTATION-PLAN.md`](../DEVICE-ADAPTATION-PLAN.md) (T1 phase).
-**Status**: LANDED. **Scope guard**: this phase changes dispatch *data and
+**Status**: LANDED (commit `7793419`, 2026-09-15). **Scope guard**: this phase changes dispatch *data and
 gates only* — no kernels touched, GB10 behavior provably unchanged.
 
 ## Goal

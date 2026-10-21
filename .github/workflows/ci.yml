@@ -95,6 +95,16 @@
 #                       frozen in the script with a reason apiece, and an
 #                       exemption that no longer covers a failure is itself a
 #                       failure (the dead-code ratchet's shape).
+#                       And `scripts/check_doc_counts.py` (#641): a derived count in
+#                       a live document must carry the revision it measured — on the
+#                       claim's line (or a neighbour), or in the document's header,
+#                       which is how the walkthrough's `Code:`/`Sizes:` block and every
+#                       dated record declare their base. A number is the one claim no
+#                       gate can verify for truth; #219 corrected a batch of them and
+#                       #636 found three wrong again in sixteen days. The ledger beside
+#                       it (`scripts/doc-counts.toml`) ships empty on purpose — every
+#                       claim in the tree names its revision — and is ratcheted both
+#                       ways: an entry that exempts nothing fails.
 #                       And `scripts/check_anchor_drift.py` (#344): resolving is
 #                       not pointing, so a PR that adds or removes lines in an
 #                       anchored file is diffed against its merge base
@@ -462,6 +472,14 @@ jobs:
         run: python3 scripts/check_doc_line_anchors.py
       - name: The doc-line-anchor checker's own pass/fail cases
         run: python3 scripts/check_doc_line_anchors.py --selftest
+      # #641: a derived count in a live document must name the revision it measured
+      # (`docs/GATE-CONTRACT.md` §"Counts"). No gate can check that a number is
+      # *right*; this one checks that the sentence says which tree it is right about —
+      # #219 corrected a batch of them and #636 found three wrong sixteen days later.
+      - name: A derived count in a live document must name its revision
+        run: python3 scripts/check_doc_counts.py
+      - name: The doc-count checker's own pass/fail cases
+        run: python3 scripts/check_doc_counts.py --selftest
       # #344: resolving is not pointing. A PR that adds or removes lines in a file
       # the docs anchor into shifts every anchor below the edit, and the checker
       # above stays green because the numbers still resolve. This diffs `HEAD`

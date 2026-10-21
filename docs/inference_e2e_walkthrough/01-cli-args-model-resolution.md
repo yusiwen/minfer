@@ -8,6 +8,7 @@
 > **Code**: `src/main.rs` (`main`, `GenParams`, `print_usage`),
 > `src/download/mod.rs` (`resolve`, `resolve_cached_name`, `download_hf`,
 > `download_ollama`, `list_local`).
+> **Sizes**: the line counts in this page are measured at `c252e24`.
 
 ## 1. Background — where this stage sits
 

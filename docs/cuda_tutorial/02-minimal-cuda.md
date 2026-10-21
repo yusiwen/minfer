@@ -839,7 +839,7 @@ layer per step**, ~0.9 MB across the 24 transformer layers (Qwen2.5-0.5B is
 24 layers — `docs/inference_e2e_walkthrough/05-graph-builder-ir.md:161` (§2 "The main event: one forward pass, node by node")).
 Compare the attention output projection (`attn_q`, an `[896, 896]` Q4_0
 weight ≈ 451 KB *per layer* — walkthrough doc 14,
-`docs/inference_e2e_walkthrough/14-metal-backend.md:48` (§2 "Why f32 activations on the GPU when the CPU quan")) and elementwise ops
+`docs/inference_e2e_walkthrough/14-metal-backend.md:49` (§2 "Why f32 activations on the GPU when the CPU quan")) and elementwise ops
 are noise in the byte budget. Their cost is therefore not bandwidth but
 **latency**: launch overhead (microseconds per launch, host-side) plus the
 kernel's start-to-finish time. This is why the elementwise family is where
