@@ -618,6 +618,17 @@ and the fail-safe asks it too: a range the classifier cannot read counts as a de
 surface, exactly as it counts as `rust`. Presence, not truth, holds here as everywhere:
 the checker can force the sentence, never its contents.
 
+**The `Doc impact` section is the ninth heading, and the second whose need is computed.** A
+sentence can resolve, carry a current number, and still describe code that changed — the one
+class no checker can read (#643). So `scripts/classify_changes.py` also reports
+`doc_cited=true` when a live document anchors into a file the range changes (fail-safe `true`
+for a range it cannot read), `scripts/doc_impact.py` prints the candidates —
+`doc:line — §heading → target` — and `check_pr_body.py` then requires a filled `## Doc impact`
+section: re-read and still true, updated in this PR, or `N/A — <reason>`. The report is a
+convenience; the body section is the gate, and it proves only that the author looked, never that
+they were right. A changed file no document anchors into asks nothing, which is the point: the
+question is about the prose that cites the change, not about every PR.
+
 ### The doc gates (`check-docs`)
 
 Moved here from `AGENTS.md`, which keeps the two-line pointer.

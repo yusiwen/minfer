@@ -20,7 +20,8 @@ otherwise would be exactly the "passed for the wrong reason" failure
 
 Rules, kept simple and documented:
 
-- **Headings.** The eight required headings are matched as ATX headings at
+- **Headings.** The eight required headings — plus `Doc impact` when the change
+  classifier says a live document cites a changed file (#643) — are matched as ATX headings at
   level two or three (`##` / `###`), case-insensitively, with surrounding
   whitespace, trailing `#`s and surrounding emphasis/backticks ignored. The
   section body runs to the next heading at the same or a shallower level.
@@ -139,7 +140,9 @@ def parse_headings(lines: list[str]):
             yield i, len(heading_match.group(1)), heading_match.group(2)
 
 
-def sections(body: str) -> dict[str, tuple[int, str]]:
+def sections(
+    body: str, extra: tuple[str, ...] = ()
+) -> dict[str, tuple[int, str]]:
     """Map each required heading's normalized text to `(line_number, body_text)`.
 
     The first occurrence wins. A section body runs from the line after its
@@ -148,12 +151,13 @@ def sections(body: str) -> dict[str, tuple[int, str]]:
     """
     lines = body.splitlines()
     marks = list(parse_headings(lines))
+    known = set(REQUIRED_NORMS) | {normalize_heading(heading) for heading in extra}
     found: dict[str, tuple[int, str]] = {}
     for pos, (index, level, text) in enumerate(marks):
         if level not in (2, 3):
             continue  # only ## / ### identify a required section
         norm = normalize_heading(text)
-        if norm not in REQUIRED_NORMS or norm in found:
+        if norm not in known or norm in found:
             continue
         end = len(lines)
         for later_index, later_level, _ in marks[pos + 1 :]:
@@ -175,7 +179,12 @@ def section_state(text: str) -> str:
     return "filled"
 
 
-def check_body(body: str, decision_surface: bool = False, adr_question: str = "") -> list[str]:
+def check_body(
+    body: str,
+    decision_surface: bool = False,
+    adr_question: str = "",
+    doc_cited: bool = False,
+) -> list[str]:
     """Every problem with `body`, in template order; empty means it passes.
 
     ``decision_surface`` is the classifier's answer for the *range*: true when it
@@ -185,20 +194,21 @@ def check_body(body: str, decision_surface: bool = False, adr_question: str = ""
     decisions the range answers to (#541); it is quoted back in the failure so the
     message says *which* ADR is at stake instead of only that one is.
     """
-    found = sections(body)
+    found = sections(body, ("Doc impact",) if doc_cited else ())
     problems: list[str] = []
-    for position, heading in enumerate(REQUIRED_HEADINGS, start=1):
+    required = REQUIRED_HEADINGS + (("Doc impact",) if doc_cited else ())
+    for position, heading in enumerate(required, start=1):
         if heading.casefold() in found:
             continue
-        previous = REQUIRED_HEADINGS[position - 2] if position > 1 else None
-        where = f"required heading {position} of {len(REQUIRED_HEADINGS)}"
+        previous = required[position - 2] if position > 1 else None
+        where = f"required heading {position} of {len(required)}"
         if previous is not None:
             where += f', expected after "## {previous}"'
         else:
             where += " and must come first"
         problems.append(f'missing required heading "## {heading}" ({where})')
 
-    for heading in CONTENT_HEADINGS:
+    for heading in CONTENT_HEADINGS + (("Doc impact",) if doc_cited else ()):
         entry = found.get(heading.casefold())
         if entry is None:
             continue  # already reported as missing
@@ -273,6 +283,7 @@ def complete_body(
     bar: str = "the checker exits 0 on a template-shaped body and names the heading on each negative",
     mutation: str = "deleted `## Mutation evidence` -> exit 1, message names it",
     mac: str = "macbook (macOS 27.0.1, Apple M4 Pro) / 2026-10-07 / `cargo test --release`",
+    doc: str | None = None,
 ) -> str:
     """A body that passes: every heading present and all checked sections filled."""
     return (
@@ -288,7 +299,8 @@ def complete_body(
         "presence, not truth\n"
         "## Follow-ups\n"
         "N/A — none\n"
-        f"## Mac verification\n{mac}\n"
+        + (f"## Doc impact\n{doc}\n" if doc is not None else "")
+        + f"## Mac verification\n{mac}\n"
     )
 
 
@@ -462,12 +474,34 @@ def run_selftest() -> int:
         if not ok:
             failures += 1
             print(f"      got: {detail or 'no detail'}")
+    # #643: `## Doc impact` is asked for only when a live document cites a changed
+    # file; a stated non-applicability is a filled section, an empty one is not.
+    doc_cases = (
+        (
+            "a cited change with a filled Doc impact passes",
+            "N/A — no prose cites a changed file",
+            True,
+            None,
+        ),
+        ("a cited change with no Doc impact fails", None, False, "Doc impact"),
+        ("a cited change with an empty Doc impact fails", "", False, "Doc impact"),
+    )
+    for name, section, should_pass, expected in doc_cases:
+        problems = check_body(complete_body(doc=section), doc_cited=True)
+        ok = ((not problems) == should_pass) and (
+            expected is None or any(expected in problem for problem in problems)
+        )
+        print(f"{'PASS' if ok else 'FAIL'}  {name}")
+        if not ok:
+            failures += 1
+            print(f"      expected {'pass' if should_pass else f'a failure naming {expected!r}'}")
+            print(f"      got: {problems or 'pass'}")
     # The help text must state the limit (issue #175 acceptance).
     help_ok = HELP_LIMIT in build_parser().description
     print(f"{'PASS' if help_ok else 'FAIL'}  --help states the presence/truth limit")
     if not help_ok:
         failures += 1
-    total = len(selftest_cases()) + len(adr_cases) + 1
+    total = len(selftest_cases()) + len(adr_cases) + len(doc_cases) + 1
     print(f"check_pr_body selftest: {total - failures}/{total} cases pass")
     return 1 if failures else 0
 
@@ -515,6 +549,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--doc-cited",
+        metavar="true|false",
+        default="",
+        help=(
+            "the `changes` job's `doc_cited` answer: when true, a live document cites a "
+            "changed file and the body must carry a filled `## Doc impact` section (#643)"
+        ),
+    )
+    parser.add_argument(
         "--selftest",
         action="store_true",
         help="run the built-in pass/fail cases in-process and exit non-zero on a failure",
@@ -532,8 +575,12 @@ def main(argv: list[str]) -> int:
 
     body = read_body(args)
     decision_surface = args.decision_surface.strip().casefold() == "true"
+    doc_cited = args.doc_cited.strip().casefold() == "true"
     problems = check_body(
-        body, decision_surface=decision_surface, adr_question=args.adr_question.strip()
+        body,
+        decision_surface=decision_surface,
+        adr_question=args.adr_question.strip(),
+        doc_cited=doc_cited,
     )
     if problems:
         for problem in problems:
@@ -553,6 +600,7 @@ def main(argv: list[str]) -> int:
         f"check_pr_body: all {len(REQUIRED_HEADINGS)} required headings present and the "
         f"{len(CONTENT_HEADINGS)} checked sections filled (presence only, not truth)"
         + adr
+        + (f" · the Doc impact question is asked" if doc_cited else " · no doc cites a changed file (Doc impact not asked)")
     )
     return 0
 

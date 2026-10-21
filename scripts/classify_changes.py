@@ -185,14 +185,33 @@ def governed(root: Path, paths: list[str]) -> list[tuple[str, str, str]]:
     return out
 
 
+def doc_citations(root: Path, paths: list[str]) -> bool:
+    """Whether any changed path is the target of a live doc anchor (#643).
+
+    The reverse index `scripts/doc_impact.py` prints, reduced to a boolean: the PR
+    body's `## Doc impact` section is asked for when this is true. The checker owns
+    anchor resolution, so this imports it rather than growing a second notion of a
+    live anchor.
+    """
+    import check_doc_line_anchors as anchors
+
+    report = anchors.Checker(root).run()
+    targets = {anchor.target for anchor in report.anchors if anchor.target}
+    return any(path in targets for path in paths)
+
+
 def decide(
-    counts: dict[str, int], added: tuple[str, ...] = (), touched: int = 0
+    counts: dict[str, int],
+    added: tuple[str, ...] = (),
+    touched: int = 0,
+    doc_cited: bool = False,
 ) -> dict[str, bool]:
-    """The three predicates: the Rust jobs, the suite job's reason, and the ADR question."""
+    """The four predicates: Rust jobs, suite job's reason, ADR question, Doc impact."""
     return {
         "rust": counts["rust"] > 0,
         "baselines": counts["baselines"] > 0,
         "decision_surface": touched > 0 or any(DESIGN_DOC.match(p) for p in added),
+        "doc_cited": doc_cited,
     }
 
 
@@ -294,6 +313,7 @@ def emit(decision: dict[str, bool]) -> None:
     print(f"rust={'true' if decision['rust'] else 'false'}")
     print(f"baselines={'true' if decision['baselines'] else 'false'}")
     print(f"decision_surface={'true' if decision['decision_surface'] else 'false'}")
+    print(f"doc_cited={'true' if decision['doc_cited'] else 'false'}")
 
 
 # --------------------------------------------------------------------------
@@ -424,6 +444,14 @@ def run_selftest() -> int:
         RUST_DOC_FILES == (),
         f"RUST_DOC_FILES={RUST_DOC_FILES!r}",
     )
+    # #643: the fourth predicate is carried through, and it defaults to false — the
+    # question is asked by the caller, never assumed by `decide` itself.
+    record(
+        "doc_cited defaults to false and is carried when set",
+        decide(classify([]))["doc_cited"] is False
+        and decide(classify([]), doc_cited=True)["doc_cited"] is True,
+        "",
+    )
 
     # The range itself, end to end, in a hermetic repo: a docs commit, then a source
     # commit, then the three fail-safe ranges.
@@ -442,6 +470,23 @@ def run_selftest() -> int:
         _git_checked(root, "add", "-A")
         _git_checked(root, "commit", "-q", "-m", "c3 source")
         c3 = _git_checked(root, "rev-parse", "HEAD")
+        # #643: a document that cites a source file, kept in a commit of its own so the
+        # citation index sees it as tracked markdown.
+        (root / "docs" / "citing.md").write_text(
+            "See `src/lib.rs:1` for the thing.\n", encoding="utf-8"
+        )
+        _git_checked(root, "add", "-A")
+        _git_checked(root, "commit", "-q", "-m", "c4 cites source")
+        record(
+            "a doc citing a changed source file sets doc_cited",
+            doc_citations(root, ["src/lib.rs"]),
+            "",
+        )
+        record(
+            "a changed file no live doc cites does not",
+            not doc_citations(root, ["docs/chapter.md"]),
+            "",
+        )
 
         paths, reason = git_paths(root, c1, c2)
         record(
@@ -484,9 +529,9 @@ def run_selftest() -> int:
             "",
         )
         record(
-            "a docs range prints all three predicates false",
+            "a docs range prints every predicate false",
             run_main("--base", c1, "--head", c2)
-            == "rust=false\nbaselines=false\ndecision_surface=false\nadr_question=\n",
+            == "rust=false\nbaselines=false\ndecision_surface=false\ndoc_cited=false\nadr_question=\n",
             run_main("--base", c1, "--head", c2),
         )
 
@@ -557,21 +602,23 @@ def main(argv: list[str]) -> int:
         print(f"classify_changes: {reason} — running every code job", file=sys.stderr)
         # The fail-safe asks the ADR question too: a range nobody could read is not
         # evidence that no decision was taken.
-        emit({"rust": True, "baselines": False, "decision_surface": True})
+        emit({"rust": True, "baselines": False, "decision_surface": True, "doc_cited": True})
         print("adr_question=")
         return 0
 
     counts = classify(paths)
     added = tuple(git_added(root, base, head))
     touched = governed(root, paths)
-    decision = decide(counts, added, len(touched))
+    cited = doc_citations(root, paths)
+    decision = decide(counts, added, len(touched), cited)
     reasons = decision_reasons(touched, added)
     summary = ", ".join(f"{name}={counts[name]}" for name in CLASSES)
     print(
         f"classify_changes: {len(paths)} changed path(s) over {base}...{head} ({summary}) "
         f"→ rust={'true' if decision['rust'] else 'false'} "
         f"baselines={'true' if decision['baselines'] else 'false'} "
-        f"decision_surface={'true' if decision['decision_surface'] else 'false'}",
+        f"decision_surface={'true' if decision['decision_surface'] else 'false'} "
+        f"doc_cited={'true' if decision['doc_cited'] else 'false'}",
         file=sys.stderr,
     )
     for line in reasons:
