@@ -568,6 +568,32 @@ it is right about. The ledger beside it (`scripts/doc-counts.toml`, ADR-0023) is
 and ratchets both ways: an entry that exempts no claim fails, and it ships empty because, measured
 when the checker landed, all 62 claims in the tree already named their revision.
 
+## Transcriptions: include the source, don't copy it
+
+The same failure as a stale number, one layer down: a fenced listing that opens with a comment
+naming a source file is a **transcription claim**, and it is right only until the file changes.
+#219 corrected one such copy's text and #645 converted it; #647 found the next one already wrong
+(it quoted a Q6_K branch that had moved into `models/weight_reg.rs`).
+
+The fix is mechanical, because mdBook 0.4.37 supports anchor includes: wrap the source block in
+`// ANCHOR: <name>` / `// ANCHOR_END: <name>` and write
+
+    ```rust
+    {{#rustdoc_include ../../src/…:name}}
+    ```
+
+in the page. `rustdoc_include`, not `include`, because `scripts/check_figures.py` claims every
+plain include for figures (it failed this repository's build with `E203` the first time). The
+included text is the file's own bytes, so a rename, a reorder or a rewrite appears in the book
+without anyone re-copying it — and a renamed anchor is a build failure, which is the loud half.
+
+`scripts/check_doc_code_copies.py` (#647) enforces the direction of travel: a claim in a document
+with no ledger entry fails, more claims than `scripts/doc-transcriptions.toml` records fails, and
+**fewer** claims fails too, so a conversion must lower the count in the same commit. The ledger
+ships with the 94 claims the tree carried when the checker landed, in 13 documents; it is a
+migration list, not a permission, and each entry goes when its page is converted. The checker
+cannot make a *wrong* listing right — it makes the copy impossible to keep by accident.
+
 ## Writing the next gate — checklist
 
 1. What **value** does it assert, and how is that value computed independently

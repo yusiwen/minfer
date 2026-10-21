@@ -762,7 +762,7 @@ this order:
 
 So every M has a dedicated kernel: 1–8 → MMVQ, 9–∞ → MMQ. minfer's hole
 (nt=2–15 → legacy `*_f32_matmul`, from the `nt >= 16` tiled-GEMM gate at
-`src/cuda/methods/weights.rs:229` and the `nt == 1` MMVQ gates, e.g. `src/cuda/methods/weights.rs:307`)
+`src/cuda/methods/weights.rs:231` and the `nt == 1` MMVQ gates, e.g. `src/cuda/methods/weights.rs:309`)
 is exactly the seam between two tuned regimes that this chain does not
 have.
 

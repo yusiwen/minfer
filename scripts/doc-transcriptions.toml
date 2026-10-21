@@ -1,0 +1,82 @@
+# Hand-copied source listings, per document (#647).
+#
+# A fenced block whose first line names a repository source file is a `transcription
+# claim` — the page says "this is src/…, as it was when someone copied it". The fix is
+# `{{#rustdoc_include path:anchor}}`: the page renders the source itself, so the listing
+# cannot drift from the code. `scripts/check_doc_code_copies.py` reads this file:
+#
+#   1. a claim in a document with no entry fails (a new copy);
+#   2. more claims than `count` fails (a new copy in a migrated page);
+#   3. *fewer* claims than `count` fails too — a conversion must lower the number in the
+#      same commit, so the population can only shrink;
+#   4. an entry whose document carries no claim fails (the ledger may not rot).
+#
+# These entries are a migration list, not a permission. Each one should disappear when
+# its page is next edited: add `// ANCHOR: <name>` markers around the source block, put
+# `{{#rustdoc_include path:name}}` in the page, delete the entry's count by one and
+# re-run the checker. The frozen records are exempt inside the checker, not here.
+
+[[doc]]
+path = "docs/CLI-CONVERSATION-PLAN.md"
+count = 1
+reason = "a legacy listing copied from the source; bind it when the file is next edited"
+
+[[doc]]
+path = "docs/CUDA-TECH-PRIMER.md"
+count = 1
+reason = "a legacy listing copied from the source; bind it when the file is next edited"
+
+[[doc]]
+path = "docs/cuda_tutorial/02-minimal-cuda.md"
+count = 2
+reason = "tutorial page: the listing is teaching material copied from the source; bind it when the page is next edited"
+
+[[doc]]
+path = "docs/debug-dump.md"
+count = 1
+reason = "a legacy listing copied from the source; bind it when the file is next edited"
+
+[[doc]]
+path = "docs/inference_e2e_walkthrough/03-model-dispatch-weights.md"
+count = 2
+reason = "walkthrough page: the listing is teaching material copied from the source; bind it when the page is next edited"
+
+[[doc]]
+path = "docs/inference_e2e_walkthrough/04-tokenizer-template.md"
+count = 7
+reason = "walkthrough page: the listing is teaching material copied from the source; bind it when the page is next edited"
+
+[[doc]]
+path = "docs/inference_e2e_walkthrough/08-scheduler-execute.md"
+count = 10
+reason = "walkthrough page: the listing is teaching material copied from the source; bind it when the page is next edited"
+
+[[doc]]
+path = "docs/inference_e2e_walkthrough/09-prefill-forward-path.md"
+count = 1
+reason = "walkthrough page: the listing is teaching material copied from the source; bind it when the page is next edited"
+
+[[doc]]
+path = "docs/inference_e2e_walkthrough/10-cpu-matmul-kernels.md"
+count = 16
+reason = "walkthrough page: the listing is teaching material copied from the source; bind it when the page is next edited"
+
+[[doc]]
+path = "docs/inference_e2e_walkthrough/11-attention-vecops-kv.md"
+count = 8
+reason = "walkthrough page: the listing is teaching material copied from the source; bind it when the page is next edited"
+
+[[doc]]
+path = "docs/inference_e2e_walkthrough/12-sampler.md"
+count = 11
+reason = "walkthrough page: the listing is teaching material copied from the source; bind it when the page is next edited"
+
+[[doc]]
+path = "docs/inference_e2e_walkthrough/14-metal-backend.md"
+count = 21
+reason = "walkthrough page: the listing is teaching material copied from the source; bind it when the page is next edited"
+
+[[doc]]
+path = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
+count = 13
+reason = "walkthrough page: the listing is teaching material copied from the source; bind it when the page is next edited"

@@ -105,6 +105,15 @@
 #                       it (`scripts/doc-counts.toml`) ships empty on purpose — every
 #                       claim in the tree names its revision — and is ratcheted both
 #                       ways: an entry that exempts nothing fails.
+#                       And `scripts/check_doc_code_copies.py` (#647): a fenced block
+#                       whose first line names a repository source file is a
+#                       transcription claim — "this is src/…, as it was when I copied
+#                       it". #219 and #645 both found that rot. The page must include
+#                       the source instead (`{{#rustdoc_include path:anchor}}`, the
+#                       plain `{{#include}}` being reserved by the figure checker), and
+#                       the ledger beside it is a migration list that can only shrink:
+#                       a new claim fails, a conversion must lower its count in the
+#                       same commit, and an entry that covers nothing fails too.
 #                       And `scripts/check_anchor_drift.py` (#344): resolving is
 #                       not pointing, so a PR that adds or removes lines in an
 #                       anchored file is diffed against its merge base
@@ -480,6 +489,13 @@ jobs:
         run: python3 scripts/check_doc_counts.py
       - name: The doc-count checker's own pass/fail cases
         run: python3 scripts/check_doc_counts.py --selftest
+      # #647: a hand-copied source listing is the artefact that drifts. A fenced block
+      # claiming a repo source path must become `{{#rustdoc_include}}`; the ledger is a
+      # migration list that can only shrink (a conversion lowers its count here).
+      - name: A hand-copied source listing must become an include
+        run: python3 scripts/check_doc_code_copies.py
+      - name: The code-copy checker's own pass/fail cases
+        run: python3 scripts/check_doc_code_copies.py --selftest
       # #643: the reverse index, printed for the author — which live paragraphs cite a
       # file this PR changes. A report, never a gate: "no output" must not read as "no
       # impact", and the enforced half is the PR body's `## Doc impact` section.

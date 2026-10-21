@@ -141,6 +141,7 @@ impl CudaState {
         // sizing (see prewarm_prefill).
         self.max_nchunk
             .fetch_max(id / 32, std::sync::atomic::Ordering::Relaxed);
+        // ANCHOR: q6k_padded_repack
         const Q6KB: usize = 210;
         const Q6KPB: usize = 224;
         let nbe = id.div_ceil(256);
@@ -166,6 +167,7 @@ impl CudaState {
             .lock()
             .unwrap()
             .insert(name.to_string(), data.len());
+        // ANCHOR_END: q6k_padded_repack
         // D4-4 L1: dense split-plane (dpl) decode sibling plane — per row
         // [ql nbe*128][qh nbe*64][sc nbe*16][d nbe*2] at a 16B-aligned row
         // stride, 210B of content per 256-elem block (no 224B pad sectors).
