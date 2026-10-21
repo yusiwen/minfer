@@ -430,7 +430,7 @@ Two details of this table deserve unpacking.
 every node reads and writes `f32` slices, whatever its logical type. Token
 ids and positions are integers. Rather than special-case integer buffers,
 `fill_input_i32` stores each `u32` *bit pattern* reinterpreted as an `f32`
-value `fill_input_i32` (`alloc.rs:1903`), and the kernels that consume these inputs
+value `fill_input_i32` (`alloc.rs:1894`), and the kernels that consume these inputs
 (attention, KV store) convert back with `f32::to_bits() as usize`
 (`cpu_backend.rs:`, the store's position decode; `:919-920`, attention's). This is exact for values below 2²⁴ —
 vocabulary ids and positions never come close — and it keeps one uniform

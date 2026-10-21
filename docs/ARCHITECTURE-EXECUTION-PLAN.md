@@ -2152,7 +2152,10 @@ What S1 changed (production):
   no longer pass a row buffer (26 call sites migrated);
 - `KvCache::attn_span` resolves `cell = run.start + position`;
   `GraphAllocator::kv_cells_for_seq` fills `cells`, with the classic
-  single-sequence identity fallback when no run is reserved;
+  single-sequence identity fallback when no run was reserved *(deleted in
+  [#229](https://github.com/yusiwen/minfer/issues/229), 2026-10-21: an unreserved
+  sequence is now refused, and the single-sequence case still resolves `cells ==
+  positions` because `fill_batch_inputs` reserves the whole arena)*;
 - `fill_batch_inputs` / `fill_attn_inputs` / `fill_seq_ids` use relative positions,
   and `fill_attn_inputs` only resolves `cells` when the graph has that input (a
   rope-only fixture must not need a KV arena). *(History: `fill_attn_inputs` was
@@ -5810,10 +5813,15 @@ caller.**
   `fill_attn_inputs` → `kv_note_used` → `own_prefix` (E1 and `kv_note_used` deleted;
   `own_prefix` now test-only with its doc naming the tests). Its documented role is
   unchanged; only the "two fill entry points" comment was corrected.
-- Residual, not fixed (out of this ticket's scope, recorded): `kv_cells_for_seq`'s
-  `classic` branch (`arena_stats().sequences == 0` → `cell == position`) is now
-  reachable only from `alloc/tests.rs`; production always reserves before
-  `fill_seq_ids` runs, because `fill_batch_inputs`'s first loop covers every group.
+- Residual at the time (out of this ticket's scope, recorded; **closed by
+  [#229](https://github.com/yusiwen/minfer/issues/229) on 2026-10-21**):
+  `kv_cells_for_seq`'s `classic` branch (`arena_stats().sequences == 0` →
+  `cell == position`) had no production caller — `fill_batch_inputs` reserves every
+  group before `fill_seq_ids` runs — and, measured with a file-backed probe on
+  2026-10-21, no test caller either (0 hits over the 607-test suite). The branch is
+  deleted, so an unreserved sequence is refused by name, and
+  `a_sequence_without_a_reserved_run_is_refused_by_the_cell_resolver` drives the
+  refusal; restoring the branch makes that gate fail.
 
 **Mutation evidence (rule 3), CPU aarch64, 2026-09-30.** The production path must be
 the thing that goes red. Mutation: in `fill_batch_inputs`, own the **wrong** positions —
