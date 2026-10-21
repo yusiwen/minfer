@@ -1755,9 +1755,16 @@ impl GraphAllocator {
     /// runs the caller reserved (C6). This is what the KV store writes to, while
     /// `positions` stays the token's index within its sequence (what RoPE needs).
     ///
-    /// Production reaches it through [`Self::fill_batch_inputs`] →
-    /// [`Self::fill_seq_ids`]; the reservation that bounds every write is the one
-    /// `fill_batch_inputs` took.
+    /// **A sequence with no reserved run has no cell, and is refused by name**
+    /// (`has no reserved run`): the reservation is what bounds a write, so there is
+    /// no reservation-free fallback. Production reaches this through
+    /// [`Self::fill_batch_inputs`] → [`Self::fill_seq_ids`], and
+    /// `fill_batch_inputs` reserves a single sequence before filling it and refuses
+    /// a multi-sequence batch whose runs are missing, so a forward cannot reach the
+    /// refusal; the gate that drives it is the direct-call test
+    /// `a_sequence_without_a_reserved_run_is_refused_by_the_cell_resolver` in
+    /// `alloc::tests::kv_arena`. The test-only `fill_attn_inputs_without_cells` has
+    /// no `cells` input and never calls this.
     pub fn kv_cells_for_seq(
         &self,
         seq_ids: &[u32],
@@ -1771,29 +1778,13 @@ impl GraphAllocator {
             ));
         }
         let mut cells = Vec::with_capacity(positions.len());
-        // The classic single-sequence path holds no reservation: the sequence owns
-        // the whole arena, so `cell == position` (C1's identity). Any other
-        // unreserved sequence is an error — the same rule `fill_batch_inputs`
-        // applies when it reserves implicitly.
-        let classic = self.kv.arena_stats().sequences == 0;
-        let n_ctx = self.kv.n_ctx();
         for (t, (&seq, &rel)) in seq_ids.iter().zip(positions).enumerate() {
+            // C6: a cell exists only inside a reserved run — an unreserved sequence
+            // is a caller bug, refused rather than resolved by position.
             let Some(slot) = self.kv.seq_slot(seq) else {
-                if !classic {
-                    return Err(format!(
-                        "kv_cells_for_seq: query {t} has no reserved run (seq {seq})"
-                    ));
-                }
-                if n_ctx == 0 {
-                    return Err("kv_cells_for_seq: no KV arena allocated".to_string());
-                }
-                if rel >= n_ctx {
-                    return Err(format!(
-                        "kv_cells_for_seq: query {t} position {rel} is past the {n_ctx}-cell arena"
-                    ));
-                }
-                cells.push(rel as u32);
-                continue;
+                return Err(format!(
+                    "kv_cells_for_seq: query {t} has no reserved run (seq {seq})"
+                ));
             };
             // C8b S3: a run holds positions `[shared.rows, shared.rows + cap)` — the
             // lower positions are read from the donor's cells, and a store there would
