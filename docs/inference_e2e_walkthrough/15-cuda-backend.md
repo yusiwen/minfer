@@ -499,24 +499,13 @@ buffer.
 
 Special layouts register through special entries. The important one is Q6_K:
 the raw 210-byte block stride forces 1-byte-per-instruction weight loads that
-capped 7B decode near ~38 GB/s, so the loader repacks each block into a
+capped 7B decode near ~38 GB/s, so the registration rule routes it to
+`CudaState::register_weight_q6k_padded`, which repacks each block into a
 **224-byte slot** (a multiple of 16) and the kernels stream with aligned
 `uint4` loads:
 
 ```rust
-// src/models/qwen2/loader.rs:318 (`load`)
-if ttype == TensorType::Q6_K {
-    // 7e②: register Q6_K in the padded 224-byte block layout so
-    // the matmul kernel can use aligned uint4 weight loads
-    // (the raw 210-byte stride forces 1-byte-per-instruction
-    // reads and caps 7B decode near ~38 GB/s).
-    cuda.register_weight_q6k_padded(
-        &ti.name,
-        tensor.data(),
-        tensor.shape[1] as usize,
-        tensor.shape[0] as usize,
-    );
-}
+{{#rustdoc_include ../../src/cuda/methods/weights.rs:q6k_padded_repack}}
 ```
 
 That one repack was a 3.1× decode win (8.4 → 26.4 tok/s on 7B — the 7e②

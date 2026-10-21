@@ -474,7 +474,7 @@ file: *register a weight → use it → (never) free it*.
    (`:93-96`):
    `self.weights.lock().unwrap().insert(name.to_string(), (CudaPtr(ptr), data.len()))`.
    From here the *only* way to reach the buffer is
-   `get_weight_ptr` (`src/cuda/methods/weights.rs:567`) — the registry is the single owner, and dispatchers
+   `get_weight_ptr` (`src/cuda/methods/weights.rs:569`) — the registry is the single owner, and dispatchers
    resolve by name at execution time.
 4. **Use.** A decode step later, dispatch resolves the name to a device
    pointer and passes it to a launcher. The Rust side of `add_f32`
