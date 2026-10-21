@@ -1,6 +1,6 @@
 # minfer — AI Agent Context
 
-Pure-Rust LLM inference engine written from scratch (~55k LOC of Rust, ~93k with tests), llama.cpp-inspired, 0 ML framework deps.
+Pure-Rust LLM inference engine written from scratch, llama.cpp-inspired, 0 ML framework deps.
 Qwen2/Qwen2.5 + Qwen3 (dense) · CPU + Metal (macOS) + CUDA (opt-in) · GGUF v3.
 Inference runs through a **declarative compute graph** (builder → scheduler → per-backend kernels) — design + implementation record: `docs/COMPUTE-GRAPH-DESIGN.md`.
 

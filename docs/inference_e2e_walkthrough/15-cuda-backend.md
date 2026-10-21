@@ -1,7 +1,7 @@
 # 15 · The CUDA backend
 
 > **Stage**: the Metal contrast (doc 14) → **this stage: the same compute graph on NVIDIA GPUs** → end of the series ([Index](./index.md)).
-> **Code**: `src/graph/cuda_backend.rs` (`CudaBackend`, `execute_node_inner`, `graph_replay_step`), `src/cuda.rs` (`CudaState` singleton, `register_weight`, `matmul_f32_ptr_layout`, `prefill_mmq`, `gqa_attn_split`), `src/cuda/kernels/*.cu` (the CUDA C++ kernels — `common.cuh` + 17 translation units, 10,656 lines, since [#263](https://github.com/yusiwen/minfer/issues/263)), `build.rs` (the nvcc build chain).
+> **Code**: `src/graph/cuda_backend.rs` (`CudaBackend`, `execute_node_inner`, `graph_replay_step`), `src/cuda.rs` (`CudaState` singleton, `register_weight`, `matmul_f32_ptr_layout`, `prefill_mmq`, `gqa_attn_split`), `src/cuda/kernels/*.cu` (the CUDA C++ kernels — `common.cuh` + 17 translation units, since [#263](https://github.com/yusiwen/minfer/issues/263)), `build.rs` (the nvcc build chain).
 
 ## 1. Background — where this stage sits
 
@@ -27,7 +27,7 @@ builds.
 Three source files cooperate, and keeping their roles separate makes the rest
 of the document easy to follow:
 
-- **`src/cuda.rs` (1,014 lines of Rust)** plus the 18 `src/cuda/methods/*.rs` family files — the
+- **`src/cuda.rs`** plus the 18 `src/cuda/methods/*.rs` family files — the
   *device layer*. A
   process-wide singleton, `CudaState`, owns the CUDA context pieces: the
   device, one command stream, the weight registry (name → device pointer),
@@ -35,8 +35,8 @@ of the document easy to follow:
   function per kernel. It talks to the CUDA runtime through hand-written
   `extern "C"` declarations (there is no `-lcuda` crate and no bindgen — the
   FFI surface is explicit and auditable).
-- **`src/graph/cuda_backend.rs` (2,351 lines + 8,511 lines of tests in a 106-line parent and 11
-  `tests/<topic>.rs` files)** — the *graph
+- **`src/graph/cuda_backend.rs`** (the device suite lives in 11 `tests/<topic>.rs` files under a
+  module parent) — the *graph
   backend*. It implements the same `Backend` trait as the CPU and Metal
   backends (doc 08): `supports_op`, a device buffer pool, `execute_node`,
   host read/write, `synchronize`. Its job is translation, not math: turn a

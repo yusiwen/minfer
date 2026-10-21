@@ -889,8 +889,8 @@ Newer, still-standing items:
 
 ### 7.1 Device test suite
 
-`src/graph/cuda_backend.rs` carries the device suite (39 test functions); the device layer's own
-gates live in `src/cuda.rs`. Both are device-gated: tests skip when no CUDA device is present.
+`src/graph/cuda_backend.rs` carries the device suite in 11 `tests/<topic>.rs` files; the device
+layer's own gates live in `src/cuda.rs`. Both are device-gated: tests skip when no CUDA device is present.
 Categories and the invariants they pin:
 
 - **Capture / replay** — `cuda_graph_replay_bit_parity`, `cuda_prefill_shaped_graph_never_captures`,

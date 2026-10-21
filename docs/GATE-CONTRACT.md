@@ -529,6 +529,30 @@ The convention, stated once here and implemented as rule D:
 The convention for the *content* of a range is unchanged from §"Prose anchors" above: a
 heading or a symbol is still the stable locator, and a bare range is still the fallback.
 
+## Counts: state structure, not a derived number
+
+The other convention the doc gates cannot enforce: `check_doc_line_anchors.py` proves that a
+`path:NNN` resolves and that the backticked symbol still sits in it, and nothing checks that
+"2,351 lines" is still 2,351. A derived count is true for one merge and wrong for the next, so it
+decays into exactly the claim a reader cannot verify and a reviewer cannot see fail.
+
+[#636] is the evidence, and it is the second round. [#219] corrected these numbers on 2026-10-04;
+at `8c14286` (2026-10-20) the index's tree size was 27% low, the walkthrough's `src/cuda.rs` count
+was short by 2 lines, its `cuda_backend.rs` count by 170, and §7.1 still named a test count from
+before the suite split. The doc gates ran on the PRs that made those corrections and none could
+see any of it.
+
+So:
+
+- **State structure, not size.** "18 `src/cuda/methods/*.rs` family files", "11
+  `tests/<topic>.rs` files", "`common.cuh` + 17 translation units" are facts about the shape: they
+  move only when the shape moves, and a move is a visible edit.
+- **A count that is the point of a record carries its commit.** A survey, a baseline, a
+  measurement is a snapshot, and a snapshot names the revision it measured — the shape
+  `docs/TEST-BASELINES.md` already uses. Live prose does not quote one.
+- **An index is the worst place for a number.** `AGENTS.md` is loaded into every session and read
+  before anything else: a size there is a claim repeated thousands of times and re-measured never.
+
 ## Writing the next gate — checklist
 
 1. What **value** does it assert, and how is that value computed independently
@@ -725,6 +749,8 @@ answer from the PR, not as property tests.
 [#339]: https://github.com/yusiwen/minfer/issues/339
 [#356]: https://github.com/yusiwen/minfer/issues/356
 [#371]: https://github.com/yusiwen/minfer/issues/371
+[#219]: https://github.com/yusiwen/minfer/issues/219
+[#636]: https://github.com/yusiwen/minfer/issues/636
 [PR #343]: https://github.com/yusiwen/minfer/pull/343
 
 ## Decisions governing this document
