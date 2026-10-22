@@ -112,7 +112,26 @@ kernel void kernel_q4_k_f32_matmul(
     }
 }
 
-// ─── Q4_K × f32 prefill (multi-token) ───────────────────────
+// ─── Q4_K × f32 prefill (multi-token, weights read once) ─────
+//
+// The verify band (`1 < nt <= GEMM_MIN_NT`) runs on this kernel, so two things
+// are load-bearing and both are structural:
+//
+// * **Per-row bitwise with `kernel_q4_k_f32_matmul`.** The lane mapping, the
+//   block stride (4), the activation loads, the `acc1`/`acc2` float4 sums and the
+//   final scale/min expression are the single-row kernel's, verbatim. The only
+//   difference is where the token loop sits: `sumf[row][u]` separates the
+//   accumulators, so token `u`'s `+=` sequence is the single-row kernel's, in the
+//   same order (blocks ascending). That is what makes a spec-verify round's
+//   numbers the decode path's numbers (ADR-0010, ADR-0017) — and
+//   `small_batch_matvec_is_per_row_exact_for_every_quant` gates it.
+// * **One weight pass per round.** The token loop is INSIDE the block loop: the
+//   block's scales/nibbles are decoded once and reused for every token, which is
+//   the whole point of batching a verify round (a per-token pass re-streams the
+//   model's weights). `MAXT` bounds the accumulators, so `nt` stays unbounded
+//   (`MINFER_GEMM=0` also sends long prefills here, in chunks of `MAXT`).
+//
+// Grid: x = ceil(od / (NR0*NSG)), y = 1, TG = (32, NSG, 1) — unchanged.
 
 kernel void kernel_q4_k_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
@@ -123,65 +142,173 @@ kernel void kernel_q4_k_f32_matmul_multi(
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
-    const int QKK = 256; const int Q4KB = 144;
-    const short NR0 = 2; const short NSG = 2; const short NW = 32;
-    const int nbe = p[1] / QKK;
-    const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
-    const int row_stride = nbe * Q4KB;
+    constexpr short NR0 = 2;
+    constexpr short NSG = 2;
+    /// Tokens accumulated per weight pass; `nt` itself is unbounded. 4 keeps the
+    /// accumulator set (2 rows x 4) inside the register file: at 8 the compiler
+    /// spilled them and the kernel cost ~1.6 full weight passes per extra token,
+    /// which is worse than the GEMM it is meant to beat.
+    constexpr short MAXT = 4;
 
-    for (int t = 0; t < p[2]; t++) {
-        device const uchar * w0 = weights + (r0 + 0) * row_stride;
-        device const uchar * w1 = weights + (r0 + 1) * row_stride;
-        device const float  * y  = acts + t * p[1];
-        float sumf0 = 0.0f, sumf1 = 0.0f;
-        for (int ib = (int)tiisg; ib < nbe; ib += NW) {
-            device const uchar * blk0 = w0 + ib * Q4KB;
-            device const uchar * blk1 = w1 + ib * Q4KB;
-            float bd0 = float(*(device const half *)(blk0 + 0));
-            float bm0 = float(*(device const half *)(blk0 + 2));
-            float bd1 = float(*(device const half *)(blk1 + 0));
-            float bm1 = float(*(device const half *)(blk1 + 2));
-            device const uchar * sc0 = blk0 + 4; device const uchar * sc1 = blk1 + 4;
-             device const uchar * qs0 = blk0 + 16; device const uchar * qs1 = blk1 + 16;
-             device const float * yb = y + ib * QKK;
-             uchar sc0_s[8], sc0_m[8], sc1_s[8], sc1_m[8];
-             for (int j = 0; j < 8; j++) {
-                 get_scale_min_k4(j, sc0, sc0_s[j], sc0_m[j]);
-                 get_scale_min_k4(j, sc1, sc1_s[j], sc1_m[j]);
-             }
-             // Deinterleave qs nibbles: 4 chunks of 32 bytes, each covering 2 subblocks
-             uchar nb0[256], nb1[256];
-             for (int ci = 0; ci < 4; ci++) {
-                 device const uchar * ch0 = qs0 + ci * 32;
-                 device const uchar * ch1 = qs1 + ci * 32;
-                 for (int l = 0; l < 32; l++) {
-                     nb0[(2*ci)*32 + l] = ch0[l] & 0x0F;
-                     nb0[(2*ci+1)*32 + l] = ch0[l] >> 4;
-                     nb1[(2*ci)*32 + l] = ch1[l] & 0x0F;
-                     nb1[(2*ci+1)*32 + l] = ch1[l] >> 4;
-                 }
-             }
-             for (int s = 0; s < 8; s++) {
-                 float dsc0 = bd0 * sc0_s[s]; float dmn0 = bm0 * sc0_m[s];
-                 float dsc1 = bd1 * sc1_s[s]; float dmn1 = bm1 * sc1_m[s];
-                 device const float  * ys = yb + s * 32;
-                 float acc0 = 0.0f, acc1 = 0.0f, sumy = 0.0f;
-                 for (int k = 0; k < 32; k++) {
-                     float yv = ys[k];
-                     acc0 += (float)nb0[s * 32 + k] * yv;
-                     acc1 += (float)nb1[s * 32 + k] * yv;
-                     sumy += yv;
-                 }
-                 sumf0 += dsc0 * acc0 - dmn0 * sumy;
-                 sumf1 += dsc1 * acc1 - dmn1 * sumy;
-             }
+    constexpr ushort kmask1 = 0x3f3f;
+    constexpr ushort kmask2 = 0x0f0f;
+    constexpr ushort kmask3 = 0xc0c0;
+
+    const int nb = p[1] / 256;
+    const int row_stride = nb * 144;
+    const int r0 = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
+
+    const short ix = tiisg / 8;                      // 0...3
+    const short it = tiisg % 8;                      // 0...7
+    const short iq = it / 4;                         // 0 or 1
+    const short ir = it % 4;                         // 0...3
+
+    // A threadgroup's last tile can start past the output rows (od % 4 != 0), and
+    // only the guard on the store would catch it — but row 1's pointers are used
+    // unconditionally below, so both are clamped here instead (#431: the previous
+    // body read past the weight tensor for such a tile).
+    if (r0 >= p[0]) return;
+    const bool has1 = (r0 + 1) < p[0];
+
+    device const uchar * wrow[NR0];
+    wrow[0] = weights + (r0 + 0) * row_stride;
+    wrow[1] = has1 ? weights + (r0 + 1) * row_stride : wrow[0];
+
+    for (int t0 = 0; t0 < p[2]; t0 += MAXT) {
+        const int tn = min((int)MAXT, p[2] - t0);
+        float sumf[NR0][MAXT];
+        for (short row = 0; row < NR0; ++row) {
+            for (short u = 0; u < MAXT; ++u) sumf[row][u] = 0.0f;
         }
-        sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
-        if (tiisg == 0) {
-            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
-            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+
+        for (int ib = ix; ib < nb; ib += 4) {
+            // Decode this block's weight fields once, for both rows.
+            ushort q1r[NR0][4];
+            ushort q2r[NR0][4];
+            ushort sc16[NR0][4];
+            float  dh0r[NR0];
+            float  dh1r[NR0];
+            for (short row = 0; row < NR0; ++row) {
+                device const uchar * blk = wrow[row] + ib * 144;
+                device const ushort * sc = (device const ushort *)(blk + 4) + iq;
+                device const ushort * q1 = (device const ushort *)(blk + 16) + 16 * iq + 4 * ir;
+                device const half   * dh = (device const half *)(blk + 0);
+
+                const ushort sc16_0 = (ushort)(sc[0] & kmask1);
+                const ushort sc16_1 = (ushort)(sc[2] & kmask1);
+                const ushort sc16_2 = (ushort)(((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2));
+                const ushort sc16_3 = (ushort)(((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2));
+
+                sc16[row][0] = sc16_0;
+                sc16[row][1] = sc16_1;
+                sc16[row][2] = sc16_2;
+                sc16[row][3] = sc16_3;
+
+                for (short i = 0; i < 4; ++i) {
+                    q1r[row][i] = q1[i];
+                    q2r[row][i] = q1[32 + i];
+                }
+                dh0r[row] = float(dh[0]);
+                dh1r[row] = float(dh[1]);
+            }
+
+            for (int u = 0; u < tn; ++u) {
+                // The single-row kernel's activation slice, verbatim.
+                device const float * y4 = acts + (t0 + u) * p[1] + ib * 256 + 64 * iq + 8 * ir;
+
+                float yl[16];
+                float yh[16];
+                float4 sumy = { 0.0f, 0.0f, 0.0f, 0.0f };
+                for (short i = 0; i < 8; ++i) {
+                    yl[i +  0] = y4[i +  0]; sumy[0] += yl[i +  0];
+                    yl[i +  8] = y4[i + 32]; sumy[1] += yl[i +  8];
+                    yh[i +  0] = y4[i +128]; sumy[2] += yh[i +  0];
+                    yh[i +  8] = y4[i +160]; sumy[3] += yh[i +  8];
+                }
+
+                for (short row = 0; row < NR0; ++row) {
+                    float4 acc1 = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    float4 acc2 = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+                    for (short i = 0; i < 4; ++i) {
+                        acc1[0] += yl[2*i + 0] * (float)(q1r[row][i] & 0x000F);
+                        acc1[1] += yl[2*i + 1] * (float)(q1r[row][i] & 0x0F00);
+                        acc1[2] += yl[2*i + 8] * (float)(q1r[row][i] & 0x00F0);
+                        acc1[3] += yl[2*i + 9] * (float)(q1r[row][i] & 0xF000);
+                        acc2[0] += yh[2*i + 0] * (float)(q2r[row][i] & 0x000F);
+                        acc2[1] += yh[2*i + 1] * (float)(q2r[row][i] & 0x0F00);
+                        acc2[2] += yh[2*i + 8] * (float)(q2r[row][i] & 0x00F0);
+                        acc2[3] += yh[2*i + 9] * (float)(q2r[row][i] & 0xF000);
+                    }
+
+                    // The scale bytes are derived here rather than pre-expanded:
+                    // the values are identical (same masks), and four `ushort`
+                    // words instead of eight floats keeps the per-block state
+                    // small enough to stay in registers.
+                    const float sc8_0 = (float)(sc16[row][0] & 0xFF);
+                    const float sc8_1 = (float)(sc16[row][0] >> 8);
+                    const float sc8_2 = (float)(sc16[row][1] & 0xFF);
+                    const float sc8_3 = (float)(sc16[row][1] >> 8);
+                    const float sc8_4 = (float)(sc16[row][2] & 0xFF);
+                    const float sc8_5 = (float)(sc16[row][2] >> 8);
+                    const float sc8_6 = (float)(sc16[row][3] & 0xFF);
+                    const float sc8_7 = (float)(sc16[row][3] >> 8);
+
+                    sumf[row][u] +=
+                        dh0r[row] * ((acc1[0] + (1.0f/256.0f) * acc1[1]) * sc8_0 +
+                                     (acc1[2] + (1.0f/256.0f) * acc1[3]) * sc8_1 * (1.0f/16.0f) +
+                                     (acc2[0] + (1.0f/256.0f) * acc2[1]) * sc8_4 +
+                                     (acc2[2] + (1.0f/256.0f) * acc2[3]) * sc8_5 * (1.0f/16.0f)) -
+                        dh1r[row] * (sumy[0] * sc8_2 + sumy[1] * sc8_3 +
+                                     sumy[2] * sc8_6 + sumy[3] * sc8_7);
+                }
+            }
+        }
+
+        for (int u = 0; u < tn; ++u) {
+            const float s0 = simd_sum(sumf[0][u]);
+            const float s1 = simd_sum(sumf[1][u]);
+            if (tiisg == 0) {
+                output[(t0 + u) * p[0] + r0 + 0] = s0;
+                if (has1) output[(t0 + u) * p[0] + r0 + 1] = s1;
+            }
         }
     }
+}
+
+// ─── Q6_K dot: ONE arithmetic, two consumers ─────────────────
+//
+// The decode kernel (`nt == 1`) and the verify band (`1 < nt <= GEMM_MIN_NT`)
+// must produce bit-identical values for the same (row, position), because a
+// speculative round's identity contract is "the verify rows are the decode
+// path's own numbers" (ADR-0010, ADR-0017). Sharing the *source* of the dot —
+// rather than repeating its expression — is what makes that structural: Metal is
+// free to contract and reassociate float expressions, and a verbatim copy in a
+// second kernel compiles differently. Measured (M4 Pro, Q6_K, full-mantissa
+// data): a copied expression disagreed by ~1 ULP in 72% of the outputs, while
+// the same function inlined in both kernels is exact.
+inline float q6k_block_dot(
+    device const uchar * q1,
+    device const uchar * q2,
+    device const uchar * qh,
+    device const int8_t * sc,
+    float d,
+    thread const float * yl
+) {
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    float4 sums = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (short l = 0; l < 4; ++l) {
+        sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+        sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+        sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+        sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+    }
+    return d * (sums[0] * float(sc[0]) + sums[1] * float(sc[2])
+              + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
 }
 
 // ─── Q6_K × f32 matrix multiplication (simdgroup-cooperative) ──
@@ -203,11 +330,6 @@ kernel void kernel_q6_k_f32_matmul(
     // layout, float4 sums). Dispatch: TG(32, nsg=2), grid_x = od/(nr0*nsg).
     constexpr short NR0 = 2;
     constexpr short NSG = 2;
-
-    constexpr uint8_t kmask1 = 0x03;
-    constexpr uint8_t kmask2 = 0x0C;
-    constexpr uint8_t kmask3 = 0x30;
-    constexpr uint8_t kmask4 = 0xC0;
 
     const int nb = p[1] / 256;                       // super-blocks per row
     const int r0 = (int)tgpig.x;                     // grid tile (not row!)
@@ -253,17 +375,7 @@ kernel void kernel_q6_k_f32_matmul(
         }
 
         for (short row = 0; row < NR0; ++row) {
-            float4 sums = { 0.0f, 0.0f, 0.0f, 0.0f };
-
-            for (short l = 0; l < 4; ++l) {
-                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
-            }
-
-            sumf[row] += float(dh[0]) * (sums[0] * float(sc[0]) + sums[1] * float(sc[2])
-                                       + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
+            sumf[row] += q6k_block_dot(q1, q2, qh, sc, float(dh[0]), yl);
 
             q1 += row_stride;
             q2 += row_stride;
@@ -281,7 +393,14 @@ kernel void kernel_q6_k_f32_matmul(
     }
 }
 
-// ─── Q6_K × f32 prefill (multi-token) ───────────────────────
+// ─── Q6_K × f32 prefill (multi-token, weights read once) ─────
+//
+// Same two structural requirements as the Q4_K sibling above: the single-row
+// kernel's lane mapping (`tid`/`ix`/`ip`/`il`), stride (2) and `sums[0..3]`
+// expression are kept verbatim so each token's accumulation is the decode path's
+// bit for bit, while the token loop sits INSIDE the block loop so one pass over
+// the weights serves the whole verify round. Grid unchanged:
+// x = ceil(od / (NR0*NSG)), y = 1, TG = (32, NSG, 1).
 
 kernel void kernel_q6_k_f32_matmul_multi(
     device const uchar  * weights  [[buffer(0)]],
@@ -292,57 +411,81 @@ kernel void kernel_q6_k_f32_matmul_multi(
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
-    const int QKK = 256; const int Q6KB = 210;
-    const short NR0 = 2; const short NSG = 2; const short NW = 32;
-    const int nbe = p[1] / QKK;
-    const int r0  = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
-    const int row_stride = nbe * Q6KB;
+    constexpr short NR0 = 2;
+    constexpr short NSG = 2;
+    constexpr short MAXT = 4;   // see the Q4_K sibling's note on register pressure
 
-    for (int t = 0; t < p[2]; t++) {
-        device const uchar * w0 = weights + (r0 + 0) * row_stride;
-        device const uchar * w1 = weights + (r0 + 1) * row_stride;
-        device const float  * y  = acts + t * p[1];
-        float sumf0 = 0.0f, sumf1 = 0.0f;
-        for (int ib = (int)tiisg; ib < nbe; ib += NW) {
-            device const uchar * blk0 = w0 + ib * Q6KB;
-            device const uchar * blk1 = w1 + ib * Q6KB;
-            float bd0 = float(*(device const half *)(blk0 + 208));
-            float bd1 = float(*(device const half *)(blk1 + 208));
-            device const uchar * ql0 = blk0; device const uchar * ql1 = blk1;
-            device const uchar * qh0 = blk0 + 128; device const uchar * qh1 = blk1 + 128;
-            device const char  * sc0 = (device const char *)(blk0 + 192);
-            device const char  * sc1 = (device const char *)(blk1 + 192);
-            device const float * yb = y + ib * QKK;
-            for (int n = 0; n < 2; n++) {
-                for (int l = 0; l < 32; l++) {
-                    int is = l / 16;
-                    device const float * ys = yb + n * 128 + l;
-                    int q0_0 = ((int)(ql0[l] & 0xF) | (((int)(qh0[l] >> 0) & 3) << 4)) - 32;
-                    int q1_0 = ((int)(ql1[l] & 0xF) | (((int)(qh1[l] >> 0) & 3) << 4)) - 32;
-                    int q0_1 = ((int)(ql0[l + 32] & 0xF) | (((int)(qh0[l] >> 2) & 3) << 4)) - 32;
-                    int q1_1 = ((int)(ql1[l + 32] & 0xF) | (((int)(qh1[l] >> 2) & 3) << 4)) - 32;
-                    int q0_2 = ((int)(ql0[l] >> 4) | (((int)(qh0[l] >> 4) & 3) << 4)) - 32;
-                    int q1_2 = ((int)(ql1[l] >> 4) | (((int)(qh1[l] >> 4) & 3) << 4)) - 32;
-                    int q0_3 = ((int)(ql0[l + 32] >> 4) | (((int)(qh0[l] >> 6) & 3) << 4)) - 32;
-                    int q1_3 = ((int)(ql1[l + 32] >> 4) | (((int)(qh1[l] >> 6) & 3) << 4)) - 32;
-                    int si = is + n * 8;
-                    sumf0 += bd0 * float(sc0[si + 0]) * ys[0]  * float(q0_0)
-                           + bd0 * float(sc0[si + 2]) * ys[32] * float(q0_1)
-                           + bd0 * float(sc0[si + 4]) * ys[64] * float(q0_2)
-                           + bd0 * float(sc0[si + 6]) * ys[96] * float(q0_3);
-                    sumf1 += bd1 * float(sc1[si + 0]) * ys[0]  * float(q1_0)
-                           + bd1 * float(sc1[si + 2]) * ys[32] * float(q1_1)
-                           + bd1 * float(sc1[si + 4]) * ys[64] * float(q1_2)
-                           + bd1 * float(sc1[si + 6]) * ys[96] * float(q1_3);
+    const int nb = p[1] / 256;
+    const int row_stride = nb * 210;
+    const int r0 = ((int)tgpig.x * NSG + (int)sgitg) * NR0;
+
+    const short tid = tiisg / 2;
+    const short ix  = tiisg % 2;
+    const short ip  = tid / 8;                       // 0 or 1
+    const short il  = tid % 8;
+    const short l0  = 4 * il;
+    const short is  = 8 * ip + l0 / 16;
+
+    const short y_offset   = 128 * ip + l0;
+    const short q_offset_l =  64 * ip + l0;
+    const short q_offset_h =  32 * ip + l0;
+
+    if (r0 >= p[0]) return;
+    const bool has1 = (r0 + 1) < p[0];
+
+    device const uchar * wrow[NR0];
+    wrow[0] = weights + (r0 + 0) * row_stride;
+    wrow[1] = has1 ? weights + (r0 + 1) * row_stride : wrow[0];
+
+    for (int t0 = 0; t0 < p[2]; t0 += MAXT) {
+        const int tn = min((int)MAXT, p[2] - t0);
+        float sumf[NR0][MAXT];
+        for (short row = 0; row < NR0; ++row) {
+            for (short u = 0; u < MAXT; ++u) sumf[row][u] = 0.0f;
+        }
+
+        for (int i = ix; i < nb; i += 2) {
+            // This block's weight pointers, once for both rows.
+            device const uchar * q1p[NR0];
+            device const uchar * q2p[NR0];
+            device const uchar * qhp[NR0];
+            device const int8_t * scp[NR0];
+            float dh0r[NR0];
+            for (short row = 0; row < NR0; ++row) {
+                device const uchar * blk = wrow[row] + i * 210;
+                q1p[row] = blk + q_offset_l;
+                q2p[row] = blk + q_offset_l + 32;
+                qhp[row] = blk + 128 + q_offset_h;
+                scp[row] = (device const int8_t *)(blk + 192) + is;
+                dh0r[row] = float(*(device const half *)(blk + 208));
+            }
+
+            for (int u = 0; u < tn; ++u) {
+                // The single-row kernel's activation slice, verbatim.
+                device const float * y = acts + (t0 + u) * p[1] + i * 256 + y_offset;
+                float yl[16];
+                for (short l = 0; l < 4; ++l) {
+                    yl[4*l + 0] = y[l +  0];
+                    yl[4*l + 1] = y[l + 32];
+                    yl[4*l + 2] = y[l + 64];
+                    yl[4*l + 3] = y[l + 96];
                 }
-                ql0 += 64; ql1 += 64;
-                qh0 += 32; qh1 += 32;
+
+                // The SAME dot the decode kernel calls — see q6k_block_dot.
+                for (short row = 0; row < NR0; ++row) {
+                    sumf[row][u] += q6k_block_dot(q1p[row], q2p[row], qhp[row],
+                                                  scp[row], dh0r[row], yl);
+                }
             }
         }
-        sumf0 = simd_sum(sumf0); sumf1 = simd_sum(sumf1);
-        if (tiisg == 0) {
-            if (r0 + 0 < p[0]) output[t * p[0] + r0 + 0] = sumf0;
-            if (r0 + 1 < p[0]) output[t * p[0] + r0 + 1] = sumf1;
+
+        for (int u = 0; u < tn; ++u) {
+            const float s0 = simd_sum(sumf[0][u]);
+            const float s1 = simd_sum(sumf[1][u]);
+            if (tiisg == 0) {
+                output[(t0 + u) * p[0] + r0 + 0] = s0;
+                if (has1) output[(t0 + u) * p[0] + r0 + 1] = s1;
+            }
         }
     }
 }
