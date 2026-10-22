@@ -1574,7 +1574,8 @@ fn prefill_gemm_throughput_profile() {
     // 7B Q4_K_M prefill GEMMs (od=ne[1], id=ne[0] from `minfer info`):
     //   q4_K: attn_q/attn_output (3584/3584), attn_k (512/3584), ffn_gate/up (18944/3584)
     //   q6_K: attn_v (512/3584), ffn_down (3584/18944), output (152064/3584)
-    // Use the 64x32-tile GEMM (nt>=16) which is what prefill uses.
+    // Use the 64x32-tile GEMM (nt = 430, well above `GEMM_MIN_NT`) which is what
+    // a full prefill takes.
     let cases: &[(&str, TensorType, usize, usize)] = &[
         (
             "attn_q Q5_0  od=896    id=896   nt=430",
@@ -2010,4 +2011,165 @@ fn bf16_embed_gather_matches_the_reference() {
             assert_eq!(got[t * ne + i], want, "bf16 embed [{t},{i}]");
         }
     }
+}
+
+/// The small-batch band (`nt < GEMM_MIN_NT`) is served by the `_multi` matvec
+/// kernels, and every output row of a multi-row call must be **bitwise** the
+/// value the single-row kernel produces for that same activation row.
+///
+/// This is the invariant the speculative decoder's identity contract rests on: a
+/// verify round is one `nt = d + 1` forward whose rows must be the decode path's
+/// own numbers, position by position (ADR-0010's identity bar, ADR-0017's verify
+/// contract) — the band `--spec-draft` lives in. It is also the band no Metal
+/// test had ever dispatched: the prefill profile above starts at `nt = 430` (the
+/// GEMM), so `pp2..8` and the verify band had **zero** kernel-level coverage on
+/// the row-split arms (#431).
+///
+/// The comparison is on `to_bits`, and the activations are **full-mantissa**
+/// pseudo-random values (`0.5 + 0.125 t` would be exact, and every accumulation
+/// order would agree — the test would pass on an order change it exists to
+/// catch). Row `t`'s reference is the `nt == 1` call on row `t` alone, so a
+/// row-index error is visible too. Every case is reported, not just the first
+/// failure: one run says which arms are bitwise and which are not.
+#[test]
+fn small_batch_matvec_is_per_row_exact_for_every_quant() {
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let mps = MpsState::get().expect("MPS must be active");
+    let dev = &mps.inner.device;
+    let id = 512usize;
+    let nt_max = 8usize;
+    // od = 512 is inside the old `od < 2048` band (the matvec already served it);
+    // od = 4096 sat above it, so at nt <= 8 these cases also prove the policy flip
+    // (#431): the GEMM's 32-row tile is no longer taken below GEMM_MIN_NT.
+    let cases: &[(&str, TensorType, usize)] = &[
+        ("q4_0   od=512", TensorType::Q4_0, 512),
+        ("q4_1   od=512", TensorType::Q4_1, 512),
+        ("q5_0   od=512", TensorType::Q5_0, 512),
+        ("q5_1   od=512", TensorType::Q5_1, 512),
+        ("q8_0   od=512", TensorType::Q8_0, 512),
+        ("q4_k   od=512", TensorType::Q4_K, 512),
+        ("q5_k   od=512", TensorType::Q5_K, 512),
+        ("q6_k   od=512", TensorType::Q6_K, 512),
+        ("q4_0   od=4096", TensorType::Q4_0, 4096),
+        ("q8_0   od=4096", TensorType::Q8_0, 4096),
+        ("q4_k   od=4096", TensorType::Q4_K, 4096),
+        ("q6_k   od=4096", TensorType::Q6_K, 4096),
+    ];
+    let mut bad: Vec<String> = Vec::new();
+    for &(label, ttype, od) in cases {
+        let bq = quant_block_q(ttype);
+        let bb = quant_block_bytes(ttype);
+        let row_bytes = (id / bq) * bb; // one output row's weights
+        let wbytes = row_bytes * od;
+        let wb = dev
+            .newBufferWithLength_options(wbytes, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        // 0x33 everywhere: finite nibbles AND finite fp16 block scales, so no
+        // denormal/NaN path enters the comparison.
+        unsafe {
+            std::slice::from_raw_parts_mut(wb.contents().as_ptr() as *mut u8, wbytes).fill(0x33);
+        }
+        let acts = dev
+            .newBufferWithLength_options(
+                (id * nt_max * 4) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        unsafe {
+            let a =
+                std::slice::from_raw_parts_mut(acts.contents().as_ptr() as *mut f32, id * nt_max);
+            // xorshift64: deterministic, full mantissa, |v| < 1.
+            let mut st = 0x9E37_79B9_7F4A_7C15u64;
+            for v in a.iter_mut() {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                *v = ((st >> 40) as f32 / 8_388_608.0) - 1.0;
+            }
+        }
+        let out1 = dev
+            .newBufferWithLength_options((od * 4) as usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        // Reference: the single-row kernel, one row at a time.
+        let mut want: Vec<f32> = Vec::with_capacity(nt_max * od);
+        for t in 0..nt_max {
+            let cb = mps.cmd_buffer();
+            cb.quant_matmul_f32_on_gpu_buf(
+                &wb,
+                0,
+                ttype,
+                &acts,
+                (t * id * 4) as u64,
+                &out1,
+                od,
+                id,
+                1,
+            )
+            .unwrap_or_else(|e| panic!("{label}: single-row dispatch failed: {e}"));
+            cb.submit()
+                .unwrap_or_else(|e| panic!("{label}: single-row submit failed: {e}"));
+            unsafe {
+                want.extend_from_slice(std::slice::from_raw_parts(
+                    out1.contents().as_ptr() as *const f32,
+                    od,
+                ))
+            };
+        }
+        let mut case_bad = 0usize;
+        let mut first: Option<String> = None;
+        // 2 and 3 go through the production entry (so the policy itself is under
+        // test); 5 and 8 are forced onto the matvec kernels, which the policy only
+        // reaches through `MINFER_GEMM=0` — the kernels must be correct for every
+        // `nt` they can be dispatched with, not only for the band.
+        for (nt, forced) in [(2usize, false), (3, false), (5, true), (8, true)] {
+            let outn = dev
+                .newBufferWithLength_options(
+                    (od * nt * 4) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            let cb = mps.cmd_buffer();
+            let dispatched = if forced {
+                cb.quant_matmul_f32_matvec(&wb, 0, ttype, &acts, 0, &outn, od, id, nt)
+            } else {
+                cb.quant_matmul_f32_on_gpu_buf(&wb, 0, ttype, &acts, 0, &outn, od, id, nt)
+            };
+            dispatched
+                .unwrap_or_else(|e| panic!("{label} nt={nt}: multi-row dispatch failed: {e}"));
+            cb.submit()
+                .unwrap_or_else(|e| panic!("{label} nt={nt}: multi-row submit failed: {e}"));
+            let got = unsafe {
+                std::slice::from_raw_parts(outn.contents().as_ptr() as *const f32, od * nt)
+            };
+            for t in 0..nt {
+                for r in 0..od {
+                    if got[t * od + r].to_bits() != want[t * od + r].to_bits() {
+                        case_bad += 1;
+                        if first.is_none() {
+                            first = Some(format!(
+                                "nt={nt} row={t} col={r}: got {} want {}",
+                                got[t * od + r],
+                                want[t * od + r]
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if case_bad == 0 {
+            println!("  {label:<14} OK   nt 2/3/5/8 per-row exact (bitwise)");
+        } else {
+            println!(
+                "  {label:<14} FAIL {case_bad} value(s) differ; first {}",
+                first.unwrap_or_default()
+            );
+            bad.push(format!("{label}: {case_bad} value(s) differ"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "the multi-row matvec kernels are not per-row bitwise with the single-row kernels:\n  {}",
+        bad.join("\n  ")
+    );
 }
