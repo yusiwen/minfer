@@ -265,9 +265,10 @@ tiny-`pp` timing is a few ms of per-call setup, so the session's ambient dominat
 ratio across four sessions fell in 0.33-0.52 for k_m and 0.52-0.65 for q4_0). At
 `pp30` the engines are within ~±15 %. The gap is real and lives exactly where #40
 left it: the `nt∈[2,8]` small-od matmuls still take the serialized `_multi` kernel
-where llama runs `kernel_mul_mv_ext` (the batched matvec), because the GEMM gate is
-`nt >= 2 && (od >= 2048 || nt >= 9)` (`src/metal/ops.rs:40`), so a 0.5B's `attn_qkv`
-(od 1152) stays on the multi path through `nt` 8; the GEMM does kick in at `nt >= 9`,
+where llama runs `kernel_mul_mv_ext` (the batched matvec), because the GEMM gate was
+then `nt >= 2 && (od >= 2048 || nt >= 9)` — the same expression copied into all seven
+quant arms, now one function in `src/metal/policy.rs` (§0.4) — so a 0.5B's `attn_qkv`
+(od 1152) stays on the multi path through `nt` 8; the GEMM did kick in at `nt >= 9`,
 which is why the ratio improves through `pp12-16`.
 
 **Decision — kept deferred (2026-10-09).** The fix is a `mul_mv_ext`-style
@@ -282,6 +283,114 @@ prefill), or a batched-matvec kernel landing anyway for a larger reason. The wor
 filed as [#431](https://github.com/yusiwen/minfer/issues/431) so the finding is
 schedulable and searchable; the trigger above still decides when it is worth starting.
 Until then this is a decision, not an oversight.
+
+**Superseded 2026-10-22 — see [§0.4](#04-small-batch-band-rebuilt-on-measurement-2026-10-22-431--651).**
+The trigger fired (the speculative decoder verifies `nt = d + 1` rows), the band was
+re-measured on both axes, and the GEMM gate is no longer
+`nt >= 2 && (od >= 2048 || nt >= 9)`: it is `nt >= 4 && od >= 2048`, decided in one
+place (`policy::gemm_preferred`). The numbers below stay as the 2026-10-09 record.
+
+### §0.4 Small-batch band rebuilt on measurement (2026-10-22, #431 + #651)
+
+**Protocol.** `macbook (macOS 27.0.1, Apple M4 Pro, 48 GiB)`, models under
+`/Volumes/WD_BLACK/models/hf/Qwen/`, minfer `fdd92dd` + the change below, AC power.
+The box was **loaded** throughout (15-min load average 4.5-29 — Edge, an agent, and
+the build/test runs of this session), so every figure here is a single `-r 5`
+median, not the campaign's interleaved same-window A/B: treat the bands
+(±2-10 %) as wider than the digits suggest. Cost protocol: `minfer specverify -p
+512 -r 20`; prefill protocol: `minfer bench -p P -n 128 -r 5`; identity:
+`scripts/identity_battery.sh` (4 prompts × 200 greedy tokens, byte comparison).
+
+**Trigger.** §0.3 deferred the window by arguing that "a window real chat prompts
+never occupy" — and named "speculative-draft prefill" as the revisit trigger.
+[#651](https://github.com/yusiwen/minfer/issues/651) fired it: a speculative round
+verifies `nt = d + 1` rows (`d <= 7`), which is exactly this band. Measured before
+any change (the numbers the fix had to move):
+
+| target | `C_T(1)` | `C_T(3)` | `C_T(5)` | amortization `nt=3` | e2e spec `d=2` |
+|---|---|---|---|---|---|
+| Qwen2.5-7B q4_K_M | 20.61 ms | 100.84 ms | 103.07 ms | 0.61× | 19.6 tok/s = **0.43×** |
+| Qwen2.5-14B q4_K_M | 41.78 ms | 180.54 ms | 189.34 ms | 0.69× | 11.9 tok/s = **0.59×** |
+
+`C_T(5) ≈ C_T(3)` is the tell: the cost was **flat in `nt`**, which is the GEMM's
+32-row M tile spending 29 of its 32 rows on padding. Two further findings came out of
+the same probe, both filed/fixed here: `MINFER_GEMM=0` on a 14B **hung the GPU**
+(10 s submit timeout in `src/metal/backend`, `gpu_abort` path) because the Q4_K/Q6_K
+`_multi` kernels read past the weight tensor for a partial tile; and `specverify`
+labelled every Metal run `(cpu)`.
+
+**What changed (one PR).**
+
+1. **One dispatch authority.** `policy::gemm_preferred(nt, od)` +
+   `policy::gemm_enabled()` replace the same `nt >= 2 && (od >= 2048 || nt >= 9)`
+   expression that had been copied into all seven quant arms — the duplication
+   [#431](https://github.com/yusiwen/minfer/issues/431) was filed about, and the
+   reason the comments around it still claimed `nt >= 16`
+   ([#652](https://github.com/yusiwen/minfer/issues/652)).
+2. **The boundary is two-variable, both axes measured.** `nt >= 4 && od >= 2048`.
+   Rows: at `nt = 3` the GEMM costs 100.8 ms against 58.3 ms for the matvec family;
+   at `nt = 5` it is 103.1 against 114.4. Width: at `nt = 4..8` the 0.5B's narrow
+   rows (`od` 896-1152) lose through the GEMM by **1.56×** (341 vs 533 t/s), because
+   the 64-wide N tile is then the half that under-fills. The old rule's `od >= 2048`
+   half was right; its `nt >= 9` half was wrong.
+3. **Q4_K / Q6_K `_multi` rewritten** (`src/metal/kernels/mul_f32act_kquant.metal`):
+   the block's weights decode once, the token loop sits *inside* the block loop, and
+   each token keeps its own accumulators. `MAXT = 4` is load-bearing — at 8 the
+   accumulator set spilled and `nt = 3` cost 89 ms instead of 58 ms. Q6_K's block dot
+   became one `inline` function shared by the decode kernel and the `_multi` kernel:
+   a verbatim copy of the same expression disagreed with it by ~1 ULP in 72 % of the
+   outputs (Metal contracts/reassociates float code per kernel), which is enough to
+   break the verify band's bitwise contract.
+4. **Gates.** `policy::gate_tests` pins the boundary (device-free, no environment
+   mutation) and `small_batch_matvec_is_per_row_exact_for_every_quant` asserts that
+   `nt = 2/3/5/8` rows are **bitwise** the `nt = 1` value for all seven quant arms at
+   `od` 512 and 4096 — the band had no kernel-level test at all before this (the only
+   matmul test started at `nt = 430`, i.e. the GEMM).
+
+**Small-batch prefill, before → after** (0.5B, `bench -n 128 -r 5`; the "before"
+column is the §0.3 record of 2026-10-09):
+
+| | before | after | ratio |
+|---|---|---|---|
+| q4_K_M `pp2` | 230.5 | **350.4** | **1.52×** |
+| q4_K_M `pp4` | 306.1 | **491.8** | **1.61×** |
+| q4_K_M `pp8` | 446.8 | **772.1** | **1.73×** |
+| q4_K_M `pp30` | 2258.2 | 2276.3 | 1.01× |
+| q4_0 `pp2` | 279.1 | **427.5** | **1.53×** |
+| q4_0 `pp4` | 533.2 | 551.6 | 1.03× |
+| q4_0 `pp8` | 884.3 | 936.6 | 1.06× |
+| q4_0 `pp30` | 2432.8 | 2455.6 | 1.01× |
+| 7B q4_K_M `tg128` | 48.33 | 49.13 | 1.02× (no regression) |
+| 7B q4_K_M `pp30` | 285.93 | 288.12 | 1.01× (no regression) |
+
+The q4_K_M gains are the rewritten `_multi` kernels (that quant is the one the 0.5B
+uses for its narrow rows); q4_0's `pp2` gain is the policy alone (its `_multi`
+already streamed per token), and the rest of its rows are inside the noise band.
+
+**Speculative decoding on Metal: measured, and it still loses.** After the change:
+
+| target | `C_T(1)` | `C_T(3)` | `C_T(5)` | amortization `nt=3` | e2e spec `d=2` |
+|---|---|---|---|---|---|
+| 7B q4_K_M | 20.65 ms | **58.31 ms** | 99.47 ms | 1.06× | 31.6 tok/s = **0.70×** |
+| 14B q4_K_M | 39.83 ms | **110.26 ms** | 175.00 ms | 1.08× | 18.3 tok/s = **0.85×** |
+
+Acceptance is unchanged (61.1 % of drafted tokens at 2.22 tokens/round on the 7B;
+70.4 % / 2.37 on the 14B) and the identity battery stays **4/4 identical**. The
+verify forward is now 1.7× cheaper than before, but `C_T(3)/C_T(1) = 2.8×` against
+2.22 tokens per round — the round still costs more than it saves. The reason is
+structural, not a tuning miss: on this box decode already runs at **213 GB/s ≈ 78 % of
+peak**, so batching rows saves only the *weight* half of the traffic while the
+*activation* half grows per token; the GEMM's side is the M-padding, the matvec's side
+is per-token activation work. The CUDA campaign's `C_T(3)/C_T(1) = 1.22×` comes from
+a different regime (decode latency-bound on a 273 GB/s-class part with a 4 GB model),
+which is why its `2.14×` amortization does not transfer. **Conclusion: `d = 2` is
+0.70×/0.85× on Metal today and must not be enabled as a win; the priced next
+increment is a small-M (8/16-row) GEMM tile, the only structure that shares the
+activation side without paying 32-row padding.** The identity boundary that follows
+from the measured policy: `nt <= 3` is bitwise with decode on every shape, `nt >= 4`
+takes the GEMM for wide targets and is tolerance-class — stated rather than assumed,
+per [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) and
+[ADR-0017](adr/0017-speculative-decoding-refuses-what-it-cannot-carry.md).
 
 ### ✅ Done
 
