@@ -495,6 +495,37 @@ the `nt == 1` matvec reaches 214 GB/s. The next step is a diagnostic that times 
 loop and the mma loop separately (two variants of the same kernel, test-only), not another
 kernel design.
 
+**The staging hypothesis, tested and refuted (same day).** §0.5's guess was that the
+Q4_K **dequant staging** kept the GEMM at ≈30 % of peak. Two test-only variants of the same
+kernel — staging only (no mma loop) and mma only (constant fill instead of dequant, both
+keeping the barriers and the store) — measured at `nt = 32`, interleaved, min-of-3 after
+pre-warming every variant:
+
+| shape | `T_full` | `T_stage` | `T_mma` | mma marginal | dequant marginal (≤) | shared bucket |
+|---|---|---|---|---|---|---|
+| 7B attn 3584×3584 | 0.227 ms | 0.099 | 0.185 | 56.4 % | 18.5 % | 25.1 % |
+| 7B ffn 18944×3584 | 0.791 ms | 0.375 | 0.659 | 52.6 % | 16.7 % | 30.7 % |
+| 14B ffn 5120×13824 | 0.895 ms | 0.465 | 0.690 | 48.0 % | 22.9 % | 29.1 % |
+
+`T_stage + T_mma` is 1.24-1.31× `T_full` on every shape — expected, because the split
+variants duplicate both per-k-step barriers and the full kernel overlaps the next k-step's
+dequant with the current mma. The dequant specifically is **at most 17-23 %** of the time,
+and its marginal cost implies 172-289 GB/s on the weight bytes, i.e. already at DRAM
+roofline; the full kernel's low weight-stream rate (31.8-44.5 GB/s against staging-alone's
+72.9-101.8) is a *consequence* of the mma being the critical path, not evidence against the
+dequant.
+
+So the guess was wrong and the record keeps it that way: **the mma loop is the cost.** The
+mma-only variant runs at **3.30 TMAC/s** on both ffn shapes (≈40 % of the half-precision
+peak) while the full kernel is at 2.75/2.53 — even a free staging would leave the GEMM near
+40 %. The loop's visible candidates are its geometry (4 simdgroups × 8 accumulators per
+threadgroup) and **three `simdgroup_barrier(mem_none)` per 8×8×8 step — twelve per
+32-element K chunk for 32 mma ops**. A 2× mma improvement would take the 14B verify at
+`nt = 3` from 110 ms to ≈85 and at `nt = 5` from 178 to ≈110: parity at `d = 2` becomes
+plausible, `d = 4` stays out of reach. That work is a **prefill** lever (it moves `pp30+`,
+which sits at 0.86-0.93× of llama), and it should be accepted against that bar rather than
+against speculative decoding.
+
 **The 7B is out of reach and the record says why.** At `d=2` it would need verify ≤25 ms
 (from 99) to reach 1.2×; its draft alone is 7.8 ms/step — 71 % of the 21.9 ms/token — so
 even a free verify leaves it at 0.84×. The 14B is the only target worth kernel work.
