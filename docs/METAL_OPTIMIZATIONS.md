@@ -412,19 +412,92 @@ row-block's weights live while a fully unrolled `n`-token inner loop accumulates
 is what makes its verify round nearly free.
 
 **Corrected conclusion.** `d = 2` is 0.70×/0.85× *for minfer's kernels today*; it is
-**not** a property of this chip, and the priced next increment is **a faithful
-`kernel_mul_mv_ext` port for the K-quant arms** — not a smaller GEMM tile (an 8-row tile
-was prototyped and measured the same day: 0.125 ms at `nt=3` against 0.107 ms for the
-existing matvec and 0.224 ms for the 32-row GEMM, i.e. it loses exactly where it was
-meant to win, and wins only in the `nt=4..8` band that already routes to the GEMM).
-Acceptance for that work is the control above: same-box `d=2` ≥ 1.2×, `C_T(3)/C_T(1)`
-toward llama's ≈1.5, with the 4-prompt identity battery still 4/4.
+**not** a property of this chip. Both kernel increments this pointed at were then built and
+measured out — an 8-row GEMM tile and a port of llama's `mul_mv_ext` shape — so the
+increment is no longer a kernel design; see [§0.5](#05-two-no-go-kernels-and-where-the-verify-cost-lives-2026-10-22)
+for their numbers and for where the remaining gap actually is.
 
 The identity boundary that follows from the measured policy: `nt <= 3` is bitwise with
 decode on every shape, `nt >= 4` takes the GEMM for wide targets and is tolerance-class
 — stated rather than assumed, per
 [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) and
 [ADR-0017](adr/0017-speculative-decoding-refuses-what-it-cannot-carry.md).
+
+### §0.5 Two no-go kernels, and where the verify cost lives (2026-10-22)
+
+§0.4's control showed llama.cpp winning 1.19× (`d=2`) and 1.29× (`d=4`) with the *same*
+draft on this box while minfer loses. Two kernel experiments followed, both measured out.
+They are recorded because a negative result that is written down is cheaper than one that
+is rebuilt: the protocol was per-dispatch timing in one warm command buffer (each kernel
+dispatched `n` times, warmed, then timed — the `matmul_bandwidth_profile` method), with a
+single-token dispatch at the same shape as the "one weight pass" unit.
+
+**Experiment 1 — an 8-row token tile (`NR1 = 8`) for the Q4_K GEMM.** One threadgroup
+covers `64 od × 8 tokens`; the four simdgroups split the od axis instead of (token half,
+od half). Gate: bitwise against the 32-row tile over 3 shapes × `nt` 2/3/5/8 (12 cases),
+with a deliberate store-offset mutation that turned it red.
+
+| Q4_K attn_q, ms per dispatch (warm) | 8-row tile | per-row matvec | 32-row GEMM |
+|---|---|---|---|
+| 7B `nt=2` (7.2 MB) | 0.123 | **0.076** | 0.225 |
+| 7B `nt=3` | 0.125 | **0.107** | 0.224 |
+| 7B `nt=8` | 0.136 | 0.354 | **0.227** |
+| 14B `nt=3` (14.7 MB) | 0.191 | — | **0.323** |
+
+It halves the 32-row tile and is flat in `nt`, but it **loses to the per-row matvec exactly
+in the band it was built for** and wins only where the GEMM already runs. No wiring case.
+
+**Experiment 2 — llama's `mul_mv_ext` shape for Q4_K**: `float4` dequant, `dot(float4,
+float4)` accumulation, partial-lane `simd_shuffle_down`, one pipeline per token count
+(`r1ptg = nt`), 8 output rows per threadgroup. Gate: max relative error **1.37e-5** against
+the decode kernel (asserted at 2e-5), a ratchet that is **bitwise 0** against the 32-row
+GEMM on exactly-representable data, and a K-chunk mutation that turned both red.
+
+| ms per dispatch (warm) | `ext` | 32-row GEMM | per-row matvec |
+|---|---|---|---|
+| 7B `nt=4` | **0.162** | 0.220 | 0.140 |
+| 7B `nt=5` | 0.209 | 0.222 | 0.201 |
+| 7B `nt=8` | 0.292 | **0.220** | 0.349 |
+| 14B `nt=4` | 0.323 | **0.316** | 0.262 |
+| 14B `nt=8` | 0.592 | **0.317** | 0.720 |
+
+Per-row marginal, in units of one weight pass: **`ext` 1.23 (7B) / 1.44 (14B)**, the existing
+matvec **1.97 / 2.46**, the GEMM **0.0** by construction (its 32-row tile is paid once). So
+the port improved on the matvec and still lands an order of magnitude above the ~0.2 a
+weight-bound verify needs. Beating the GEMM at `nt=4` (1.36×) and losing at `nt=8` (0.75× /
+0.54×) is not a wiring case.
+
+**Attention is not the cost.** 7B `C_T(3)/C_T(5)` under the attention switches: default
+58.0 / 99.3 ms; `MINFER_NO_PREFILL_FLASH=1` 62.4 / 104.1; `MINFER_NO_MATMUL_ATTN=1` 58.1 /
+99.1; both 77.9 / 127.8. The shipped flash prefill is the fastest of the four, so the verify
+round's cost is in the matmuls.
+
+**What matching llama would take.** 14B, decode step 46.7 ms ours / 39.5 ms llama, 9 GB of
+weights (one pass = 39.5 ms):
+
+| | needs | has | factor |
+|---|---|---|---|
+| `d=2` (30.0 tok/s) | ≈70 ms verify | 110 ms | **1.57×** |
+| `d=4` (32.6 tok/s) | ≈70 ms verify | 178 ms | **2.54×** |
+
+`≈70 ms` is not a miracle number — one weight pass plus five rows of row work — so the
+target is the floor, and llama is at it. Note llama's two figures are nearly equal: its
+32-row `mul_mm` (which is what it uses at `ne11 = 3`, since its K-quant `mul_mv_ext` tier
+starts at 4) and its `mul_mv_ext` at `ne11 = 5` are both ≈one-pass class, while our two
+kernels are both ≈4.5 passes.
+
+**Where the remaining gap is — hypothesis, not yet measured.** Our 32-row GEMM does its MACs
+at ≈2.5 TMAC/s (≈30 % of the half-precision peak); llama's, by the same reverse arithmetic,
+≈6.7 TMAC/s (≈78 %). Same tile shape, same `simdgroup_half8x8`, so the prime suspect is the
+Q4_K **dequant staging** (`dequant_q4_k_16` → `sa`) rather than the mma — which is also
+consistent with the earlier profile showing this GEMM streaming weights at 32-46 GB/s while
+the `nt == 1` matvec reaches 214 GB/s. The next step is a diagnostic that times the staging
+loop and the mma loop separately (two variants of the same kernel, test-only), not another
+kernel design.
+
+**The 7B is out of reach and the record says why.** At `d=2` it would need verify ≤25 ms
+(from 99) to reach 1.2×; its draft alone is 7.8 ms/step — 71 % of the 21.9 ms/token — so
+even a free verify leaves it at 0.84×. The 14B is the only target worth kernel work.
 
 ### ✅ Done
 
