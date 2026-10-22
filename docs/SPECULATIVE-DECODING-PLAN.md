@@ -155,8 +155,7 @@ sections, real numbers) — docs 83+.
 | Acceptance p is prompt-dependent (code 3.1×, prose 1.7× in the battery) | Report per-prompt, never averages alone; stats per round |
 | `n_out = d+1` lm_head path | Already validated end-to-end by the specverify instrument (docs 81–82); n_out=1 decode path untouched when spec=off |
 | Draft model doubles footprint | 0.5 GB on top of 9 GB — fine on GB10; opt-in flag only |
-| Metal parity — **measured 2026-10-22, [#651](https://github.com/yusiwen/minfer/issues/651): not yet a win** | The verify forward is now 1.7× cheaper (`C_T(3)` 7B 100.8 → 58.3 ms, 14B 180.5 → 110.3 ms) and the identity battery is 4/4, but `C_T(3)/C_T(1) = 2.8×` against 2.22 tokens/round still loses: e2e `d=2` is 0.70× (7B) / 0.85× (14B). Decode on that part is bandwidth-bound (213 GB/s ≈ 78 % of peak), so batching rows saves only the weight half. Priced next step: a small-M (8/16-row) GEMM tile — [`METAL_OPTIMIZATIONS.md`](METAL_OPTIMIZATIONS.md) §0.4 |
-
+| Metal parity — **measured 2026-10-22, [#651](https://github.com/yusiwen/minfer/issues/651): the gap is our verify kernel, not the chip** | Same box, same 14B + 0.5B draft: llama.cpp `c479922ac` runs **1.19× (`d=2`) / 1.29× (`d=4`)** where minfer runs 0.86× / 0.63×. Decomposing the `d=4` round puts our verify at ≈156-175 ms (`nt=5`) against llama's ≈61 ms — **2.5-3× dearer at the same shape** — because our `_multi` matvec pays about one full weight pass per extra row (0.076 / 0.107 / 0.354 ms at `nt` 2 / 3 / 8 for a 7.23 MB matmul vs ≈32 µs a pass), while llama's `kernel_mul_mv_ext` amortizes. Priced next step: a faithful `mul_mv_ext` port for the K-quant arms; acceptance is the same-box control (≥1.2× at `d=2`). An 8-row GEMM tile was also prototyped and measured out. Records: [`METAL_OPTIMIZATIONS.md`](METAL_OPTIMIZATIONS.md) §0.4 |
 ## 7. Acceptance gates (campaign rules apply unchanged)
 
 Greedy token-identity vs the non-spec path (the spec path is an optimization,
