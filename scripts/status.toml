@@ -45,11 +45,13 @@ refreshed_against = "53b3ace"
 # value is compared *literally* against the plan's `Next: ….**` sentence, so the
 # two must be edited together. The macOS round-2 plan ([#333]) closed 2026-10-09 —
 # every §A ticket landed and the §B debt was measured, decided or filed — so the
-# sentence no longer names a Mac lane; the residual fixture work is [#428].
+# sentence no longer names a Mac lane. The last fixture work ([#428]) closed
+# 2026-10-22 with its two gate defaults moved onto the recorded cache, so the
+# sentence no longer names fixture work either.
 #
 # [#333]: https://github.com/yusiwen/minfer/issues/333
 # [#428]: https://github.com/yusiwen/minfer/issues/428
-next = "the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121), beginning with #428's three fixture producers, and F1's weight-repacking increment, which still wants an x86 host"
+next = "the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121), and F1's weight-repacking increment, which still wants an x86 host"
 
 # --- prose locations for the three scalars ----------------------------------
 

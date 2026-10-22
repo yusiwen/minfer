@@ -17,7 +17,7 @@ Phase D **complete** (3/3) (**D1 done**: views, multi-output via `split_parts`, 
 F8 done; **F1 waits for an x86 host**); Phase G
 **complete** (7/7) — G1–G7 all landed on a Mac (the KV port G5 and the
 measurement bookend G7 last; [#54](https://github.com/yusiwen/minfer/issues/54) recorded the round's final baseline).
-**Next: the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121), beginning with #428's three fixture producers, and F1's weight-repacking increment, which still wants an x86 host.** The order was
+**Next: the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121), and F1's weight-repacking increment, which still wants an x86 host.** The order was
 deliberate: the Metal KV port (G5) came **after** the CUDA arena stopped changing shape
 (C7, C7b, C8), so those semantics were written into Metal once — it landed on a Mac 2026-10-06. Per-ticket evidence is in
 each phase's record and in the §14 open-risks table.
@@ -10008,10 +10008,10 @@ NB-BT-only flag was never cleared for a 2-D f32 matmul weight. The shared rule t
 
 | Model | Provenance | Size |
 |---|---|---|
-| `/tmp/f167-work/qwen3-q4k.gguf` | HuggingFace **`unsloth/Qwen3-0.6B-GGUF`** `Qwen3-0.6B-Q4_K_M.gguf` (the official `Qwen/Qwen3-0.6B-GGUF` repo ships only Q8_0); a real Q4_K_M mix — 168 q4_K + 29 other quantized 2-D tensors | 396 705 472 B |
-| `/tmp/f167-work/qwen3-f16.gguf` | `llama-quantize --allow-requantize <cached `Qwen3-0.6B-Q8_0.gguf`> … F16` — 2-D f16, 1-D f32 | 1 198 182 048 B |
-| `/tmp/f167-work/qwen3-q4_0.gguf` | `minfer quantize --type q4_0` of the cached Q8_0 — the **ratio-equal** negative control (q4_0's bytes/element is exactly q4_K's) | 419 245 728 B |
-| `/tmp/f167-work/qwen3-f16-minfer-quantize.gguf` | `minfer quantize --type f16` of the cached Q8_0 — **not usable**, see below | 1 198 050 976 B |
+| `~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_K_M.gguf` | `llama-quantize … q4_K` on the recorded `qwen3-0.6b-f16.gguf` — the Q4_K_M mixture (168 q4_K + 29 q6_K + 113 f32); recorded 2026-10-19, `dgxspark` | 396 704 416 B |
+| `~/.cache/minfer/f6-src/qwen3-0.6b-f16.gguf` | `llama-quantize --allow-requantize <cached `Qwen3-0.6B-Q8_0.gguf`> … F16` — 2-D f16, 1-D f32 | 1 198 182 048 B |
+| `~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_0.gguf` | `llama-quantize … q4_0` on the same f16 source — the **ratio-equal** negative control (196 q4_0 + 1 q6_K + 113 f32; q4_0's bytes/element is exactly q4_K's); recorded 2026-10-19, `dgxspark` | 381 565 600 B |
+| `qwen3-f16-minfer-quantize.gguf` (rejected, not kept) | `minfer quantize --type f16` of the cached Q8_0 — **not usable**, see below | 1 198 050 976 B |
 
 `minfer quantize --type f16` was tried first, as the ticket suggested, and does **not** work: it is a
 pure element cast, so it writes the 1-D norms as f16 too, and the engine's f16 contract requires 1-D
@@ -10065,9 +10065,10 @@ reverted with `sha256sum -c` OK.
 
 **Honest scope.** (a) The **prefill win the dsc plane buys is not measured here** — the gate proves
 the plane exists, contains the right weights, and that the kernel's pointer-keyed lookup finds each;
-the r59 dsc prefill A/B on Qwen3 is not run. (b) The q4_K test model is a community quant
-(unsloth) because the official Qwen Qwen3-0.6B GGUF repo has only Q8_0; it is a real Q4_K_M mix, not
-a uniform q4_K, which is stronger for the type gate but means the per-tensor set is that file's.
+the r59 dsc prefill A/B on Qwen3 is not run. (b) The q4_K test model is the recorded
+`llama-quantize` Q4_K_M mixture, not a uniform q4_K — the per-tensor set is that file's, and the
+non-q4_K 2-D weights are what the type gate needs; the file and its producer are recorded in
+`tests/fixtures/f6-fixtures.json`.
 (c) The f16 test model is `llama-quantize`'s F16 of the cached Q8_0, so its weights are a q8_0
 re-quantization, not an HF bf16/f16 checkpoint; it preserves the 2-D-f16/1-D-f32 shape contract and
 is the same class of file #141 gated. (d) The f16 device gate's absolute bound (0.05) is looser than

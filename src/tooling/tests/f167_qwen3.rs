@@ -253,7 +253,10 @@ fn f167_qwen3_q4k_registers_the_dsc_plane_exactly() {
             eprintln!("skipping: no CUDA device");
             return;
         };
-        let Some(path) = env_path("MINFER_F167_Q4K_GGUF", "/tmp/f167-work/qwen3-q4k.gguf") else {
+        let Some(path) = env_path(
+            "MINFER_F167_Q4K_GGUF",
+            "~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_K_M.gguf",
+        ) else {
             return;
         };
         let ns = "f167q4k:";
@@ -383,7 +386,7 @@ fn f167_qwen3_q4k_registers_the_dsc_plane_exactly() {
 
         // Negative arms, each under its own namespace: a q8_0 Qwen3 (whose payload
         // is *longer* than q4_K's, so the payload gate is the only refuser) and a
-        // **q4_0** Qwen3 (`minfer quantize --type q4_0` of the same Q8_0 source).
+        // **q4_0** Qwen3 (`llama-quantize … q4_0` of the recorded f16 source).
         // q4_0's bytes/element ratio equals q4_K's exactly (18/32 == 144/256), so a
         // q4_0 payload passes the payload contract — the *type* gate is the only
         // thing that can refuse it, and this arm is what makes a type-gate bypass
@@ -430,7 +433,7 @@ fn f167_qwen3_q4k_registers_the_dsc_plane_exactly() {
         neg_arm(
             "q4_0",
             "MINFER_F167_NEG_Q40_GGUF",
-            "/tmp/f167-work/qwen3-q4_0.gguf",
+            "~/.cache/minfer/f6-src/ref/qwen3-0.6b-q4_0.gguf",
             "f167negq40:",
         );
     }
