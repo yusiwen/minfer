@@ -289,10 +289,15 @@ CUDA's `supports_op` gates RoPE to `NonInterleaved` only. All supported models a
 | `QkvBiasRopeStore` | `Err("op ... unsupported on Metal (CUDA-only)")` — reaching it is a scheduling invariant violation |
 
 **MatMul tiers** (`quant_matmul_f32_on_gpu_buf`): a simdgroup **GEMM** kernel (64×32 tile,
-128 threads, 8 KiB threadgroup scratch) when
-`nt >= 2 && (od >= 2048 || nt >= 9) && gemm_enabled()`; otherwise the **`_multi`** kernel for
-`nt > 1` (one threadgroup per two output rows); otherwise the **single-token** kernel. Every
-supported quant type has the tiers that matter. Guards: K-quant `id % 256 != 0` aborts via
+128 threads, 8 KiB threadgroup scratch) when `policy::gemm_preferred(nt, od) &&
+policy::gemm_enabled()`, i.e. `nt >= 4 && od >= 2048`; otherwise the **`_multi`** kernel for
+`nt > 1`; otherwise the **single-token** kernel. The boundary is one authority
+(`src/metal/policy.rs`, `src/metal/policy/gate_tests.rs`) and both axes are measured — rows
+because the 32-row M tile pads, width because the 64-wide N tile under-fills (the 0.5B's
+`od` 896-1152 rows lose 1.56× through the GEMM at `nt = 4..8`); see
+[`METAL_OPTIMIZATIONS.md`](METAL_OPTIMIZATIONS.md) §0.4. Every supported quant type has the
+tiers that matter, and `_multi` keeps the decode kernel's per-row arithmetic bitwise (gated
+by `small_batch_matvec_is_per_row_exact_for_every_quant`). Guards: K-quant `id % 256 != 0` aborts via
 `gpu_abort`; the GEMM checks the threadgroup-memory request against the device limit queried at
 init. `MINFER_GEMM=0` disables the GEMM tier for A/B. An **unregistered weight dtype** is refused
 with `Err` (#329) — the catch-all `_` arm is a guard, not a fallback (see the f32 paragraph below).

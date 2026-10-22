@@ -155,7 +155,7 @@ sections, real numbers) — docs 83+.
 | Acceptance p is prompt-dependent (code 3.1×, prose 1.7× in the battery) | Report per-prompt, never averages alone; stats per round |
 | `n_out = d+1` lm_head path | Already validated end-to-end by the specverify instrument (docs 81–82); n_out=1 decode path untouched when spec=off |
 | Draft model doubles footprint | 0.5 GB on top of 9 GB — fine on GB10; opt-in flag only |
-| Metal parity | CUDA first (campaign home turf); Metal is a follow-up, not a gate |
+| Metal parity — **measured 2026-10-22, [#651](https://github.com/yusiwen/minfer/issues/651): not yet a win** | The verify forward is now 1.7× cheaper (`C_T(3)` 7B 100.8 → 58.3 ms, 14B 180.5 → 110.3 ms) and the identity battery is 4/4, but `C_T(3)/C_T(1) = 2.8×` against 2.22 tokens/round still loses: e2e `d=2` is 0.70× (7B) / 0.85× (14B). Decode on that part is bandwidth-bound (213 GB/s ≈ 78 % of peak), so batching rows saves only the weight half. Priced next step: a small-M (8/16-row) GEMM tile — [`METAL_OPTIMIZATIONS.md`](METAL_OPTIMIZATIONS.md) §0.4 |
 
 ## 7. Acceptance gates (campaign rules apply unchanged)
 
