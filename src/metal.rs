@@ -376,15 +376,24 @@ impl MpsCommandBuffer<'_> {
         self.barrier();
     }
 
-    /// GEMM kernels (prefill nt>=16) are enabled unless MINFER_GEMM=0.
-    fn gemm_enabled() -> bool {
-        static GEMM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *GEMM.get_or_init(|| std::env::var("MINFER_GEMM").map_or(true, |v| v != "0"))
+    /// The **one** dispatch-policy authority shared by all seven quant arms
+    /// ([#431]): `true` takes the GEMM, `false` keeps the matvec kernels. The two
+    /// halves live in `policy` — `gemm_preferred` (the pure `(nt, od)` boundary,
+    /// device-free and tested by `policy::gate_tests`) and `gemm_enabled` (the
+    /// `MINFER_GEMM=0` A/B switch). Before this, the same
+    /// `nt >= 2 && (od >= 2048 || nt >= 9)` expression was copied into every arm,
+    /// so the two halves of one decision could and did drift: the comments still
+    /// claimed `nt >= 16` and that Q4_K "still falls back".
+    ///
+    /// [#431]: https://github.com/yusiwen/minfer/issues/431
+    fn use_gemm(nt: usize, od: usize) -> bool {
+        policy::gemm_preferred(nt, od) && policy::gemm_enabled()
     }
 
-    /// Dispatch a 64×32-tile simdgroup GEMM (NT≥16 prefill). GPU safety: the
-    /// kernels stage 8 KB of threadgroup memory (sa 4 KB + sb 2 KB + bc_out
-    /// 8 KB reusing sa/sb) — verified against the queried device limit.
+    /// Dispatch a 64×32-tile simdgroup GEMM (M = 32 rows, N = 64 output rows),
+    /// used from `GEMM_MIN_NT` rows up. GPU safety: the kernels stage 8 KB of
+    /// threadgroup memory (sa 4 KB + sb 2 KB + bc_out 8 KB reusing sa/sb) —
+    /// verified against the queried device limit.
     fn gemm_dispatch(
         &self,
         pl: &MetalComputePipelineState,

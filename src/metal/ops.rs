@@ -22,6 +22,47 @@ impl MpsCommandBuffer<'_> {
         id: usize,
         nt: usize,
     ) -> Result<(), String> {
+        self.quant_matmul_f32_dispatch(wb, w_off, ttype, x, x_off, out, od, id, nt, false)
+    }
+
+    /// Test-only twin of [`Self::quant_matmul_f32_on_gpu_buf`] that always takes
+    /// the per-row matvec kernels.
+    ///
+    /// The per-row exactness gate must cover the `_multi` kernels across their
+    /// whole `nt` range, but the production policy only routes `nt <
+    /// GEMM_MIN_NT` there — the rest is reachable solely through `MINFER_GEMM=0`,
+    /// which is a process-global latch a unit test cannot flip safely. Forcing the
+    /// path here keeps the kernel coverage independent of the policy.
+    #[cfg(test)]
+    pub fn quant_matmul_f32_matvec(
+        &self,
+        wb: &MetalBuffer,
+        w_off: u64,
+        ttype: TensorType,
+        x: &MetalBuffer,
+        x_off: u64,
+        out: &MetalBuffer,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) -> Result<(), String> {
+        self.quant_matmul_f32_dispatch(wb, w_off, ttype, x, x_off, out, od, id, nt, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn quant_matmul_f32_dispatch(
+        &self,
+        wb: &MetalBuffer,
+        w_off: u64,
+        ttype: TensorType,
+        x: &MetalBuffer,
+        x_off: u64,
+        out: &MetalBuffer,
+        od: usize,
+        id: usize,
+        nt: usize,
+        force_matvec: bool,
+    ) -> Result<(), String> {
         self.trace_op("matmul");
         // GPU safety (M1): the K-quant (super-block) kernels index weights by
         // K/256 super-blocks (floor). A non-256-aligned id silently drops the
@@ -37,7 +78,7 @@ impl MpsCommandBuffer<'_> {
         }
         match ttype {
             TensorType::Q8_0 => {
-                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
+                if !force_matvec && Self::use_gemm(nt, od) {
                     self.gemm_dispatch(
                         &self.state.pl_q8_0_mm_f32,
                         wb,
@@ -100,10 +141,9 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q4_K | TensorType::Q6_K => {
-                // Q6_K has a simdgroup GEMM (super-block); Q4_K still falls back
-                // to the scalar f32 multi (no Q4_K in the shipped 0.5B K_M models).
-                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
-                    // both Q4_K and Q6_K have simdgroup GEMMs
+                // Both Q4_K and Q6_K have a super-block simdgroup GEMM; the f32
+                // multi kernels below serve the `nt < GEMM_MIN_NT` band.
+                if !force_matvec && Self::use_gemm(nt, od) {
                     let pl = if ttype == TensorType::Q6_K {
                         &self.state.pl_q6_k_mm_f32
                     } else {
@@ -168,7 +208,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q4_1 => {
-                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
+                if !force_matvec && Self::use_gemm(nt, od) {
                     self.gemm_dispatch(
                         &self.state.pl_q4_1_mm_f32,
                         wb,
@@ -223,7 +263,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_0 => {
-                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
+                if !force_matvec && Self::use_gemm(nt, od) {
                     self.gemm_dispatch(
                         &self.state.pl_q5_0_mm_f32,
                         wb,
@@ -278,7 +318,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_1 => {
-                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
+                if !force_matvec && Self::use_gemm(nt, od) {
                     self.gemm_dispatch(
                         &self.state.pl_q5_1_mm_f32,
                         wb,
@@ -333,7 +373,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_K => {
-                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
+                if !force_matvec && Self::use_gemm(nt, od) {
                     self.gemm_dispatch(
                         &self.state.pl_q5_k_mm_f32,
                         wb,
@@ -388,11 +428,10 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q4_0 => {
-                // Prefill uses the simdgroup GEMM (faithful llama.cpp port, float
-                // accumulation). MINFER_GEMM=0 disables it (f32 multi fallback) for
-                // A/B comparison. GEMM wins for nt >= ~16 (fixed dispatch overhead
-                // dominates for tiny prefills).
-                if nt >= 2 && (od >= 2048 || nt >= 9) && Self::gemm_enabled() {
+                // Prefill takes the simdgroup GEMM (faithful llama.cpp port, float
+                // accumulation) from `GEMM_MIN_NT` rows up; `MINFER_GEMM=0` forces
+                // the f32 multi fallback at every nt (the A/B switch).
+                if !force_matvec && Self::use_gemm(nt, od) {
                     self.gemm_dispatch(
                         &self.state.pl_q4_0_mm_f32,
                         wb,

@@ -120,5 +120,55 @@ pub fn packed_attn_route(
     }
 }
 
+/// Smallest `nt` at which the multi-row GEMM beats the per-row matvec family —
+/// for an output width that can fill its N tile (see [`GEMM_MIN_OD`]).
+///
+/// The GEMM's M tile is a fixed 32 rows (`MpsCommandBuffer::gemm_dispatch`), so a
+/// call with fewer rows spends most of the tile on padding *and* pays the whole
+/// tile's compute; the matvec kernels instead read the weights once and pay the
+/// activation side per token. Measured on Metal (Qwen2.5-7B q4_K_M, M4 Pro, KV
+/// depth 512, `minfer specverify`, 20 reps): `nt = 1` 20.8 ms, `nt = 3` 58.3 ms
+/// against 100.8 ms for the GEMM at the same depth, and `nt = 5` 114.4 ms against
+/// 103.1 ms. The crossover therefore sits between 3 and 4 rows.
+/// [`GEMM_MIN_OD`] is the other half of the same measurement: at `nt = 4..8` a
+/// narrow output row (the 0.5B's `attn_qkv`, od 1152) still loses to the matvec
+/// family by 1.56x, because the GEMM's 64-wide N tile is then the half that
+/// under-fills.
+///
+/// Consequence for the speculative decoder: `d = 2` (verify `nt = 3`) lands in the
+/// matvec band and is bitwise against decode on every shape; `d >= 3` takes the
+/// GEMM for wide targets (tolerance-class) and stays matvec for narrow ones. That
+/// is measured, not assumed — the record lives in `docs/METAL_OPTIMIZATIONS.md`.
+///
+/// [#431]: https://github.com/yusiwen/minfer/issues/431
+pub const GEMM_MIN_NT: usize = 4;
+
+/// Smallest output width (`od`, the matmul's N dimension) at which the GEMM's
+/// 64-wide N tile is worth its M-tile padding.
+///
+/// Measured on the 0.5B q4_0 (`od` 896-1152): `nt = 4` costs 341 t/s through the
+/// GEMM against 533 t/s through the matvec family — the GEMM loses 1.56x when both
+/// tiles under-fill. Wide targets (a 7B's 3584-152064) are the GEMM's case.
+pub const GEMM_MIN_OD: usize = 2048;
+
+/// The dispatch policy's **pure** half: does a call with `nt` rows want the GEMM?
+///
+/// Split from [`gemm_enabled`] so the boundary is testable with **no device and no
+/// environment mutation** (`src/metal/policy/gate_tests.rs`) — the Metal module
+/// only compiles on macOS, but this half needs no GPU and no `MINFER_*` switch,
+/// which is what lets one authority serve all seven quant arms.
+pub fn gemm_preferred(nt: usize, od: usize) -> bool {
+    nt >= GEMM_MIN_NT && od >= GEMM_MIN_OD
+}
+
+/// Whether the GEMM path is available at all: `MINFER_GEMM=0` forces the per-row
+/// matvec family at every `nt` (the A/B switch). ON by default.
+pub fn gemm_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_GEMM").map_or(true, |v| v != "0"))
+}
+
+#[cfg(test)]
+mod gate_tests;
 #[cfg(test)]
 mod route_tests;
