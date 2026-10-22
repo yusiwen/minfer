@@ -246,12 +246,14 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
     };
     eprintln!("Model loaded.");
 
-    // Backend label (same availability checks bench uses).
-    #[cfg(feature = "cuda")]
-    let cuda_on = crate::cuda::CudaState::get().is_some();
-    #[cfg(not(feature = "cuda"))]
-    let cuda_on = false;
-    let backend = if cuda_on { "cuda" } else { "cpu" };
+    // Backend label: ask the *model* which device its forwards run on. The old
+    // probe was a cuda-feature check, so every Metal run printed `(cpu)` and the
+    // table read as a CPU measurement — the one thing a reader would mis-file.
+    let backend = match model.device() {
+        crate::models::Device::Cuda => "cuda",
+        crate::models::Device::Metal => "metal",
+        crate::models::Device::Cpu => "cpu",
+    };
 
     // KV sizing: depth + margin, clamped to the model's context length.
     let model_ctx_len: Option<usize> = {
