@@ -367,7 +367,8 @@ The q4_K_M gains are the rewritten `_multi` kernels (that quant is the one the 0
 uses for its narrow rows); q4_0's `pp2` gain is the policy alone (its `_multi`
 already streamed per token), and the rest of its rows are inside the noise band.
 
-**Speculative decoding on Metal: measured, and it still loses.** After the change:
+**Speculative decoding on Metal: our verify round is 2.5-3x more expensive than
+llama.cpp's, and that — not the chip — is why we lose.** After the change, on this box:
 
 | target | `C_T(1)` | `C_T(3)` | `C_T(5)` | amortization `nt=3` | e2e spec `d=2` |
 |---|---|---|---|---|---|
@@ -375,21 +376,54 @@ already streamed per token), and the rest of its rows are inside the noise band.
 | 14B q4_K_M | 39.83 ms | **110.26 ms** | 175.00 ms | 1.08× | 18.3 tok/s = **0.85×** |
 
 Acceptance is unchanged (61.1 % of drafted tokens at 2.22 tokens/round on the 7B;
-70.4 % / 2.37 on the 14B) and the identity battery stays **4/4 identical**. The
-verify forward is now 1.7× cheaper than before, but `C_T(3)/C_T(1) = 2.8×` against
-2.22 tokens per round — the round still costs more than it saves. The reason is
-structural, not a tuning miss: on this box decode already runs at **213 GB/s ≈ 78 % of
-peak**, so batching rows saves only the *weight* half of the traffic while the
-*activation* half grows per token; the GEMM's side is the M-padding, the matvec's side
-is per-token activation work. The CUDA campaign's `C_T(3)/C_T(1) = 1.22×` comes from
-a different regime (decode latency-bound on a 273 GB/s-class part with a 4 GB model),
-which is why its `2.14×` amortization does not transfer. **Conclusion: `d = 2` is
-0.70×/0.85× on Metal today and must not be enabled as a win; the priced next
-increment is a small-M (8/16-row) GEMM tile, the only structure that shares the
-activation side without paying 32-row padding.** The identity boundary that follows
-from the measured policy: `nt <= 3` is bitwise with decode on every shape, `nt >= 4`
-takes the GEMM for wide targets and is tolerance-class — stated rather than assumed,
-per [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) and
+70.4 % / 2.37 on the 14B) and the identity battery stays **4/4 identical**. The verify
+forward is 1.7× cheaper than before, but `C_T(3)/C_T(1) = 2.8×` against 2.22 tokens per
+round — so *our* round costs more than it saves.
+
+**The control that invalidates the obvious reading of that number** (added the same day;
+the first version of this section concluded "no configuration can win on this chip" and
+that conclusion was **wrong**):
+
+| 14B q4_K_M + 0.5B q4_K_M draft, `-n 64`, greedy | base | `d=2` | `d=4` | `d=8` | `ngram` (no draft) |
+|---|---|---|---|---|---|
+| minfer | 21.4 tok/s | 18.5 (**0.86×**) | 13.4 (**0.63×**) | — | — |
+| llama.cpp `c479922ac` (b11458) | 25.3 tok/s | 30.0 (**1.19×**) | 32.6 (**1.29×**) | 21.8 (0.86×) | 24.6 (0.97×) |
+
+Same machine, same two GGUFs, same prompt, same session (load average 11.7; a second
+session agreed: llama 23.3 → 30.25 at `d=2`). **llama.cpp wins 1.19-1.29× here with the
+same draft**, so the hardware and the draft are not the constraint, and the `ngram` row
+shows the win needs a draft rather than batching in general.
+
+Decomposing each engine's `d=4` round (tokens/round ≈ 2.5, llama decode step 39.5 ms,
+ours 46.7 ms, draft step 7.8 ms ours / ~4 ms llama):
+
+| | per token | round | minus 4 draft steps | verify `nt=5` | vs one decode step |
+|---|---|---|---|---|---|
+| minfer | 74.6 ms | ≈187 ms | 31 ms | ≈156 ms (specverify: 175) | **3.9-4.4×** |
+| llama.cpp | 30.7 ms | ≈77 ms | 16 ms | ≈61 ms | **1.1-1.6×** |
+
+**Same `nt`, same weights: llama's verify is 2.5-3× cheaper.** The cause is visible in
+the kernel-level profile above: our `_multi` matvec pays roughly **one full weight pass
+per extra row** (a 7.23 MB Q4_K matmul costs 0.076 ms at `nt=2`, 0.107 at `nt=3`,
+0.354 at `nt=8`, against ≈32 µs for one pass), so the "weights read once" rewrite
+separates the accumulators without amortizing on the hardware — it is
+activation/instruction-bound. llama's `kernel_mul_mv_ext` (its `mul_mv.metal`) keeps one
+row-block's weights live while a fully unrolled `n`-token inner loop accumulates, which
+is what makes its verify round nearly free.
+
+**Corrected conclusion.** `d = 2` is 0.70×/0.85× *for minfer's kernels today*; it is
+**not** a property of this chip, and the priced next increment is **a faithful
+`kernel_mul_mv_ext` port for the K-quant arms** — not a smaller GEMM tile (an 8-row tile
+was prototyped and measured the same day: 0.125 ms at `nt=3` against 0.107 ms for the
+existing matvec and 0.224 ms for the 32-row GEMM, i.e. it loses exactly where it was
+meant to win, and wins only in the `nt=4..8` band that already routes to the GEMM).
+Acceptance for that work is the control above: same-box `d=2` ≥ 1.2×, `C_T(3)/C_T(1)`
+toward llama's ≈1.5, with the 4-prompt identity battery still 4/4.
+
+The identity boundary that follows from the measured policy: `nt <= 3` is bitwise with
+decode on every shape, `nt >= 4` takes the GEMM for wide targets and is tolerance-class
+— stated rather than assumed, per
+[ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) and
 [ADR-0017](adr/0017-speculative-decoding-refuses-what-it-cannot-carry.md).
 
 ### ✅ Done

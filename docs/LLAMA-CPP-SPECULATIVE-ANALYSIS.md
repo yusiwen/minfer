@@ -347,6 +347,33 @@ Grammar interaction: `grammar_first=true` is passed for the draft side only; on 
 side the user's grammar applies through the normal chain (grammar-based resampling inside
 `common_sampler_sample`, `sampling.cpp:646–675`).
 
+### 6.4 What makes the batched decode cheap: the `mul_mv_ext` dispatch
+
+The round above is one `llama_decode` carrying `1 + d` rows, so its cost is decided by the
+Metal kernel the matmuls pick for `ne11 = 1 + d`. llama.cpp has a **third** matmul tier for
+exactly that band, selected in `ggml/src/ggml-metal/ggml-metal-ops.cpp`:
+
+- non-K quants (f16/bf16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/…): `ne11 >= 2 && ne11 <= 8` (`:2399`);
+- the K-quants Q4_K/Q5_K/Q6_K: `ne11 >= 4 && ne11 <= 8` (`:2408`).
+
+The selected kernel is `kernel_mul_mv_ext_<src0>_<src1>_r1_<n>` (`kernels/mul_mv.metal:602`,
+templated over `r1ptg`/`n`, with `nsg`/`nxpsg`/`r1ptg` chosen at `:2425+`). Its shape is
+what the whole technique depends on: **one row-block of weights stays live while an
+unrolled `n`-token inner loop accumulates**, so a verify round of `d + 1` rows pays one
+weight pass, not `d + 1`. This is the tier minfer lacks: its `_multi` kernels separate the
+per-token accumulators but still pay ≈one full pass *per row* (measured: 0.076 / 0.107 /
+0.354 ms at `nt` 2 / 3 / 8 for a 7.23 MB Q4_K matmul against ≈32 µs a pass —
+`docs/METAL_OPTIMIZATIONS.md` §0.4).
+
+Two facts a minfer port must take from this dispatch:
+
+- the K-quant ext starts at `ne11 = 4`, so `d = 2` (`ne11 = 3`) does **not** use it — yet
+  llama.cpp still beats minfer at `d = 2` (1.19× vs 0.86× on the same box), so whatever it
+  picks at three rows (`mul_mm` or the single-row `mul_mv`) is also cheaper than ours. That
+  second gap is open.
+- batching alone is not the win: `--spec-type ngram-simple` (no draft model) measured
+  0.97× on that box, while the drafted run measured 1.19-1.29×.
+
 ## 7. KV rollback: seq_rm vs checkpoints vs replay
 
 Whether partial acceptance needs special handling depends on the memory module, probed **at
