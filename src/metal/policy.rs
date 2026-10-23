@@ -173,11 +173,23 @@ pub const GEMM_MIN_NT: usize = 4;
 /// | 3584×3584 (7B attn) | 0.46 | 0.56 | 0.66 | 0.78 | 0.90 |
 /// | 18944×3584 (7B ffn) | 0.65 | 0.81 | 0.99 | 1.16 | 1.34 |
 /// | 5120×13824 (14B ffn) | 0.62 | 0.77 | 0.93 | 1.09 | 1.26 |
+/// | 152064×3584 (`output.weight`, Q6_K) | 0.94 | 1.18 | **1.41** | 1.65 | 1.89 |
+/// | 152064×3584 (`output.weight`, Q4_K) | 0.73 | 0.93 | **1.13** | 1.33 | 1.54 |
 ///
-/// `nt = 4` and `5` are unambiguous wins on every shape, so the floor is 6.
-/// `nt = 6` is neutral on two of the three (0.93-0.99, one 1.5x win) and the
-/// widest rows — `output.weight` at `od` 151936 — are unmeasured, so the GEMM
-/// keeps that row; `nt = 7` and above are the GEMM's by measurement.
+/// `nt = 4` and `5` are unambiguous wins on every working-set shape, so the floor
+/// is 6. `nt = 6` is neutral on two of the three working-set shapes (0.93-0.99, one
+/// 1.5x win) — and the row that settled it is `output.weight`, the widest N in
+/// every model, added to the profile on 2026-10-23: a `q4_K_M` file stores it as
+/// Q6_K padded to **152064** (K-quants block by 256; the vocabulary's 151936 is not
+/// a multiple, so 32-aligned types keep 151936 and K-quants pad). There the GEMM
+/// wins outright from `nt = 6` up (1.41x at 6, 1.65 at 7), which kills the
+/// floor-7 option and leaves 6 exact.
+///
+/// It also prices the *lower* option honestly: on that row, at `nt = 4, 5`, the
+/// matvec is 6-18 % slower for Q6_K (the type the row actually is) while it is
+/// still 7-27 % faster for Q4_K — and the row is 1 of ~170 matmuls, so the whole
+/// question is worth ~0.3-0.7 % of the verify cost, not a third policy axis and
+/// not the bitwise logits the matvec arm gives `d = 3, 4`.
 pub const GEMM_MIN_NT_SINGLE_GRID: usize = 6;
 
 /// Smallest output width (`od`, the matmul's N dimension) at which the GEMM's

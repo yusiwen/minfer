@@ -645,13 +645,34 @@ Method as §0.6: `n = 50` dispatches in one command buffer, every variant pre-wa
 | 18944×3584 (7B ffn) | **0.65** | **0.81** | 0.99 | 1.16 | 1.34 |
 | 5120×13824 (14B ffn) | **0.61** | **0.77** | 0.93 | 1.09 | 1.26 |
 
-`single grid / GEMM`, below 1.00 meaning the matvec wins. `nt = 4` and `5` win on every shape
-by 1.2-2.2×, which is what the floor of 6 buys. `nt = 6` is a tie on the two wide shapes
-(0.99, 0.93) and a 1.5× win only on the narrowest, and the crossover moves **right** with
-`od` — so the widest row in every model, `output.weight` at `od` 151936, would take the
-matvec at the wrong side of its own crossover. It stays on the GEMM until that shape is
-measured. `nt = 7, 8` are the GEMM's by measurement (1.09-1.34), which is why the band stops
-at 6 rather than at 8.
+`single grid / GEMM`, below 1.00 meaning the matvec wins. `nt = 4` and `5` win on every working-set
+shape by 1.2-2.2×, which is what the floor of 6 buys. `nt = 6` was a tie on the two wide shapes
+(0.99, 0.93) and a 1.5× win only on the narrowest, and the crossover moves **right** with `od` —
+so the widest row in every model, `output.weight`, was left on the GEMM unmeasured rather than bet
+on. `nt = 7, 8` are the GEMM's by measurement (1.09-1.34), which is why the band stops at 6 rather
+than at 8.
+
+**The row that was left unmeasured, measured (2026-10-23, same method, second session).** The
+profile now carries `output.weight` as its own case, on both K-quant types. The first thing that
+came out of it is a correction to the paragraph above: a `q4_K_M` file stores that row as **Q6_K
+padded to `od` 152064**, not 151936 — K-quants block by 256 and 152064 = 594 × 256, while the
+vocabulary's 151936 is not a multiple (32-aligned types such as Q8_0 keep 151936). The second is
+that the row decides the `nt = 6` question **against** raising the floor, and by more than the
+working-set shapes did:
+
+| od×id, type | nt=4 | nt=5 | nt=6 | nt=7 | nt=8 |
+|---|---|---|---|---|---|
+| 152064×3584, Q6_K (`output.weight`) | 0.94 | 1.18 | **1.41** | 1.65 | 1.89 |
+| 152064×3584, Q4_K | 0.73 | 0.93 | **1.13** | 1.33 | 1.54 |
+
+At `nt = 6` the GEMM is 41 % ahead on the Q6_K form, so a floor of 7 would have been a straight
+regression on the very row it was supposed to help — the "tie" at 6 was a narrow-shape artifact.
+The floor stays 6, now for a measured reason instead of a deferred one. The table also prices the
+*lower* direction: on that row the matvec is 6-18 % slower at `nt = 4, 5` for Q6_K (while still
+faster for Q4_K), but the row is 1 of ~170 matmuls, i.e. ~0.3-0.7 % of the verify — not worth a
+third policy axis, and not worth trading the bitwise logits the matvec arm gives `d = 3, 4`. No
+policy change came out of this measurement; the profile case and this paragraph are the whole
+deliverable.
 
 **Model level** (14B q4_K_M, `specverify -p 512 -r 20`, same box, greedy, both passes):
 
