@@ -867,12 +867,16 @@ kept its exact 70.4 % / 2.37 tokens/round.
 
 **The attribution, stated as such.** The verify trails llama by ~1.26-1.30×, it is 78 % matmul, and
 the matmul is at 1.33× per call at `nt = 3`. Four structural alternatives to that matmul were built
-and measured; none won, and the one that matches llama's own kernel lost by more. The remaining
-untried lever is the same one §3.6 named for the prefill GEMM — the mma geometry, at 3.30 TMAC/s
-against a ~40 %-of-peak ceiling — and the only hardware path past it (the tensor API) is one llama
-itself disables on this part. Until someone prices that geometry experiment, this step is **measured
-and not addressable by the structures we have**, which is the same verdict §3.6 reached from the
-prefill side.
+and measured; none won, and the one that matches llama's own kernel lost by more.
+
+That lands in the residual class §3.6 already established for the **prefill** GEMM — and it is the
+same class, not a neighbouring one: §3.6 measured the `mma` geometry itself (a grid-shape probe
+spanning 3.5-5.4 TF) alongside concurrency, fusion, small kernels, dequant type, the ik-loop barrier
+and sb-staging vectorization, and **none of them explained the 1.33×**, which it attributed to
+compiler-level scheduling below static visibility. So the geometry is *not* an untried lever; it is a
+tested one, and the only hardware path past this ceiling is the tensor API, which llama itself
+disables on this part (§3.6, `PARAMETER_AUDIT` A). Both rows of this ledger therefore end in the same
+place: **measured, and not addressable by any structure or knob either engine exposes today**.
 
 **Methodology, now mandatory for this document.** The box is an active desktop: the same `C_T(3)` read
 84.2 ms in the morning and 90-96 ms in the evening, and a stray background benchmark moves it 10 %.
