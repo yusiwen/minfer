@@ -665,6 +665,12 @@ working-set shapes did:
 | 152064×3584, Q6_K (`output.weight`) | 0.94 | 1.18 | **1.41** | 1.65 | 1.89 |
 | 152064×3584, Q4_K | 0.73 | 0.93 | **1.13** | 1.33 | 1.54 |
 
+A repeat at the shipped per-shape count (`n = 10`, see below) reproduced the three decisive cells
+within 1 %: Q6_K 0.95 / 1.18 / 1.42 at `nt = 4, 5, 6`, Q4_K 0.74 / 0.93 / 1.13. The wide cases now
+run `n = 10` dispatches per timed buffer instead of 50 — one dispatch there is 2-11 ms, so ten
+already bury the command-buffer floor, and fifty made the profile a 70-second tax (25 s now) on
+every macOS `cargo test` run.
+
 At `nt = 6` the GEMM is 41 % ahead on the Q6_K form, so a floor of 7 would have been a straight
 regression on the very row it was supposed to help — the "tie" at 6 was a narrow-shape artifact.
 The floor stays 6, now for a measured reason instead of a deferred one. The table also prices the
