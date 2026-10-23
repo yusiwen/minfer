@@ -530,6 +530,94 @@ against speculative decoding.
 (from 99) to reach 1.2×; its draft alone is 7.8 ms/step — 71 % of the 21.9 ms/token — so
 even a free verify leaves it at 0.84×. The 14B is the only target worth kernel work.
 
+### §0.6 The `_multi` scheduling change: one threadgroup per (row tile, token) (2026-10-23, #651 + #431)
+
+§0.5 changed the kernel and both attempts were measured out. This increment changes only the
+**scheduling**: the shipped single-token Q4_K/Q6_K kernel already takes its token from
+`tgpig.y` (`const int t = (int)tgpig.y; if (t >= p[2]) return;`) and addresses both operands
+by it, so dispatching it with `grid.y = nt` gives one threadgroup per (output-row tile,
+**token**) and the concurrent waves share the weight stream through L2. Production now does
+that for `nt <= 8`; `nt > 8` keeps `_multi` with `grid.y = 1` (that is the band
+`MINFER_GEMM=0` sends long prefills to, and it must not be charged `nt` threadgroups), and
+`nt == 1` is unchanged. No kernel body, policy tier or pipeline changed.
+
+Measured on `macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-23, AC power, load average
+13.5/11.7/8.4, `n = 50` dispatches in one command buffer, every variant pre-warmed, min of 3
+interleaved (Q4_K; "passes/row" is the per-extra-row weight-stream marginal in units of one
+weight pass, from the same run):
+
+| od×id | nt | `_multi` | single `grid.y=nt` | ratio | `_multi` passes/row | single passes/row |
+|---|---|---|---|---|---|---|
+| 3584×3584 | 3 | 0.1041 ms | **0.0737** | 1.41× | 1.37 | 0.84 |
+| 18944×3584 | 3 | 0.4823 | **0.3662** | 1.32× | 1.02 | 0.65 |
+| 5120×13824 | 3 | 0.7426 | **0.3954** | **1.88×** | 1.67 | 0.66 |
+| 3584×3584 | 5 | 0.2017 | **0.1248** | 1.62× | 1.59 | 0.89 |
+| 18944×3584 | 5 | 1.0802 | **0.6265** | 1.72× | 1.45 | 0.74 |
+| 5120×13824 | 5 | 1.3831 | **0.6754** | 2.05× | 1.77 | 0.74 |
+
+**Identity.** `f32::to_bits`-identical to `_multi` at 16/16 gate cases (Q4_K and Q6_K ×
+(3584, 3584) and (5120, 13824) × `nt = 2, 3, 5, 8`), and the **production** entry is gated
+bitwise against the forced `_multi` path at `nt = 2, 3` on both shapes plus `nt = 2, 3, 5, 8`
+on a narrow shape that keeps production on the matvec branch. A `grid.y → 1` mutation leaves
+tokens `1..nt` untouched and turns the production gate red (exit 101, first mismatch at
+`t=1`); the restored tree is byte-identical and green again.
+
+**Verify cost, `specverify -p 512 -r 20` on the 14B q4_K_M, same box:**
+
+| | `C_T(1)` | `C_T(3)` | `C_T(5)` | `nt=3` amortization |
+|---|---|---|---|---|
+| before (#654, 2026-10-22) | 39.83 ms | 110.26 ms | 175.00 ms | 1.08× |
+| after (this change) | 41.38 ms | **86.53 ms** | 176.17 ms | 1.43× |
+
+The per-extra-row verify cost — the quantity this change targets — moved from
+`(110.26 − 39.83) / 2 = 34.2 ms/row` to `(86.53 − 41.38) / 2 = 22.6 ms/row`, **1.51×
+better**, i.e. 0.55 decode-step-equivalents per row against llama's ≈0.43 and our previous
+≈0.82. `C_T(5)` is unchanged **by policy**, not by measurement: at `nt = 5` on these wide
+`od`s the default policy still takes the 32-row GEMM, which this change does not touch.
+`C_T(3)` landed at **86.5 ms against the 80 ms bar** — a miss of 6.5 ms. The residual is the
+part the dispatch cannot move: attention, norms, logits readback, plus the prefill half of
+the phase.
+
+**End-to-end, 14B q4_K_M + 0.5B q4_K_M draft, `-n 64`, greedy, two interleaved rounds,
+same prompt for all three arms** — the recorded baseline's prompt (`Explain the difference
+between TCP and UDP, and give one concrete example where each is the right choice.`). The
+prompt matters because acceptance is a property of prompt × model pair: an earlier run of
+this section used the battery's prose prompt, accepted 48.5 % at 1.94 tokens/round and read
+0.90× — a prompt confound, not a result of this change, and not the bar measurement.
+
+| | round 1 | round 2 | mean |
+|---|---|---|---|
+| sequential | 19.4 tok/s | 19.6 | 19.5 |
+| `--spec-draft-n 2` | **23.0** | **22.8** | **22.9 = 1.17×** |
+| `--spec-draft-adaptive` | 22.4 | 22.7 | 22.6 = 1.16× |
+
+The `d = 2` round accepted **70.4 %** of 54 drafted tokens at **2.37 tokens/round** —
+exactly the §0.4 baseline's yield, so the ratio compares the same work. It lands at
+**1.17×**, clearing the ≥1.1× bar.
+
+**The acceptance-independent number: round cost.** A speculative round is one verify at
+`nt = 3` plus two single-token draft steps (7.8 ms each, §0.4): before `110.26 + 2 × 7.8 =
+125.9 ms`, after `86.53 + 2 × 7.8 = 102.1 ms` — **1.23× cheaper per round** at an unchanged
+yield of 2.37 tokens/round (the yield is the model pair × prompt, not this kernel). That is
+53.1 → 43.1 ms/token, or 18.8 → 23.2 tok/s, matching the measured 23.0/22.8. The sequential
+rate this session was 19.4-19.6 tok/s against the 2026-10-22 record's 21.4 (ambient load 13
+vs 11.7), which is why the measured ratio sits above the recorded-sequential projection: the
+ratio is in-session, the round cost is the number that does not depend on the draw.
+
+**Controls.** The 4-prompt `scripts/identity_battery.sh` (7B q4_K_M target, 0.5B q4_K_M
+draft, adaptive) stays **4/4 identical**. `bench -p 4 -n 128 -r 3` / `-p 8` on the 7B q4_K_M:
+`pp4` 41.97 ± 0.25 t/s, `pp8` 74.14 ± 0.86, `tg128` 47.48 ± 0.23 / 47.20 ± 0.44. Those rows
+are untouched by construction — `nt = 4/8` on a 3584-wide `od` still takes the GEMM, and
+`nt = 1` never entered this branch — so they are a control, not a measured improvement.
+
+**What this does not fix, priced.** The e2e bar is now met at 1.17×, but `C_T(3)` is still
+6.5 ms above its 80 ms bar and the round is still dearer than llama's ≈70 ms target. Two
+increments are priced and still open: raising `GEMM_MIN_NT` 4 → 6 so `nt = 4, 5` take
+this same single-token grid (the dispatch table above measures 1.23-1.79× over the GEMM at
+`nt = 5` on all three shapes, but `nt = 4/6/7` must be measured first), and the same
+`grid.y = nt` dispatch for the remaining quant arms (Q8_0, Q5_K, Q4_0, …), each with its own
+A/B — the measured win here is Q4_K/Q6_K-specific and is not generalised.
+
 ### ✅ Done
 
 | # | Item | Measured effect | Commit (pre-rewrite) |
