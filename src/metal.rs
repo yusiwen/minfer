@@ -378,16 +378,21 @@ impl MpsCommandBuffer<'_> {
 
     /// The **one** dispatch-policy authority shared by all seven quant arms
     /// ([#431]): `true` takes the GEMM, `false` keeps the matvec kernels. The two
-    /// halves live in `policy` — `gemm_preferred` (the pure `(nt, od)` boundary,
-    /// device-free and tested by `policy::gate_tests`) and `gemm_enabled` (the
-    /// `MINFER_GEMM=0` A/B switch). Before this, the same
+    /// halves live in `policy` — `gemm_preferred` (the pure boundary, device-free
+    /// and tested by `policy::gate_tests`) and `gemm_enabled` (the `MINFER_GEMM=0`
+    /// A/B switch). Before this, the same
     /// `nt >= 2 && (od >= 2048 || nt >= 9)` expression was copied into every arm,
     /// so the two halves of one decision could and did drift: the comments still
     /// claimed `nt >= 16` and that Q4_K "still falls back".
     ///
+    /// `arm` is not a preference but a **capability**: a family whose matvec arm
+    /// can put one threadgroup per (row tile, token) pays about half the
+    /// per-extra-row cost the `_multi` arm does, so the GEMM takes two more rows
+    /// to win (`BandArm`, and the measurement in its doc).
+    ///
     /// [#431]: https://github.com/yusiwen/minfer/issues/431
-    fn use_gemm(nt: usize, od: usize) -> bool {
-        policy::gemm_preferred(nt, od) && policy::gemm_enabled()
+    fn use_gemm(nt: usize, od: usize, arm: policy::BandArm) -> bool {
+        policy::gemm_preferred(nt, od, arm) && policy::gemm_enabled()
     }
 
     /// Dispatch a 64×32-tile simdgroup GEMM (M = 32 rows, N = 64 output rows),
@@ -509,7 +514,7 @@ mod runtime;
 
 pub use policy::{
     flash_attn_enabled, matmul_attn_enabled, packed_attn_route, prefill_flash_enabled,
-    prefill_window_flash_enabled, rms_norm_256_enabled, PackedRoute,
+    prefill_window_flash_enabled, rms_norm_256_enabled, BandArm, PackedRoute,
 };
 
 #[cfg(test)]

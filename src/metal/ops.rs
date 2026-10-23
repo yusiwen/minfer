@@ -62,11 +62,13 @@ impl MpsCommandBuffer<'_> {
     /// `(32, 2)` and the absent threadgroup memory are the `nt == 1` path's,
     /// verbatim. Only the grid height differs (`nt` instead of 1).
     ///
-    /// The same dispatch production now takes for `nt <= 8`, kept test-only so the
-    /// gate and the A/B profile can reach it at `nt = 5/8` on wide targets too —
-    /// there the default policy routes to the GEMM and production would otherwise
-    /// hide the arm. The bitwise gate compares it against `_multi`, and against
-    /// the production entry wherever production really takes the matvec branch.
+    /// The same dispatch production takes for the band — `nt <= 8` on a narrow
+    /// `od`, `nt <= 6` on a wide one (the single-grid arm's GEMM floor, see
+    /// `policy::BandArm`) — kept test-only so the gate and the A/B profile can
+    /// reach it at `nt = 7, 8` on wide targets too, where the policy routes to the
+    /// GEMM and production would otherwise hide the arm. The bitwise gate compares
+    /// it against `_multi`, and against the production entry wherever production
+    /// really takes the matvec branch.
     /// `Q4_K`/`Q6_K` only; every other type is an `Err`, so a profile cannot
     /// silently measure a different arm.
     #[cfg(test)]
@@ -160,7 +162,7 @@ impl MpsCommandBuffer<'_> {
         }
         match ttype {
             TensorType::Q8_0 => {
-                if !force_matvec && Self::use_gemm(nt, od) {
+                if !force_matvec && Self::use_gemm(nt, od, BandArm::MultiOnly) {
                     self.gemm_dispatch(
                         &self.state.pl_q8_0_mm_f32,
                         wb,
@@ -225,8 +227,10 @@ impl MpsCommandBuffer<'_> {
             TensorType::Q4_K | TensorType::Q6_K => {
                 // Both Q4_K and Q6_K have a super-block simdgroup GEMM above the
                 // small-batch band; below it the matvec branch picks the
-                // single-token kernel (grid.y = nt) or `_multi` by `nt`.
-                if !force_matvec && Self::use_gemm(nt, od) {
+                // single-token kernel (grid.y = nt) or `_multi` by `nt`. The
+                // single-token arm is why this pair's GEMM floor is two rows
+                // higher than every other arm's (`BandArm::SingleGrid`).
+                if !force_matvec && Self::use_gemm(nt, od, BandArm::SingleGrid) {
                     let pl = if ttype == TensorType::Q6_K {
                         &self.state.pl_q6_k_mm_f32
                     } else {
@@ -313,7 +317,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q4_1 => {
-                if !force_matvec && Self::use_gemm(nt, od) {
+                if !force_matvec && Self::use_gemm(nt, od, BandArm::MultiOnly) {
                     self.gemm_dispatch(
                         &self.state.pl_q4_1_mm_f32,
                         wb,
@@ -368,7 +372,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_0 => {
-                if !force_matvec && Self::use_gemm(nt, od) {
+                if !force_matvec && Self::use_gemm(nt, od, BandArm::MultiOnly) {
                     self.gemm_dispatch(
                         &self.state.pl_q5_0_mm_f32,
                         wb,
@@ -423,7 +427,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_1 => {
-                if !force_matvec && Self::use_gemm(nt, od) {
+                if !force_matvec && Self::use_gemm(nt, od, BandArm::MultiOnly) {
                     self.gemm_dispatch(
                         &self.state.pl_q5_1_mm_f32,
                         wb,
@@ -478,7 +482,7 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q5_K => {
-                if !force_matvec && Self::use_gemm(nt, od) {
+                if !force_matvec && Self::use_gemm(nt, od, BandArm::MultiOnly) {
                     self.gemm_dispatch(
                         &self.state.pl_q5_k_mm_f32,
                         wb,
@@ -536,7 +540,7 @@ impl MpsCommandBuffer<'_> {
                 // Prefill takes the simdgroup GEMM (faithful llama.cpp port, float
                 // accumulation) from `GEMM_MIN_NT` rows up; `MINFER_GEMM=0` forces
                 // the f32 multi fallback at every nt (the A/B switch).
-                if !force_matvec && Self::use_gemm(nt, od) {
+                if !force_matvec && Self::use_gemm(nt, od, BandArm::MultiOnly) {
                     self.gemm_dispatch(
                         &self.state.pl_q4_0_mm_f32,
                         wb,
