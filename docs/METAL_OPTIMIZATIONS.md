@@ -287,8 +287,9 @@ Until then this is a decision, not an oversight.
 **Superseded 2026-10-22 — see [§0.4](#04-small-batch-band-rebuilt-on-measurement-2026-10-22-431--651).**
 The trigger fired (the speculative decoder verifies `nt = d + 1` rows), the band was
 re-measured on both axes, and the GEMM gate is no longer
-`nt >= 2 && (od >= 2048 || nt >= 9)`: it is `nt >= 4 && od >= 2048`, decided in one
-place (`policy::gemm_preferred`). The numbers below stay as the 2026-10-09 record.
+`nt >= 2 && (od >= 2048 || nt >= 9)`: it is `od >= 2048` plus `nt >= 4` on the `_multi` arm
+and `nt >= 6` on the Q4_K/Q6_K single-grid arm (§0.7), decided in one
+place (`policy::gemm_preferred(nt, od, arm)`). The numbers below stay as the 2026-10-09 record.
 
 ### §0.4 Small-batch band rebuilt on measurement (2026-10-22, #431 + #651)
 
@@ -327,7 +328,8 @@ labelled every Metal run `(cpu)`.
    [#431](https://github.com/yusiwen/minfer/issues/431) was filed about, and the
    reason the comments around it still claimed `nt >= 16`
    ([#652](https://github.com/yusiwen/minfer/issues/652)).
-2. **The boundary is two-variable, both axes measured.** `nt >= 4 && od >= 2048`.
+2. **The boundary is two-variable, both axes measured.** `nt >= 4 && od >= 2048`
+   (the row floor became arm-dependent on 2026-10-23 — §0.7).
    Rows: at `nt = 3` the GEMM costs 100.8 ms against 58.3 ms for the matvec family;
    at `nt = 5` it is 103.1 against 114.4. Width: at `nt = 4..8` the 0.5B's narrow
    rows (`od` 896-1152) lose through the GEMM by **1.56×** (341 vs 533 t/s), because
@@ -418,8 +420,10 @@ increment is no longer a kernel design; see [§0.5](#05-two-no-go-kernels-and-wh
 for their numbers and for where the remaining gap actually is.
 
 The identity boundary that follows from the measured policy: `nt <= 3` is bitwise with
-decode on every shape, `nt >= 4` takes the GEMM for wide targets and is tolerance-class
-— stated rather than assumed, per
+decode on every shape, and `nt >= 4` takes the GEMM for wide targets and is tolerance-class —
+except on Q4_K/Q6_K from §0.7, where the bitwise single-grid arm now reaches `nt = 6` and the
+GEMM starts at 7 (so `d = 3..5` verifies are bitwise, `d >= 6` is not). Stated rather than
+assumed, per
 [ADR-0010](adr/0010-the-identity-gate-bitwise-by-default.md) and
 [ADR-0017](adr/0017-speculative-decoding-refuses-what-it-cannot-carry.md).
 
@@ -610,13 +614,90 @@ draft, adaptive) stays **4/4 identical**. `bench -p 4 -n 128 -r 3` / `-p 8` on t
 are untouched by construction — `nt = 4/8` on a 3584-wide `od` still takes the GEMM, and
 `nt = 1` never entered this branch — so they are a control, not a measured improvement.
 
-**What this does not fix, priced.** The e2e bar is now met at 1.17×, but `C_T(3)` is still
-6.5 ms above its 80 ms bar and the round is still dearer than llama's ≈70 ms target. Two
-increments are priced and still open: raising `GEMM_MIN_NT` 4 → 6 so `nt = 4, 5` take
-this same single-token grid (the dispatch table above measures 1.23-1.79× over the GEMM at
-`nt = 5` on all three shapes, but `nt = 4/6/7` must be measured first), and the same
-`grid.y = nt` dispatch for the remaining quant arms (Q8_0, Q5_K, Q4_0, …), each with its own
-A/B — the measured win here is Q4_K/Q6_K-specific and is not generalised.
+**Superseded 2026-10-23 — see [§0.7](#07-the-single-grid-arm-keeps-the-matvec-band-two-rows-longer-2026-10-23-651).**
+`nt = 4` no longer "still takes the GEMM": the two single-grid families keep the matvec arm
+through `nt = 6`, so `pp4` on a wide target is now an arm change, not a control, and both
+increments this paragraph prices ("priced and still open") are settled — one landed, one
+narrowed to a per-arm measurement.
+
+### §0.7 The single-grid arm keeps the matvec band two rows longer (2026-10-23, #651)
+
+**What changed.** `GEMM_MIN_NT` was one row floor for all seven quant arms. It is now the
+floor of the `_multi` arm only: Q4_K and Q6_K — the two families that also have the shipped
+single-token kernel — get `GEMM_MIN_NT_SINGLE_GRID = 6`, because that arm's per-extra-row
+cost is roughly half `_multi`'s (§0.6: 0.71-0.82 weight passes per row against 1.3-1.8), so
+the GEMM's fixed 32-row tile needs two more rows to pay off. The other six arms keep 4. The
+capability is explicit in the policy rather than implied by the type match:
+`BandArm::{MultiOnly, SingleGrid}` + `gemm_min_nt(arm)`, so an arm cannot inherit a floor it
+was not measured at.
+
+**The measurement.** §0.6 priced this from a `_multi`-vs-single comparison and left `nt =
+4/6/7` unmeasured — the band where the *decision* lives is GEMM-vs-single, so the profile now
+dispatches all four arms **explicitly** (production, GEMM, `_multi`, single grid; trusting
+`shipped` would have measured the matvec against itself the moment the gate moved).
+Method as §0.6: `n = 50` dispatches in one command buffer, every variant pre-warmed at every
+`nt`, min of 3 interleaved rounds, cell order rotated. Q4_K, M4 Pro, 2026-10-23, second run
+(the first produced the same numbers within ±1 %):
+
+| od×id (target) | nt=4 | nt=5 | nt=6 | nt=7 | nt=8 |
+|---|---|---|---|---|---|
+| 3584×3584 (7B attn_q) | **0.45** | **0.55** | 0.67 | 0.79 | 0.89 |
+| 18944×3584 (7B ffn) | **0.65** | **0.81** | 0.99 | 1.16 | 1.34 |
+| 5120×13824 (14B ffn) | **0.61** | **0.77** | 0.93 | 1.09 | 1.26 |
+
+`single grid / GEMM`, below 1.00 meaning the matvec wins. `nt = 4` and `5` win on every shape
+by 1.2-2.2×, which is what the floor of 6 buys. `nt = 6` is a tie on the two wide shapes
+(0.99, 0.93) and a 1.5× win only on the narrowest, and the crossover moves **right** with
+`od` — so the widest row in every model, `output.weight` at `od` 151936, would take the
+matvec at the wrong side of its own crossover. It stays on the GEMM until that shape is
+measured. `nt = 7, 8` are the GEMM's by measurement (1.09-1.34), which is why the band stops
+at 6 rather than at 8.
+
+**Model level** (14B q4_K_M, `specverify -p 512 -r 20`, same box, greedy, both passes):
+
+| | `C_T(1)` | `C_T(3)` | `C_T(4)` | `C_T(5)` | `C_T(6)` | `C_T(7)` |
+|---|---|---|---|---|---|---|
+| before (`4f8fec4`) | 39.51 ms | 83.84 | 171.38 | 172.85 | 174.12 | 175.84 |
+| after | 39.83 | 84.20 | **110.23** | **138.00** | 174.25 | 175.78 |
+| ratio | — | 1.00× | **1.55×** | **1.25×** | 1.00× | 1.00× |
+
+`C_T(3)` is unchanged by construction (the `d = 2` verify was already in the matvec band);
+`C_T(6)`/`C_T(7)` are unchanged by policy, and their agreement is the control that the run
+did not drift between the two measurements. Round cost (verify + `d` draft steps at 7.8 ms,
+§0.4): `d = 3` 194.8 → **133.6 ms (1.46×)**, `d = 4` 204.1 → **169.2 ms (1.21×)**, at
+unchanged acceptance — the same computation §0.6 used for `d = 2`, not a measured e2e rate.
+
+**Identity and gates.** `single_grid_y_q4k_is_bitwise_with_the_shipped_path` gets *stronger*
+from this change: at `nt = 5` production now takes the matvec arm, so the case that used to be
+compared only against the GEMM (tolerance-class by design) is now required to be bitwise
+against the shipped path — 16/16 **BITWISE**, and the `nt = 8` rows still print the GEMM as
+the tolerance-class reference. `production_small_batch_is_bitwise_with_the_forced_multi`
+stays green over its whole band, and the three device-free policy tests now pin both floors
+and both arms (`the_gemm_boundary_is_the_measured_crossover`,
+`the_single_grid_arm_keeps_the_band_two_rows_longer`, `the_boundary_is_monotone_in_nt`).
+
+**Side effect on small-batch prefill.** `bench -p 4 -n 128 -r 3` on the 7B q4_K_M:
+`pp4` 41.97 → **70.45 ± 0.15 t/s (1.68×)**, `pp8` 74.14 → 83.35 ± 0.09, `tg128` 47.48 →
+49.62 ± 0.12 (decode never enters the branch). `pp4` moves *because* it is in the band — a
+4-token prompt over wide `od`s is exactly the arm that changed, and the per-shape table above
+predicts 1.5-2.2× on the matmul itself. `pp8` keeps the GEMM (floor 6), so its 12 % is
+ambient: this run was on a quiet box, §0.6's record on a loaded one. The 0.5B q4_K_M is split
+by shape — its `ffn` `od` 4864 is affected, `attn_qkv`/`o` at 896-1152 are below
+`GEMM_MIN_OD` — and lands `pp4` 491.8 → 494.53 ± 4.28, `pp8` 772.1 → 799.30 ± 5.56: the wide
+`ffn` row is one of a dozen in a 0.5B layer, so no regression is the expected and measured
+outcome.
+
+**Identity.** The 4-prompt `scripts/identity_battery.sh` (7B q4_K_M target, 0.5B q4_K_M
+draft, adaptive, so the verify reaches `nt = 4..7`) is **4/4 identical, 0 diverged**. Note
+for whoever re-runs it on macOS: the script calls `timeout`, which macOS does not ship, and a
+missing `timeout` makes every run produce empty output that the battery then reports as
+"EMPTY OUTPUT" — a `timeout` shim on `PATH` is required, not optional.
+
+**What remains.** The same dispatch for the six `_multi` arms is still open and each needs its
+own A/B — `_multi` is a different cost curve, and the `nt = 4` column of the table above is
+within 1.02-1.24× of the GEMM there rather than 1.5-2.2×, so it cannot be assumed. Unchanged:
+`C_T(3)` still sits ≈4 ms above its 80 ms bar in this run (`84.20`; §0.6's landed run measured 86.53) and acceptance (llama 76.9 % vs our 70.4 %) is
+not a kernel property.
 
 ### ✅ Done
 
