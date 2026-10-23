@@ -49,6 +49,88 @@ impl MpsCommandBuffer<'_> {
         self.quant_matmul_f32_dispatch(wb, w_off, ttype, x, x_off, out, od, id, nt, true)
     }
 
+    /// Test-only probe of the **scheduling** hypothesis for the small-batch band:
+    /// run the shipped single-token kernel with `grid.y = nt` — one threadgroup
+    /// per output-row tile **per token** — instead of the `_multi` kernel, whose
+    /// token loop sits inside one threadgroup.
+    ///
+    /// The shipped `kernel_q4_k_f32_matmul` / `kernel_q6_k_f32_matmul` already
+    /// take their token from `tgpig.y` (`const int t = (int)tgpig.y; if (t >=
+    /// p[2]) return;`) and address both operands by it (`acts + t * p[1]`,
+    /// `output[t * p[0] + …]`), so the shipped `nt == 1` dispatch serves any `nt`
+    /// unchanged: bindings, the 12-byte `p = [od, id, nt]`, the threadgroup shape
+    /// `(32, 2)` and the absent threadgroup memory are the `nt == 1` path's,
+    /// verbatim. Only the grid height differs (`nt` instead of 1).
+    ///
+    /// The same dispatch production now takes for `nt <= 8`, kept test-only so the
+    /// gate and the A/B profile can reach it at `nt = 5/8` on wide targets too —
+    /// there the default policy routes to the GEMM and production would otherwise
+    /// hide the arm. The bitwise gate compares it against `_multi`, and against
+    /// the production entry wherever production really takes the matvec branch.
+    /// `Q4_K`/`Q6_K` only; every other type is an `Err`, so a profile cannot
+    /// silently measure a different arm.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_matmul_f32_single_grid_y(
+        &self,
+        wb: &MetalBuffer,
+        w_off: u64,
+        ttype: TensorType,
+        x: &MetalBuffer,
+        x_off: u64,
+        out: &MetalBuffer,
+        od: usize,
+        id: usize,
+        nt: usize,
+    ) -> Result<(), String> {
+        let pl: &MetalComputePipelineState = match ttype {
+            TensorType::Q4_K => &self.state.pl_q4_k_f32,
+            TensorType::Q6_K => &self.state.pl_q6_k_f32,
+            other => {
+                return Err(format!(
+                    "quant_matmul_f32_single_grid_y: unsupported TensorType {other:?} \
+                     (the grid.y=nt probe covers Q4_K/Q6_K only)"
+                ))
+            }
+        };
+        // Same GPU-safety guard as the production arm: the K-quant kernels index
+        // weights by K/256 super-blocks (floor), so a misaligned `id` silently
+        // drops the remainder.
+        if id % 256 != 0 {
+            return Err(format!(
+                "quant_matmul_f32_single_grid_y: input dim id={id} is not 256-aligned for {ttype:?}"
+            ));
+        }
+        if nt == 0 {
+            return Err("quant_matmul_f32_single_grid_y: nt must be >= 1".to_string());
+        }
+        self.enc.setComputePipelineState(&**(pl));
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize)
+        };
+        let mm_p = [od as i32, id as i32, nt as i32];
+        unsafe {
+            self.enc.setBytes_length_atIndex(
+                NonNull::new(mm_p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(),
+                (12) as usize,
+                (3) as usize,
+            )
+        };
+        // The shipped `nt == 1` grid for Q4_K/Q6_K: x = ceil(od/4) row tiles,
+        // y = 1, TG(32, 2), no threadgroup memory. Here y = nt.
+        self.dispatch_2d(((od + 3) / 4) as u64, nt as u64, 32, 2);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn quant_matmul_f32_dispatch(
         &self,
@@ -141,8 +223,9 @@ impl MpsCommandBuffer<'_> {
                 }
             }
             TensorType::Q4_K | TensorType::Q6_K => {
-                // Both Q4_K and Q6_K have a super-block simdgroup GEMM; the f32
-                // multi kernels below serve the `nt < GEMM_MIN_NT` band.
+                // Both Q4_K and Q6_K have a super-block simdgroup GEMM above the
+                // small-batch band; below it the matvec branch picks the
+                // single-token kernel (grid.y = nt) or `_multi` by `nt`.
                 if !force_matvec && Self::use_gemm(nt, od) {
                     let pl = if ttype == TensorType::Q6_K {
                         &self.state.pl_q6_k_mm_f32
@@ -151,17 +234,39 @@ impl MpsCommandBuffer<'_> {
                     };
                     self.gemm_dispatch(pl, wb, w_off, x, x_off, out, od, id, nt);
                 } else {
+                    // Scheduling decision for the matvec band (measured 2026-10-23,
+                    // Apple M4 Pro): the shipped single-token kernel already takes
+                    // its token from `tgpig.y`, so dispatching it with `grid.y = nt`
+                    // gives one threadgroup per (output-row tile, **token**) — the
+                    // concurrent waves then share the weight stream through L2.
+                    // That is 1.3-1.9x faster than `_multi`, which loops the tokens
+                    // inside one threadgroup and re-streams the weights per row,
+                    // and it is bitwise identical (`f32::to_bits`) at every gated
+                    // case.
+                    //
+                    // `nt <= 8` is the band the speculative decoder verifies in and
+                    // the band `MINFER_GEMM=0` sends small-batch matmuls to. Above
+                    // it the dispatch keeps `_multi` with `grid.y = 1`: a long
+                    // prefill must not pay `nt` threadgroups for a row tile the
+                    // serialized form already covers, and nothing here measured
+                    // beyond 8.
+                    //
+                    // `force_matvec` is the test-only reference: it keeps `_multi`
+                    // at every `nt > 1`, so the bitwise gate compares two genuinely
+                    // different dispatches. `nt == 1` is unchanged — the
+                    // single-token kernel with `grid.y = 1`.
+                    let single_grid_y = nt == 1 || (!force_matvec && nt <= 8);
                     let pl: &MetalComputePipelineState = if ttype == TensorType::Q4_K {
-                        if nt > 1 {
-                            &self.state.pl_q4_k_f32_multi
-                        } else {
+                        if single_grid_y {
                             &self.state.pl_q4_k_f32
+                        } else {
+                            &self.state.pl_q4_k_f32_multi
                         }
                     } else {
-                        if nt > 1 {
-                            &self.state.pl_q6_k_f32_multi
-                        } else {
+                        if single_grid_y {
                             &self.state.pl_q6_k_f32
+                        } else {
+                            &self.state.pl_q6_k_f32_multi
                         }
                     };
                     self.enc.setComputePipelineState(&**(pl));
@@ -195,7 +300,7 @@ impl MpsCommandBuffer<'_> {
                             (3) as usize,
                         )
                     };
-                    let grid_y = if nt > 1 { 1 } else { nt as u64 };
+                    let grid_y = if single_grid_y { nt as u64 } else { 1 };
                     // Q6_K/Q4_K: llama's kernel_mul_mv_q6_K/q4_K_f32_impl use
                     // TG(32, nsg=2); the stride-2 (q6_K) / stride-4 (q4_K) thread
                     // layout keeps all threads busy for small id (nb super-blocks),

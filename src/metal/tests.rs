@@ -2173,3 +2173,520 @@ fn small_batch_matvec_is_per_row_exact_for_every_quant() {
         bad.join("\n  ")
     );
 }
+
+// ─── `grid.y = nt`: the single-token Q4_K/Q6_K kernel ──────────────────────
+//
+// Hypothesis (2026-10-23): the `_multi` kernel's token loop inside one
+// threadgroup does not amortize the weight stream on this hardware (measured at
+// ~1.4-2.5 weight passes per extra row), while llama.cpp's `mul_mv` launches one
+// threadgroup per (output-row tile, token) and lets the concurrent waves share
+// the weights through L2 (~0.43 passes per row). The shipped single-token kernel
+// already takes its token from `tgpig.y`, so the scheduling change is the grid
+// height alone. It is now the **production** dispatch for `nt <= 8`; the test-only
+// entry remains to reach that arm at `nt = 5/8` on wide targets, where the default
+// policy takes the GEMM. The tests below are the correctness gates (probe and
+// production) and the A/B measurement.
+
+/// Which dispatch a `grid.y = nt` case runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridYProbe {
+    /// The shipped production entry: the single-token kernel with `grid.y = nt`
+    /// below `GEMM_MIN_NT` (and through `nt = 8` for narrow `od`), the 32-row
+    /// simdgroup GEMM from `GEMM_MIN_NT` up on wide targets.
+    Shipped,
+    /// The `_multi` matvec kernel, forced even where production takes the GEMM —
+    /// the dispatch this change replaces, at every `nt`.
+    ForcedMulti,
+    /// The shipped single-token kernel dispatched with `grid.y = nt`, test-only so
+    /// the gate and the profile can reach it where production takes the GEMM.
+    SingleGridY,
+}
+
+fn dispatch_grid_y_probe(
+    cb: &MpsCommandBuffer<'_>,
+    route: GridYProbe,
+    wb: &MetalBuffer,
+    ttype: TensorType,
+    acts: &MetalBuffer,
+    out: &MetalBuffer,
+    od: usize,
+    id: usize,
+    nt: usize,
+) -> Result<(), String> {
+    match route {
+        GridYProbe::Shipped => {
+            cb.quant_matmul_f32_on_gpu_buf(wb, 0, ttype, acts, 0, out, od, id, nt)
+        }
+        GridYProbe::ForcedMulti => {
+            cb.quant_matmul_f32_matvec(wb, 0, ttype, acts, 0, out, od, id, nt)
+        }
+        GridYProbe::SingleGridY => {
+            cb.quant_matmul_f32_single_grid_y(wb, 0, ttype, acts, 0, out, od, id, nt)
+        }
+    }
+}
+
+/// What production actually dispatches for `(nt, od)`: the 32-row GEMM from
+/// `GEMM_MIN_NT` up on wide targets, the matvec family otherwise.
+fn production_takes_gemm(nt: usize, od: usize) -> bool {
+    super::policy::gemm_preferred(nt, od) && super::policy::gemm_enabled()
+}
+
+/// `0x33`-filled quant weights: finite nibbles **and** finite fp16 block
+/// scales, so no denormal/NaN path enters the comparison (the shipped exactness
+/// gate's fill).
+fn fill_quant_0x33(buf: &MetalBuffer, bytes: usize) {
+    unsafe { std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, bytes).fill(0x33) }
+}
+
+/// Full-mantissa deterministic activations in `[-1, 1)` (`xorshift64`). Values
+/// like `0.5` would be exact and every accumulation order would agree — the test
+/// would pass on an order change it exists to catch.
+fn fill_random_acts(buf: &MetalBuffer, n: usize) {
+    unsafe {
+        let a = std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut f32, n);
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        for v in a.iter_mut() {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            *v = ((st >> 40) as f32 / 8_388_608.0) - 1.0;
+        }
+    }
+}
+
+/// `BITWISE` or `DIFF n (first mismatch)`, for the per-case report line.
+fn bits_verdict(n: usize, first: &Option<String>) -> String {
+    if n == 0 {
+        "BITWISE".to_string()
+    } else {
+        format!("DIFF {n} ({})", first.as_deref().unwrap_or_default())
+    }
+}
+
+/// Gate: serving the small-batch band by launching one threadgroup per
+/// (output-row tile, **token**) must reproduce the shipped numbers **bitwise**
+/// (`f32::to_bits`).
+///
+/// Two references per `(shape, type, nt)`:
+///
+/// * `ForcedMulti` — the `_multi` kernel the scheduling change replaces. This is
+///   the identity claim and is asserted at every `nt`: the shipped single-row
+///   kernel is per-row bitwise with `_multi` by construction, and this gate
+///   proves the per-token grid keeps that.
+/// * `Shipped` — what the engine actually dispatches: the single-token kernel
+///   with `grid.y = nt` at `nt = 2/3` (below `GEMM_MIN_NT`), the 32-row
+///   simdgroup GEMM at `nt = 5/8` for these wide `od`s. The GEMM is
+///   tolerance-class by design (ADR-0010/ADR-0017), so its row is printed for
+///   every case and asserted only where production itself takes a matvec arm.
+///
+/// Shapes/`nt`: `(3584, 3584)` and `(5120, 13824)` at `nt = 2, 3, 5, 8`, Q4_K
+/// and Q6_K. Every case is printed, and failures accumulate, so one run names
+/// every non-bitwise arm instead of stopping at the first.
+#[test]
+fn single_grid_y_q4k_is_bitwise_with_the_shipped_path() {
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the grid.y exactness gate");
+        return;
+    };
+    let dev = &mps.inner.device;
+    let cases: &[(usize, usize)] = &[(3584, 3584), (5120, 13824)];
+    let nts: &[usize] = &[2, 3, 5, 8];
+    let nt_max = 8usize;
+    let routes = [
+        GridYProbe::SingleGridY,
+        GridYProbe::ForcedMulti,
+        GridYProbe::Shipped,
+    ];
+    let mut bad: Vec<String> = Vec::new();
+    println!("\n=== grid.y = nt bitwise gate (Q4_K / Q6_K) ===");
+    for &(od, id) in cases {
+        for &ttype in &[TensorType::Q4_K, TensorType::Q6_K] {
+            let bq = quant_block_q(ttype);
+            let bb = quant_block_bytes(ttype);
+            let wbytes = (id / bq) * bb * od;
+            let wb = dev
+                .newBufferWithLength_options(
+                    (wbytes as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_quant_0x33(&wb, wbytes);
+            let acts = dev
+                .newBufferWithLength_options(
+                    ((id * nt_max * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_random_acts(&acts, id * nt_max);
+            let new_out = || {
+                dev.newBufferWithLength_options(
+                    ((od * nt_max * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+            };
+            let read = |b: &MetalBuffer, n: usize| -> Vec<f32> {
+                unsafe {
+                    std::slice::from_raw_parts(b.contents().as_ptr() as *const f32, n).to_vec()
+                }
+            };
+            for &nt in nts {
+                let outs: Vec<MetalBuffer> = routes.iter().map(|_| new_out()).collect();
+                for (route, out) in routes.iter().zip(outs.iter()) {
+                    let cb = mps.cmd_buffer();
+                    dispatch_grid_y_probe(&cb, *route, &wb, ttype, &acts, out, od, id, nt)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "{ttype:?} od={od} id={id} nt={nt} {route:?}: dispatch failed: {e}"
+                            )
+                        });
+                    cb.submit().unwrap_or_else(|e| {
+                        panic!("{ttype:?} od={od} id={id} nt={nt} {route:?}: submit failed: {e}")
+                    });
+                }
+                let got = read(&outs[0], od * nt);
+                let multi = read(&outs[1], od * nt);
+                let shipped = read(&outs[2], od * nt);
+                let diff = |a: &[f32], b: &[f32]| -> (usize, Option<String>) {
+                    let mut n = 0usize;
+                    let mut first = None;
+                    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                        if x.to_bits() != y.to_bits() {
+                            n += 1;
+                            if first.is_none() {
+                                first = Some(format!(
+                                    "t={} col={}: got {} ({:#010x}) want {} ({:#010x})",
+                                    i / od,
+                                    i % od,
+                                    x,
+                                    x.to_bits(),
+                                    y,
+                                    y.to_bits()
+                                ));
+                            }
+                        }
+                    }
+                    (n, first)
+                };
+                let (n_multi, f_multi) = diff(&got, &multi);
+                let (n_shipped, f_shipped) = diff(&got, &shipped);
+                let arm = if production_takes_gemm(nt, od) {
+                    "GEMM, tolerance-class"
+                } else {
+                    "matvec, bitwise-required"
+                };
+                println!(
+                    "  {ttype:?} od={od} id={id} nt={nt}: vs forced `_multi` {} | vs shipped ({arm}) {}",
+                    bits_verdict(n_multi, &f_multi),
+                    bits_verdict(n_shipped, &f_shipped)
+                );
+                if n_multi != 0 {
+                    bad.push(format!(
+                        "{ttype:?} od={od} id={id} nt={nt}: single_grid_y != forced `_multi` ({} values; first {})",
+                        n_multi,
+                        f_multi.unwrap_or_default()
+                    ));
+                }
+                if !production_takes_gemm(nt, od) && n_shipped != 0 {
+                    bad.push(format!(
+                        "{ttype:?} od={od} id={id} nt={nt}: single_grid_y != shipped matvec ({} values; first {})",
+                        n_shipped,
+                        f_shipped.unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "the grid.y = nt dispatch is not bitwise with the shipped matvec path:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// Regression gate for the **production** dispatch: at `nt = 2/3` the shipped
+/// entry must be bitwise identical to the forced `_multi` kernel
+/// (`quant_matmul_f32_matvec`) for Q4_K and Q6_K.
+///
+/// This is the gate for the `grid.y = nt` production change. `nt = 2/3` are the
+/// speculative decoder's verify band below `GEMM_MIN_NT`, i.e. the rows that used
+/// to take `_multi`; the `od = 512` cases additionally reach `nt = 5/8`, where
+/// production still takes the matvec branch because `od < GEMM_MIN_OD` — the band
+/// `MINFER_GEMM=0` uses for small-batch prefill. Every case asserts production
+/// really took the matvec branch, so a policy change that quietly routes one of
+/// them to the GEMM fails here instead of comparing a tolerance-class arm
+/// bitwise.
+///
+/// Both outputs are zeroed before the dispatch: a mutation that collapses the grid
+/// to one row leaves tokens `1..nt` untouched, and the gate must read that as a
+/// difference rather than as whatever the allocator returned.
+#[test]
+fn production_small_batch_is_bitwise_with_the_forced_multi() {
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the production bitwise gate");
+        return;
+    };
+    let dev = &mps.inner.device;
+    let nt_max = 8usize;
+    // (od, id, nts): the two measured wide shapes at the decoder's verify band,
+    // plus a narrow shape whose `od` keeps production on the matvec branch
+    // through `nt = 8`.
+    let cases: &[(usize, usize, &[usize])] = &[
+        (3584, 3584, &[2, 3]),
+        (5120, 13824, &[2, 3]),
+        (512, 512, &[2, 3, 5, 8]),
+    ];
+    let mut bad: Vec<String> = Vec::new();
+    println!("\n=== production vs forced `_multi` bitwise gate (Q4_K / Q6_K) ===");
+    for &(od, id, nts) in cases {
+        for &ttype in &[TensorType::Q4_K, TensorType::Q6_K] {
+            let bq = quant_block_q(ttype);
+            let bb = quant_block_bytes(ttype);
+            let wbytes = (id / bq) * bb * od;
+            let wb = dev
+                .newBufferWithLength_options(
+                    (wbytes as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_quant_0x33(&wb, wbytes);
+            let acts = dev
+                .newBufferWithLength_options(
+                    ((id * nt_max * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_random_acts(&acts, id * nt_max);
+            for &nt in nts {
+                assert!(
+                    !production_takes_gemm(nt, od),
+                    "{ttype:?} od={od} id={id} nt={nt}: the case must reach the matvec branch; \
+                     the policy routes it to the GEMM"
+                );
+                let new_out = || {
+                    dev.newBufferWithLength_options(
+                        ((od * nt * 4) as u64) as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+                };
+                let zero = |b: &MetalBuffer, n: usize| unsafe {
+                    std::slice::from_raw_parts_mut(b.contents().as_ptr() as *mut f32, n).fill(0.0)
+                };
+                let read = |b: &MetalBuffer, n: usize| -> Vec<f32> {
+                    unsafe {
+                        std::slice::from_raw_parts(b.contents().as_ptr() as *const f32, n).to_vec()
+                    }
+                };
+                let out_prod = new_out();
+                let out_multi = new_out();
+                zero(&out_prod, od * nt);
+                zero(&out_multi, od * nt);
+                for (route, out) in [
+                    (GridYProbe::Shipped, &out_prod),
+                    (GridYProbe::ForcedMulti, &out_multi),
+                ] {
+                    let cb = mps.cmd_buffer();
+                    dispatch_grid_y_probe(&cb, route, &wb, ttype, &acts, out, od, id, nt)
+                        .unwrap_or_else(|e| {
+                            panic!("{ttype:?} od={od} id={id} nt={nt} {route:?}: {e}")
+                        });
+                    cb.submit().unwrap_or_else(|e| {
+                        panic!("{ttype:?} od={od} id={id} nt={nt} {route:?}: {e}")
+                    });
+                }
+                let got = read(&out_prod, od * nt);
+                let want = read(&out_multi, od * nt);
+                let mut n = 0usize;
+                let mut first = None;
+                for (i, (x, y)) in got.iter().zip(want.iter()).enumerate() {
+                    if x.to_bits() != y.to_bits() {
+                        n += 1;
+                        if first.is_none() {
+                            first = Some(format!(
+                                "t={} col={}: got {} ({:#010x}) want {} ({:#010x})",
+                                i / od,
+                                i % od,
+                                x,
+                                x.to_bits(),
+                                y,
+                                y.to_bits()
+                            ));
+                        }
+                    }
+                }
+                println!(
+                    "  {ttype:?} od={od} id={id} nt={nt}: {}",
+                    bits_verdict(n, &first)
+                );
+                if n != 0 {
+                    bad.push(format!(
+                        "{ttype:?} od={od} id={id} nt={nt}: production != forced `_multi` \
+                         ({n} values; first {})",
+                        first.unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "the production grid.y = nt dispatch is not bitwise with `_multi`:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// A/B: does `grid.y = nt` move the per-extra-row cost toward llama.cpp's ~0.43
+/// weight passes per row?
+///
+/// Method is `matmul_bandwidth_profile`'s: `n` dispatches in one command buffer
+/// (single-dispatch timing is dominated by the command-buffer floor), **every
+/// variant pre-warmed at every `nt` before any measurement** (a cold first
+/// variant poisoned an earlier comparison), then min-of-3 interleaved rounds with
+/// the cell order rotated per round (interleaving absorbs clock drift; the
+/// minimum is the least-contended sample).
+///
+/// Shapes are Qwen2.5-7B Q4_K `attn_q` `(3584, 3584)`, 7B `ffn_gate/up`
+/// `(18944, 3584)` and the 14B `ffn` `(5120, 13824)`; `nt = 2, 3, 5, 8`.
+/// Variants: the shipped entry, the forced `_multi` kernel, and the
+/// single-token/`grid.y = nt` dispatch (which production takes at `nt = 2/3`, and
+/// which is test-only at `nt = 5/8` where the default policy takes the GEMM);
+/// `nt = 1` is the "one weight pass" unit.
+/// The printed marginal is `(t(nt) - t(1)) / (nt - 1) / t(1)` — 1.0 means one
+/// extra full weight stream per extra row, ~0.0 means the rows share the stream.
+#[test]
+fn single_grid_y_bandwidth_profile() {
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the grid.y profile");
+        return;
+    };
+    let dev = &mps.inner.device;
+    let nts: &[usize] = &[2, 3, 5, 8];
+    let nt_max = 8usize;
+    let cases: &[(usize, usize)] = &[(3584, 3584), (18944, 3584), (5120, 13824)];
+    let routes = [
+        GridYProbe::Shipped,
+        GridYProbe::ForcedMulti,
+        GridYProbe::SingleGridY,
+    ];
+    let names = ["shipped", "_multi (forced)", "single grid.y=nt"];
+    let ttype = TensorType::Q4_K;
+    let n = 50usize;
+    println!(
+        "\n=== grid.y = nt A/B (Q4_K, n={n} per timed cb, pre-warmed, min of 3 interleaved) ==="
+    );
+    for &(od, id) in cases {
+        let bq = quant_block_q(ttype);
+        let bb = quant_block_bytes(ttype);
+        let wbytes = (id / bq) * bb * od;
+        let wb = dev
+            .newBufferWithLength_options(
+                (wbytes as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        fill_quant_0x33(&wb, wbytes);
+        let acts = dev
+            .newBufferWithLength_options(
+                ((id * nt_max * 4) as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        unsafe {
+            std::slice::from_raw_parts_mut(acts.contents().as_ptr() as *mut f32, id * nt_max)
+                .fill(0.5);
+        }
+        let out = dev
+            .newBufferWithLength_options(
+                ((od * nt_max * 4) as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+
+        // Pre-warm every variant at every nt, plus the nt = 1 unit, before any
+        // timed run.
+        for &nt in nts.iter().chain(std::iter::once(&1usize)) {
+            for (ri, &route) in routes.iter().enumerate() {
+                if nt == 1 && ri != 0 {
+                    continue;
+                }
+                let cb = mps.cmd_buffer();
+                for _ in 0..(n / 2).max(16) {
+                    dispatch_grid_y_probe(&cb, route, &wb, ttype, &acts, &out, od, id, nt)
+                        .expect("warmup dispatch");
+                }
+                cb.submit().expect("warmup submit");
+            }
+        }
+
+        // Cells: every (nt, variant), then the nt = 1 unit last.
+        let mut cells: Vec<(usize, usize)> = Vec::new();
+        for &nt in nts {
+            for ri in 0..routes.len() {
+                cells.push((nt, ri));
+            }
+        }
+        cells.push((1, 0));
+        let mut best = vec![f64::INFINITY; cells.len()];
+        for rep in 0..3usize {
+            let len = cells.len();
+            for k in 0..len {
+                // Rotation (not a fixed order) per repetition: no cell is always
+                // measured first or last.
+                let ci = (k + rep * 5) % len;
+                let (nt, ri) = cells[ci];
+                let cb = mps.cmd_buffer();
+                for _ in 0..n {
+                    dispatch_grid_y_probe(&cb, routes[ri], &wb, ttype, &acts, &out, od, id, nt)
+                        .unwrap_or_else(|e| panic!("od={od} id={id} nt={nt} {}: {e}", names[ri]));
+                }
+                let t0 = std::time::Instant::now();
+                cb.submit().expect("submit");
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / n as f64;
+                if ms < best[ci] {
+                    best[ci] = ms;
+                }
+            }
+        }
+
+        let unit = best[cells.len() - 1];
+        println!("\n  Q4_K od={od} id={id}: one weight pass (nt=1) = {unit:.4} ms per dispatch");
+        println!(
+            "    {:>2}  {:>28}  {:>28}  {:>28}",
+            "nt", names[0], names[1], names[2]
+        );
+        for (k, &nt) in nts.iter().enumerate() {
+            let mut line = format!("    {nt:>2}");
+            for ri in 0..routes.len() {
+                let ms = best[k * routes.len() + ri];
+                let marg = (ms - unit) / (nt as f64 - 1.0) / unit;
+                line.push_str(&format!("  {ms:>11.4} ms ({marg:>5.2}p)"));
+            }
+            let arm = if production_takes_gemm(nt, od) {
+                "GEMM"
+            } else {
+                "matvec"
+            };
+            println!("{line}   [production: {arm}]");
+        }
+        let mut wins = String::new();
+        for (k, &nt) in nts.iter().enumerate() {
+            let mut wi = 0;
+            for ri in 1..routes.len() {
+                if best[k * routes.len() + ri] < best[k * routes.len() + wi] {
+                    wi = ri;
+                }
+            }
+            wins.push_str(&format!(" nt={nt}:{}", names[wi]));
+        }
+        println!("    fastest per nt:{wins}");
+    }
+    println!("=== end grid.y = nt A/B ===");
+}
