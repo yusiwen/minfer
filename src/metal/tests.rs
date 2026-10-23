@@ -2182,20 +2182,26 @@ fn small_batch_matvec_is_per_row_exact_for_every_quant() {
 // threadgroup per (output-row tile, token) and lets the concurrent waves share
 // the weights through L2 (~0.43 passes per row). The shipped single-token kernel
 // already takes its token from `tgpig.y`, so the scheduling change is the grid
-// height alone. It is now the **production** dispatch for `nt <= 8`; the test-only
-// entry remains to reach that arm at `nt = 5/8` on wide targets, where the default
-// policy takes the GEMM. The tests below are the correctness gates (probe and
-// production) and the A/B measurement.
+// height alone. It is now the **production** dispatch for the whole band on these
+// two types: `nt <= 8` narrow, `nt <= 6` wide (the single-grid arm's GEMM floor is
+// 6). The test-only entry remains to reach the arm at `nt = 7, 8` on wide targets,
+// where the policy takes the GEMM. The tests below are the correctness gates
+// (probe and production) and the A/B measurement.
 
 /// Which dispatch a `grid.y = nt` case runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GridYProbe {
-    /// The shipped production entry: the single-token kernel with `grid.y = nt`
-    /// below `GEMM_MIN_NT` (and through `nt = 8` for narrow `od`), the 32-row
-    /// simdgroup GEMM from `GEMM_MIN_NT` up on wide targets.
+    /// The shipped production entry: whatever the policy picks for this
+    /// `(nt, od, type)` — the single-token kernel with `grid.y = nt` below that
+    /// family's row floor, the 32-row simdgroup GEMM from the floor up on wide
+    /// targets.
     Shipped,
+    /// The simdgroup GEMM dispatched **regardless of policy** — the decision's
+    /// reference arm. Needed because the policy itself now prefers the single-grid
+    /// matvec at `nt = 4, 5`, so `Shipped` alone can no longer price the GEMM there.
+    Gemm,
     /// The `_multi` matvec kernel, forced even where production takes the GEMM —
-    /// the dispatch this change replaces, at every `nt`.
+    /// the dispatch `grid.y = nt` replaces, at every `nt`.
     ForcedMulti,
     /// The shipped single-token kernel dispatched with `grid.y = nt`, test-only so
     /// the gate and the profile can reach it where production takes the GEMM.
@@ -2217,6 +2223,19 @@ fn dispatch_grid_y_probe(
         GridYProbe::Shipped => {
             cb.quant_matmul_f32_on_gpu_buf(wb, 0, ttype, acts, 0, out, od, id, nt)
         }
+        GridYProbe::Gemm => {
+            let pl = match ttype {
+                TensorType::Q4_K => &cb.state.pl_q4_k_mm_f32,
+                TensorType::Q6_K => &cb.state.pl_q6_k_mm_f32,
+                other => {
+                    return Err(format!(
+                        "grid.y probe: no simdgroup GEMM pipeline for {other:?}"
+                    ))
+                }
+            };
+            cb.gemm_dispatch(pl, wb, 0, acts, 0, out, od, id, nt);
+            Ok(())
+        }
         GridYProbe::ForcedMulti => {
             cb.quant_matmul_f32_matvec(wb, 0, ttype, acts, 0, out, od, id, nt)
         }
@@ -2226,10 +2245,19 @@ fn dispatch_grid_y_probe(
     }
 }
 
-/// What production actually dispatches for `(nt, od)`: the 32-row GEMM from
-/// `GEMM_MIN_NT` up on wide targets, the matvec family otherwise.
-fn production_takes_gemm(nt: usize, od: usize) -> bool {
-    super::policy::gemm_preferred(nt, od) && super::policy::gemm_enabled()
+/// What production actually dispatches for `(nt, od, type)`: the 32-row GEMM at
+/// that family's row floor on wide targets, the matvec family otherwise.
+fn production_takes_gemm(nt: usize, od: usize, ttype: TensorType) -> bool {
+    super::policy::gemm_preferred(nt, od, band_arm(ttype)) && super::policy::gemm_enabled()
+}
+
+/// The matvec arm a quant family reaches below the GEMM — the capability the
+/// policy's row floor depends on (Q4_K/Q6_K are the two with `grid.y = nt`).
+fn band_arm(ttype: TensorType) -> super::policy::BandArm {
+    match ttype {
+        TensorType::Q4_K | TensorType::Q6_K => super::policy::BandArm::SingleGrid,
+        _ => super::policy::BandArm::MultiOnly,
+    }
 }
 
 /// `0x33`-filled quant weights: finite nibbles **and** finite fp16 block
@@ -2275,8 +2303,8 @@ fn bits_verdict(n: usize, first: &Option<String>) -> String {
 ///   kernel is per-row bitwise with `_multi` by construction, and this gate
 ///   proves the per-token grid keeps that.
 /// * `Shipped` — what the engine actually dispatches: the single-token kernel
-///   with `grid.y = nt` at `nt = 2/3` (below `GEMM_MIN_NT`), the 32-row
-///   simdgroup GEMM at `nt = 5/8` for these wide `od`s. The GEMM is
+///   with `grid.y = nt` at `nt = 2, 3, 5` (below the single-grid arm's floor of
+///   6), the 32-row simdgroup GEMM at `nt = 8` for these wide `od`s. The GEMM is
 ///   tolerance-class by design (ADR-0010/ADR-0017), so its row is printed for
 ///   every case and asserted only where production itself takes a matvec arm.
 ///
@@ -2373,7 +2401,7 @@ fn single_grid_y_q4k_is_bitwise_with_the_shipped_path() {
                 };
                 let (n_multi, f_multi) = diff(&got, &multi);
                 let (n_shipped, f_shipped) = diff(&got, &shipped);
-                let arm = if production_takes_gemm(nt, od) {
+                let arm = if production_takes_gemm(nt, od, ttype) {
                     "GEMM, tolerance-class"
                 } else {
                     "matvec, bitwise-required"
@@ -2390,7 +2418,7 @@ fn single_grid_y_q4k_is_bitwise_with_the_shipped_path() {
                         f_multi.unwrap_or_default()
                     ));
                 }
-                if !production_takes_gemm(nt, od) && n_shipped != 0 {
+                if !production_takes_gemm(nt, od, ttype) && n_shipped != 0 {
                     bad.push(format!(
                         "{ttype:?} od={od} id={id} nt={nt}: single_grid_y != shipped matvec ({} values; first {})",
                         n_shipped,
@@ -2407,18 +2435,21 @@ fn single_grid_y_q4k_is_bitwise_with_the_shipped_path() {
     );
 }
 
-/// Regression gate for the **production** dispatch: at `nt = 2/3` the shipped
-/// entry must be bitwise identical to the forced `_multi` kernel
-/// (`quant_matmul_f32_matvec`) for Q4_K and Q6_K.
+/// Regression gate for the **production** dispatch: on every row production serves
+/// from the matvec band, the shipped entry must be bitwise identical to the forced
+/// `_multi` kernel (`quant_matmul_f32_matvec`) for Q4_K and Q6_K.
 ///
-/// This is the gate for the `grid.y = nt` production change. `nt = 2/3` are the
-/// speculative decoder's verify band below `GEMM_MIN_NT`, i.e. the rows that used
-/// to take `_multi`; the `od = 512` cases additionally reach `nt = 5/8`, where
-/// production still takes the matvec branch because `od < GEMM_MIN_OD` — the band
-/// `MINFER_GEMM=0` uses for small-batch prefill. Every case asserts production
-/// really took the matvec branch, so a policy change that quietly routes one of
-/// them to the GEMM fails here instead of comparing a tolerance-class arm
-/// bitwise.
+/// This is the gate for the `grid.y = nt` production change, and it is what pins
+/// the **wiring** of the band rather than its number: the wide shapes run
+/// `nt = 2..5`, which since `GEMM_MIN_NT_SINGLE_GRID` is the band production must
+/// reach through the single-grid arm — so a call site that says
+/// `BandArm::MultiOnly` (routing `nt = 4, 5` back to the GEMM) compares a
+/// tolerance-class arm bitwise and fails here. The `od = 512` cases additionally
+/// reach `nt = 5/8`, where production is on the matvec branch at every `nt`
+/// because `od < GEMM_MIN_OD` — the band `MINFER_GEMM=0` uses for small-batch
+/// prefill. Every case asserts production really took the matvec branch, so a
+/// policy change that quietly routes one of them to the GEMM fails here instead of
+/// comparing a tolerance-class arm bitwise.
 ///
 /// Both outputs are zeroed before the dispatch: a mutation that collapses the grid
 /// to one row leaves tokens `1..nt` untouched, and the gate must read that as a
@@ -2433,12 +2464,12 @@ fn production_small_batch_is_bitwise_with_the_forced_multi() {
     };
     let dev = &mps.inner.device;
     let nt_max = 8usize;
-    // (od, id, nts): the two measured wide shapes at the decoder's verify band,
-    // plus a narrow shape whose `od` keeps production on the matvec branch
-    // through `nt = 8`.
+    // (od, id, nts): the two measured wide shapes across the whole band the
+    // single-grid arm now owns (2..5, i.e. 1 + d for d = 1..4), plus a narrow
+    // shape whose `od` keeps production on the matvec branch through `nt = 8`.
     let cases: &[(usize, usize, &[usize])] = &[
-        (3584, 3584, &[2, 3]),
-        (5120, 13824, &[2, 3]),
+        (3584, 3584, &[2, 3, 4, 5]),
+        (5120, 13824, &[2, 3, 4, 5]),
         (512, 512, &[2, 3, 5, 8]),
     ];
     let mut bad: Vec<String> = Vec::new();
@@ -2464,7 +2495,7 @@ fn production_small_batch_is_bitwise_with_the_forced_multi() {
             fill_random_acts(&acts, id * nt_max);
             for &nt in nts {
                 assert!(
-                    !production_takes_gemm(nt, od),
+                    !production_takes_gemm(nt, od, ttype),
                     "{ttype:?} od={od} id={id} nt={nt}: the case must reach the matvec branch; \
                      the policy routes it to the GEMM"
                 );
@@ -2554,12 +2585,14 @@ fn production_small_batch_is_bitwise_with_the_forced_multi() {
 /// Shapes are Qwen2.5-7B Q4_K `attn_q` `(3584, 3584)`, 7B `ffn_gate/up`
 /// `(18944, 3584)` and the 14B `ffn` `(5120, 13824)`; `nt = 2..8`, the whole band
 /// the speculative decoder verifies in (`nt = d + 1`, `d <= 7`).
-/// Variants: the shipped entry, the forced `_multi` kernel, and the
-/// single-token/`grid.y = nt` dispatch. Every shape here has `od >= 2048`, so from
-/// `GEMM_MIN_NT` up the **shipped** column *is* the simdgroup GEMM (each row
-/// prints which arm production takes), which makes `single/shipped` the per-shape
-/// answer to "would lowering the GEMM gate win at this `nt`?" — the measurement
-/// `GEMM_MIN_NT` 4 → 6 rests on. `nt = 1` is the "one weight pass" unit.
+/// Four variants, each dispatched explicitly: the shipped production entry (each
+/// row prints which arm the policy picks), the **GEMM** regardless of policy, the
+/// forced `_multi` kernel, and the single-token/`grid.y = nt` dispatch. Explicit
+/// arms are what make `single/GEMM` — the per-shape answer to "is the matvec
+/// cheaper at this `nt`?" — stable across a policy change; the measurement
+/// `GEMM_MIN_NT_SINGLE_GRID = 6` rests on it. Every shape here has `od >= 2048`
+/// (below that the N tile under-fills and the GEMM is not the candidate at all).
+/// `nt = 1` is the "one weight pass" unit.
 /// The printed marginal is `(t(nt) - t(1)) / (nt - 1) / t(1)` — 1.0 means one
 /// extra full weight stream per extra row, ~0.0 means the rows share the stream.
 #[test]
@@ -2576,10 +2609,11 @@ fn single_grid_y_bandwidth_profile() {
     let cases: &[(usize, usize)] = &[(3584, 3584), (18944, 3584), (5120, 13824)];
     let routes = [
         GridYProbe::Shipped,
+        GridYProbe::Gemm,
         GridYProbe::ForcedMulti,
         GridYProbe::SingleGridY,
     ];
-    let names = ["shipped", "_multi (forced)", "single grid.y=nt"];
+    let names = ["shipped", "GEMM", "_multi (forced)", "single grid.y=nt"];
     let ttype = TensorType::Q4_K;
     let n = 50usize;
     println!(
@@ -2661,10 +2695,11 @@ fn single_grid_y_bandwidth_profile() {
 
         let unit = best[cells.len() - 1];
         println!("\n  Q4_K od={od} id={id}: one weight pass (nt=1) = {unit:.4} ms per dispatch");
-        println!(
-            "    {:>2}  {:>28}  {:>28}  {:>28}",
-            "nt", names[0], names[1], names[2]
-        );
+        let mut header = format!("    {:>2}", "nt");
+        for name in names {
+            header.push_str(&format!("  {name:>28}"));
+        }
+        println!("{header}");
         for (k, &nt) in nts.iter().enumerate() {
             let mut line = format!("    {nt:>2}");
             for ri in 0..routes.len() {
@@ -2672,16 +2707,17 @@ fn single_grid_y_bandwidth_profile() {
                 let marg = (ms - unit) / (nt as f64 - 1.0) / unit;
                 line.push_str(&format!("  {ms:>11.4} ms ({marg:>5.2}p)"));
             }
-            let arm = if production_takes_gemm(nt, od) {
+            let arm = if production_takes_gemm(nt, od, ttype) {
                 "GEMM"
             } else {
                 "matvec"
             };
-            // The decision number: single grid / shipped. Where production takes
-            // the GEMM this is "matvec vs GEMM at this nt"; where it already
-            // takes the matvec it must read ~1.00 (same dispatch).
-            let ratio = best[k * routes.len() + 2] / best[k * routes.len()];
-            println!("{line}   [production: {arm}]  single/shipped = {ratio:.2}x");
+            // The decision number: single grid / GEMM. Both arms are dispatched
+            // explicitly, so it does not move when the policy does — trusting
+            // `shipped` here would have measured the matvec against itself as soon
+            // as the gate moved.
+            let ratio = best[k * routes.len() + 3] / best[k * routes.len() + 1];
+            println!("{line}   [production: {arm}]  single/GEMM = {ratio:.2}x");
         }
         let mut wins = String::new();
         for (k, &nt) in nts.iter().enumerate() {

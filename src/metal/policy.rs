@@ -120,8 +120,24 @@ pub fn packed_attn_route(
     }
 }
 
-/// Smallest `nt` at which the multi-row GEMM beats the per-row matvec family —
-/// for an output width that can fill its N tile (see [`GEMM_MIN_OD`]).
+/// Which matvec arm a quant family has for the multi-row band below the GEMM —
+/// it decides the row floor of the boundary, because the two arms have different
+/// per-extra-row costs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BandArm {
+    /// `_multi` only: the token loop sits **inside** one threadgroup, so each
+    /// extra row re-streams the weight block. All arms except Q4_K/Q6_K.
+    MultiOnly,
+    /// Also the shipped single-token kernel, which takes its token from
+    /// `tgpig.y`: dispatching it with `grid.y = nt` gives one threadgroup per
+    /// (output-row tile, **token**) and the waves share the weight stream
+    /// through L2. Q4_K and Q6_K only ([#659]).
+    SingleGrid,
+}
+
+/// Smallest `nt` at which the multi-row GEMM beats the per-row matvec family
+/// **for a family with no `grid.y = nt` band** ([`BandArm::MultiOnly`]) — and an
+/// output width that can fill the N tile (see [`GEMM_MIN_OD`]).
 ///
 /// The GEMM's M tile is a fixed 32 rows (`MpsCommandBuffer::gemm_dispatch`), so a
 /// call with fewer rows spends most of the tile on padding *and* pays the whole
@@ -143,6 +159,27 @@ pub fn packed_attn_route(
 /// [#431]: https://github.com/yusiwen/minfer/issues/431
 pub const GEMM_MIN_NT: usize = 4;
 
+/// Smallest `nt` at which the GEMM beats the **single-token/`grid.y = nt`** arm
+/// ([`BandArm::SingleGrid`], Q4_K/Q6_K).
+///
+/// That arm's per-extra-row cost is about half `_multi`'s, so the GEMM's fixed
+/// 32-row tile takes two more rows to pay off. Measured 2026-10-23
+/// (`single_grid_y_bandwidth_profile`, Q4_K, `n = 50` dispatches per timed command
+/// buffer, min of 3 interleaved rounds) — the number is
+/// `single grid / shipped GEMM`, below 1.00 meaning the matvec wins:
+
+/// | od×id (target) | nt=4 | nt=5 | nt=6 | nt=7 | nt=8 |
+/// |---|---|---|---|---|---|
+/// | 3584×3584 (7B attn) | 0.46 | 0.56 | 0.66 | 0.78 | 0.90 |
+/// | 18944×3584 (7B ffn) | 0.65 | 0.81 | 0.99 | 1.16 | 1.34 |
+/// | 5120×13824 (14B ffn) | 0.62 | 0.77 | 0.93 | 1.09 | 1.26 |
+///
+/// `nt = 4` and `5` are unambiguous wins on every shape, so the floor is 6.
+/// `nt = 6` is neutral on two of the three (0.93-0.99, one 1.5x win) and the
+/// widest rows — `output.weight` at `od` 151936 — are unmeasured, so the GEMM
+/// keeps that row; `nt = 7` and above are the GEMM's by measurement.
+pub const GEMM_MIN_NT_SINGLE_GRID: usize = 6;
+
 /// Smallest output width (`od`, the matmul's N dimension) at which the GEMM's
 /// 64-wide N tile is worth its M-tile padding.
 ///
@@ -151,14 +188,23 @@ pub const GEMM_MIN_NT: usize = 4;
 /// tiles under-fill. Wide targets (a 7B's 3584-152064) are the GEMM's case.
 pub const GEMM_MIN_OD: usize = 2048;
 
-/// The dispatch policy's **pure** half: does a call with `nt` rows want the GEMM?
+/// The row floor for a family's band arm. Both floors share [`GEMM_MIN_OD`].
+pub fn gemm_min_nt(arm: BandArm) -> usize {
+    match arm {
+        BandArm::MultiOnly => GEMM_MIN_NT,
+        BandArm::SingleGrid => GEMM_MIN_NT_SINGLE_GRID,
+    }
+}
+
+/// The dispatch policy's **pure** half: does a call with `nt` rows over `od`
+/// output columns want the GEMM, given which matvec arm the family has?
 ///
 /// Split from [`gemm_enabled`] so the boundary is testable with **no device and no
 /// environment mutation** (`src/metal/policy/gate_tests.rs`) — the Metal module
 /// only compiles on macOS, but this half needs no GPU and no `MINFER_*` switch,
 /// which is what lets one authority serve all seven quant arms.
-pub fn gemm_preferred(nt: usize, od: usize) -> bool {
-    nt >= GEMM_MIN_NT && od >= GEMM_MIN_OD
+pub fn gemm_preferred(nt: usize, od: usize, arm: BandArm) -> bool {
+    nt >= gemm_min_nt(arm) && od >= GEMM_MIN_OD
 }
 
 /// Whether the GEMM path is available at all: `MINFER_GEMM=0` forces the per-row
