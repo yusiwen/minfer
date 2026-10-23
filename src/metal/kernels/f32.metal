@@ -50,3 +50,29 @@ kernel void kernel_f32_f32_matmul(
         }
     }
 }
+
+// ─── F32 embedding gather (#660) ─────────────────────────────
+//
+// The f32 twin of `kernel_get_rows_f16` (`f16.metal`): an f32 GGUF stores
+// `token_embd.weight` as f32, and until this kernel `embed_tokens_gpu` had no
+// `F32` arm — it hit an `unreachable!` on the model's first forward on a machine
+// with a Metal device, which CI never saw because its macOS runner has no GPU
+// and the binary then runs the CPU path.
+//
+// Geometry is the f16 kernel's: `embed_tokens_gpu` dispatches `nt * ne` threads
+// and each copies **one** element, so a row is a straight load/store with no
+// conversion. `ne`/`nt` arrive as bytes 3/4 of the buffer-argument list.
+kernel void kernel_get_rows_f32_embed(
+    device const float * weights [[buffer(0)]],
+    device const int   * ids     [[buffer(1)]],
+    device       float * dst     [[buffer(2)]],
+    constant    int    & ne      [[buffer(3)]],
+    constant    int    & nt      [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    int total = nt * ne;
+    int idx = (int)tid;
+    if (idx >= total) return;
+    int token_id = ids[idx / ne];
+    dst[idx] = weights[(size_t)token_id * ne + (idx % ne)];
+}

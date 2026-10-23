@@ -30,7 +30,9 @@ above runs on the GPU.
 ² F32 weights are supported on both GPUs: 1-D norms/biases through the norm kernels and 2-D matmul
 weights through CUDA's `launch_f32_f32_matmul` and Metal's `kernel_f32_f32_matmul`
 ([#317](https://github.com/yusiwen/minfer/issues/317)). Before #317 an f32 weight on Metal had no
-arm and silently ran the Q4_0 kernel.
+arm and silently ran the Q4_0 kernel. On Metal the f32 **embedding** table now has its gather arm too
+(`kernel_get_rows_f32_embed`, [#660](https://github.com/yusiwen/minfer/issues/660)); before that, an
+f32 GGUF panicked at its first forward on a machine with a device even though CI was green.
 ³ F16 has no block: 2 B per element, so there is no integer dot to run. The CPU
 dot is vectorized — AVX2 uses `F16C` (`_mm256_cvtph_ps`) and aarch64 uses
 baseline NEON `FCVTL` (`vcvt_f32_f16`) — with an f64 scalar oracle/fallback

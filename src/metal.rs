@@ -187,7 +187,12 @@ struct MpsStateInner {
     // decode — the Metal twin of CUDA's #208 pair).
     pl_bf16_f32: MetalComputePipelineState,
     pl_get_rows_q4_0: MetalComputePipelineState,
+    /// F32 row selection for the graph's tail rows (`get_rows_f32`, 2-D:
+    /// token in `tid.x`, element in `tid.y`).
     pl_get_rows_f32: MetalComputePipelineState,
+    /// #660: F32 **embedding** gather — the flat 1-D twin of
+    /// `pl_get_rows_f16`, whose shape `embed_tokens_gpu` dispatches.
+    pl_get_rows_f32_embed: MetalComputePipelineState,
     pl_get_rows_q4_k: MetalComputePipelineState,
     pl_get_rows_q4_1: MetalComputePipelineState,
     pl_get_rows_q5_0: MetalComputePipelineState,

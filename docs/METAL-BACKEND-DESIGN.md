@@ -338,7 +338,16 @@ bytes of `1.0f32` are `0x0000`, an f16 scale of 0) and writes zeros. The gap was
 the reporting test, `graph::op_matrix::matrix_cases_match_their_reference`, only ran its Metal column
 when some earlier test in the process had already initialized `MpsState`; its Metal arm now calls
 `MpsState::init()` explicitly, exactly as its CUDA arm calls `CudaState::init()`, so the column no
-longer depends on test order. That silent-wrong-kernel fallback is the registration-gate failure the
+longer depends on test order. **The embedding half of the same type was still missing until #660**
+(2026-10-23): `embed_tokens_gpu` had arms for the quants and for f16/bf16 but none for `F32`, so an
+f32 GGUF — `minfer convert --outtype f32`, or the checked-in `tests/fixtures/toy/toy-qwen2-f32.gguf`
+— panicked on its first forward on a Mac with a device (`unreachable!` in the catch-all arm). CI
+could not see it: its macOS runner has no Metal device, the binary then takes the CPU path, and every
+`tests/template_e2e.rs` case passing there was proving a different backend. The arm is
+`kernel_get_rows_f32_embed` (`src/metal/kernels/f32.metal`, `pl_get_rows_f32_embed`) — the flat 1-D
+twin of `kernel_get_rows_f16` (`nt * ne` threads, one element each, no conversion), gated by
+`f32_embed_gather_matches_the_reference`. The catch-all is now `gpu_abort` with the type named, not
+an `unreachable!`, so the next registered-but-unserved type fails loudly. That silent-wrong-kernel fallback is the registration-gate failure the
 f16 paragraph above describes, and `docs/SUPPORT-MATRIX.md`'s footnote 2 is updated to match. Two
 scope notes: **no model in the gate set carries a 2-D f32 weight**, so this path is covered by the
 synthetic `metal_matmul_f32_matches_cpu` gate and the op-matrix case only; and the catch-all `_` arm

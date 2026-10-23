@@ -158,6 +158,7 @@ impl MpsState {
             let pl_bf16_f32 = get_pl("kernel_bf16_f32_matmul")?;
             let pl_get_rows_q4_0 = get_pl("kernel_get_rows_q4_0")?;
             let pl_get_rows_f32 = get_pl("kernel_get_rows_f32")?;
+            let pl_get_rows_f32_embed = get_pl("kernel_get_rows_f32_embed")?;
             let pl_get_rows_q4_k = get_pl("kernel_get_rows_q4_k")?;
             let pl_get_rows_q4_1 = get_pl("kernel_get_rows_q4_1")?;
             let pl_get_rows_q5_0 = get_pl("kernel_get_rows_q5_0")?;
@@ -261,6 +262,7 @@ impl MpsState {
                 pl_bf16_f32,
                 pl_get_rows_q4_0,
                 pl_get_rows_f32,
+                pl_get_rows_f32_embed,
                 pl_get_rows_q4_k,
                 pl_get_rows_q4_1,
                 pl_get_rows_q5_0,
