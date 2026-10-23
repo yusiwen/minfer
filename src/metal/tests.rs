@@ -2684,7 +2684,19 @@ fn single_grid_y_bandwidth_profile() {
     let dev = &mps.inner.device;
     let nts: &[usize] = &[2, 3, 4, 5, 6, 7, 8];
     let nt_max = 8usize;
-    let cases: &[(usize, usize)] = &[(3584, 3584), (18944, 3584), (5120, 13824)];
+    // (label, type, od, id). The first three are the band's working set. The last
+    // two are the `output.weight` row — the widest N in every model, deliberately
+    // left unmeasured when `GEMM_MIN_NT_SINGLE_GRID` was set to 6 (§0.7). A `q4_K_M`
+    // file stores that row as **Q6_K padded to 152064** (K-quants block by 256:
+    // 152064 = 594 × 256, while the vocabulary's 151936 is not a multiple — 32-aligned
+    // types such as Q8_0 keep 151936), so it is measured on Q6_K as well as Q4_K.
+    let cases: &[(&str, TensorType, usize, usize)] = &[
+        ("7B attn_q", TensorType::Q4_K, 3584, 3584),
+        ("7B ffn", TensorType::Q4_K, 18944, 3584),
+        ("14B ffn", TensorType::Q4_K, 5120, 13824),
+        ("output (q6_K pad)", TensorType::Q6_K, 152064, 3584),
+        ("output (q4_K)", TensorType::Q4_K, 152064, 3584),
+    ];
     let routes = [
         GridYProbe::Shipped,
         GridYProbe::Gemm,
@@ -2692,12 +2704,9 @@ fn single_grid_y_bandwidth_profile() {
         GridYProbe::SingleGridY,
     ];
     let names = ["shipped", "GEMM", "_multi (forced)", "single grid.y=nt"];
-    let ttype = TensorType::Q4_K;
     let n = 50usize;
-    println!(
-        "\n=== grid.y = nt A/B (Q4_K, n={n} per timed cb, pre-warmed, min of 3 interleaved) ==="
-    );
-    for &(od, id) in cases {
+    println!("\n=== grid.y = nt A/B (K-quants, n={n} per timed cb, pre-warmed, min of 3 interleaved) ===");
+    for &(label, ttype, od, id) in cases {
         let bq = quant_block_q(ttype);
         let bb = quant_block_bytes(ttype);
         let wbytes = (id / bq) * bb * od;
@@ -2772,7 +2781,9 @@ fn single_grid_y_bandwidth_profile() {
         }
 
         let unit = best[cells.len() - 1];
-        println!("\n  Q4_K od={od} id={id}: one weight pass (nt=1) = {unit:.4} ms per dispatch");
+        println!(
+            "\n  {label} {ttype:?} od={od} id={id}: one weight pass (nt=1) = {unit:.4} ms per dispatch"
+        );
         let mut header = format!("    {:>2}", "nt");
         for name in names {
             header.push_str(&format!("  {name:>28}"));
