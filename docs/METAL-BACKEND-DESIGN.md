@@ -289,18 +289,21 @@ CUDA's `supports_op` gates RoPE to `NonInterleaved` only. All supported models a
 | `QkvBiasRopeStore` | `Err("op ... unsupported on Metal (CUDA-only)")` — reaching it is a scheduling invariant violation |
 
 **MatMul tiers** (`quant_matmul_f32_on_gpu_buf`): a simdgroup **GEMM** kernel (64×32 tile,
-128 threads, 8 KiB threadgroup scratch) when `policy::gemm_preferred(nt, od) &&
-policy::gemm_enabled()`, i.e. `nt >= 4 && od >= 2048`; otherwise, for **`nt <= 8`**, the
+128 threads, 8 KiB threadgroup scratch) when `policy::gemm_preferred(nt, od, arm) &&
+policy::gemm_enabled()`, i.e. `od >= 2048` and `nt` at or above that family's row floor —
+`nt >= 4` for the `_multi` arm, `nt >= 6` for the two families with a single-grid arm
+(Q4_K/Q6_K, `BandArm`); otherwise, for **`nt <= 8`**, the
 **single-token** kernel dispatched with `grid.y = nt` (one threadgroup per output row tile per
 token — the waves share the weight stream through L2, 1.3-1.9× faster than looping the tokens
-inside one threadgroup and bitwise identical); and for **`nt > 8`** the **`_multi`** kernel with
+inside one threadgroup and bitwise identical; Q4_K/Q6_K only at `nt = 4, 5`); and for
+**`nt > 8`** the **`_multi`** kernel with
 `grid.y = 1`, so the `MINFER_GEMM=0` long-prefill route is never charged `nt` threadgroups.
 `nt == 1` is the plain single-token dispatch. The boundary is one authority
 (`src/metal/policy.rs`, `src/metal/policy/gate_tests.rs`) and both axes are measured — rows
 because the 32-row M tile pads, width because the 64-wide N tile under-fills (the 0.5B's
 `od` 896-1152 rows lose 1.56× through the GEMM at `nt = 4..8`); see
 [`METAL_OPTIMIZATIONS.md`](METAL_OPTIMIZATIONS.md) §0.4 and, for the matvec band's
-`grid.y = nt` change, §0.6. Every supported quant type has the
+`grid.y = nt` change and its two-row floor extension, §0.6-§0.7. Every supported quant type has the
 tiers that matter, and `_multi` keeps the decode kernel's per-row arithmetic bitwise (gated
 by `small_batch_matvec_is_per_row_exact_for_every_quant`). Guards: K-quant `id % 256 != 0` aborts via
 `gpu_abort`; the GEMM checks the threadgroup-memory request against the device limit queried at
