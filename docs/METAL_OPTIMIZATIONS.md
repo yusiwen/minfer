@@ -699,6 +699,86 @@ within 1.02-1.24× of the GEMM there rather than 1.5-2.2×, so it cannot be assu
 `C_T(3)` still sits ≈4 ms above its 80 ms bar in this run (`84.20`; §0.6's landed run measured 86.53) and acceptance (llama 76.9 % vs our 70.4 %) is
 not a kernel property.
 
+### §0.8 The 64-element K staging for the K-quant GEMM was measured out (2026-10-23, #658)
+
+**The proposal.** [#658](https://github.com/yusiwen/minfer/issues/658) priced a re-schedule of the
+Q4_K prefill GEMM (`kernel_q4_k_mm_f32`, `src/metal/kernels/mul_mm_kq.metal`): stage **two** K
+chunks per compute phase (`sa` 64×64 halfs = 8 KiB, `sb` 32×64 halfs = 4 KiB, 12 KiB total), run
+`ik` as 8 steps of `NK/8`, leave the per-`ik` barrier layout alone, and raise `gemm_dispatch`'s
+threadgroup-memory request from 8 KiB to 12 KiB. The issue's own table measured that variant at
+**0.922-0.944×** (5-8 % faster) on the three ffn-sized shapes, bitwise identical to the shipped
+kernel.
+
+**What was built, and what it measured.** The change was implemented exactly as priced, in place:
+the two K-quant kernels ask for 12 KiB through a new `gemm_dispatch(…, tg_mem: u64)` parameter
+while the other seven GEMM types keep 8 KiB (their occupancy is not this change's to spend), and
+two staging forms were tried — the literal "stage two chunks" (two live `float4x4` dequant
+temporaries) and a single-register sequential form. Q4_K, `macbookpro (macOS 27.0.1, Apple M4
+Pro)`, 2026-10-23, load average 1.4-5, `n = 50` dispatches per timed command buffer, every variant
+pre-warmed, min of 3 interleaved rounds:
+
+| shape | nt | `NK = 64` | `NK = 32` (shipped) | ratio |
+|---|---|---|---|---|
+| 3584×3584 | 32 | 0.2225 ms | 0.2252 | 0.988 |
+| 3584×3584 | 5 | 0.2204 | 0.2236 | 0.986 |
+| 3584×3584 | 495 | 2.1080 | 2.1169 | 0.996 |
+| 18944×3584 | 32 | 0.7770 | 0.7791 | 0.997 |
+| 18944×3584 | 5 | 0.7666 | 0.7717 | 0.993 |
+| 18944×3584 | 495 | 10.9241 | 10.9891 | 0.994 |
+| 5120×13824 | 32 | 0.8690 | 0.8847 | 0.982 |
+| 5120×13824 | 5 | 0.8595 | 0.8769 | 0.980 |
+| 5120×13824 | 495 | 11.7997 | 11.6835 | **1.010** |
+
+**-1.4 % to +1.0 %, with one shape slower.** Both clauses of the issue's acceptance ("≥ 3 %
+better", "no shape worse") fail, so there is nothing to land and the change was dropped whole. The
+model-level ≥ 3 % cannot exist when the per-matmul effect is ≈ 1 %: `pp30`/`pp495` are 76-88 %
+GEMM by §0.5's decomposition, so 1 % on the matmul is ≈ 0.8 % on prefill at best.
+
+**Why the issue's 5-8 % was never available.** The kernel pays, per **32** elements of K, two
+`threadgroup_barrier`s plus 4 `ik` steps × 3 `simdgroup_barrier`s = **14 barriers**. `NK = 64`
+removes only the two *staging* barriers per 64 K (4 → 2), so the count per 32 K goes 14 → **13 —
+a 7 % cut in *barrier count*, and that class is the 12 `ik` barriers this change explicitly does
+not touch**. The `ik`-barrier change was already banked: rows **29-30** of the `✅ Done` table (2026-08-19,
+commits `f3a499d` and `0e756f3`) landed `#pragma unroll` plus the `mem_none` ik barrier for
+**~5.8 % + ~1.2 %** of 0.5B prefill — the "~7-9 % on top" the §1.1 note records — which is the same
+5-8 % band #658's headline quotes. So the issue double-counted a lever that has been in the tree for two months; what a
+64-element stage can still find is the sliver above that, and the sliver is ≈ 1 % with a
+sign that flips by shape.
+
+**Two findings worth keeping, for whoever revisits this.**
+
+1. **The literal form is a register-pressure trap, not an occupancy one.** Staging two chunks the
+   obvious way keeps two `float4x4` dequant temporaries live (32 registers) on top of `mc[8]`'s 64
+   and measures **1.28-1.34× slower** than the shipped kernel. Sequential single-register staging
+   (`dequant → barrier → write → dequant the next chunk into the same registers → write`) brings it
+   back to 0.98-1.01. Any future attempt must start from the single-temp form.
+2. **12 KiB of threadgroup memory is free on this chip.** The occupancy control — the shipped
+   `NK = 32` body dispatched with a 12288 B request — measures 0.989-1.008× at `nt = 32, 5, 495`.
+   The blanket-raise risk is real in principle and nil here, but the per-kernel parameter is still
+   the right shape and costs nothing.
+
+**Correctness.** Both forms are **bitwise identical** to the pre-change kernel (3 shapes × `nt =
+32, 5`, `f32::to_bits`, every element, 6/6) — checked against the old body kept temporarily under a
+second name, which was scaffolding and is gone with the branch. The two properties that make a
+re-schedule safe are worth re-deriving in any future attempt: rows must not depend on the M-tile
+padding (the `nt = 32` direct store and the `nt = 5` `temp_str` path must agree bitwise), and the
+GEMM must stay within its established tolerance of the matvec arm.
+
+**Model level: not measurable on this box.** It is the user's active desktop (four browser
+renderers, an agent, a firewall, Spotlight earlier); 7B `pp495` swung 242 → 398 t/s within one
+session at ±25 t/s, so no whole-model claim is possible and the per-matmul table above is the
+result. The one clean order-balanced run (load 1.4, ±0.5 t/s) compared 397.6 t/s shipped against
+320.2 for the two-temporary variant — a consistency check on the 1.30× per-matmul penalty, not a
+result for the final form.
+
+**Consequence: no code change.** The K-quant GEMM keeps `NK = 32` and its 8 KiB scratch, so
+`docs/METAL-BACKEND-DESIGN.md`'s "MatMul tiers" and the walkthrough's identical 8 KiB sentence need
+no edit — the K-quant pair still stages 6 KiB (4 KiB `sa` + 2 KiB `sb`) inside an 8 KiB block that
+`bc_out` reuses. Q6_K was not attempted: identical structure, identical ceiling, and the premise is
+already refuted on its twin. The question §0.5 left open — the `mma` loop at **3.30 TMAC/s ≈ 40 %**
+of the half-precision peak — is untouched by this and is a geometry question, not a staging one;
+this record removes staging from that lever's list for good.
+
 ### ✅ Done
 
 | # | Item | Measured effect | Commit (pre-rewrite) |
@@ -787,6 +867,7 @@ not a kernel property.
 | 9 | **MTLDispatchTypeConcurrent encoder** (2026-08-20, §3.6) | helps only WITHOUT the per-dispatch barrier (replay 1126 vs 1143 ms); with the engine's required `memoryBarrier` it is noise (FULL 1331-1370 vs serial 1336) — reverted |
 | 10 | **GEMM-interleave / 2-CB split** (2026-08-20, §3.6) | dummy attn/norm dispatches between GEMMs: 845 vs 840 ms (hurts); llama-style split CB1+CB0: 1195-1210 vs 1126 ms (hurts) |
 | 11 | **Prefill GEMM kernel experiments** (2026-08-14, §3.6) | grid-shape probe (3.5-5.4 TF variance) not the lever; `mem_none` ik-loop barrier + vectorized sb-store both **RACY in minfer** (deterministic corruption) — the `mem_threadgroup` barrier is a genuine correctness requirement |
+| 12 | **64-element K staging for the K-quant GEMM** (2026-10-23, §0.8, [#658](https://github.com/yusiwen/minfer/issues/658)) | built in place and measured -1.4 % to +1.0 % per matmul, one shape slower; the 5-8 % it was priced at is the 2026-08-19 unroll + ik-barrier change (`✅ Done` rows 29-30), already in the tree — and the literal two-chunk form spills (1.28-1.34× slower) |
 
 ---
 
