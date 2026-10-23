@@ -81,21 +81,6 @@ static OP_ENC: std::sync::Mutex<BTreeMap<String, (u64, f64)>> =
     std::sync::Mutex::new(BTreeMap::new());
 static GPU_MS: std::sync::Mutex<(u64, f64)> = std::sync::Mutex::new((0, 0.0));
 
-/// Experimental device-side attribution (`MINFER_METAL_SYNC_OPS=1`): submit the
-/// pending command buffer after **every** node, so the per-op `EncTimer` around
-/// `execute_node` measures that node's device time instead of its encode time.
-///
-/// The graph normally encodes ~170 nodes into one command buffer, which is why
-/// `MINFER_OP_PROFILE`'s numbers are host-side; with this latch each node gets
-/// its own submission (same order, same buffers — the results are unchanged).
-/// The cost is one submit+wait per node, which lands in every row equally and is
-/// subtracted by comparing two runs (`nt = 1` against `nt = 3`): what grows
-/// between them is the device work, which is the attribution the ledger needs.
-fn sync_ops_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_METAL_SYNC_OPS").map_or(false, |v| v == "1"))
-}
-
 fn op_profile_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("MINFER_OP_PROFILE").map_or(false, |v| v == "1"))
@@ -1979,6 +1964,8 @@ impl Backend for MetalBackend {
                 Err(format!("op {:?} unsupported on Metal (CUDA-only)", node.op))
             }
         };
+        // Experimental attribution: one submission per node (see the latch at the
+        // end of the file). Same order, same buffers — results are unchanged.
         if sync_ops_enabled() {
             self.submit_pending();
         }
@@ -2116,6 +2103,23 @@ impl Backend for MetalBackend {
 /// allocator to know whether GPU is available.
 pub fn metal_available() -> bool {
     MpsState::get().is_some()
+}
+
+/// Experimental device-side attribution (`MINFER_METAL_SYNC_OPS=1`): submit the
+/// pending command buffer after **every** node, so the per-op `EncTimer` around
+/// `execute_node` measures that node's device time instead of its encode time.
+///
+/// The graph normally encodes ~170 nodes into one command buffer, which is why
+/// `MINFER_OP_PROFILE`'s numbers are host-side; with this latch each node gets
+/// its own submission. The cost is one submit+wait per node, which lands in every
+/// row equally and is subtracted by comparing two runs (`nt = 1` against
+/// `nt = 3`): what grows between them is the device work.
+///
+/// Defined at the end of the file on purpose: inserting above the trait impl
+/// shifts every `metal_backend.rs:NNN` line anchor the docs carry.
+fn sync_ops_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_METAL_SYNC_OPS").map_or(false, |v| v == "1"))
 }
 
 #[cfg(test)]

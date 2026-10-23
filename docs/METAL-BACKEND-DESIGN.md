@@ -217,6 +217,14 @@ kernel runs directly on `out_buf`, which for an aliased node is the producer's b
 submit prints a top-20 table, later submits print one line each; zero overhead when unset. `Drop`
 submits any pending command buffer (never leaving an unterminated encoder) and prints the profile.
 
+Those numbers are **host encode time**, because the graph encodes its ~170 nodes into one command
+buffer. `MINFER_METAL_SYNC_OPS=1` makes them device time: it submits and waits after every node, so
+the per-op row is that node's own GPU cost (same order, same buffers — the results are unchanged).
+The price is one submit+wait per node, which lands in every row equally, so an A/B is two runs at
+different `nt` with the same latch on, compared per call. Both latches are diagnostic only: do not
+quote a throughput number from a run with either set. First use and the subtraction of the ~0.14 ms
+per-call submit floor: [`METAL_OPTIMIZATIONS.md`](METAL_OPTIMIZATIONS.md) §0.9.
+
 ### 4.2 Backend trait mapping
 
 | Trait method | Metal implementation |

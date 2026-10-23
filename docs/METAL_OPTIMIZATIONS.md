@@ -806,6 +806,79 @@ already refuted on its twin. The question §0.5 left open — the `mma` loop at 
 of the half-precision peak — is untouched by this and is a geometry question, not a staging one;
 this record removes staging from that lever's list for good.
 
+### §0.9 The phase ledger against llama.cpp, and what the verify is made of (2026-10-23, #667)
+
+The speculative campaign optimised one path for two days without a phase-level comparison, so
+"1.17× against llama's 1.19×" hid which *step* carried the residual. This is that comparison, plus
+the per-op attribution the four kernel attempts in [#667](https://github.com/yusiwen/minfer/issues/667)
+needed and did not have.
+
+**The ledger** (`macbookpro`, macOS 27.0.1, Apple M4 Pro, 48 GiB; 14B q4_K_M target + 0.5B q4_K_M
+draft; same prompt, greedy, seed 1; llama.cpp `c479922ac` from `~/git/reading/llama.cpp`):
+
+| step | minfer | llama.cpp | ratio |
+|---|---|---|---|
+| decode `tg128`, 14B | 25.52 t/s = 39.2 ms | 25.68 t/s = 38.9 ms | **0.99 — parity** |
+| draft step `tg128`, 0.5B | 274.4 t/s = 3.64 ms | 300.0 t/s = 3.33 ms | 0.91 |
+| verify `nt = 3` (`n_out = 3`) | 92.9 ms | ≈71.6 ms | 0.77 |
+| prefill `pp30` | 132.0 t/s | 186.5 t/s | 0.71 |
+| prefill `pp495` | 157.2 t/s | 228.2 t/s | 0.69 |
+| spec round, `d = 2` | 103.2 ms | 78.3 ms | 0.76 |
+| e2e spec `d = 2` | 23.0 t/s | 32.4 t/s | 0.71 |
+| acceptance | 70.4 % | 76.9 % | — |
+
+The verify's own split (`MINFER_SPEC_DEBUG=1`, 27 rounds): **verify 92.91 ms (90 %)**, draft 7.99,
+full-accept KV repair 1.95, accept + sampling **0.38**. The sampler is not a factor, and `draft` is
+already at 0.91 — the round *is* the verify.
+
+**What the verify is made of.** `bench -p 3 -n 0` is not a verify proxy (it runs at KV depth 3), so
+the attribution came from a per-node device-side profile: `MINFER_METAL_SYNC_OPS=1` submits each node
+on its own, which turns `MINFER_OP_PROFILE`'s host-encode rows into device time. A trivial op
+(RMSNorm/Add/RoPE/SwiGLU) costs **0.14 ms** per call in that mode, i.e. the submit+wait floor; the
+per-call averages below have it subtracted:
+
+| op | nt = 1 | nt = 3 | growth |
+|---|---|---|---|
+| `MatMul` (÷ ~290 calls/forward) | **0.12 ms/call** | **0.24 ms/call** | **2.0×** |
+| `Attn` (÷ ~48) | 0.035 | 0.21 | 6× |
+| everything else | ≤ 0.005 | ≤ 0.005 | flat |
+
+So the verify is **≈78 % matmul, ≈11 % attention** at depth 3 (attention's share grows with depth),
+and the matmul's per-call cost *doubles* from one row to three. That is the band's per-row weight
+re-streaming, and it is the item every attempt below targeted.
+
+**Five attempts, all measured out** (each with its own record in #667):
+
+1. **Grid axis order** — tokens on the fast axis so the threadgroups sharing a row tile's weights run
+   adjacent: **within noise** (≤ 0.6 % at `nt = 2..8`), bitwise under the latch.
+2. **Wider row tile** (`NR0 2 → 4`, 8 rows per threadgroup): decode **−9 %**, band no better.
+3. **`_multi` with half the accumulators** (`MAXT 4 → 2`): its marginal improves 1.68 → 1.29 passes
+   per row and remains **2× behind** the shipped arm.
+4. **llama's `mul_mv_ext` shape**, ported faithfully (r1 tokens per threadgroup, `float4x4` chunks,
+   min term folded into the dequant): **16-30 % slower** everywhere, 23.0 → 19.4 t/s end to end.
+5. **Classic attention at small `nt`**: 10 % worse on `C_T(3)` at depth 512 and ~20 % end to end —
+   the shallow-depth numbers that suggested it were a `bench -p N` artifact.
+
+Two by-products are worth keeping. llama's `ne11 = 3` path is **plain `mul_mv`** (its ext covers
+`4..8`), i.e. the same algorithm we run — so this is not a tier we failed to find. And the band's
+arithmetic does **not** change a sampled token: with the band on the GEMM (a perturbation ~100×
+larger than a re-ordered accumulation), the identity battery stayed **4/4** and the recorded spec run
+kept its exact 70.4 % / 2.37 tokens/round.
+
+**The attribution, stated as such.** The verify trails llama by ~1.26-1.30×, it is 78 % matmul, and
+the matmul is at 1.33× per call at `nt = 3`. Four structural alternatives to that matmul were built
+and measured; none won, and the one that matches llama's own kernel lost by more. The remaining
+untried lever is the same one §3.6 named for the prefill GEMM — the mma geometry, at 3.30 TMAC/s
+against a ~40 %-of-peak ceiling — and the only hardware path past it (the tensor API) is one llama
+itself disables on this part. Until someone prices that geometry experiment, this step is **measured
+and not addressable by the structures we have**, which is the same verdict §3.6 reached from the
+prefill side.
+
+**Methodology, now mandatory for this document.** The box is an active desktop: the same `C_T(3)` read
+84.2 ms in the morning and 90-96 ms in the evening, and a stray background benchmark moves it 10 %.
+Every A/B below this line must be **interleaved** (back-to-back pairs, compare ratios, never absolute
+ms across runs) and must record the **load average** it ran at.
+
 ### ✅ Done
 
 | # | Item | Measured effect | Commit (pre-rewrite) |
