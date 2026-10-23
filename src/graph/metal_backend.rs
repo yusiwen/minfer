@@ -81,6 +81,21 @@ static OP_ENC: std::sync::Mutex<BTreeMap<String, (u64, f64)>> =
     std::sync::Mutex::new(BTreeMap::new());
 static GPU_MS: std::sync::Mutex<(u64, f64)> = std::sync::Mutex::new((0, 0.0));
 
+/// Experimental device-side attribution (`MINFER_METAL_SYNC_OPS=1`): submit the
+/// pending command buffer after **every** node, so the per-op `EncTimer` around
+/// `execute_node` measures that node's device time instead of its encode time.
+///
+/// The graph normally encodes ~170 nodes into one command buffer, which is why
+/// `MINFER_OP_PROFILE`'s numbers are host-side; with this latch each node gets
+/// its own submission (same order, same buffers — the results are unchanged).
+/// The cost is one submit+wait per node, which lands in every row equally and is
+/// subtracted by comparing two runs (`nt = 1` against `nt = 3`): what grows
+/// between them is the device work, which is the attribution the ledger needs.
+fn sync_ops_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_METAL_SYNC_OPS").map_or(false, |v| v == "1"))
+}
+
 fn op_profile_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("MINFER_OP_PROFILE").map_or(false, |v| v == "1"))
@@ -938,7 +953,7 @@ impl Backend for MetalBackend {
         } else {
             None
         };
-        match &node.op {
+        let r = match &node.op {
             Op::Input => Ok(()),
             Op::Silu => {
                 if in_bufs[0].id != out_buf.id {
@@ -1963,7 +1978,11 @@ impl Backend for MetalBackend {
             Op::QkvBiasRopeStore { .. } => {
                 Err(format!("op {:?} unsupported on Metal (CUDA-only)", node.op))
             }
+        };
+        if sync_ops_enabled() {
+            self.submit_pending();
         }
+        r
     }
 
     /// C3 (issue #44 part (b)): move KV rows inside one arena on the device.
