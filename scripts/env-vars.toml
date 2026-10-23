@@ -29,7 +29,7 @@
 #
 # The line below states what the checker counts, and the checker compares it: refresh it in
 # the same change that adds a knob or moves one between the tables (#628).
-# Measured 2026-10-20: 85 production reads — 73 documented, 12 internal.
+# Measured 2026-10-23: 86 production reads — 74 documented, 12 internal.
 
 [documented]
 
@@ -54,6 +54,7 @@ MINFER_GRAPH_DUMP = "AGENTS.md"
 MINFER_GRAPH_TRACE = "docs/COMPUTE-GRAPH-DESIGN.md"
 MINFER_METALLIB_FILE = "docs/METAL-BACKEND-DESIGN.md"
 MINFER_METAL_CAPTURE = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_METAL_SYNC_OPS = "docs/METAL-BACKEND-DESIGN.md"
 MINFER_MMQ_A_FUSE = "docs/CUDA-BACKEND-DESIGN.md"
 MINFER_MMQ_Q4K_DSC = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
 MINFER_MMQ_Q6K_EXP = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
