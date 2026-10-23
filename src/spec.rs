@@ -507,6 +507,7 @@ impl SpecEngine {
             "2" => 2,
             _ => 1,
         });
+        let accept_t0 = std::time::Instant::now();
         let (emitted, accepted) = accept_loop(
             &logits,
             &proposals,
@@ -517,6 +518,7 @@ impl SpecEngine {
             self.stats.rounds,
             pos,
         );
+        let accept_ms = accept_t0.elapsed().as_secs_f64() * 1e3;
         if let Some(ad) = self.adaptive.as_mut() {
             ad.observe_round(d, accepted);
         }
@@ -527,6 +529,7 @@ impl SpecEngine {
         // not forwarded) — repair it so the next round's draft KV stays
         // contiguous. Partial accepts leave no hole: the draft KV already
         // reaches pos+k for every k ≤ d-1.
+        let repair_t0 = std::time::Instant::now();
         if emitted.len() == d + 1 {
             let _ = self.draft.forward_graph_cached(
                 &[proposals[d - 1]],
@@ -536,6 +539,19 @@ impl SpecEngine {
                 &mut self.draft_cache,
             );
             self.stats.repairs += 1;
+        }
+        let repair_ms = repair_t0.elapsed().as_secs_f64() * 1e3;
+        if debug {
+            // Phase split of one round, for the parity ledger (`docs/
+            // METAL_OPTIMIZATIONS.md` §0.9): the adaptive controller already
+            // times draft and verify, so this line only adds the two halves it
+            // does not (accept and the full-accept KV repair) and the total.
+            eprintln!(
+                "[spec] r{} d={d} ms: draft={draft_ms:.2} verify={verify_ms:.2} \
+                 accept={accept_ms:.2} repair={repair_ms:.2} total={:.2} accepted={accepted}",
+                self.stats.rounds,
+                draft_ms + verify_ms + accept_ms + repair_ms,
+            );
         }
         emitted
     }
