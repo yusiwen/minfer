@@ -1866,6 +1866,84 @@ fn f16_embed_gather_matches_the_reference() {
     }
 }
 
+/// #660: the f32 embedding gather copies the requested rows bitwise.
+///
+/// The f16 gate's twin over the type that had **no** arm: an f32 GGUF's
+/// `token_embd.weight` reached `embed_tokens_gpu`'s catch-all and panicked on the
+/// first forward, and CI could not see it because its macOS runner has no device
+/// and the binary then takes the CPU path. Values are full-mantissa (`v / 8`) so a
+/// scale or byte-offset error cannot pass by rounding.
+///
+/// Two shapes: `nt = 1` (decode, the path every token takes) and `nt = 4`, whose
+/// `4 × 96 = 384` elements do **not** fill the 256-thread groups — that exercises
+/// the kernel's `idx >= nt * ne` guard, which a dropped guard would turn into a
+/// write past the destination row.
+#[test]
+fn f32_embed_gather_matches_the_reference() {
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the f32 embed gate");
+        return;
+    };
+    let dev = &mps.inner.device;
+    let (n_vocab, ne) = (50usize, 96usize);
+    let wv: Vec<f32> = (0..n_vocab * ne)
+        .map(|k| ((k * 37 + 11) % 97) as f32 / 8.0 - 6.0)
+        .collect();
+
+    let wb = dev
+        .newBufferWithLength_options(
+            ((n_vocab * ne * 4) as u64) as usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap();
+    unsafe {
+        let p = wb.contents().as_ptr() as *mut f32;
+        for (i, &v) in wv.iter().enumerate() {
+            *p.add(i) = v;
+        }
+    }
+
+    for nt in [1usize, 4] {
+        let ids: Vec<usize> = (0..nt).map(|t| (t * 17 + 3) % n_vocab).collect();
+        let idb = dev
+            .newBufferWithLength_options(
+                ((nt * 4) as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        unsafe {
+            let p = idb.contents().as_ptr() as *mut i32;
+            for (i, &v) in ids.iter().enumerate() {
+                *p.add(i) = v as i32;
+            }
+        }
+        let dst = dev
+            .newBufferWithLength_options(
+                ((nt * ne * 4) as u64) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap();
+        let cb = mps.cmd_buffer();
+        cb.embed_tokens_gpu(&wb, 0, &idb, &dst, ne, nt, TensorType::F32);
+        cb.submit().expect("submit");
+        let got =
+            unsafe { std::slice::from_raw_parts(dst.contents().as_ptr() as *const f32, nt * ne) };
+        for t in 0..nt {
+            for i in 0..ne {
+                let want = wv[ids[t] * ne + i];
+                assert_eq!(
+                    got[t * ne + i].to_bits(),
+                    want.to_bits(),
+                    "f32 embed [{t},{i}] (nt = {nt}, id = {})",
+                    ids[t]
+                );
+            }
+        }
+    }
+}
+
 /// #208: the bf16 weight matmul kernel reproduces an **exact** integer
 /// reference — the f16 gate's twin over the second 2 B/element dtype.
 ///

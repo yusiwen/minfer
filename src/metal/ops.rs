@@ -733,7 +733,20 @@ impl MpsCommandBuffer<'_> {
             TensorType::F16 => (&self.state.pl_get_rows_f16, ne),
             // #208: bf16 embedding rows, same one-element-per-thread shape.
             TensorType::BF16 => (&self.state.pl_get_rows_bf16, ne),
-            _ => unreachable!("embed_tokens_gpu called with unsupported type {ttype:?}"),
+            // #660: f32 embedding rows are a plain copy, same shape again. The
+            // type is registered by the loader (ADR-0037's `F32 | F16 | BF16`
+            // branch) and has no conversion to do, so the arm was simply missing —
+            // it used to fall into the catch-all arm and panic the model's first
+            // forward on a device, while CI (no GPU → CPU path) stayed green.
+            TensorType::F32 => (&self.state.pl_get_rows_f32_embed, ne),
+            // Every remaining type is unregistered for weights (the loader admits
+            // only the quants above plus F32/F16/BF16), so reaching this is a
+            // dispatch invariant violation, not a model: name it and abort rather
+            // than `unreachable!` into a panic a user cannot act on.
+            other => gpu_abort(&format!(
+                "embed_tokens_gpu: no embedding-row kernel for {other:?} \
+                 (registered weight types are the quants plus F32/F16/BF16)"
+            )),
         };
         self.enc.setComputePipelineState(&**(pl));
         unsafe {
