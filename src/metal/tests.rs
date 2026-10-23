@@ -2552,11 +2552,14 @@ fn production_small_batch_is_bitwise_with_the_forced_multi() {
 /// minimum is the least-contended sample).
 ///
 /// Shapes are Qwen2.5-7B Q4_K `attn_q` `(3584, 3584)`, 7B `ffn_gate/up`
-/// `(18944, 3584)` and the 14B `ffn` `(5120, 13824)`; `nt = 2, 3, 5, 8`.
+/// `(18944, 3584)` and the 14B `ffn` `(5120, 13824)`; `nt = 2..8`, the whole band
+/// the speculative decoder verifies in (`nt = d + 1`, `d <= 7`).
 /// Variants: the shipped entry, the forced `_multi` kernel, and the
-/// single-token/`grid.y = nt` dispatch (which production takes at `nt = 2/3`, and
-/// which is test-only at `nt = 5/8` where the default policy takes the GEMM);
-/// `nt = 1` is the "one weight pass" unit.
+/// single-token/`grid.y = nt` dispatch. Every shape here has `od >= 2048`, so from
+/// `GEMM_MIN_NT` up the **shipped** column *is* the simdgroup GEMM (each row
+/// prints which arm production takes), which makes `single/shipped` the per-shape
+/// answer to "would lowering the GEMM gate win at this `nt`?" — the measurement
+/// `GEMM_MIN_NT` 4 → 6 rests on. `nt = 1` is the "one weight pass" unit.
 /// The printed marginal is `(t(nt) - t(1)) / (nt - 1) / t(1)` — 1.0 means one
 /// extra full weight stream per extra row, ~0.0 means the rows share the stream.
 #[test]
@@ -2568,7 +2571,7 @@ fn single_grid_y_bandwidth_profile() {
         return;
     };
     let dev = &mps.inner.device;
-    let nts: &[usize] = &[2, 3, 5, 8];
+    let nts: &[usize] = &[2, 3, 4, 5, 6, 7, 8];
     let nt_max = 8usize;
     let cases: &[(usize, usize)] = &[(3584, 3584), (18944, 3584), (5120, 13824)];
     let routes = [
@@ -2674,7 +2677,11 @@ fn single_grid_y_bandwidth_profile() {
             } else {
                 "matvec"
             };
-            println!("{line}   [production: {arm}]");
+            // The decision number: single grid / shipped. Where production takes
+            // the GEMM this is "matvec vs GEMM at this nt"; where it already
+            // takes the matvec it must read ~1.00 (same dispatch).
+            let ratio = best[k * routes.len() + 2] / best[k * routes.len()];
+            println!("{line}   [production: {arm}]  single/shipped = {ratio:.2}x");
         }
         let mut wins = String::new();
         for (k, &nt) in nts.iter().enumerate() {
