@@ -103,6 +103,27 @@ GOVERNS_LEDGER = "scripts/adr-governs.toml"
 #: *added* one: editing a design doc is how the contract is kept true, which is routine.
 DESIGN_DOC = re.compile(r"\Adocs/[A-Z0-9][A-Za-z0-9-]*-DESIGN\.md\Z")
 
+#: The paths whose change makes the **MacBook gate mandatory** (#678): a mistake here is
+#: invisible to every job CI can run, because CI has no Metal device (#674). Kept narrow
+#: on purpose — `src/models/*/graph.rs` is in it because that is where the fused nodes and
+#: their Metal execution arms are decided, which is exactly the class of change #671/#673
+#: make; a path this table does not name is *not* a reason to demand a Mac run, and the
+#: reviewer can still ask for one.
+METAL_PREFIXES = ("src/metal/", "src/graph/metal_backend/")
+METAL_FILES = ("src/graph/metal_backend.rs", "build.rs")
+METAL_MODEL_GRAPH = re.compile(r"\Asrc/models/[^/]+/graph(?:\.rs|/)")
+
+
+def touches_metal(paths: list[str]) -> bool:
+    """Whether a range changes a path only a Metal device can validate (#678)."""
+    for raw in paths:
+        path = raw.strip()
+        while path.startswith("./"):
+            path = path[2:]
+        if path in METAL_FILES or path.startswith(METAL_PREFIXES) or METAL_MODEL_GRAPH.match(path):
+            return True
+    return False
+
 
 def classify(paths: list[str]) -> dict[str, int]:
     """`{class: count}` for `paths`; anything unrecognised is `rust`."""
@@ -205,13 +226,15 @@ def decide(
     added: tuple[str, ...] = (),
     touched: int = 0,
     doc_cited: bool = False,
+    metal: bool = False,
 ) -> dict[str, bool]:
-    """The four predicates: Rust jobs, suite job's reason, ADR question, Doc impact."""
+    """The five predicates: Rust jobs, suite job's reason, ADR question, Doc impact, MacBook gate."""
     return {
         "rust": counts["rust"] > 0,
         "baselines": counts["baselines"] > 0,
         "decision_surface": touched > 0 or any(DESIGN_DOC.match(p) for p in added),
         "doc_cited": doc_cited,
+        "metal": metal,
     }
 
 
@@ -314,6 +337,7 @@ def emit(decision: dict[str, bool]) -> None:
     print(f"baselines={'true' if decision['baselines'] else 'false'}")
     print(f"decision_surface={'true' if decision['decision_surface'] else 'false'}")
     print(f"doc_cited={'true' if decision['doc_cited'] else 'false'}")
+    print(f"metal={'true' if decision.get('metal') else 'false'}")
 
 
 # --------------------------------------------------------------------------
@@ -531,7 +555,7 @@ def run_selftest() -> int:
         record(
             "a docs range prints every predicate false",
             run_main("--base", c1, "--head", c2)
-            == "rust=false\nbaselines=false\ndecision_surface=false\ndoc_cited=false\nadr_question=\n",
+            == "rust=false\nbaselines=false\ndecision_surface=false\ndoc_cited=false\nmetal=false\nadr_question=\n",
             run_main("--base", c1, "--head", c2),
         )
 
@@ -557,6 +581,23 @@ def run_selftest() -> int:
             )
     else:
         print("SKIP  the governance cases (not run from a checkout)")
+
+    # #678: the MacBook gate's trigger set, including the model graph builders.
+    metal_cases = (
+        (["src/metal/kernels/mul_f32act_kquant.metal"], True),
+        (["src/metal/policy.rs"], True),
+        (["src/graph/metal_backend.rs"], True),
+        (["src/graph/metal_backend/tests/packed_kv.rs"], True),
+        (["build.rs"], True),
+        (["src/models/qwen2/graph.rs"], True),
+        (["src/models/qwen3/graph/tests.rs"], True),
+        (["src/graph/alloc.rs"], False),
+        (["src/models/qwen2/loader.rs"], False),
+        (["docs/USAGE.md"], False),
+    )
+    for paths, want in metal_cases:
+        got = touches_metal(paths)
+        record(f"metal trigger: {paths[0]} -> {want}", got == want, f"got {got}")
 
     # `--help` states the honest limit.
     record("--help states the honest limit", HELP_LIMIT in build_parser().description, "")
@@ -602,7 +643,15 @@ def main(argv: list[str]) -> int:
         print(f"classify_changes: {reason} — running every code job", file=sys.stderr)
         # The fail-safe asks the ADR question too: a range nobody could read is not
         # evidence that no decision was taken.
-        emit({"rust": True, "baselines": False, "decision_surface": True, "doc_cited": True})
+        # The MacBook gate is asked too: a range nobody could read is not evidence that no
+        # Metal path moved, and guessing "no" is the expensive direction (#678).
+        emit({
+            "rust": True,
+            "baselines": False,
+            "decision_surface": True,
+            "doc_cited": True,
+            "metal": True,
+        })
         print("adr_question=")
         return 0
 
@@ -610,7 +659,7 @@ def main(argv: list[str]) -> int:
     added = tuple(git_added(root, base, head))
     touched = governed(root, paths)
     cited = doc_citations(root, paths)
-    decision = decide(counts, added, len(touched), cited)
+    decision = decide(counts, added, len(touched), cited, metal=touches_metal(paths))
     reasons = decision_reasons(touched, added)
     summary = ", ".join(f"{name}={counts[name]}" for name in CLASSES)
     print(

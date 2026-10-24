@@ -300,6 +300,20 @@ gate is the local run recorded below; a real CI gate needs a self-hosted runner 
 a Mac, which [#674] tracks and nobody has asked for yet. The same failure is what
 produced [#676] (the two unavailability causes now print differently).
 
+**A Metal-path PR must run the whole gate on the Mac, and record it** (#678). The
+trigger is path-based and checked by the classifier, not by judgement:
+`src/metal/**`, `src/graph/metal_backend.rs`, `src/graph/metal_backend/**`,
+`build.rs`, and `src/models/*/graph.rs` — the last one because that is where the
+fused nodes and their Metal execution arms are decided, which is the class of
+change #671/#673 make. For such a range the `Mac verification` section may **not**
+be `N/A`, and it must carry the box label, the date, the commit, `cargo test
+--release` and the counts; `scripts/mac_gate.sh` runs the gate (build + full suite +
+the identity battery when the models are present, wrapped in `caffeinate`, because a
+sleeping machine cuts the run in half) and prints the block to paste.
+`scripts/check_pr_body.py --metal true` enforces the shape. Shape is the whole
+claim: the checker can refuse `N/A` and refuse a record missing the commit, and it
+cannot make the numbers true — a reviewer still has to read them.
+
 **The PR body's `Mac verification` section is this rule on the one path CI
 cannot run** ([#335]). `build-macos` compiles the crate and — since [#303] — the
 test target, but it has no Metal device, so on the macOS/Metal path the
