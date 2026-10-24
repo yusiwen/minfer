@@ -106,6 +106,15 @@ CONTENT_NORMS = {h.casefold() for h in CONTENT_HEADINGS}
 ADR_LINE = re.compile(r"^\s*ADR\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 #: `none — <reason>`: the change is not a decision, and the reason says why.
 ADR_NONE = re.compile(r"^none\s*[—-]\s*(\S.*)$", re.IGNORECASE)
+#: #678: a range that touches the Metal path must carry a *real* Mac record, because no
+#: job CI can run has a Metal device (#674). Shape only — this can force the record to
+#: exist and to name its box, date, commit and command; it cannot make the numbers true.
+METAL_NA = re.compile(r"^\s*N/?A\b", re.IGNORECASE)
+METAL_DATE = re.compile(r"\b20\d{2}-\d{2}-\d{2}\b")
+METAL_COMMIT = re.compile(r"\b[0-9a-f]{7,40}\b")
+METAL_COMMAND = "cargo test --release"
+METAL_COUNTS = re.compile(r"\b\d+\s+passed\b", re.IGNORECASE)
+
 #: An ADR reference: `0011`, `ADR-0011` or `0011-backend-ids-are-append-only`.
 ADR_REF = re.compile(r"^(?:ADR-)?\d{4}(?:-[a-z0-9][a-z0-9-]*)?$", re.IGNORECASE)
 
@@ -184,6 +193,7 @@ def check_body(
     decision_surface: bool = False,
     adr_question: str = "",
     doc_cited: bool = False,
+    metal: bool = False,
 ) -> list[str]:
     """Every problem with `body`, in template order; empty means it passes.
 
@@ -224,6 +234,36 @@ def check_body(
                 f'"## {heading}" (line {line}) still holds only the template '
                 f'placeholder ("{PLACEHOLDER_PREFIX} ...")'
             )
+    if metal:
+        entry = found.get("mac verification")
+        if entry is not None:
+            line, text = entry
+            without_comments = COMMENT_RE.sub("", text).strip()
+            if METAL_NA.match(without_comments):
+                problems.append(
+                    f'"## Mac verification" (line {line}) answers N/A, and this range '
+                    "touches the Metal path — CI has no Metal device (#674), so the "
+                    'MacBook run is the only evidence there is. Record it as `<box '
+                    "label> / <date> / <commit> / <command and counts>` (#678), or "
+                    "narrow the change so it does not touch the Metal path"
+                )
+            else:
+                missing = []
+                if not re.search(r"\bmacbook\w*\b", without_comments, re.IGNORECASE):
+                    missing.append("the box label (e.g. `macbookpro (macOS …, Apple …)`)")
+                if not METAL_DATE.search(without_comments):
+                    missing.append("the date (`YYYY-MM-DD`)")
+                if not METAL_COMMIT.search(without_comments):
+                    missing.append("the commit the run was made on (7-40 hex)")
+                if METAL_COMMAND not in without_comments:
+                    missing.append(f"the command (`{METAL_COMMAND}`)")
+                if not METAL_COUNTS.search(without_comments):
+                    missing.append("the suite counts (e.g. `715 passed / 0 failed`)")
+                if missing:
+                    problems.append(
+                        f'"## Mac verification" (line {line}) is the MacBook record for a '
+                        "Metal-path range and is missing: " + "; ".join(missing)
+                    )
     if decision_surface:
         match = ADR_LINE.search(body)
         if match is None:
@@ -496,12 +536,59 @@ def run_selftest() -> int:
             failures += 1
             print(f"      expected {'pass' if should_pass else f'a failure naming {expected!r}'}")
             print(f"      got: {problems or 'pass'}")
+    # #678: a Metal-path range must carry a real Mac record; N/A is refused for it.
+    good = complete_body(
+        mac="macbookpro (macOS 27.0.1, Apple M4 Pro) / 2026-10-24 / 0699bf3 / "
+        "cargo test --release -> 715 passed / 0 failed / 56 ignored"
+    )
+    metal_cases = (
+        ("a Metal range with a full Mac record passes", good, True, None, True),
+        (
+            "a Metal range answering N/A fails",
+            complete_body(mac="N/A — docs only"),
+            False,
+            "N/A",
+            True,
+        ),
+        (
+            "a Metal range without the commit fails",
+            complete_body(mac="macbookpro / 2026-10-24 / cargo test --release -> 715 passed"),
+            False,
+            "commit",
+            True,
+        ),
+        (
+            "a Metal range without the command fails",
+            complete_body(mac="macbookpro / 2026-10-24 / 0699bf3 / 715 passed"),
+            False,
+            "cargo test --release",
+            True,
+        ),
+        (
+            "a non-Metal range may still answer N/A",
+            complete_body(mac="N/A — docs only"),
+            True,
+            None,
+            False,
+        ),
+    )
+    for name, body, should_pass, expected, metal in metal_cases:
+        problems = check_body(body, metal=metal)
+        ok = ((not problems) == should_pass) and (
+            expected is None or any(expected in problem for problem in problems)
+        )
+        print(f"{'PASS' if ok else 'FAIL'}  {name}")
+        if not ok:
+            failures += 1
+            print(f"      expected {'pass' if should_pass else f'a failure naming {expected!r}'}")
+            print(f"      got: {problems or 'pass'}")
+
     # The help text must state the limit (issue #175 acceptance).
     help_ok = HELP_LIMIT in build_parser().description
     print(f"{'PASS' if help_ok else 'FAIL'}  --help states the presence/truth limit")
     if not help_ok:
         failures += 1
-    total = len(selftest_cases()) + len(adr_cases) + len(doc_cases) + 1
+    total = len(selftest_cases()) + len(adr_cases) + len(doc_cases) + len(metal_cases) + 1
     print(f"check_pr_body selftest: {total - failures}/{total} cases pass")
     return 1 if failures else 0
 
@@ -558,6 +645,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--metal",
+        metavar="true|false",
+        default="",
+        help=(
+            "the `changes` job's `metal` answer: when true, `## Mac verification` may not "
+            "be N/A and must carry the box label, date, commit, `cargo test --release` and "
+            "the counts (#678) — CI has no Metal device (#674)"
+        ),
+    )
+    parser.add_argument(
         "--selftest",
         action="store_true",
         help="run the built-in pass/fail cases in-process and exit non-zero on a failure",
@@ -576,11 +673,13 @@ def main(argv: list[str]) -> int:
     body = read_body(args)
     decision_surface = args.decision_surface.strip().casefold() == "true"
     doc_cited = args.doc_cited.strip().casefold() == "true"
+    metal = args.metal.strip().casefold() == "true"
     problems = check_body(
         body,
         decision_surface=decision_surface,
         adr_question=args.adr_question.strip(),
         doc_cited=doc_cited,
+        metal=metal,
     )
     if problems:
         for problem in problems:

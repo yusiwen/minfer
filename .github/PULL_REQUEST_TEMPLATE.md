@@ -62,9 +62,13 @@ FILL-ME: what happened to the citing paragraphs, or `N/A — <reason>`
 ## Mac verification
 
 <!-- The macOS/Metal path this change touches and how it was checked, or why it
-     needs no Mac: `<box label> / <date> / <command>` (the box label is absolute,
-     gate contract rule 5) or `N/A — <reason>`. CI's `build-macos` only compiles
-     the crate and the test target, so this line is the record of what was run
-     on which box — and what was not. -->
+     needs no Mac: `<box label> / <date> / <commit> / <command and counts>` (the box
+     label is absolute, gate contract rule 5) or `N/A — <reason>`. CI's `build-macos`
+     only compiles the crate and the test target — the hosted runner has no Metal
+     device at all (#674) — so this line is the record of what was run on which box.
+
+     N/A is REFUSED when the range touches src/metal/**, src/graph/metal_backend*,
+     build.rs or src/models/*/graph.rs (#678): run `scripts/mac_gate.sh` on the Mac
+     and paste what it prints. -->
 
 FILL-ME: `<box label> / <date> / <command>`, or `N/A — <reason>`

@@ -107,7 +107,11 @@ gate](https://github.com/yusiwen/minfer/issues/154) checks its own robustness.
 crate: `cargo test --release --no-run` on the Linux CPU job (implicitly), `cargo test --release
 --features cuda --no-run` on the CUDA job and `cargo test --release --no-run` on `build-macos`
 ([#303](https://github.com/yusiwen/minfer/issues/303)) — `cargo build` does not compile
-`#[cfg(test)]`, and a macOS-only test module was invisible for eleven days because of it. Those
+`#[cfg(test)]`, and a macOS-only test module was invisible for eleven days because of it. The macOS job cannot run them: GitHub's hosted
+runner has no Metal device ([#674](https://github.com/yusiwen/minfer/issues/674), measured — 13
+device tests fail with no `MPS:` line in the log), so the device gate is
+`scripts/mac_gate.sh` on a Mac, and a Metal-path PR must paste its record into the PR body
+([#678](https://github.com/yusiwen/minfer/issues/678)). Those
 three jobs are skipped when the change classifier finds no code change (ADR-0025): a docs-only
 change runs the doc gates instead, and the suite still runs whenever the suite ledger moves. Since the KV storage format became **per engine**
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no

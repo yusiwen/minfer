@@ -690,7 +690,7 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           OUT=$(python3 scripts/classify_changes.py --base "origin/$BASE_REF" --head "$SHA") \
-            || OUT=$(printf 'decision_surface=true\ndoc_cited=true\n')
+            || OUT=$(printf 'decision_surface=true\ndoc_cited=true\nmetal=true\n')
           SURFACE=$(printf '%s\n' "$OUT" | sed -n 's/^decision_surface=//p')
           # The decisions the range answers to, so the checker's failure names them
           # (#541). One line, and empty when the range touches no governed surface.
@@ -698,10 +698,14 @@ jobs:
           # #643: does a live document cite a file this range changes? The fail-safe is
           # the same as the ADR question's — an unreadable range asks, never assumes.
           CITED=$(printf '%s\n' "$OUT" | sed -n 's/^doc_cited=//p')
+          # #678: does the range touch a path only a Metal device can validate? CI has
+          # none (#674), so the PR body must then carry the MacBook's record.
+          METAL=$(printf '%s\n' "$OUT" | sed -n 's/^metal=//p')
           {
             echo "surface=${SURFACE:-true}"
             echo "question=$QUESTION"
             echo "cited=${CITED:-true}"
+            echo "metal=${METAL:-true}"
           } >> "$GITHUB_OUTPUT"
       - name: The checker's own pass/fail cases
         run: python3 scripts/check_pr_body.py --selftest
@@ -711,7 +715,8 @@ jobs:
           DECISION_SURFACE: ${{ steps.decision.outputs.surface }}
           ADR_QUESTION: ${{ steps.decision.outputs.question }}
           DOC_CITED: ${{ steps.decision.outputs.cited }}
+          METAL: ${{ steps.decision.outputs.metal }}
         run: |
           python3 scripts/check_pr_body.py --body-env PR_BODY \
             --decision-surface "$DECISION_SURFACE" --adr-question "$ADR_QUESTION" \
-            --doc-cited "$DOC_CITED"
+            --doc-cited "$DOC_CITED" --metal "$METAL"
