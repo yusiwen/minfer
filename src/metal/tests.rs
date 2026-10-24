@@ -40,6 +40,103 @@ fn the_two_unavailable_causes_read_differently() {
     );
 }
 
+/// #673: the few-row MMA arm must agree with the matvec it replaces. Not bitwise —
+/// it stages activations as f16 fragments — so this is a *tolerance* gate, the same
+/// class the band's GEMM arm uses. It pins the wiring, not the number: a mismatched
+/// `nsg` drops K chunks silently, and that shows up here as a large relative error.
+#[test]
+fn few_row_mma_matches_the_matvec() {
+    use crate::metal::policy::few_row_mma;
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the few-row MMA gate");
+        return;
+    };
+    let dev = &mps.inner.device;
+    let cases: &[(usize, usize, usize)] = &[(512, 512, 3), (1152, 1024, 3), (512, 512, 9)];
+    let mut bad: Vec<String> = Vec::new();
+    println!("\n=== few-row MMA vs matvec (Q4_K / Q6_K) ===");
+    for &(od, id, nt) in cases {
+        for ttype in [TensorType::Q4_K, TensorType::Q6_K] {
+            let Some(tiling) = few_row_mma(ttype, nt, od, id) else {
+                bad.push(format!("{ttype:?} od={od} id={id} nt={nt}: not in the arm"));
+                continue;
+            };
+            let bq = quant_block_q(ttype);
+            let bb = quant_block_bytes(ttype);
+            let wbytes = (id / bq) * bb * od;
+            let wb = dev
+                .newBufferWithLength_options(
+                    (wbytes as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_quant_0x33(&wb, wbytes);
+            let acts = dev
+                .newBufferWithLength_options(
+                    ((id * nt * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_random_acts(&acts, id * nt);
+            let new_out = || {
+                dev.newBufferWithLength_options(
+                    ((od * nt * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+            };
+            let out_ref = new_out();
+            let out_mma = new_out();
+            let read = |b: &MetalBuffer, n: usize| -> Vec<f32> {
+                unsafe {
+                    std::slice::from_raw_parts(b.contents().as_ptr() as *const f32, n).to_vec()
+                }
+            };
+            // Reference: the matvec arm, production entry, forced off every other tier.
+            let cb = mps.cmd_buffer();
+            cb.quant_matmul_f32_matvec(&wb, 0, ttype, &acts, 0, &out_ref, od, id, nt)
+                .unwrap_or_else(|e| panic!("{ttype:?} reference dispatch: {e}"));
+            cb.submit()
+                .unwrap_or_else(|e| panic!("{ttype:?} reference submit: {e}"));
+            let cb = mps.cmd_buffer();
+            cb.mma_dispatch(&wb, 0, ttype, &acts, 0, &out_mma, od, id, nt, tiling)
+                .unwrap_or_else(|e| panic!("{ttype:?} mma dispatch: {e}"));
+            cb.submit()
+                .unwrap_or_else(|e| panic!("{ttype:?} mma submit: {e}"));
+
+            let want = read(&out_ref, od * nt);
+            let got = read(&out_mma, od * nt);
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let max_abs = got
+                .iter()
+                .zip(&want)
+                .fold(0.0f32, |m, (g, w)| m.max((g - w).abs()));
+            let rel = max_abs / scale;
+            println!(
+                "  {ttype:?} od={od} id={id} nt={nt} (nt_tile={} rt={} nsg={}): max|Δ|={max_abs:.6} rel={rel:.2e}",
+                tiling.nt, tiling.rt, tiling.nsg
+            );
+            // The generic MMA path holds A and B in f32 fragments and accumulates in
+            // f32, so it must agree with the matvec to rounding order, not to an
+            // f16-ish tolerance — measured 3e-7 on the rt=1 shapes. 1e-4 leaves room
+            // for the different summation order and still fails loudly on a wiring
+            // error (a wrong kernel selection read 1.6e-1).
+            if rel > 1e-4 {
+                bad.push(format!(
+                    "{ttype:?} od={od} id={id} nt={nt}: rel error {rel:.3e} over the 1e-4 bound"
+                ));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "the few-row MMA arm does not match the matvec:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
 /// #673: the few-row MMA tiling is llama's rule, so the boundaries are pinned here —
 /// a wrong tiling reads the wrong K split silently (a wrong number, not a crash).
 #[test]

@@ -137,7 +137,7 @@ impl MpsCommandBuffer<'_> {
     /// K, od, nt, out row stride, weight row stride (bytes), activation row stride
     /// (floats), nsg, block bytes.
     #[allow(clippy::too_many_arguments)]
-    fn mma_dispatch(
+    pub fn mma_dispatch(
         &self,
         wb: &MetalBuffer,
         w_off: u64,
@@ -155,7 +155,11 @@ impl MpsCommandBuffer<'_> {
             TensorType::Q6_K => (&self.state.pl_q6_k_mma, id / 256 * 210, 210i32),
             other => return Err(format!("mma_dispatch: unsupported type {other:?}")),
         };
-        let idx = (if t.nt == 2 { 1 } else { 0 }) * 2 + if t.rt == 2 { 1 } else { 0 };
+        // The arrays are ordered [nt1_rt1, nt2_rt1, nt1_rt2, nt2_rt2]: rt is the
+        // high bit. Getting this backwards selects the NT=2/RT=1 kernel for an
+        // rt=2 shape and lands 16 rows of output where 8 belong — silent garbage,
+        // which is what `few_row_mma_matches_the_matvec` caught.
+        let idx = (if t.rt == 2 { 2 } else { 0 }) + (if t.nt == 2 { 1 } else { 0 });
         self.enc.setComputePipelineState(&*(pls[idx]));
         unsafe {
             self.enc
