@@ -73,7 +73,7 @@ DRAFT="/Volumes/WD_BLACK/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-
 IDENTITY="not run (the 7B/0.5B GGUF pair is not on this box)"
 if [ -f "$TARGET" ] && [ -f "$DRAFT" ]; then
     if run identity bash -c "bash scripts/identity_battery.sh '$TARGET' '$DRAFT' 2>&1 | tee /tmp/mac-gate-identity.log"; then
-        IDENTITY=$(grep -oE 'identity battery: [0-9]+/[0-9]+ identical, [0-9]+ diverged' /tmp/mac-gate-identity.log | tail -1)
+        IDENTITY=$(grep -oE '[0-9]+/[0-9]+ identical, [0-9]+ diverged' /tmp/mac-gate-identity.log | tail -1)
         IDENTITY=${IDENTITY:-"ran (see /tmp/mac-gate-identity.log)"}
     fi
 fi
