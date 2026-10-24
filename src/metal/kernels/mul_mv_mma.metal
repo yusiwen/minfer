@@ -195,6 +195,15 @@ kernel void name##_nt2_rt1(                                                     
         threadgroup float * red [[threadgroup(0)]]) {                                      \
     mma_qk_body<2, 1, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
 }                                                                                          \
+kernel void name##_nt4_rt1(                                                                \
+        device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
+        device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
+        uint3 tgpig [[threadgroup_position_in_grid]],                                      \
+        ushort tiisg [[thread_index_in_simdgroup]],                                        \
+        ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
+        threadgroup float * red [[threadgroup(0)]]) {                                      \
+    mma_qk_body<4, 1, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
+}                                                                                          \
 kernel void name##_nt1_rt2(                                                                \
         device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
         device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
@@ -203,6 +212,15 @@ kernel void name##_nt1_rt2(                                                     
         ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
         threadgroup float * red [[threadgroup(0)]]) {                                      \
     mma_qk_body<1, 2, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
+}                                                                                          \
+kernel void name##_nt4_rt2(                                                                \
+        device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
+        device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
+        uint3 tgpig [[threadgroup_position_in_grid]],                                      \
+        ushort tiisg [[thread_index_in_simdgroup]],                                        \
+        ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
+        threadgroup float * red [[threadgroup(0)]]) {                                      \
+    mma_qk_body<4, 2, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
 }                                                                                          \
 kernel void name##_nt2_rt2(                                                                \
         device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \

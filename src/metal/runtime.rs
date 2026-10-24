@@ -193,17 +193,24 @@ impl MpsState {
             let pl_q6_k_mm_f32 = get_pl("kernel_q6_k_mm_f32")?;
             let pl_q6_k_f32_multi = get_pl("kernel_q6_k_f32_matmul_multi")?;
             // #673: the few-row MMA arm (2..16 activation rows), four tilings per type.
+            // Six per type: [nt1_rt1, nt2_rt1, nt4_rt1, nt1_rt2, nt2_rt2, nt4_rt2].
+            // `nt = 4` is reachable (`NT_MAX`), and a missing instantiation would fall
+            // back to another NT and write the wrong rows — see the tiling gate.
             let pl_q4_k_mma = [
                 get_pl("kernel_q4_k_f32_mma_nt1_rt1")?,
                 get_pl("kernel_q4_k_f32_mma_nt2_rt1")?,
+                get_pl("kernel_q4_k_f32_mma_nt4_rt1")?,
                 get_pl("kernel_q4_k_f32_mma_nt1_rt2")?,
                 get_pl("kernel_q4_k_f32_mma_nt2_rt2")?,
+                get_pl("kernel_q4_k_f32_mma_nt4_rt2")?,
             ];
             let pl_q6_k_mma = [
                 get_pl("kernel_q6_k_f32_mma_nt1_rt1")?,
                 get_pl("kernel_q6_k_f32_mma_nt2_rt1")?,
+                get_pl("kernel_q6_k_f32_mma_nt4_rt1")?,
                 get_pl("kernel_q6_k_f32_mma_nt1_rt2")?,
                 get_pl("kernel_q6_k_f32_mma_nt2_rt2")?,
+                get_pl("kernel_q6_k_f32_mma_nt4_rt2")?,
             ];
             let pl_q5_0_f32 = get_pl("kernel_q5_0_f32_matmul")?;
             let pl_q5_0_mm_f32 = get_pl("kernel_q5_0_mm_f32")?;

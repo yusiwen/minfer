@@ -54,7 +54,17 @@ fn few_row_mma_matches_the_matvec() {
         return;
     };
     let dev = &mps.inner.device;
-    let cases: &[(usize, usize, usize)] = &[(512, 512, 3), (1152, 1024, 3), (512, 512, 9)];
+    // Cover all three weight tilings the policy can pick: od = 512 -> nt_tile 1,
+    // od = 2048 -> 2, od = 4096 -> 4 (nt_rows = od/1024), and the rt = 2 half above
+    // 8 rows. Every instantiation the policy can name must appear here.
+    let cases: &[(usize, usize, usize)] = &[
+        (512, 512, 3),
+        (1152, 1024, 3),
+        (2048, 512, 3),
+        (4096, 512, 3),
+        (512, 512, 9),
+        (4096, 512, 9),
+    ];
     let mut bad: Vec<String> = Vec::new();
     println!("\n=== few-row MMA vs matvec (Q4_K / Q6_K) ===");
     for &(od, id, nt) in cases {

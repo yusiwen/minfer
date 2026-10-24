@@ -159,7 +159,14 @@ impl MpsCommandBuffer<'_> {
         // high bit. Getting this backwards selects the NT=2/RT=1 kernel for an
         // rt=2 shape and lands 16 rows of output where 8 belong — silent garbage,
         // which is what `few_row_mma_matches_the_matvec` caught.
-        let idx = (if t.rt == 2 { 2 } else { 0 }) + (if t.nt == 2 { 1 } else { 0 });
+        // Order [nt1_rt1, nt2_rt1, nt4_rt1, nt1_rt2, nt2_rt2, nt4_rt2]: rt picks the
+        // half, `nt` the slot inside it. A wrong pick writes the wrong rows silently.
+        let nt_slot = match t.nt {
+            1 => 0,
+            2 => 1,
+            _ => 2,
+        };
+        let idx = (if t.rt == 2 { 3 } else { 0 }) + nt_slot;
         self.enc.setComputePipelineState(&*(pls[idx]));
         unsafe {
             self.enc
