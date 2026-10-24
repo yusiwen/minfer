@@ -289,6 +289,28 @@ pub fn few_row_mma(ttype: TensorType, nt: usize, od: usize, k: usize) -> Option<
     })
 }
 
+/// Debug knob for the geometry sweep (#673): `MINFER_MV_MMA_NT=1|2|4` re-clamps the
+/// weight-tile count, which changes how many threadgroups the dispatch has. The tiling
+/// rule above is llama's; this exists to ask whether *our* GPU wants a narrower tile
+/// than the rule picks, without a rebuild per answer.
+pub fn few_row_mma_nt_override() -> Option<usize> {
+    std::env::var("MINFER_MV_MMA_NT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| matches!(n, 1 | 2 | 4))
+}
+
+/// Apply [`few_row_mma_nt_override`] to a tiling, keeping the reduction size consistent.
+pub fn with_nt_override(mut t: FewRowMma) -> FewRowMma {
+    if let Some(nt) = few_row_mma_nt_override() {
+        if nt != t.nt {
+            t.nt = nt;
+            t.smem = t.nsg * t.nt * t.rt * 256;
+        }
+    }
+    t
+}
+
 /// Whether the GEMM path is available at all: `MINFER_GEMM=0` forces the per-row
 /// matvec family at every `nt` (the A/B switch). ON by default.
 pub fn gemm_enabled() -> bool {

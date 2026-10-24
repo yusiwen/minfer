@@ -241,6 +241,7 @@ impl MpsCommandBuffer<'_> {
         // Behind `MINFER_MV_MMA=1` until it is measured against the matvec on a Mac.
         if crate::metal::policy::few_row_mma_enabled() {
             if let Some(t) = crate::metal::policy::few_row_mma(ttype, nt, od, id) {
+                let t = crate::metal::policy::with_nt_override(t);
                 return self.mma_dispatch(wb, w_off, ttype, x, x_off, out, od, id, nt, t);
             }
         }
