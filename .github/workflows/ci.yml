@@ -340,7 +340,12 @@ jobs:
       - name: Newly dead code must fail the dead-code oracle (cuda)
         run: python3 scripts/check_dead_code_oracle.py --config cuda
 
-  build-macos:
+  # Renamed from `build-macos` when the Mac suite started running here: it is no
+  # longer only a build check. The release artifacts are built by
+  # `release-build.yml`'s `macos-arm64` job, not here — this job has never uploaded
+  # anything, and it keeps the `cargo build --release` step so "the shipping binary
+  # compiles on macOS arm64" stays guaranteed.
+  test-macos:
     needs: changes
     if: >-
       (github.event_name != 'pull_request' || github.event.action != 'edited')
@@ -356,10 +361,12 @@ jobs:
       - name: Build (release)
         run: cargo build --release
       # #303: `cargo build` never compiles `#[cfg(test)]`, so a broken macOS test
-      # target stayed green here while no macOS test could run at all (see the job
-      # comment above). `--no-run` links the test binaries without executing them.
-      - name: Compile tests (release, link only)
-        run: cargo test --release --no-run
+      # target stayed green here while no macOS test could run at all. `--no-run`
+      # linked the binaries; this runs them. `pipefail` is load-bearing: without it
+      # `tee` returns its own status and a failing suite would read as green —
+      # exactly the silent skip the Mac gate exists to prevent.
+      - name: Test (release, Metal)
+        run: set -o pipefail; cargo test --release 2>&1 | tee /tmp/cargo-test.log
 
   # The documentation gate (#63, #94). Checked first because it is the cheap half and
   # the half that catches rot: a renamed file leaves a dead link that `mdbook build`
