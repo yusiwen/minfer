@@ -288,6 +288,18 @@ and the prose in the same commit. A box whose name has no manifest row fails
 `--check-live` loudly, which is deliberate: a fabricated box must not pass
 vacuously.
 
+**CI has no Metal device, so a green macOS job says nothing about the Metal
+path.** Measured 2026-10-24 ([#674], PR #675): the hosted `macos-14` runner runs
+`cargo test --release` as `666 passed / 13 failed / 50 ignored`, and those 13 are
+exactly the device tests — with **no `MPS:` line in the log at all**, which means
+`MTLCreateSystemDefaultDevice()` returned nil before any shader was compiled: the
+runner's VM exposes no GPU. The job therefore stays `build-macos` (compile check
+only), and the rule for anyone reading it is: *a green `build-macos` proves the
+crate and the test target compile, not that a kernel ran.* The Metal correctness
+gate is the local run recorded below; a real CI gate needs a self-hosted runner on
+a Mac, which [#674] tracks and nobody has asked for yet. The same failure is what
+produced [#676] (the two unavailability causes now print differently).
+
 **The PR body's `Mac verification` section is this rule on the one path CI
 cannot run** ([#335]). `build-macos` compiles the crate and — since [#303] — the
 test target, but it has no Metal device, so on the macOS/Metal path the
