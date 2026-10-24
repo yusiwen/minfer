@@ -74,7 +74,11 @@ inline void mma_store(
 
 // The body both K-quant kernels share; `deq` is a 16-weight dequantizer returning a
 // float4x4, the same helper the GEMM family already uses (kernels/dequantize.h).
-template <short NT, short RT, void (*deq)(device const uchar *, short, thread float4x4 &)>
+// The dequantizer as a *compile-time* selector, not a function pointer: a pointer
+// template parameter is not inlined reliably, and the first measurement of this arm
+// (2.5x slower than the matvec at nt=3) is consistent with the call never being
+// flattened. KIND 0 = Q4_K, 1 = Q6_K.
+template <short NT, short RT, int KIND>
 inline void mma_qk_body(
         device const uchar * weights,
         device const float * acts,
@@ -145,7 +149,12 @@ inline void mma_qk_body(
         #pragma unroll
         for (short t = 0; t < NT; ++t) {
             float4x4 w;
-            deq(x[t] + (long) (ci / NL) * p[7], ci % NL, w);
+            device const uchar * blk = x[t] + (long) (ci / NL) * p[7];
+            if (KIND == 0) {
+                dequant_q4_k_16(blk, ci % NL, w);
+            } else {
+                dequant_q6_k_16(blk, ci % NL, w);
+            }
             #pragma unroll
             for (short s = 0; s < 8; ++s) {
                 simdgroup_float8x8 ma;
@@ -176,7 +185,7 @@ inline void mma_qk_body(
 // activation tilings. `rt = 2` is llama's choice above 8 activation rows; below it
 // one 8-row activation tile is enough. Names end in `_mma_nt{N}_rt{R}` so the Rust
 // side can build the name from the tiling (see #673's dispatch row).
-#define MINFER_MMA_QK(name, deq)                                                          \
+#define MINFER_MMA_QK(name, kind)                                                          \
 kernel void name##_nt1_rt1(                                                              \
         device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
         device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
@@ -184,7 +193,7 @@ kernel void name##_nt1_rt1(                                                     
         ushort tiisg [[thread_index_in_simdgroup]],                                        \
         ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
         threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<1, 1, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
+    mma_qk_body<1, 1, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
 }                                                                                          \
 kernel void name##_nt2_rt1(                                                                \
         device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
@@ -193,7 +202,7 @@ kernel void name##_nt2_rt1(                                                     
         ushort tiisg [[thread_index_in_simdgroup]],                                        \
         ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
         threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<2, 1, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
+    mma_qk_body<2, 1, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
 }                                                                                          \
 kernel void name##_nt4_rt1(                                                                \
         device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
@@ -202,7 +211,7 @@ kernel void name##_nt4_rt1(                                                     
         ushort tiisg [[thread_index_in_simdgroup]],                                        \
         ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
         threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<4, 1, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
+    mma_qk_body<4, 1, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
 }                                                                                          \
 kernel void name##_nt1_rt2(                                                                \
         device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
@@ -211,7 +220,7 @@ kernel void name##_nt1_rt2(                                                     
         ushort tiisg [[thread_index_in_simdgroup]],                                        \
         ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
         threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<1, 2, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
+    mma_qk_body<1, 2, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
 }                                                                                          \
 kernel void name##_nt4_rt2(                                                                \
         device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
@@ -220,7 +229,7 @@ kernel void name##_nt4_rt2(                                                     
         ushort tiisg [[thread_index_in_simdgroup]],                                        \
         ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
         threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<4, 2, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
+    mma_qk_body<4, 2, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
 }                                                                                          \
 kernel void name##_nt2_rt2(                                                                \
         device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
@@ -229,9 +238,9 @@ kernel void name##_nt2_rt2(                                                     
         ushort tiisg [[thread_index_in_simdgroup]],                                        \
         ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
         threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<2, 2, deq>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
+    mma_qk_body<2, 2, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
 }
 
-MINFER_MMA_QK(kernel_q4_k_f32_mma, dequant_q4_k_16)
-MINFER_MMA_QK(kernel_q6_k_f32_mma, dequant_q6_k_16)
+MINFER_MMA_QK(kernel_q4_k_f32_mma, 0)
+MINFER_MMA_QK(kernel_q6_k_f32_mma, 1)
 #undef MINFER_MMA_QK
