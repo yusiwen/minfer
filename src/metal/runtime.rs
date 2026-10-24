@@ -23,13 +23,56 @@ use objc2_metal::{
 /// The source is the SAME concatenation `build.rs` compiles into the metallib:
 /// build.rs writes `$OUT_DIR/minfer.metal` from its `SHADER_SOURCES` list (#265),
 /// so the two compile entry points cannot drift apart.
+/// Why [`MpsState::get`] answered `None`.
+///
+/// Two causes used to share one message ("Metal shader compilation failed"), which
+/// sent a reader into `src/metal/kernels/*.metal` on a machine that has no GPU at
+/// all ([#676](https://github.com/yusiwen/minfer/issues/676), measured on GitHub's
+/// hosted `macos-14`: 13 device tests failed with that text while no `MPS:` line
+/// was logged, because `MTLCreateSystemDefaultDevice` returned nil before anything
+/// was compiled). `GPU_SAFETY.md` requires a guard failure to carry the actual
+/// value, so the two are recorded and printed separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unavailable {
+    /// `MTLCreateSystemDefaultDevice()` returned nil: this machine exposes no
+    /// Metal device (a hosted CI runner does not).
+    NoDevice,
+    /// A device exists and the shader source failed to compile; the string is the
+    /// `NSError` description.
+    Compile(String),
+}
+
+/// The sentence a caller prints for a recorded [`Unavailable`].
+pub fn unavailable_message(reason: &Unavailable) -> String {
+    match reason {
+        Unavailable::NoDevice => "no Metal device (MTLCreateSystemDefaultDevice returned nil) — \
+             this machine cannot run Metal kernels at all"
+            .to_string(),
+        Unavailable::Compile(e) => format!("the shader library failed to compile: {e}"),
+    }
+}
+
+static UNAVAILABLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn record_unavailable(reason: Unavailable) {
+    let _ = UNAVAILABLE.set(unavailable_message(&reason));
+}
+
+/// The recorded reason Metal is unavailable, or `""` when it is available (or was
+/// never initialized). Test helpers interpolate it so a failure names its cause.
+pub fn unavailable_detail() -> &'static str {
+    UNAVAILABLE.get().map(|s| s.as_str()).unwrap_or("")
+}
+
 #[cfg(target_os = "macos")]
 fn compile_metal_source(device: &MetalDevice) -> Option<MetalLibrary> {
     let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     match device.newLibraryWithSource_options_error(&*NSString::from_str(src), None) {
         Ok(l) => Some(l),
         Err(e) => {
-            eprintln!("MPS: shader compilation failed: {}", e);
+            let reason = Unavailable::Compile(e.to_string());
+            eprintln!("MPS: {}", unavailable_message(&reason));
+            record_unavailable(reason);
             None
         }
     }
@@ -68,7 +111,15 @@ impl MpsState {
 
         #[cfg(target_os = "macos")]
         {
-            let device = MTLCreateSystemDefaultDevice()?;
+            let device = match MTLCreateSystemDefaultDevice() {
+                Some(d) => d,
+                None => {
+                    let reason = Unavailable::NoDevice;
+                    eprintln!("MPS: {}", unavailable_message(&reason));
+                    record_unavailable(reason);
+                    return None;
+                }
+            };
 
             // GPU trace capture: set MINFER_METAL_CAPTURE=1
             if std::env::var("MINFER_METAL_CAPTURE").is_ok() {
@@ -353,8 +404,13 @@ impl MpsState {
             let s = Self::try_new();
             if s.is_some() {
                 eprintln!("MPS: GPU acceleration enabled");
-            } else {
+            } else if unavailable_detail().is_empty() {
                 eprintln!("MPS: not available, using CPU fallback");
+            } else {
+                eprintln!(
+                    "MPS: not available ({}), using CPU fallback",
+                    unavailable_detail()
+                );
             }
             s
         });

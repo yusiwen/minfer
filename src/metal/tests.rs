@@ -14,14 +14,40 @@ use std::ptr::NonNull;
 /// fall back to CPU silently, which looks like a "GPU throttling" slowdown
 /// (2026-08-06: the Q5_0 `block_q5_0_dot_y` redefine bug did exactly this).
 /// This test compiles every pipeline and fails if MPS is unavailable.
+/// [#676](https://github.com/yusiwen/minfer/issues/676): the two causes must read
+/// differently, and neither may send the reader to the kernel sources.
+#[test]
+fn the_two_unavailable_causes_read_differently() {
+    use crate::metal::runtime::{unavailable_message, Unavailable};
+    let no_device = unavailable_message(&Unavailable::NoDevice);
+    let compile = unavailable_message(&Unavailable::Compile("error: unknown type name".into()));
+    assert_ne!(no_device, compile);
+    assert!(
+        no_device.contains("no Metal device"),
+        "a device-less machine must say so: {no_device}"
+    );
+    assert!(
+        no_device.contains("MTLCreateSystemDefaultDevice"),
+        "the message must name the call that returned nil: {no_device}"
+    );
+    assert!(
+        compile.contains("failed to compile") && compile.contains("unknown type name"),
+        "a compile failure must carry the compiler's own text: {compile}"
+    );
+    assert!(
+        !no_device.contains("kernels/"),
+        "the no-device text must not point at the kernel sources: {no_device}"
+    );
+}
+
 #[test]
 fn metal_pipelines_compile() {
     let _g = crate::metal::metal_test_lock();
     MpsState::init();
     assert!(
         MpsState::get().is_some(),
-        "MPS unavailable — Metal shader compilation failed (check src/metal/kernels/*.metal for \
-         duplicate/missing kernel definitions); the model would run on CPU"
+        "MPS unavailable — {}",
+        crate::metal::runtime::unavailable_detail()
     );
 }
 
