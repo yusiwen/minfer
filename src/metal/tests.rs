@@ -40,6 +40,55 @@ fn the_two_unavailable_causes_read_differently() {
     );
 }
 
+/// #673: the few-row MMA tiling is llama's rule, so the boundaries are pinned here —
+/// a wrong tiling reads the wrong K split silently (a wrong number, not a crash).
+#[test]
+fn few_row_mma_tiling_matches_llama() {
+    use crate::metal::policy::few_row_mma;
+    use crate::tensor::TensorType;
+
+    // 14B layer, the verify shape: od 5120, K 5120, nt 3 -> rt 1, nsg 8 (od > 6144? no:
+    // 5120 <= 6144 -> 16, halved to 8 by n_steps), nt tile 4.
+    let t = few_row_mma(TensorType::Q4_K, 3, 5120, 5120).expect("in range");
+    assert_eq!(
+        (t.rt, t.nt),
+        (1, 4),
+        "nt=3 is one activation tile, four weight tiles"
+    );
+    assert!(t.nsg == 8 || t.nsg == 16, "nsg {} must be 8 or 16", t.nsg);
+    assert_eq!(t.smem, t.nsg * t.nt * t.rt * 256);
+
+    // Rows below the per-type minimum and above the window are not this arm.
+    assert!(
+        few_row_mma(TensorType::Q4_K, 2, 5120, 5120).is_none(),
+        "Q4_K starts at 3 rows"
+    );
+    assert!(
+        few_row_mma(TensorType::Q6_K, 2, 5120, 5120).is_some(),
+        "Q6_K starts at 2 rows"
+    );
+    assert!(few_row_mma(TensorType::Q4_K, 1, 5120, 5120).is_none());
+    assert!(few_row_mma(TensorType::Q4_K, 17, 5120, 5120).is_none());
+
+    // Above 8 rows llama doubles the activation tile.
+    let t = few_row_mma(TensorType::Q4_K, 9, 5120, 5120).expect("in range");
+    assert_eq!(t.rt, 2);
+
+    // A small output (the 0.5B's attn_qkv, od 1152) and a short K still tile.
+    let t = few_row_mma(TensorType::Q6_K, 3, 1152, 1024).expect("in range");
+    assert!(
+        t.nt >= 1 && t.smem <= 16384,
+        "tile {} smem {}",
+        t.nt,
+        t.smem
+    );
+
+    // K must be a multiple of the 64-weight chunk.
+    assert!(few_row_mma(TensorType::Q4_K, 3, 5120, 1000).is_none());
+    // Types outside the arm stay on the matvec.
+    assert!(few_row_mma(TensorType::Q8_0, 3, 5120, 5120).is_none());
+}
+
 #[test]
 fn metal_pipelines_compile() {
     let _g = crate::metal::metal_test_lock();

@@ -169,6 +169,10 @@ struct MpsStateInner {
     pl_q4_k_mm_f32: MetalComputePipelineState,
     pl_q6_k_f32: MetalComputePipelineState,
     pl_q6_k_f32_multi: MetalComputePipelineState,
+    /// #673: few-row MMA arm, indexed by `[nt_tile == 2][rt == 2]` — the four
+    /// `kernel_{q4_k,q6_k}_f32_mma_nt{1,2}_rt{1,2}` instantiations.
+    pl_q4_k_mma: [MetalComputePipelineState; 4],
+    pl_q6_k_mma: [MetalComputePipelineState; 4],
     pl_q6_k_mm_f32: MetalComputePipelineState,
     pl_q5_0_f32: MetalComputePipelineState,
     pl_q5_0_f32_multi: MetalComputePipelineState,

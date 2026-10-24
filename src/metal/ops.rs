@@ -133,6 +133,72 @@ impl MpsCommandBuffer<'_> {
         Ok(())
     }
 
+    /// #673: dispatch the few-row MMA kernel. `p[]` mirrors the kernel's header:
+    /// K, od, nt, out row stride, weight row stride (bytes), activation row stride
+    /// (floats), nsg, block bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn mma_dispatch(
+        &self,
+        wb: &MetalBuffer,
+        w_off: u64,
+        ttype: TensorType,
+        x: &MetalBuffer,
+        x_off: u64,
+        out: &MetalBuffer,
+        od: usize,
+        id: usize,
+        nt: usize,
+        t: crate::metal::policy::FewRowMma,
+    ) -> Result<(), String> {
+        let (pls, w_row, blk) = match ttype {
+            TensorType::Q4_K => (&self.state.pl_q4_k_mma, id / 256 * 144, 144i32),
+            TensorType::Q6_K => (&self.state.pl_q6_k_mma, id / 256 * 210, 210i32),
+            other => return Err(format!("mma_dispatch: unsupported type {other:?}")),
+        };
+        let idx = (if t.nt == 2 { 1 } else { 0 }) * 2 + if t.rt == 2 { 1 } else { 0 };
+        self.enc.setComputePipelineState(&*(pls[idx]));
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize)
+        };
+        let p = [
+            id as i32,
+            od as i32,
+            nt as i32,
+            od as i32, // out is [nt][od], row-major
+            w_row as i32,
+            id as i32, // activations are [nt][id], row-major
+            t.nsg as i32,
+            blk,
+        ];
+        unsafe {
+            self.enc.setBytes_length_atIndex(
+                NonNull::new(p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(),
+                (std::mem::size_of_val(&p)) as usize,
+                (3) as usize,
+            )
+        };
+        unsafe {
+            self.enc
+                .setThreadgroupMemoryLength_atIndex((t.smem) as usize, (0) as usize)
+        };
+        self.dispatch_2d(
+            ((od + 8 * t.nt - 1) / (8 * t.nt)) as u64,
+            ((nt + 8 * t.rt - 1) / (8 * t.rt)) as u64,
+            32,
+            t.nsg as u64,
+        );
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn quant_matmul_f32_dispatch(
         &self,
@@ -159,6 +225,13 @@ impl MpsCommandBuffer<'_> {
             gpu_abort(&format!(
                 "matmul input dim id={id} is not 256-aligned for {ttype:?} (K-quant kernels use K/256 super-block floor)"
             ));
+        }
+        // #673: the few-row MMA arm — 2..16 activation rows on simdgroup matrices.
+        // Behind `MINFER_MV_MMA=1` until it is measured against the matvec on a Mac.
+        if crate::metal::policy::few_row_mma_enabled() {
+            if let Some(t) = crate::metal::policy::few_row_mma(ttype, nt, od, id) {
+                return self.mma_dispatch(wb, w_off, ttype, x, x_off, out, od, id, nt, t);
+            }
         }
         match ttype {
             TensorType::Q8_0 => {
