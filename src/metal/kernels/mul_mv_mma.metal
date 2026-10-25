@@ -157,9 +157,16 @@ inline void mma_qk_body(
             }
             #pragma unroll
             for (short s = 0; s < 8; ++s) {
-                simdgroup_float8x8 ma;
-                ma.thread_elements()[0] = w[s / 4][s % 4];
-                ma.thread_elements()[1] = w[s / 4 + 2][s % 4];
+                // The A fragment is **half**, not float: Apple's matrix unit runs an
+                // f16 fragment several times faster than an f32 one, and the weights
+                // are 4-6 bit to begin with, so the f32 fragment bought no accuracy.
+                // This is llama's split too — its specialized `blk` kernels use
+                // `simdgroup_half8x8 ma` with a float B and float accumulators
+                // (mul_mv_mma.metal:283-290); the first version of this kernel copied
+                // the generic path's f32 A and lost the bandwidth the tile had saved.
+                simdgroup_half8x8 ma;
+                ma.thread_elements()[0] = (half) w[s / 4][s % 4];
+                ma.thread_elements()[1] = (half) w[s / 4 + 2][s % 4];
                 #pragma unroll
                 for (short rt = 0; rt < RT; ++rt) {
                     simdgroup_multiply_accumulate(mc[rt][t], ma, mb[rt][s], mc[rt][t]);

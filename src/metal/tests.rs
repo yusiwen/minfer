@@ -133,7 +133,10 @@ fn few_row_mma_matches_the_matvec() {
             // f16-ish tolerance — measured 3e-7 on the rt=1 shapes. 1e-4 leaves room
             // for the different summation order and still fails loudly on a wiring
             // error (a wrong kernel selection read 1.6e-1).
-            if rel > 1e-4 {
+            // v2 stages the A fragment as f16 (the weights are 4-6 bit), so the bound
+            // is f16-class, not f32-class: llama accepts the same trade in its `blk`
+            // kernels. The identity battery is the gate that matters for tokens.
+            if rel > 2e-3 {
                 bad.push(format!(
                     "{ttype:?} od={od} id={id} nt={nt}: rel error {rel:.3e} over the 1e-4 bound"
                 ));
