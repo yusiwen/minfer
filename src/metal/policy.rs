@@ -264,15 +264,16 @@ pub fn few_row_mma(ttype: TensorType, nt: usize, od: usize, k: usize) -> Option<
     }
     let rt = if nt > 8 { 2 } else { 1 };
     let n_steps = k / 64;
-    let mut nsg = if od <= 64 {
-        32
-    } else if od <= 6144 {
-        16
-    } else {
-        8
-    };
+    // Only 8 and 16 are instantiated (see the kernel's MINFER_MMA_ONE list): 32 would
+    // need a threadgroup of 1024 threads and no shape this arm serves picks it, so a
+    // 32 is clamped — a mismatch between this number and the kernel's baked NSG drops
+    // K chunks silently, which is why the value is checked by the tiling gate.
+    let mut nsg = if od <= 6144 { 16 } else { 8 };
     while nsg > 1 && nsg > n_steps {
         nsg /= 2;
+    }
+    if nsg < 8 {
+        nsg = 8;
     }
     let limit = (SMEM_MAX / (nsg * rt * 256)).min(od / (MIN_TG * TILE));
     // llama's `halve_to_limit(NT_MAX, min(nt_smem, nt_rows))`: start at the cap and

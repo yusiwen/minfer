@@ -166,7 +166,9 @@ impl MpsCommandBuffer<'_> {
             2 => 1,
             _ => 2,
         };
-        let idx = (if t.rt == 2 { 3 } else { 0 }) + nt_slot;
+        // [nsg8: six] then [nsg16: six]; inside a block, rt picks the half.
+        let nsg_slot = if t.nsg == 8 { 0 } else { 6 };
+        let idx = nsg_slot + (if t.rt == 2 { 3 } else { 0 }) + nt_slot;
         self.enc.setComputePipelineState(&*(pls[idx]));
         unsafe {
             self.enc

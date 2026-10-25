@@ -78,7 +78,7 @@ inline void mma_store(
 // template parameter is not inlined reliably, and the first measurement of this arm
 // (2.5x slower than the matvec at nt=3) is consistent with the call never being
 // flattened. KIND 0 = Q4_K, 1 = Q6_K.
-template <short NT, short RT, int KIND>
+template <short NT, short RT, short NSG, int KIND>
 inline void mma_qk_body(
         device const uchar * weights,
         device const float * acts,
@@ -86,7 +86,9 @@ inline void mma_qk_body(
         constant int * p,
         threadgroup float * red,
         uint3 tgpig, ushort tiisg, ushort sgitg) {
-    const short NSG = (short) p[6];
+    // NSG is a *compile-time* constant: as a runtime value it made the reduction
+    // loop and the K-loop stride unrollable, which is llama's arrangement too
+    // (`FC_mul_mv_mma_nsg` is a function constant).
     constexpr short NL = 16;   // 16-weight chunks per K-quant super-block
 
     const int K = p[0], od = p[1], nt = p[2], out_stride = p[3];
@@ -188,66 +190,42 @@ inline void mma_qk_body(
     mma_store<NT, RT>(acc, out, red, i01, i11, od, nt, out_stride, NSG, tiisg, sgitg);
 }
 
-// The eight instantiations this arm uses: two types x two row tilings x two
-// activation tilings. `rt = 2` is llama's choice above 8 activation rows; below it
-// one 8-row activation tile is enough. Names end in `_mma_nt{N}_rt{R}` so the Rust
-// side can build the name from the tiling (see #673's dispatch row).
-#define MINFER_MMA_QK(name, kind)                                                          \
-kernel void name##_nt1_rt1(                                                              \
+// NSG is baked per instantiation, like llama's `FC_mul_mv_mma_nsg` function constant.
+// Only the values the tiling can pick are instantiated: 16 for od <= 6144 (every
+// layer of a 7B/14B) and 8 above it (the 152064-row output head).
+#define MINFER_MMA_ONE(pname, NT, RT, NSG, KIND)                                          \
+kernel void pname(                                                                        \
         device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
         device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
         uint3 tgpig [[threadgroup_position_in_grid]],                                      \
         ushort tiisg [[thread_index_in_simdgroup]],                                        \
         ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
         threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<1, 1, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
-}                                                                                          \
-kernel void name##_nt2_rt1(                                                                \
-        device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
-        device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
-        uint3 tgpig [[threadgroup_position_in_grid]],                                      \
-        ushort tiisg [[thread_index_in_simdgroup]],                                        \
-        ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
-        threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<2, 1, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
-}                                                                                          \
-kernel void name##_nt4_rt1(                                                                \
-        device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
-        device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
-        uint3 tgpig [[threadgroup_position_in_grid]],                                      \
-        ushort tiisg [[thread_index_in_simdgroup]],                                        \
-        ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
-        threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<4, 1, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
-}                                                                                          \
-kernel void name##_nt1_rt2(                                                                \
-        device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
-        device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
-        uint3 tgpig [[threadgroup_position_in_grid]],                                      \
-        ushort tiisg [[thread_index_in_simdgroup]],                                        \
-        ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
-        threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<1, 2, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
-}                                                                                          \
-kernel void name##_nt4_rt2(                                                                \
-        device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
-        device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
-        uint3 tgpig [[threadgroup_position_in_grid]],                                      \
-        ushort tiisg [[thread_index_in_simdgroup]],                                        \
-        ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
-        threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<4, 2, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
-}                                                                                          \
-kernel void name##_nt2_rt2(                                                                \
-        device const uchar * weights [[buffer(0)]], device const float * acts [[buffer(1)]], \
-        device float * out [[buffer(2)]], constant int * p [[buffer(3)]],                  \
-        uint3 tgpig [[threadgroup_position_in_grid]],                                      \
-        ushort tiisg [[thread_index_in_simdgroup]],                                        \
-        ushort sgitg [[simdgroup_index_in_threadgroup]],                                   \
-        threadgroup float * red [[threadgroup(0)]]) {                                      \
-    mma_qk_body<2, 2, kind>(weights, acts, out, p, red, tgpig, tiisg, sgitg);               \
+    mma_qk_body<NT, RT, NSG, KIND>(weights, acts, out, p, red, tgpig, tiisg, sgitg);        \
 }
 
-MINFER_MMA_QK(kernel_q4_k_f32_mma, 0)
-MINFER_MMA_QK(kernel_q6_k_f32_mma, 1)
-#undef MINFER_MMA_QK
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg8_nt1_rt1, 1, 1, 8, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg8_nt1_rt2, 1, 2, 8, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg8_nt2_rt1, 2, 1, 8, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg8_nt2_rt2, 2, 2, 8, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg8_nt4_rt1, 4, 1, 8, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg8_nt4_rt2, 4, 2, 8, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg16_nt1_rt1, 1, 1, 16, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg16_nt1_rt2, 1, 2, 16, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg16_nt2_rt1, 2, 1, 16, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg16_nt2_rt2, 2, 2, 16, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg16_nt4_rt1, 4, 1, 16, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg16_nt4_rt2, 4, 2, 16, 0)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg8_nt1_rt1, 1, 1, 8, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg8_nt1_rt2, 1, 2, 8, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg8_nt2_rt1, 2, 1, 8, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg8_nt2_rt2, 2, 2, 8, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg8_nt4_rt1, 4, 1, 8, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg8_nt4_rt2, 4, 2, 8, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt1_rt1, 1, 1, 16, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt1_rt2, 1, 2, 16, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt2_rt1, 2, 1, 16, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt2_rt2, 2, 2, 16, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt4_rt1, 4, 1, 16, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt4_rt2, 4, 2, 16, 1)
+#undef MINFER_MMA_ONE
