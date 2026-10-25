@@ -270,7 +270,12 @@ impl MpsCommandBuffer<'_> {
                     // at every `nt > 1`, so the bitwise gate compares two genuinely
                     // different dispatches. `nt == 1` is unchanged — the
                     // single-token kernel with `grid.y = 1`.
-                    let single_grid_y = nt == 1 || (!force_matvec && nt <= 8);
+                    // `MINFER_MV_MULTI=1` forces the `_multi` arm (token loop inside the
+                    // threadgroup, weights read once for all tokens) for `nt > 1`. It is
+                    // a diagnostic for #673: at `nt = 3` the single-grid arm moves 3x the
+                    // weight bytes, and this is the arm that does not.
+                    let force_multi = std::env::var("MINFER_MV_MULTI").map_or(false, |v| v == "1");
+                    let single_grid_y = nt == 1 || (!force_matvec && !force_multi && nt <= 8);
                     // #673: the wide matvec (NSG=8, 256 threads per threadgroup). Same
                     // kernel body and lane layout, so each row is still summed by one
                     // simdgroup — bitwise identical to the shipped arm.
