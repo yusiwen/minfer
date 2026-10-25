@@ -5,7 +5,8 @@
 // NR0=2 rows per simdgroup, NSG=2 simdgroups per threadgroup => 64 threads.
 // Grid: x = ceil(od / (NR0*NSG)), y = nt, TG = (64, 1, 1).
 
-kernel void kernel_q4_k_f32_matmul(
+template <short NSG>
+kernel void kernel_q4_k_f32_matmul_nsg(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
@@ -16,9 +17,11 @@ kernel void kernel_q4_k_f32_matmul(
 ) {
     // Faithful port of llama's kernel_mul_mv_q4_K_f32_impl (stride-4 super-block
     // thread layout, float4 sums, kmask nibble/scale unpack). Dispatch:
-    // TG(32, nsg=2), grid_x = od/(nr0*nsg) — same as the q6_K port.
+    // TG(32, NSG), grid_x = ceil(od/(NR0*NSG)) — same as the q6_K port. NSG is a
+    // template parameter since #673's 0.186 ms target: 2 simdgroups (64 threads) per
+    // threadgroup is 8x less memory-level parallelism than the reference's small-batch
+    // kernel, and both sit at ~23 % of the bandwidth roofline.
     constexpr short NR0 = 2;
-    constexpr short NSG = 2;
 
     constexpr ushort kmask1 = 0x3f3f;
     constexpr ushort kmask2 = 0x0f0f;
@@ -317,7 +320,8 @@ inline float q6k_block_dot(
 // Dequant: val = d * scales[sub] * ((low4 | (high2 << 4)) - 32).
 // NR0=2, NSG=2, TG=64. Grid: x = ceil(od/4), y = nt.
 
-kernel void kernel_q6_k_f32_matmul(
+template <short NSG>
+kernel void kernel_q6_k_f32_matmul_nsg(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
@@ -327,9 +331,8 @@ kernel void kernel_q6_k_f32_matmul(
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     // Faithful port of llama's kernel_mul_mv_q6_K_f32_impl (stride-2 thread
-    // layout, float4 sums). Dispatch: TG(32, nsg=2), grid_x = od/(nr0*nsg).
+    // layout, float4 sums). Dispatch: TG(32, NSG), grid_x = ceil(od/(NR0*NSG)).
     constexpr short NR0 = 2;
-    constexpr short NSG = 2;
 
     const int nb = p[1] / 256;                       // super-blocks per row
     const int r0 = (int)tgpig.x;                     // grid tile (not row!)
@@ -633,3 +636,10 @@ kernel void kernel_q8_0_f32_matmul_multi(
     }
 }
 
+// #673: the shipped arm (NSG=2, 64 threads) and the wide variant (NSG=8, 256 threads).
+// Each output row is still summed by one simdgroup with the unchanged lane layout, so
+// the two are bitwise identical — the existing gates check that.
+template [[host_name("kernel_q4_k_f32_matmul")]]      kernel void kernel_q4_k_f32_matmul_nsg<2>(device const uchar *, device const float *, device float *, constant int *, uint3, ushort, ushort);
+template [[host_name("kernel_q4_k_f32_matmul_nsg8")]] kernel void kernel_q4_k_f32_matmul_nsg<8>(device const uchar *, device const float *, device float *, constant int *, uint3, ushort, ushort);
+template [[host_name("kernel_q6_k_f32_matmul")]]      kernel void kernel_q6_k_f32_matmul_nsg<2>(device const uchar *, device const float *, device float *, constant int *, uint3, ushort, ushort);
+template [[host_name("kernel_q6_k_f32_matmul_nsg8")]] kernel void kernel_q6_k_f32_matmul_nsg<8>(device const uchar *, device const float *, device float *, constant int *, uint3, ushort, ushort);

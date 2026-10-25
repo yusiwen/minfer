@@ -169,6 +169,11 @@ struct MpsStateInner {
     pl_q4_k_mm_f32: MetalComputePipelineState,
     pl_q6_k_f32: MetalComputePipelineState,
     pl_q6_k_f32_multi: MetalComputePipelineState,
+    /// #673: the matvec's wide variant (NSG=8, 256 threads per threadgroup) — the
+    /// reference achieves 0.186 ms per matmul at `nt = 3` with 512 threads where the
+    /// shipped arm uses 64 and costs 0.240 ms.
+    pl_q4_k_f32_nsg8: MetalComputePipelineState,
+    pl_q6_k_f32_nsg8: MetalComputePipelineState,
     pl_q6_k_mm_f32: MetalComputePipelineState,
     pl_q5_0_f32: MetalComputePipelineState,
     pl_q5_0_f32_multi: MetalComputePipelineState,

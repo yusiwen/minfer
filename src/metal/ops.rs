@@ -85,7 +85,13 @@ impl MpsCommandBuffer<'_> {
         id: usize,
         nt: usize,
     ) -> Result<(), String> {
+        // #673: 256-thread variant of the same kernel (NSG=8 instead of 2). Each row is
+        // still summed by one simdgroup with the same lane layout, so it is bitwise
+        // identical to the shipped arm — the existing gates assert that.
+        let wide = std::env::var("MINFER_MV_NSG8").map_or(false, |v| v == "1") && nt > 1;
         let pl: &MetalComputePipelineState = match ttype {
+            TensorType::Q4_K if wide => &self.state.pl_q4_k_f32_nsg8,
+            TensorType::Q6_K if wide => &self.state.pl_q6_k_f32_nsg8,
             TensorType::Q4_K => &self.state.pl_q4_k_f32,
             TensorType::Q6_K => &self.state.pl_q6_k_f32,
             other => {
@@ -129,7 +135,12 @@ impl MpsCommandBuffer<'_> {
         };
         // The shipped `nt == 1` grid for Q4_K/Q6_K: x = ceil(od/4) row tiles,
         // y = 1, TG(32, 2), no threadgroup memory. Here y = nt.
-        self.dispatch_2d(((od + 3) / 4) as u64, nt as u64, 32, 2);
+        if wide {
+            // 8 simdgroups per threadgroup: 16 rows a tile, so a quarter of the tiles.
+            self.dispatch_2d(((od + 15) / 16) as u64, nt as u64, 32, 8);
+        } else {
+            self.dispatch_2d(((od + 3) / 4) as u64, nt as u64, 32, 2);
+        }
         Ok(())
     }
 
@@ -260,14 +271,24 @@ impl MpsCommandBuffer<'_> {
                     // different dispatches. `nt == 1` is unchanged — the
                     // single-token kernel with `grid.y = 1`.
                     let single_grid_y = nt == 1 || (!force_matvec && nt <= 8);
+                    // #673: the wide matvec (NSG=8, 256 threads per threadgroup). Same
+                    // kernel body and lane layout, so each row is still summed by one
+                    // simdgroup — bitwise identical to the shipped arm.
+                    let wide = single_grid_y
+                        && nt > 1
+                        && std::env::var("MINFER_MV_NSG8").map_or(false, |v| v == "1");
                     let pl: &MetalComputePipelineState = if ttype == TensorType::Q4_K {
-                        if single_grid_y {
+                        if wide {
+                            &self.state.pl_q4_k_f32_nsg8
+                        } else if single_grid_y {
                             &self.state.pl_q4_k_f32
                         } else {
                             &self.state.pl_q4_k_f32_multi
                         }
                     } else {
-                        if single_grid_y {
+                        if wide {
+                            &self.state.pl_q6_k_f32_nsg8
+                        } else if single_grid_y {
                             &self.state.pl_q6_k_f32
                         } else {
                             &self.state.pl_q6_k_f32_multi
@@ -309,7 +330,10 @@ impl MpsCommandBuffer<'_> {
                     // TG(32, nsg=2); the stride-2 (q6_K) / stride-4 (q4_K) thread
                     // layout keeps all threads busy for small id (nb super-blocks),
                     // unlike the old stride-64 scalar loop.
-                    if ttype == TensorType::Q6_K || ttype == TensorType::Q4_K {
+                    if wide {
+                        // 8 simdgroups: 16 rows per threadgroup, a quarter of the tiles.
+                        self.dispatch_2d(((od + 15) / 16) as u64, grid_y, 32, 8);
+                    } else if ttype == TensorType::Q6_K || ttype == TensorType::Q4_K {
                         self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 32, 2);
                     } else {
                         self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
