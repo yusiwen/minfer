@@ -147,6 +147,97 @@ fn few_row_mma_matches_the_matvec() {
     );
 }
 
+/// #673: where does each arm sit against the memory roofline for ONE shape? The
+/// question this answers is whether the MMA port is slow because of its algorithm
+/// (then it is a design limit) or because of a defect (then it is fixable): a kernel
+/// at the roofline cannot be improved by tuning, and one far below it can.
+///
+#[test]
+fn few_row_mma_roofline_at_the_verify_shape() {
+    use crate::metal::policy::few_row_mma;
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the roofline profile");
+        return;
+    };
+    let dev = &mps.inner.device;
+    // The 14B's actual matmul shapes at the verify (the output head's 152064 rows are
+    // 437 MB of weights — measured separately, it is one call per forward).
+    let shapes: &[(usize, usize, &str)] = &[
+        (5120, 5120, "attn_q"),
+        (1024, 5120, "attn_kv"),
+        (5120, 5120, "attn_out"),
+        (13824, 5120, "ffn_gate_up"),
+        (5120, 13824, "ffn_down"),
+    ];
+    let (nt, reps) = (3usize, 20usize);
+    for (od, id, label) in shapes.iter().copied() {
+        for ttype in [TensorType::Q4_K, TensorType::Q6_K] {
+            let bq = quant_block_q(ttype);
+            let bb = quant_block_bytes(ttype);
+            let wbytes = (id / bq) * bb * od;
+            let Some(t) = few_row_mma(ttype, nt, od, id) else {
+                continue;
+            };
+            let wb = dev
+                .newBufferWithLength_options(
+                    (wbytes as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_quant_0x33(&wb, wbytes);
+            let acts = dev
+                .newBufferWithLength_options(
+                    ((id * nt * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_random_acts(&acts, id * nt);
+            let out = dev
+                .newBufferWithLength_options(
+                    ((od * nt * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            let wgb = wbytes as f64 / 1e9;
+            let mut run_matvec = || {
+                let cb = mps.cmd_buffer();
+                cb.quant_matmul_f32_matvec(&wb, 0, ttype, &acts, 0, &out, od, id, nt)
+                    .unwrap();
+                cb.submit().unwrap();
+            };
+            let mut run_mma = || {
+                let cb = mps.cmd_buffer();
+                cb.mma_dispatch(&wb, 0, ttype, &acts, 0, &out, od, id, nt, t)
+                    .unwrap();
+                cb.submit().unwrap();
+            };
+            run_matvec();
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                run_matvec();
+            }
+            let ms_matvec = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+            run_mma();
+            let t1 = std::time::Instant::now();
+            for _ in 0..reps {
+                run_mma();
+            }
+            let ms_mma = t1.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+            println!("  {ttype:?} matvec {ms_matvec:.3} ms, mma {ms_mma:.3} ms");
+            println!(
+            "  {label:>12} {ttype:?} od={od} id={id} nt_tile={} nsg={}: matvec {ms_matvec:.3} ms ({:.1} GB/s), mma {ms_mma:.3} ms ({:.1} GB/s) {:.2}x",
+            t.nt,
+            t.nsg,
+            wgb / (ms_matvec / 1000.0),
+            wgb / (ms_mma / 1000.0),
+            ms_mma / ms_matvec
+        );
+        }
+    }
+}
+
 /// #673: the few-row MMA tiling is llama's rule, so the boundaries are pinned here —
 /// a wrong tiling reads the wrong K split silently (a wrong number, not a crash).
 #[test]
