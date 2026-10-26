@@ -204,30 +204,29 @@ fn few_row_mma_roofline_at_the_verify_shape() {
                 )
                 .unwrap();
             let wgb = wbytes as f64 / 1e9;
-            let mut run_matvec = || {
+            // Queue `reps` dispatches into ONE command buffer and synchronise once — the
+            // way a forward runs them. One submit+wait per call measures round-trip
+            // latency (1.1 ms for a 15 MB read) and cannot arbitrate between kernels.
+            let ms_matvec = {
                 let cb = mps.cmd_buffer();
-                cb.quant_matmul_f32_matvec(&wb, 0, ttype, &acts, 0, &out, od, id, nt)
-                    .unwrap();
+                for _ in 0..reps {
+                    cb.quant_matmul_f32_matvec(&wb, 0, ttype, &acts, 0, &out, od, id, nt)
+                        .unwrap();
+                }
+                let t0 = std::time::Instant::now();
                 cb.submit().unwrap();
+                t0.elapsed().as_secs_f64() * 1000.0 / reps as f64
             };
-            let mut run_mma = || {
+            let ms_mma = {
                 let cb = mps.cmd_buffer();
-                cb.mma_dispatch(&wb, 0, ttype, &acts, 0, &out, od, id, nt, t)
-                    .unwrap();
+                for _ in 0..reps {
+                    cb.mma_dispatch(&wb, 0, ttype, &acts, 0, &out, od, id, nt, t)
+                        .unwrap();
+                }
+                let t0 = std::time::Instant::now();
                 cb.submit().unwrap();
+                t0.elapsed().as_secs_f64() * 1000.0 / reps as f64
             };
-            run_matvec();
-            let t0 = std::time::Instant::now();
-            for _ in 0..reps {
-                run_matvec();
-            }
-            let ms_matvec = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
-            run_mma();
-            let t1 = std::time::Instant::now();
-            for _ in 0..reps {
-                run_mma();
-            }
-            let ms_mma = t1.elapsed().as_secs_f64() * 1000.0 / reps as f64;
             println!("  {ttype:?} matvec {ms_matvec:.3} ms, mma {ms_mma:.3} ms");
             println!(
             "  {label:>12} {ttype:?} od={od} id={id} nt_tile={} nsg={}: matvec {ms_matvec:.3} ms ({:.1} GB/s), mma {ms_mma:.3} ms ({:.1} GB/s) {:.2}x",
