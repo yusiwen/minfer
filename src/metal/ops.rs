@@ -136,6 +136,16 @@ impl MpsCommandBuffer<'_> {
     /// #673: dispatch the few-row MMA kernel. `p[]` mirrors the kernel's header:
     /// K, od, nt, out row stride, weight row stride (bytes), activation row stride
     /// (floats), nsg, block bytes.
+    /// Label an MMA dispatch with its instantiation, so a GPU trace can tell the tile
+    /// variants apart (#673).
+    fn cb_label(&self, ttype: TensorType, t: crate::metal::policy::FewRowMma) {
+        let name = match ttype {
+            TensorType::Q4_K => format!("mma_q4k_nt{}_rt{}_nsg{}", t.nt, t.rt, t.nsg),
+            _ => format!("mma_q6k_nt{}_rt{}_nsg{}", t.nt, t.rt, t.nsg),
+        };
+        self.label(&name);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn mma_dispatch(
         &self,
@@ -169,6 +179,7 @@ impl MpsCommandBuffer<'_> {
         // [nsg8: six] then [nsg16: six]; inside a block, rt picks the half.
         let nsg_slot = if t.nsg == 8 { 0 } else { 6 };
         let idx = nsg_slot + (if t.rt == 2 { 3 } else { 0 }) + nt_slot;
+        self.cb_label(ttype, t);
         self.enc.setComputePipelineState(&*(pls[idx]));
         unsafe {
             self.enc
@@ -397,6 +408,11 @@ impl MpsCommandBuffer<'_> {
                     // layout keeps all threads busy for small id (nb super-blocks),
                     // unlike the old stride-64 scalar loop.
                     if ttype == TensorType::Q6_K || ttype == TensorType::Q4_K {
+                        self.label(if single_grid_y {
+                            "matvec_gridy"
+                        } else {
+                            "matvec_multi"
+                        });
                         self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 32, 2);
                     } else {
                         self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
