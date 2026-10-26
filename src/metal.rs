@@ -173,6 +173,9 @@ struct MpsStateInner {
     /// reference achieves 0.186 ms per matmul at `nt = 3` with 512 threads where the
     /// shipped arm uses 64 and costs 0.240 ms.
     pl_q4_k_f32_nsg8: MetalComputePipelineState,
+    /// #673: the one-pass (token loop inside the block loop) arm with NR0=1, i.e. twice
+    /// the threadgroups — the parallelism the NR0=2 form was starved of.
+    pl_q4_k_f32_multi_nr1: MetalComputePipelineState,
     pl_q6_k_f32_nsg8: MetalComputePipelineState,
     pl_q6_k_mm_f32: MetalComputePipelineState,
     pl_q5_0_f32: MetalComputePipelineState,

@@ -136,7 +136,8 @@ kernel void kernel_q4_k_f32_matmul_nsg(
 //
 // Grid: x = ceil(od / (NR0*NSG)), y = 1, TG = (32, NSG, 1) — unchanged.
 
-kernel void kernel_q4_k_f32_matmul_multi(
+template <short NR0>
+kernel void kernel_q4_k_f32_matmul_multi_nr(
     device const uchar  * weights  [[buffer(0)]],
     device const float  * acts     [[buffer(1)]],
     device       float  * output   [[buffer(2)]],
@@ -145,7 +146,6 @@ kernel void kernel_q4_k_f32_matmul_multi(
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr short NR0 = 2;
     constexpr short NSG = 2;
     /// Tokens accumulated per weight pass; `nt` itself is unbounded. 4 keeps the
     /// accumulator set (2 rows x 4) inside the register file: at 8 the compiler
@@ -643,3 +643,10 @@ template [[host_name("kernel_q4_k_f32_matmul")]]      kernel void kernel_q4_k_f3
 template [[host_name("kernel_q4_k_f32_matmul_nsg8")]] kernel void kernel_q4_k_f32_matmul_nsg<8>(device const uchar *, device const float *, device float *, constant int *, uint3, ushort, ushort);
 template [[host_name("kernel_q6_k_f32_matmul")]]      kernel void kernel_q6_k_f32_matmul_nsg<2>(device const uchar *, device const float *, device float *, constant int *, uint3, ushort, ushort);
 template [[host_name("kernel_q6_k_f32_matmul_nsg8")]] kernel void kernel_q6_k_f32_matmul_nsg<8>(device const uchar *, device const float *, device float *, constant int *, uint3, ushort, ushort);
+
+// #673: NR0=1 doubles the threadgroup count for the same work — the one-pass arm was
+// starved of parallelism (1280 threadgroups of 64 threads against the 3-pass arm's
+// 3840), which is why it streamed at 44 GB/s of unique bytes where this arm's 3-pass
+// sibling reaches 187 GB/s of actual traffic.
+template [[host_name("kernel_q4_k_f32_matmul_multi")]]     kernel void kernel_q4_k_f32_matmul_multi_nr<2>(device const uchar *, device const float *, device float *, constant int *, uint3, ushort, ushort);
+template [[host_name("kernel_q4_k_f32_matmul_multi_nr1")]] kernel void kernel_q4_k_f32_matmul_multi_nr<1>(device const uchar *, device const float *, device float *, constant int *, uint3, ushort, ushort);

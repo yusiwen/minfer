@@ -274,7 +274,11 @@ impl MpsCommandBuffer<'_> {
                     // threadgroup, weights read once for all tokens) for `nt > 1`. It is
                     // a diagnostic for #673: at `nt = 3` the single-grid arm moves 3x the
                     // weight bytes, and this is the arm that does not.
-                    let force_multi = std::env::var("MINFER_MV_MULTI").map_or(false, |v| v == "1");
+                    // MINFER_MV_MULTI=1 forces the one-pass arm (NR0=2); =2 forces its
+                    // NR0=1 form, which has twice the threadgroups for the same work.
+                    let mv_multi = std::env::var("MINFER_MV_MULTI").unwrap_or_default();
+                    let force_multi = mv_multi == "1" || mv_multi == "2";
+                    let multi_nr1 = mv_multi == "2" && ttype == TensorType::Q4_K;
                     let single_grid_y = nt == 1 || (!force_matvec && !force_multi && nt <= 8);
                     // #673: the wide matvec (NSG=8, 256 threads per threadgroup). Same
                     // kernel body and lane layout, so each row is still summed by one
@@ -283,7 +287,9 @@ impl MpsCommandBuffer<'_> {
                         && nt > 1
                         && std::env::var("MINFER_MV_NSG8").map_or(false, |v| v == "1");
                     let pl: &MetalComputePipelineState = if ttype == TensorType::Q4_K {
-                        if wide {
+                        if multi_nr1 {
+                            &self.state.pl_q4_k_f32_multi_nr1
+                        } else if wide {
                             &self.state.pl_q4_k_f32_nsg8
                         } else if single_grid_y {
                             &self.state.pl_q4_k_f32
@@ -339,7 +345,8 @@ impl MpsCommandBuffer<'_> {
                         // 8 simdgroups: 16 rows per threadgroup, a quarter of the tiles.
                         self.dispatch_2d(((od + 15) / 16) as u64, grid_y, 32, 8);
                     } else if ttype == TensorType::Q6_K || ttype == TensorType::Q4_K {
-                        self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 32, 2);
+                        let per_tg = if multi_nr1 { 2 } else { 4 };
+                        self.dispatch_2d(((od + per_tg - 1) / per_tg) as u64, grid_y, 32, 2);
                     } else {
                         self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);
                     }
