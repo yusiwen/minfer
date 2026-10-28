@@ -29,7 +29,7 @@
 #
 # The line below states what the checker counts, and the checker compares it: refresh it in
 # the same change that adds a knob or moves one between the tables (#628).
-# Measured 2026-10-23: 86 production reads — 74 documented, 12 internal.
+# Measured 2026-10-28: 90 production reads — 74 documented, 16 internal.
 
 [documented]
 
@@ -117,6 +117,10 @@ MINFER_GEMM_A32 = "A/B switch for the smem-mirror A32 GEMM variant (`src/cuda/me
 MINFER_MMQ_KSPLIT_TARGET = "overrides the auto-ksplit SM-count target (`src/cuda/methods/prefill_mmq.rs`); documented in the CUDA campaign record `docs/CUDA_OPTIMIZATION.md`"
 MINFER_NO_DP4A_Q8_KV = "A/B switch that selects the incumbent packed-Q8_0 K dot over the dp4a one (`src/cuda.rs`); documented in `docs/CUDA_OPTIMIZATION.md` and its step record"
 MINFER_NO_F16_ROWB = "A/B control for the f16 row-block weight dot (`src/vec_ops/f16.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
+MINFER_METAL_LABELS = "tags each Metal dispatch with an encoder label so a GPU trace is attributable (`src/metal.rs`); the ticket record #673 names it"
+MINFER_MV_MMA = "turns on the few-row MMA arm for the 2..16 activation-row band (`src/metal/policy.rs`); off by default because it is slower than the matvec, the record is #673/#680"
+MINFER_MV_MMA_NSG = "A/B switch for the MMA arm's simdgroups per threadgroup: 1 selects the single-simdgroup tiling that drops the reduction (`src/metal/policy.rs`); #680 names it"
+MINFER_MV_MMA_NT = "clamps the MMA arm's weight tile width for the tiling sweep (`src/metal/policy.rs`); a diagnostic the record in #673 names"
 MINFER_NO_KV_DEFRAG = "presence-checked switch that disables KV defragmentation (`src/graph/alloc.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
 MINFER_NO_PREFIX_REUSE = "presence-checked switch that disables prefix reuse, the pre-B2 behaviour (`src/server/chat.rs`, `src/server/batch.rs`); mentioned only by `docs/ARCHITECTURE-EXECUTION-PLAN.md`"
 MINFER_NO_Q8_KV_WIDE = "A/B switch that selects the incumbent four-byte packed-Q8_0 KV loads (`src/cuda.rs`); documented in `docs/CUDA_OPTIMIZATION.md` and its step record"
