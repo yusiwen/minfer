@@ -695,7 +695,7 @@ compilation) does the whole pipeline:
    `MINFER_CUDA_CCBIN` overrides the probe.
 4. **Probe the architectures.** `detect_archs()` (`build.rs:`)
    compiles a one-line dummy kernel for every candidate from `sm_70` to
-   sm_121 `detect_archs` (`build.rs:732`)) and keeps the ones this nvcc accepts —
+   sm_121 `detect_archs` (`build.rs:733`)) and keeps the ones this nvcc accepts —
    candidates newer than the toolkit simply fail their probe and are skipped,
    so one list works on every CUDA version. (The floor is sm_70, not Pascal:
    the prefill GEMM uses WMMA tensor-core intrinsics that require Volta+,
@@ -722,7 +722,7 @@ compilation) does the whole pipeline:
    NVIDIA driver at run time; the default links `libcudart.so` and bakes an
    rpath — *only* when the toolkit dir is not a system dir, to avoid
    shadowing a nix-provided glibc (`build.rs:541`, the rpath guard). The lib directory is
-   probed rather than assumed (`build.rs:633`, `find_cuda_lib_dir`), because distro packages
+   probed rather than assumed (`build.rs:634`, `find_cuda_lib_dir`), because distro packages
    install cudart into the multiarch dir. What is *never* linked is the
    driver library `libcuda.so.1` — it is dlopen'd lazily at run time
    (`preload_driver`, `src/cuda/methods/init.rs:34`), the same lazy-loading trick as the
