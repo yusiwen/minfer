@@ -264,9 +264,16 @@ MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt2_rt1, 2, 1, 16, 1)
 MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt2_rt2, 2, 2, 16, 1)
 MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt4_rt1, 4, 1, 16, 1)
 MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt4_rt2, 4, 2, 16, 1)
-// Single-simdgroup tilings (#673): one threadgroup owns its output rows, so no
-// reduction and no threadgroup memory. `nt=1` keeps the grid populated — a TG of 32
-// threads covering 8 rows means od/8 threadgroups, against od/32 at NT=4.
+// Single-simdgroup tilings (#673, #680): one threadgroup owns its output rows, so no
+// reduction and no threadgroup memory. `nt` trades grid size against the number of
+// independent accumulators: every one of the eight MMAs inside a chunk accumulates
+// into the same `mc[rt][t]`, so a single tile is an eight-deep dependency chain and
+// `nt` tiles are `nt` chains the scheduler can interleave. `nt=1` maximises the grid
+// (od/8 threadgroups), `nt=4` maximises ILP at od/32.
 MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg1_nt1_rt1, 1, 1, 1, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg1_nt2_rt1, 2, 1, 1, 0)
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg1_nt4_rt1, 4, 1, 1, 0)
 MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg1_nt1_rt1, 1, 1, 1, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg1_nt2_rt1, 2, 1, 1, 1)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg1_nt4_rt1, 4, 1, 1, 1)
 #undef MINFER_MMA_ONE

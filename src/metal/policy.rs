@@ -280,8 +280,13 @@ pub fn few_row_mma(ttype: TensorType, nt: usize, od: usize, k: usize) -> Option<
     // enough threadgroups in the grid (od/8 against od/32 at NT=4).
     if let Ok(v) = std::env::var("MINFER_MV_MMA_NSG") {
         if v.parse::<usize>().ok() == Some(1) {
+            // `nt=4` measured best: 17.88 tokens/s against 17.16 at nt=2 and 15.36 at
+            // nt=1 (14B, nt=3, same afternoon). The eight MMAs inside a chunk all
+            // accumulate into one `mc[rt][t]`, so the tile count *is* the number of
+            // independent dependency chains; the grid it costs (od/32 threadgroups at
+            // 32 threads) is still enough to fill the device.
             return Some(FewRowMma {
-                nt: 1,
+                nt: 4,
                 rt: 1,
                 nsg: 1,
                 smem: 1024,

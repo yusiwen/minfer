@@ -183,9 +183,9 @@ impl MpsCommandBuffer<'_> {
         // #673: nsg=1 has its own single-simdgroup pipeline (no reduction).
         let single = if t.nsg == 1 {
             Some(if matches!(ttype, TensorType::Q4_K) {
-                &self.state.pl_q4_k_mma_n1
+                &self.state.pl_q4_k_mma_n1[nt_slot]
             } else {
-                &self.state.pl_q6_k_mma_n1
+                &self.state.pl_q6_k_mma_n1[nt_slot]
             })
         } else {
             None
