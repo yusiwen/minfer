@@ -13,8 +13,11 @@
 // engines could not hold different layouts and a C5 session could be described
 // under the wrong width.
 
+use crate::tensor::TensorType;
+
 /// Use the 256-thread multi-simdgroup rms_norm in the decode path (P1 2026-08-10
 /// A/B gate; ON by default after it measured ~2x faster than the 32-thread kernel).
+
 pub fn rms_norm_256_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("MINFER_NO_RMS_256").map_or(true, |v| v != "1"))
@@ -217,6 +220,96 @@ pub fn gemm_min_nt(arm: BandArm) -> usize {
 /// which is what lets one authority serve all seven quant arms.
 pub fn gemm_preferred(nt: usize, od: usize, arm: BandArm) -> bool {
     nt >= gemm_min_nt(arm) && od >= GEMM_MIN_OD
+}
+
+/// llama's **few-row MMA** tiling for the 2..16 activation-row window (#673): an
+/// 8x8 simdgroup-matrix kernel whose weight rows and activation rows are both tiled,
+/// so the weights are read once per 8-row tile instead of once per token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FewRowMma {
+    /// The pipeline suffix the kernel was instantiated under: `nt{N}_rt{R}`.
+    pub nt: usize,
+    pub rt: usize,
+    pub nsg: usize,
+    /// Threadgroup memory the reduction needs, in bytes.
+    pub smem: usize,
+}
+
+/// Whether the few-row MMA arm is **enabled**: `MINFER_MV_MMA=1`. Off by default until
+/// the arm is measured against the matvec on a Mac (#673); the tiling itself is pure so
+/// it can be tested and reasoned about without the latch.
+pub fn few_row_mma_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MINFER_MV_MMA").map_or(false, |v| v == "1"))
+}
+
+/// The tiling llama picks for this shape, or `None` when the shape is outside the arm.
+///
+/// Constants and the halving rule are `ggml-metal-device.cpp:805-865`: 8-row tiles,
+/// at most 4 weight tiles, 16 KB of reduction buffer, 128 threadgroups wanted, and
+/// `nsg` 32/16/8 by output-row count, halved until the K split has that many 64-weight
+/// chunks. `k` must be a multiple of 64 (the kernel's chunk size).
+pub fn few_row_mma(ttype: TensorType, nt: usize, od: usize, k: usize) -> Option<FewRowMma> {
+    const NT_MAX: usize = 4;
+    const SMEM_MAX: usize = 16384;
+    const MIN_TG: usize = 128;
+    const TILE: usize = 8;
+    let rows_min = match ttype {
+        TensorType::Q4_K => 3,
+        TensorType::Q6_K => 2,
+        _ => return None,
+    };
+    if nt < rows_min || nt > 16 || od < TILE || k < 64 || k % 64 != 0 {
+        return None;
+    }
+    let rt = if nt > 8 { 2 } else { 1 };
+    let n_steps = k / 64;
+    // Only 8 and 16 are instantiated (see the kernel's MINFER_MMA_ONE list): 32 would
+    // need a threadgroup of 1024 threads and no shape this arm serves picks it, so a
+    // 32 is clamped — a mismatch between this number and the kernel's baked NSG drops
+    // K chunks silently, which is why the value is checked by the tiling gate.
+    let mut nsg = if od <= 6144 { 16 } else { 8 };
+    while nsg > 1 && nsg > n_steps {
+        nsg /= 2;
+    }
+    if nsg < 8 {
+        nsg = 8;
+    }
+    let limit = (SMEM_MAX / (nsg * rt * 256)).min(od / (MIN_TG * TILE));
+    // llama's `halve_to_limit(NT_MAX, min(nt_smem, nt_rows))`: start at the cap and
+    // halve while the tile budget cannot hold it.
+    let mut nt_tile = NT_MAX;
+    while nt_tile > 1 && nt_tile > limit {
+        nt_tile /= 2;
+    }
+    Some(FewRowMma {
+        nt: nt_tile,
+        rt,
+        nsg,
+        smem: nsg * nt_tile * rt * 256,
+    })
+}
+
+/// Debug knob for the geometry sweep (#673): `MINFER_MV_MMA_NT=1|2|4` re-clamps the
+/// weight-tile count, which changes how many threadgroups the dispatch has. The tiling
+/// rule above is llama's; this exists to ask whether *our* GPU wants a narrower tile
+/// than the rule picks, without a rebuild per answer.
+pub fn few_row_mma_nt_override() -> Option<usize> {
+    std::env::var("MINFER_MV_MMA_NT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| matches!(n, 1 | 2 | 4))
+}
+
+/// Apply [`few_row_mma_nt_override`] to a tiling, keeping the reduction size consistent.
+pub fn with_nt_override(mut t: FewRowMma) -> FewRowMma {
+    if let Some(nt) = few_row_mma_nt_override() {
+        if nt != t.nt {
+            t.nt = nt;
+            t.smem = t.nsg * t.nt * t.rt * 256;
+        }
+    }
+    t
 }
 
 /// Whether the GEMM path is available at all: `MINFER_GEMM=0` forces the per-row
