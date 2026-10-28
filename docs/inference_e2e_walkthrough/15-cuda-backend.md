@@ -391,7 +391,7 @@ missing toolkit is a hard error rather than a silent CPU-only binary, because
 archive can satisfy.
 
 ```rust
-// build.rs:171 (`main`) (abridged)
+// build.rs:172 (`main`) (abridged)
 let nvcc = match find_nvcc() {
     Some(n) => n,
     None => panic!(
