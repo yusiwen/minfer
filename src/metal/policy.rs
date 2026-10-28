@@ -275,6 +275,19 @@ pub fn few_row_mma(ttype: TensorType, nt: usize, od: usize, k: usize) -> Option<
     if nsg < 8 {
         nsg = 8;
     }
+    // Probe (#673): NSG=1 gives every threadgroup its own output rows, so the store
+    // path needs no reduction and no threadgroup memory. `nt` drops to 1 to keep
+    // enough threadgroups in the grid (od/8 against od/32 at NT=4).
+    if let Ok(v) = std::env::var("MINFER_MV_MMA_NSG") {
+        if v.parse::<usize>().ok() == Some(1) {
+            return Some(FewRowMma {
+                nt: 1,
+                rt: 1,
+                nsg: 1,
+                smem: 1024,
+            });
+        }
+    }
     let limit = (SMEM_MAX / (nsg * rt * 256)).min(od / (MIN_TG * TILE));
     // llama's `halve_to_limit(NT_MAX, min(nt_smem, nt_rows))`: start at the cap and
     // halve while the tile budget cannot hold it.

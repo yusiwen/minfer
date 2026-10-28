@@ -180,7 +180,18 @@ impl MpsCommandBuffer<'_> {
         let nsg_slot = if t.nsg == 8 { 0 } else { 6 };
         let idx = nsg_slot + (if t.rt == 2 { 3 } else { 0 }) + nt_slot;
         self.cb_label(ttype, t);
-        self.enc.setComputePipelineState(&*(pls[idx]));
+        // #673: nsg=1 has its own single-simdgroup pipeline (no reduction).
+        let single = if t.nsg == 1 {
+            Some(if matches!(ttype, TensorType::Q4_K) {
+                &self.state.pl_q4_k_mma_n1
+            } else {
+                &self.state.pl_q6_k_mma_n1
+            })
+        } else {
+            None
+        };
+        self.enc
+            .setComputePipelineState(&**single.unwrap_or(&pls[idx]));
         unsafe {
             self.enc
                 .setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize)

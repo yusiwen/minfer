@@ -228,6 +228,8 @@ impl MpsState {
                 get_pl("kernel_q6_k_f32_mma_nsg16_nt2_rt2")?,
                 get_pl("kernel_q6_k_f32_mma_nsg16_nt4_rt2")?,
             ];
+            let pl_q4_k_mma_n1 = get_pl("kernel_q4_k_f32_mma_nsg1_nt1_rt1")?;
+            let pl_q6_k_mma_n1 = get_pl("kernel_q6_k_f32_mma_nsg1_nt1_rt1")?;
             let pl_q5_0_f32 = get_pl("kernel_q5_0_f32_matmul")?;
             let pl_q5_0_mm_f32 = get_pl("kernel_q5_0_mm_f32")?;
             let pl_q5_0_f32_multi = get_pl("kernel_q5_0_f32_matmul_multi")?;
@@ -334,6 +336,8 @@ impl MpsState {
                 pl_q4_k_mm_f32,
                 pl_q4_k_mma,
                 pl_q6_k_mma,
+                pl_q4_k_mma_n1,
+                pl_q6_k_mma_n1,
                 pl_q6_k_f32,
                 pl_q6_k_f32_multi,
                 pl_q6_k_mm_f32,
