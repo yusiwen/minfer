@@ -35,6 +35,38 @@ inline short mma_lane_fm(ushort l) { return ((l / 4) & 4) + ((l / 2) % 4); }
 inline short mma_lane_fn(ushort l) { return ((l / 4) & 2) * 2 + (l % 2) * 2; }
 
 // Reduces the NSG partial sums of an 8*NT x 8*RT tile and writes it to `out`.
+// Single-simdgroup store: the threadgroup that owns an output tile has exactly one
+// simdgroup, so the cross-simdgroup reduction (threadgroup memory round trip plus a
+// `threadgroup_barrier`) has nothing to reduce. Writing the accumulators straight to
+// the output removes both the barrier and the 16 KB of threadgroup memory, which is
+// what limits residency to one threadgroup per core at NSG=16 (#673).
+template <short NT, short RT>
+inline void mma_store_direct(
+        thread float (&acc)[RT][NT][2],
+        device float * out,
+        int i01, int i11, int od, int nt, int out_stride,
+        ushort tiisg) {
+    const short l = (short) tiisg;
+    const short fm = mma_lane_fm(l);
+    const short fn = mma_lane_fn(l);
+    #pragma unroll
+    for (short rt = 0; rt < RT; ++rt) {
+        #pragma unroll
+        for (short t = 0; t < NT; ++t) {
+            const int r0 = i01 + 8 * t + fm;
+            if (r0 < od) {
+                const int r1 = i11 + 8 * rt + fn;
+                if (r1 < nt) {
+                    out[(long) r1 * out_stride + r0] = acc[rt][t][0];
+                }
+                if (r1 + 1 < nt) {
+                    out[(long) (r1 + 1) * out_stride + r0] = acc[rt][t][1];
+                }
+            }
+        }
+    }
+}
+
 template <short NT, short RT>
 inline void mma_store(
         thread float (&acc)[RT][NT][2],
@@ -187,7 +219,11 @@ inline void mma_qk_body(
         }
     }
 
-    mma_store<NT, RT>(acc, out, red, i01, i11, od, nt, out_stride, NSG, tiisg, sgitg);
+    if (NSG == 1) {
+        mma_store_direct<NT, RT>(acc, out, i01, i11, od, nt, out_stride, tiisg);
+    } else {
+        mma_store<NT, RT>(acc, out, red, i01, i11, od, nt, out_stride, NSG, tiisg, sgitg);
+    }
 }
 
 // NSG is baked per instantiation, like llama's `FC_mul_mv_mma_nsg` function constant.
@@ -228,4 +264,9 @@ MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt2_rt1, 2, 1, 16, 1)
 MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt2_rt2, 2, 2, 16, 1)
 MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt4_rt1, 4, 1, 16, 1)
 MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg16_nt4_rt2, 4, 2, 16, 1)
+// Single-simdgroup tilings (#673): one threadgroup owns its output rows, so no
+// reduction and no threadgroup memory. `nt=1` keeps the grid populated — a TG of 32
+// threads covering 8 rows means od/8 threadgroups, against od/32 at NT=4.
+MINFER_MMA_ONE(kernel_q4_k_f32_mma_nsg1_nt1_rt1, 1, 1, 1, 0)
+MINFER_MMA_ONE(kernel_q6_k_f32_mma_nsg1_nt1_rt1, 1, 1, 1, 1)
 #undef MINFER_MMA_ONE
