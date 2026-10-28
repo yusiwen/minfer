@@ -133,6 +133,96 @@ impl MpsCommandBuffer<'_> {
         Ok(())
     }
 
+    /// #673: dispatch the few-row MMA kernel. `p[]` mirrors the kernel's header:
+    /// K, od, nt, out row stride, weight row stride (bytes), activation row stride
+    /// (floats), nsg, block bytes.
+    /// Label an MMA dispatch with its instantiation, so a GPU trace can tell the tile
+    /// variants apart (#673).
+    fn cb_label(&self, ttype: TensorType, t: crate::metal::policy::FewRowMma) {
+        let name = match ttype {
+            TensorType::Q4_K => format!("mma_q4k_nt{}_rt{}_nsg{}", t.nt, t.rt, t.nsg),
+            _ => format!("mma_q6k_nt{}_rt{}_nsg{}", t.nt, t.rt, t.nsg),
+        };
+        self.label(&name);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mma_dispatch(
+        &self,
+        wb: &MetalBuffer,
+        w_off: u64,
+        ttype: TensorType,
+        x: &MetalBuffer,
+        x_off: u64,
+        out: &MetalBuffer,
+        od: usize,
+        id: usize,
+        nt: usize,
+        t: crate::metal::policy::FewRowMma,
+    ) -> Result<(), String> {
+        let (pls, w_row, blk) = match ttype {
+            TensorType::Q4_K => (&self.state.pl_q4_k_mma, id / 256 * 144, 144i32),
+            TensorType::Q6_K => (&self.state.pl_q6_k_mma, id / 256 * 210, 210i32),
+            other => return Err(format!("mma_dispatch: unsupported type {other:?}")),
+        };
+        // The arrays are ordered [nt1_rt1, nt2_rt1, nt1_rt2, nt2_rt2]: rt is the
+        // high bit. Getting this backwards selects the NT=2/RT=1 kernel for an
+        // rt=2 shape and lands 16 rows of output where 8 belong — silent garbage,
+        // which is what `few_row_mma_matches_the_matvec` caught.
+        // Order [nt1_rt1, nt2_rt1, nt4_rt1, nt1_rt2, nt2_rt2, nt4_rt2]: rt picks the
+        // half, `nt` the slot inside it. A wrong pick writes the wrong rows silently.
+        let nt_slot = match t.nt {
+            1 => 0,
+            2 => 1,
+            _ => 2,
+        };
+        // [nsg8: six] then [nsg16: six]; inside a block, rt picks the half.
+        let nsg_slot = if t.nsg == 8 { 0 } else { 6 };
+        let idx = nsg_slot + (if t.rt == 2 { 3 } else { 0 }) + nt_slot;
+        self.cb_label(ttype, t);
+        self.enc.setComputePipelineState(&*(pls[idx]));
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(wb)), (w_off) as usize, (0) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(x)), (x_off) as usize, (1) as usize)
+        };
+        unsafe {
+            self.enc
+                .setBuffer_offset_atIndex(Some(&**(out)), (0) as usize, (2) as usize)
+        };
+        let p = [
+            id as i32,
+            od as i32,
+            nt as i32,
+            od as i32, // out is [nt][od], row-major
+            w_row as i32,
+            id as i32, // activations are [nt][id], row-major
+            t.nsg as i32,
+            blk,
+        ];
+        unsafe {
+            self.enc.setBytes_length_atIndex(
+                NonNull::new(p.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(),
+                (std::mem::size_of_val(&p)) as usize,
+                (3) as usize,
+            )
+        };
+        unsafe {
+            self.enc
+                .setThreadgroupMemoryLength_atIndex((t.smem) as usize, (0) as usize)
+        };
+        self.dispatch_2d(
+            ((od + 8 * t.nt - 1) / (8 * t.nt)) as u64,
+            ((nt + 8 * t.rt - 1) / (8 * t.rt)) as u64,
+            32,
+            t.nsg as u64,
+        );
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn quant_matmul_f32_dispatch(
         &self,
@@ -159,6 +249,14 @@ impl MpsCommandBuffer<'_> {
             gpu_abort(&format!(
                 "matmul input dim id={id} is not 256-aligned for {ttype:?} (K-quant kernels use K/256 super-block floor)"
             ));
+        }
+        // #673: the few-row MMA arm — 2..16 activation rows on simdgroup matrices.
+        // Behind `MINFER_MV_MMA=1` until it is measured against the matvec on a Mac.
+        if crate::metal::policy::few_row_mma_enabled() {
+            if let Some(t) = crate::metal::policy::few_row_mma(ttype, nt, od, id) {
+                let t = crate::metal::policy::with_nt_override(t);
+                return self.mma_dispatch(wb, w_off, ttype, x, x_off, out, od, id, nt, t);
+            }
         }
         match ttype {
             TensorType::Q8_0 => {
@@ -310,6 +408,11 @@ impl MpsCommandBuffer<'_> {
                     // layout keeps all threads busy for small id (nb super-blocks),
                     // unlike the old stride-64 scalar loop.
                     if ttype == TensorType::Q6_K || ttype == TensorType::Q4_K {
+                        self.label(if single_grid_y {
+                            "matvec_gridy"
+                        } else {
+                            "matvec_multi"
+                        });
                         self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 32, 2);
                     } else {
                         self.dispatch_2d(((od + 3) / 4) as u64, grid_y, 64, 1);

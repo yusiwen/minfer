@@ -40,6 +40,255 @@ fn the_two_unavailable_causes_read_differently() {
     );
 }
 
+/// #673: the few-row MMA arm must agree with the matvec it replaces. Not bitwise —
+/// it stages activations as f16 fragments — so this is a *tolerance* gate, the same
+/// class the band's GEMM arm uses. It pins the wiring, not the number: a mismatched
+/// `nsg` drops K chunks silently, and that shows up here as a large relative error.
+#[test]
+fn few_row_mma_matches_the_matvec() {
+    use crate::metal::policy::few_row_mma;
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the few-row MMA gate");
+        return;
+    };
+    let dev = &mps.inner.device;
+    // Cover all three weight tilings the policy can pick: od = 512 -> nt_tile 1,
+    // od = 2048 -> 2, od = 4096 -> 4 (nt_rows = od/1024), and the rt = 2 half above
+    // 8 rows. Every instantiation the policy can name must appear here.
+    let cases: &[(usize, usize, usize)] = &[
+        (512, 512, 3),
+        (1152, 1024, 3),
+        (2048, 512, 3),
+        (4096, 512, 3),
+        (512, 512, 9),
+        (4096, 512, 9),
+    ];
+    let mut bad: Vec<String> = Vec::new();
+    println!("\n=== few-row MMA vs matvec (Q4_K / Q6_K) ===");
+    for &(od, id, nt) in cases {
+        for ttype in [TensorType::Q4_K, TensorType::Q6_K] {
+            let Some(tiling) = few_row_mma(ttype, nt, od, id) else {
+                bad.push(format!("{ttype:?} od={od} id={id} nt={nt}: not in the arm"));
+                continue;
+            };
+            let bq = quant_block_q(ttype);
+            let bb = quant_block_bytes(ttype);
+            let wbytes = (id / bq) * bb * od;
+            let wb = dev
+                .newBufferWithLength_options(
+                    (wbytes as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_quant_0x33(&wb, wbytes);
+            let acts = dev
+                .newBufferWithLength_options(
+                    ((id * nt * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_random_acts(&acts, id * nt);
+            let new_out = || {
+                dev.newBufferWithLength_options(
+                    ((od * nt * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+            };
+            let out_ref = new_out();
+            let out_mma = new_out();
+            let read = |b: &MetalBuffer, n: usize| -> Vec<f32> {
+                unsafe {
+                    std::slice::from_raw_parts(b.contents().as_ptr() as *const f32, n).to_vec()
+                }
+            };
+            // Reference: the matvec arm, production entry, forced off every other tier.
+            let cb = mps.cmd_buffer();
+            cb.quant_matmul_f32_matvec(&wb, 0, ttype, &acts, 0, &out_ref, od, id, nt)
+                .unwrap_or_else(|e| panic!("{ttype:?} reference dispatch: {e}"));
+            cb.submit()
+                .unwrap_or_else(|e| panic!("{ttype:?} reference submit: {e}"));
+            let cb = mps.cmd_buffer();
+            cb.mma_dispatch(&wb, 0, ttype, &acts, 0, &out_mma, od, id, nt, tiling)
+                .unwrap_or_else(|e| panic!("{ttype:?} mma dispatch: {e}"));
+            cb.submit()
+                .unwrap_or_else(|e| panic!("{ttype:?} mma submit: {e}"));
+
+            let want = read(&out_ref, od * nt);
+            let got = read(&out_mma, od * nt);
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let max_abs = got
+                .iter()
+                .zip(&want)
+                .fold(0.0f32, |m, (g, w)| m.max((g - w).abs()));
+            let rel = max_abs / scale;
+            println!(
+                "  {ttype:?} od={od} id={id} nt={nt} (nt_tile={} rt={} nsg={}): max|Δ|={max_abs:.6} rel={rel:.2e}",
+                tiling.nt, tiling.rt, tiling.nsg
+            );
+            // The generic MMA path holds A and B in f32 fragments and accumulates in
+            // f32, so it must agree with the matvec to rounding order, not to an
+            // f16-ish tolerance — measured 3e-7 on the rt=1 shapes. 1e-4 leaves room
+            // for the different summation order and still fails loudly on a wiring
+            // error (a wrong kernel selection read 1.6e-1).
+            // v2 stages the A fragment as f16 (the weights are 4-6 bit), so the bound
+            // is f16-class, not f32-class: llama accepts the same trade in its `blk`
+            // kernels. The identity battery is the gate that matters for tokens.
+            if rel > 2e-3 {
+                bad.push(format!(
+                    "{ttype:?} od={od} id={id} nt={nt}: rel error {rel:.3e} over the 1e-4 bound"
+                ));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "the few-row MMA arm does not match the matvec:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// #673: where does each arm sit against the memory roofline for ONE shape? The
+/// question this answers is whether the MMA port is slow because of its algorithm
+/// (then it is a design limit) or because of a defect (then it is fixable): a kernel
+/// at the roofline cannot be improved by tuning, and one far below it can.
+///
+#[test]
+fn few_row_mma_roofline_at_the_verify_shape() {
+    use crate::metal::policy::few_row_mma;
+    let _g = crate::metal::metal_test_lock();
+    MpsState::init();
+    let Some(mps) = MpsState::get() else {
+        eprintln!("no Metal device; skipping the roofline profile");
+        return;
+    };
+    let dev = &mps.inner.device;
+    // The 14B's actual matmul shapes at the verify (the output head's 152064 rows are
+    // 437 MB of weights — measured separately, it is one call per forward).
+    let shapes: &[(usize, usize, &str)] = &[
+        (5120, 5120, "attn_q"),
+        (1024, 5120, "attn_kv"),
+        (5120, 5120, "attn_out"),
+        (13824, 5120, "ffn_gate_up"),
+        (5120, 13824, "ffn_down"),
+    ];
+    let (nt, reps) = (3usize, 20usize);
+    for (od, id, label) in shapes.iter().copied() {
+        for ttype in [TensorType::Q4_K, TensorType::Q6_K] {
+            let bq = quant_block_q(ttype);
+            let bb = quant_block_bytes(ttype);
+            let wbytes = (id / bq) * bb * od;
+            let Some(t) = few_row_mma(ttype, nt, od, id) else {
+                continue;
+            };
+            let wb = dev
+                .newBufferWithLength_options(
+                    (wbytes as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_quant_0x33(&wb, wbytes);
+            let acts = dev
+                .newBufferWithLength_options(
+                    ((id * nt * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            fill_random_acts(&acts, id * nt);
+            let out = dev
+                .newBufferWithLength_options(
+                    ((od * nt * 4) as u64) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
+            let wgb = wbytes as f64 / 1e9;
+            // Queue `reps` dispatches into ONE command buffer and synchronise once — the
+            // way a forward runs them. One submit+wait per call measures round-trip
+            // latency (1.1 ms for a 15 MB read) and cannot arbitrate between kernels.
+            let ms_matvec = {
+                let cb = mps.cmd_buffer();
+                for _ in 0..reps {
+                    cb.quant_matmul_f32_matvec(&wb, 0, ttype, &acts, 0, &out, od, id, nt)
+                        .unwrap();
+                }
+                let t0 = std::time::Instant::now();
+                cb.submit().unwrap();
+                t0.elapsed().as_secs_f64() * 1000.0 / reps as f64
+            };
+            let ms_mma = {
+                let cb = mps.cmd_buffer();
+                for _ in 0..reps {
+                    cb.mma_dispatch(&wb, 0, ttype, &acts, 0, &out, od, id, nt, t)
+                        .unwrap();
+                }
+                let t0 = std::time::Instant::now();
+                cb.submit().unwrap();
+                t0.elapsed().as_secs_f64() * 1000.0 / reps as f64
+            };
+            println!("  {ttype:?} matvec {ms_matvec:.3} ms, mma {ms_mma:.3} ms");
+            println!(
+            "  {label:>12} {ttype:?} od={od} id={id} nt_tile={} nsg={}: matvec {ms_matvec:.3} ms ({:.1} GB/s), mma {ms_mma:.3} ms ({:.1} GB/s) {:.2}x",
+            t.nt,
+            t.nsg,
+            wgb / (ms_matvec / 1000.0),
+            wgb / (ms_mma / 1000.0),
+            ms_mma / ms_matvec
+        );
+        }
+    }
+}
+
+/// #673: the few-row MMA tiling is llama's rule, so the boundaries are pinned here —
+/// a wrong tiling reads the wrong K split silently (a wrong number, not a crash).
+#[test]
+fn few_row_mma_tiling_matches_llama() {
+    use crate::metal::policy::few_row_mma;
+    use crate::tensor::TensorType;
+
+    // 14B layer, the verify shape: od 5120, K 5120, nt 3 -> rt 1, nsg 8 (od > 6144? no:
+    // 5120 <= 6144 -> 16, halved to 8 by n_steps), nt tile 4.
+    let t = few_row_mma(TensorType::Q4_K, 3, 5120, 5120).expect("in range");
+    assert_eq!(
+        (t.rt, t.nt),
+        (1, 4),
+        "nt=3 is one activation tile, four weight tiles"
+    );
+    assert!(t.nsg == 8 || t.nsg == 16, "nsg {} must be 8 or 16", t.nsg);
+    assert_eq!(t.smem, t.nsg * t.nt * t.rt * 256);
+
+    // Rows below the per-type minimum and above the window are not this arm.
+    assert!(
+        few_row_mma(TensorType::Q4_K, 2, 5120, 5120).is_none(),
+        "Q4_K starts at 3 rows"
+    );
+    assert!(
+        few_row_mma(TensorType::Q6_K, 2, 5120, 5120).is_some(),
+        "Q6_K starts at 2 rows"
+    );
+    assert!(few_row_mma(TensorType::Q4_K, 1, 5120, 5120).is_none());
+    assert!(few_row_mma(TensorType::Q4_K, 17, 5120, 5120).is_none());
+
+    // Above 8 rows llama doubles the activation tile.
+    let t = few_row_mma(TensorType::Q4_K, 9, 5120, 5120).expect("in range");
+    assert_eq!(t.rt, 2);
+
+    // A small output (the 0.5B's attn_qkv, od 1152) and a short K still tile.
+    let t = few_row_mma(TensorType::Q6_K, 3, 1152, 1024).expect("in range");
+    assert!(
+        t.nt >= 1 && t.smem <= 16384,
+        "tile {} smem {}",
+        t.nt,
+        t.smem
+    );
+
+    // K must be a multiple of the 64-weight chunk.
+    assert!(few_row_mma(TensorType::Q4_K, 3, 5120, 1000).is_none());
+    // Types outside the arm stay on the matvec.
+    assert!(few_row_mma(TensorType::Q8_0, 3, 5120, 5120).is_none());
+}
+
 #[test]
 fn metal_pipelines_compile() {
     let _g = crate::metal::metal_test_lock();
