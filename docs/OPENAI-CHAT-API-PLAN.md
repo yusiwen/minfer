@@ -99,7 +99,7 @@
 >
 > **Revision 8 (2026-08-22) — realdata attention fixtures restored.** The `attn_parallel_realdata_correctness`
 > test was previously skipping because its layer-0 q/k/v dump files came from the **deleted** layer_gpu
-> dump path (removed in the Phase 6 graph refactor, commit `6af12a4`). Restored with a one-time
+> dump path (removed in the Phase 6 graph refactor, commit `e54070c`). Restored with a one-time
 > generator instead of the old path:
 > - `#[test] #[ignore] gen_layer0_realdata_dump` in `src/metal/` runs a real 35-token prefill on the
 >   cached Qwen2.5-0.5B q4_0 through the current **graph** path (embedding → rms_norm → q/k/v matmul,

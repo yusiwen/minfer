@@ -55,7 +55,7 @@ full section in §3.3:
 
 There was an older design: `models/qwen2/forward.rs`, an imperative per-layer
 loop that computed as it went and hard-coded its GPU fallbacks. It is gone —
-deleted in Phase 6 of the graph refactor (commit `6af12a4`) only after the
+deleted in Phase 6 of the graph refactor (commit `e54070c`) only after the
 graph path reproduced its logits bit-identically, prefill and decode
 (`docs/COMPUTE-GRAPH-DESIGN.md` §17, Phases 5–6 and 8). Its shape survives as
 a historical record in `docs/ARCHITECTURE.md` Appendix A.

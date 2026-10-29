@@ -642,7 +642,7 @@ Four reasons stack up:
    build-order executor had read it, attention reused the residual buffer, and
    the tail `get_rows` read the attention output instead of the residual —
    logits off by **21.79** (`docs/COMPUTE-GRAPH-DESIGN.md` §22, fixed in commit
-   `8febf4c`). The fix was not "sort better"; it was "everyone uses build
+   `d81af71`). The fix was not "sort better"; it was "everyone uses build
    order".
 3. *Store-before-attention for free.* With explicit KV nodes (doc 05) plus
    build order, the write-before-read property of KV needs no scheduling
@@ -707,7 +707,7 @@ input/output vectors.
 - **One order everywhere (invariant 5).** Execution, liveness, and the
   "buffer may be freed" logic all use build order; `topo_order()` only proves
   acyclicity. Origin: the G3 regression — 21.79 of logit drift traced to an
-  executor/allocator order mismatch, fixed in `8febf4c` together with "inputs
+  executor/allocator order mismatch, fixed in `d81af71` together with "inputs
   are never freed" (COMPUTE-GRAPH-DESIGN §23: two inputs whose liveness-shared
   buffer got refilled by the *later* input's fill, clobbering the first — the
   `embedding_and_rope` case).
