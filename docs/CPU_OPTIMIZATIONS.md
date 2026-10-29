@@ -17,9 +17,10 @@ llama.cpp, and documents optimization attempts and their outcomes.
 > 7B-class models), **flash attention** (on both GPU backends; the CPU path
 > keeps the multi-pass form), and **P1 — the AVX2/AVX-512 dot products for the
 > K-quant types** ([#56](https://github.com/yusiwen/minfer/issues/56), landed
-> 2026-10-08; see §P1 below). The remaining piece of that lane is **weight
-> repacking**, tracked in `docs/ARCHITECTURE-ROADMAP.md` §2.7 and
-> `docs/SUPPORT-MATRIX.md`.
+> 2026-10-08; see §P1 below). The lane's last piece, **weight repacking**, was
+> measured NULL on 2026-10-29 ([#433](https://github.com/yusiwen/minfer/issues/433))
+> and the kernel half that replaced it landed as
+> [#688](https://github.com/yusiwen/minfer/issues/688); §P1 carries the numbers.
 
 ## Current State
 
@@ -361,9 +362,10 @@ minfer and llama.cpp is due to:
 
 > **Superseded in part (2026-10-08).** P2, P3 and P4 below have shipped since
 > this section was written, and **P1 — the K-quant AVX2/AVX-512 dots — landed
-> 2026-10-08** ([#56](https://github.com/yusiwen/minfer/issues/56)); only its
-> weight-repacking half remains. See the status banner at the top of this
-> document.
+> 2026-10-08** ([#56](https://github.com/yusiwen/minfer/issues/56)); its
+> weight-repacking half was measured NULL on 2026-10-29 and the kernel half that
+> replaced it landed as [#688](https://github.com/yusiwen/minfer/issues/688). See
+> the status banner at the top of this document.
 
 ### P1: K-quant AVX2 / AVX-512 Dot Products — **DONE 2026-10-08** (#56)
 
@@ -381,13 +383,28 @@ ratios on a 4096-element row: AVX2 `3.39× / 2.80× / 1.79×`, AVX-512
 2026-10-08). `minfer bench` on the cached Qwen2.5-0.5B Q4_K_M (16 threads, median
 of nine `-r 3` samples, `--n-ctx 656`) moves prefill `pp512` 28.59 → 32.13 tok/s
 and decode `tg128` 11.20 → 12.54 tok/s; the modest end-to-end delta is the
-weight-row re-read per token, which the remaining **weight-repacking** increment
-addresses.
+weight-row re-read per token.
+
+**Update 2026-10-29 (the repacking question, answered).** A four-arm probe on
+`nuc11 (x86_64, i7-11700B)` — 4096-element row, 9 interleaved rounds, medians,
+pinned 1.97.1 — priced the weight-repack layout at **5.4% (AVX2) / 10.6%
+(AVX-512)** end to end with control arms: the decode is only 20–23% of a dot
+call. Two kernel restructurings on the **raw** layout are worth far more:
+vectorising the min term over the q8_K bsums and folding the subblock scale into
+`vpmaddwd` gives **−42.5% / −45.5%** and keeps 98.6%/129.9% of the permuted
+layout's gain, with no extra memory and no loader change
+([#433](https://github.com/yusiwen/minfer/issues/433) measured it,
+[#688](https://github.com/yusiwen/minfer/issues/688) landed the Q4_K half). The
+harness now records Q4_K at **6.02× (AVX2) / 7.32× (AVX-512)** vs scalar, up from
+3.47×/3.90×.
 
 **llama.cpp approach:** `ggml/src/ggml-cpu/arch/x86/quants.c` uses the
 `denibble()`/`maddubs` AVX2 shape and the VNNI `dpbusd` AVX-512 shape; minfer's
-kernels follow the same structure and keep the scalar float order so the result is
-bitwise, not merely close.
+kernels keep the scalar float order so the result is bitwise, not merely close.
+Since [#688](https://github.com/yusiwen/minfer/issues/688) the Q4_K path departs
+from that instruction mix by folding the scale into the `vpmaddwd` — measured
+faster than `dpbusd` + `vpmulld` on i7-11700B, unverified on other
+microarchitectures.
 
 ### P2: f16 KV Cache
 

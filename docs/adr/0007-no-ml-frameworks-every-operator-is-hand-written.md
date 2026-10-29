@@ -69,8 +69,11 @@ and this ADR does not claim otherwise.
   and each backend compared against its own reference.
 - Cost accepted: no framework means no framework's kernels, and a supported model family costs a
   hand-written graph (`models/qwen2/`, `models/qwen3/`) rather than a config file. One piece of that
-  cost is still open at the time of writing: CPU K-quant **weight repacking** (the F1 increment) is
-  unimplemented.
+  cost was open at the time of writing: CPU K-quant **weight repacking** (the F1 increment) was
+  unimplemented. It has since been measured and closed as not worth building — the layout buys
+  5.4%/10.6% end to end ([#433](https://github.com/yusiwen/minfer/issues/433)), and the kernel
+  restructurings it hid behind were the real lever
+  ([#688](https://github.com/yusiwen/minfer/issues/688)).
 
 ## References
 
