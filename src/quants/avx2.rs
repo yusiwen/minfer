@@ -107,8 +107,62 @@ pub(super) fn f16_at(b: &[u8], off: usize) -> f32 {
     block::fp16_to_f32(u16::from_le_bytes([b[off], b[off + 1]]))
 }
 
-/// The Q4_K/Q5_K min term: `Σ_s mins[s] * (bsums[2s] + bsums[2s+1])`, the
-/// exact scalar i32 accumulation.
+/// Raw-layout Q4_K/Q5_K scale/min decode: one unaligned 16-byte load and twelve
+/// SSE ops per superblock, straight from the GGUF bytes as they sit in the row
+/// (no permuted copy, no decoded table). Same algebra as
+/// `block::unpack_q4k_scales`, vectorised:
+///
+/// * `scales[j]`   (j<4) = `blk[4+j] & 0x3F`
+/// * `scales[4+j]`       = (`blk[12+j] & 0x0F`) | ((`blk[4+j]` >> 6) << 4)
+/// * `mins[j]`     (j<4) = `blk[8+j] & 0x3F`
+/// * `mins[4+j]`         = (`blk[12+j]` >> 4)   | ((`blk[8+j]` >> 6) << 4)
+///
+/// Two `vpshufb`s pair, per 16-bit lane, the byte carrying the low six bits with
+/// the byte carrying the high two bits / the nibble, so one lane holds both
+/// halves of one field: `w & 0x3F` is the low six bits, `(w >> 8) & 0x0F` is the
+/// nibble (scale form) or `(w >> 12) & 0x0F` the high nibble (min form), and
+/// `(w >> 2) & 0x30` moves the top two bits into place for both.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) unsafe fn q4k_scales_raw(u: __m128i) -> (__m128i, __m128i) {
+    let m3f = _mm_set1_epi16(0x003F);
+    let m0f = _mm_set1_epi16(0x000F);
+    let m30 = _mm_set1_epi16(0x0030);
+    // scales[0..4] = blk[4+j] & 0x3F, scales[4..8] = the nibble of blk[12+j]
+    // plus the top two bits of blk[4+j] moved into place.
+    let sw = _mm_shuffle_epi8(
+        u,
+        _mm_setr_epi8(
+            4, 12, 5, 13, 6, 14, 7, 15, -128, -128, -128, -128, -128, -128, -128, -128,
+        ),
+    );
+    let s_lo = _mm_and_si128(sw, m3f);
+    let s_hi = _mm_or_si128(
+        _mm_and_si128(_mm_srli_epi16(sw, 8), m0f),
+        _mm_and_si128(_mm_srli_epi16(sw, 2), m30),
+    );
+    // mins: lane j pairs blk[8+j] (low six + top two) with blk[12+j] (high nibble)
+    let mw = _mm_shuffle_epi8(
+        u,
+        _mm_setr_epi8(
+            8, 12, 9, 13, 10, 14, 11, 15, -128, -128, -128, -128, -128, -128, -128, -128,
+        ),
+    );
+    let m_lo = _mm_and_si128(mw, m3f);
+    let m_hi = _mm_or_si128(
+        _mm_and_si128(_mm_srli_epi16(mw, 12), m0f),
+        _mm_and_si128(_mm_srli_epi16(mw, 2), m30),
+    );
+    (
+        _mm_unpacklo_epi64(s_lo, s_hi),
+        _mm_unpacklo_epi64(m_lo, m_hi),
+    )
+}
+
+/// The Q5_K min term: `Σ_s mins[s] * (bsums[2s] + bsums[2s+1])`, the exact
+/// scalar i32 accumulation. Q4_K does not use this eight-step serial chain any
+/// more — it vectorises the same sum over the q8_K `bsums` in i16 lanes.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(super) fn k_mterm(q8b: &[u8], mins: &[i32; 8]) -> i32 {
@@ -124,7 +178,7 @@ pub(super) fn k_mterm(q8b: &[u8], mins: &[i32; 8]) -> i32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn hsum_epi32_8(v: __m256i) -> i32 {
+pub(super) unsafe fn hsum_epi32_8(v: __m256i) -> i32 {
     let x = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
     let x = _mm_add_epi32(x, _mm_shuffle_epi32(x, 0x4E));
     let x = _mm_add_epi32(x, _mm_shuffle_epi32(x, 0xB1));
@@ -157,6 +211,22 @@ unsafe fn q6_group_sum(u: __m128i, y: *const i8) -> i32 {
 }
 
 /// Q4_K × Q8_K (AVX2/FMA) — see `kquant::dot_q4_k_q8_k_scalar`.
+///
+/// Two restructurings on the raw GGUF layout, both exact in i32, which is what
+/// keeps the result bitwise-identical to the scalar kernel rather than merely
+/// close:
+///
+/// * the min term is vectorised over the q8_K `bsums` with the mins in i16 lanes
+///   and one `vpmaddwd` for the `bsums[2s] + bsums[2s+1]` pairing, instead of the
+///   serial eight-step i32 chain in [`k_mterm`];
+/// * the per-subblock scale rides the `vpmaddwd` that folds the byte pairs, so
+///   the finished dot is never multiplied by a `vpmullo_epi32` per subblock.
+///   `(scale, pair sum)` cannot overflow either: a Q4_K nibble is ≤ 15, so the
+///   `vpmaddubsw` pair sum is at most 15·127·2 = 3810 (never saturating i16) and
+///   the `vpmaddwd` product is at most 3810·63·2 = 480 060 per i32 lane.
+///
+/// The per-superblock float fold keeps the scalar kernel's order
+/// (`sumf -= dmin * mterm; sumf += d * total`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub(super) unsafe fn dot_q4_k_q8_k(q4: &[u8], q8k: &[u8]) -> f32 {
@@ -169,8 +239,16 @@ pub(super) unsafe fn dot_q4_k_q8_k(q4: &[u8], q8k: &[u8]) -> f32 {
         let q8b = &q8k[i * crate::block::Q8KB..];
         let d = f16_at(q4b, 0) * f16_at(q8b, 0);
         let dmin = f16_at(q4b, 2) * f16_at(q8b, 0);
-        let (scales, mins) = block::unpack_q4k_scales(<&[u8; 12]>::try_from(&q4b[4..16]).unwrap());
-        sumf -= dmin * k_mterm(q8b, &mins) as f32;
+        let (s16, m16) = q4k_scales_raw(_mm_loadu_si128(q4b.as_ptr() as *const __m128i));
+        // Min term, vectorised: Σ_s mins[s] * (bsums[2s] + bsums[2s+1]). The
+        // eight decoded mins stay in i16 lanes; one `vpmaddwd` folds each bsum
+        // pair and the widening multiply lands in 32-bit lanes.
+        let bsums = _mm256_loadu_si256(q8b.as_ptr().add(274) as *const __m256i);
+        let pairs = _mm256_madd_epi16(bsums, ones);
+        let mterm = hsum_epi32_8(_mm256_mullo_epi32(_mm256_cvtepu16_epi32(m16), pairs));
+        sumf -= dmin * mterm as f32;
+        let mut sbuf = [0i16; 8];
+        _mm_storeu_si128(sbuf.as_mut_ptr() as *mut __m128i, s16);
         let mut acc1 = _mm256_setzero_si256();
         let mut acc2 = _mm256_setzero_si256();
         let p4 = q4b.as_ptr();
@@ -180,15 +258,14 @@ pub(super) unsafe fn dot_q4_k_q8_k(q4: &[u8], q8k: &[u8]) -> f32 {
             let hi = _mm256_and_si256(_mm256_srli_epi16(bits, 4), m4b);
             let ylo = _mm256_loadu_si256(q8b.as_ptr().add(2 + 64 * j) as *const __m256i);
             let yhi = _mm256_loadu_si256(q8b.as_ptr().add(2 + 64 * j + 32) as *const __m256i);
-            let dotlo = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, ylo), ones);
-            let dothi = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, yhi), ones);
-            acc1 = _mm256_add_epi32(
-                acc1,
-                _mm256_mullo_epi32(dotlo, _mm256_set1_epi32(scales[2 * j])),
-            );
+            let plo = _mm256_maddubs_epi16(lo, ylo);
+            let phi = _mm256_maddubs_epi16(hi, yhi);
+            // The subblock scale rides in the `vpmaddwd` instead of a
+            // `vpmullo_epi32` on the finished dot.
+            acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(plo, _mm256_set1_epi16(sbuf[2 * j])));
             acc2 = _mm256_add_epi32(
                 acc2,
-                _mm256_mullo_epi32(dothi, _mm256_set1_epi32(scales[2 * j + 1])),
+                _mm256_madd_epi16(phi, _mm256_set1_epi16(sbuf[2 * j + 1])),
             );
         }
         let total = hsum_epi32_8(acc1) + hsum_epi32_8(acc2);
