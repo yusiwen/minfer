@@ -42,8 +42,8 @@ refreshed_against = "53b3ace"
 # sequencing diagram and its §14 hardware row, where a reader of the plan sees
 # it. #56 landed F1's AVX2/AVX-512 K-quant dots on an x86 host (2026-10-08); the
 # weight-repacking increment that used to be named here was measured NULL on
-# 2026-10-29 ([#433]) and replaced by the Q4_K kernel fold ([#688]), so the
-# `next:` clause now names only the Q5_K/Q6_K folds. The
+# 2026-10-29 ([#433]) and replaced by the kernel folds ([#688], [#689]), so F1 is
+# closed and the `next:` clause names only the Linux-side tickets again. The
 # value is compared *literally* against the plan's `Next: ….**` sentence, so the
 # two must be edited together. The macOS round-2 plan ([#333]) closed 2026-10-09 —
 # every §A ticket landed and the §B debt was measured, decided or filed — so the
@@ -55,7 +55,8 @@ refreshed_against = "53b3ace"
 # [#428]: https://github.com/yusiwen/minfer/issues/428
 # [#433]: https://github.com/yusiwen/minfer/issues/433
 # [#688]: https://github.com/yusiwen/minfer/issues/688
-next = "the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121), and F1's last piece, the Q5_K/Q6_K kernel folds"
+# [#689]: https://github.com/yusiwen/minfer/issues/689
+next = "the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121)"
 
 # --- prose locations for the three scalars ----------------------------------
 
@@ -133,9 +134,9 @@ regex = 'Phase E\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]
 
 [[phase]]
 id = "F"
-done = 7
+done = 8
 total = 8
-state = "in progress"
+state = "complete"
 file = "docs/ARCHITECTURE-EXECUTION-PLAN.md"
 regex = 'Phase F\s+\*\*(?P<state>[a-z ]+)\*\* \((?P<done>[0-9]+)/(?P<total>[0-9]+)'
 
