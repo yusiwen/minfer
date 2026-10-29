@@ -91,9 +91,14 @@ pub fn dot_q6_k_q8_k(q6: &[u8], q8k: &[u8]) -> f32 {
     dot_q6_k_q8_k_scalar(q6, q8k)
 }
 
+/// Q6_K × Q8_K — the reference order of ADR-0061: eight i32 lanes per
+/// superblock (per-group scales in the lane sums, the -32 offset corrected from
+/// the q8_K bsums), one f32 accumulator per lane across the row, and a fixed
+/// reduction tree. The SIMD kernels reproduce this bitwise; the order *is* the
+/// contract, so do not "simplify" it back into a per-group fold.
 pub(super) fn dot_q6_k_q8_k_scalar(q6: &[u8], q8k: &[u8]) -> f32 {
     let n_super = q6.len() / Q6KB;
-    let mut sumf = 0.0f32;
+    let mut acc = [0.0f32; 8];
     for i in 0..n_super {
         let q6b = &q6[i * Q6KB..];
         let q8b = &q8k[i * crate::block::Q8KB..];
@@ -102,7 +107,8 @@ pub(super) fn dot_q6_k_q8_k_scalar(q6: &[u8], q8k: &[u8]) -> f32 {
         let ql = &q6b[0..128];
         let qh = &q6b[128..192];
         let sc = &q6b[192..208];
-        // Dequantize to a[256] i8 (interleaved, same layout as the q8_0 path)
+        // Decode to a[256] as the unsigned 0..63 code (interleaved, the same
+        // element order the SIMD kernels see).
         let mut a = [0i8; 256];
         {
             let mut a_off = 0usize;
@@ -113,27 +119,53 @@ pub(super) fn dot_q6_k_q8_k_scalar(q6: &[u8], q8k: &[u8]) -> f32 {
                     let ql0 = ql[ql_off + l] as i32;
                     let ql1 = ql[ql_off + l + 32] as i32;
                     let qh_b = qh[qh_off + l] as i32;
-                    a[a_off + l + 0] = (((ql0 & 0x0F) | ((qh_b & 3) << 4)) - 32) as i8;
-                    a[a_off + l + 32] = (((ql1 & 0x0F) | ((qh_b >> 2) & 3) << 4) - 32) as i8;
-                    a[a_off + l + 64] = (((ql0 >> 4) | ((qh_b >> 4) & 3) << 4) - 32) as i8;
-                    a[a_off + l + 96] = (((ql1 >> 4) | ((qh_b >> 6) & 3) << 4) - 32) as i8;
+                    a[a_off + l + 0] = ((ql0 & 0x0F) | ((qh_b & 3) << 4)) as i8;
+                    a[a_off + l + 32] = ((ql1 & 0x0F) | ((qh_b >> 2) & 3) << 4) as i8;
+                    a[a_off + l + 64] = ((ql0 >> 4) | ((qh_b >> 4) & 3) << 4) as i8;
+                    a[a_off + l + 96] = ((ql1 >> 4) | ((qh_b >> 6) & 3) << 4) as i8;
                 }
                 a_off += 128;
                 ql_off += 64;
                 qh_off += 32;
             }
         }
-        for g in 0..16 {
-            let scale = sc[g] as i8 as f32;
-            let mut sum_sub = 0i32;
-            for k in 0..16 {
-                let elem = g * 16 + k;
-                sum_sub += (a[elem] as i32) * (q8b[2 + g * 16 + k] as i8 as i32);
+        // Step 1: lane j takes the even-group contributions at sub-position j,
+        // lane 4+j the odd-group ones (32 consecutive elements per chunk).
+        let mut lane = [0i32; 8];
+        for c in 0..8 {
+            let s_even = sc[2 * c] as i8 as i32;
+            let s_odd = sc[2 * c + 1] as i8 as i32;
+            for j in 0..4 {
+                let mut p_even = 0i32;
+                let mut p_odd = 0i32;
+                for e in 0..4 {
+                    // a[] holds the unsigned code, exactly as the SIMD
+                    // kernels see it; the step-2 correction is not applied
+                    // twice.
+                    let i0 = 32 * c + 4 * j + e;
+                    let i1 = i0 + 16;
+                    p_even += (a[i0] as i32) * (q8b[2 + i0] as i8 as i32);
+                    p_odd += (a[i1] as i32) * (q8b[2 + i1] as i8 as i32);
+                }
+                lane[j] += s_even * p_even;
+                lane[4 + j] += s_odd * p_odd;
             }
-            sumf += d * scale * sum_sub as f32;
+        }
+        // Step 2: the -32 offset, once per lane.
+        for k in 0..8 {
+            let b0 = i16::from_le_bytes([q8b[274 + 4 * k], q8b[274 + 4 * k + 1]]) as i32;
+            let b1 = i16::from_le_bytes([q8b[274 + 4 * k + 2], q8b[274 + 4 * k + 3]]) as i32;
+            let s0 = sc[2 * k] as i8 as i32;
+            let s1 = sc[2 * k + 1] as i8 as i32;
+            lane[k] -= 32 * (s0 * b0 + s1 * b1);
+        }
+        // Step 3: one float fold per lane, held across the whole row.
+        for k in 0..8 {
+            acc[k] += d * (lane[k] as f32);
         }
     }
-    sumf
+    // Step 4: the fixed reduction tree.
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
 }
 
 /// Q5_K × Q8_K dot (like Q4_K with high bits).

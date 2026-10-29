@@ -316,3 +316,8 @@ path = "src/quantize/mix.rs"
 adr = "0060"
 what = "the `OUTPUT`/tied-embedding branch runs for every quantizing ftype and answers from the row length"
 symbol = "output_branch"
+
+[[governs]]
+adr = "0061"
+what = "the Q6_K dot's reference order is eight lanes accumulated across the row, not a per-group fold"
+symbol = "dot_q6_k_q8_k_scalar"

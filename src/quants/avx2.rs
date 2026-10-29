@@ -359,57 +359,56 @@ pub(super) unsafe fn dot_q5_k_q8_k(q5: &[u8], q8k: &[u8]) -> f32 {
     sumf
 }
 
-/// Q6_K × Q8_K (AVX2/FMA) — see `kquant::dot_q6_k_q8_k_scalar`.
+/// Q6_K × Q8_K (AVX2) — the reference order of ADR-0061.
 ///
-/// The raw kernel paid, per 16-element group, two 4-lane horizontal reductions
-/// and a scalar `d * scale * sum_sub`. This shape amortises all of it over a
-/// **pair** of groups:
-///
-/// * two groups' unsigned values and their two 16-byte q8 slices are contiguous
-///   ([`q6k_unsigned_groups`] returns them that way), so one 32-byte load covers
-///   both groups and one `vpmaddubsw` yields 16 pair sums (8 per group, no
-///   saturation: 63·127·2 = 16002);
-/// * `vpmaddwd` against a vector of ones turns them into 8 i32 lanes (4 per
-///   group); the `-32` offset is carried in-vector by the same treatment of
-///   `Σ y` (`32·Σy` after a 5-bit shift, ≤ 8128, still exact);
-/// * one two-step 4-lane reduce per 128-bit lane leaves the two group sums in
-///   lanes 0 and 4 — one reduction per *pair*, not two per group;
-/// * the float fold is unchanged and in the scalar order: the group sums are
-///   extracted two at a time and fed to the same `sumf += d * scale * sum_sub`
-///   in increasing group order, so the result is bitwise-identical, not merely
-///   close.
+/// One `i32` accumulator of eight lanes per superblock: `vpmaddubsw` gives the
+/// byte-pair sums of two groups, the per-group scale rides the following
+/// `vpmaddwd`, the `-32` offset is subtracted once per superblock from the q8_K
+/// bsums, and the f32 accumulator is one lane per sub-position across the row.
+/// There is no per-group extraction and no serial fold — that chain is exactly
+/// what ADR-0061 removed. The final reduction tree is the reference's.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2")]
 pub(super) unsafe fn dot_q6_k_q8_k(q6: &[u8], q8k: &[u8]) -> f32 {
     let n_super = q6.len() / Q6KB;
-    let ones8 = _mm256_set1_epi8(1);
-    let ones16 = _mm256_set1_epi16(1);
-    let mut sumf = 0.0f32;
+    let mut acc = _mm256_setzero_ps();
     for i in 0..n_super {
         let q6b = &q6[i * Q6KB..];
         let q8b = &q8k[i * crate::block::Q8KB..];
         let d = f16_at(q6b, 208) * f16_at(q8b, 0);
+        // -32 offset: 32 * sum_k (s[2k]*b[2k] + s[2k+1]*b[2k+1]), eight lanes.
+        let bsums = _mm256_loadu_si256(q8b.as_ptr().add(274) as *const __m256i);
+        let scales = _mm256_cvtepi8_epi16(_mm_loadu_si128(q6b.as_ptr().add(192) as *const __m128i));
+        let corr = _mm256_slli_epi32(_mm256_madd_epi16(bsums, scales), 5);
+        let mut sumi = _mm256_setzero_si256();
         for n in 0..2 {
             let qv = q6k_unsigned_groups(q6b, n);
             for t in 0..4 {
+                let g = n * 8 + 2 * t;
                 let u =
                     _mm256_inserti128_si256(_mm256_castsi128_si256(qv[2 * t]), qv[2 * t + 1], 1);
                 let y = _mm256_loadu_si256(
                     q8b.as_ptr().add(2 + (n * 8 + 2 * t) * 16) as *const __m256i
                 );
-                let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(u, y), ones16);
-                let ys = _mm256_slli_epi16(_mm256_maddubs_epi16(ones8, y), 5);
-                let sub = _mm256_sub_epi32(p32, _mm256_madd_epi16(ys, ones16));
-                let x = _mm256_add_epi32(sub, _mm256_shuffle_epi32(sub, 0xB1));
-                let x = _mm256_add_epi32(x, _mm256_shuffle_epi32(x, 0x4E));
-                let g = n * 8 + 2 * t;
-                let s0 = _mm_cvtsi128_si32(_mm256_castsi256_si128(x));
-                let s1 = _mm_cvtsi128_si32(_mm256_extracti128_si256(x, 1));
-                let k0 = q6b[192 + g] as i8 as f32;
-                sumf += d * k0 * (s0 as f32);
-                sumf += d * (q6b[192 + g + 1] as i8 as f32) * (s1 as f32);
+                let p16 = _mm256_maddubs_epi16(u, y);
+                // Each group's scale is repeated over its four i32 lanes, so the
+                // lane sums carry the scale and nothing needs extracting.
+                let sv = _mm256_inserti128_si256(
+                    _mm256_castsi128_si256(_mm_set1_epi16(q6b[192 + g] as i8 as i16)),
+                    _mm_set1_epi16(q6b[192 + g + 1] as i8 as i16),
+                    1,
+                );
+                sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(sv, p16));
             }
         }
+        let sub = _mm256_sub_epi32(sumi, corr);
+        acc = _mm256_add_ps(
+            acc,
+            _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sub)),
+        );
     }
-    sumf
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
+        + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]))
 }
