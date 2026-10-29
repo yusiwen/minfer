@@ -9,7 +9,7 @@
 //! back to AVX2 and then scalar. `MINFER_NO_AVX512=1` forces the AVX2 kernel
 //! and `MINFER_NO_AVX2=1` forces scalar (both are read once, like
 //! `MINFER_NO_NEON`).
-use super::avx2::{f16_at, k_mterm};
+use super::avx2::{f16_at, hsum_epi32_8, k_mterm, q4k_scales_raw};
 use super::*;
 
 /// True when the whole AVX-512/VNNI layer may be used. `MINFER_NO_AVX2=1`
@@ -61,28 +61,53 @@ unsafe fn reduce4(v: __m512i) -> __m512i {
 }
 
 /// Q4_K × Q8_K (AVX-512/VNNI) — see `kquant::dot_q4_k_q8_k_scalar`.
+///
+/// The AVX2 arm's two restructurings in their 512-bit form, on the raw GGUF
+/// layout and both exact in i32: the min term is vectorised over the q8_K
+/// `bsums` with the mins in i16 lanes, and the per-subblock scale is folded into
+/// the `vpmaddwd` that folds the `vpmaddubsw` byte-pair sums — one `vpermw` per
+/// group spreads the decoded i16 scale pair over its two subblocks — so the
+/// finished dot is never multiplied. The per-superblock float fold keeps the
+/// scalar kernel's order (`sumf -= dmin * mterm; sumf += d * total`); the
+/// `vpmaddubsw` pair sums cannot saturate (a Q4_K nibble is ≤ 15, so ≤ 15·127·2)
+/// and the `vpmaddwd` product stays far inside i32, as on the AVX2 arm.
 #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512vnni,avx2,fma")]
 pub(super) unsafe fn dot_q4_k_q8_k(q4: &[u8], q8k: &[u8]) -> f32 {
     let n_super = q4.len() / Q4KB;
     let m4b = _mm256_set1_epi8(0x0F);
+    let ones = _mm256_set1_epi16(1);
+    // hoisted: i16 lanes 0-15 select scale[2j], lanes 16-31 select scale[2j+1]
+    let base = combine_256(_mm256_setzero_si256(), _mm256_set1_epi16(1));
+    let mut idx = [_mm512_setzero_si512(); 4];
+    for (j, slot) in idx.iter_mut().enumerate() {
+        *slot = _mm512_add_epi16(base, _mm512_set1_epi16(2 * j as i16));
+    }
     let mut sumf = 0.0f32;
     for i in 0..n_super {
         let q4b = &q4[i * Q4KB..];
         let q8b = &q8k[i * crate::block::Q8KB..];
         let d = f16_at(q4b, 0) * f16_at(q8b, 0);
         let dmin = f16_at(q4b, 2) * f16_at(q8b, 0);
-        let (scales, mins) = block::unpack_q4k_scales(<&[u8; 12]>::try_from(&q4b[4..16]).unwrap());
-        sumf -= dmin * k_mterm(q8b, &mins) as f32;
+        let (s16, m16) = q4k_scales_raw(_mm_loadu_si128(q4b.as_ptr() as *const __m128i));
+        // Min term, vectorised as in the AVX2 arm.
+        let bsums = _mm256_loadu_si256(q8b.as_ptr().add(274) as *const __m256i);
+        let pairs = _mm256_madd_epi16(bsums, ones);
+        let mterm = hsum_epi32_8(_mm256_mullo_epi32(_mm256_cvtepu16_epi32(m16), pairs));
+        sumf -= dmin * mterm as f32;
+        let sv16 = _mm512_zextsi128_si512(s16);
         let mut acc = _mm512_setzero_si512();
-        for j in 0..4 {
+        for (j, id) in idx.iter().enumerate() {
             let bits = _mm256_loadu_si256(q4b.as_ptr().add(16 + 32 * j) as *const __m256i);
             let lo = _mm256_and_si256(bits, m4b);
             let hi = _mm256_and_si256(_mm256_srli_epi16(bits, 4), m4b);
             let u = combine_256(lo, hi);
             let y = _mm512_loadu_si512(q8b.as_ptr().add(2 + 64 * j) as *const __m512i);
-            let dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u, y);
-            let sv = scale_vec(scales[2 * j], scales[2 * j + 1]);
-            acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(dot, sv));
+            // Pair sums, then the scale folded in by the same `vpmaddwd`.
+            let ps = _mm512_maddubs_epi16(u, y);
+            acc = _mm512_add_epi32(
+                acc,
+                _mm512_madd_epi16(ps, _mm512_permutexvar_epi16(*id, sv16)),
+            );
         }
         let total = _mm512_reduce_add_epi32(acc);
         sumf += d * total as f32;
