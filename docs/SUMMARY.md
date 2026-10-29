@@ -79,6 +79,7 @@
     - [0058. A request's tools reach the prompt as the client wrote them, and a template that drops them refuses by name](./adr/0058-tools-reach-the-prompt-as-the-client-wrote-them.md)
     - [0059. The batched worker queues against a bounded depth, and a run that makes no progress is failed rather than waited on](./adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md)
     - [0060. A mixture is a per-tensor policy over the same encoders, and the OUTPUT/tied branch runs for every quantizing ftype](./adr/0060-a-mixture-is-a-per-tensor-policy-and-the-output-branch-runs-for-every-ftype.md)
+    - [0061. The Q6_K dot accumulates in eight lanes, and the scalar kernel implements that order](./adr/0061-the-q6-k-dot-accumulates-in-eight-lanes-and-the-scalar-kernel-implements-that-order.md)
 
 # Model Support
 

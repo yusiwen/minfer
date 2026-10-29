@@ -44,14 +44,6 @@ unsafe fn combine_128(a: __m128i, b: __m128i, c: __m128i, d: __m128i) -> __m512i
     _mm512_inserti32x4(v, d, 3)
 }
 
-/// Sum the four i32 lanes inside each 128-bit lane (the Q6_K grouping): after
-/// this, lanes 0/4/8/12 hold the four group sums.
-#[inline]
-unsafe fn reduce4(v: __m512i) -> __m512i {
-    let x = _mm512_add_epi32(v, _mm512_shuffle_epi32(v, 0xB1));
-    _mm512_add_epi32(x, _mm512_shuffle_epi32(x, 0x4E))
-}
-
 /// Q4_K × Q8_K (AVX-512/VNNI) — see `kquant::dot_q4_k_q8_k_scalar`.
 ///
 /// The AVX2 arm's two restructurings in their 512-bit form, on the raw GGUF
@@ -171,29 +163,27 @@ pub(super) unsafe fn dot_q5_k_q8_k(q5: &[u8], q8k: &[u8]) -> f32 {
     sumf
 }
 
-/// Q6_K × Q8_K (AVX-512/VNNI) — see `kquant::dot_q6_k_q8_k_scalar`.
-///
-/// **Deliberately left in its raw shape.** The restructured four-groups-per-
-/// register arm (one `vpdpbusd` pair, one 4-lane reduce, then `vpcompressd`
-/// 0x1111) was measured at only **-9.2 %** on nuc11 (i7-11700B, 2026-10-29):
-/// below the 15 % bar, and the reason is structural — the serial f32 fold
-/// (`sumf += d * scale * sum`, sixteen times per superblock, each an
-/// extract-then-multiply dependency chain) is the floor at ~20 ns/superblock,
-/// and no amount of vectorising the i32 side removes it. On that same box the
-/// restructured **AVX2** arm measured *faster* than this kernel (315.6 ns vs
-/// 328.3 ns for a 4096-element row), so which kernel an AVX-512 machine should
-/// run is an open question; the dispatch is unchanged pending an answer.
+/// Q6_K × Q8_K (AVX-512/VNNI) — the reference order of ADR-0061 in 512-bit
+/// form: `vpmaddubsw`-free VNNI on four groups at a time, each group's scale
+/// applied with one `vpmulld`, the four i32 lanes per group folded pairwise so
+/// the result has the same eight lanes as the AVX2 arm, the `-32` offset
+/// subtracted once per superblock from the q8_K bsums, and one f32 accumulator
+/// per lane across the row.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512vnni,avx2,fma")]
 pub(super) unsafe fn dot_q6_k_q8_k(q6: &[u8], q8k: &[u8]) -> f32 {
     let n_super = q6.len() / Q6KB;
     let m4 = _mm_set1_epi8(0x0F);
     let m3 = _mm_set1_epi8(3);
-    let ones8 = _mm512_set1_epi8(1);
-    let mut sumf = 0.0f32;
+    let mut acc = _mm256_setzero_ps();
     for i in 0..n_super {
         let q6b = &q6[i * Q6KB..];
         let q8b = &q8k[i * crate::block::Q8KB..];
         let d = f16_at(q6b, 208) * f16_at(q8b, 0);
+        let bsums = _mm256_loadu_si256(q8b.as_ptr().add(274) as *const __m256i);
+        let scales = _mm256_cvtepi8_epi16(_mm_loadu_si128(q6b.as_ptr().add(192) as *const __m128i));
+        let corr = _mm256_slli_epi32(_mm256_madd_epi16(bsums, scales), 5);
+        let mut sumi = _mm256_setzero_si256();
         for n in 0..2 {
             let qlp = q6b.as_ptr().add(n * 64);
             let qhp = q6b.as_ptr().add(128 + n * 32);
@@ -237,28 +227,39 @@ pub(super) unsafe fn dot_q6_k_q8_k(q6: &[u8], q8k: &[u8]) -> f32 {
                     _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 6), m3), 4),
                 ),
             ];
-            for c in 0..2 {
-                let u = combine_128(qv[c * 4], qv[c * 4 + 1], qv[c * 4 + 2], qv[c * 4 + 3]);
-                let y = _mm512_loadu_si512(
-                    q8b.as_ptr().add(2 + (n * 8 + c * 4) * 16) as *const __m512i
+            for pair in 0..2 {
+                let g = n * 8 + pair * 4;
+                let u = combine_128(
+                    qv[pair * 4],
+                    qv[pair * 4 + 1],
+                    qv[pair * 4 + 2],
+                    qv[pair * 4 + 3],
                 );
+                let y = _mm512_loadu_si512(q8b.as_ptr().add(2 + g * 16) as *const __m512i);
                 let dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u, y);
-                let sy = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones8, y);
-                // One i32 per group: reduce each 4-lane group, then fold the
-                // Σy correction (×32) in-vector before extracting.
-                let sub = _mm512_sub_epi32(reduce4(dot), _mm512_slli_epi32(reduce4(sy), 5));
-                let g0 = _mm_cvtsi128_si32(_mm512_extracti32x4_epi32(sub, 0));
-                let g1 = _mm_cvtsi128_si32(_mm512_extracti32x4_epi32(sub, 1));
-                let g2 = _mm_cvtsi128_si32(_mm512_extracti32x4_epi32(sub, 2));
-                let g3 = _mm_cvtsi128_si32(_mm512_extracti32x4_epi32(sub, 3));
-                let sums = [g0, g1, g2, g3];
-                for (k, &sum_sub) in sums.iter().enumerate() {
-                    let gg = n * 8 + c * 4 + k;
-                    let scale = q6b[192 + gg] as i8 as f32;
-                    sumf += d * scale * (sum_sub as f32);
-                }
+                let s0 = q6b[192 + g] as i8 as i32;
+                let s1 = q6b[192 + g + 1] as i8 as i32;
+                let s2 = q6b[192 + g + 2] as i8 as i32;
+                let s3 = q6b[192 + g + 3] as i8 as i32;
+                let sv = _mm512_set_epi32(
+                    s3, s3, s3, s3, s2, s2, s2, s2, s1, s1, s1, s1, s0, s0, s0, s0,
+                );
+                let scaled = _mm512_mullo_epi32(dot, sv);
+                // Groups 0/2 (even) fold into lanes 0-3, groups 1/3 (odd) into
+                // lanes 4-7 - the same eight lanes the AVX2 arm accumulates.
+                let lo = _mm512_castsi512_si256(scaled);
+                let hi = _mm512_extracti64x4_epi64(scaled, 1);
+                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(lo, hi));
             }
         }
+        let sub = _mm256_sub_epi32(sumi, corr);
+        acc = _mm256_add_ps(
+            acc,
+            _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sub)),
+        );
     }
-    sumf
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3]))
+        + ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]))
 }

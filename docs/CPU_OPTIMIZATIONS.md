@@ -399,24 +399,38 @@ harness now records, vs scalar (2026-10-29, nuc11):
 
 | path | Q4_K | Q5_K | Q6_K |
 |---|---|---|---|
-| AVX2 | 6.05× | 4.90× | 2.84× |
-| AVX-512 | 7.26× | 5.19× | 2.54× |
+| AVX2 | 6.11× | 4.99× | 8.25× |
+| AVX-512 | 7.11× | 5.20× | 8.23× |
 
-Q4_K and Q5_K take the fold on both ISAs; Q6_K takes it on AVX2 only
-([#689](https://github.com/yusiwen/minfer/issues/689)). The AVX-512 Q6_K kernel
-was left raw on purpose: its restructured form measured only **−9.2%**, below the
-15% bar, because the serial f32 fold (`(d*scale)*sum`, sixteen times per
-superblock) is the floor — and the restructured AVX2 kernel measured *faster*
-than it on this box (315.6 vs 328.3 ns), so which kernel an AVX-512 machine
-should run is open.
+Q4_K and Q5_K take the fold on both ISAs
+([#689](https://github.com/yusiwen/minfer/issues/689)). Q6_K was a different
+problem: its scale is per group, so the scalar reference folded `d*scale*sum`
+sixteen times per superblock and every kernel had to reproduce that chain — the
+measured floor was 19.7 ns/superblock, and restructuring the AVX-512 kernel
+could not beat it ([#689](https://github.com/yusiwen/minfer/issues/689) left it
+raw for that reason). [#693](https://github.com/yusiwen/minfer/issues/693)
+measured what the chain costs: 312.8 ns for the landed AVX2 kernel against
+167.9 ns for the same integer work accumulated in eight lanes.
+[ADR-0061](./adr/0061-the-q6-k-dot-accumulates-in-eight-lanes-and-the-scalar-kernel-implements-that-order.md)
+therefore moved the reference order itself: `dot_q6_k_q8_k_scalar` now defines
+eight `i32` lanes per superblock (per-group scales in the lane, the −32 offset
+from the q8_K bsums once), one f32 accumulator per lane held across the row, and
+a fixed reduction tree; the AVX2 and AVX-512 kernels reproduce it bitwise. Landed
+2026-10-29: AVX2 **312.8 → 180.4 ns (1.73×)**, AVX-512 **363.6 → 180.9 ns
+(2.02×)**. End to end on the cached 0.5B (nuc11, three alternating rounds,
+medians): pp128 33.15 → **33.39 tok/s (+0.7%)**, tg64 12.54 → **12.81 tok/s
+(+2.1%)**. The dispatch question of
+[#691](https://github.com/yusiwen/minfer/issues/691) disappears with it: the two
+engines now tie, so the 13% it measured was the fold, not the width.
 
-**llama.cpp approach:** `ggml/src/ggml-cpu/arch/x86/quants.c` uses the
-`denibble()`/`maddubs` AVX2 shape and the VNNI `dpbusd` AVX-512 shape; minfer's
-kernels keep the scalar float order so the result is bitwise, not merely close.
-Since [#688](https://github.com/yusiwen/minfer/issues/688) the Q4_K path departs
-from that instruction mix by folding the scale into the `vpmaddwd` — measured
-faster than `dpbusd` + `vpmulld` on i7-11700B, unverified on other
-microarchitectures.
+**llama.cpp approach:** `ggml/src/ggml-cpu/arch/x86/quants.c` keeps every K-quant
+dot at 256-bit — the file contains no `_mm512` intrinsic, and `__AVX512F__` only
+selects 256-bit instructions (`vpmovwb`) — and its Q6_K accumulates across the
+row in a `__m256`: the per-group scale rides `madd_epi16` and the −32 offset
+comes from the bsums. That is the shape ADR-0061 adopted. minfer's Q4_K path
+departs from llama.cpp's instruction mix by folding the scale into the
+`vpmaddwd` — measured faster than `dpbusd` + `vpmulld` on i7-11700B, unverified
+on other microarchitectures.
 
 ### P2: f16 KV Cache
 
@@ -796,5 +810,6 @@ The CPU path went from **1.1 tok/s decode (single-threaded scalar) to
 ## Decisions governing this document
 
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
+- [ADR-0061](adr/0061-the-q6-k-dot-accumulates-in-eight-lanes-and-the-scalar-kernel-implements-that-order.md) — The Q6_K dot's reference order is a per-superblock lane accumulation, and the scalar kernel implements it
 - [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32
 - [ADR-0007](adr/0007-no-ml-frameworks-every-operator-is-hand-written.md) — No ML frameworks: every operator is hand-written
