@@ -160,21 +160,6 @@ pub(super) unsafe fn q4k_scales_raw(u: __m128i) -> (__m128i, __m128i) {
     )
 }
 
-/// The Q5_K min term: `Σ_s mins[s] * (bsums[2s] + bsums[2s+1])`, the exact
-/// scalar i32 accumulation. Q4_K does not use this eight-step serial chain any
-/// more — it vectorises the same sum over the q8_K `bsums` in i16 lanes.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-pub(super) fn k_mterm(q8b: &[u8], mins: &[i32; 8]) -> i32 {
-    let mut m = 0i32;
-    for s in 0..8 {
-        let b0 = i16::from_le_bytes([q8b[274 + 4 * s], q8b[274 + 4 * s + 1]]) as i32;
-        let b1 = i16::from_le_bytes([q8b[274 + 4 * s + 2], q8b[274 + 4 * s + 3]]) as i32;
-        m += mins[s] * (b0 + b1);
-    }
-    m
-}
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -185,29 +170,59 @@ pub(super) unsafe fn hsum_epi32_8(v: __m256i) -> i32 {
     _mm_cvtsi128_si32(x)
 }
 
+/// One Q6_K half's eight 16-element groups as **unsigned** 6-bit values (`0..63`,
+/// the raw encoding, not `u - 32`), laid out exactly as the scalar reference's
+/// `a[...]` dequantizes them: `qv[g]` is group `g` of half `n`. Keeping the
+/// unsigned form is what lets a byte-pair sum ride `vpmaddubsw`; the `-32`
+/// offset is carried as a per-group `32 * Σy` correction, which is exact in i32.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
-unsafe fn hsum_epi32_4(v: __m128i) -> i32 {
-    let x = _mm_add_epi32(v, _mm_shuffle_epi32(v, 0x4E));
-    let x = _mm_add_epi32(x, _mm_shuffle_epi32(x, 0xB1));
-    _mm_cvtsi128_si32(x)
-}
-
-/// One Q6_K 16-element group: `Σ (u - 32) * y` with `u` the unsigned 6-bit
-/// values and `y` the Q8_K bytes. `Σ u*y - 32*Σ y` is exact in i32.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn q6_group_sum(u: __m128i, y: *const i8) -> i32 {
-    let yv = _mm_loadu_si128(y as *const __m128i);
-    let ones16 = _mm_set1_epi16(1);
-    let dot_u = hsum_epi32_4(_mm_madd_epi16(_mm_maddubs_epi16(u, yv), ones16));
-    let sum_y = hsum_epi32_4(_mm_madd_epi16(
-        _mm_maddubs_epi16(_mm_set1_epi8(1), yv),
-        ones16,
-    ));
-    dot_u - 32 * sum_y
+unsafe fn q6k_unsigned_groups(q6b: &[u8], n: usize) -> [__m128i; 8] {
+    let m4 = _mm_set1_epi8(0x0F);
+    let m3 = _mm_set1_epi8(3);
+    let qlp = q6b.as_ptr().add(n * 64);
+    let qhp = q6b.as_ptr().add(128 + n * 32);
+    let ql0 = _mm_loadu_si128(qlp as *const __m128i);
+    let ql1 = _mm_loadu_si128(qlp.add(16) as *const __m128i);
+    let ql2 = _mm_loadu_si128(qlp.add(32) as *const __m128i);
+    let ql3 = _mm_loadu_si128(qlp.add(48) as *const __m128i);
+    let qh0 = _mm_loadu_si128(qhp as *const __m128i);
+    let qh1 = _mm_loadu_si128(qhp.add(16) as *const __m128i);
+    [
+        _mm_or_si128(
+            _mm_and_si128(ql0, m4),
+            _mm_slli_epi16(_mm_and_si128(qh0, m3), 4),
+        ),
+        _mm_or_si128(
+            _mm_and_si128(ql1, m4),
+            _mm_slli_epi16(_mm_and_si128(qh1, m3), 4),
+        ),
+        _mm_or_si128(
+            _mm_and_si128(ql2, m4),
+            _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 2), m3), 4),
+        ),
+        _mm_or_si128(
+            _mm_and_si128(ql3, m4),
+            _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 2), m3), 4),
+        ),
+        _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16(ql0, 4), m4),
+            _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 4), m3), 4),
+        ),
+        _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16(ql1, 4), m4),
+            _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 4), m3), 4),
+        ),
+        _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16(ql2, 4), m4),
+            _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 6), m3), 4),
+        ),
+        _mm_or_si128(
+            _mm_and_si128(_mm_srli_epi16(ql3, 4), m4),
+            _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 6), m3), 4),
+        ),
+    ]
 }
 
 /// Q4_K × Q8_K (AVX2/FMA) — see `kquant::dot_q4_k_q8_k_scalar`.
@@ -217,8 +232,8 @@ unsafe fn q6_group_sum(u: __m128i, y: *const i8) -> i32 {
 /// close:
 ///
 /// * the min term is vectorised over the q8_K `bsums` with the mins in i16 lanes
-///   and one `vpmaddwd` for the `bsums[2s] + bsums[2s+1]` pairing, instead of the
-///   serial eight-step i32 chain in [`k_mterm`];
+///   and one `vpmaddwd` for the `bsums[2s] + bsums[2s+1]` pairing, instead of a
+///   serial eight-step i32 chain;
 /// * the per-subblock scale rides the `vpmaddwd` that folds the byte pairs, so
 ///   the finished dot is never multiplied by a `vpmullo_epi32` per subblock.
 ///   `(scale, pair sum)` cannot overflow either: a Q4_K nibble is ≤ 15, so the
@@ -275,6 +290,21 @@ pub(super) unsafe fn dot_q4_k_q8_k(q4: &[u8], q8k: &[u8]) -> f32 {
 }
 
 /// Q5_K × Q8_K (AVX2/FMA) — see `kquant::dot_q5_k_q8_k_scalar`.
+///
+/// The Q4_K shape applied to Q5_K on the raw GGUF layout, both restructurings
+/// exact in i32, which is what keeps the result bitwise-identical to the scalar
+/// kernel rather than merely close:
+///
+/// * the min term is vectorised over the q8_K `bsums` with the decoded mins in
+///   i16 lanes and one `vpmaddwd` for the `bsums[2s] + bsums[2s+1]` pairing,
+///   replacing the serial eight-step i32 chain;
+/// * each subblock's scale rides the `vpmaddwd` that folds the `vpmaddubsw`
+///   byte-pair sums, so the finished dot is never `vpmullo_epi32`-ed.
+///
+/// Neither new product can saturate: a Q5_K value is ≤ 31, so a pair sum is at
+/// most 31·127·2 = 7874 and the `vpmaddwd` product at most 7874·63·2 = 992 124.
+/// The per-superblock float fold keeps the scalar kernel's order
+/// (`sumf -= dmin * mterm; sumf += d * total`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub(super) unsafe fn dot_q5_k_q8_k(q5: &[u8], q8k: &[u8]) -> f32 {
@@ -289,34 +319,38 @@ pub(super) unsafe fn dot_q5_k_q8_k(q5: &[u8], q8k: &[u8]) -> f32 {
         let q8b = &q8k[i * crate::block::Q8KB..];
         let d = f16_at(q5b, 0) * f16_at(q8b, 0);
         let dmin = f16_at(q5b, 2) * f16_at(q8b, 0);
-        let (scales, mins) = block::unpack_q4k_scales(<&[u8; 12]>::try_from(&q5b[4..16]).unwrap());
-        sumf -= dmin * k_mterm(q8b, &mins) as f32;
-        let qh = q5b.as_ptr().add(16);
+        let (s16, m16) = q4k_scales_raw(_mm_loadu_si128(q5b.as_ptr() as *const __m128i));
+        // Min term, vectorised as in the Q4_K arm: Σ_s mins[s] * (bsums[2s] +
+        // bsums[2s+1]), the eight decoded mins staying in i16 lanes.
+        let bsums = _mm256_loadu_si256(q8b.as_ptr().add(274) as *const __m256i);
+        let pairs = _mm256_madd_epi16(bsums, ones);
+        let mterm = hsum_epi32_8(_mm256_mullo_epi32(_mm256_cvtepu16_epi32(m16), pairs));
+        sumf -= dmin * mterm as f32;
+        let mut sbuf = [0i16; 8];
+        _mm_storeu_si128(sbuf.as_mut_ptr() as *mut __m128i, s16);
+        let qhv = _mm256_loadu_si256(q5b.as_ptr().add(16) as *const __m256i);
         let qs = q5b.as_ptr().add(48);
-        let qhv = _mm256_loadu_si256(qh as *const __m256i);
         let mut acc1 = _mm256_setzero_si256();
         let mut acc2 = _mm256_setzero_si256();
         for j in 0..4 {
             let chunk = _mm256_loadu_si256(qs.add(32 * j) as *const __m256i);
             let lo = _mm256_and_si256(chunk, m4b);
             let hi = _mm256_and_si256(_mm256_srli_epi16(chunk, 4), m4b);
-            let sh_lo = _mm256_set1_epi32((2 * j) as i32);
-            let sh_hi = _mm256_set1_epi32((2 * j + 1) as i32);
-            let hlo = _mm256_and_si256(_mm256_srlv_epi32(qhv, sh_lo), one);
-            let hhi = _mm256_and_si256(_mm256_srlv_epi32(qhv, sh_hi), one);
+            let sh = 2 * j as i32;
+            let hlo = _mm256_and_si256(_mm256_srlv_epi32(qhv, _mm256_set1_epi32(sh)), one);
+            let hhi = _mm256_and_si256(_mm256_srlv_epi32(qhv, _mm256_set1_epi32(sh + 1)), one);
             let ulo = _mm256_or_si256(lo, _mm256_slli_epi16(hlo, 4));
             let uhi = _mm256_or_si256(hi, _mm256_slli_epi16(hhi, 4));
             let ylo = _mm256_loadu_si256(q8b.as_ptr().add(2 + (2 * j) * 32) as *const __m256i);
             let yhi = _mm256_loadu_si256(q8b.as_ptr().add(2 + (2 * j + 1) * 32) as *const __m256i);
-            let dotlo = _mm256_madd_epi16(_mm256_maddubs_epi16(ulo, ylo), ones);
-            let dothi = _mm256_madd_epi16(_mm256_maddubs_epi16(uhi, yhi), ones);
-            acc1 = _mm256_add_epi32(
-                acc1,
-                _mm256_mullo_epi32(dotlo, _mm256_set1_epi32(scales[2 * j])),
-            );
+            let plo = _mm256_maddubs_epi16(ulo, ylo);
+            let phi = _mm256_maddubs_epi16(uhi, yhi);
+            // The subblock scale rides the widening multiply instead of a
+            // `vpmullo_epi32` on the finished 32-element dot.
+            acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(plo, _mm256_set1_epi16(sbuf[2 * j])));
             acc2 = _mm256_add_epi32(
                 acc2,
-                _mm256_mullo_epi32(dothi, _mm256_set1_epi32(scales[2 * j + 1])),
+                _mm256_madd_epi16(phi, _mm256_set1_epi16(sbuf[2 * j + 1])),
             );
         }
         let total = hsum_epi32_8(acc1) + hsum_epi32_8(acc2);
@@ -326,65 +360,54 @@ pub(super) unsafe fn dot_q5_k_q8_k(q5: &[u8], q8k: &[u8]) -> f32 {
 }
 
 /// Q6_K × Q8_K (AVX2/FMA) — see `kquant::dot_q6_k_q8_k_scalar`.
+///
+/// The raw kernel paid, per 16-element group, two 4-lane horizontal reductions
+/// and a scalar `d * scale * sum_sub`. This shape amortises all of it over a
+/// **pair** of groups:
+///
+/// * two groups' unsigned values and their two 16-byte q8 slices are contiguous
+///   ([`q6k_unsigned_groups`] returns them that way), so one 32-byte load covers
+///   both groups and one `vpmaddubsw` yields 16 pair sums (8 per group, no
+///   saturation: 63·127·2 = 16002);
+/// * `vpmaddwd` against a vector of ones turns them into 8 i32 lanes (4 per
+///   group); the `-32` offset is carried in-vector by the same treatment of
+///   `Σ y` (`32·Σy` after a 5-bit shift, ≤ 8128, still exact);
+/// * one two-step 4-lane reduce per 128-bit lane leaves the two group sums in
+///   lanes 0 and 4 — one reduction per *pair*, not two per group;
+/// * the float fold is unchanged and in the scalar order: the group sums are
+///   extracted two at a time and fed to the same `sumf += d * scale * sum_sub`
+///   in increasing group order, so the result is bitwise-identical, not merely
+///   close.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 pub(super) unsafe fn dot_q6_k_q8_k(q6: &[u8], q8k: &[u8]) -> f32 {
     let n_super = q6.len() / Q6KB;
-    let m4 = _mm_set1_epi8(0x0F);
-    let m3 = _mm_set1_epi8(3);
+    let ones8 = _mm256_set1_epi8(1);
+    let ones16 = _mm256_set1_epi16(1);
     let mut sumf = 0.0f32;
     for i in 0..n_super {
         let q6b = &q6[i * Q6KB..];
         let q8b = &q8k[i * crate::block::Q8KB..];
         let d = f16_at(q6b, 208) * f16_at(q8b, 0);
         for n in 0..2 {
-            let qlp = q6b.as_ptr().add(n * 64);
-            let qhp = q6b.as_ptr().add(128 + n * 32);
-            let ql0 = _mm_loadu_si128(qlp as *const __m128i);
-            let ql1 = _mm_loadu_si128(qlp.add(16) as *const __m128i);
-            let ql2 = _mm_loadu_si128(qlp.add(32) as *const __m128i);
-            let ql3 = _mm_loadu_si128(qlp.add(48) as *const __m128i);
-            let qh0 = _mm_loadu_si128(qhp as *const __m128i);
-            let qh1 = _mm_loadu_si128(qhp.add(16) as *const __m128i);
-            let qv = [
-                _mm_or_si128(
-                    _mm_and_si128(ql0, m4),
-                    _mm_slli_epi16(_mm_and_si128(qh0, m3), 4),
-                ),
-                _mm_or_si128(
-                    _mm_and_si128(ql1, m4),
-                    _mm_slli_epi16(_mm_and_si128(qh1, m3), 4),
-                ),
-                _mm_or_si128(
-                    _mm_and_si128(ql2, m4),
-                    _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 2), m3), 4),
-                ),
-                _mm_or_si128(
-                    _mm_and_si128(ql3, m4),
-                    _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 2), m3), 4),
-                ),
-                _mm_or_si128(
-                    _mm_and_si128(_mm_srli_epi16(ql0, 4), m4),
-                    _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 4), m3), 4),
-                ),
-                _mm_or_si128(
-                    _mm_and_si128(_mm_srli_epi16(ql1, 4), m4),
-                    _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 4), m3), 4),
-                ),
-                _mm_or_si128(
-                    _mm_and_si128(_mm_srli_epi16(ql2, 4), m4),
-                    _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh0, 6), m3), 4),
-                ),
-                _mm_or_si128(
-                    _mm_and_si128(_mm_srli_epi16(ql3, 4), m4),
-                    _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh1, 6), m3), 4),
-                ),
-            ];
-            for g in 0..8 {
-                let y = q8b.as_ptr().add(2 + (n * 8 + g) * 16) as *const i8;
-                let sum_sub = q6_group_sum(qv[g], y);
-                let scale = q6b[192 + n * 8 + g] as i8 as f32;
-                sumf += d * scale * (sum_sub as f32);
+            let qv = q6k_unsigned_groups(q6b, n);
+            for t in 0..4 {
+                let u =
+                    _mm256_inserti128_si256(_mm256_castsi128_si256(qv[2 * t]), qv[2 * t + 1], 1);
+                let y = _mm256_loadu_si256(
+                    q8b.as_ptr().add(2 + (n * 8 + 2 * t) * 16) as *const __m256i
+                );
+                let p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(u, y), ones16);
+                let ys = _mm256_slli_epi16(_mm256_maddubs_epi16(ones8, y), 5);
+                let sub = _mm256_sub_epi32(p32, _mm256_madd_epi16(ys, ones16));
+                let x = _mm256_add_epi32(sub, _mm256_shuffle_epi32(sub, 0xB1));
+                let x = _mm256_add_epi32(x, _mm256_shuffle_epi32(x, 0x4E));
+                let g = n * 8 + 2 * t;
+                let s0 = _mm_cvtsi128_si32(_mm256_castsi256_si128(x));
+                let s1 = _mm_cvtsi128_si32(_mm256_extracti128_si256(x, 1));
+                let k0 = q6b[192 + g] as i8 as f32;
+                sumf += d * k0 * (s0 as f32);
+                sumf += d * (q6b[192 + g + 1] as i8 as f32) * (s1 as f32);
             }
         }
     }
