@@ -886,10 +886,12 @@ The graph-era details live in `docs/COMPUTE-GRAPH-DESIGN.md` §17 (Phases 1–11
 
 ### 5.2 Optimization and cold-start record
 
-> **Hash caveat.** The commit hashes printed in `docs/METAL_OPTIMIZATIONS.md` predate a repository
-> history rewrite and no longer resolve. The hashes below are subject-matched equivalents from the
-> current history; each was verified with `git cat-file -t`. Cite these, and the
-> `METAL_OPTIMIZATIONS.md` section, together.
+> **Hash caveat.** The commit hashes in `docs/METAL_OPTIMIZATIONS.md`'s `Commit (pre-rewrite)` columns,
+> and in its pre-rewrite change records, predate a repository history rewrite and no longer resolve —
+> those are the labels, not every hash in that file (its post-rewrite measurement records cite
+> current-history commits, which do resolve; see its header caveat). The hashes below are
+> subject-matched equivalents from the current history; each was verified with `git cat-file -t`. Cite
+> these, and the `METAL_OPTIMIZATIONS.md` section, together.
 
 | Workstream | What it changed | Doc reference | Representative commits |
 |---|---|---|---|
