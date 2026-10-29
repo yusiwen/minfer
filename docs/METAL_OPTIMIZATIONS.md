@@ -18,13 +18,19 @@
 > ⚠️ **The §0 progress table is the single source of truth for tracking**; §1-§6
 > are the detailed explanations behind it. Update §0 first before changing code.
 >
-> ⚠️ **Commit hashes in this document predate a repository history rewrite and do not resolve.**
-> Measured on 2026-10-10: **44 of the 47** hash-like tokens here fail `git cat-file -t`, and the three
-> that pass are not this repository's commits anyway (llama.cpp's own `c479922ac` and `88b47a755`, and
-> an AppleClang version). They are kept as history, not as citations. Subject-matched equivalents from the
-> current history — each verified with `git cat-file -t` — are listed in
-> [`METAL-BACKEND-DESIGN.md`](METAL-BACKEND-DESIGN.md) §5.2; cite the equivalent **and** that section
-> together, and treat a bare hash in this file as a pre-rewrite label rather than a locator.
+> ⚠️ **A hash in this file is not automatically a locator.** The four `Commit (pre-rewrite)` columns,
+> and part of the change history in prose, predate a repository history rewrite: measured on
+> 2026-10-10, when this caveat was written, **44 of the 47** hash-like tokens then in the file failed
+> `git cat-file -t`, and the three that passed were not this repository's commits anyway (llama.cpp's
+> own `c479922ac` and `88b47a755`, and an AppleClang version). Those labels are kept as *history*, not
+> as citations. Subject-matched equivalents from the current history — each verified with
+> `git cat-file -t` — are listed in [`METAL-BACKEND-DESIGN.md`](METAL-BACKEND-DESIGN.md) §5.2; cite the
+> equivalent **and** that section together.
+>
+> The two classes are interleaved: records added since the rewrite also quote current-history commits,
+> which do resolve, while a newer record that points back at an older change cites its pre-rewrite
+> label. **Decide per hash with `git cat-file -t`** — a hash that resolves is a locator; one that does
+> not is a pre-rewrite label, kept as history rather than as a dead link to repair.
 >
 > 📌 **Compute-graph era note (2026-08-21+, Phase 6)**: inference now runs through
 > the declarative compute graph (`src/graph/`, `MetalBackend`), which dispatches
@@ -36,9 +42,9 @@
 >
 > 📖 **Backend design of record**: [`METAL-BACKEND-DESIGN.md`](METAL-BACKEND-DESIGN.md)
 > (`MetalBackend` lifecycle, dispatch, command buffers, model wiring, safety). This
-> document stays the optimization ledger; commit hashes printed below predate a
-> history rewrite and no longer resolve — see the design doc's §5.2 for
-> subject-matched equivalents.
+> document stays the optimization ledger; the pre-rewrite hashes below are kept as
+> history rather than as citations (see the hash caveat above), and the design doc's
+> §5.2 carries subject-matched equivalents.
 
 ---
 
