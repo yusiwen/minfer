@@ -13,11 +13,11 @@ all three backends: Metal's share path landed after the G5 port, in
 dots and the CUDA kernels are [#87](https://github.com/yusiwen/minfer/issues/87), Metal's packed read [#310](https://github.com/yusiwen/minfer/issues/310);
 the CLI/server surfaces C5 enables are [#89](https://github.com/yusiwen/minfer/issues/89)).
 Phase D **complete** (3/3) (**D1 done**: views, multi-output via `split_parts`, D2, D3); Phase E
-**complete** (7/7) (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **in progress** (7/8) (F2, F3, **F4**, **F5**, **F6**, F7,
-F8 done; **F1's Q5_K/Q6_K folds wait for an x86 host**); Phase G
+**complete** (7/7) (E1, E1b, E2, **E3**, **E4**, **E5**, E6 all done); Phase F **complete** (8/8) (F1, F2, F3, **F4**, **F5**, **F6**, F7,
+F8 all done); Phase G
 **complete** (7/7) — G1–G7 all landed on a Mac (the KV port G5 and the
 measurement bookend G7 last; [#54](https://github.com/yusiwen/minfer/issues/54) recorded the round's final baseline).
-**Next: the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121), and F1's last piece, the Q5_K/Q6_K kernel folds.** The order was
+**Next: the open Linux-side tickets on dgxspark (aarch64, GB10 sm_121).** The order was
 deliberate: the Metal KV port (G5) came **after** the CUDA arena stopped changing shape
 (C7, C7b, C8), so those semantics were written into Metal once — it landed on a Mac 2026-10-06. Per-ticket evidence is in
 each phase's record and in the §14 open-risks table.
@@ -104,7 +104,7 @@ Measured records name it absolutely, never as "this box" (gate contract rule 5).
 | CPU (aarch64 NEON+SDOT) | ✅ | ✅ | Primary correctness net here |
 | CUDA (sm_121) | ✅ | ✅ **device since 2026-09-18** | GB10 (121.6 GiB, driver 580.178.04, CUDA 13.0). Device-gated tests are still **local-only**: CI has no GPU, so its CUDA job only compiles the harness (F-campaign note in §14 row 1) |
 | Metal | ❌ | ❌ | macOS-only code, not compilable here → Phase G |
-| x86 AVX2 / AVX-512 | ❌ | ❌ | dgxspark cannot build/run x86. Item 11's dots were verified on an x86 host 2026-10-08 (F1 landing record in §9); the repacking increment was measured NULL on 2026-10-29 and replaced by the Q4_K kernel fold ([#688](https://github.com/yusiwen/minfer/issues/688)) |
+| x86 AVX2 / AVX-512 | ❌ | ❌ | dgxspark cannot build/run x86. Item 11 was measured on an x86 host on 2026-10-08 (dots) and 2026-10-29 (the repack NULL, then the Q4_K and Q5_K/Q6_K kernel folds, [#688](https://github.com/yusiwen/minfer/issues/688) / [#689](https://github.com/yusiwen/minfer/issues/689)) |
 
 **A0 verdict (2026-09-16) — superseded (2026-09-18).** It read "CUDA is
 compile-only in this environment", and for two days every CUDA ticket's acceptance
@@ -7566,7 +7566,7 @@ Can run in parallel with A–E by a different workstream.
 
 | ID | Item | Title | Effort | Box needed |
 |---|---|---|---|---|
-| F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) — **dots landed 2026-10-08 on an x86 host** (bitwise gates; AVX-512/VNNI selected at runtime); the repacking increment was **measured NULL on 2026-10-29** ([#433](https://github.com/yusiwen/minfer/issues/433)) and replaced by the Q4_K kernel fold ([#688](https://github.com/yusiwen/minfer/issues/688)); **Q5_K/Q6_K folds are the remaining piece** | L | x86 |
+| F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) — **DONE**: dots landed 2026-10-08 on an x86 host (bitwise gates; AVX-512/VNNI selected at runtime); the repacking increment was **measured NULL on 2026-10-29** ([#433](https://github.com/yusiwen/minfer/issues/433)) and replaced by kernel folds — Q4_K ([#688](https://github.com/yusiwen/minfer/issues/688)), then Q5_K + Q6_K AVX2 arm ([#689](https://github.com/yusiwen/minfer/issues/689)) | L | x86 |
 | F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost — **DONE 2026-10-14**) | M | dgxspark |
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | dgxspark |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
@@ -7579,19 +7579,23 @@ F1's dot half **landed on an x86 host on 2026-10-08** (landing record below);
 the increment it left open was **weight repacking**, which a four-arm probe
 **measured NULL on 2026-10-29** — a permuted layout is worth 5.4%/10.6% end to
 end, because the decode is only 20–23% of a dot call. What pays is the kernel
-half, now landed as the Q4_K fold ([#688](https://github.com/yusiwen/minfer/issues/688)):
-−42.5% (AVX2) / −45.5% (AVX-512) per dot. The Q5_K/Q6_K equivalents are the
-remaining piece, and they still need that machine class to measure.
+half: the Q4_K fold landed first ([#688](https://github.com/yusiwen/minfer/issues/688),
+−42.5% AVX2 / −45.5% AVX-512), then Q5_K and the Q6_K AVX2 arm ([#689](https://github.com/yusiwen/minfer/issues/689),
+−36%/−33% and −40%). Q6_K on AVX-512 is the one measured piece below the bar
+(−9.2%: the serial f32 fold is the floor), so that kernel stays in its raw shape
+with the measurement in a comment; whether an AVX-512 machine should simply run
+the faster AVX2 arm is a follow-up question, not an open F1 item.
 
-**The hardware lane, stated where the sequencing is read (#335).** F1's
-remaining piece (the Q5_K/Q6_K kernel folds; the AVX2/AVX-512 dots landed
-2026-10-08 and the repacking increment was measured NULL on 2026-10-29) wants an
-**x86 host** — an
-entirely different machine class from the two
-boxes this project owns, `dgxspark (aarch64, GB10 sm_121)` and `macbook (macOS
-27.0.1, Apple M4 Pro)`; the `x86_64 (CI runner)` is GitHub's ephemeral runner and
-cannot host interactive work. It is therefore **not** the project's `next:`
-sentence, and `docs/status.toml`'s `next:` no longer says so. What can start on
+**F1 is closed.** The hardware lane section below is kept as the record of why
+the lane needed an x86 box, not as an open ask.
+
+**The hardware lane, stated where the sequencing is read (#335).** F1 needed an
+**x86 host** — a machine class entirely different from the two boxes this
+project owns, `dgxspark (aarch64, GB10 sm_121)` and `macbook (macOS 27.0.1,
+Apple M4 Pro)`; the `x86_64 (CI runner)` is GitHub's ephemeral runner and cannot
+host interactive work. That is why F1 was never the project's `next:` sentence
+while it was open: a lane measurable only on an x86 box has to be named in the
+plan, not inferred from a green CI run. What can start on
 the two boxes instead, per the §14 hardware row: on **macbook** the macOS round-2
 tickets tracked in [#333](https://github.com/yusiwen/minfer/issues/333) — the
 Metal-only list and the order, with [#310](https://github.com/yusiwen/minfer/issues/310)
@@ -10360,7 +10364,7 @@ Phase B  ├─ B1 ✔ ─ B2 ✔ ─ B3 ✔                          (starts on
 Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C4 ✔ ─ C5 ✔ ─ C6 ✔ ─ C7 ✔ ─ C8 ✔   (C8 covers C8a/C8b, and C8b's S1a–S5; C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ✔ ─ D2 ✔ ─ D3 ✔ ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E1b ✔ ─ E2 ✔ ─ E3 ✔ ─ E4 ✔ ─ E5 ✔ ─ E6 ✔        (E1b device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
-Phase F  └─ F1 ─ F2 ✔ ─ F3 ✔ ─ F4 ✔ ─ F5 ✔ ─ F6 ✔ ─ F7 ✔ ─ F8 ✔        (F1: dots landed as #56, repacking measured NULL as #433, Q4_K fold #688; the Q5_K/Q6_K folds still want an x86 host)
+Phase F  └─ F1 ✔ ─ F2 ✔ ─ F3 ✔ ─ F4 ✔ ─ F5 ✔ ─ F6 ✔ ─ F7 ✔ ─ F8 ✔        (F1: dots #56, repacking measured NULL #433, kernel folds #688 + #689)
 Phase G  └─────────────────► G1 ✔ ─ G2 ✔ ─ G3 ✔ ─ G5 ✔ ─ G4 ✔ ─ G6 ✔ ─ G7 ✔   (after C8; G1–G3 compile-verified in CI; device claims need a Mac)
 ```
 

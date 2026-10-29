@@ -380,7 +380,7 @@ AVX2, `MINFER_NO_AVX2=1` to scalar — the x86 counterparts of `MINFER_NO_NEON`)
 reference, and its `#[ignore]`d `kquant_simd_dot_speedup` harness records the dot
 ratios on a 4096-element row: AVX2 `3.39× / 2.80× / 1.79×`, AVX-512
 `3.97× / 3.23× / 2.51×` scalar for `Q4_K / Q5_K / Q6_K` (Intel `i7-11700B`,
-2026-10-08). `minfer bench` on the cached Qwen2.5-0.5B Q4_K_M (16 threads, median
+2026-10-08 — the post-fold numbers are in the 2026-10-29 update below). `minfer bench` on the cached Qwen2.5-0.5B Q4_K_M (16 threads, median
 of nine `-r 3` samples, `--n-ctx 656`) moves prefill `pp512` 28.59 → 32.13 tok/s
 and decode `tg128` 11.20 → 12.54 tok/s; the modest end-to-end delta is the
 weight-row re-read per token.
@@ -395,8 +395,20 @@ vectorising the min term over the q8_K bsums and folding the subblock scale into
 layout's gain, with no extra memory and no loader change
 ([#433](https://github.com/yusiwen/minfer/issues/433) measured it,
 [#688](https://github.com/yusiwen/minfer/issues/688) landed the Q4_K half). The
-harness now records Q4_K at **6.02× (AVX2) / 7.32× (AVX-512)** vs scalar, up from
-3.47×/3.90×.
+harness now records, vs scalar (2026-10-29, nuc11):
+
+| path | Q4_K | Q5_K | Q6_K |
+|---|---|---|---|
+| AVX2 | 6.05× | 4.90× | 2.84× |
+| AVX-512 | 7.26× | 5.19× | 2.54× |
+
+Q4_K and Q5_K take the fold on both ISAs; Q6_K takes it on AVX2 only
+([#689](https://github.com/yusiwen/minfer/issues/689)). The AVX-512 Q6_K kernel
+was left raw on purpose: its restructured form measured only **−9.2%**, below the
+15% bar, because the serial f32 fold (`(d*scale)*sum`, sixteen times per
+superblock) is the floor — and the restructured AVX2 kernel measured *faster*
+than it on this box (315.6 vs 328.3 ns), so which kernel an AVX-512 machine
+should run is open.
 
 **llama.cpp approach:** `ggml/src/ggml-cpu/arch/x86/quants.c` uses the
 `denibble()`/`maddubs` AVX2 shape and the VNNI `dpbusd` AVX-512 shape; minfer's
