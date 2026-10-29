@@ -9,7 +9,7 @@
 //! back to AVX2 and then scalar. `MINFER_NO_AVX512=1` forces the AVX2 kernel
 //! and `MINFER_NO_AVX2=1` forces scalar (both are read once, like
 //! `MINFER_NO_NEON`).
-use super::avx2::{f16_at, hsum_epi32_8, k_mterm, q4k_scales_raw};
+use super::avx2::{f16_at, hsum_epi32_8, q4k_scales_raw};
 use super::*;
 
 /// True when the whole AVX-512/VNNI layer may be used. `MINFER_NO_AVX2=1`
@@ -42,14 +42,6 @@ unsafe fn combine_128(a: __m128i, b: __m128i, c: __m128i, d: __m128i) -> __m512i
     let v = _mm512_inserti32x4(v, b, 1);
     let v = _mm512_inserti32x4(v, c, 2);
     _mm512_inserti32x4(v, d, 3)
-}
-
-/// Low eight i32 lanes = `lo`, next eight = `hi`.
-#[inline]
-unsafe fn scale_vec(lo: i32, hi: i32) -> __m512i {
-    _mm512_setr_epi32(
-        lo, lo, lo, lo, lo, lo, lo, lo, hi, hi, hi, hi, hi, hi, hi, hi,
-    )
 }
 
 /// Sum the four i32 lanes inside each 128-bit lane (the Q6_K grouping): after
@@ -116,37 +108,62 @@ pub(super) unsafe fn dot_q4_k_q8_k(q4: &[u8], q8k: &[u8]) -> f32 {
 }
 
 /// Q5_K × Q8_K (AVX-512/VNNI) — see `kquant::dot_q5_k_q8_k_scalar`.
+///
+/// The AVX2 arm's two restructurings in their 512-bit form, on the raw GGUF
+/// layout and both exact in i32: the min term is vectorised over the q8_K
+/// `bsums` with the decoded mins in i16 lanes, and the per-subblock scale rides
+/// the `vpmaddwd` that folds the `vpmaddubsw` byte-pair sums — one `vpermw` per
+/// group spreads the decoded i16 scale pair over its two subblocks — so the
+/// finished dot is never multiplied. The per-superblock float fold keeps the
+/// scalar kernel's order (`sumf -= dmin * mterm; sumf += d * total`); a Q5_K
+/// value is ≤ 31, so the pair sum (≤ 31·127·2 = 7874) never saturates i16 and
+/// the `vpmaddwd` product (≤ 7874·63·2 = 992 124) stays far inside i32.
 #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512vnni,avx2,fma")]
 pub(super) unsafe fn dot_q5_k_q8_k(q5: &[u8], q8k: &[u8]) -> f32 {
     const Q5KB: usize = 176;
     let n_super = q5.len() / Q5KB;
     let m4b = _mm256_set1_epi8(0x0F);
     let one = _mm256_set1_epi8(1);
+    let ones = _mm256_set1_epi16(1);
+    // hoisted (a function of the loop index only): i16 lanes 0-15 select
+    // scales[2j] and lanes 16-31 scales[2j+1], for each j.
+    let base = combine_256(_mm256_setzero_si256(), _mm256_set1_epi16(1));
+    let mut idx = [_mm512_setzero_si512(); 4];
+    for (j, slot) in idx.iter_mut().enumerate() {
+        *slot = _mm512_add_epi16(base, _mm512_set1_epi16(2 * j as i16));
+    }
     let mut sumf = 0.0f32;
     for i in 0..n_super {
         let q5b = &q5[i * Q5KB..];
         let q8b = &q8k[i * crate::block::Q8KB..];
         let d = f16_at(q5b, 0) * f16_at(q8b, 0);
         let dmin = f16_at(q5b, 2) * f16_at(q8b, 0);
-        let (scales, mins) = block::unpack_q4k_scales(<&[u8; 12]>::try_from(&q5b[4..16]).unwrap());
-        sumf -= dmin * k_mterm(q8b, &mins) as f32;
+        let (s16, m16) = q4k_scales_raw(_mm_loadu_si128(q5b.as_ptr() as *const __m128i));
+        // Min term, vectorised as in the AVX2 arm.
+        let bsums = _mm256_loadu_si256(q8b.as_ptr().add(274) as *const __m256i);
+        let pairs = _mm256_madd_epi16(bsums, ones);
+        let mterm = hsum_epi32_8(_mm256_mullo_epi32(_mm256_cvtepu16_epi32(m16), pairs));
+        sumf -= dmin * mterm as f32;
+        let sv16 = _mm512_zextsi128_si512(s16);
         let qhv = _mm256_loadu_si256(q5b.as_ptr().add(16) as *const __m256i);
         let mut acc = _mm512_setzero_si512();
-        for j in 0..4 {
+        for (j, id) in idx.iter().enumerate() {
             let chunk = _mm256_loadu_si256(q5b.as_ptr().add(48 + 32 * j) as *const __m256i);
             let lo = _mm256_and_si256(chunk, m4b);
             let hi = _mm256_and_si256(_mm256_srli_epi16(chunk, 4), m4b);
-            let sh_lo = _mm256_set1_epi32((2 * j) as i32);
-            let sh_hi = _mm256_set1_epi32((2 * j + 1) as i32);
-            let hlo = _mm256_and_si256(_mm256_srlv_epi32(qhv, sh_lo), one);
-            let hhi = _mm256_and_si256(_mm256_srlv_epi32(qhv, sh_hi), one);
+            let sh = 2 * j as i32;
+            let hlo = _mm256_and_si256(_mm256_srlv_epi32(qhv, _mm256_set1_epi32(sh)), one);
+            let hhi = _mm256_and_si256(_mm256_srlv_epi32(qhv, _mm256_set1_epi32(sh + 1)), one);
             let ulo = _mm256_or_si256(lo, _mm256_slli_epi16(hlo, 4));
             let uhi = _mm256_or_si256(hi, _mm256_slli_epi16(hhi, 4));
             let u = combine_256(ulo, uhi);
             let y = _mm512_loadu_si512(q8b.as_ptr().add(2 + 64 * j) as *const __m512i);
-            let dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u, y);
-            let sv = scale_vec(scales[2 * j], scales[2 * j + 1]);
-            acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(dot, sv));
+            // Pair sums, then the scale folded in by the same `vpmaddwd`.
+            let ps = _mm512_maddubs_epi16(u, y);
+            acc = _mm512_add_epi32(
+                acc,
+                _mm512_madd_epi16(ps, _mm512_permutexvar_epi16(*id, sv16)),
+            );
         }
         let total = _mm512_reduce_add_epi32(acc);
         sumf += d * total as f32;
@@ -155,6 +172,17 @@ pub(super) unsafe fn dot_q5_k_q8_k(q5: &[u8], q8k: &[u8]) -> f32 {
 }
 
 /// Q6_K × Q8_K (AVX-512/VNNI) — see `kquant::dot_q6_k_q8_k_scalar`.
+///
+/// **Deliberately left in its raw shape.** The restructured four-groups-per-
+/// register arm (one `vpdpbusd` pair, one 4-lane reduce, then `vpcompressd`
+/// 0x1111) was measured at only **-9.2 %** on nuc11 (i7-11700B, 2026-10-29):
+/// below the 15 % bar, and the reason is structural — the serial f32 fold
+/// (`sumf += d * scale * sum`, sixteen times per superblock, each an
+/// extract-then-multiply dependency chain) is the floor at ~20 ns/superblock,
+/// and no amount of vectorising the i32 side removes it. On that same box the
+/// restructured **AVX2** arm measured *faster* than this kernel (315.6 ns vs
+/// 328.3 ns for a 4096-element row), so which kernel an AVX-512 machine should
+/// run is an open question; the dispatch is unchanged pending an answer.
 #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512vnni,avx2,fma")]
 pub(super) unsafe fn dot_q6_k_q8_k(q6: &[u8], q8k: &[u8]) -> f32 {
     let n_super = q6.len() / Q6KB;
