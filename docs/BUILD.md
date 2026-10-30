@@ -57,6 +57,46 @@ the CI pin, and the two would then render slightly different HTML. When bumping
 nixpkgs, compare `nix develop -c mdbook --version` with the `tool:
 mdbook@0.4.37` lines in `.github/workflows/ci.yml` and `docs.yml`.
 
+### The toolchain pin is bypassed by `RUSTUP_TOOLCHAIN`
+
+The toolchain is pinned three times, to the same **1.97.1**:
+`flake.nix` (`pkgs.rust-bin.stable."1.97.1".default`, whose rustfmt is 1.9.0),
+`rust-toolchain.toml` (`channel = "1.97.1"`), and the CI jobs
+(`dtolnay/rust-toolchain@1.97.1`, five sites). `rust-toolchain.toml` is what
+makes a plain `cargo` outside the flake reproducible — but **rustup's environment
+variable wins over the file**, and the agent shells on this project's boxes
+export `RUSTUP_TOOLCHAIN=stable`:
+
+```console
+$ rustc --version                                  # cwd = the checkout
+rustc 1.99.1
+$ rustup show active-toolchain
+stable-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
+$ env -u RUSTUP_TOOLCHAIN rustc --version
+rustc 1.97.1
+```
+
+So in exactly the environment an agent is told to use, the pin is inert. Three
+verified ways to reach it:
+
+```bash
+env -u RUSTUP_TOOLCHAIN cargo fmt --all --check   # lets rust-toolchain.toml apply
+rustup run 1.97.1 cargo test --release            # name the pinned toolchain
+nix develop -c cargo fmt --all --check            # the devShell's own rust
+```
+
+The rule this implies: **a format verdict, a suite count or a benchmark produced
+by a bare `cargo` in such a shell is not the pinned verdict.** The counts in
+`scripts/test-baselines.toml` and every CI job are 1.97.1 numbers. The measured
+witness (2026-10-29, `nuc11`): a file formatted by the shell's rustfmt 1.10.0
+(1.99.1) failed the pinned rustfmt 1.9.0's `cargo fmt --all --check` with one
+comment-indent diff, while `master`'s copy of the same file is clean under both
+versions.
+
+The pre-commit hook is not a substitute: its `rustfmt --check` gate is installed
+by the devShell's `shellHook` (see "Git hooks" below), so a commit made outside
+`nix develop` runs no hook at all.
+
 ## Build commands
 
 ```bash
