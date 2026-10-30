@@ -165,10 +165,16 @@ fn noop_emit() -> impl FnMut(&[u8]) {
 }
 /// Byte-level tokenization of the canonical render (ChatML fallback, no generation prompt).
 fn canonical(messages: &[(String, Option<String>)]) -> Vec<u32> {
-    FakeCodec.encode(&template::fallback_chatml_messages(messages, false))
+    FakeCodec.encode(&template::fallback_chatml_messages(
+        &template::messages_from_parts(messages),
+        false,
+    ))
 }
 fn fallback_full(messages: &[(String, Option<String>)]) -> Vec<u32> {
-    FakeCodec.encode(&template::fallback_chatml_messages(messages, true))
+    FakeCodec.encode(&template::fallback_chatml_messages(
+        &template::messages_from_parts(messages),
+        true,
+    ))
 }
 /// The locally cached Qwen2.5-0.5B q4_0 the real-model tests run against.
 fn cached_qwen05_q4_0() -> Option<std::path::PathBuf> {

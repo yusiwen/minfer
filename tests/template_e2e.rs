@@ -222,6 +222,10 @@ const NO_TOOLS_BRANCH_TEMPLATE: &str = "U:{{ messages[0][\"content\"] }}";
 const TOOLS_BRANCH_TEMPLATE: &str =
     "{% if tools %}T:{{ tools|length }}|{% endif %}U:{{ messages[0][\"content\"] }}";
 
+/// A template that renders a replayed assistant turn's `tool_calls` (#613), so a
+/// request carrying one is served instead of being dropped at the message type.
+const TOOL_CALLS_TEMPLATE: &str = "{% for m in messages %}[{{ m.role }}{% for c in m.tool_calls %}|{{ c.function.name }}={{ c.function.arguments }}{% endfor %}]{% endfor %}";
+
 #[test]
 fn serve_starts_and_answers_health_with_an_override_file() {
     let model = test_model();
@@ -453,5 +457,56 @@ fn serve_refuses_tools_a_template_cannot_render_and_serves_the_ones_it_can() {
     assert!(
         response.contains("extracted from the model's output"),
         "the refusal must name what is missing; body:\n{response}"
+    );
+}
+
+/// #613: a replayed tool call survives the request type and reaches the render,
+/// while a malformed entry is a 400 naming both indices.
+///
+/// The prompt bytes are gated against the transformers reference in
+/// `src/template/tests/tools.rs`; a toy model cannot show them here. What this
+/// test proves is the HTTP surface: the request is accepted (not silently
+/// stripped) and the refusal names the entry.
+#[test]
+fn serve_carries_a_replayed_tool_call_and_refuses_a_malformed_one_by_index() {
+    let model = test_model();
+    let template = template_file("tool-calls.jinja", TOOL_CALLS_TEMPLATE);
+    let mut server = Server::spawn("serve", &model.to_string_lossy(), 18108, Some(&template));
+    assert!(
+        server.wait_listening(),
+        "no banner; log so far:\n{}",
+        server.log()
+    );
+
+    let replayed = r#"{"messages":[
+        {"role":"user","content":"Weather?"},
+        {"role":"assistant","content":null,"tool_calls":[
+            {"id":"call_1","type":"function",
+             "function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}
+        ]}
+    ],"max_tokens":1}"#;
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(replayed));
+    assert_eq!(
+        status, 200,
+        "a replayed tool call must reach the render; body:\n{response}"
+    );
+
+    // `arguments` as an object would render different bytes than OpenAI's text;
+    // it is refused, and the message names the message and the entry.
+    let malformed = r#"{"messages":[
+        {"role":"user","content":"Weather?"},
+        {"role":"assistant","content":null,"tool_calls":[
+            {"id":"call_1","type":"function",
+             "function":{"name":"get_weather","arguments":{"city":"Paris"}}}
+        ]}
+    ],"max_tokens":1}"#;
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(malformed));
+    assert_eq!(
+        status, 400,
+        "a malformed tool call must be refused; body:\n{response}"
+    );
+    assert!(
+        response.contains("messages[1].tool_calls[0]"),
+        "the refusal must name the entry; body:\n{response}"
     );
 }

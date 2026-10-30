@@ -174,19 +174,19 @@ fn overflow_truncates_oldest_turns_and_rehydrates() {
     );
     // KV = the full render after re-render (turn_pos reset to zero) + EOG
     let canon = FakeCodec.encode(&template::fallback_chatml_messages(
-        &[
+        &template::messages_from_parts(&[
             ("user".into(), Some("Q".into())),
             ("assistant".into(), Some("".into())),
-        ],
+        ]),
         false,
     ));
     assert_eq!(c.turn_pos, 0);
     let full = FakeCodec.encode(&template::fallback_chatml_messages(
-        &[
+        &template::messages_from_parts(&[
             ("user".into(), Some("Q".into())),
             ("assistant".into(), Some("".into())),
             ("user".into(), Some("X".into())),
-        ],
+        ]),
         true,
     ));
     assert_eq!(c.stream_tokens, [&full[..], &[IM_END]].concat());

@@ -450,20 +450,17 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
     // Render the chat template + tokenize (cheap, do it on the handler side so
     // context-overflow is rejected before the job occupies the worker queue).
     let bos = state.tokenizer.bos_text();
-    let messages: Vec<(String, Option<String>)> = req
-        .messages
-        .iter()
-        .map(|m| (m.role.clone(), m.content.clone()))
-        .collect();
     // #597: `tools` reaches the template, and `tool_choice` is resolved here so
     // an unimplemented mode is a 400 rather than a silently ignored field.
     let tools = match req.prompt_tools() {
         Ok(t) => t,
         Err(e) => return error_response(&e),
     };
-    let prompt = match crate::template::render_messages_opt_with_tools(
+    // #613: the request's own message objects reach the template — no rebuild, so
+    // `tool_calls` and the client's key order survive.
+    let prompt = match crate::template::render_messages_opt_with_tools_raw(
         state.chat_template.as_deref(),
-        &messages,
+        &req.messages,
         tools,
         true,
         &bos,

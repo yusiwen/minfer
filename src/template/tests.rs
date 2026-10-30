@@ -2,6 +2,7 @@
 //! build does not parse it. See the parent module for the docs.
 use super::*;
 
+mod messages;
 mod tools;
 
 fn msgs() -> Vec<(String, Option<String>)> {
@@ -483,7 +484,16 @@ fn fixed_clock() -> CivilTime {
 #[test]
 fn strftime_now_uses_the_injected_clock_and_is_reproducible() {
     let tmpl = "{{ strftime_now('%Y-%m-%d') }}T{{ strftime_now('%T') }}";
-    let render = |t: &str| render_at(fixed_clock(), Some(t), &msgs(), None, true, "");
+    let render = |t: &str| {
+        render_at(
+            fixed_clock(),
+            Some(t),
+            &messages_from_parts(&msgs()),
+            None,
+            true,
+            "",
+        )
+    };
     let a = render(tmpl).unwrap();
     let b = render(tmpl).unwrap();
     assert_eq!(a, "2026-10-18T12:24:52");
@@ -495,7 +505,7 @@ fn strftime_now_refuses_an_unknown_directive_by_name() {
     let err = render_at(
         fixed_clock(),
         Some("{{ strftime_now('%Q') }}"),
-        &msgs(),
+        &messages_from_parts(&msgs()),
         None,
         true,
         "",

@@ -930,19 +930,52 @@ pub fn render_messages(
     )
 }
 
+/// One message object built from the `(role, content)` pairs the CLI and the
+/// conversation session record (#613).
+///
+/// The server path never uses this: a request's message object is carried as the
+/// client wrote it, so its key order and any extra key (`tool_calls`, `name`) are
+/// the client's. This builder exists for the callers that have no JSON of their
+/// own.
+pub(crate) fn message_object(role: &str, content: Option<&str>) -> ToolJson {
+    ToolJson::Object(vec![
+        ("role".to_string(), ToolJson::String(role.to_string())),
+        (
+            "content".to_string(),
+            match content {
+                Some(c) => ToolJson::String(c.to_string()),
+                None => ToolJson::Null,
+            },
+        ),
+    ])
+}
+
+/// The `(role, content)` adapter: every non-request caller's message list.
+pub(crate) fn messages_from_parts(messages: &[(String, Option<String>)]) -> Vec<ToolJson> {
+    messages
+        .iter()
+        .map(|(role, content)| message_object(role, content.as_deref()))
+        .collect()
+}
+
 /// The one render core: `template` (`None` = the ChatML fallback) plus the
 /// `tools` context value, as of one fixed instant.
+///
+/// `messages` are the client's own JSON objects (#613) — never rebuilt — so a
+/// template that echoes a message (`message | tojson`) sees the client's key order
+/// and every key it sent. `serde_json::Map` would sort that order away; the
+/// carrier does not.
 fn render_at(
     now: CivilTime,
     template: Option<&str>,
-    messages: &[(String, Option<String>)],
+    messages: &[ToolJson],
     tools: Option<&[ToolJson]>,
     add_generation_prompt: bool,
     bos_token: &str,
 ) -> Result<String, TemplateError> {
     let Some(template) = template else {
-        // The fallback has no tool format; `render_checked_at` is what refuses a
-        // request that brought `tools` here.
+        // The fallback has no tool or message format; `render_checked_at` is what
+        // refuses a request that brought `tools` here.
         return Ok(fallback_chatml_messages(messages, add_generation_prompt));
     };
     let mut env = environment_at(now);
@@ -953,15 +986,10 @@ fn render_at(
         .get_template("chat")
         .map_err(|e| TemplateError::classify(&e))?;
 
-    let msgs: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|(role, content)| {
-            serde_json::json!({
-                "role": role,
-                "content": content,
-            })
-        })
-        .collect();
+    // Serialized as they are: `Value::from_serialize` walks `ToolJson`'s entries in
+    // document order (minijinja's `preserve_order`), which is the order the client
+    // wrote.
+    let msgs_value = Value::from_serialize(messages);
 
     // transformers passes `tools=None`; `none` keeps `{% if tools %}` and
     // `tools is defined` behaving the way jinja2 does.
@@ -971,7 +999,7 @@ fn render_at(
     };
 
     tmpl.render(context! {
-        messages => msgs,
+        messages => msgs_value,
         add_generation_prompt => add_generation_prompt,
         bos_token => bos_token,
         tools => tools_value,
@@ -990,7 +1018,7 @@ fn render_at(
 fn render_checked_at(
     now: CivilTime,
     template: Option<&str>,
-    messages: &[(String, Option<String>)],
+    messages: &[ToolJson],
     tools: Option<&[ToolJson]>,
     add_generation_prompt: bool,
     bos_token: &str,
@@ -1041,9 +1069,34 @@ pub fn render_messages_opt(
 
 /// `render_messages_opt` plus the request's `tools` (the server's path, and the
 /// only place the tools contract is enforced for a template-less GGUF too).
+///
+/// A `(role, content)` adapter over [`render_messages_opt_with_tools_raw`]: the
+/// CLI and the conversation session have no request JSON to carry.
 pub fn render_messages_opt_with_tools(
     template: Option<&str>,
     messages: &[(String, Option<String>)],
+    tools: Option<&[ToolJson]>,
+    add_generation_prompt: bool,
+    bos_token: &str,
+) -> Result<String, TemplateError> {
+    render_messages_opt_with_tools_raw(
+        template,
+        &messages_from_parts(messages),
+        tools,
+        add_generation_prompt,
+        bos_token,
+    )
+}
+
+/// The server's render entry point: the request's own message objects reach the
+/// template verbatim (#613).
+///
+/// `messages` are the objects the client sent — order and every key preserved.
+/// This is the only entry point whose messages are not built from `(role,
+/// content)` pairs.
+pub fn render_messages_opt_with_tools_raw(
+    template: Option<&str>,
+    messages: &[ToolJson],
     tools: Option<&[ToolJson]>,
     add_generation_prompt: bool,
     bos_token: &str,
@@ -1069,7 +1122,7 @@ fn render_messages_opt_in(
     render_at(
         clock(),
         template,
-        messages,
+        &messages_from_parts(messages),
         None,
         add_generation_prompt,
         bos_token,
@@ -1209,15 +1262,17 @@ pub fn render_single_turn(
 /// emits the role marker only.
 ///
 /// Used **only** for a GGUF with no `tokenizer.chat_template`: there is no
-/// model-specific format to lose, and the load path prints a notice.
+/// model-specific format to lose, and the load path prints a notice. A message's
+/// extra keys have no ChatML spelling and are not rendered here (#613).
 pub(crate) fn fallback_chatml_messages(
-    messages: &[(String, Option<String>)],
+    messages: &[ToolJson],
     add_generation_prompt: bool,
 ) -> String {
     let mut r = String::new();
-    for (role, content) in messages {
-        match content {
-            Some(c) => r.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, c)),
+    for message in messages {
+        let role = message.get("role").and_then(ToolJson::as_str).unwrap_or("");
+        match message.get("content").and_then(ToolJson::as_str) {
+            Some(content) => r.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content)),
             None => r.push_str(&format!("<|im_start|>{}\n<|im_end|>\n", role)),
         }
     }
