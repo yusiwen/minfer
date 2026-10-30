@@ -8,6 +8,7 @@ pub mod batch;
 pub mod chat;
 pub mod metrics;
 pub mod slot;
+pub mod toolcall;
 pub mod types;
 pub mod viz;
 
