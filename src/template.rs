@@ -122,12 +122,39 @@ impl TemplateError {
         }
     }
 
+    /// A replayed message carried `tool_calls` and the template never put them in
+    /// the prompt (#613).
+    ///
+    /// Same mechanical check as [`Self::tools_not_rendered`]: render once with the
+    /// calls and once with every `tool_calls` key stripped, and byte-identical
+    /// output means the call reached nothing. `has_template` only shapes the
+    /// explanation — the ChatML fallback has no tool format, a model template
+    /// without the replay branch ignores the calls.
+    fn tool_calls_not_rendered(has_template: bool) -> Self {
+        let detail = if has_template {
+            "this model's chat template has no `tool_calls` branch: it renders the same prompt \
+             with and without a replayed assistant call, so the call would never reach the model \
+             (the turn would render as its content, which is empty for a call-only turn)"
+        } else {
+            "this GGUF carries no `tokenizer.chat_template` and the generic ChatML fallback has \
+             no tool-call format, so a replayed assistant call would never reach the model"
+        };
+        Self {
+            kind: "tool calls not rendered",
+            detail: detail.to_string(),
+            line: None,
+        }
+    }
+
     /// The full, user-facing refusal. Names the construct, the template line
     /// and the engine's alternative, so nothing is silent.
     pub fn message(&self) -> String {
         // Both engine refusals have their own complete wording: appending the
         // `str`-method list to a tools refusal would blame the wrong construct.
-        if self.kind == "template file" || self.kind == "tools not rendered" {
+        if self.kind == "template file"
+            || self.kind == "tools not rendered"
+            || self.kind == "tool calls not rendered"
+        {
             return format!("chat template error — {}: {}", self.kind, self.detail);
         }
         let at = match self.line {
@@ -1007,6 +1034,34 @@ fn render_at(
     .map_err(|e| TemplateError::classify(&e))
 }
 
+/// Whether any message carries a replayed assistant call (#613).
+fn carries_tool_calls(messages: &[ToolJson]) -> bool {
+    messages.iter().any(|message| {
+        matches!(
+            message.get("tool_calls"),
+            Some(ToolJson::Array(calls)) if !calls.is_empty()
+        )
+    })
+}
+
+/// The same conversation with every `tool_calls` key removed, for the check that
+/// a template cannot silently ignore a replayed call.
+fn strip_tool_calls(messages: &[ToolJson]) -> Vec<ToolJson> {
+    messages
+        .iter()
+        .map(|message| match message {
+            ToolJson::Object(entries) => ToolJson::Object(
+                entries
+                    .iter()
+                    .filter(|(key, _)| key != "tool_calls")
+                    .cloned()
+                    .collect(),
+            ),
+            other => other.clone(),
+        })
+        .collect()
+}
+
 /// `render_at` with the `tools` contract applied: when a request supplies tools,
 /// the same conversation is rendered twice at one instant, and byte-identical
 /// output is a refusal — the definitions reached nothing (#597).
@@ -1023,36 +1078,61 @@ fn render_checked_at(
     add_generation_prompt: bool,
     bos_token: &str,
 ) -> Result<String, TemplateError> {
-    let Some(tools) = tools.filter(|t| !t.is_empty()) else {
-        return render_at(
+    let rendered = match tools.filter(|t| !t.is_empty()) {
+        None => render_at(
             now,
             template,
             messages,
             None,
             add_generation_prompt,
             bos_token,
-        );
+        )?,
+        Some(tools) => {
+            let with = render_at(
+                now,
+                template,
+                messages,
+                Some(tools),
+                add_generation_prompt,
+                bos_token,
+            )?;
+            let without = render_at(
+                now,
+                template,
+                messages,
+                None,
+                add_generation_prompt,
+                bos_token,
+            )?;
+            if with == without {
+                return Err(TemplateError::tools_not_rendered(template.is_some()));
+            }
+            with
+        }
     };
-    let with = render_at(
-        now,
-        template,
-        messages,
-        Some(tools),
-        add_generation_prompt,
-        bos_token,
-    )?;
-    let without = render_at(
-        now,
-        template,
-        messages,
-        None,
-        add_generation_prompt,
-        bos_token,
-    )?;
-    if with == without {
-        return Err(TemplateError::tools_not_rendered(template.is_some()));
+
+    // #613: a replayed assistant call must reach the prompt too. The second pass
+    // strips every `tool_calls` key; identical bytes mean the call reached nothing
+    // (the ChatML fallback, or a template without the replay branch).
+    if carries_tool_calls(messages) {
+        let stripped = strip_tool_calls(messages);
+        // A stripped render that fails outright still proves the template depends
+        // on the call: Qwen2.5 concatenates `message.content`, which is null for a
+        // call-only turn, so removing the call turns a rendered prompt into a
+        // render error. Only equal *bytes* mean the call reached nothing.
+        let without = render_at(
+            now,
+            template,
+            &stripped,
+            tools.filter(|t| !t.is_empty()),
+            add_generation_prompt,
+            bos_token,
+        );
+        if matches!(without, Ok(ref without) if *without == rendered) {
+            return Err(TemplateError::tool_calls_not_rendered(template.is_some()));
+        }
     }
-    Ok(with)
+    Ok(rendered)
 }
 
 /// Render with an optional template: `None` (the GGUF carries no
