@@ -485,6 +485,8 @@ jobs:
       # (`docs/GATE-CONTRACT.md` §"Counts"). No gate can check that a number is
       # *right*; this one checks that the sentence says which tree it is right about —
       # #219 corrected a batch of them and #636 found three wrong sixteen days later.
+      # #700 widened it to a line count of 1,000 or more with no path beside it,
+      # the shape four tutorial sites used to slip past the path arms.
       - name: A derived count in a live document must name its revision
         run: python3 scripts/check_doc_counts.py
       - name: The doc-count checker's own pass/fail cases

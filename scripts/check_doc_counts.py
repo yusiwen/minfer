@@ -19,7 +19,14 @@ What counts as a claim:
     (`` `src/cuda.rs` (1,014 lines) ``, `` 2,351 lines in `cuda_backend.rs` ``);
   - a bare size of the tree — `` 70,797 lines of Rust ``, `` 44,105 LOC ``,
     `` ~55k LOC ``;
+  - a line count of 1,000 or more that names no path at all — `` across 17
+    translation units, 10,326 lines ``, `` the 4,546-line `impl` `` (#700). Three
+    digits stay out deliberately: "the kernel is 5 lines" is prose about a sample,
+    not a measurement of the tree;
   - a count of test functions — `` 39 test functions ``.
+
+The arms are tried in order and the first match names the claim, so a count that
+does sit beside a path keeps the more specific "path + line count" label.
 
 A claim passes when its own line or either neighbour carries a **stamp**: a commit
 (`` at `8c14286` ``, `` at commit 8c14286 ``, or a bare backticked 7–40-char hex) or an
@@ -76,6 +83,16 @@ CLAIM_PATTERNS = (
     ),
     ("tree size", re.compile(r"\b\d[\d,]*\s+(?:lines of (?:Rust|tests)|LOC)\b")),
     ("~Nk size", re.compile(r"~\s?\d+(?:\.\d+)?k\s+(?:lines|LOC)\b")),
+    (
+        # #700: a line count of 1,000 or more is a size of the tree wherever it is written.
+        # Beside a *file* count instead of a path ("across 17 translation units,
+        # 10,326 lines") neither path arm can see it, which is how four stale claims
+        # in the CUDA tutorial survived #641's gate. The hyphenated compound ("the
+        # 4,546-line `impl`") is the same claim one word later. Three digits stay out:
+        # "the kernel is 5 lines" is prose about a sample, not a measurement.
+        "line count, no path",
+        re.compile(r"\b(?:[1-9]\d{0,2}(?:,\d{3})+|[1-9]\d{3,})(?:\s+lines|-line)\b"),
+    ),
     ("test-function count", re.compile(r"\b\d+\s+test functions?\b")),
 )
 
@@ -292,6 +309,57 @@ def selftest() -> int:
         (
             "a tree-size claim fails",
             run({"docs/a.md": "The tree is ~55k LOC of Rust.\n"}) == 1,
+            "",
+        )
+    )
+    cases.append(
+        (
+            "a line count that names no path fails",
+            run({"docs/a.md": "It spans 17 translation units, 10,326 lines.\n"}) == 1,
+            "",
+        )
+    )
+    cases.append(
+        (
+            "the same claim stamped on its own line passes",
+            run({"docs/a.md": "It spans 17 translation units, 10,326 lines at `f26e7e1`.\n"})
+            == 0,
+            "",
+        )
+    )
+    cases.append(
+        (
+            "a stamp on the neighbouring line covers it",
+            run({"docs/a.md": "Measured at\n`f26e7e1`: 17 translation units, 10,326 lines.\n"})
+            == 0,
+            "",
+        )
+    )
+    cases.append(
+        (
+            "the hyphenated form is the same claim",
+            run({"docs/a.md": "`src/cuda.rs` loses its 4,546-line `impl`.\n"}) == 1,
+            "",
+        )
+    )
+    cases.append(
+        (
+            "a line count below 1,000 is not a claim",
+            run({"docs/a.md": "The kernel is 5 lines; the file is 842 lines.\n"}) == 0,
+            "",
+        )
+    )
+    cases.append(
+        (
+            "the pre-#637 tutorial sentence fails",
+            run(
+                {
+                    "docs/a.md": "Today that prints **99 `__global__ void` definitions** — plus "
+                    "six prose mentions —\nacross **17 files** (10,147 lines). Nobody memorizes "
+                    "99 entries; you navigate by\nfamily.\n"
+                }
+            )
+            == 1,
             "",
         )
     )

@@ -43,9 +43,9 @@ both ends.
 ### 2.1 The matmul corner of the kernel inventory
 
 The forensics protocol starts with enumeration. Chapter 03 §2.1 carries the
-inventory as a snapshot; at `f26e7e1` (2026-10-30) the same scan printed **101
-`__global__ void` definitions** across `src/cuda/kernels/*.cu` — 17 translation
-units, 10,326 lines (the pre-#263 single TU was 10,215):
+inventory as a snapshot: **101 `__global__ void` definitions** across
+`src/cuda/kernels/*.cu` in 17 translation units, 10,326 lines, measured at
+`f26e7e1` (2026-10-30; the pre-#263 single TU was 10,215):
 
 ```bash
 grep -n '__global__' src/cuda/kernels/*.cu
