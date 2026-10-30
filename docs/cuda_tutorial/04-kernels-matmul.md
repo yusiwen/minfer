@@ -42,16 +42,17 @@ both ends.
 
 ### 2.1 The matmul corner of the kernel inventory
 
-The forensics protocol starts with enumeration. Chapter 03's count is **99
-`__global__ void` definitions** across `src/cuda/kernels/*.cu` — 17 translation units, **10,147 lines** today (the pre-#263 single TU was 10,215; re-run the
-grep to confirm before citing):
+The forensics protocol starts with enumeration. Chapter 03 §2.1 carries the
+inventory as a snapshot; at `f26e7e1` (2026-10-30) the same scan printed **101
+`__global__ void` definitions** across `src/cuda/kernels/*.cu` — 17 translation
+units, 10,326 lines (the pre-#263 single TU was 10,215):
 
 ```bash
 grep -n '__global__' src/cuda/kernels/*.cu
 ```
 
-Of those 99, **47 are matmul-family kernels** (names matching
-`matmul`/`mmvq`/`gemm`/`mmq`). You navigate them by regime:
+Of those 101, **47 are matmul-family kernels** (names matching
+`matmul`/`mmvq`/`gemm`/`mmq`, at that revision). You navigate them by regime:
 
 | Family | Examples (file, first hit line) | What it does | Where taught |
 |---|---|---|---|

@@ -52,8 +52,9 @@ answer one question — *who can call this function, from where?*
 - `__host__` — an ordinary CPU function (the default). Written explicitly only
   for functions that compile in *both* worlds — `__host__ __device__`.
 
-`src/cuda/kernels/*.cu` uses exactly this split: `__global__` for the 99 kernels — 89 at the pre-#263 single TU
-(the count from `grep -c '__global__' src/cuda_kernels.cu` at that revision) — plain
+`src/cuda/kernels/*.cu` uses exactly this split: `__global__` for the kernels — 89 at the pre-#263 single TU
+(the count from `grep -c '__global__' src/cuda_kernels.cu` at that revision; chapter 03 §2.1
+carries the current inventory as a stamped snapshot) — plain
 `__device__` helpers for shared math, and ordinary C++ for the host-side
 launcher functions below.
 
@@ -222,7 +223,9 @@ the token count) — leave this kind of comment on every launch geometry you
 write.
 
 **minfer's real elementwise family, side by side with the toy.** The kernel
-inventory (`grep -n '__global__ void' src/cuda/kernels/*.cu`) lists 99 kernels today (89 at the pre-#263 revision); the
+inventory (`grep -n '__global__ void' src/cuda/kernels/*.cu`) lists every
+definition in the tree — chapter 03 §2.1 carries the count as a snapshot at a
+named revision (89 at the pre-#263 revision) — and the
 elementwise ones are the plainest and are all structured like your toy
 (global 1-D index, guard, one memory access per thread):
 

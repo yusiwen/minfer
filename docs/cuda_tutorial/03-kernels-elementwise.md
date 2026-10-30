@@ -49,8 +49,11 @@ The forensics protocol from `STYLE.md` starts with enumeration. Run:
 grep -n '__global__' src/cuda/kernels/*.cu
 ```
 
-Today that prints **99 `__global__ void` definitions** — plus six prose mentions — across **17 files**
-(10,147 lines). Nobody memorizes 99 entries; you navigate by family. Here is the map (file and line):
+Every definition lives in one of **17 translation units**, one per kernel family, plus `common.cuh`
+for the shared helpers. A snapshot at `f26e7e1` (2026-10-30) put that scan at **101
+`__global__ void` definitions** plus six prose mentions, 10,326 lines: if your checkout prints a
+different number, that is drift, not a broken grep. Nobody memorizes the list; you navigate by
+family. Here is the map (file and line):
 
 | Family | Examples (file, first hit line) | What it does | Where taught |
 |---|---|---|---|
@@ -61,7 +64,7 @@ Today that prints **99 `__global__ void` definitions** — plus six prose mentio
 | Decode matvec (MMVQ) | `q4_k_q8_mmvq_multi` (`mmvq_multi.cu:25`), `q4_0_q8_mmvq` (`:446`) | one output row per block, dp4a integer dots | ch 04 |
 | Prefill GEMM | `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`), `mmq_nt_kernel` (`mmq_int8.cu:236`) | tiled tensor-core GEMM, f16 or int8 | ch 04 |
 | Attention | `gqa_attn_f32_f16kv` (`attention_decode.cu:18`), `fa_prefill_kv` (`attention_prefill.cu:117`) | GQA attention, flash-style prefill | ch 05 |
-| Fused decode tail | `attn_bias_rope_store_f32` (`kv_store.cu:133`) | bias×3 + rope×2 + store×2 in one launch | ch 05 |
+| Fused decode tail | `attn_bias_rope_store_f32` (`kv_store.cu:133`), `attn_rope_store_f32` (`:307`), `attn_rope_store_q8_0` (`:376`) | bias×3 + rope×2 + store×2 in one launch; the `attn_rope_store_*` pair is the no-bias variant | ch 05 |
 | Activation quantize | `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`), `rms_norm_quant_f32_t` (`:169`) | f32 activations → q8 blocks for MMQ | ch 04 |
 
 Two structural facts the table hides, and both matter for reading:
