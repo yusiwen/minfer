@@ -428,6 +428,61 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
     if let Err(e) = params.resolve_dry_breakers(&state.tokenizer) {
         return error_response(&e);
     }
+    // #597/#614: `tools` reaches the template, and `tool_choice` is resolved here.
+    // `"required"` and a forced function become a sampling grammar: the model's
+    // `<tool_call>` syntax with the name fixed or enumerated, so the call the
+    // parser extracts afterwards is the one the client demanded.
+    let tools = match req.prompt_tools() {
+        Ok(tools) => tools,
+        Err(e) => return error_response(&e),
+    };
+    let tool_choice = match req.resolve_tool_choice() {
+        Ok(intent) => intent,
+        Err(e) => return error_response(&e),
+    };
+    if let Some(forced) = tool_choice.constraint() {
+        if params.grammar_source.is_some() {
+            return error_response(&ApiError::invalid_request(
+                "tool_choice \"required\" or a forced function constrains sampling with a \
+                 grammar, so it cannot be combined with `grammar` or a non-text `response_format`"
+                    .to_string(),
+            ));
+        }
+        if state.spec_enabled {
+            return error_response(&ApiError::invalid_request(
+                "tool_choice \"required\" or a forced function constrains sampling with a \
+                 grammar, which cannot be combined with the server's speculative draft engine"
+                    .to_string(),
+            ));
+        }
+        let Some(template) = state.chat_template.as_deref() else {
+            return error_response(&ApiError::invalid_request(
+                "tool_choice \"required\" or a forced function needs a model template whose \
+                 tool-call format can be constrained; this GGUF has none (the ChatML fallback \
+                 has no tool format)"
+                    .to_string(),
+            ));
+        };
+        if !template.contains("<tool_call>") {
+            return error_response(&ApiError::invalid_request(
+                "the model's chat template does not emit the `<tool_call>` block, so this \
+                 server cannot constrain the output to a call for it"
+                    .to_string(),
+            ));
+        }
+        let names: Vec<&str> = tools
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(crate::template::ToolJson::as_str)
+            })
+            .collect();
+        params.grammar_source = Some(crate::grammar::GrammarSource::Gbnf(
+            toolcall::forced_call_grammar(&names, forced),
+        ));
+    }
     // F2 (#47): compile the grammar/schema now (the vocabulary is here), so an
     // unsupported construct is a 400 before the job is queued. Speculative
     // decoding samples several rows from one automaton state, so a grammar and
@@ -452,12 +507,6 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
     // Render the chat template + tokenize (cheap, do it on the handler side so
     // context-overflow is rejected before the job occupies the worker queue).
     let bos = state.tokenizer.bos_text();
-    // #597: `tools` reaches the template, and `tool_choice` is resolved here so
-    // an unimplemented mode is a 400 rather than a silently ignored field.
-    let tools = match req.prompt_tools() {
-        Ok(t) => t,
-        Err(e) => return error_response(&e),
-    };
     // #613: the request's own message objects reach the template — no rebuild, so
     // `tool_calls` and the client's key order survive.
     let prompt = match crate::template::render_messages_opt_with_tools_raw(

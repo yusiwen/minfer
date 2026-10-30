@@ -238,10 +238,68 @@ impl Parser {
                 Ok(false)
             }
             Err(RawStatus::Bad(detail)) => Err(ParseError::new(format!(
-                "the call's JSON does not parse: {detail}"
+                "the call's JSON does not parse: {detail} (near {:?})",
+                truncate_at(&self.buf[start..], 160)
             ))),
         }
     }
+}
+
+/// The GBNF for `tool_choice: "required"` (one of `names`) or a forced function.
+///
+/// It forces the model's own tool-call syntax: the `<tool_call>` wrapper, a
+/// `{"name": …, "arguments": …}` object with the name fixed or enumerated, and a
+/// JSON object for the arguments (reusing the schema compiler's generic `j-object`
+/// rules). The result is the block this module parses, so extraction and the
+/// constraint agree by construction.
+///
+/// Only the `<tool_call>` format can be constrained this way; a template that
+/// emits another family's syntax is refused by the caller instead.
+pub fn forced_call_grammar(names: &[&str], forced: Option<&str>) -> String {
+    let mut grammar = String::new();
+    for (name, rhs) in crate::grammar::GENERIC_RULES {
+        grammar.push_str(name);
+        grammar.push_str(" ::= ");
+        grammar.push_str(rhs);
+        grammar.push('\n');
+    }
+    let name_rule = match forced {
+        Some(name) => gbnf_literal(name),
+        None => names
+            .iter()
+            .map(|name| gbnf_literal(name))
+            .collect::<Vec<_>>()
+            .join(" | "),
+    };
+    grammar.push_str("root ::= ");
+    grammar.push_str(&gbnf_literal("<tool_call>\n{\"name\": \""));
+    grammar.push(' ');
+    grammar.push_str(&name_rule);
+    grammar.push(' ');
+    grammar.push_str(&gbnf_literal("\", \"arguments\": "));
+    grammar.push_str("j-object");
+    grammar.push(' ');
+    grammar.push_str(&gbnf_literal("}\n</tool_call>"));
+    grammar.push('\n');
+    grammar
+}
+
+/// One string as a GBNF literal: quotes, backslashes and control characters are
+/// escaped the way the grammar parser expects them.
+fn gbnf_literal(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Parse a whole completion in one call (the non-streaming path).

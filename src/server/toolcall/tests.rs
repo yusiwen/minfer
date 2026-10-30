@@ -363,3 +363,37 @@ fn streamed_deltas_rebuild_the_non_streaming_tool_calls() {
         }
     }
 }
+
+// === The tool_choice constraint (#614) ==================================
+
+fn byte_pieces() -> (Vec<Option<Box<[u8]>>>, Vec<bool>) {
+    let mut pieces: Vec<Option<Box<[u8]>>> = Vec::new();
+    for b in 0..=255u16 {
+        pieces.push(Some(vec![b as u8].into_boxed_slice()));
+    }
+    pieces.push(Some(b"<eos>".to_vec().into_boxed_slice()));
+    let n = pieces.len();
+    let mut eog = vec![false; n];
+    eog[n - 1] = true;
+    (pieces, eog)
+}
+
+#[test]
+fn the_forced_call_grammar_wraps_the_json_object_and_names_the_tool() {
+    let grammar = forced_call_grammar(&["get_weather", "search_docs"], None);
+    assert!(grammar.contains("j-object"), "the JSON prelude is reused");
+    assert!(grammar.contains("\"get_weather\"") && grammar.contains("\"search_docs\""));
+    let (pieces, eog) = byte_pieces();
+    crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
+        .expect("the required-call grammar compiles");
+
+    let grammar = forced_call_grammar(&["get_weather", "search_docs"], Some("get_weather"));
+    assert!(grammar.contains("\"get_weather\""));
+    assert!(
+        !grammar.contains("\"search_docs\""),
+        "a forced name must not offer the other tools"
+    );
+    let (pieces, eog) = byte_pieces();
+    crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
+        .expect("the forced-call grammar compiles");
+}

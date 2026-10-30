@@ -492,28 +492,61 @@ fn tool_choice_none_drops_the_tools_from_the_prompt() {
 }
 
 #[test]
-fn tool_choice_required_and_a_forced_function_are_refused_by_name() {
-    for (extra, needle) in [
-        (r#","tool_choice":"required""#, "required"),
-        (
-            r#","tool_choice":{"type":"function","function":{"name":"get_weather"}}"#,
-            "get_weather",
-        ),
-    ] {
-        let req = ChatCompletionRequest::parse(body_with_tools(extra).as_bytes()).expect("parse");
-        let err = req.prompt_tools().unwrap_err();
-        assert_eq!(err.status, 400);
-        assert!(
-            err.message.contains("extracted from the model's output"),
-            "extra={extra:?} -> {}",
-            err.message
-        );
-        assert!(
-            err.message.contains(needle),
-            "extra={extra:?} -> {}",
-            err.message
-        );
-    }
+fn tool_choice_required_and_a_forced_function_are_resolved_to_a_constraint() {
+    // #614: both stop being 400s. `required` renders the tools and asks the
+    // handler for a grammar; a forced function names the one tool.
+    let req =
+        ChatCompletionRequest::parse(body_with_tools(r#","tool_choice":"required""#).as_bytes())
+            .expect("parse");
+    assert_eq!(
+        req.resolve_tool_choice().unwrap(),
+        ToolChoiceIntent::Required
+    );
+    assert!(
+        req.prompt_tools().unwrap().is_some(),
+        "required renders tools"
+    );
+
+    let req = ChatCompletionRequest::parse(
+        body_with_tools(r#","tool_choice":{"type":"function","function":{"name":"get_weather"}}"#)
+            .as_bytes(),
+    )
+    .expect("parse");
+    assert_eq!(
+        req.resolve_tool_choice().unwrap(),
+        ToolChoiceIntent::Forced("get_weather".to_string())
+    );
+    assert!(req.prompt_tools().unwrap().is_some());
+
+    // `auto` and `none` keep their old meaning.
+    let req = ChatCompletionRequest::parse(body_with_tools("").as_bytes()).expect("parse");
+    assert_eq!(req.resolve_tool_choice().unwrap(), ToolChoiceIntent::Auto);
+    let req = ChatCompletionRequest::parse(body_with_tools(r#","tool_choice":"none""#).as_bytes())
+        .expect("parse");
+    assert_eq!(req.resolve_tool_choice().unwrap(), ToolChoiceIntent::None);
+    assert!(req.prompt_tools().unwrap().is_none());
+}
+
+#[test]
+fn a_forced_function_must_be_one_of_the_offered_tools() {
+    let err = ChatCompletionRequest::parse(
+        body_with_tools(r#","tool_choice":{"type":"function","function":{"name":"nope"}}"#)
+            .as_bytes(),
+    )
+    .expect("parse")
+    .resolve_tool_choice()
+    .unwrap_err();
+    assert_eq!(err.status, 400);
+    assert!(err.message.contains("nope"), "{}", err.message);
+
+    let err = ChatCompletionRequest::parse(
+        body_with_tools(r#","tool_choice":{"type":"other","function":{"name":"get_weather"}}"#)
+            .as_bytes(),
+    )
+    .expect("parse")
+    .resolve_tool_choice()
+    .unwrap_err();
+    assert!(err.message.contains("other"), "{}", err.message);
 }
 
 #[test]

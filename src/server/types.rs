@@ -98,6 +98,30 @@ pub struct ForcedToolChoice {
     pub function: ForcedToolName,
 }
 
+/// What `tool_choice` asks of the generation (#614).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChoiceIntent {
+    /// No constraint; the model decides.
+    Auto,
+    /// Render without tools.
+    None,
+    /// The model must call one of the offered tools.
+    Required,
+    /// The model must call this tool.
+    Forced(String),
+}
+
+impl ToolChoiceIntent {
+    /// `Some(None)` = required, `Some(Some(name))` = forced, `None` = free.
+    pub fn constraint(&self) -> Option<Option<&str>> {
+        match self {
+            Self::Required => Some(None),
+            Self::Forced(name) => Some(Some(name.as_str())),
+            Self::Auto | Self::None => None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct ForcedToolName {
     pub name: String,
@@ -325,31 +349,57 @@ impl ChatCompletionRequest {
 
     /// The `tools` this request puts in the prompt, or `None` (#597).
     ///
-    /// `tool_choice` is honoured where a *prompt* can express it. `auto` (the
-    /// default) renders the definitions; `"none"` renders without them, because
-    /// this server does not parse tool calls out of the model's output, so
-    /// showing the schemas while promising not to call would invite exactly the
-    /// call it cannot report. `"required"` and a forced function name are
-    /// refused by name for the same reason — accepting them and then returning
-    /// a `<tool_call>` block as ordinary content is the silent substitution
-    /// ADR-0019 forbids.
+    /// `tool_choice: "none"` renders without them; every other mode renders them,
+    /// including `"required"` and a forced function, which are enforced by a
+    /// sampling grammar (#614, [`Self::resolve_tool_choice`]).
     pub fn prompt_tools(&self) -> Result<Option<&[crate::template::ToolJson]>, ApiError> {
         let tools = self.tools.as_deref();
         match &self.tool_choice {
-            None | Some(ToolChoice::Mode(ToolChoiceMode::Auto)) => Ok(tools),
             Some(ToolChoice::Mode(ToolChoiceMode::None)) => Ok(None),
-            Some(ToolChoice::Mode(ToolChoiceMode::Required)) => Err(ApiError::invalid_request(
-                "tool_choice \"required\" needs tool calls to be extracted from the model's \
-                 output, which this server does not implement yet: the call would come back as \
-                 ordinary content"
-                    .to_string(),
-            )),
-            Some(ToolChoice::Function(forced)) => Err(ApiError::invalid_request(format!(
-                "tool_choice forcing function '{}' needs tool calls to be extracted from the \
-                 model's output, which this server does not implement yet: the call would come \
-                 back as ordinary content",
-                forced.function.name
-            ))),
+            _ => Ok(tools),
+        }
+    }
+
+    /// What `tool_choice` asks for, resolved against the offered tools (#614).
+    ///
+    /// `"required"` and a forced function become a **sampling constraint**: the
+    /// handler builds a GBNF for the model's `<tool_call>` syntax, so the call the
+    /// parser then extracts is the one the client demanded. A forced name that is
+    /// not offered, or a forced-choice object whose `type` is not `"function"`, is
+    /// a `400` naming it — never a silently ignored field.
+    pub fn resolve_tool_choice(&self) -> Result<ToolChoiceIntent, ApiError> {
+        use crate::template::ToolJson;
+        match &self.tool_choice {
+            None | Some(ToolChoice::Mode(ToolChoiceMode::Auto)) => Ok(ToolChoiceIntent::Auto),
+            Some(ToolChoice::Mode(ToolChoiceMode::None)) => Ok(ToolChoiceIntent::None),
+            Some(ToolChoice::Mode(ToolChoiceMode::Required)) => Ok(ToolChoiceIntent::Required),
+            Some(ToolChoice::Function(forced)) => {
+                if forced.kind != "function" {
+                    return Err(ApiError::invalid_request(format!(
+                        "tool_choice.type is '{}'; this server implements 'function' only",
+                        forced.kind
+                    )));
+                }
+                let name = forced.function.name.trim();
+                if name.is_empty() {
+                    return Err(ApiError::invalid_request(
+                        "tool_choice.function.name must be a non-empty string".to_string(),
+                    ));
+                }
+                let offered = self.tools.as_deref().unwrap_or(&[]);
+                let found = offered.iter().any(|tool| {
+                    tool.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(ToolJson::as_str)
+                        == Some(name)
+                });
+                if !found {
+                    return Err(ApiError::invalid_request(format!(
+                        "tool_choice forces '{name}', which is not in `tools`"
+                    )));
+                }
+                Ok(ToolChoiceIntent::Forced(name.to_string()))
+            }
         }
     }
 

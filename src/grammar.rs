@@ -1765,7 +1765,11 @@ fn emit_node(node: &Node, ids: &HashMap<&str, u32>, prog: &mut Vec<Inst>) -> Res
 /// The generic JSON value grammar, emitted once per compilation. Schema-specific
 /// rules reference these; `additionalProperties: true` and `enum`/`const`
 /// literals reuse them.
-const GENERIC_RULES: &[(&str, &str)] = &[
+///
+/// `pub(crate)` for the tool-call grammar (`src/server/toolcall.rs`), which wraps
+/// `j-object` in the model's `<tool_call>` syntax (#614) — one JSON grammar, not
+/// a second copy that can drift from the schema compiler's.
+pub(crate) const GENERIC_RULES: &[(&str, &str)] = &[
     ("j-ws", r#"[ \t\n\r]*"#),
     ("j-char", r#"[^"\\\u0000-\u001f] | "\\" j-esc"#),
     (
