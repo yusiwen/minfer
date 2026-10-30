@@ -227,10 +227,9 @@ On the wire: `tools` is the OpenAI array (validated per index — object, `type 
 `tool_choice` is honoured only where a prompt can express it — absent/`auto` renders,
 `"none"` renders without them, `"required"` and a forced function are `400`s naming
 the missing extraction. Tool-call extraction from the model's output is a separate
-increment, and is tracked as such (#597): message-shaped `tool_calls` and the client's
-key order inside a message are [#613](https://github.com/yusiwen/minfer/issues/613),
-and parsing the output block back into `message.tool_calls` is
-[#614](https://github.com/yusiwen/minfer/issues/614).
+increment, and is tracked as such (#597): a message's own JSON — `tool_calls`, the
+client's key order — is §2.8, and parsing the output block back into
+`message.tool_calls` is [#614](https://github.com/yusiwen/minfer/issues/614).
 
 `strftime_now(fmt)` is registered against the environment's **injected clock**.
 Production passes UTC now; every test passes a fixed clock, so no gate reads the
@@ -239,6 +238,39 @@ anything else is refused by name (§2.3). A clock-dependent template is
 non-deterministic for the incremental renderer, which already handles that: the
 two-pass diff reports `prefix_matched = false` and the caller re-renders the
 whole history (`CLI-CONVERSATION-PLAN.md` §5.4).
+
+### 2.8 A request message reaches the prompt as the client wrote it (#613, ADR-0062)
+
+`template::render_messages_opt_with_tools_raw` is the server's entry point, and the only one
+whose messages are the client's own objects. The three `(role, content)` functions are adapters
+for the CLI, the conversation session and the single-turn path: they build exactly the object
+this engine has always emitted, so nothing about those paths moved. The request's array is
+`Vec<template::ToolJson>`, which gives three properties:
+
+- **`tool_calls` reaches the template.** A replayed assistant turn renders through the model
+  template's own replay branch — Qwen2.5's `<tool_call>` block — byte for byte against
+  transformers. Its `content` is normally `null`, and the branch tolerates that.
+- **The client's key order survives.** The object is serialized once through the same
+  `Value::from_serialize` path `tools` uses, so `{"role": …, "content": …}` and `{"content": …, "role": …}`
+  come out as written. `serde_json`'s `preserve_order` stays off (ADR-0058 decision 3).
+- **Unknown keys pass through.** `name`, `tool_call_id` and vendor extensions are the template's
+  to read or ignore; the engine does not police what the prompt may reference.
+
+Validation follows the page's "refuse by name, never drop" rule: `role` must be known, `content`
+a string (or `null`/absent), and a `tool_calls` array non-empty with OpenAI's shape —
+`{id, type: "function", function: {name, arguments}}` where `arguments` is a JSON **string**,
+because the template echoes it through `tojson` — or a `400` naming
+`messages[i].tool_calls[j]`. `tool_calls: []` is refused like `tools: []`.
+
+A call that would reach nothing refuses too. The check is the tools check applied to
+`tool_calls`: render the conversation as given, then render it with every `tool_calls` key
+stripped; equal bytes mean the call reached nothing, so a template without the replay branch —
+and the ChatML fallback, which has no tool format — answer a `400` (`tool calls not rendered`)
+naming the cause. A stripped render that fails outright counts as "the template depends on the
+call" (Qwen2.5 concatenates `message.content`, null for a call-only turn). The check is scoped to
+`tool_calls`: an unknown vendor key a template ignores is not a refusal. Parsing the model's
+output back into `choices[].message.tool_calls` remains the separate increment
+([#614](https://github.com/yusiwen/minfer/issues/614)).
 
 ## 3. Tokenizer — accepted, refused, detected
 
@@ -528,7 +560,10 @@ return.
 | `str`-method coverage | unit test: the fixture's method set **equals** `SUPPORTED_STR_METHODS`; `python3 scripts/gen_chat_fixtures.py --check` regenerates it | CPython 3.12.3 |
 | The toy model itself | `python3 scripts/gen_toy_gguf.py --check` reproduces `tests/fixtures/toy/toy-qwen2-f32.gguf` byte for byte (113 KB, 1 layer, 260-token vocabulary); the five startup/template e2e run against it in CI, no cached model | the generator (#609) |
 | Override path, byte for byte | unit test: each model fixture's template is written to a file, loaded through `load_template_file`, and rendered against the same transformers reference (4 × 7 cases, 28 checked) — a stray newline fails it | transformers 5.17.0 (`tests/fixtures/chat/*.json`) |
-| Tools, byte for byte | unit test over `tests/fixtures/chat/tools_qwen2.5-0.5b-instruct.json`: four cases (one tool; two nested schemas carrying `<`, `&`, non-ASCII and a fractional default; no system message; a replayed tool response) render byte-identically, and the fixture's template is the same text as the tools-free reference's | transformers 5.17.0 `render_jinja_template` (the function `apply_chat_template` calls), `scripts/gen_tools_fixture.py` |
+| Tools, byte for byte | unit test over `tests/fixtures/chat/tools_qwen2.5-0.5b-instruct.json`: five cases (one tool; two nested schemas carrying `<`, `&`, non-ASCII and a fractional default; no system message; a replayed tool response; a replayed tool round-trip) render byte-identically, and the fixture's template is the same text as the tools-free reference's | transformers 5.17.0 `render_jinja_template` (the function `apply_chat_template` calls), `scripts/gen_tools_fixture.py` |
+| A message's own JSON | unit test: the replayed round-trip (user → assistant with `tool_calls` and null content → tool → generation prompt) renders byte for byte; the client's key order survives in both directions; a vendor key survives `| tojson`; the `(role, content)` adapter and the raw objects render identical bytes | transformers 5.17.0, `scripts/gen_tools_fixture.py` (#613) |
+| A replayed call that reaches nothing refuses | unit + e2e: a template without a `tool_calls` branch and the ChatML fallback each refuse with kind `tool calls not rendered`; a vendor key does not trigger the check; a valid replay is served | the mechanical two-pass check (ADR-0062) |
+| The request message surface | unit: a non-object message, a non-string `role`/`content`, a non-array or empty `tool_calls`, and a missing `id`/`function`/`name` or object `arguments` are `400`s naming `messages[i].tool_calls[j]` | OpenAI's shapes (#613) |
 | `tojson` is CPython's | unit test over `tests/fixtures/chat/tojson_cpython.json`: nine entries (separators, key order, `ensure_ascii=False`, unescaped HTML characters, controls, empty containers, non-object roots, the pretty form) compare byte for byte; an unhonoured keyword (`sort_keys`) is refused by name | CPython 3.12.3 `json.dumps`, `scripts/gen_chat_fixtures.py --check` |
 | Key order survives the parse | unit test: the ordered carrier keeps `{"z":1,"a":…}` in document order through deserialize + re-serialize, and a tools request keeps `type` before `function` | the client's own JSON (#597) |
 | Tools that reach nothing refuse | unit test: a template with no `tools` branch and the ChatML fallback each refuse with kind `tools not rendered` and name the cause; the same conversation without tools still renders | the mechanical two-pass check (ADR-0058) |
@@ -561,6 +596,7 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0019](adr/0019-a-chat-template-that-cannot-render-refuses-the-load.md) — A chat template that cannot be rendered refuses the load
 - [ADR-0057](adr/0057-a-template-file-overrides-the-gguf-and-time-enters-through-one-clock.md) — A template file overrides the GGUF copy, and time enters a render through one injected clock
 - [ADR-0058](adr/0058-tools-reach-the-prompt-as-the-client-wrote-them.md) — A request's tools reach the prompt as the client wrote them, and a template that drops them refuses by name
+- [ADR-0062](adr/0062-a-request-message-reaches-the-prompt-as-the-client-wrote-it.md) — A request message reaches the prompt as the client wrote it, and a replayed tool call that reaches nothing refuses by name
 - [ADR-0042](adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md) — The tokenizer applies the model's declared NFC normalizer
 - [ADR-0043](adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) — A special token is declared by the file, never inferred from its name
 - [ADR-0044](adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md) — The input normalizer follows the pre-tokenizer family's declaration

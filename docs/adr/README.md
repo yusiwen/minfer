@@ -181,6 +181,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0059](./0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md) | 2026-10-19 | the batched worker queues a request against a bounded depth, and a run that makes no progress is failed rather than waited on | Accepted (supersedes the #121 record's reject-loudly policy) |
 | [0060](./0060-a-mixture-is-a-per-tensor-policy-and-the-output-branch-runs-for-every-ftype.md) | 2026-10-19 | a mixture is a per-tensor policy over the same encoders, and the `OUTPUT`/tied branch runs for every quantizing ftype | Accepted (corrects ADR-0020) |
 | [0061](./0061-the-q6-k-dot-accumulates-in-eight-lanes-and-the-scalar-kernel-implements-that-order.md) | 2026-10-29 | the Q6_K dot accumulates in eight lanes, and the scalar kernel implements that order | Accepted |
+| [0062](./0062-a-request-message-reaches-the-prompt-as-the-client-wrote-it.md) | 2026-10-30 | a request message reaches the prompt as the client wrote it, and a replayed call that reaches nothing refuses by name | Accepted (amends ADR-0019; completes ADR-0058's message-object consequence) |
 
 ## The template
 

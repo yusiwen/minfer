@@ -471,10 +471,19 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -
 A template that never puts the definitions into the prompt — a model whose template has no `tools`
 branch, or a GGUF with no `tokenizer.chat_template` at all (the ChatML fallback has no tool format)
 — is refused **by name** with a `400`, never answered `200` with a prompt that silently dropped
-them. **Not implemented:** parsing `<tool_call>` out of the model's output into
-`choices[].message.tool_calls`, `tool_choice: "required"`, a forced function, and `tool_calls` on a
-request message (a replayed assistant call renders as its `content`). Those are
-[#613](https://github.com/yusiwen/minfer/issues/613) (message objects) and [#614](https://github.com/yusiwen/minfer/issues/614) (output extraction).
+them.
+
+A **request message is carried verbatim** (#613): an assistant turn's `tool_calls` renders through
+the model template's own replay branch (the Qwen2.5 `<tool_call>` block, byte for byte against
+transformers), the client's key order inside a message is preserved, and `name`/`tool_call_id`/any
+vendor key passes through. A malformed entry — not the OpenAI shape
+`{id, type: "function", function: {name, arguments}}` with `arguments` a JSON string — is a `400`
+naming `messages[i].tool_calls[j]`, and `tool_calls: []` is refused like `tools: []`. A template
+that would drop the call (no `tool_calls` branch, or the ChatML fallback) is refused **by name**
+too, never answered `200` with the call silently missing. **Not implemented:** parsing
+`<tool_call>` out of the model's output into `choices[].message.tool_calls`,
+`tool_choice: "required"`, and a forced function — that is
+[#614](https://github.com/yusiwen/minfer/issues/614) (output extraction).
 
 ### Metrics and observability (F8)
 
