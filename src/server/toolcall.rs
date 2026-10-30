@@ -80,6 +80,8 @@ pub struct Parser {
     /// Just closed a block: leading whitespace of the next content segment is a
     /// separator, not content.
     after_call: bool,
+    /// A malformed block seen mid-stream; surfaced by [`Self::finish`].
+    error: Option<ParseError>,
 }
 
 impl Parser {
@@ -89,14 +91,22 @@ impl Parser {
 
     /// Feed one chunk; returns the events that are final now.
     pub fn feed(&mut self, text: &str) -> Vec<Event> {
+        if self.error.is_some() {
+            return Vec::new();
+        }
         self.buf.push_str(text);
         let mut out = Vec::new();
-        self.pump(&mut out, false);
+        if let Err(e) = self.pump(&mut out, false) {
+            self.error = Some(e);
+        }
         out
     }
 
     /// Flush: the completion is over. An open block is an error.
     pub fn finish(mut self) -> Result<Vec<Event>, ParseError> {
+        if let Some(e) = self.error.take() {
+            return Err(e);
+        }
         let mut out = Vec::new();
         self.pump(&mut out, true)?;
         Ok(out)
@@ -142,19 +152,20 @@ impl Parser {
         let hold = if eos {
             0
         } else {
+            // Hold a suffix that could still become the opening tag, plus the
+            // whitespace before it: that run is a separator if the tag completes,
+            // and only content if it does not.
             let tag_prefix = longest_suffix_prefix(&self.buf, OPEN_TAG);
-            let whitespace = if self.after_call {
+            let before = &self.buf[..self.buf.len() - tag_prefix];
+            let whitespace = trailing_whitespace_len(before);
+            let hold = if self.after_call && self.buf.chars().all(char::is_whitespace) {
                 // After a call, a whitespace-only run is a separator until text
                 // proves otherwise.
-                if self.buf.chars().all(char::is_whitespace) {
-                    self.buf.len()
-                } else {
-                    0
-                }
+                self.buf.len()
             } else {
-                trailing_whitespace_len(&self.buf)
+                tag_prefix + whitespace
             };
-            tag_prefix.max(whitespace)
+            hold
         };
         let cut = self.buf.len() - hold;
         if cut > 0 {

@@ -107,7 +107,7 @@ fn error_json_format_matches_llama_cpp() {
 
 #[test]
 fn response_json_shape() {
-    let r = build_response("chatcmpl-x", "qwen", 1, "hi".into(), "stop", 3, 1);
+    let r = build_response("chatcmpl-x", "qwen", 1, "hi".into(), "stop", 3, 1, None);
     let v = serde_json::to_value(&r).unwrap();
     assert_eq!(v["object"], "chat.completion");
     assert_eq!(v["choices"][0]["message"]["role"], "assistant");
@@ -621,4 +621,48 @@ fn a_malformed_message_or_tool_call_is_a_400_naming_the_index() {
             err.message
         );
     }
+}
+
+// === #614: tool calls in the response ===================================
+
+#[test]
+fn a_response_with_tool_calls_serialises_the_openai_shape() {
+    let call = crate::server::toolcall::ToolCall {
+        name: "get_weather".to_string(),
+        arguments: r#"{"city": "Paris"}"#.to_string(),
+    };
+    let r = build_response(
+        "id",
+        "m",
+        1,
+        String::new(),
+        "tool_calls",
+        3,
+        1,
+        Some(vec![ResponseToolCall::new(&call)]),
+    );
+    let v = serde_json::to_value(&r).unwrap();
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(msg["content"], "");
+    assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(msg["tool_calls"][0]["type"], "function");
+    assert!(
+        msg["tool_calls"][0]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("call_"),
+        "the model writes no id; the response synthesises one"
+    );
+    assert_eq!(msg["tool_calls"][0]["function"]["name"], "get_weather");
+    assert_eq!(
+        msg["tool_calls"][0]["function"]["arguments"],
+        r#"{"city": "Paris"}"#
+    );
+}
+
+#[test]
+fn a_prose_response_has_no_tool_calls_field() {
+    let r = build_response("id", "m", 1, "hi".into(), "stop", 3, 1, None);
+    let v = serde_json::to_value(&r).unwrap();
+    assert!(v["choices"][0]["message"].get("tool_calls").is_none());
 }

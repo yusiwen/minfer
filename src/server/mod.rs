@@ -26,6 +26,7 @@ use axum::Router;
 use futures_util::stream::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::gguf::GgufModel;
 use crate::models::ModelDef;
@@ -531,14 +532,32 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
                 state
                     .metrics
                     .record_tokens(prompt_tokens as u64, completion_tokens as u64);
+                // #614: the completion's blocks become `tool_calls`; a block that
+                // never closed is a named refusal, never half a call in `content`.
+                let (content, calls) = match toolcall::parse_completion(&text) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        let err = ApiError::invalid_request(e.message());
+                        state.metrics.record_failed(err.error_type);
+                        return error_response(&err);
+                    }
+                };
+                let tool_calls: Vec<types::ResponseToolCall> =
+                    calls.iter().map(types::ResponseToolCall::new).collect();
+                let finish_reason = if tool_calls.is_empty() {
+                    reason
+                } else {
+                    "tool_calls".to_string()
+                };
                 let resp = types::build_response(
                     &id,
                     &model_name,
                     created,
-                    text,
-                    &reason,
+                    content,
+                    &finish_reason,
                     prompt_tokens,
                     completion_tokens,
+                    (!tool_calls.is_empty()).then_some(tool_calls),
                 );
                 (StatusCode::OK, axum::Json(resp)).into_response()
             }
@@ -597,11 +616,18 @@ async fn collect_response(
     Ok((text, reason, completion_tokens))
 }
 
-/// SSE stream: role chunk -> content chunks -> finish chunk -> [DONE].
+/// SSE stream: role chunk -> content and tool-call chunks -> finish chunk -> [DONE].
 ///
 /// `guard` rides the stream so `in_flight` only falls when the stream is dropped
 /// (client done, or disconnected mid-answer) — dropping it here instead would
 /// report the request finished while its tokens are still being written.
+///
+/// #614: the completion's text is fed through the same parser the non-streaming
+/// path uses, so a `<tool_call>` block becomes `delta.tool_calls` instead of
+/// `delta.content`. Content before the block still streams; a call's arguments are
+/// emitted as one fragment once the block's JSON is complete (the model's bytes
+/// are carried whole, never re-escaped mid-string).
+#[allow(clippy::too_many_arguments)]
 fn stream_response(
     id: &str,
     model: &str,
@@ -615,39 +641,102 @@ fn stream_response(
     let done = ok(Event::default().data("[DONE]"));
     let id_owned = id.to_string();
     let model_owned = model.to_string();
+    let mut parser = Some(toolcall::Parser::new());
+    let mut call_index = 0usize;
+    let mut saw_call = false;
     let stream = futures_util::stream::iter(vec![role])
-        .chain(
-            tokio_stream::wrappers::ReceiverStream::new(rx).map(move |ev| {
-                let _keep = &guard;
-                // F8: the worker sends `Finish` exactly once per request, so this
-                // is the streaming path's token-accounting point. A client that
-                // disconnects first drops the stream and its tokens are not
-                // counted — they were never delivered.
-                if let StreamEvent::Finish { tokens: n, .. } = &ev {
-                    tokens.record_tokens(prompt_tokens, *n as u64);
+        .chain(ReceiverStream::new(rx).flat_map(move |ev| {
+            let _keep = &guard;
+            let mut out: Vec<Result<Event, Infallible>> = Vec::new();
+            match ev {
+                StreamEvent::Text(text) => {
+                    if let Some(p) = parser.as_mut() {
+                        for event in p.feed(&text) {
+                            push_parsed(
+                                &mut out,
+                                event,
+                                &id_owned,
+                                &model_owned,
+                                created,
+                                &mut call_index,
+                                &mut saw_call,
+                            );
+                        }
+                    }
                 }
-                // #157: the streaming half of the terminal-error boundary — the
-                // error frame is this request's answer, so it is counted here and
-                // not at the worker's send site.
-                if let StreamEvent::Err(e) = &ev {
+                StreamEvent::Finish { reason, tokens: n } => {
+                    // F8: the worker sends `Finish` exactly once per request, so
+                    // this is the streaming path's token-accounting point.
+                    tokens.record_tokens(prompt_tokens, n as u64);
+                    if let Some(p) = parser.take() {
+                        match p.finish() {
+                            Ok(events) => {
+                                for event in events {
+                                    push_parsed(
+                                        &mut out,
+                                        event,
+                                        &id_owned,
+                                        &model_owned,
+                                        created,
+                                        &mut call_index,
+                                        &mut saw_call,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                // The status is long sent; the error frame is the
+                                // answer, counted here like every terminal error.
+                                let err = ApiError::invalid_request(e.message());
+                                tokens.record_failed(err.error_type);
+                                out.push(ok(Event::default().data(err.json())));
+                                return futures_util::stream::iter(out);
+                            }
+                        }
+                    }
+                    let reason = if saw_call {
+                        "tool_calls".to_string()
+                    } else {
+                        reason
+                    };
+                    out.push(ok(Event::default().data(types::chunk_finish(
+                        &id_owned,
+                        &model_owned,
+                        created,
+                        &reason,
+                    ))));
+                }
+                StreamEvent::Err(e) => {
+                    // #157: the streaming half of the terminal-error boundary —
+                    // the error frame is this request's answer.
                     tokens.record_failed(e.error_type);
+                    out.push(ok(Event::default().data(e.json())));
                 }
-                to_event(&id_owned, &model_owned, created, ev)
-            }),
-        )
+            }
+            futures_util::stream::iter(out)
+        }))
         .chain(futures_util::stream::iter(vec![done]));
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
 }
 
-fn to_event(id: &str, model: &str, created: i64, ev: StreamEvent) -> Result<Event, Infallible> {
-    let data = match ev {
-        StreamEvent::Text(t) => types::chunk_content(id, model, created, &t),
-        StreamEvent::Finish { reason, .. } => types::chunk_finish(id, model, created, &reason),
-        StreamEvent::Err(e) => e.json(),
-    };
-    Ok(Event::default().data(data))
+/// Map one parser event to SSE chunks (content, or a call's start + arguments).
+#[allow(clippy::too_many_arguments)]
+fn push_parsed(
+    out: &mut Vec<Result<Event, Infallible>>,
+    event: toolcall::Event,
+    id: &str,
+    model: &str,
+    created: i64,
+    call_index: &mut usize,
+    saw_call: &mut bool,
+) {
+    if matches!(event, toolcall::Event::Call(_)) {
+        *saw_call = true;
+    }
+    for payload in types::chunks_for_tool_event(id, model, created, call_index, &event) {
+        out.push(ok(Event::default().data(payload)));
+    }
 }
 
 fn ok(e: Event) -> Result<Event, Infallible> {
