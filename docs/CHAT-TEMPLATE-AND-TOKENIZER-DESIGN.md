@@ -272,6 +272,35 @@ call" (Qwen2.5 concatenates `message.content`, null for a call-only turn). The c
 output back into `choices[].message.tool_calls` remains the separate increment
 ([#614](https://github.com/yusiwen/minfer/issues/614)).
 
+### 2.9 A completion's tool call is extracted (#614, ADR-0063)
+
+`src/server/toolcall.rs` is the request carrier's mirror image. Both response paths run the
+completion through one parser, so the serial and batched engines share it:
+
+- **The parser is incremental.** `feed` holds back a suffix that could still become
+  `<tool_call>`, parses the block only once its JSON value is complete, and never splits on
+  `</tool_call>` with `str::find` — the arguments may contain that literal inside a string.
+- **The arguments are the model's bytes.** A JSON object is carried as its own source slice
+  (`serde_json`'s `raw_value`; whitespace and key order included), a JSON string is decoded.
+- **The response is OpenAI's shape.** `message.tool_calls` (a synthesised `call_…` id,
+  `type: "function"`, name, arguments) and `finish_reason: "tool_calls"`; `content` is the text
+  outside the blocks. A block whose arguments were cut off is a named `400`, never half a call
+  in `content`.
+- **Streaming reuses the mapping.** A call is a `delta.tool_calls` start chunk plus one
+  arguments fragment; content keeps streaming. `types::chunks_for_tool_event` is shared by the
+  handler and the differential test that folds the deltas back into the non-streaming message.
+- **`tool_choice: "required"` / a forced function are enforced**, not accepted-and-ignored: a
+  GBNF built from the schema compiler's `j-object` rules wrapped in the model's `<tool_call>`
+  syntax fixes or enumerates the name. Boundaries are named `400`s — a template without that
+  format (other families need the template analysis llama.cpp's auto-parser does), a combination
+  with `grammar`/a non-text `response_format`, the speculative engine, or a forced name that is
+  not offered.
+
+The reference is transformers 5.17.0's `chat_parsing.parse_response` with its Qwen response
+template (`tests/fixtures/chat/parse_qwen2.5.json`, 12 cases). One case records a deliberate
+divergence: the reference splits at the first `</tool_call>` inside a string and refuses; this
+parser scans the JSON value and accepts.
+
 ## 3. Tokenizer — accepted, refused, detected
 
 ### 3.0 The engine comes first: `tokenizer.ggml.model` (#132 S4, 2026-10-15/16; ADR-0045–ADR-0052)
@@ -564,6 +593,10 @@ return.
 | A message's own JSON | unit test: the replayed round-trip (user → assistant with `tool_calls` and null content → tool → generation prompt) renders byte for byte; the client's key order survives in both directions; a vendor key survives `| tojson`; the `(role, content)` adapter and the raw objects render identical bytes | transformers 5.17.0, `scripts/gen_tools_fixture.py` (#613) |
 | A replayed call that reaches nothing refuses | unit + e2e: a template without a `tool_calls` branch and the ChatML fallback each refuse with kind `tool calls not rendered`; a vendor key does not trigger the check; a valid replay is served | the mechanical two-pass check (ADR-0062) |
 | The request message surface | unit: a non-object message, a non-string `role`/`content`, a non-array or empty `tool_calls`, and a missing `id`/`function`/`name` or object `arguments` are `400`s naming `messages[i].tool_calls[j]` | OpenAI's shapes (#613) |
+| A tool call is extracted | unit test over `tests/fixtures/chat/parse_qwen2.5.json`: 12 completions (one/two calls, content around them, string arguments, HTML/unicode, a `</tool_call>` inside a string, extra keys, prose, three truncated shapes) compared to the reference's `tool_calls` and, for object arguments, to the block's own bytes | transformers 5.17.0 `chat_parsing.parse_response` + its Qwen response template, `scripts/gen_tool_call_parse_fixture.py` (#614) |
+| The deltas rebuild the call | unit test: the event→chunk mapping folded at six chunk splits equals the non-streaming `build_response` | the shipped mapping (`types::chunks_for_tool_event`) |
+| A truncated call refuses | unit + e2e: a block cut inside its JSON, or inside a partial closing tag, is an error; the HTTP surface answers `400` naming the block | the parser (ADR-0063) |
+| `tool_choice` is constrained | unit: the grammar closes the object and names/enumerates the tool and compiles over a byte vocabulary; e2e: `"required"` and a forced function each return a `tool_calls` completion on the toy model, an unconstrainable template and a `grammar` conflict are `400`s | the GBNF on the model's call format (#614) |
 | `tojson` is CPython's | unit test over `tests/fixtures/chat/tojson_cpython.json`: nine entries (separators, key order, `ensure_ascii=False`, unescaped HTML characters, controls, empty containers, non-object roots, the pretty form) compare byte for byte; an unhonoured keyword (`sort_keys`) is refused by name | CPython 3.12.3 `json.dumps`, `scripts/gen_chat_fixtures.py --check` |
 | Key order survives the parse | unit test: the ordered carrier keeps `{"z":1,"a":…}` in document order through deserialize + re-serialize, and a tools request keeps `type` before `function` | the client's own JSON (#597) |
 | Tools that reach nothing refuse | unit test: a template with no `tools` branch and the ChatML fallback each refuse with kind `tools not rendered` and name the cause; the same conversation without tools still renders | the mechanical two-pass check (ADR-0058) |
@@ -597,6 +630,7 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0057](adr/0057-a-template-file-overrides-the-gguf-and-time-enters-through-one-clock.md) — A template file overrides the GGUF copy, and time enters a render through one injected clock
 - [ADR-0058](adr/0058-tools-reach-the-prompt-as-the-client-wrote-them.md) — A request's tools reach the prompt as the client wrote them, and a template that drops them refuses by name
 - [ADR-0062](adr/0062-a-request-message-reaches-the-prompt-as-the-client-wrote-it.md) — A request message reaches the prompt as the client wrote it, and a replayed tool call that reaches nothing refuses by name
+- [ADR-0063](adr/0063-a-completion-s-tool-call-is-extracted-and-tool-choice-constrains-the-model-s-own-format.md) — A completion's tool call is extracted, and `tool_choice` is a grammar on the model's own call format
 - [ADR-0042](adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md) — The tokenizer applies the model's declared NFC normalizer
 - [ADR-0043](adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) — A special token is declared by the file, never inferred from its name
 - [ADR-0044](adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md) — The input normalizer follows the pre-tokenizer family's declaration

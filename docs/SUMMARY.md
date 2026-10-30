@@ -81,6 +81,7 @@
     - [0060. A mixture is a per-tensor policy over the same encoders, and the OUTPUT/tied branch runs for every quantizing ftype](./adr/0060-a-mixture-is-a-per-tensor-policy-and-the-output-branch-runs-for-every-ftype.md)
     - [0061. The Q6_K dot accumulates in eight lanes, and the scalar kernel implements that order](./adr/0061-the-q6-k-dot-accumulates-in-eight-lanes-and-the-scalar-kernel-implements-that-order.md)
     - [0062. A request message reaches the prompt as the client wrote it, and a replayed tool call that reaches nothing refuses by name](./adr/0062-a-request-message-reaches-the-prompt-as-the-client-wrote-it.md)
+    - [0063. A completion's tool call is extracted, and tool_choice is a grammar on the model's own call format](./adr/0063-a-completion-s-tool-call-is-extracted-and-tool-choice-constrains-the-model-s-own-format.md)
 
 # Model Support
 

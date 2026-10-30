@@ -480,10 +480,21 @@ vendor key passes through. A malformed entry — not the OpenAI shape
 `{id, type: "function", function: {name, arguments}}` with `arguments` a JSON string — is a `400`
 naming `messages[i].tool_calls[j]`, and `tool_calls: []` is refused like `tools: []`. A template
 that would drop the call (no `tool_calls` branch, or the ChatML fallback) is refused **by name**
-too, never answered `200` with the call silently missing. **Not implemented:** parsing
-`<tool_call>` out of the model's output into `choices[].message.tool_calls`,
-`tool_choice: "required"`, and a forced function — that is
-[#614](https://github.com/yusiwen/minfer/issues/614) (output extraction).
+too, never answered `200` with the call silently missing.
+
+**A completion's call is extracted** (#614): a `<tool_call>` block the model writes comes back as
+`choices[].message.tool_calls` with `finish_reason: "tool_calls"`, the arguments exactly as the
+model wrote them (an object keeps its own bytes; a JSON string is decoded), and a synthesised
+`call_…` id a client can echo as `tool_call_id`. Streaming sends a `delta.tool_calls` start chunk
+followed by one arguments fragment; concatenating the deltas reproduces the non-streaming call.
+Text outside a block stays `content`. A completion cut off inside a block is a `400` naming the
+block, never a `200` with half a call in `content`.
+
+`tool_choice: "required"` and a forced function are **enforced** with a grammar over the model's
+own `<tool_call>` format (Qwen2/Qwen3): the name is enumerated or fixed, so the returned call is
+the one demanded. A template that emits another family's call syntax, a combination with
+`grammar`/a non-text `response_format`, the speculative draft engine, or a forced name that is not
+in `tools` are each a named `400`.
 
 ### Metrics and observability (F8)
 

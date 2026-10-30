@@ -182,6 +182,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0060](./0060-a-mixture-is-a-per-tensor-policy-and-the-output-branch-runs-for-every-ftype.md) | 2026-10-19 | a mixture is a per-tensor policy over the same encoders, and the `OUTPUT`/tied branch runs for every quantizing ftype | Accepted (corrects ADR-0020) |
 | [0061](./0061-the-q6-k-dot-accumulates-in-eight-lanes-and-the-scalar-kernel-implements-that-order.md) | 2026-10-29 | the Q6_K dot accumulates in eight lanes, and the scalar kernel implements that order | Accepted |
 | [0062](./0062-a-request-message-reaches-the-prompt-as-the-client-wrote-it.md) | 2026-10-30 | a request message reaches the prompt as the client wrote it, and a replayed call that reaches nothing refuses by name | Accepted (amends ADR-0019; completes ADR-0058's message-object consequence) |
+| [0063](./0063-a-completion-s-tool-call-is-extracted-and-tool-choice-constrains-the-model-s-own-format.md) | 2026-10-30 | a completion's tool call is extracted, and `tool_choice` is a grammar on the model's own call format | Accepted (amends ADR-0019; completes ADR-0062 decision 6) |
 
 ## The template
 
