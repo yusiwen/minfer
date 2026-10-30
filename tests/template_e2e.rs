@@ -226,6 +226,11 @@ const TOOLS_BRANCH_TEMPLATE: &str =
 /// request carrying one is served instead of being dropped at the message type.
 const TOOL_CALLS_TEMPLATE: &str = "{% for m in messages %}[{{ m.role }}{% for c in m.tool_calls %}|{{ c.function.name }}={{ c.function.arguments }}{% endfor %}]{% endfor %}";
 
+/// A template that renders messages but has no `tool_calls` branch (#613): the
+/// call would reach nothing, so the server refuses it by name.
+const NO_REPLAY_BRANCH_TEMPLATE: &str =
+    "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}";
+
 #[test]
 fn serve_starts_and_answers_health_with_an_override_file() {
     let model = test_model();
@@ -508,5 +513,24 @@ fn serve_carries_a_replayed_tool_call_and_refuses_a_malformed_one_by_index() {
     assert!(
         response.contains("messages[1].tool_calls[0]"),
         "the refusal must name the entry; body:\n{response}"
+    );
+
+    // A template with no replay branch: the call would reach nothing, so it is a
+    // 400 naming the missing branch instead of an empty assistant turn (#613 S5).
+    let branchless = template_file("no-tool-calls.jinja", NO_REPLAY_BRANCH_TEMPLATE);
+    let mut server = Server::spawn("serve", &model.to_string_lossy(), 18109, Some(&branchless));
+    assert!(
+        server.wait_listening(),
+        "no banner; log so far:\n{}",
+        server.log()
+    );
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(replayed));
+    assert_eq!(
+        status, 400,
+        "a template without a replay branch must refuse the call; body:\n{response}"
+    );
+    assert!(
+        response.contains("tool calls not rendered") && response.contains("no `tool_calls` branch"),
+        "the refusal must name the missing branch; body:\n{response}"
     );
 }

@@ -121,3 +121,92 @@ fn the_tools_entry_point_still_carries_the_same_message_bytes() {
         render_messages_opt_with_tools_raw(Some(&template), &objects, None, true, "").unwrap()
     );
 }
+
+// === The refusal: a replayed call that reaches nothing (#613, S5) ========
+
+/// A template with no `tool_calls` branch — the witness for a template a
+/// replayed call cannot reach.
+const NO_REPLAY_BRANCH: &str = "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}";
+
+fn replayed() -> Vec<ToolJson> {
+    vec![
+        message(r#"{"role":"user","content":"Weather in Paris?"}"#),
+        message(
+            r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}]}"#,
+        ),
+    ]
+}
+
+#[test]
+fn a_template_without_a_replay_branch_refuses_a_replayed_call() {
+    let err =
+        render_messages_opt_with_tools_raw(Some(NO_REPLAY_BRANCH), &replayed(), None, true, "")
+            .expect_err("a template with no `tool_calls` branch must refuse");
+    assert_eq!(err.kind, "tool calls not rendered");
+    assert!(
+        err.message().contains("no `tool_calls` branch"),
+        "the refusal must name the missing branch: {}",
+        err.message()
+    );
+    // ...and the same conversation without the calls still renders, so the
+    // refusal is about the call and nothing else.
+    let plain = vec![replayed()[0].clone()];
+    assert!(
+        render_messages_opt_with_tools_raw(Some(NO_REPLAY_BRANCH), &plain, None, true, "")
+            .unwrap()
+            .contains("Weather in Paris?")
+    );
+}
+
+#[test]
+fn the_chatml_fallback_refuses_a_replayed_call() {
+    let err = render_messages_opt_with_tools_raw(None, &replayed(), None, true, "")
+        .expect_err("the ChatML fallback has no tool-call format");
+    assert_eq!(err.kind, "tool calls not rendered");
+    assert!(
+        err.message().contains("ChatML fallback"),
+        "the refusal must name the fallback: {}",
+        err.message()
+    );
+    assert!(
+        !err.message().contains("Supported Python str methods"),
+        "a tool-call refusal must not blame the str-method hook: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn a_vendor_key_is_not_a_replayed_call() {
+    // The check is scoped to `tool_calls`: an unknown key a template ignores must
+    // not turn into a refusal.
+    let objects = vec![message(r#"{"role":"user","content":"hi","x_vendor":1}"#)];
+    let got = render_messages_opt_with_tools_raw(
+        Some("{% for m in messages %}{{ m.role }}:{{ m.content }}{% endfor %}"),
+        &objects,
+        None,
+        true,
+        "",
+    )
+    .expect("a vendor key is the template's business, not a refusal");
+    assert_eq!(got, "user:hi");
+}
+
+#[test]
+fn the_replay_branch_is_reached_and_changes_the_bytes() {
+    // Positive control for the check: with the branch, the call reaches the prompt.
+    // The tools are supplied because the Qwen2.5 replay branch lives inside its
+    // `{% if tools %}` block.
+    let tools = vec![message(
+        r#"{"type":"function","function":{"name":"get_weather"}}"#,
+    )];
+    let got = render_messages_opt_with_tools_raw(
+        Some(&qwen_template()),
+        &replayed(),
+        Some(&tools),
+        true,
+        "",
+    )
+    .expect("the Qwen2.5 template has a `tool_calls` branch");
+    assert!(got.contains("<tool_call>"), "got: {got}");
+    assert!(got.contains("get_weather"), "got: {got}");
+}
