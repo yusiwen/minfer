@@ -40,10 +40,20 @@ struct Server {
 
 impl Server {
     fn spawn(mode: &str, model: &str, port: u16, template: Option<&Path>) -> Server {
+        Self::spawn_with_ctx(mode, model, port, template, 64)
+    }
+
+    fn spawn_with_ctx(
+        mode: &str,
+        model: &str,
+        port: u16,
+        template: Option<&Path>,
+        n_ctx: u32,
+    ) -> Server {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_minfer"));
         cmd.arg(mode)
             .arg(model)
-            .args(["--port", &port.to_string(), "--n-ctx", "64"]);
+            .args(["--port", &port.to_string(), "--n-ctx", &n_ctx.to_string()]);
         if let Some(t) = template {
             cmd.arg("--chat-template").arg(t);
         }
@@ -532,5 +542,118 @@ fn serve_carries_a_replayed_tool_call_and_refuses_a_malformed_one_by_index() {
     assert!(
         response.contains("tool calls not rendered") && response.contains("no `tool_calls` branch"),
         "the refusal must name the missing branch; body:\n{response}"
+    );
+}
+
+/// #614: a completion containing a `<tool_call>` block becomes `tool_calls`, and
+/// an output cut off inside the block is a named refusal.
+///
+/// The completion is forced deterministically with a request grammar, so the toy
+/// model produces the block regardless of its weights — the same lever the
+/// real-model gates use, with no cached model needed.
+#[test]
+fn serve_extracts_a_tool_call_from_the_completion_and_refuses_a_truncated_one() {
+    let model = test_model();
+    let template = template_file("tool-calls-extract.jinja", TOOLS_BRANCH_TEMPLATE);
+    let mut server = Server::spawn_with_ctx(
+        "serve",
+        &model.to_string_lossy(),
+        18110,
+        Some(&template),
+        256,
+    );
+    assert!(
+        server.wait_listening(),
+        "no banner; log so far:\n{}",
+        server.log()
+    );
+
+    let block = r#"root ::= "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>""#;
+    let request = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+        "grammar": block,
+        "max_tokens": 96,
+    })
+    .to_string();
+
+    let (status, body) = server.request("POST", "/v1/chat/completions", Some(&request));
+    assert_eq!(status, 200, "body:\n{body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("completion json");
+    let choice = &parsed["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "body:\n{body}");
+    assert_eq!(choice["message"]["content"], "", "body:\n{body}");
+    let calls = choice["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls");
+    assert_eq!(calls.len(), 1, "body:\n{body}");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    assert_eq!(
+        calls[0]["function"]["arguments"], r#"{"city": "Paris"}"#,
+        "the arguments are the block's own bytes"
+    );
+    assert!(
+        calls[0]["id"].as_str().unwrap().starts_with("call_"),
+        "the response synthesises an id"
+    );
+
+    // Streaming: the deltas rebuild the same call.
+    let streaming = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+        "grammar": block,
+        "max_tokens": 96,
+        "stream": true,
+    })
+    .to_string();
+    let (status, body) = server.request("POST", "/v1/chat/completions", Some(&streaming));
+    assert_eq!(status, 200, "stream body:\n{body}");
+    let mut delta_args = String::new();
+    let mut delta_name = String::new();
+    let mut finish = String::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let chunk: serde_json::Value = serde_json::from_str(data).expect("chunk json");
+        let choice = &chunk["choices"][0];
+        if let Some(reason) = choice["finish_reason"].as_str() {
+            finish = reason.to_string();
+        }
+        if let Some(list) = choice["delta"]["tool_calls"].as_array() {
+            for call in list {
+                if let Some(name) = call["function"]["name"].as_str() {
+                    delta_name = name.to_string();
+                }
+                if let Some(args) = call["function"]["arguments"].as_str() {
+                    delta_args.push_str(args);
+                }
+            }
+        }
+    }
+    assert_eq!(finish, "tool_calls", "stream body:\n{body}");
+    assert_eq!(delta_name, "get_weather");
+    assert_eq!(delta_args, r#"{"city": "Paris"}"#, "stream body:\n{body}");
+
+    // Truncated inside the block: a named 400, never a half-call in content.
+    let truncated = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        "grammar": block,
+        // Enough for the opening tag and the start of the JSON, not for the call.
+        "max_tokens": 20,
+    })
+    .to_string();
+    let (status, body) = server.request("POST", "/v1/chat/completions", Some(&truncated));
+    assert_eq!(status, 400, "body:\n{body}");
+    assert!(
+        body.contains("tool-call block"),
+        "the refusal must name the block; body:\n{body}"
     );
 }

@@ -264,3 +264,102 @@ fn the_transformers_reference_parses_identically() {
     assert_eq!(seen, fx.cases.len());
     assert_eq!(fx.cases.len(), 12, "fixture shrank");
 }
+
+// === Streaming: the deltas rebuild the non-streaming message =============
+
+/// Fold SSE payloads into (content, [(id, name, arguments)]), the way a client
+/// assembles `delta` chunks.
+fn fold_chunks(payloads: &[String]) -> (String, Vec<(String, String, String)>) {
+    let mut content = String::new();
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    for payload in payloads {
+        let v: serde_json::Value = serde_json::from_str(payload).expect("chunk json");
+        let delta = &v["choices"][0]["delta"];
+        if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+            content.push_str(c);
+        }
+        if let Some(list) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+            for tc in list {
+                let i = tc["index"].as_u64().unwrap() as usize;
+                while calls.len() <= i {
+                    calls.push((String::new(), String::new(), String::new()));
+                }
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    calls[i].0 = id.to_string();
+                }
+                if let Some(name) = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                {
+                    calls[i].1 = name.to_string();
+                }
+                if let Some(args) = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                {
+                    calls[i].2.push_str(args);
+                }
+            }
+        }
+    }
+    (content, calls)
+}
+
+#[test]
+fn streamed_deltas_rebuild_the_non_streaming_tool_calls() {
+    use crate::server::types;
+    let text = format!("Let me check.\n{CALL}\n{CALL}");
+    let (want_content, want_calls) = parse_completion(&text).unwrap();
+    let response = types::build_response(
+        "id",
+        "m",
+        1,
+        want_content.clone(),
+        "tool_calls",
+        1,
+        1,
+        Some(
+            want_calls
+                .iter()
+                .map(types::ResponseToolCall::new)
+                .collect(),
+        ),
+    );
+    let response = serde_json::to_value(&response).unwrap();
+    let message = &response["choices"][0]["message"];
+
+    for split in [1usize, 2, 3, 5, 7, 4096] {
+        let mut parser = Parser::new();
+        let mut index = 0usize;
+        let mut payloads = Vec::new();
+        for chunk in text.as_bytes().chunks(split) {
+            let text = std::str::from_utf8(chunk).unwrap();
+            for event in parser.feed(text) {
+                payloads.extend(types::chunks_for_tool_event(
+                    "id", "m", 1, &mut index, &event,
+                ));
+            }
+        }
+        for event in parser.finish().unwrap() {
+            payloads.extend(types::chunks_for_tool_event(
+                "id", "m", 1, &mut index, &event,
+            ));
+        }
+
+        let (content, calls) = fold_chunks(&payloads);
+        assert_eq!(content, want_content, "split {split}");
+        assert_eq!(
+            calls.len(),
+            message["tool_calls"].as_array().unwrap().len(),
+            "split {split}"
+        );
+        for (i, (id, name, arguments)) in calls.iter().enumerate() {
+            let want = &message["tool_calls"][i];
+            assert!(id.starts_with("call_"), "split {split}: {id}");
+            assert_eq!(name, want["function"]["name"].as_str().unwrap());
+            assert_eq!(arguments, want["function"]["arguments"].as_str().unwrap());
+        }
+    }
+}

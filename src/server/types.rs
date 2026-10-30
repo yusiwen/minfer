@@ -658,6 +658,40 @@ pub struct Choice {
 pub struct ResponseMessage {
     pub role: &'static str,
     pub content: String,
+    /// Present only when the completion carried a tool-call block (#614).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ResponseToolCall>>,
+}
+
+/// One OpenAI tool call in a response.
+#[derive(Serialize)]
+pub struct ResponseToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: ResponseFunction,
+}
+
+#[derive(Serialize)]
+pub struct ResponseFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ResponseToolCall {
+    /// The response shape of a parsed call. The model does not write an id, so
+    /// one is synthesised here — a client needs it for the follow-up `tool`
+    /// message's `tool_call_id` (llama.cpp leaves it out; OpenAI requires it).
+    pub fn new(call: &crate::server::toolcall::ToolCall) -> Self {
+        Self {
+            id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+            kind: "function",
+            function: ResponseFunction {
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -676,6 +710,7 @@ pub fn build_response(
     finish_reason: &str,
     prompt_tokens: usize,
     completion_tokens: usize,
+    tool_calls: Option<Vec<ResponseToolCall>>,
 ) -> ChatCompletionResponse {
     ChatCompletionResponse {
         id: id.to_string(),
@@ -687,6 +722,7 @@ pub fn build_response(
             message: ResponseMessage {
                 role: "assistant",
                 content: text,
+                tool_calls,
             },
             finish_reason: finish_reason.to_string(),
         }],
@@ -724,6 +760,96 @@ pub fn chunk_content(id: &str, model: &str, created: i64, text: &str) -> String 
         "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}],
     })
     .to_string()
+}
+
+/// First chunk of a streamed tool call: index, id, type and the function name;
+/// the arguments follow in [`chunk_tool_call_arguments`] fragments.
+pub fn chunk_tool_call_start(
+    id: &str,
+    model: &str,
+    created: i64,
+    index: usize,
+    call_id: &str,
+    name: &str,
+) -> String {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": index,
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": ""},
+            }]},
+            "finish_reason": null,
+        }],
+    })
+    .to_string()
+}
+
+/// One arguments fragment of a streamed tool call.
+pub fn chunk_tool_call_arguments(
+    id: &str,
+    model: &str,
+    created: i64,
+    index: usize,
+    fragment: &str,
+) -> String {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{"index": index, "function": {"arguments": fragment}}]},
+            "finish_reason": null,
+        }],
+    })
+    .to_string()
+}
+
+/// The SSE payloads for one parser event: a content chunk, or a call's start and
+/// its arguments fragment. The streaming handler and its differential test both
+/// go through this one mapping.
+pub fn chunks_for_tool_event(
+    id: &str,
+    model: &str,
+    created: i64,
+    call_index: &mut usize,
+    event: &crate::server::toolcall::Event,
+) -> Vec<String> {
+    match event {
+        crate::server::toolcall::Event::Content(text) => {
+            vec![chunk_content(id, model, created, text)]
+        }
+        crate::server::toolcall::Event::Call(call) => {
+            let call = ResponseToolCall::new(call);
+            let mut out = vec![chunk_tool_call_start(
+                id,
+                model,
+                created,
+                *call_index,
+                &call.id,
+                &call.function.name,
+            )];
+            if !call.function.arguments.is_empty() {
+                out.push(chunk_tool_call_arguments(
+                    id,
+                    model,
+                    created,
+                    *call_index,
+                    &call.function.arguments,
+                ));
+            }
+            *call_index += 1;
+            out
+        }
+    }
 }
 
 /// Final chunk: empty delta + finish_reason.
