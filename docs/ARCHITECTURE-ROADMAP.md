@@ -439,7 +439,7 @@ Two smaller but immediate items sit in this layer:
   `forward_graph_cached`; the speculative path calls both models' forwards
   directly (`spec.rs`) and the tokenizer, sampler and stop-string paths were
   bare. A panic in any of them unwound `worker_loop`, dropping the bounded job
-  channel (capacity 64, `server/mod.rs:66`) — later requests got 503 — and the
+  channel (capacity 64, `server/mod.rs:68`) — later requests got 503 — and the
   queued jobs' `StreamEvent` senders, ending their SSE
   (Server-Sent Events) stream after an empty `[DONE]` rather than an error
   (`server/mod.rs:`). The whole per-job body now runs under

@@ -331,3 +331,13 @@ symbol = "render_at"
 adr = "0062"
 what = "`messages` is the client's own JSON: role/content are validated, every other key passes through, and a malformed `tool_calls` entry is a 400 naming the index"
 symbol = "validate_message"
+
+[[governs]]
+adr = "0063"
+what = "a completion's `<tool_call>` block is extracted as OpenAI `tool_calls` (arguments as the model's bytes, `finish_reason: tool_calls`, a truncated block is a refusal)"
+symbol = "parse_completion"
+
+[[governs]]
+adr = "0063"
+what = "`tool_choice: required` and a forced function are enforced by a GBNF on the model's `<tool_call>` format"
+symbol = "forced_call_grammar"

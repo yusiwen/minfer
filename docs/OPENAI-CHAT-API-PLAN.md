@@ -191,7 +191,7 @@ touch behavior):
 | Prompt caching / KV reuse across requests | Slots keep their KV between requests; a shared-prefix matcher is future work |
 | SSE `stream_options.include_usage` | OpenAI extension, not in MVP scope |
 | Multimodal content arrays / embeddings | Non-goals (MVP) |
-| Tool-call **extraction** (the prompt side shipped, and a replayed request message carries `tool_calls` — §Tool Calling) | [#614](https://github.com/yusiwen/minfer/issues/614) |
+| ~~Tool-call extraction~~ | shipped ([#614](https://github.com/yusiwen/minfer/issues/614)): a `<tool_call>` completion becomes `message.tool_calls` (`finish_reason: "tool_calls"`), and `tool_choice: "required"`/a forced function are enforced by a grammar |
 
 > **Update (2026-09-15):** the f16 KV cache, listed as deferred in rev 5, has
 > since shipped — `MINFER_CACHE_TYPE=f16` with auto-selection for 7B-class
@@ -332,8 +332,11 @@ A request message is the client's own JSON (#613): an assistant turn's `tool_cal
 through the template's replay branch, key order is preserved, and a template that would drop the
 call is a `400` (`tool calls not rendered`) rather than a `200` with the call missing.
 
-Not implemented: parsing `<tool_call>` out of the model's output, `tool_choice: "required"`, and a
-forced function — that is [#614](https://github.com/yusiwen/minfer/issues/614).
+A completion's `<tool_call>` block becomes `choices[].message.tool_calls` (`finish_reason:
+"tool_calls"`; arguments as the model wrote them; a `call_…` id synthesised), and `tool_choice:
+"required"` / a forced function are enforced by a grammar on the model's own call format —
+other formats, `grammar` conflicts and a forced name outside `tools` are named `400`s (#614,
+ADR-0063).
 
 ### Stop Strings
 
