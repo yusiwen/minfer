@@ -104,7 +104,7 @@ Measured records name it absolutely, never as "this box" (gate contract rule 5).
 | CPU (aarch64 NEON+SDOT) | ✅ | ✅ | Primary correctness net here |
 | CUDA (sm_121) | ✅ | ✅ **device since 2026-09-18** | GB10 (121.6 GiB, driver 580.178.04, CUDA 13.0). Device-gated tests are still **local-only**: CI has no GPU, so its CUDA job only compiles the harness (F-campaign note in §14 row 1) |
 | Metal | ❌ | ❌ | macOS-only code, not compilable here → Phase G |
-| x86 AVX2 / AVX-512 | ❌ | ❌ | dgxspark cannot build/run x86. Item 11 was measured on an x86 host on 2026-10-08 (dots) and 2026-10-29 (the repack NULL, then the Q4_K and Q5_K/Q6_K kernel folds, [#688](https://github.com/yusiwen/minfer/issues/688) / [#689](https://github.com/yusiwen/minfer/issues/689)) |
+| x86 AVX2 / AVX-512 | ❌ | ❌ | dgxspark cannot build/run x86. Item 11 was measured on an x86 host on 2026-10-08 (dots) and 2026-10-29 (the repack NULL, then the Q4_K and Q5_K/Q6_K kernel folds, [#688](https://github.com/yusiwen/minfer/issues/688) / [#689](https://github.com/yusiwen/minfer/issues/689), and the Q6_K lane order, [#693](https://github.com/yusiwen/minfer/issues/693)) |
 
 **A0 verdict (2026-09-16) — superseded (2026-09-18).** It read "CUDA is
 compile-only in this environment", and for two days every CUDA ticket's acceptance
@@ -7566,7 +7566,7 @@ Can run in parallel with A–E by a different workstream.
 
 | ID | Item | Title | Effort | Box needed |
 |---|---|---|---|---|
-| F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) — **DONE**: dots landed 2026-10-08 on an x86 host (bitwise gates; AVX-512/VNNI selected at runtime); the repacking increment was **measured NULL on 2026-10-29** ([#433](https://github.com/yusiwen/minfer/issues/433)) and replaced by kernel folds — Q4_K ([#688](https://github.com/yusiwen/minfer/issues/688)), then Q5_K + Q6_K AVX2 arm ([#689](https://github.com/yusiwen/minfer/issues/689)) | L | x86 |
+| F1 | 11 | AVX2/AVX-512 dots for the K-quants + weight repacking · [#56](https://github.com/yusiwen/minfer/issues/56) — **DONE**: dots landed 2026-10-08 on an x86 host (bitwise gates; AVX-512/VNNI selected at runtime); the repacking increment was **measured NULL on 2026-10-29** ([#433](https://github.com/yusiwen/minfer/issues/433)) and replaced by kernel folds — Q4_K ([#688](https://github.com/yusiwen/minfer/issues/688)), then Q5_K + Q6_K AVX2 arm ([#689](https://github.com/yusiwen/minfer/issues/689)), then the Q6_K lane order ([#693](https://github.com/yusiwen/minfer/issues/693)) | L | x86 |
 | F2 | 15 | GBNF-style grammar + JSON-schema constrained decoding · [#47](https://github.com/yusiwen/minfer/issues/47) — **DONE 2026-09-24** · follow-ups [#125](https://github.com/yusiwen/minfer/issues/125) (refused constructs), [#126](https://github.com/yusiwen/minfer/issues/126) (mask cost — **DONE 2026-10-14**) | M | dgxspark |
 | F3 | 16 | Sampler set: min-p, typical, XTC, DRY, mirostat, logit bias · [#48](https://github.com/yusiwen/minfer/issues/48) — **DONE 2026-09-24** | M | dgxspark |
 | F4 | 12 | Backend registry (drop the compile-time enum) · [#57](https://github.com/yusiwen/minfer/issues/57) — **DONE 2026-09-24** · the per-device KV-format capability [#87](https://github.com/yusiwen/minfer/issues/87) needs is now a **used** registry field (`BackendCaps::reads_packed_kv`), not a hardcoded CPU test | M | dgxspark |
@@ -7581,10 +7581,13 @@ the increment it left open was **weight repacking**, which a four-arm probe
 end, because the decode is only 20–23% of a dot call. What pays is the kernel
 half: the Q4_K fold landed first ([#688](https://github.com/yusiwen/minfer/issues/688),
 −42.5% AVX2 / −45.5% AVX-512), then Q5_K and the Q6_K AVX2 arm ([#689](https://github.com/yusiwen/minfer/issues/689),
-−36%/−33% and −40%). Q6_K on AVX-512 is the one measured piece below the bar
-(−9.2%: the serial f32 fold is the floor), so that kernel stays in its raw shape
-with the measurement in a comment; whether an AVX-512 machine should simply run
-the faster AVX2 arm is a follow-up question, not an open F1 item.
+−36%/−33% and −40%). Q6_K on AVX-512 measured −9.2% at the time (the serial f32 fold was the floor),
+and [#693](https://github.com/yusiwen/minfer/issues/693) then removed the floor by
+moving the dot's reference order to an eight-lane accumulation
+([ADR-0061](adr/0061-the-q6-k-dot-accumulates-in-eight-lanes-and-the-scalar-kernel-implements-that-order.md)):
+AVX2 312.8 → 180.4 ns and AVX-512 363.6 → 180.9 ns on nuc11, so the two arms tie
+and the dispatch question of [#691](https://github.com/yusiwen/minfer/issues/691)
+is closed.
 
 **F1 is closed.** The hardware lane section below is kept as the record of why
 the lane needed an x86 box, not as an open ask.
@@ -10364,7 +10367,7 @@ Phase B  ├─ B1 ✔ ─ B2 ✔ ─ B3 ✔                          (starts on
 Phase C  ├─ C1 ✔ ─ C2 ✔ ─────► C3 ✔ ─ C4 ✔ ─ C5 ✔ ─ C6 ✔ ─ C7 ✔ ─ C8 ✔   (C8 covers C8a/C8b, and C8b's S1a–S5; C3 needed D1; the CUDA path first, per the 2026-09-20 decision)
 Phase D  ├────────── D1 ✔ ─ D2 ✔ ─ D3 ✔ ──────────────►         (D unlocks MoE/MLA)
 Phase E  ├──────────────────── E1 ✔ ─ E1b ✔ ─ E2 ✔ ─ E3 ✔ ─ E4 ✔ ─ E5 ✔ ─ E6 ✔        (E1b device-verified; E2 closed: CPU 0.49x, GPU 1.9x)
-Phase F  └─ F1 ✔ ─ F2 ✔ ─ F3 ✔ ─ F4 ✔ ─ F5 ✔ ─ F6 ✔ ─ F7 ✔ ─ F8 ✔        (F1: dots #56, repacking measured NULL #433, kernel folds #688 + #689)
+Phase F  └─ F1 ✔ ─ F2 ✔ ─ F3 ✔ ─ F4 ✔ ─ F5 ✔ ─ F6 ✔ ─ F7 ✔ ─ F8 ✔        (F1: dots #56, repacking measured NULL #433, kernel folds #688 + #689, Q6_K lane order #693)
 Phase G  └─────────────────► G1 ✔ ─ G2 ✔ ─ G3 ✔ ─ G5 ✔ ─ G4 ✔ ─ G6 ✔ ─ G7 ✔   (after C8; G1–G3 compile-verified in CI; device claims need a Mac)
 ```
 
