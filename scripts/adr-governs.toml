@@ -321,3 +321,13 @@ symbol = "output_branch"
 adr = "0061"
 what = "the Q6_K dot's reference order is eight lanes accumulated across the row, not a per-group fold"
 symbol = "dot_q6_k_q8_k_scalar"
+
+[[governs]]
+adr = "0062"
+what = "a request message is carried as the client wrote it (`tool_calls`, the client's key order), and a replayed call that reaches nothing is a refusal"
+symbol = "render_at"
+
+[[governs]]
+adr = "0062"
+what = "`messages` is the client's own JSON: role/content are validated, every other key passes through, and a malformed `tool_calls` entry is a 400 naming the index"
+symbol = "validate_message"
