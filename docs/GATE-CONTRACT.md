@@ -563,9 +563,9 @@ heading or a symbol is still the stable locator, and a bare range is still the f
 ## Counts: state structure, not a derived number
 
 The other convention the doc gates cannot enforce: `check_doc_line_anchors.py` proves that a
-`path:NNN` resolves and that the backticked symbol still sits in it, and nothing checks that
-"2,351 lines" is still 2,351. A derived count is true for one merge and wrong for the next, so it
-decays into exactly the claim a reader cannot verify and a reviewer cannot see fail.
+`path:NNN` resolves and that the backticked symbol still sits in it, and nothing checks that a
+quoted line count is still that count. A derived count is true for one merge and wrong for the
+next, so it decays into exactly the claim a reader cannot verify and a reviewer cannot see fail.
 
 [#636] is the evidence, and it is the second round. [#219] corrected these numbers on 2026-10-04;
 at `8c14286` (2026-10-20) the index's tree size was 27% low, the walkthrough's `src/cuda.rs` count
@@ -584,15 +584,18 @@ So:
 - **An index is the worst place for a number.** `AGENTS.md` is loaded into every session and read
   before anything else: a size there is a claim repeated thousands of times and re-measured never.
 
-**The half a checker can do.** `scripts/check_doc_counts.py` (#641) fails a claim that names no
-revision: a repository path next to a line count, a bare "N lines of Rust" / "N LOC" / "~Nk LOC",
-or an "N test functions". A stamp is accepted on the claim's own line or a neighbour, and — because
-the walkthrough pages have opened with a `Code:` block ending `lines verified at commit <sha>`
-since #266 — in the document's header as well, which makes the whole page a snapshot of that
-revision. It cannot check that the number is *right*; it checks that the sentence says which tree
-it is right about. The ledger beside it (`scripts/doc-counts.toml`, ADR-0023) is the escape hatch
-and ratchets both ways: an entry that exempts no claim fails, and it ships empty because, measured
-when the checker landed, all 62 claims in the tree already named their revision.
+**The half a checker can do.** `scripts/check_doc_counts.py` (#641, extended by #700) fails a claim
+that names no revision: a repository path next to a line count, a bare "N lines of Rust" / "N LOC" /
+"~Nk LOC", a line count of 1,000 or more that names no path at all (written beside a file count, or as a
+hyphenated compound), or an "N test functions". A stamp is accepted on the claim's own line or a
+neighbour, and — because the walkthrough pages have opened with a `Code:` block ending
+`lines verified at commit <sha>` since #266 — in the document's header as well, which makes the
+whole page a snapshot of that revision. It cannot check that the number is *right*; it checks that
+the sentence says which tree it is right about. The ledger beside it (`scripts/doc-counts.toml`,
+ADR-0023) is the escape hatch and ratchets both ways: an entry that exempts no claim fails. It held
+no entry when the checker landed (all 62 claims then stamped); the path-free arm measured 15 claims
+more on adoption, 14 already stamped or header-stamped and one ledgered — the llama.cpp analysis,
+whose counts date a foreign tree this repository does not pin.
 
 ## Transcriptions: include the source, don't copy it
 
