@@ -134,6 +134,34 @@ CASES = [
         "add_generation_prompt": False,
     },
     {
+        # A replayed tool *round-trip* (#613): the assistant turn carries
+        # `tool_calls`, so it renders through the template's replay branch instead
+        # of its plain-content branch. `content` is null — the shape OpenAI
+        # clients send — and `arguments` is a JSON string, which the template
+        # echoes through `tojson`.
+        "name": "assistant_tool_call_replay",
+        "messages": [
+            {"role": "user", "content": "Weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_weather_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Paris"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": '{"temperature": 18, "unit": "celsius"}'},
+        ],
+        "tools": [GET_WEATHER],
+        "add_generation_prompt": True,
+    },
+    {
         # A replayed tool result. The messages carry only `role`/`content` — the
         # same shape minfer's request type has — so the assistant turn renders
         # through the template's plain-content branch (it has no `tool_calls`)

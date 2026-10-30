@@ -523,3 +523,102 @@ fn an_unknown_tool_choice_shape_is_a_body_error() {
             .unwrap_err();
     assert_eq!(err.status, 400);
 }
+
+// === #613: a request message's own JSON ==================================
+
+#[test]
+fn parse_accepts_a_replayed_tool_call_and_keeps_every_key() {
+    let body = br#"{"messages":[
+        {"role":"user","content":"Weather?"},
+        {"role":"assistant","content":null,"tool_calls":[
+            {"id":"call_1","type":"function",
+             "function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}
+        ]},
+        {"role":"tool","content":"18C","tool_call_id":"call_1"}
+    ]}"#;
+    let req = ChatCompletionRequest::parse(body).expect("a replayed round-trip parses");
+    assert_eq!(req.messages.len(), 3);
+
+    // The object's own key order is the client's, not the engine's.
+    let keys: Vec<&str> = req.messages[1]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect();
+    assert_eq!(keys, ["role", "content", "tool_calls"]);
+
+    let crate::template::ToolJson::Array(calls) = req.messages[1].get("tool_calls").unwrap() else {
+        panic!("tool_calls must stay an array");
+    };
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(crate::template::ToolJson::as_str),
+        Some(r#"{"city": "Paris"}"#),
+        "the arguments string is carried verbatim"
+    );
+
+    // A key the engine does not read (`tool_call_id`) still survives the parse.
+    assert!(req.messages[2].get("tool_call_id").is_some());
+}
+
+#[test]
+fn a_malformed_message_or_tool_call_is_a_400_naming_the_index() {
+    // Every arm of `validate_message` / `validate_tool_call`, each naming the
+    // message and — where it applies — the entry.
+    let cases: &[(&str, &str)] = &[
+        (r#"{"messages":["hi"]}"#, "messages[0] must be an object"),
+        (
+            r#"{"messages":[{"role":1,"content":"x"}]}"#,
+            "messages[0] has no string `role`",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":1}]}"#,
+            "messages[0].content must be a string or null",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":{}}]}"#,
+            "messages[0].tool_calls must be an array",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":[]}]}"#,
+            "must not be empty",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":["x"]}]}"#,
+            "messages[0].tool_calls[0] must be an object",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"f","arguments":"{}"}}]}]}"#,
+            "messages[0].tool_calls[0].id",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"other","function":{"name":"f","arguments":"{}"}}]}]}"#,
+            "messages[0].tool_calls[0].type",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"function"}]}]}"#,
+            "messages[0].tool_calls[0] has no `function` object",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"","arguments":"{}"}}]}]}"#,
+            "messages[0].tool_calls[0].function.name",
+        ),
+        (
+            r#"{"messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":{"city":"Paris"}}}]}]}"#,
+            "messages[0].tool_calls[0].function.arguments must be a string",
+        ),
+    ];
+    for (body, needle) in cases {
+        let err = ChatCompletionRequest::parse(body.as_bytes()).expect_err(body);
+        assert_eq!(err.status, 400, "{body}");
+        assert!(
+            err.message.contains(needle),
+            "{body}\nexpected a message containing {needle:?}, got: {}",
+            err.message
+        );
+    }
+}

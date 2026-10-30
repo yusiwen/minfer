@@ -14,7 +14,10 @@
 
 use super::super::{civil_from_unix, environment_at};
 use super::msgs;
-use crate::template::{render_messages_opt, render_messages_opt_with_tools, ToolJson};
+use crate::template::{
+    render_messages_opt, render_messages_opt_with_tools, render_messages_opt_with_tools_raw,
+    ToolJson,
+};
 use minijinja::context;
 
 const TOOLS_JSON: &str =
@@ -162,25 +165,12 @@ struct ToolsFixture {
 #[derive(serde::Deserialize)]
 struct ToolsCase {
     name: String,
-    messages: Vec<ToolsMessage>,
+    /// The client's own message objects (#613) — an assistant turn may carry
+    /// `tool_calls`, which a `{role, content}` pair cannot express.
+    messages: Vec<ToolJson>,
     tools: Vec<ToolJson>,
     add_generation_prompt: bool,
     expected: String,
-}
-
-#[derive(serde::Deserialize)]
-struct ToolsMessage {
-    role: String,
-    content: Option<String>,
-}
-
-impl ToolsCase {
-    fn messages(&self) -> Vec<(String, Option<String>)> {
-        self.messages
-            .iter()
-            .map(|m| (m.role.clone(), m.content.clone()))
-            .collect()
-    }
 }
 
 fn tools_fixture() -> ToolsFixture {
@@ -245,9 +235,9 @@ fn tools_render_byte_for_byte_against_the_transformers_reference() {
             case.name
         );
 
-        let got = render_messages_opt_with_tools(
+        let got = render_messages_opt_with_tools_raw(
             Some(&fx.template),
-            &case.messages(),
+            &case.messages,
             Some(&case.tools),
             case.add_generation_prompt,
             bos,
@@ -262,7 +252,31 @@ fn tools_render_byte_for_byte_against_the_transformers_reference() {
         );
         cases += 1;
     }
-    assert_eq!(cases, 4, "all four reference cases must be checked");
+    assert_eq!(cases, 5, "all five reference cases must be checked");
+
+    // The replayed tool round-trip (#613): the assistant turn's `tool_calls`
+    // reached the template's replay branch, and the arguments string survived as
+    // the JSON text the client sent.
+    let replay = fx
+        .cases
+        .iter()
+        .find(|c| c.name == "assistant_tool_call_replay")
+        .expect("replayed tool-call case");
+    assert!(
+        replay.expected.contains("<tool_call>") && replay.expected.contains("</tool_call>"),
+        "the reference must render the template's replay branch"
+    );
+    assert!(
+        replay.expected.contains(r#"\"city\": \"Paris\""#),
+        "the arguments string must reach the prompt as CPython tojson wrote it: {}",
+        replay.expected
+    );
+    // The assistant turn is the template's `assistant` branch with a null content:
+    // no fabricated `null` text either side of the block.
+    assert!(
+        !replay.expected.contains("assistant\nnull"),
+        "a null content must not render as the text `null`"
+    );
 
     // The case that pins the escaping contract: raw `<`, `&` and non-ASCII.
     let escaped = fx

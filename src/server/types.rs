@@ -12,7 +12,9 @@ use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
-    pub messages: Vec<ChatMessage>,
+    /// The client's own message objects (#613): role/content plus any extra key
+    /// (`tool_calls`, `name`, a vendor extension), key order preserved.
+    pub messages: Vec<crate::template::ToolJson>,
     pub model: Option<String>,
     pub stream: Option<bool>,
     pub max_tokens: Option<i64>, // default -1 = no limit (llama.cpp n_predict)
@@ -123,12 +125,6 @@ pub struct JsonSchemaSpec {
     pub schema: serde_json::Value,
     #[serde(default)]
     pub strict: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,15 +299,8 @@ impl ChatCompletionRequest {
                 "messages must not be empty".to_string(),
             ));
         }
-        for m in &req.messages {
-            if !VALID_ROLES.contains(&m.role.as_str()) {
-                return Err(ApiError::invalid_request(format!(
-                    "unknown message role '{}'",
-                    m.role
-                )));
-            }
-            // content: Option<String> — an array (multimodal) fails serde with
-            // a clear error; we surface it as invalid_request_error.
+        for (index, message) in req.messages.iter().enumerate() {
+            validate_message(index, message)?;
         }
         if let Some(tools) = &req.tools {
             // "No tools" is the absence of the field, not an empty array: an
@@ -468,6 +457,136 @@ impl ChatCompletionRequest {
             max_tokens: self.max_tokens.unwrap_or(MAX_TOKENS_UNLIMITED),
         })
     }
+}
+
+/// One request message (#613).
+///
+/// The object is carried verbatim into the template, so only the two fields the
+/// engine itself reads are validated: `role` (a known role) and `content` (a
+/// string, or `null`/absent for a tool-call turn). Every other key — a client's
+/// `tool_calls`, `name`, a vendor extension — passes through untouched; a template
+/// that echoes the message sees exactly what the client sent.
+fn validate_message(index: usize, message: &crate::template::ToolJson) -> Result<(), ApiError> {
+    use crate::template::ToolJson;
+    if message.as_object().is_none() {
+        return Err(ApiError::invalid_request(format!(
+            "messages[{index}] must be an object with `role` and `content`"
+        )));
+    }
+    match message.get("role").and_then(ToolJson::as_str) {
+        Some(role) if VALID_ROLES.contains(&role) => {}
+        Some(role) => {
+            return Err(ApiError::invalid_request(format!(
+                "unknown message role '{role}' at messages[{index}]"
+            )))
+        }
+        None => {
+            return Err(ApiError::invalid_request(format!(
+                "messages[{index}] has no string `role`"
+            )))
+        }
+    }
+    if let Some(content) = message.get("content") {
+        match content {
+            ToolJson::Null | ToolJson::String(_) => {}
+            // content is a string or null. An array (multimodal) is a documented
+            // non-goal: a clear 400 naming the message, never a serde panic.
+            _ => {
+                return Err(ApiError::invalid_request(format!(
+                    "messages[{index}].content must be a string or null (multimodal content \
+                     arrays are not supported)"
+                )))
+            }
+        }
+    }
+    // A replayed assistant turn (#613). "No calls" is the absence of the field, not
+    // an empty array — the same rule `tools: []` follows, and the shape the Qwen2.5
+    // template's `not message.tool_calls` branch would otherwise see as one.
+    if let Some(tool_calls) = message.get("tool_calls") {
+        let ToolJson::Array(calls) = tool_calls else {
+            return Err(ApiError::invalid_request(format!(
+                "messages[{index}].tool_calls must be an array"
+            )));
+        };
+        if calls.is_empty() {
+            return Err(ApiError::invalid_request(format!(
+                "messages[{index}].tool_calls must not be empty; omit the field to send none"
+            )));
+        }
+        for (call_index, call) in calls.iter().enumerate() {
+            validate_tool_call(index, call_index, call)?;
+        }
+    }
+    Ok(())
+}
+
+/// One replayed tool call on an `assistant` message (#613).
+///
+/// The OpenAI shape is `{id, type: "function", function: {name, arguments}}`, and
+/// `arguments` is a JSON **string** — the template echoes it through `tojson`, so
+/// an object would render different bytes. Anything else is a `400` naming the
+/// message and the entry, never a silently dropped call.
+fn validate_tool_call(
+    message: usize,
+    index: usize,
+    call: &crate::template::ToolJson,
+) -> Result<(), ApiError> {
+    use crate::template::ToolJson;
+    let at = format!("messages[{message}].tool_calls[{index}]");
+    if call.as_object().is_none() {
+        return Err(ApiError::invalid_request(format!(
+            "{at} must be an object with `id`, `type` and `function`"
+        )));
+    }
+    match call.get("id").and_then(ToolJson::as_str) {
+        Some(id) if !id.trim().is_empty() => {}
+        _ => {
+            return Err(ApiError::invalid_request(format!(
+                "{at}.id must be a non-empty string"
+            )))
+        }
+    }
+    match call.get("type").and_then(ToolJson::as_str) {
+        Some("function") => {}
+        Some(other) => {
+            return Err(ApiError::invalid_request(format!(
+                "{at}.type is '{other}'; this server implements 'function' only"
+            )))
+        }
+        None => {
+            return Err(ApiError::invalid_request(format!(
+                "{at} has no string `type` (expected \"function\")"
+            )))
+        }
+    }
+    let Some(function) = call.get("function") else {
+        return Err(ApiError::invalid_request(format!(
+            "{at} has no `function` object"
+        )));
+    };
+    if function.as_object().is_none() {
+        return Err(ApiError::invalid_request(format!(
+            "{at}.function must be an object"
+        )));
+    }
+    match function.get("name").and_then(ToolJson::as_str) {
+        Some(name) if !name.trim().is_empty() => {}
+        _ => {
+            return Err(ApiError::invalid_request(format!(
+                "{at}.function.name must be a non-empty string"
+            )))
+        }
+    }
+    match function.get("arguments") {
+        Some(ToolJson::String(_)) => {}
+        _ => {
+            return Err(ApiError::invalid_request(format!(
+                "{at}.function.arguments must be a string: OpenAI sends the call's \
+                 arguments as JSON text and the template echoes them through `tojson`"
+            )))
+        }
+    }
+    Ok(())
 }
 
 /// One OpenAI tool definition: `{"type":"function","function":{"name":…}}`
