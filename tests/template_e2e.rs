@@ -236,6 +236,11 @@ const TOOLS_BRANCH_TEMPLATE: &str =
 /// request carrying one is served instead of being dropped at the message type.
 const TOOL_CALLS_TEMPLATE: &str = "{% for m in messages %}[{{ m.role }}{% for c in m.tool_calls %}|{{ c.function.name }}={{ c.function.arguments }}{% endfor %}]{% endfor %}";
 
+/// A template whose prompt renders the tools and whose text carries the
+/// `<tool_call>` format marker (in a Jinja comment, so it does not reach the
+/// prompt) — what `tool_choice: "required"` checks before constraining sampling.
+const CONSTRAINT_TEMPLATE: &str = "{# <tool_call> #}{% if tools %}<tools>{{ tools | length }}</tools>{% endif %}{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}";
+
 /// A template that renders messages but has no `tool_calls` branch (#613): the
 /// call would reach nothing, so the server refuses it by name.
 const NO_REPLAY_BRANCH_TEMPLATE: &str =
@@ -470,8 +475,8 @@ fn serve_refuses_tools_a_template_cannot_render_and_serves_the_ones_it_can() {
         "tool_choice \"required\" must be refused; body:\n{response}"
     );
     assert!(
-        response.contains("extracted from the model's output"),
-        "the refusal must name what is missing; body:\n{response}"
+        response.contains("`<tool_call>` block"),
+        "a template without the block format cannot be constrained; body:\n{response}"
     );
 }
 
@@ -656,4 +661,94 @@ fn serve_extracts_a_tool_call_from_the_completion_and_refuses_a_truncated_one() 
         body.contains("tool-call block"),
         "the refusal must name the block; body:\n{body}"
     );
+}
+
+/// #614: `tool_choice: "required"` and a forced function stop being 400s — they
+/// constrain the sampling grammar to the model's `<tool_call>` syntax, and the
+/// extracted call matches what was demanded.
+#[test]
+fn serve_enforces_tool_choice_required_and_a_forced_function() {
+    let model = test_model();
+    let template = template_file("tool-choice-constraint.jinja", CONSTRAINT_TEMPLATE);
+    let mut server = Server::spawn_with_ctx(
+        "serve",
+        &model.to_string_lossy(),
+        18111,
+        Some(&template),
+        1024,
+    );
+    assert!(
+        server.wait_listening(),
+        "no banner; log so far:\n{}",
+        server.log()
+    );
+
+    let tool = serde_json::json!({
+        "type": "function",
+        "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+    });
+
+    for choice in [
+        serde_json::json!("required"),
+        serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+    ] {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool],
+            "tool_choice": choice,
+            "max_tokens": 512,
+            "seed": 42,
+        })
+        .to_string();
+        let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
+        assert_eq!(status, 200, "choice {choice}: body:\n{response}");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("completion json");
+        let choice_out = &parsed["choices"][0];
+        assert_eq!(
+            choice_out["finish_reason"], "tool_calls",
+            "body:\n{response}"
+        );
+        assert_eq!(
+            choice_out["message"]["tool_calls"][0]["function"]["name"], "get_weather",
+            "body:\n{response}"
+        );
+    }
+
+    // A template whose format cannot be constrained is a named 400, not a
+    // silently unconstrained generation.
+    let plain = template_file("tool-choice-unconstrained.jinja", TOOLS_BRANCH_TEMPLATE);
+    let mut unconstrained =
+        Server::spawn_with_ctx("serve", &model.to_string_lossy(), 18112, Some(&plain), 256);
+    assert!(
+        unconstrained.wait_listening(),
+        "no banner; log so far:\n{}",
+        unconstrained.log()
+    );
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        "tool_choice": "required",
+        "max_tokens": 8,
+    })
+    .to_string();
+    let (status, response) = unconstrained.request("POST", "/v1/chat/completions", Some(&body));
+    assert_eq!(status, 400, "body:\n{response}");
+    assert!(
+        response.contains("`<tool_call>` block"),
+        "the refusal must name the missing format; body:\n{response}"
+    );
+
+    // Two sampling constraints are a conflict, named.
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        "tool_choice": "required",
+        "grammar": "root ::= \"x\"",
+        "max_tokens": 8,
+    })
+    .to_string();
+    let (status, response) = unconstrained.request("POST", "/v1/chat/completions", Some(&body));
+    assert_eq!(status, 400, "body:\n{response}");
+    assert!(response.contains("cannot be combined"), "body:\n{response}");
 }
