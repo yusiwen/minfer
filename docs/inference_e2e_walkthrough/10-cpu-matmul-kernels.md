@@ -189,6 +189,8 @@ pub fn dot_q4_0_q8_0(q4: &[u8], q8: &[u8]) -> f32 {
 
 Runtime detection (`is_x86_feature_detected!`, wrapped in `avx2_enabled()`) is why one binary ships everywhere and picks AVX2 only where it exists; `MINFER_NO_AVX2=1` forces the portable fallback for A/B (`MINFER_NO_NEON=1` on aarch64). The K-quant dots (`dot_q4_k_q8_k`/`dot_q5_k_q8_k`/`dot_q6_k_q8_k`) follow the same shape with a third arm — an AVX-512/VNNI variant selected first, then AVX2, then scalar ([#56](https://github.com/yusiwen/minfer/issues/56)) — so the same wrapper text applies to all eight `dot_*` entry points; doc 06's `supports_op` story is about *ops*, this one is about *instructions*, and both follow the same capability-query philosophy.
 
+Q6_K is the one dot whose *body* is not shaped like `dot_q4_0_q8_0`'s: its per-group scales used to force a sixteen-deep `f32` fold per superblock, and since [ADR-0061](../adr/0061-the-q6-k-dot-accumulates-in-eight-lanes-and-the-scalar-kernel-implements-that-order.md) the scalar reference and both x86 kernels accumulate in eight lanes instead — the SSE/AVX2 kernel body is in §P1 of `CPU_OPTIMIZATIONS.md`.
+
 The AVX2 kernel processes one 32-value block per iteration with two 256-bit registers:
 
 ```rust
