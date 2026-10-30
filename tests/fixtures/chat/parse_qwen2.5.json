@@ -1,0 +1,210 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+  "response_template": {
+    "defaults": {
+      "role": "assistant"
+    },
+    "start_anchor": "<|im_start|>assistant\n",
+    "fields": {
+      "thinking": {
+        "open": "<think>",
+        "close": "</think>",
+        "content": "text"
+      },
+      "tool_calls": {
+        "open_pattern": "\\s*<tool_call>",
+        "close": "</tool_call>",
+        "repeats": true,
+        "content": "json",
+        "transform": {
+          "type": "function",
+          "function": "{content}"
+        }
+      },
+      "content": {
+        "close_pattern": "\\s*(?:<\\|im_end\\|>|<\\|endoftext\\|>|<\\|eot_id\\|>)",
+        "content": "text"
+      }
+    }
+  },
+  "prefix": "<|im_start|>assistant\n",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "unit": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "provenance": {
+    "reference": "HuggingFaceTB transformers 5.17.0 transformers.utils.chat_parsing.parse_response with the Qwen2/Qwen3 response-template fallback shipped in transformers/cli/serving/utils.py (_RESPONSE_TEMPLATE_FALLBACKS)",
+    "template_source": "tests/fixtures/chat/qwen2.5-0.5b-instruct.json (the same template the tools and replay fixtures render)",
+    "command": "uv run --with transformers==5.17.0 python scripts/gen_tool_call_parse_fixture.py",
+    "date": "2026-10-30"
+  },
+  "cases": [
+    {
+      "name": "single_call",
+      "completion": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_calls",
+      "completion": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          },
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "content_before_the_call",
+      "completion": "Let me check.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+      "expected": {
+        "content": "Let me check.",
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "content_after_the_call",
+      "completion": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\nDone.",
+      "expected": {
+        "content": "Done.",
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "string_arguments",
+      "completion": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}\n</tool_call>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": "{\"city\": \"Paris\"}"
+          }
+        ]
+      }
+    },
+    {
+      "name": "unicode_and_html_in_the_arguments",
+      "completion": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"检索 <b> & 'c'\"}}\n</tool_call>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "检索 <b> & 'c'"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "closing_tag_inside_the_arguments",
+      "diverges": "transformers splits the region at the first `</tool_call>` and refuses the incomplete JSON; minfer scans the JSON value and accepts it",
+      "completion": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"</tool_call>\"}}\n</tool_call>",
+      "error": "json parser could not parse region as JSON.\nContent: '\\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"'\nError: Unterminated string starting at: line 2 column 47 (char 47)"
+    },
+    {
+      "name": "extra_keys_in_the_call_object",
+      "completion": "<tool_call>\n{\"id\": \"call_1\", \"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "prose",
+      "completion": "Hello, world!\n",
+      "expected": {
+        "content": "Hello, world!",
+        "tool_calls": []
+      }
+    },
+    {
+      "name": "truncated_json",
+      "completion": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par",
+      "error": "json parser could not parse region as JSON.\nContent: '\\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par'\nError: Unterminated string starting at: line 2 column 47 (char 47)"
+    },
+    {
+      "name": "truncated_close",
+      "completion": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty_block",
+      "completion": "<tool_call>",
+      "error": "json parser could not parse region as JSON.\nContent: ''\nError: Expecting value: line 1 column 1 (char 0)"
+    }
+  ]
+}
