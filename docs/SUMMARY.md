@@ -82,6 +82,7 @@
     - [0061. The Q6_K dot accumulates in eight lanes, and the scalar kernel implements that order](./adr/0061-the-q6-k-dot-accumulates-in-eight-lanes-and-the-scalar-kernel-implements-that-order.md)
     - [0062. A request message reaches the prompt as the client wrote it, and a replayed tool call that reaches nothing refuses by name](./adr/0062-a-request-message-reaches-the-prompt-as-the-client-wrote-it.md)
     - [0063. A completion's tool call is extracted, and tool_choice is a grammar on the model's own call format](./adr/0063-a-completion-s-tool-call-is-extracted-and-tool-choice-constrains-the-model-s-own-format.md)
+    - [0064. A hash that does not resolve is history only where the document or the ledger says so](./adr/0064-a-hash-that-does-not-resolve-is-history-only-where-the-document-says-so.md)
 
 # Model Support
 

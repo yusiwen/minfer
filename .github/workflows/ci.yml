@@ -105,6 +105,20 @@
 #                       it (`scripts/doc-counts.toml`) ships empty on purpose — every
 #                       claim in the tree names its revision — and is ratcheted both
 #                       ways: an entry that exempts nothing fails.
+#                       And `scripts/check_doc_hashes.py` (#684): a backticked commit
+#                       hash is a locator no other checker reads — not a relative link,
+#                       not a `path:NNN` anchor — so it must resolve to a commit **HEAD
+#                       can reach**, or be pinned in `scripts/doc-hashes.toml` with a
+#                       source and a reason, or sit in a document whose
+#                       `<!-- doc-hashes: history -->` marker covers it. Measured on
+#                       adoption (a fresh clone): 936 tokens, 807 resolve, 129
+#                       unresolvable, 0 unexcused. Both ratchet (an entry nobody cites
+#                       fails, an entry whose hash resolves now fails, a marker that
+#                       covers nothing fails), and a shallow clone exits 2 rather than
+#                       passing on objects it never fetched. Ancestry, not existence: a
+#                       checkout that has amended keeps the discarded commits, and the
+#                       first CI run found 14 citations a local existence probe had
+#                       admitted — the reason the check is `rev-list HEAD` membership.
 #                       And `scripts/check_doc_code_copies.py` (#647): a fenced block
 #                       whose first line names a repository source file is a
 #                       transcription claim — "this is src/…, as it was when I copied
@@ -491,6 +505,19 @@ jobs:
         run: python3 scripts/check_doc_counts.py
       - name: The doc-count checker's own pass/fail cases
         run: python3 scripts/check_doc_counts.py --selftest
+      # #684: a backticked commit hash is the third locator class — neither a relative
+      # link (`check_docs_links.py`) nor a `path:NNN` anchor (`check_doc_line_anchors.py`)
+      # — so `git cat-file -t` is the only check that sees it. A hash that resolves must
+      # name a *commit HEAD can reach*; one that does not must say so, in
+      # `scripts/doc-hashes.toml` (one entry per hash, with a source and a reason) or
+      # through a document marker that excuses its unresolvable hashes and never a
+      # resolvable one (#685's narrowing). Both ratchet. The checkout's `fetch-depth: 0`
+      # is load-bearing here too: a shallow clone cannot tell "never existed" from
+      # "never fetched", and the checker exits 2 rather than passing on that ambiguity.
+      - name: A document's commit hash must resolve or say it is history
+        run: python3 scripts/check_doc_hashes.py
+      - name: The hash-citation checker's own pass/fail cases
+        run: python3 scripts/check_doc_hashes.py --selftest
       # #647: a hand-copied source listing is the artefact that drifts. A fenced block
       # claiming a repo source path must become `{{#rustdoc_include}}`; the ledger is a
       # migration list that can only shrink (a conversion lowers its count here).
