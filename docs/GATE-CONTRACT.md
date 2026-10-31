@@ -623,6 +623,47 @@ ships with the 94 claims the tree carried when the checker landed, in 13 documen
 migration list, not a permission, and each entry goes when its page is converted. The checker
 cannot make a *wrong* listing right — it makes the copy impossible to keep by accident.
 
+## Citations: a hash that does not resolve is history, and the document says so
+
+The third locator class, after `path:NNN` and a relative link: a backticked commit hash. Neither
+checker sees one, so
+[#443](https://github.com/yusiwen/minfer/issues/443)'s rule — no document cites a commit
+`git cat-file -t` cannot resolve — held only as a convention.
+[#683](https://github.com/yusiwen/minfer/issues/683) swept the tree and found four violations,
+[#685](https://github.com/yusiwen/minfer/pull/685) repaired them, and the class is not small:
+measured 2026-10-31 at `master` `24626ad`, of 936 backticked hash-like tokens in the 260 documents
+the gates read, **129 are unresolvable in 58 distinct hashes** — every one legitimate, either a
+pre-rewrite label kept as history, an amended-away twin the record already narrates, or a llama.cpp
+hash from another repository. A bare probe would raise 129 failures and be switched off inside a
+week, which is [ADR-0027](adr/0027-a-citation-is-dated-too.md)'s finding one token class over.
+
+**"Unresolvable" means HEAD cannot reach it, not that this clone lacks the object.** A checkout that
+has amended or rebased keeps the discarded commits, so `git cat-file -t` resolves 14 citations in
+10 hashes that a fresh clone cannot — the amended-away twins the CUDA records already call
+unresolvable. Existence alone would be green locally and red in CI; the ancestry rule
+`scripts/check_status.py` applies to its baseline commits is the same fix here.
+
+So the class a document may keep is declared, in one of two places:
+
+- **The ledger.** `scripts/doc-hashes.toml` pins a hash with a `kind` (`foreign` | `pre-rewrite`),
+  the `source` it comes from and a reason. One entry per hash, never per line: a line number drifts
+  on any edit above it, and the same hash is cited from up to ten documents.
+- **The document marker.** One standalone comment, `<!-- doc-hashes: history -->`, declares that
+  the document's unresolvable hashes are history. It applies to the whole document and is invisible
+  in the book, and it excuses an **unresolvable** hash only: a hash that resolves is a locator, and
+  no marker may exempt it. That scoping is the point — #685 had to narrow a prose caveat that said
+  "every hash here is history" in a file that also cites current commits.
+
+`scripts/check_doc_hashes.py` (#684) is the gate, and its refusals are the ledger's ratchet: an
+unresolvable hash with neither a marker nor an entry fails, naming the file, line and hash; an
+entry no document cites any more fails; an entry whose hash resolves now fails, because it is not
+history any more; a marker that covers nothing fails. A tree it cannot judge — no git, not a work
+tree, a shallow clone where an absent object may never have been fetched — exits 2 rather than
+passing.
+
+It proves existence, never correctness: a hash that resolves may still be the wrong commit for the
+sentence, exactly as `check_doc_counts.py` can prove a number's stamp but not its value.
+
 ## Writing the next gate — checklist
 
 1. What **value** does it assert, and how is that value computed independently
@@ -735,7 +776,12 @@ pre-split revision are frozen inside it, one reason apiece, and an exemption tha
 failure fails too. `scripts/check_doc_counts.py` (#641) then carries the half no anchor can: a
 derived count in a live document must name the revision it measured, or the claim fails — a number
 is the one claim a gate cannot verify for truth (§"Counts"). Its ledger
-(`scripts/doc-counts.toml`) is the escape hatch, ratcheted both ways and empty today. Resolving is
+(`scripts/doc-counts.toml`) is the escape hatch, ratcheted both ways and empty today.
+`scripts/check_doc_hashes.py` (#684) then covers the last locator class (§"Citations"): a backticked
+commit hash must resolve to a commit **HEAD can reach**, or be pinned in `scripts/doc-hashes.toml`
+with a source and a reason, or sit in a document that declares its unresolvable hashes are history —
+both exemptions ratchet, and a tree it cannot judge (no git, a shallow clone) fails rather than
+passing. Resolving is
 not pointing, so the same job runs
 `scripts/check_anchor_drift.py` (#344) on `pull_request`: it diffs `HEAD` against the PR's merge base
 (`origin/<base_ref>...HEAD`, the second reason the checkout is `fetch-depth: 0`), maps every anchored
@@ -855,3 +901,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0025](adr/0025-a-docs-only-change-skips-the-compilers.md) — A docs-only change runs the docs gate, not the compilers
 - [ADR-0039](adr/0039-the-corpus-is-entered-through-a-question-at-pr-time.md) — The corpus is entered through a question at PR time, and its maps are checked
 - [ADR-0040](adr/0040-a-decision-is-bound-to-the-surfaces-it-governs.md) — A decision is bound to the surfaces it governs, so the question names it
+- [ADR-0064](adr/0064-a-hash-that-does-not-resolve-is-history-only-where-the-document-says-so.md) — A hash that does not resolve is history only where the document or the ledger says so
