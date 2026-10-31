@@ -1,0 +1,161 @@
+# Hashes a document cites that cannot resolve here, and why each one stays (#684).
+#
+# `scripts/check_doc_hashes.py` reads this ledger beside it (ADR-0023). `docs/GATE-CONTRACT.md`
+# §"Citations" states the rule: a backticked hash is a locator, and a document that keeps a hash
+# which cannot resolve must say so where the checker can read it — in one standalone comment,
+#
+#     <!-- doc-hashes: history -->
+#
+# or in one entry below. The marker covers *unresolvable* hashes in a whole document; the ledger
+# pins a single hash wherever it is cited. Both exist because the classes are not the same: a
+# record document may keep its own pre-rewrite labels wholesale, while a foreign repository's
+# hash is one fact that belongs in one place, with the repository it came from.
+#
+# One entry per hash, never per line: a line number drifts on any edit above it (ADR-0027), and
+# the same hash is cited from up to ten documents. `source` says whose history it is, `reason`
+# says why it is kept rather than repaired.
+#
+# The checker enforces four things about this file, so an exemption cannot outlive its reason:
+#   1. an unresolvable hash that no marker covers and that is not pinned here fails;
+#   2. an entry that **no document cites any more** fails (the ledger may not rot);
+#   3. an entry whose hash **resolves now** fails — it is not history any more;
+#   4. `kind` must be `foreign` or `pre-rewrite`, and `source`/`reason` must be non-empty.
+#
+# The marker ratchets the same way: one that covers no unresolvable hash fails, so deleting the
+# last pre-rewrite label from a record must also delete its marker.
+#
+# Population when this landed (2026-10-31, `master` `24626ad`, measured in a fresh clone): 129
+# unresolvable occurrences in 58 distinct hashes — 41 hashes / 72 occurrences covered by
+# `METAL_OPTIMIZATIONS.md`'s marker, the 17 below covering the other 57. An entry here is a
+# reviewed exception, not a place to hide a typo: a hash that *should* resolve (a mistyped or
+# stale commit of this repository) is repaired, not pinned.
+#
+# "Unresolvable" means **a commit HEAD cannot reach**, not "an object this clone lacks": an amend
+# or a rebase leaves the discarded commit in the object database, so a local `git cat-file -t`
+# resolves 14 citations in 10 hashes below that a fresh clone cannot. Those are the amended-away
+# twins the CUDA records already describe as unresolvable, and the checker now reads them the
+# same way everywhere.
+
+[[exempt]]
+
+hash = "ca3d5a3e1"
+kind = "foreign"
+source = "llama.cpp"
+reason = "the CUDA backend port's reference build: the port record, the MMQ analysis and ADR-0060 all compare against this llama.cpp revision, which this repository never contained"
+
+[[exempt]]
+
+hash = "c479922ac"
+kind = "foreign"
+source = "llama.cpp"
+reason = "the llama.cpp build (11458) the 2026-10-07 Metal A/B was measured against, quoted by the optimization record's header, §0.2 and the 7B rows"
+
+[[exempt]]
+
+hash = "050dde50c"
+kind = "foreign"
+source = "llama.cpp"
+reason = "the llama.cpp HEAD the gguf-conversion and quantize references were produced from (GGUF-TOOLING, the speculative analysis, ADR-0043)"
+
+[[exempt]]
+
+hash = "458681e1d"
+kind = "foreign"
+source = "llama.cpp"
+reason = "the 2026-09-01 llama.cpp build whose quantize output the F6 fixture rows compare against, and the build ADR-0060 read the per-tensor fallback in"
+
+[[exempt]]
+
+hash = "88b47a755"
+kind = "foreign"
+source = "llama.cpp"
+reason = "the 2026-08-14/08-17 record's llama.cpp reference build, superseded in the same document by c479922ac and kept as the history the numbers belong to"
+
+[[exempt]]
+
+hash = "1d36b3670"
+kind = "foreign"
+source = "llama.cpp"
+reason = "the last upstream commit before the legacy `examples/main` interaction loop moved out of llama.cpp, cited by the CLI-conversation plan as the reference for that design"
+
+[[exempt]]
+
+hash = "b8568cd"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the P5 session-range start: both records that cite it say it does not resolve to any commit, which is the correct treatment of a pre-rewrite label and the reason it is pinned rather than replaced"
+
+# The amended-away history of this repository — 14 occurrences in 10 hashes. Each record says in
+# its own words that the id does not resolve (a twin swallowed by an amend) or that the id is a
+# branch snapshot never merged under that name; the settlement is to keep the record and pin the
+# label, because the measurement it carries is the point.
+
+[[exempt]]
+
+hash = "71b86da"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the plan's S0 landing label; that commit is not in the merged history, and the step it records is kept as the record of that day rather than re-pointed to a guess"
+
+[[exempt]]
+
+hash = "dc550a9"
+kind = "pre-rewrite"
+source = "minfer (branch snapshot)"
+reason = "a row of the plan's tree-size table — the state after the uncoupled deletions — taken on a branch that was rewritten before merge, so the snapshot has no commit in this history"
+
+[[exempt]]
+
+hash = "2fbaf00"
+kind = "pre-rewrite"
+source = "minfer (branch snapshot)"
+reason = "the same table's 'final tree' snapshot; a branch head that was rewritten before merge, kept because the counts are the measurement"
+
+[[exempt]]
+
+hash = "8d3f54a"
+kind = "pre-rewrite"
+source = "minfer (branch snapshot)"
+reason = "the plan's 'this branch's final tree' row: a branch snapshot, never merged under that id, and the counts beside it are the record"
+
+[[exempt]]
+
+hash = "8c3f74b"
+kind = "pre-rewrite"
+source = "minfer (branch snapshot)"
+reason = "one column of the plan's dead-code comparison, measured on the same rewritten branch — the comparison is the record, not the id"
+
+[[exempt]]
+
+hash = "9df405d"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the commit the plan and the backend-registry design name as where the 2026-10-09 Mac record was taken; it was amended away, and the record is kept as the provenance of that measurement"
+
+[[exempt]]
+
+hash = "feb37de"
+kind = "pre-rewrite"
+source = "minfer (pre-amend twin)"
+reason = "the r59 record names it a duplicate swallowed by an amend, and CUDA_OPTIMIZATION.md's footnote gives it as its own example of an id that no longer resolves"
+
+[[exempt]]
+
+hash = "708067d"
+kind = "pre-rewrite"
+source = "minfer (pre-amend twin)"
+reason = "the kernel revision the r17 record says the code was reverted to for the comparison; the record is kept, the commit was amended away"
+
+[[exempt]]
+
+hash = "1e0dded"
+kind = "pre-rewrite"
+source = "minfer (pre-amend twin)"
+reason = "the r18 record says it in as many words: an anchor that was swallowed by an amend and no longer resolves"
+
+[[exempt]]
+
+hash = "384b3d9"
+kind = "pre-rewrite"
+source = "minfer (pre-amend twin)"
+reason = "the r19 record says it in as many words: an unresolvable pre-amend twin, kept with the master-table footnote-3 convention"
