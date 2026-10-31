@@ -359,7 +359,7 @@ jobs:
     if: >-
       (github.event_name != 'pull_request' || github.event.action != 'edited')
       && needs.changes.outputs.rust == 'true'
-    runs-on: macos-14 # Apple Silicon (arm64)
+    runs-on: macos-15 # Apple Silicon (arm64); `macos-14` is deprecated and retires 2026-11-02 (actions/runner-images#13518)
     steps:
       - uses: actions/checkout@v5
       # No `dtolnay/rust-toolchain` step here, unlike the release job: the
