@@ -46,6 +46,12 @@
 > history rather than as citations (see the hash caveat above), and the design doc's
 > §5.2 carries subject-matched equivalents.
 
+The machine-readable form of that caveat — read by `scripts/check_doc_hashes.py` (#684) — is the
+comment below. It excuses an **unresolvable** hash in this document only; a hash that resolves is a
+locator and stays one, which is why this is not a blanket "every hash here is history".
+
+<!-- doc-hashes: history -->
+
 ---
 
 ## §0 Progress Overview (single tracking source)
