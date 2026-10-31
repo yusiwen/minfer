@@ -109,16 +109,17 @@
 #                       hash is a locator no other checker reads — not a relative link,
 #                       not a `path:NNN` anchor — so it must resolve to a commit **HEAD
 #                       can reach**, or be pinned in `scripts/doc-hashes.toml` with a
-#                       source and a reason, or sit in a document whose
-#                       `<!-- doc-hashes: history -->` marker covers it. Measured on
-#                       adoption (a fresh clone): 936 tokens, 807 resolve, 129
-#                       unresolvable, 0 unexcused. Both ratchet (an entry nobody cites
-#                       fails, an entry whose hash resolves now fails, a marker that
-#                       covers nothing fails), and a shallow clone exits 2 rather than
-#                       passing on objects it never fetched. Ancestry, not existence: a
-#                       checkout that has amended keeps the discarded commits, and the
-#                       first CI run found 14 citations a local existence probe had
-#                       admitted — the reason the check is `rev-list HEAD` membership.
+#                       source and a reason, or sit in a block whose
+#                       `<!-- doc-hashes: history -->` marker covers it (one block, one
+#                       marker — ADR-0065). Measured on adoption (a fresh clone): 937
+#                       tokens, 808 resolve, 129 unresolvable, 0 unexcused. Both ratchet
+#                       (an entry nobody cites fails, an entry whose hash resolves now
+#                       fails, a marker that covers nothing fails), and a shallow clone
+#                       exits 2 rather than passing on objects it never fetched. Ancestry,
+#                       not existence: a checkout that has amended keeps the discarded
+#                       commits, and the first CI run found 14 citations a local existence
+#                       probe had admitted — the reason the check is `rev-list HEAD`
+#                       membership.
 #                       And `scripts/check_doc_code_copies.py` (#647): a fenced block
 #                       whose first line names a repository source file is a
 #                       transcription claim — "this is src/…, as it was when I copied
@@ -510,8 +511,8 @@ jobs:
       # — so `git cat-file -t` is the only check that sees it. A hash that resolves must
       # name a *commit HEAD can reach*; one that does not must say so, in
       # `scripts/doc-hashes.toml` (one entry per hash, with a source and a reason) or
-      # through a document marker that excuses its unresolvable hashes and never a
-      # resolvable one (#685's narrowing). Both ratchet. The checkout's `fetch-depth: 0`
+      # through a marker above the block that excuses its unresolvable hashes and never
+      # a resolvable one (#685's narrowing, ADR-0065's block scope). Both ratchet. The checkout's `fetch-depth: 0`
       # is load-bearing here too: a shallow clone cannot tell "never existed" from
       # "never fetched", and the checker exits 2 rather than passing on that ambiguity.
       - name: A document's commit hash must resolve or say it is history

@@ -184,6 +184,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0062](./0062-a-request-message-reaches-the-prompt-as-the-client-wrote-it.md) | 2026-10-30 | a request message reaches the prompt as the client wrote it, and a replayed call that reaches nothing refuses by name | Accepted (amends ADR-0019; completes ADR-0058's message-object consequence) |
 | [0063](./0063-a-completion-s-tool-call-is-extracted-and-tool-choice-constrains-the-model-s-own-format.md) | 2026-10-30 | a completion's tool call is extracted, and `tool_choice` is a grammar on the model's own call format | Accepted (amends ADR-0019; completes ADR-0062 decision 6) |
 | [0064](./0064-a-hash-that-does-not-resolve-is-history-only-where-the-document-says-so.md) | 2026-10-31 | a hash that does not resolve is history only where the document or the ledger says so | Accepted (amends ADR-0027) |
+| [0065](./0065-the-hash-marker-covers-the-block-below-it-not-the-document.md) | 2026-10-31 | the hash marker covers the block below it, not the document | Accepted (amends ADR-0064 decision 3) |
 
 ## The template
 

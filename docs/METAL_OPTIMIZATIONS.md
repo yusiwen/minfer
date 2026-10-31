@@ -46,11 +46,12 @@
 > history rather than as citations (see the hash caveat above), and the design doc's
 > §5.2 carries subject-matched equivalents.
 
-The machine-readable form of that caveat — read by `scripts/check_doc_hashes.py` (#684) — is the
-comment below. It excuses an **unresolvable** hash in this document only; a hash that resolves is a
-locator and stays one, which is why this is not a blanket "every hash here is history".
-
-<!-- doc-hashes: history -->
+The machine-readable form of that caveat — read by `scripts/check_doc_hashes.py` (#684,
+ADR-0064, ADR-0065) — is a marker line above each block it describes: the four `Commit (pre-rewrite)`
+tables below carry their own, so the excuse reaches the table it belongs to and not the prose around
+it. A pre-rewrite label inside a prose record is pinned in `scripts/doc-hashes.toml` instead, because
+a marker in the middle of a list would split it. A hash that resolves is a locator and stays one,
+which is why no marker is a blanket "every hash here is history".
 
 ---
 
@@ -897,6 +898,8 @@ ms across runs) and must record the **load average** it ran at.
 
 ### ✅ Done
 
+<!-- doc-hashes: history -->
+
 | # | Item | Measured effect | Commit (pre-rewrite) |
 |---|---|---|---|
 | 1 | Metal backend foundation + 4 correctness fixes (RoPE freq_scale / output_b / softmax max / stack array) | Qwen2-0.5B 130→334 t/s | `2473981` / `26f0e4d` (early; TODO-trace) |
@@ -1264,6 +1267,8 @@ on the ≤k survivors).
 
 ### 3.3 Decode optimizations (GPU)
 
+<!-- doc-hashes: history -->
+
 | Item | Effect | Commit (pre-rewrite) |
 |---|---|---|
 | Fused QKV + FFN gate/up (nt==1 single matmul/group) | ~5 % decode | `6f0c847` |
@@ -1587,6 +1592,8 @@ The compute graph is now the inference path (Phase 6). Kernel-level parity work
 is complete (§0); the remaining gap is **wiring already-tested kernels into
 `MetalBackend`** — see §0.1 for the status table and measured numbers.
 
+<!-- doc-hashes: history -->
+
 | # | Item | Status | Approach / Result | Commit (pre-rewrite) |
 |---|---|---|---|---|
 | G1 | **Attention: wire the fast kernels** | ✅ **done** | per-op `Attn` dispatch: nt==1 → `flash_attn_enabled(hd)` → `gqa_attn_flash` (chunked `MINFER_ATTN_CHUNKS`) else `gqa_attn_split_f32` else classic; nt>1 → hd 64/128 + `prefill_flash_enabled(hd)` → `attn_flash_prefill` else `matmul_attn_enabled()` → `attn_parallel_prefill` else classic. Gated like the old path (`MINFER_NO_FLASH`/`MINFER_NO_SPLIT_ATTN`/`MINFER_NO_PREFILL_FLASH`/`MINFER_NO_MATMUL_ATTN`). Decode KV-growth closed: 0.5B KV206 ~122 → **~256 t/s (2.1×)**, 7B ~32.5 → **~49 t/s**; greedy byte-identical | `32b0d03` |
@@ -1643,6 +1650,8 @@ the relevant §3 section → update the §1 gap numbers.
   path (§3.1 #4).
 
 ### 5.3 Tested-and-rejected ideas (with commits)
+
+<!-- doc-hashes: history -->
 
 | Idea | Result | Commit (pre-rewrite) |
 |---|---|---|

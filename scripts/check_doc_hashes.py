@@ -21,16 +21,19 @@ one of them is legitimate, which is why the gate needs three classes rather than
   - **ledgered** — `scripts/doc-hashes.toml` pins the hash with a `kind` (`foreign` or
     `pre-rewrite`), the repository it comes from, and a reason. One entry per hash, never per
     line: a line number drifts on any edit above it ([ADR-0027]).
-  - **marked** — the document declares, in one standalone HTML comment, that its unresolvable
-    hashes are kept as history:
+  - **marked** — the document declares, above a block, that the block's unresolvable hashes are
+    kept as history:
 
         <!-- doc-hashes: history -->
 
-    The marker applies to the whole document and is invisible in the rendered book. It excuses
-    an **unresolvable** hash only: a hash that resolves is a locator and no marker can exempt
-    it. That scoping is not decoration — #685 had to narrow `METAL_OPTIMIZATIONS.md`'s prose
-    caveat precisely because that file interleaves pre-rewrite labels with current-history
-    commits that do resolve.
+    The marker covers **the block that follows it** — the next run of non-blank lines, which is
+    one paragraph, one table or one record entry — and it is invisible in the rendered book. It
+    excuses an **unresolvable** hash only: a hash that resolves is a locator and no marker can
+    exempt it. Block scope is the point, not a detail: #685 had to narrow
+    `METAL_OPTIMIZATIONS.md`'s prose caveat because that file interleaves pre-rewrite labels with
+    current-history commits, and a document-wide marker would let a mistyped current hash hide
+    anywhere in it (ADR-0065). Prose inside a list item cannot carry a marker without splitting
+    the list, so a label there belongs in the ledger instead.
 
 Everything else fails, naming the file, line and hash. Both exemptions ratchet, the
 `adr-citations.toml` shape: an entry no document cites fails, an entry whose hash now resolves
@@ -118,6 +121,20 @@ class Citation:
     text: str
     state: str = ""  # commit | ledger: <source> | marker | a failure reason
     why: str = ""
+
+
+@dataclass
+class Marker:
+    """One `<!-- doc-hashes: history -->` line and the block of lines it excuses (1-based)."""
+
+    doc: str
+    line: int
+    start: int
+    end: int  # exclusive
+    covered: int = 0
+
+    def covers(self, line: int) -> bool:
+        return self.start <= line < self.end
 
 
 @dataclass
@@ -269,13 +286,13 @@ def scan(root: Path, files: list[Path], entries: list[Exempt], report: Report) -
     by_hash = {entry.hash: entry for entry in entries}
     covered = {entry.hash: False for entry in entries}
     pending: list[Citation] = []
-    markers: dict[str, int] = {}
-    marker_covered: dict[str, int] = {}
+    markers: dict[str, list[Marker]] = {}
 
     for path in files:
         rel = path.relative_to(root).as_posix()
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         fence: str | None = None
+        declared: list[int] = []  # 0-based marker lines, outside fences
         for index, text in enumerate(lines):
             opener = FENCE.match(text)
             if fence is not None:
@@ -287,24 +304,50 @@ def scan(root: Path, files: list[Path], entries: list[Exempt], report: Report) -
                 continue
             found = MARKER.match(text)
             if found is not None:
-                marker = Citation(rel, index + 1, "", text.strip())
                 name = found.group(1).strip()
                 if name not in MARKER_CLASSES:
-                    marker.why = (
-                        f"unknown marker class {name!r}; the vocabulary is "
-                        f"{', '.join(sorted(MARKER_CLASSES))}"
+                    report.failures.append(
+                        Citation(
+                            rel,
+                            index + 1,
+                            "",
+                            text.strip(),
+                            why=(
+                                f"unknown marker class {name!r}; the vocabulary is "
+                                f"{', '.join(sorted(MARKER_CLASSES))}"
+                            ),
+                        )
                     )
-                    report.failures.append(marker)
-                elif rel in markers:
-                    marker.why = (
-                        f"a second `doc-hashes` marker; the first is at line {markers[rel]}"
-                    )
-                    report.failures.append(marker)
                 else:
-                    markers[rel] = index + 1
+                    declared.append(index)
                 continue
             for token in TOKEN.finditer(text):
                 pending.append(Citation(rel, index + 1, token.group(1), text.strip()))
+
+        # A marker covers the block that follows it: the next run of non-blank lines, once any
+        # further marker lines have been skipped. A marker with no block behind it declares
+        # nothing and is itself a failure.
+        for index in declared:
+            start = index + 1
+            while start < len(lines) and (
+                not lines[start].strip() or MARKER.match(lines[start])
+            ):
+                start += 1
+            if start >= len(lines):
+                report.failures.append(
+                    Citation(
+                        rel,
+                        index + 1,
+                        "",
+                        lines[index].strip(),
+                        why="covers no block — a marker must sit above the block it excuses",
+                    )
+                )
+                continue
+            end = start
+            while end < len(lines) and lines[end].strip():
+                end += 1
+            markers.setdefault(rel, []).append(Marker(rel, index + 1, start + 1, end + 1))
 
     # The ledger's own hashes go into the same batch: "the entry resolves now" and "nothing
     # cites it" are different findings, and only a resolution can tell them apart.
@@ -330,13 +373,16 @@ def scan(root: Path, files: list[Path], entries: list[Exempt], report: Report) -
             covered[entry.hash] = True
             citation.state = f"ledger: {entry.source}"
             continue
-        if citation.doc in markers:
-            marker_covered[citation.doc] = marker_covered.get(citation.doc, 0) + 1
+        marker = next(
+            (m for m in markers.get(citation.doc, []) if m.covers(citation.line)), None
+        )
+        if marker is not None:
+            marker.covered += 1
             citation.state = "marker"
             continue
         citation.why = (
-            f"{detail} and unexcused — pin it in {LEDGER}, or declare "
-            "`<!-- doc-hashes: history -->` in the document"
+            f"{detail} and unexcused — pin it in {LEDGER}, or put "
+            "`<!-- doc-hashes: history -->` above the block"
         )
         citation.state = citation.why
         report.failures.append(citation)
@@ -351,9 +397,10 @@ def scan(root: Path, files: list[Path], entries: list[Exempt], report: Report) -
         )
         report.stale_ledger.append((entry, why))
 
-    for rel, line in markers.items():
-        if not marker_covered.get(rel):
-            report.stale_markers.append((rel, line))
+    for doc, found in markers.items():
+        for marker in found:
+            if not marker.covered:
+                report.stale_markers.append((doc, marker.line))
 
 
 def check(
@@ -469,8 +516,20 @@ def selftest() -> int:
         cases.append(("an unresolvable hash fails", run({"docs/a.md": "`deadbeef`\n"}) == 1))
         cases.append(
             (
-                "the document marker excuses it",
+                "the marker excuses the block below it",
                 run({"docs/a.md": "<!-- doc-hashes: history -->\n\n`deadbeef`\n"}) == 0,
+            )
+        )
+        cases.append(
+            (
+                "the marker does not reach the block after that",
+                run(
+                    {
+                        "docs/a.md": "<!-- doc-hashes: history -->\n\n"
+                        "`deadbeef`\n\nA second paragraph with `cafebabe`.\n"
+                    }
+                )
+                == 1,
             )
         )
         cases.append(
@@ -483,6 +542,12 @@ def selftest() -> int:
                     }
                 )
                 == 1,
+            )
+        )
+        cases.append(
+            (
+                "a marker with no block behind it fails",
+                run({"docs/a.md": f"`{short}`\n\n<!-- doc-hashes: history -->\n"}) == 1,
             )
         )
         cases.append(
@@ -528,14 +593,14 @@ def selftest() -> int:
         )
         cases.append(
             (
-                "a second marker fails",
+                "two markers cover two blocks",
                 run(
                     {
-                        "docs/a.md": "<!-- doc-hashes: history -->\n\n"
-                        "<!-- doc-hashes: history -->\n\n`deadbeef`\n"
+                        "docs/a.md": "<!-- doc-hashes: history -->\n\n`deadbeef`\n\n"
+                        "<!-- doc-hashes: history -->\n\n`cafebabe`\n"
                     }
                 )
-                == 1,
+                == 0,
             )
         )
         cases.append(
@@ -675,7 +740,7 @@ def main(argv: list[str]) -> int:
         sys.stdout.flush()
         print(
             "check_doc_hashes: a hash is a locator — resolve it, pin it in "
-            f"{LEDGER}, or declare `<!-- doc-hashes: history -->` "
+            f"{LEDGER}, or put `<!-- doc-hashes: history -->` above the block "
             "(see docs/GATE-CONTRACT.md §Citations)",
             file=sys.stderr,
         )

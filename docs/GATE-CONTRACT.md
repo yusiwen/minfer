@@ -648,18 +648,21 @@ So the class a document may keep is declared, in one of two places:
 - **The ledger.** `scripts/doc-hashes.toml` pins a hash with a `kind` (`foreign` | `pre-rewrite`),
   the `source` it comes from and a reason. One entry per hash, never per line: a line number drifts
   on any edit above it, and the same hash is cited from up to ten documents.
-- **The document marker.** One standalone comment, `<!-- doc-hashes: history -->`, declares that
-  the document's unresolvable hashes are history. It applies to the whole document and is invisible
-  in the book, and it excuses an **unresolvable** hash only: a hash that resolves is a locator, and
-  no marker may exempt it. That scoping is the point — #685 had to narrow a prose caveat that said
-  "every hash here is history" in a file that also cites current commits.
+- **The block marker.** One standalone comment, `<!-- doc-hashes: history -->`, declares that the
+  block **below it** — the next run of non-blank lines, one paragraph or one table — keeps
+  unresolvable hashes as history. It is invisible in the book, and it excuses an **unresolvable**
+  hash only: a hash that resolves is a locator, and no marker may exempt it. The scope is one block
+  on purpose (ADR-0065): a document-wide marker would let a mistyped current hash hide anywhere in
+  the record, which is the defect #685 had to fix in prose ("every hash here is history" in a file
+  that also cites current commits). A label inside a **list item** cannot carry a marker without
+  splitting the list, so it goes in the ledger instead.
 
 `scripts/check_doc_hashes.py` (#684) is the gate, and its refusals are the ledger's ratchet: an
-unresolvable hash with neither a marker nor an entry fails, naming the file, line and hash; an
-entry no document cites any more fails; an entry whose hash resolves now fails, because it is not
-history any more; a marker that covers nothing fails. A tree it cannot judge — no git, not a work
-tree, a shallow clone where an absent object may never have been fetched — exits 2 rather than
-passing.
+unresolvable hash with neither a marker above its block nor an entry fails, naming the file, line
+and hash; an entry no document cites any more fails; an entry whose hash resolves now fails, because
+it is not history any more; a marker that covers nothing, or sits above no block, fails. A tree it
+cannot judge — no git, not a work tree, a shallow clone where an absent object may never have been
+fetched — exits 2 rather than passing.
 
 It proves existence, never correctness: a hash that resolves may still be the wrong commit for the
 sentence, exactly as `check_doc_counts.py` can prove a number's stamp but not its value.
@@ -779,7 +782,7 @@ is the one claim a gate cannot verify for truth (§"Counts"). Its ledger
 (`scripts/doc-counts.toml`) is the escape hatch, ratcheted both ways and empty today.
 `scripts/check_doc_hashes.py` (#684) then covers the last locator class (§"Citations"): a backticked
 commit hash must resolve to a commit **HEAD can reach**, or be pinned in `scripts/doc-hashes.toml`
-with a source and a reason, or sit in a document that declares its unresolvable hashes are history —
+with a source and a reason, or sit in a block that declares its unresolvable hashes are history —
 both exemptions ratchet, and a tree it cannot judge (no git, a shallow clone) fails rather than
 passing. Resolving is
 not pointing, so the same job runs
@@ -902,3 +905,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0039](adr/0039-the-corpus-is-entered-through-a-question-at-pr-time.md) — The corpus is entered through a question at PR time, and its maps are checked
 - [ADR-0040](adr/0040-a-decision-is-bound-to-the-surfaces-it-governs.md) — A decision is bound to the surfaces it governs, so the question names it
 - [ADR-0064](adr/0064-a-hash-that-does-not-resolve-is-history-only-where-the-document-says-so.md) — A hash that does not resolve is history only where the document or the ledger says so
+- [ADR-0065](adr/0065-the-hash-marker-covers-the-block-below-it-not-the-document.md) — The hash marker covers the block below it, not the document
