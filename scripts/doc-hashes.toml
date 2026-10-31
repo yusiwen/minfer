@@ -2,14 +2,17 @@
 #
 # `scripts/check_doc_hashes.py` reads this ledger beside it (ADR-0023). `docs/GATE-CONTRACT.md`
 # §"Citations" states the rule: a backticked hash is a locator, and a document that keeps a hash
-# which cannot resolve must say so where the checker can read it — in one standalone comment,
+# which cannot resolve must say so where the checker can read it — in one standalone comment
+# above the block it describes (one comment, one paragraph or table),
 #
 #     <!-- doc-hashes: history -->
 #
-# or in one entry below. The marker covers *unresolvable* hashes in a whole document; the ledger
-# pins a single hash wherever it is cited. Both exist because the classes are not the same: a
-# record document may keep its own pre-rewrite labels wholesale, while a foreign repository's
-# hash is one fact that belongs in one place, with the repository it came from.
+# or in one entry below. The marker covers *unresolvable* hashes in the block that follows it
+# (ADR-0065); the ledger pins a single hash wherever it is cited. Both exist because the classes
+# are not the same: a record document may keep a table of pre-rewrite labels as one block, while a
+# foreign repository's hash is one fact that belongs in one place, with the repository it came
+# from — and a label inside a list item cannot carry a marker without splitting the list, so it
+# belongs here.
 #
 # One entry per hash, never per line: a line number drifts on any edit above it (ADR-0027), and
 # the same hash is cited from up to ten documents. `source` says whose history it is, `reason`
@@ -25,8 +28,8 @@
 # last pre-rewrite label from a record must also delete its marker.
 #
 # Population when this landed (2026-10-31, `master` `24626ad`, measured in a fresh clone): 129
-# unresolvable occurrences in 58 distinct hashes — 41 hashes / 72 occurrences covered by
-# `METAL_OPTIMIZATIONS.md`'s marker, the 17 below covering the other 57. An entry here is a
+# unresolvable occurrences in 58 distinct hashes — 28 occurrences behind the four block markers in
+# `METAL_OPTIMIZATIONS.md`, the 35 entries below covering the other 101. An entry here is a
 # reviewed exception, not a place to hide a typo: a hash that *should* resolve (a mistyped or
 # stale commit of this repository) is repaired, not pinned.
 #
@@ -159,3 +162,135 @@ hash = "384b3d9"
 kind = "pre-rewrite"
 source = "minfer (pre-amend twin)"
 reason = "the r19 record says it in as many words: an unresolvable pre-amend twin, kept with the master-table footnote-3 convention"
+
+# The pre-rewrite labels that sit inside the Metal record's *prose* (18 hashes, 22 occurrences).
+# The four `Commit (pre-rewrite)` tables carry a block marker each, but these paragraphs are list
+# items and continuation paragraphs: a standalone comment above one would split the list it belongs
+# to, so the hash is pinned here instead. Each entry names the record it comes from; the label is
+# kept as history, never re-pointed at a guess.
+
+[[exempt]]
+
+hash = "28d4ba2"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.1 GQA `simd_max` divergence fix (2026-08-01), cited inside its own bullet"
+
+[[exempt]]
+
+hash = "bff73db"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.1 GPU-hang safety hardening (2026-08-03), and the §3.5 f16 KV default it also names"
+
+[[exempt]]
+
+hash = "b3d4c7a"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.3 split-attention design record"
+
+[[exempt]]
+
+hash = "6f0c847"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.3 fused-QKV essentials, whose '24 %' figure the same paragraph retracts"
+
+[[exempt]]
+
+hash = "26b145b"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.3 correction that put the fused-QKV gain at ~5 % instead of 24 %"
+
+[[exempt]]
+
+hash = "c9f865c"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "one of the three §3.4 non-Q4_0 GEMM labels (2026-08-03), cited as a triplet"
+
+[[exempt]]
+
+hash = "2c03bd1"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "one of the three §3.4 non-Q4_0 GEMM labels (2026-08-03), cited as a triplet"
+
+[[exempt]]
+
+hash = "5b914f0"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "one of the three §3.4 non-Q4_0 GEMM labels (2026-08-03), cited as a triplet"
+
+[[exempt]]
+
+hash = "b2c97fd"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.4 parallel prefill attention (2026-08-11)"
+
+[[exempt]]
+
+hash = "5974eb1"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.4 prefill flash-attention port (2026-08-14), also named in §1.1 as when the numbers were updated"
+
+[[exempt]]
+
+hash = "89ac39a"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.4 hd=128 (7B) prefill flash port (2026-08-15)"
+
+[[exempt]]
+
+hash = "7253a3b"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.4 simdgroup-matrix kernel fix that followed the hd=128 port"
+
+[[exempt]]
+
+hash = "f3a499d"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.4 mm-kernel hot-loop `pragma unroll` (2026-08-19), also named in §0.8"
+
+[[exempt]]
+
+hash = "0e756f3"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.4 follow-up that fixed the pre-unroll corruption, also named in §0.8"
+
+[[exempt]]
+
+hash = "66f4290"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.5 KV geometric growth"
+
+[[exempt]]
+
+hash = "387d612"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "the §3.5 f16 KV auto-default"
+
+[[exempt]]
+
+hash = "cbba68c"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "one of the two §3.5 split-GGUF labels"
+
+[[exempt]]
+
+hash = "34eaf10"
+kind = "pre-rewrite"
+source = "minfer (pre-rewrite label)"
+reason = "one of the two §3.5 split-GGUF labels"
