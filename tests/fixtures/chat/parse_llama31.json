@@ -1,0 +1,162 @@
+{
+  "format": "llama31",
+  "response_template": {
+    "defaults": {
+      "role": "assistant"
+    },
+    "start_anchor": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+    "fields": {
+      "tool_calls": {
+        "open": "<|python_tag|>",
+        "close_pattern": "\\s*;?\\s*(?=<\\|python_tag\\|>|<\\|eot_id\\|>|\\Z)",
+        "content": "json",
+        "repeats": true,
+        "transform": {
+          "type": "function",
+          "function": {
+            "name": "{content.name}",
+            "arguments": "{content.parameters}"
+          }
+        }
+      },
+      "content": {
+        "close": "<|python_tag|>",
+        "content": "text"
+      }
+    }
+  },
+  "prefix": "<|start_header_id|>user<|end_header_id|>\n\nWeather in Paris?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "provenance": {
+    "reference": "HuggingFaceTB transformers 5.17.0 transformers.utils.chat_parsing.parse_response with an authored response_template for Llama 3.1 `{\"name\":…, \"parameters\":…}` (llama.cpp `common_chat_parse_llama_3_1`)",
+    "template_source": "authored from the family's published call syntax; llama.cpp's parser is the second oracle",
+    "command": "uv run --with transformers==5.17.0 python scripts/gen_tool_call_family_fixtures.py --family llama31",
+    "date": "2026-11-01"
+  },
+  "cases": [
+    {
+      "name": "single_call",
+      "completion": "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_calls",
+      "completion": "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}\n<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Lyon\"}}",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          },
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Lyon"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_calls_semicolon",
+      "completion": "<|python_tag|>{\"name\": \"a\", \"parameters\": {}};<|python_tag|>{\"name\": \"b\", \"parameters\": {\"x\": 1}}",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "a",
+            "arguments": {}
+          },
+          {
+            "name": "b",
+            "arguments": {
+              "x": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "content_before_the_call",
+      "completion": "Let me check. <|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
+      "expected": {
+        "content": "Let me check.",
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "type_key",
+      "completion": "<|python_tag|>{\"type\": \"function\", \"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "truncated_object",
+      "completion": "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Par\"",
+      "error": "json parser could not parse region as JSON.\nContent: '{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Par\"'\nError: Expecting ',' delimiter: line 1 column 53 (char 52)"
+    },
+    {
+      "name": "without_the_python_tag",
+      "completion": "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
+      "expected": {
+        "content": "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
+        "tool_calls": []
+      }
+    },
+    {
+      "name": "prose",
+      "completion": "Hello, world!",
+      "expected": {
+        "content": "Hello, world!",
+        "tool_calls": []
+      }
+    }
+  ]
+}

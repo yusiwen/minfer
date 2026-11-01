@@ -440,7 +440,7 @@ or batch slot) carries its own position, so slots cannot perturb each other. A r
 ends mid-character: if a generation stops with a partial UTF-8 sequence pending, those bytes are
 dropped (with a printed note) rather than decoded to `U+FFFD`.
 
-### Tool calling (#597)
+### Tool calling (#597/#614/#699)
 
 `/v1/chat/completions` accepts OpenAI's `tools` and `tool_choice` on the **prompt** side: the
 definitions are rendered into the prompt by the model's own template, exactly as the client wrote
@@ -450,8 +450,8 @@ them.
 |---|---|
 | `"tools": [{"type":"function","function":{"name":"get_weather","parameters":{…}}}]` | the array is passed through verbatim — the client's key order and any unknown key included, because the template echoes each entry with `| tojson` |
 | `"tool_choice": "auto"` (or absent) | the definitions are rendered |
-| `"tool_choice": "none"` | the prompt is rendered **without** them (this server does not parse tool calls out of the output, so describing them would invite a call it cannot report) |
-| `"tool_choice": "required"` or `{"type":"function","function":{"name":…}}` | `400`: those need tool calls to be extracted from the model's output |
+| `"tool_choice": "none"` | the prompt is rendered **without** them; a call the model writes anyway is still extracted (the parser does not depend on `tools`) |
+| `"tool_choice": "required"` or `{"type":"function","function":{"name":…}}` | enforced with a grammar over the model's own call format: `<tool_call>` (Qwen2/Qwen3), `[TOOL_CALLS] [{…}]` (Mistral Nemo) or `<|python_tag|>{"name":…, "parameters":…}` (Llama 3.1). A template whose format the table does not recognise, or a recognised format with no grammar yet, is a named `400` |
 | `"tools": []` | `400` — "no tools" is the absence of the field |
 
 A malformed entry (not an object, `type` other than `"function"`, a missing or empty
@@ -482,7 +482,7 @@ naming `messages[i].tool_calls[j]`, and `tool_calls: []` is refused like `tools:
 that would drop the call (no `tool_calls` branch, or the ChatML fallback) is refused **by name**
 too, never answered `200` with the call silently missing.
 
-**A completion's call is extracted** (#614): a `<tool_call>` block the model writes comes back as
+**A completion's call is extracted** (#614): a call block the model writes comes back as
 `choices[].message.tool_calls` with `finish_reason: "tool_calls"`, the arguments exactly as the
 model wrote them (an object keeps its own bytes; a JSON string is decoded), and a synthesised
 `call_…` id a client can echo as `tool_call_id`. Streaming sends a `delta.tool_calls` start chunk
@@ -490,9 +490,22 @@ followed by one arguments fragment; concatenating the deltas reproduces the non-
 Text outside a block stays `content`. A completion cut off inside a block is a `400` naming the
 block, never a `200` with half a call in `content`.
 
-`tool_choice: "required"` and a forced function are **enforced** with a grammar over the model's
-own `<tool_call>` format (Qwen2/Qwen3): the name is enumerated or fixed, so the returned call is
-the one demanded. A template that emits another family's call syntax, a combination with
+The block's syntax comes from the model's own template (one row of the format table, ADR-0066).
+Three formats are recognised:
+
+- **Qwen2/Qwen3 (and Hermes):** `<tool_call>{"name": …, "arguments": …}</tool_call>`.
+- **Mistral Nemo / Magistral:** one `[TOOL_CALLS] [{"name": …, "arguments": …}, …]` array; the
+  array may hold one call or several.
+- **Llama 3.1:** `<|python_tag|>{"name": …, "parameters": …}` per call, an optional `;` between
+  calls; a completion that omits the tag is content, not a call.
+
+Qwen3.5's XML body (#708), Ministral 3's `[TOOL_CALLS]name[ARGS]{…}` (#709) and Gemma 4's
+`<|tool_call>call:name{…}` (#710) are not recognised yet; `tool_choice: "required"`/forced on
+those templates is a named `400`, never an unconstrained generation.
+
+`tool_choice: "required"` and a forced function are **enforced** with a grammar over the same
+row: the name is enumerated or fixed, so the returned call is the one demanded. A template the
+table does not recognise, a recognised row with no grammar shape yet, a combination with
 `grammar`/a non-text `response_format`, the speculative draft engine, or a forced name that is not
 in `tools` are each a named `400`.
 

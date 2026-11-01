@@ -272,7 +272,7 @@ call" (Qwen2.5 concatenates `message.content`, null for a call-only turn). The c
 output back into `choices[].message.tool_calls` remains the separate increment
 ([#614](https://github.com/yusiwen/minfer/issues/614)).
 
-### 2.9 A completion's tool call is extracted (#614, ADR-0063)
+### 2.9 A completion's tool call is extracted (#614/#699, ADR-0063/ADR-0066)
 
 `src/server/toolcall.rs` is the request carrier's mirror image. Both response paths run the
 completion through one parser, so the serial and batched engines share it:
@@ -302,12 +302,16 @@ completion through one parser, so the serial and batched engines share it:
   recognise, a recognised row with no grammar shape yet, a combination with `grammar`/a non-text
   `response_format`, the speculative engine, or a forced name that is not offered.
 
-The table ships the Qwen2/Qwen3 row today; the other families are rows (and, where needed, a
-block shape for an array or a next-open/EOS close), not parser branches. The reference is
-transformers 5.17.0's `chat_parsing.parse_response` with its Qwen response template
-(`tests/fixtures/chat/parse_qwen2.5.json`, 12 cases); one case records a deliberate divergence:
-the reference splits at the first `</tool_call>` inside a string and refuses, while this parser
-scans the JSON value and accepts.
+The table ships three rows: Qwen2/Qwen3 (`<tool_call>`, one JSON object then a literal close),
+Mistral Nemo/Magistral (`[TOOL_CALLS]` holding a JSON array; EOS ends it) and Llama 3.1
+(`<|python_tag|>` then one JSON object per call, with `parameters` as the arguments key; the next
+tag, an optional `;` or EOS ends it). A family is a row plus a block shape, not a parser branch.
+The references are transformers 5.17.0's `chat_parsing.parse_response` over
+`tests/fixtures/chat/parse_qwen2.5.json` (12 cases, its released Qwen template),
+`parse_mistral_nemo.json` (7 cases) and `parse_llama31.json` (8 cases; transformers ships no
+Mistral/Llama template, so those two record an authored one and name llama.cpp's parser as the
+second oracle). One Qwen case records a deliberate divergence: the reference splits at the first
+`</tool_call>` inside a string and refuses, while this parser scans the JSON value and accepts.
 
 ## 3. Tokenizer — accepted, refused, detected
 
@@ -601,10 +605,10 @@ return.
 | A message's own JSON | unit test: the replayed round-trip (user → assistant with `tool_calls` and null content → tool → generation prompt) renders byte for byte; the client's key order survives in both directions; a vendor key survives `| tojson`; the `(role, content)` adapter and the raw objects render identical bytes | transformers 5.17.0, `scripts/gen_tools_fixture.py` (#613) |
 | A replayed call that reaches nothing refuses | unit + e2e: a template without a `tool_calls` branch and the ChatML fallback each refuse with kind `tool calls not rendered`; a vendor key does not trigger the check; a valid replay is served | the mechanical two-pass check (ADR-0062) |
 | The request message surface | unit: a non-object message, a non-string `role`/`content`, a non-array or empty `tool_calls`, and a missing `id`/`function`/`name` or object `arguments` are `400`s naming `messages[i].tool_calls[j]` | OpenAI's shapes (#613) |
-| A tool call is extracted | unit test over `tests/fixtures/chat/parse_qwen2.5.json`: 12 completions (one/two calls, content around them, string arguments, HTML/unicode, a `</tool_call>` inside a string, extra keys, prose, three truncated shapes) compared to the reference's `tool_calls` and, for object arguments, to the block's own bytes | transformers 5.17.0 `chat_parsing.parse_response` + its Qwen response template, `scripts/gen_tool_call_parse_fixture.py` (#614) |
-| The deltas rebuild the call | unit test: the event→chunk mapping folded at six chunk splits equals the non-streaming `build_response` | the shipped mapping (`types::chunks_for_tool_event`) |
+| A tool call is extracted | unit tests over `tests/fixtures/chat/parse_qwen2.5.json` (12 completions: one/two calls, content around them, string arguments, HTML/unicode, a `</tool_call>` inside a string, extra keys, prose, three truncated shapes), `parse_mistral_nemo.json` (7: one/two array calls, content before the call, an extra `id`, string arguments, a truncated array, prose) and `parse_llama31.json` (8: one/two calls with newline/`;` separators, content before the call, the `type` key, a truncated object, a completion without the tag, prose), each compared to the reference's `tool_calls` and, for object arguments, to the block's own bytes | transformers 5.17.0 `chat_parsing.parse_response`: the released Qwen template for the first fixture, an authored `response_template` plus llama.cpp's parser as the second oracle for the other two, `scripts/gen_tool_call_parse_fixture.py` (#614), `scripts/gen_tool_call_family_fixtures.py` (#699) |
+| The deltas rebuild the call | unit test: the event→chunk mapping folded at six chunk splits equals the non-streaming `build_response`, for the Qwen block and each family fixture's call cases | the shipped mapping (`types::chunks_for_tool_event`) |
 | A truncated call refuses | unit + e2e: a block cut inside its JSON, or inside a partial closing tag, is an error; the HTTP surface answers `400` naming the block | the parser (ADR-0063) |
-| `tool_choice` is constrained | unit: the grammar closes the object and names/enumerates the tool and compiles over a byte vocabulary; e2e: `"required"` and a forced function each return a `tool_calls` completion on the toy model, an unconstrainable template and a `grammar` conflict are `400`s | the GBNF on the model's call format (#614) |
+| `tool_choice` is constrained | unit: the grammar closes the object and names/enumerates the tool and compiles over a byte vocabulary, for the Qwen, Mistral Nemo and Llama 3.1 rows; e2e: `"required"` and a forced function return a `tool_calls` completion on the toy model (Qwen), each family's forced block is parsed over HTTP, and an unconstrainable template and a `grammar` conflict are `400`s | the GBNF on the model's call format (#614/#699, ADR-0066) |
 | `tojson` is CPython's | unit test over `tests/fixtures/chat/tojson_cpython.json`: nine entries (separators, key order, `ensure_ascii=False`, unescaped HTML characters, controls, empty containers, non-object roots, the pretty form) compare byte for byte; an unhonoured keyword (`sort_keys`) is refused by name | CPython 3.12.3 `json.dumps`, `scripts/gen_chat_fixtures.py --check` |
 | Key order survives the parse | unit test: the ordered carrier keeps `{"z":1,"a":…}` in document order through deserialize + re-serialize, and a tools request keeps `type` before `function` | the client's own JSON (#597) |
 | Tools that reach nothing refuse | unit test: a template with no `tools` branch and the ChatML fallback each refuse with kind `tools not rendered` and name the cause; the same conversation without tools still renders | the mechanical two-pass check (ADR-0058) |

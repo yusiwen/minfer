@@ -194,7 +194,6 @@ impl Parser {
 
     /// Consume one block body. Returns false when more bytes are needed.
     fn block_step(&mut self, out: &mut Vec<Event>, eos: bool) -> Result<bool, ParseError> {
-        let close = self.format.close;
         let start = self.buf.len() - self.buf.trim_start().len();
         if start == self.buf.len() {
             // Only whitespace (or nothing) after the opening tag.
@@ -203,9 +202,26 @@ impl Parser {
             }
             return Ok(false);
         }
-        match raw_value_len(&self.buf[start..]) {
-            Ok(len) => {
-                let after = start + len;
+        let len = match raw_value_len(&self.buf[start..]) {
+            Ok(len) => len,
+            Err(RawStatus::Eof) => {
+                if eos {
+                    return Err(ParseError::new(
+                        "the completion ended inside the call's JSON",
+                    ));
+                }
+                return Ok(false);
+            }
+            Err(RawStatus::Bad(detail)) => {
+                return Err(ParseError::new(format!(
+                    "the call's JSON does not parse: {detail} (near {:?})",
+                    truncate_at(&self.buf[start..], 160)
+                )))
+            }
+        };
+        let after = start + len;
+        match self.format.shape {
+            format::BlockShape::ObjectThenClose(close) => {
                 let rest = &self.buf[after..];
                 let ws = rest.len() - rest.trim_start().len();
                 let after_ws = &rest[ws..];
@@ -235,23 +251,55 @@ impl Parser {
                     }
                     return Ok(false);
                 }
-                return Err(ParseError::new(format!(
+                Err(ParseError::new(format!(
                     "expected `{close}` after the call's JSON, found {:?}",
                     truncate_at(after_ws, 40)
-                )));
+                )))
             }
-            Err(RawStatus::Eof) => {
-                if eos {
-                    return Err(ParseError::new(
-                        "the completion ended inside the call's JSON",
-                    ));
+            format::BlockShape::ArrayAtEos => {
+                let json = &self.buf[start..after];
+                let calls = parse_call_array(json, self.format)?;
+                out.extend(calls.into_iter().map(Event::Call));
+                self.buf.drain(..after);
+                self.in_block = false;
+                self.after_call = true;
+                Ok(true)
+            }
+            format::BlockShape::ObjectUntilNextOpen { separator } => {
+                let json = &self.buf[start..after];
+                let call = parse_block(json, self.format)?;
+                let rest = &self.buf[after..];
+                let ws = rest.len() - rest.trim_start().len();
+                let mut at = after + ws;
+                if let Some(after_sep) = self.buf[at..].strip_prefix(separator) {
+                    let ws2 = after_sep.len() - after_sep.trim_start().len();
+                    at += separator.len() + ws2;
                 }
-                Ok(false)
+                let next = &self.buf[at..];
+                let open = self.format.open;
+                if next.starts_with(open) {
+                    out.push(Event::Call(call));
+                    self.buf.drain(..at + open.len());
+                    // The next object starts now: stay in the block.
+                    return Ok(true);
+                }
+                if next.is_empty() || open.starts_with(next) {
+                    if eos {
+                        // A complete call with nothing but a separator or a partial
+                        // next open after it: the model stopped at EOS.
+                        out.push(Event::Call(call));
+                        self.buf.clear();
+                        self.in_block = false;
+                        self.after_call = true;
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                Err(ParseError::new(format!(
+                    "expected `{separator}` or `{open}` after the call's JSON, found {:?}",
+                    truncate_at(next, 40)
+                )))
             }
-            Err(RawStatus::Bad(detail)) => Err(ParseError::new(format!(
-                "the call's JSON does not parse: {detail} (near {:?})",
-                truncate_at(&self.buf[start..], 160)
-            ))),
         }
     }
 }
@@ -339,13 +387,40 @@ pub fn parse_completion(
 }
 
 /// Read one call object, picking the row's name and arguments keys.
+fn parse_block(json: &str, format: &format::ToolFormat) -> Result<ToolCall, ParseError> {
+    let object: HashMap<String, &RawValue> = serde_json::from_str(json)
+        .map_err(|e| ParseError::new(format!("the call object does not parse: {e}")))?;
+    call_from_object(&object, format)
+}
+
+/// Read a block that holds a JSON array of call objects (Mistral Nemo).
+///
+/// The array is the block; an empty array is a block with no call, which is a
+/// refusal rather than a silent no-op.
+fn parse_call_array(json: &str, format: &format::ToolFormat) -> Result<Vec<ToolCall>, ParseError> {
+    let objects: Vec<HashMap<String, &RawValue>> = serde_json::from_str(json).map_err(|e| {
+        ParseError::new(format!(
+            "the call block is not an array of call objects: {e}"
+        ))
+    })?;
+    if objects.is_empty() {
+        return Err(ParseError::new("the call block holds no call"));
+    }
+    objects
+        .iter()
+        .map(|object| call_from_object(object, format))
+        .collect()
+}
+
+/// Take the name and arguments out of one call object.
 ///
 /// The object is a map of raw values, so the arguments stay the model's own
 /// bytes (ADR-0063 decision 3); a JSON string argument is decoded because OpenAI
 /// sends the call's arguments as text.
-fn parse_block(json: &str, format: &format::ToolFormat) -> Result<ToolCall, ParseError> {
-    let object: HashMap<String, &RawValue> = serde_json::from_str(json)
-        .map_err(|e| ParseError::new(format!("the call object does not parse: {e}")))?;
+fn call_from_object(
+    object: &HashMap<String, &RawValue>,
+    format: &format::ToolFormat,
+) -> Result<ToolCall, ParseError> {
     let name = match object.get(format.name_key) {
         Some(raw) => serde_json::from_str::<String>(raw.get()).map_err(|e| {
             ParseError::new(format!(

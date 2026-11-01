@@ -27,6 +27,27 @@ fn a_jinja_comment_does_not_count_as_a_rendered_format() {
 }
 
 #[test]
+fn the_mistral_array_row_is_detected_and_the_args_form_is_not() {
+    assert_eq!(
+        detected("[TOOL_CALLS] [{\"name\": \"get_weather\""),
+        Some("mistral_nemo")
+    );
+    assert_eq!(
+        detected("[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}"),
+        None,
+        "the name-in-anchor [ARGS] form is #709, not the array row"
+    );
+}
+
+#[test]
+fn the_llama_row_is_detected_from_the_python_tag() {
+    assert_eq!(
+        detected("<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {}}"),
+        Some("llama31")
+    );
+}
+
+#[test]
 fn a_template_without_a_known_anchor_has_no_row() {
     assert_eq!(
         detected("{% for m in messages %}{{ m.content }}{% endfor %}"),

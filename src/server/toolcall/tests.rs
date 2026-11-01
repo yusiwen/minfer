@@ -268,6 +268,101 @@ fn the_transformers_reference_parses_identically() {
     assert_eq!(fx.cases.len(), 12, "fixture shrank");
 }
 
+// === The family fixtures (#699) ==========================================
+
+const MISTRAL_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_mistral_nemo.json");
+const LLAMA_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_llama31.json");
+
+#[derive(serde::Deserialize)]
+struct FamilyFixture {
+    format: String,
+    provenance: serde_json::Value,
+    cases: Vec<ParseCase>,
+}
+
+fn family_row(name: &str) -> &'static format::ToolFormat {
+    match name {
+        "mistral_nemo" => &format::MISTRAL_NEMO,
+        "llama31" => &format::LLAMA31,
+        other => panic!("the fixture names an unknown format: {other}"),
+    }
+}
+
+/// Compare one family fixture against the reference, case for case.
+///
+/// The authored `response_template` is the authority here (transformers ships no
+/// Mistral/Llama template); the fixture's provenance says so, and the parser's
+/// own bytes assertion covers the "the arguments are the model's bytes" rule.
+fn check_family_fixture(text: &str, expected_cases: usize) {
+    let fx: FamilyFixture = serde_json::from_str(text).expect("parse family fixture");
+    let row = family_row(&fx.format);
+    assert!(
+        fx.provenance["reference"]
+            .as_str()
+            .unwrap()
+            .contains("transformers"),
+        "the fixture must name transformers as its authority"
+    );
+    let mut seen = 0;
+    for case in &fx.cases {
+        let got = parse_completion(&case.completion, row);
+        if case.error.is_some() {
+            assert!(
+                got.is_err(),
+                "{}: the reference refused this completion, so this engine must too",
+                case.name
+            );
+            seen += 1;
+            continue;
+        }
+        let (content, calls) = got.unwrap_or_else(|e| panic!("{}: {}", case.name, e.message()));
+        let expected = case
+            .expected
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}", case.name));
+        assert_eq!(calls.len(), expected.tool_calls.len(), "{}", case.name);
+        for (got, want) in calls.iter().zip(&expected.tool_calls) {
+            assert_eq!(got.name, want.name, "{}", case.name);
+            match &want.arguments {
+                serde_json::Value::String(text) => {
+                    assert_eq!(&got.arguments, text, "{}", case.name)
+                }
+                value => {
+                    let parsed: serde_json::Value = serde_json::from_str(&got.arguments)
+                        .unwrap_or_else(|e| panic!("{}: arguments are not JSON: {e}", case.name));
+                    assert_eq!(&parsed, value, "{}", case.name);
+                    assert!(
+                        case.completion.contains(&got.arguments),
+                        "{}: an object's arguments are the block's own bytes",
+                        case.name
+                    );
+                }
+            }
+        }
+        // A call-less completion is prose: the reference and this engine agree on
+        // the text. With calls, content is compared only where the fixture has it
+        // (a call-only block is `""` by the OpenAI convention).
+        if let Some(want) = expected.content.as_deref() {
+            assert_eq!(content, want, "{}", case.name);
+        } else if calls.is_empty() {
+            assert_eq!(content, "", "{}", case.name);
+        }
+        seen += 1;
+    }
+    assert_eq!(seen, fx.cases.len());
+    assert_eq!(fx.cases.len(), expected_cases, "fixture shrank");
+}
+
+#[test]
+fn the_mistral_nemo_reference_parses_identically() {
+    check_family_fixture(MISTRAL_JSON, 7);
+}
+
+#[test]
+fn the_llama31_reference_parses_identically() {
+    check_family_fixture(LLAMA_JSON, 8);
+}
+
 // === Streaming: the deltas rebuild the non-streaming message =============
 
 /// Fold SSE payloads into (content, [(id, name, arguments)]), the way a client
@@ -367,6 +462,56 @@ fn streamed_deltas_rebuild_the_non_streaming_tool_calls() {
     }
 }
 
+// === Streaming across the family fixtures (#699) ========================
+
+#[test]
+fn streamed_deltas_rebuild_each_family_call() {
+    use crate::server::types;
+    for (fixture, row) in [
+        (MISTRAL_JSON, &format::MISTRAL_NEMO),
+        (LLAMA_JSON, &format::LLAMA31),
+    ] {
+        let fx: FamilyFixture = serde_json::from_str(fixture).expect("parse family fixture");
+        assert_eq!(fx.format, row.id);
+        for case in &fx.cases {
+            if case.error.is_some() {
+                continue;
+            }
+            let expected = case.expected.as_ref().expect("expected");
+            if expected.tool_calls.is_empty() {
+                continue;
+            }
+            let (want_content, want_calls) =
+                parse_completion(&case.completion, row).expect("non-streaming parse");
+            for split in [1usize, 2, 3, 5, 7, 4096] {
+                let mut parser = Parser::new(row);
+                let mut index = 0usize;
+                let mut payloads = Vec::new();
+                for chunk in case.completion.as_bytes().chunks(split) {
+                    let text = std::str::from_utf8(chunk).unwrap();
+                    for event in parser.feed(text) {
+                        payloads.extend(types::chunks_for_tool_event(
+                            "id", "m", 1, &mut index, &event,
+                        ));
+                    }
+                }
+                for event in parser.finish().expect("finish") {
+                    payloads.extend(types::chunks_for_tool_event(
+                        "id", "m", 1, &mut index, &event,
+                    ));
+                }
+                let (content, calls) = fold_chunks(&payloads);
+                assert_eq!(content, want_content, "{} split {split}", case.name);
+                assert_eq!(calls.len(), want_calls.len(), "{} split {split}", case.name);
+                for ((_, name, arguments), want) in calls.iter().zip(&want_calls) {
+                    assert_eq!(name, &want.name, "{} split {split}", case.name);
+                    assert_eq!(arguments, &want.arguments, "{} split {split}", case.name);
+                }
+            }
+        }
+    }
+}
+
 // === The tool_choice constraint (#614) ==================================
 
 fn byte_pieces() -> (Vec<Option<Box<[u8]>>>, Vec<bool>) {
@@ -405,6 +550,22 @@ fn the_forced_call_grammar_wraps_the_json_object_and_names_the_tool() {
     let (pieces, eog) = byte_pieces();
     crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
         .expect("the forced-call grammar compiles");
+}
+
+#[test]
+fn the_family_grammar_shapes_are_the_rows() {
+    for (row, open, args_key) in [
+        (&format::MISTRAL_NEMO, "[TOOL_CALLS]", "arguments"),
+        (&format::LLAMA31, "<|python_tag|>", "parameters"),
+    ] {
+        let grammar = forced_call_grammar(row, &["get_weather"], Some("get_weather"))
+            .unwrap_or_else(|| panic!("{} has a grammar shape", row.id));
+        assert!(grammar.contains(open), "{}: {grammar}", row.id);
+        assert!(grammar.contains(args_key), "{}: {grammar}", row.id);
+        let (pieces, eog) = byte_pieces();
+        crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
+            .unwrap_or_else(|e| panic!("{}: the grammar does not compile: {e}", row.id));
+    }
 }
 
 #[test]

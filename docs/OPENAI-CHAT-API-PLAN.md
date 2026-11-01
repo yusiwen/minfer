@@ -191,7 +191,7 @@ touch behavior):
 | Prompt caching / KV reuse across requests | Slots keep their KV between requests; a shared-prefix matcher is future work |
 | SSE `stream_options.include_usage` | OpenAI extension, not in MVP scope |
 | Multimodal content arrays / embeddings | Non-goals (MVP) |
-| ~~Tool-call extraction~~ | shipped ([#614](https://github.com/yusiwen/minfer/issues/614)): a `<tool_call>` completion becomes `message.tool_calls` (`finish_reason: "tool_calls"`), and `tool_choice: "required"`/a forced function are enforced by a grammar |
+| ~~Tool-call extraction~~ | shipped ([#614](https://github.com/yusiwen/minfer/issues/614), [#699](https://github.com/yusiwen/minfer/issues/699)): a call in the model's own format (Qwen `<tool_call>`, Mistral Nemo `[TOOL_CALLS] [{…}]`, Llama 3.1 `<|python_tag|>{"name":…, "parameters":…}`) becomes `message.tool_calls` (`finish_reason: "tool_calls"`), and `tool_choice: "required"`/a forced function are enforced by a grammar over the same format row (ADR-0066) |
 
 > **Update (2026-09-15):** the f16 KV cache, listed as deferred in rev 5, has
 > since shipped — `MINFER_CACHE_TYPE=f16` with auto-selection for 7B-class
@@ -269,14 +269,14 @@ numbers — the file was restructured) defines the request format. Our parser mu
 > divergence from OpenAI; clients that care should pass explicit values.
 
 **Non-goals (MVP):**
-- `tools` / `tool_choice` — **shipped for the prompt side**, and a request message's
-  `tool_calls` reaches the template (#613); the output side (parsing the model's
-  `<tool_call>` into `choices[].message.tool_calls`) is still a non-goal ([#614](https://github.com/yusiwen/minfer/issues/614))
 - `response_format` (json_schema mode)
 - `logprobs` / `top_logprobs`
 - `reasoning_effort`
 - `n` (multiple choices), `logit_bias`, `user`
 - multimodal `content` arrays (reject with 400)
+
+`tools` / `tool_choice` are no longer on this list: the prompt side shipped in #597/#613, and the
+output side — extraction and the `tool_choice` constraint — in #614 and #699 (§Tool Calling).
 
 **Unknown fields** are ignored silently, but the fields above must be parsed — llama.cpp passes through
 extra sampling keys (e.g. `min_p`), and a silent drop of a known field (e.g. `top_k`) would diverge from
@@ -302,10 +302,11 @@ penalty pass avoids two scans of the 64-token window. Cost is bounded by the win
 tokens in the last 64 once (HashMap, O(64)), then apply per distinct token — the same cost class as
 llama.cpp's penalties sampler (no full-vocab scan needed).
 
-### Tool Calling (#597, 2026-10-19)
+### Tool Calling (#597, #614, #699)
 
-The **prompt side** is implemented; the **output side** is not. ADR-0058 holds the decision, the
-rejected alternatives and the measured consequences; this section is the wire contract.
+The **prompt side** is implemented (ADR-0058); the **output side** — extracting a call and
+constraining `tool_choice` — is implemented too (#614, ADR-0063), with the per-family syntax in a
+format table (#699, ADR-0066). This section is the wire contract.
 
 Request fields:
 
@@ -313,8 +314,8 @@ Request fields:
 |---|---|---|
 | `tools` | OpenAI's array, e.g. `[{"type":"function","function":{"name":…,"parameters":{…}}}]` | every entry must be an object with `type == "function"` and a non-empty `function.name`; anything else is a 400 naming the index. The array is **not** re-typed: unknown keys (`strict`, a vendor extension) and the client's key order reach the prompt through the template's `| tojson` |
 | `tool_choice` | absent / `"auto"` | the definitions are rendered |
-| | `"none"` | rendered **without** them — no extraction exists, so a prompt that still described the tools would invite a call the server returns as ordinary content |
-| | `"required"`, `{"type":"function","function":{"name":…}}` | 400 naming the missing extraction |
+| | `"none"` | rendered **without** them; extraction still runs, because the parser does not depend on `tools` having been sent |
+| | `"required"`, `{"type":"function","function":{"name":…}}` | enforced by a grammar on the model's own call format; a template the table does not recognise, or a recognised row with no grammar shape, is a named 400 |
 | an empty `tools: []` | 400 | "no tools" is the absence of the field |
 
 Rendering rules (all gated):
@@ -332,11 +333,15 @@ A request message is the client's own JSON (#613): an assistant turn's `tool_cal
 through the template's replay branch, key order is preserved, and a template that would drop the
 call is a `400` (`tool calls not rendered`) rather than a `200` with the call missing.
 
-A completion's `<tool_call>` block becomes `choices[].message.tool_calls` (`finish_reason:
-"tool_calls"`; arguments as the model wrote them; a `call_…` id synthesised), and `tool_choice:
-"required"` / a forced function are enforced by a grammar on the model's own call format —
-other formats, `grammar` conflicts and a forced name outside `tools` are named `400`s (#614,
-ADR-0063).
+A completion's call block becomes `choices[].message.tool_calls` (`finish_reason: "tool_calls"`;
+arguments as the model wrote them; a `call_…` id synthesised), and `tool_choice: "required"` / a
+forced function are enforced by a grammar on the same format row. The rows are Qwen2/Qwen3
+(`<tool_call>{"name":…, "arguments":…}`), Mistral Nemo/Magistral
+(`[TOOL_CALLS] [{"name":…, "arguments":…}, …]`) and Llama 3.1
+(`<|python_tag|>{"name":…, "parameters":…}`, an optional `;` between calls). A template the table
+does not recognise, a recognised row without a grammar, `grammar`/`response_format` conflicts and a
+forced name outside `tools` are named 400s (#614/#699, ADR-0063/ADR-0066). Qwen3.5's XML (#708),
+Ministral 3's `[ARGS]` form (#709) and Gemma 4 (#710) are tracked follow-ups.
 
 ### Stop Strings
 
