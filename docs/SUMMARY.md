@@ -84,6 +84,7 @@
     - [0063. A completion's tool call is extracted, and tool_choice is a grammar on the model's own call format](./adr/0063-a-completion-s-tool-call-is-extracted-and-tool-choice-constrains-the-model-s-own-format.md)
     - [0064. A hash that does not resolve is history only where the document or the ledger says so](./adr/0064-a-hash-that-does-not-resolve-is-history-only-where-the-document-says-so.md)
     - [0065. The hash marker covers the block below it, not the document](./adr/0065-the-hash-marker-covers-the-block-below-it-not-the-document.md)
+    - [0066. A tool-call format is a table row](./adr/0066-a-tool-call-format-is-a-table-row.md)
 
 # Model Support
 

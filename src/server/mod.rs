@@ -428,10 +428,14 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
     if let Err(e) = params.resolve_dry_breakers(&state.tokenizer) {
         return error_response(&e);
     }
-    // #597/#614: `tools` reaches the template, and `tool_choice` is resolved here.
-    // `"required"` and a forced function become a sampling grammar: the model's
-    // `<tool_call>` syntax with the name fixed or enumerated, so the call the
-    // parser extracts afterwards is the one the client demanded.
+    // #597/#614/#699: `tools` reaches the template, and `tool_choice` is resolved
+    // here. `"required"` and a forced function become a sampling grammar: the
+    // model's own call syntax with the name fixed or enumerated, so the call the
+    // parser extracts afterwards is the one the client demanded. The syntax comes
+    // from one format-table row (ADR-0066); parsing falls back to the pre-table
+    // Qwen row when the template names none (ADR-0063 decision 8 keeps parsing
+    // independent of `tools`), while the constraint refuses an unrecognised
+    // format by name.
     let tools = match req.prompt_tools() {
         Ok(tools) => tools,
         Err(e) => return error_response(&e),
@@ -440,6 +444,11 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
         Ok(intent) => intent,
         Err(e) => return error_response(&e),
     };
+    let tool_format = state
+        .chat_template
+        .as_deref()
+        .and_then(toolcall::format::detect);
+    let parse_format = tool_format.unwrap_or(&toolcall::format::QWEN);
     if let Some(forced) = tool_choice.constraint() {
         if params.grammar_source.is_some() {
             return error_response(&ApiError::invalid_request(
@@ -455,21 +464,22 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
                     .to_string(),
             ));
         }
-        let Some(template) = state.chat_template.as_deref() else {
+        if state.chat_template.is_none() {
             return error_response(&ApiError::invalid_request(
                 "tool_choice \"required\" or a forced function needs a model template whose \
                  tool-call format can be constrained; this GGUF has none (the ChatML fallback \
                  has no tool format)"
                     .to_string(),
             ));
-        };
-        if !template.contains("<tool_call>") {
+        }
+        let Some(format) = tool_format else {
             return error_response(&ApiError::invalid_request(
-                "the model's chat template does not emit the `<tool_call>` block, so this \
-                 server cannot constrain the output to a call for it"
+                "the model's chat template does not emit a tool-call format this server \
+                 recognises (known: `<tool_call>`), so it cannot constrain the output to a \
+                 call for it"
                     .to_string(),
             ));
-        }
+        };
         let names: Vec<&str> = tools
             .unwrap_or(&[])
             .iter()
@@ -479,9 +489,14 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
                     .and_then(crate::template::ToolJson::as_str)
             })
             .collect();
-        params.grammar_source = Some(crate::grammar::GrammarSource::Gbnf(
-            toolcall::forced_call_grammar(&names, forced),
-        ));
+        let Some(grammar) = toolcall::forced_call_grammar(format, &names, forced) else {
+            return error_response(&ApiError::invalid_request(format!(
+                "the model's chat template emits the `{}` tool-call format, which this server \
+                 can parse but cannot constrain with a grammar yet",
+                format.id
+            )));
+        };
+        params.grammar_source = Some(crate::grammar::GrammarSource::Gbnf(grammar));
     }
     // F2 (#47): compile the grammar/schema now (the vocabulary is here), so an
     // unsupported construct is a 400 before the job is queued. Speculative
@@ -570,6 +585,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
             guard,
             state.metrics.clone(),
             prompt_tokens as u64,
+            parse_format,
         )
     } else {
         let _guard = guard;
@@ -581,9 +597,10 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
                 state
                     .metrics
                     .record_tokens(prompt_tokens as u64, completion_tokens as u64);
-                // #614: the completion's blocks become `tool_calls`; a block that
-                // never closed is a named refusal, never half a call in `content`.
-                let (content, calls) = match toolcall::parse_completion(&text) {
+                // #614/#699: the completion's blocks become `tool_calls`; a block
+                // that never closed is a named refusal, never half a call in
+                // `content`. The format row decides the block's syntax.
+                let (content, calls) = match toolcall::parse_completion(&text, parse_format) {
                     Ok(parsed) => parsed,
                     Err(e) => {
                         let err = ApiError::invalid_request(e.message());
@@ -671,11 +688,12 @@ async fn collect_response(
 /// (client done, or disconnected mid-answer) — dropping it here instead would
 /// report the request finished while its tokens are still being written.
 ///
-/// #614: the completion's text is fed through the same parser the non-streaming
-/// path uses, so a `<tool_call>` block becomes `delta.tool_calls` instead of
-/// `delta.content`. Content before the block still streams; a call's arguments are
-/// emitted as one fragment once the block's JSON is complete (the model's bytes
-/// are carried whole, never re-escaped mid-string).
+/// #614/#699: the completion's text is fed through the same parser the
+/// non-streaming path uses, against the request's format row, so a call block
+/// becomes `delta.tool_calls` instead of `delta.content`. Content before the block
+/// still streams; a call's arguments are emitted as one fragment once the block's
+/// JSON is complete (the model's bytes are carried whole, never re-escaped
+/// mid-string).
 #[allow(clippy::too_many_arguments)]
 fn stream_response(
     id: &str,
@@ -685,12 +703,13 @@ fn stream_response(
     guard: InFlight,
     tokens: Arc<ServerMetrics>,
     prompt_tokens: u64,
+    format: &'static toolcall::format::ToolFormat,
 ) -> Response {
     let role = ok(Event::default().data(types::chunk_role(id, model, created)));
     let done = ok(Event::default().data("[DONE]"));
     let id_owned = id.to_string();
     let model_owned = model.to_string();
-    let mut parser = Some(toolcall::Parser::new());
+    let mut parser = Some(toolcall::Parser::new(format));
     let mut call_index = 0usize;
     let mut saw_call = false;
     let stream = futures_util::stream::iter(vec![role])

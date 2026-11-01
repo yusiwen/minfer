@@ -3,17 +3,18 @@
 //! `tests/fixtures/chat/parse_qwen2.5.json` and is read by
 //! `tests::the_transformers_reference_parses_identically`.
 
+use super::format;
 use super::*;
 
 const CALL: &str =
     "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
 
 fn parse(text: &str) -> (String, Vec<ToolCall>) {
-    parse_completion(text).unwrap_or_else(|e| panic!("{text:?}: {}", e.message()))
+    parse_completion(text, &format::QWEN).unwrap_or_else(|e| panic!("{text:?}: {}", e.message()))
 }
 
 fn parse_in_chunks(text: &str, size: usize) -> (String, Vec<ToolCall>) {
-    let mut p = Parser::new();
+    let mut p = Parser::new(&format::QWEN);
     let mut events = Vec::new();
     for chunk in text.as_bytes().chunks(size) {
         // The parser takes &str; the test inputs are ASCII or split on char
@@ -105,12 +106,13 @@ fn an_extra_key_in_the_call_object_is_ignored() {
 #[test]
 fn a_block_that_opens_and_never_closes_is_an_error() {
     // Open tag only.
-    assert!(parse_completion("<tool_call>").is_err());
+    assert!(parse_completion("<tool_call>", &format::QWEN).is_err());
     // JSON cut off.
-    assert!(
-        parse_completion(r#"<tool_call>{"name": "get_weather", "arguments": {"city": "Par"#)
-            .is_err()
-    );
+    assert!(parse_completion(
+        r#"<tool_call>{"name": "get_weather", "arguments": {"city": "Par"#,
+        &format::QWEN
+    )
+    .is_err());
     // JSON complete but no closing tag: the arguments are whole, so this is a
     // usable call (transformers closes the region implicitly at EOS too).
     let (content, calls) = parse(r#"<tool_call>{"name": "f", "arguments": {}}"#);
@@ -124,7 +126,7 @@ fn a_block_that_opens_and_never_closes_is_an_error() {
         1
     );
     // The error names the block, so the handler's 400 is readable.
-    let err = parse_completion("<tool_call>").unwrap_err();
+    let err = parse_completion("<tool_call>", &format::QWEN).unwrap_err();
     assert!(
         err.message().contains("tool-call block"),
         "{}",
@@ -140,13 +142,14 @@ fn a_malformed_call_object_is_an_error_not_an_empty_call() {
         r#"<tool_call>{"name": 3, "arguments": {}}</tool_call>"#,
         r#"<tool_call>{"name": "f"}</tool_call>"#,
     ] {
-        assert!(parse_completion(block).is_err(), "{block}");
+        assert!(parse_completion(block, &format::QWEN).is_err(), "{block}");
     }
     // Garbage after the JSON is not a silent close either.
-    assert!(
-        parse_completion(r#"<tool_call>{"name": "f", "arguments": {}} garbage</tool_call>"#)
-            .is_err()
-    );
+    assert!(parse_completion(
+        r#"<tool_call>{"name": "f", "arguments": {}} garbage</tool_call>"#,
+        &format::QWEN
+    )
+    .is_err());
 }
 
 #[test]
@@ -200,7 +203,7 @@ fn the_transformers_reference_parses_identically() {
     );
     let mut seen = 0;
     for case in &fx.cases {
-        let got = parse_completion(&case.completion);
+        let got = parse_completion(&case.completion, &format::QWEN);
         if let Some(reason) = &case.diverges {
             // Deliberate divergence: the reference's region scan splits at the
             // first `</tool_call>`, which sits inside a string here.
@@ -311,7 +314,7 @@ fn fold_chunks(payloads: &[String]) -> (String, Vec<(String, String, String)>) {
 fn streamed_deltas_rebuild_the_non_streaming_tool_calls() {
     use crate::server::types;
     let text = format!("Let me check.\n{CALL}\n{CALL}");
-    let (want_content, want_calls) = parse_completion(&text).unwrap();
+    let (want_content, want_calls) = parse_completion(&text, &format::QWEN).unwrap();
     let response = types::build_response(
         "id",
         "m",
@@ -331,7 +334,7 @@ fn streamed_deltas_rebuild_the_non_streaming_tool_calls() {
     let message = &response["choices"][0]["message"];
 
     for split in [1usize, 2, 3, 5, 7, 4096] {
-        let mut parser = Parser::new();
+        let mut parser = Parser::new(&format::QWEN);
         let mut index = 0usize;
         let mut payloads = Vec::new();
         for chunk in text.as_bytes().chunks(split) {
@@ -380,14 +383,20 @@ fn byte_pieces() -> (Vec<Option<Box<[u8]>>>, Vec<bool>) {
 
 #[test]
 fn the_forced_call_grammar_wraps_the_json_object_and_names_the_tool() {
-    let grammar = forced_call_grammar(&["get_weather", "search_docs"], None);
+    let grammar = forced_call_grammar(&format::QWEN, &["get_weather", "search_docs"], None)
+        .expect("the Qwen row has a grammar shape");
     assert!(grammar.contains("j-object"), "the JSON prelude is reused");
     assert!(grammar.contains("\"get_weather\"") && grammar.contains("\"search_docs\""));
     let (pieces, eog) = byte_pieces();
     crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
         .expect("the required-call grammar compiles");
 
-    let grammar = forced_call_grammar(&["get_weather", "search_docs"], Some("get_weather"));
+    let grammar = forced_call_grammar(
+        &format::QWEN,
+        &["get_weather", "search_docs"],
+        Some("get_weather"),
+    )
+    .expect("the Qwen row has a grammar shape");
     assert!(grammar.contains("\"get_weather\""));
     assert!(
         !grammar.contains("\"search_docs\""),
@@ -396,4 +405,14 @@ fn the_forced_call_grammar_wraps_the_json_object_and_names_the_tool() {
     let (pieces, eog) = byte_pieces();
     crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
         .expect("the forced-call grammar compiles");
+}
+
+#[test]
+fn a_format_without_a_grammar_answers_none_instead_of_guessing() {
+    let mut row = format::QWEN;
+    row.grammar = None;
+    assert!(
+        forced_call_grammar(&row, &["get_weather"], None).is_none(),
+        "a recognised format without a grammar must reach the caller's named 400"
+    );
 }

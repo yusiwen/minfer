@@ -341,3 +341,8 @@ symbol = "parse_completion"
 adr = "0063"
 what = "`tool_choice: required` and a forced function are enforced by a GBNF on the model's `<tool_call>` format"
 symbol = "forced_call_grammar"
+
+[[governs]]
+adr = "0066"
+what = "a tool-call format is a table row: the detection anchors, the block's literals, the name and arguments keys and the optional `tool_choice` grammar shape live together, and both the parser and the grammar read the row"
+symbol = "ToolFormat"

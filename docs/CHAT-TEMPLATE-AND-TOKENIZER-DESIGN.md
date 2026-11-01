@@ -277,11 +277,14 @@ output back into `choices[].message.tool_calls` remains the separate increment
 `src/server/toolcall.rs` is the request carrier's mirror image. Both response paths run the
 completion through one parser, so the serial and batched engines share it:
 
-- **The parser is incremental.** `feed` holds back a suffix that could still become
-  `<tool_call>`, parses the block only once its JSON value is complete, and never splits on
-  `</tool_call>` with `str::find` — the arguments may contain that literal inside a string.
+- **The parser is incremental.** `feed` holds back a suffix that could still become the
+  format row's open literal, parses the block only once its JSON value is complete, and never
+  splits on the close literal with `str::find` — the arguments may contain that literal inside a
+  string.
 - **The arguments are the model's bytes.** A JSON object is carried as its own source slice
-  (`serde_json`'s `raw_value`; whitespace and key order included), a JSON string is decoded.
+  (`serde_json`'s `raw_value`; whitespace and key order included), a JSON string is decoded. The
+  row names the object's `name` and arguments keys (Llama 3.1's is `parameters`), so the bytes are
+  read from the right field rather than re-encoded.
 - **The response is OpenAI's shape.** `message.tool_calls` (a synthesised `call_…` id,
   `type: "function"`, name, arguments) and `finish_reason: "tool_calls"`; `content` is the text
   outside the blocks. A block whose arguments were cut off is a named `400`, never half a call
@@ -290,16 +293,21 @@ completion through one parser, so the serial and batched engines share it:
   arguments fragment; content keeps streaming. `types::chunks_for_tool_event` is shared by the
   handler and the differential test that folds the deltas back into the non-streaming message.
 - **`tool_choice: "required"` / a forced function are enforced**, not accepted-and-ignored: a
-  GBNF built from the schema compiler's `j-object` rules wrapped in the model's `<tool_call>`
-  syntax fixes or enumerates the name. Boundaries are named `400`s — a template without that
-  format (other families need the template analysis llama.cpp's auto-parser does), a combination
-  with `grammar`/a non-text `response_format`, the speculative engine, or a forced name that is
-  not offered.
+  GBNF built from the schema compiler's `j-object` rules wrapped in the model's own call syntax
+  fixes or enumerates the name. The syntax is one **format-table row**
+  (`src/server/toolcall/format.rs`, ADR-0066): the parser and the grammar read the same row, so
+  the call the constraint produces is the call the parser extracts. Detection scans the template's
+  source for the row's anchors (Jinja comments stripped); parsing falls back to the Qwen row when
+  none matches, while `tool_choice` boundaries are named `400`s — a template the table does not
+  recognise, a recognised row with no grammar shape yet, a combination with `grammar`/a non-text
+  `response_format`, the speculative engine, or a forced name that is not offered.
 
-The reference is transformers 5.17.0's `chat_parsing.parse_response` with its Qwen response
-template (`tests/fixtures/chat/parse_qwen2.5.json`, 12 cases). One case records a deliberate
-divergence: the reference splits at the first `</tool_call>` inside a string and refuses; this
-parser scans the JSON value and accepts.
+The table ships the Qwen2/Qwen3 row today; the other families are rows (and, where needed, a
+block shape for an array or a next-open/EOS close), not parser branches. The reference is
+transformers 5.17.0's `chat_parsing.parse_response` with its Qwen response template
+(`tests/fixtures/chat/parse_qwen2.5.json`, 12 cases); one case records a deliberate divergence:
+the reference splits at the first `</tool_call>` inside a string and refuses, while this parser
+scans the JSON value and accepts.
 
 ## 3. Tokenizer — accepted, refused, detected
 
@@ -631,6 +639,7 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0058](adr/0058-tools-reach-the-prompt-as-the-client-wrote-them.md) — A request's tools reach the prompt as the client wrote them, and a template that drops them refuses by name
 - [ADR-0062](adr/0062-a-request-message-reaches-the-prompt-as-the-client-wrote-it.md) — A request message reaches the prompt as the client wrote it, and a replayed tool call that reaches nothing refuses by name
 - [ADR-0063](adr/0063-a-completion-s-tool-call-is-extracted-and-tool-choice-constrains-the-model-s-own-format.md) — A completion's tool call is extracted, and `tool_choice` is a grammar on the model's own call format
+- [ADR-0066](adr/0066-a-tool-call-format-is-a-table-row.md) — A tool-call format is a table row
 - [ADR-0042](adr/0042-the-tokenizer-applies-the-models-declared-nfc-normalizer.md) — The tokenizer applies the model's declared NFC normalizer
 - [ADR-0043](adr/0043-a-special-token-is-declared-by-the-file-never-inferred-from-its-name.md) — A special token is declared by the file, never inferred from its name
 - [ADR-0044](adr/0044-the-input-normalizer-follows-the-pre-tokenizer-family.md) — The input normalizer follows the pre-tokenizer family's declaration
