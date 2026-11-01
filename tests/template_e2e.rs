@@ -784,7 +784,7 @@ fn serve_reads_the_mistral_and_llama_rows_from_a_forced_completion() {
         let text = format!(
             "{{% if false %}}{marker}{{% endif %}}{{% if tools %}}<tools>{{{{ tools | length }}}}</tools>{{% endif %}}{{% for m in messages %}}{{{{ m.role }}}}:{{{{ m.content }}}};{{% endfor %}}"
         );
-        let template = template_file(&format!("tool-choice-{name}.jinja"), &text);
+        let template = template_file(&format!("tool-choice-forced-{name}.jinja"), &text);
         let port = 18113 + index as u16;
         let mut server = Server::spawn_with_ctx(
             "serve",
@@ -825,5 +825,66 @@ fn serve_reads_the_mistral_and_llama_rows_from_a_forced_completion() {
             call["function"]["arguments"], r#"{"city": "Paris"}"#,
             "{name}: the arguments are the block's own bytes; body:\n{response}"
         );
+    }
+}
+
+/// #699: `tool_choice: "required"` on the Mistral Nemo and Llama 3.1 rows
+/// returns the call the grammar produced, on the toy model.
+///
+/// Seed 0 is fixed: the grammar constrains the wrapper and the name, while the
+/// arguments are a generic JSON object, so the test parses the arguments rather
+/// than fixing their bytes. The request-grammar gate above keeps the exact-byte
+/// parse; this one proves the `tool_choice` path for the new rows.
+#[test]
+fn serve_enforces_tool_choice_on_the_mistral_and_llama_rows() {
+    let model = test_model();
+    for (index, (name, marker)) in [("mistral", "[TOOL_CALLS]"), ("llama", "<|python_tag|>")]
+        .into_iter()
+        .enumerate()
+    {
+        let text = format!(
+            "{{% if false %}}{marker}{{% endif %}}{{% if tools %}}<tools>{{{{ tools | length }}}}</tools>{{% endif %}}{{% for m in messages %}}{{{{ m.role }}}}:{{{{ m.content }}}};{{% endfor %}}"
+        );
+        let template = template_file(&format!("tool-choice-required-{name}.jinja"), &text);
+        let port = 18130 + index as u16;
+        let mut server = Server::spawn_with_ctx(
+            "serve",
+            &model.to_string_lossy(),
+            port,
+            Some(&template),
+            2048,
+        );
+        assert!(
+            server.wait_listening(),
+            "{name}: no banner; log so far:\n{}",
+            server.log()
+        );
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+            "tool_choice": "required",
+            "max_tokens": 1024,
+            "seed": 0,
+        })
+        .to_string();
+        let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
+        assert_eq!(status, 200, "{name}: body:\n{response}");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("completion json");
+        let choice = &parsed["choices"][0];
+        assert_eq!(
+            choice["finish_reason"], "tool_calls",
+            "{name}: body:\n{response}"
+        );
+        let call = &choice["message"]["tool_calls"][0];
+        assert_eq!(
+            call["function"]["name"], "get_weather",
+            "{name}: body:\n{response}"
+        );
+        let arguments = call["function"]["arguments"]
+            .as_str()
+            .expect("arguments are a JSON string");
+        serde_json::from_str::<serde_json::Value>(arguments)
+            .unwrap_or_else(|e| panic!("{name}: arguments are not JSON: {e}\n{response}"));
     }
 }
