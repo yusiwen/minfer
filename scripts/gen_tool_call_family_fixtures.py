@@ -218,6 +218,50 @@ QWEN35_CASES = [
 ]
 
 
+MINISTRAL3_SPEC = {
+    "defaults": {"role": "assistant"},
+    "start_anchor": "[/INST]",
+    "fields": {
+        "tool_calls": {
+            "open_pattern": r"\s*\[TOOL_CALLS\](?P<name>[^\[\]]+)\[ARGS\]",
+            "close_pattern": r"\s*(?=\[TOOL_CALLS\]|\Z)",
+            "content": "json",
+            "repeats": True,
+            "transform": {
+                "type": "function",
+                "function": {"name": "{name}", "arguments": "{content}"},
+            },
+        },
+        "content": {"close": "[TOOL_CALLS]", "content": "text"},
+    },
+}
+MINISTRAL3_PREFIX = "[INST] Weather in Paris? [/INST]"
+MINISTRAL3_CASES = [
+    (
+        "single_call",
+        '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}',
+    ),
+    (
+        "two_calls",
+        '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}'
+        '[TOOL_CALLS]get_weather[ARGS]{"city": "Lyon"}',
+    ),
+    (
+        "content_before_the_call",
+        'Let me check. [TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}',
+    ),
+    (
+        "string_arguments",
+        r'[TOOL_CALLS]f[ARGS]"{\"city\": \"Paris\"}"',
+    ),
+    (
+        "truncated_arguments",
+        '[TOOL_CALLS]get_weather[ARGS]{"city": "Par',
+    ),
+    ("prose", "Hello, world!"),
+]
+
+
 def build(spec: dict, prefix: str, cases: list[tuple[str, str]]) -> list[dict]:
     from transformers.utils.chat_parsing import parse_response
 
@@ -346,6 +390,17 @@ def targets() -> dict[str, tuple[pathlib.Path, dict]]:
                 build(LLAMA_SPEC, LLAMA_PREFIX, LLAMA_CASES),
                 'Llama 3.1 `{"name":…, "parameters":…}` '
                 "(llama.cpp `common_chat_parse_llama_3_1`)",
+            ),
+        ),
+        "ministral3": (
+            CHAT / "parse_ministral3.json",
+            document(
+                "ministral3",
+                MINISTRAL3_SPEC,
+                MINISTRAL3_PREFIX,
+                build(MINISTRAL3_SPEC, MINISTRAL3_PREFIX, MINISTRAL3_CASES),
+                "Ministral 3 `[TOOL_CALLS]name[ARGS]{…}` "
+                "(llama.cpp `common_chat_parse_ministral_3`)",
             ),
         ),
         "qwen3_5": (

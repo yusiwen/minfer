@@ -30,6 +30,10 @@ pub enum BlockShape {
     /// One JSON object per call; the next open, an optional `separator`, or EOS
     /// closes it.
     ObjectUntilNextOpen { separator: &'static str },
+    /// One call per block, with the name in the open anchor: the text before
+    /// `args_marker` is the name, and the JSON value after it is the arguments.
+    /// The next open or EOS closes the block.
+    NameThenArgs { args_marker: &'static str },
     /// Qwen3.5's XML body: `<function=NAME>` followed by repeated
     /// `<parameter=KEY>VALUE</parameter>`, then `function_close` and
     /// `block_close`. The values are text, not JSON, so the parser serializes
@@ -50,7 +54,7 @@ pub struct ToolFormat {
     pub anchors: &'static [&'static str],
     /// None of these literals may appear in the template's source. This is how a
     /// row for one member of a family excludes a sibling with the same prefix
-    /// (Mistral Nemo's array vs the `[ARGS]` form tracked in #709).
+    /// (Mistral Nemo's array excludes the `[ARGS]` form, which has its own row).
     pub without: &'static [&'static str],
     /// The literal that opens a call block.
     pub open: &'static str,
@@ -70,9 +74,10 @@ pub struct ToolFormat {
 /// schema compiler's `j-object`.
 ///
 /// `open` ends right before the name, `between` sits between the name and the
-/// arguments, and `close` follows the arguments. The Qwen row's literals include
-/// the newline and the key outside the object, because that is the block the
-/// parser extracts; Mistral's and Llama's do the same for their own wrappers.
+/// arguments, and `close` follows the arguments. An **empty** `close` means the
+/// arguments end the block (Ministral 3's `[ARGS]` form). The Qwen row's
+/// literals include the newline and the key outside the object, because that is
+/// the block the parser extracts; the other rows do the same for their wrappers.
 #[derive(Debug, Clone, Copy)]
 pub struct GrammarShape {
     pub open: &'static str,
@@ -112,6 +117,31 @@ pub static MISTRAL_NEMO: ToolFormat = ToolFormat {
         open: "[TOOL_CALLS] [{\"name\": \"",
         between: "\", \"arguments\": ",
         close: "}]",
+    }),
+};
+
+/// Ministral 3: `[TOOL_CALLS]name[ARGS]{…}` (#709).
+///
+/// The name is the text between the open and `[ARGS]`; the JSON value after it is
+/// the arguments object itself (not a `{"name","arguments"}` wrapper). One call
+/// per block; the next `[TOOL_CALLS]` or EOS ends it. The row sits before Mistral
+/// Nemo, whose array form shares the open but has no `[ARGS]`.
+pub static MISTRAL3: ToolFormat = ToolFormat {
+    id: "ministral3",
+    anchors: &["[TOOL_CALLS]", "[ARGS]"],
+    without: &[],
+    open: "[TOOL_CALLS]",
+    shape: BlockShape::NameThenArgs {
+        args_marker: "[ARGS]",
+    },
+    // The JSON keys are unused by the name-in-anchor shape; the fields stay for
+    // the uniform row description.
+    name_key: "name",
+    args_key: "arguments",
+    grammar: Some(GrammarShape {
+        open: "[TOOL_CALLS]",
+        between: "[ARGS]",
+        close: "",
     }),
 };
 
@@ -164,7 +194,9 @@ pub static QWEN35: ToolFormat = ToolFormat {
 
 /// The table, most specific first. `QWEN35` must precede `QWEN`: both open with
 /// `<tool_call>`, and only the XML row's anchor list includes `<function=`.
-static FORMATS: &[&ToolFormat] = &[&QWEN35, &MISTRAL_NEMO, &LLAMA31, &QWEN];
+/// `MISTRAL3` must precede `MISTRAL_NEMO`: the array row excludes `[ARGS]`, and
+/// this one requires it.
+static FORMATS: &[&ToolFormat] = &[&QWEN35, &MISTRAL3, &MISTRAL_NEMO, &LLAMA31, &QWEN];
 
 /// Pick the row whose anchors all appear (and whose exclusions do not) in the
 /// template's source.

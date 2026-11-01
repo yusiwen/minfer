@@ -273,6 +273,7 @@ fn the_transformers_reference_parses_identically() {
 const MISTRAL_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_mistral_nemo.json");
 const LLAMA_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_llama31.json");
 const QWEN35_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_qwen35.json");
+const MISTRAL3_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_ministral3.json");
 
 #[derive(serde::Deserialize)]
 struct FamilyFixture {
@@ -286,6 +287,7 @@ fn family_row(name: &str) -> &'static format::ToolFormat {
         "mistral_nemo" => &format::MISTRAL_NEMO,
         "llama31" => &format::LLAMA31,
         "qwen3_5" => &format::QWEN35,
+        "ministral3" => &format::MISTRAL3,
         other => panic!("the fixture names an unknown format: {other}"),
     }
 }
@@ -373,6 +375,11 @@ fn the_llama31_reference_parses_identically() {
 #[test]
 fn the_qwen35_reference_parses_identically() {
     check_family_fixture(QWEN35_JSON, 7, false);
+}
+
+#[test]
+fn the_ministral3_reference_parses_identically() {
+    check_family_fixture(MISTRAL3_JSON, 6, true);
 }
 
 // === Streaming: the deltas rebuild the non-streaming message =============
@@ -483,6 +490,7 @@ fn streamed_deltas_rebuild_each_family_call() {
         (MISTRAL_JSON, &format::MISTRAL_NEMO),
         (LLAMA_JSON, &format::LLAMA31),
         (QWEN35_JSON, &format::QWEN35),
+        (MISTRAL3_JSON, &format::MISTRAL3),
     ] {
         let fx: FamilyFixture = serde_json::from_str(fixture).expect("parse family fixture");
         assert_eq!(fx.format, row.id);
@@ -571,6 +579,7 @@ fn the_family_grammar_shapes_are_the_rows() {
     for (row, open, args_key) in [
         (&format::MISTRAL_NEMO, "[TOOL_CALLS]", "arguments"),
         (&format::LLAMA31, "<|python_tag|>", "parameters"),
+        (&format::MISTRAL3, "[TOOL_CALLS]", "[ARGS]"),
     ] {
         let grammar = forced_call_grammar(row, &["get_weather"], Some("get_weather"))
             .unwrap_or_else(|| panic!("{} has a grammar shape", row.id));

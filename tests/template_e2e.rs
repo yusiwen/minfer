@@ -954,3 +954,50 @@ fn serve_reads_the_qwen35_xml_call_and_refuses_tool_choice() {
         "the refusal must name the parse-only format; body:\n{response}"
     );
 }
+
+/// #709: `tool_choice: "required"` on the Ministral 3
+/// `[TOOL_CALLS]name[ARGS]{…}` row returns the call the grammar produced.
+///
+/// Seed 0 is fixed; the grammar constrains the wrapper and the name, while the
+/// arguments are a generic JSON object, so the test parses them.
+#[test]
+fn serve_enforces_tool_choice_on_the_ministral3_row() {
+    let model = test_model();
+    let template = template_file(
+        "ministral3-required.jinja",
+        "{% if false %}[TOOL_CALLS][ARGS]{% endif %}{% if tools %}<tools>{{ tools | length }}</tools>{% endif %}{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}",
+    );
+    let mut server = Server::spawn_with_ctx(
+        "serve",
+        &model.to_string_lossy(),
+        18134,
+        Some(&template),
+        2048,
+    );
+    assert!(
+        server.wait_listening(),
+        "no banner; log so far:\n{}",
+        server.log()
+    );
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+        "tool_choice": "required",
+        "max_tokens": 1024,
+        "seed": 0,
+    })
+    .to_string();
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
+    assert_eq!(status, 200, "body:\n{response}");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("completion json");
+    let choice = &parsed["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "body:\n{response}");
+    let call = &choice["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "get_weather", "body:\n{response}");
+    let arguments = call["function"]["arguments"]
+        .as_str()
+        .expect("arguments are a JSON string");
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .unwrap_or_else(|e| panic!("arguments are not JSON: {e}\n{response}"));
+}

@@ -351,3 +351,8 @@ symbol = "ToolFormat"
 adr = "0067"
 what = "Qwen3.5's XML block is a parse-only row: the parser reads `<function=…>`/`<parameter=…>`, serializes the arguments to JSON text, and `tool_choice` stays a named 400"
 symbol = "QWEN35"
+
+[[governs]]
+adr = "0068"
+what = "Ministral 3's name-in-anchor block is one more row: the name is the text before `[ARGS]`, the JSON value after it is the arguments, and the `tool_choice` grammar ends at the arguments"
+symbol = "MISTRAL3"

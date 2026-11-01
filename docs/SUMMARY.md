@@ -86,6 +86,7 @@
     - [0065. The hash marker covers the block below it, not the document](./adr/0065-the-hash-marker-covers-the-block-below-it-not-the-document.md)
     - [0066. A tool-call format is a table row](./adr/0066-a-tool-call-format-is-a-table-row.md)
     - [0067. Qwen3.5's XML call is parsed, and its arguments are serialized JSON](./adr/0067-qwen3-5-xml-call-is-parsed-and-its-arguments-are-serialized-json.md)
+    - [0068. Ministral 3 puts the name in the anchor](./adr/0068-ministral-3-puts-the-name-in-the-anchor.md)
 
 # Model Support
 
