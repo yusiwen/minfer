@@ -699,8 +699,8 @@ fn serve_enforces_tool_choice_required_and_a_forced_function() {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [tool],
             "tool_choice": choice,
-            "max_tokens": 512,
-            "seed": 42,
+            "max_tokens": 1024,
+            "seed": 0,
         })
         .to_string();
         let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
@@ -753,4 +753,77 @@ fn serve_enforces_tool_choice_required_and_a_forced_function() {
     let (status, response) = unconstrained.request("POST", "/v1/chat/completions", Some(&body));
     assert_eq!(status, 400, "body:\n{response}");
     assert!(response.contains("cannot be combined"), "body:\n{response}");
+}
+
+/// #699: the Mistral Nemo array and Llama 3.1 rows are detected from the
+/// template and parsed out of a completion a request grammar forces.
+///
+/// The toy model's weights are garbage, so its own `j-object` under the
+/// `tool_choice` grammar is unbounded (the Qwen gate happened to close early;
+/// the Mistral one generated a kilobyte-long object and was cut). The block is
+/// therefore forced with a request grammar, exactly as the extraction gate does;
+/// the `tool_choice` grammar's own shape is asserted in the parser's unit tests.
+#[test]
+fn serve_reads_the_mistral_and_llama_rows_from_a_forced_completion() {
+    let model = test_model();
+    for (index, (name, marker, block)) in [
+        (
+            "mistral",
+            "[TOOL_CALLS]",
+            r#"root ::= "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}]""#,
+        ),
+        (
+            "llama",
+            "<|python_tag|>",
+            r#"root ::= "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}""#,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let text = format!(
+            "{{% if false %}}{marker}{{% endif %}}{{% if tools %}}<tools>{{{{ tools | length }}}}</tools>{{% endif %}}{{% for m in messages %}}{{{{ m.role }}}}:{{{{ m.content }}}};{{% endfor %}}"
+        );
+        let template = template_file(&format!("tool-choice-{name}.jinja"), &text);
+        let port = 18113 + index as u16;
+        let mut server = Server::spawn_with_ctx(
+            "serve",
+            &model.to_string_lossy(),
+            port,
+            Some(&template),
+            1024,
+        );
+        assert!(
+            server.wait_listening(),
+            "{name}: no banner; log so far:\n{}",
+            server.log()
+        );
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+            "grammar": block,
+            "max_tokens": 512,
+            "seed": 42,
+        })
+        .to_string();
+        let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
+        assert_eq!(status, 200, "{name}: body:\n{response}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response).expect("completion json");
+        let choice = &parsed["choices"][0];
+        assert_eq!(
+            choice["finish_reason"], "tool_calls",
+            "{name}: body:\n{response}"
+        );
+        let call = &choice["message"]["tool_calls"][0];
+        assert_eq!(
+            call["function"]["name"], "get_weather",
+            "{name}: body:\n{response}"
+        );
+        assert_eq!(
+            call["function"]["arguments"], r#"{"city": "Paris"}"#,
+            "{name}: the arguments are the block's own bytes; body:\n{response}"
+        );
+    }
 }

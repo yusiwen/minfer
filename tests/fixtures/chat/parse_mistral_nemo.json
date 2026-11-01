@@ -1,0 +1,147 @@
+{
+  "format": "mistral_nemo",
+  "response_template": {
+    "defaults": {
+      "role": "assistant"
+    },
+    "start_anchor": "[/INST]",
+    "fields": {
+      "tool_calls": {
+        "open": "[TOOL_CALLS]",
+        "content": "json",
+        "transform_each": true,
+        "transform": {
+          "type": "function",
+          "function": {
+            "name": "{name}",
+            "arguments": "{arguments}"
+          }
+        }
+      },
+      "content": {
+        "close": "[TOOL_CALLS]",
+        "content": "text"
+      }
+    }
+  },
+  "prefix": "[INST] Weather in Paris? [/INST]",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "provenance": {
+    "reference": "HuggingFaceTB transformers 5.17.0 transformers.utils.chat_parsing.parse_response with an authored response_template for Mistral Nemo / Magistral `[TOOL_CALLS] [{…}]` (llama.cpp `common_chat_parse_mistral_nemo`)",
+    "template_source": "authored from the family's published call syntax; llama.cpp's parser is the second oracle",
+    "command": "uv run --with transformers==5.17.0 python scripts/gen_tool_call_family_fixtures.py --family mistral_nemo",
+    "date": "2026-11-01"
+  },
+  "cases": [
+    {
+      "name": "single_call",
+      "completion": "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}]",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_calls",
+      "completion": "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Lyon\"}}]",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          },
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Lyon"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "content_before_the_call",
+      "completion": "Let me check. [TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}]",
+      "expected": {
+        "content": "Let me check.",
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "extra_id_key",
+      "completion": "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"abc123456\"}]",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "string_arguments",
+      "completion": "[TOOL_CALLS] [{\"name\": \"f\", \"arguments\": \"{\\\"city\\\": \\\"Paris\\\"}\"}]",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "f",
+            "arguments": "{\"city\": \"Paris\"}"
+          }
+        ]
+      }
+    },
+    {
+      "name": "truncated_array",
+      "completion": "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par\"",
+      "error": "json parser could not parse region as JSON.\nContent: ' [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par\"'\nError: Expecting ',' delimiter: line 1 column 54 (char 53)"
+    },
+    {
+      "name": "prose",
+      "completion": "Hello, world!",
+      "expected": {
+        "content": "Hello, world!",
+        "tool_calls": []
+      }
+    }
+  ]
+}
