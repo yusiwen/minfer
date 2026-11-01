@@ -237,9 +237,11 @@ const TOOLS_BRANCH_TEMPLATE: &str =
 const TOOL_CALLS_TEMPLATE: &str = "{% for m in messages %}[{{ m.role }}{% for c in m.tool_calls %}|{{ c.function.name }}={{ c.function.arguments }}{% endfor %}]{% endfor %}";
 
 /// A template whose prompt renders the tools and whose text carries the
-/// `<tool_call>` format marker (in a Jinja comment, so it does not reach the
-/// prompt) — what `tool_choice: "required"` checks before constraining sampling.
-const CONSTRAINT_TEMPLATE: &str = "{# <tool_call> #}{% if tools %}<tools>{{ tools | length }}</tools>{% endif %}{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}";
+/// `<tool_call>` format marker (in an unreachable branch, so it does not reach
+/// the prompt) — what `tool_choice: "required"` detects before constraining
+/// sampling. The comment form is deliberately not used: the table strips Jinja
+/// comments (ADR-0066), and a comment is documentation, not a format.
+const CONSTRAINT_TEMPLATE: &str = "{% if false %}<tool_call>{% endif %}{% if tools %}<tools>{{ tools | length }}</tools>{% endif %}{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}";
 
 /// A template that renders messages but has no `tool_calls` branch (#613): the
 /// call would reach nothing, so the server refuses it by name.
@@ -475,8 +477,8 @@ fn serve_refuses_tools_a_template_cannot_render_and_serves_the_ones_it_can() {
         "tool_choice \"required\" must be refused; body:\n{response}"
     );
     assert!(
-        response.contains("`<tool_call>` block"),
-        "a template without the block format cannot be constrained; body:\n{response}"
+        response.contains("does not emit a tool-call format"),
+        "a template without a recognised call format cannot be constrained; body:\n{response}"
     );
 }
 
@@ -715,7 +717,7 @@ fn serve_enforces_tool_choice_required_and_a_forced_function() {
         );
     }
 
-    // A template whose format cannot be constrained is a named 400, not a
+    // A template with no recognised tool-call format is a named 400, not a
     // silently unconstrained generation.
     let plain = template_file("tool-choice-unconstrained.jinja", TOOLS_BRANCH_TEMPLATE);
     let mut unconstrained =
@@ -735,7 +737,7 @@ fn serve_enforces_tool_choice_required_and_a_forced_function() {
     let (status, response) = unconstrained.request("POST", "/v1/chat/completions", Some(&body));
     assert_eq!(status, 400, "body:\n{response}");
     assert!(
-        response.contains("`<tool_call>` block"),
+        response.contains("does not emit a tool-call format"),
         "the refusal must name the missing format; body:\n{response}"
     );
 

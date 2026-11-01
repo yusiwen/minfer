@@ -1,15 +1,18 @@
-//! Tool-call extraction (#614): a `<tool_call>` block in the model's completion
+//! Tool-call extraction (#614, #699): a call block in the model's completion
 //! becomes OpenAI `tool_calls`, never ordinary content.
 //!
 //! The parser is the render path's mirror image. ADR-0062 carries a request
 //! message's `tool_calls` into the prompt; this module reads them back out of the
-//! completion, so a client can replay the round trip. Two properties shape it:
+//! completion, so a client can replay the round trip. The per-family syntax lives
+//! in `format` (ADR-0066): one row says what opens and closes a call, which object
+//! keys carry the name and the arguments, and what a `tool_choice` grammar wraps
+//! around them. Two properties shape the parser:
 //!
 //! * **Incremental.** The generation loop emits text in arbitrary UTF-8 chunks, so
-//!   the opening tag can be split across chunks. A suffix that could still become
-//!   `<tool_call>` is held back, and the block body is parsed only once the JSON
-//!   value is complete — the closing tag is *never* found by `str::find`, because
-//!   the arguments may legitimately contain that literal inside a string.
+//!   the opening anchor can be split across chunks. A suffix that could still
+//!   become it is held back, and the block body is parsed only once the JSON value
+//!   is complete — the closing anchor is *never* found by `str::find`, because the
+//!   arguments may legitimately contain that literal inside a string.
 //! * **The arguments are the model's bytes.** A JSON object is carried as its own
 //!   source slice (whitespace and key order included); a JSON *string* is decoded,
 //!   because OpenAI sends the call's arguments as text and some templates render
@@ -19,13 +22,11 @@
 //! A block that opens and never closes is an error — a named refusal upstream —
 //! never a half-call in `content`.
 
-use serde::Deserialize;
-use serde_json::value::RawValue;
+pub(crate) mod format;
 
-/// The opening tag of the Qwen2/Qwen3 (and Hermes) tool-call format.
-pub const OPEN_TAG: &str = "<tool_call>";
-/// Its closing tag.
-pub const CLOSE_TAG: &str = "</tool_call>";
+use std::collections::HashMap;
+
+use serde_json::value::RawValue;
 
 /// One call parsed out of a completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,12 +71,14 @@ impl ParseError {
 
 /// The incremental parser. Feed it the completion's chunks, then call
 /// [`Self::finish`]; the events are returned in order.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Parser {
+    /// The format row this completion is parsed against (ADR-0066).
+    format: &'static format::ToolFormat,
     /// Unconsumed text: a content tail that could still be a tag prefix or a
     /// trailing whitespace run, or a block body that is not complete yet.
     buf: String,
-    /// Inside a `<tool_call>` block: the body (JSON + closing tag) is pending.
+    /// Inside a call block: the body (JSON + closing anchor) is pending.
     in_block: bool,
     /// Just closed a block: leading whitespace of the next content segment is a
     /// separator, not content.
@@ -85,8 +88,14 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(format: &'static format::ToolFormat) -> Self {
+        Self {
+            format,
+            buf: String::new(),
+            in_block: false,
+            after_call: false,
+            error: None,
+        }
     }
 
     /// Feed one chunk; returns the events that are final now.
@@ -129,7 +138,8 @@ impl Parser {
     /// Consume as much content as is final. Returns false when the parser is
     /// waiting for more bytes (or at EOS, when nothing is left).
     fn content_step(&mut self, out: &mut Vec<Event>, eos: bool) -> bool {
-        if let Some(at) = self.buf.find(OPEN_TAG) {
+        let open = self.format.open;
+        if let Some(at) = self.buf.find(open) {
             let mut before = &self.buf[..at];
             // Whitespace between two calls separates them; it is not content.
             if self.after_call {
@@ -141,7 +151,7 @@ impl Parser {
             if !before.is_empty() {
                 out.push(Event::Content(before.to_string()));
             }
-            self.buf.drain(..at + OPEN_TAG.len());
+            self.buf.drain(..at + open.len());
             self.in_block = true;
             self.after_call = false;
             return true;
@@ -155,7 +165,7 @@ impl Parser {
             // Hold a suffix that could still become the opening tag, plus the
             // whitespace before it: that run is a separator if the tag completes,
             // and only content if it does not.
-            let tag_prefix = longest_suffix_prefix(&self.buf, OPEN_TAG);
+            let tag_prefix = longest_suffix_prefix(&self.buf, open);
             let before = &self.buf[..self.buf.len() - tag_prefix];
             let whitespace = trailing_whitespace_len(before);
             let hold = if self.after_call && self.buf.chars().all(char::is_whitespace) {
@@ -184,6 +194,7 @@ impl Parser {
 
     /// Consume one block body. Returns false when more bytes are needed.
     fn block_step(&mut self, out: &mut Vec<Event>, eos: bool) -> Result<bool, ParseError> {
+        let close = self.format.close;
         let start = self.buf.len() - self.buf.trim_start().len();
         if start == self.buf.len() {
             // Only whitespace (or nothing) after the opening tag.
@@ -198,24 +209,24 @@ impl Parser {
                 let rest = &self.buf[after..];
                 let ws = rest.len() - rest.trim_start().len();
                 let after_ws = &rest[ws..];
-                if after_ws.starts_with(CLOSE_TAG) {
+                if after_ws.starts_with(close) {
                     let json = &self.buf[start..after];
-                    let call = parse_block(json)?;
+                    let call = parse_block(json, self.format)?;
                     out.push(Event::Call(call));
-                    let consumed = after + ws + CLOSE_TAG.len();
+                    let consumed = after + ws + close.len();
                     self.buf.drain(..consumed);
                     self.in_block = false;
                     self.after_call = true;
                     return Ok(true);
                 }
-                if after_ws.is_empty() || CLOSE_TAG.starts_with(after_ws) {
+                if after_ws.is_empty() || close.starts_with(after_ws) {
                     if eos {
                         // The JSON value is complete and nothing but (a prefix of)
-                        // the closing tag follows: the model stopped at EOS after a
-                        // usable call. transformers closes the region implicitly
+                        // the closing anchor follows: the model stopped at EOS after
+                        // a usable call. transformers closes the region implicitly
                         // here too; only *incomplete arguments* are truncated.
                         let json = &self.buf[start..after];
-                        let call = parse_block(json)?;
+                        let call = parse_block(json, self.format)?;
                         out.push(Event::Call(call));
                         self.buf.clear();
                         self.in_block = false;
@@ -225,7 +236,7 @@ impl Parser {
                     return Ok(false);
                 }
                 return Err(ParseError::new(format!(
-                    "expected `</tool_call>` after the call's JSON, found {:?}",
+                    "expected `{close}` after the call's JSON, found {:?}",
                     truncate_at(after_ws, 40)
                 )));
             }
@@ -247,15 +258,21 @@ impl Parser {
 
 /// The GBNF for `tool_choice: "required"` (one of `names`) or a forced function.
 ///
-/// It forces the model's own tool-call syntax: the `<tool_call>` wrapper, a
-/// `{"name": …, "arguments": …}` object with the name fixed or enumerated, and a
-/// JSON object for the arguments (reusing the schema compiler's generic `j-object`
-/// rules). The result is the block this module parses, so extraction and the
-/// constraint agree by construction.
+/// It forces the model's own tool-call syntax from the format row (ADR-0066): the
+/// row's literals wrap a `name` fixed or enumerated at `ToolFormat::name_key`
+/// and a JSON object for the arguments (reusing the schema compiler's generic
+/// `j-object` rules). The result is the block this module parses, so extraction
+/// and the constraint agree by construction.
 ///
-/// Only the `<tool_call>` format can be constrained this way; a template that
-/// emits another family's syntax is refused by the caller instead.
-pub fn forced_call_grammar(names: &[&str], forced: Option<&str>) -> String {
+/// `None` means the template's format is recognised but has no grammar shape yet;
+/// the caller answers a named `400` rather than accepting an unconstrained
+/// generation.
+pub fn forced_call_grammar(
+    format: &format::ToolFormat,
+    names: &[&str],
+    forced: Option<&str>,
+) -> Option<String> {
+    let shape = format.grammar?;
     let mut grammar = String::new();
     for (name, rhs) in crate::grammar::GENERIC_RULES {
         grammar.push_str(name);
@@ -272,16 +289,16 @@ pub fn forced_call_grammar(names: &[&str], forced: Option<&str>) -> String {
             .join(" | "),
     };
     grammar.push_str("root ::= ");
-    grammar.push_str(&gbnf_literal("<tool_call>\n{\"name\": \""));
+    grammar.push_str(&gbnf_literal(shape.open));
     grammar.push(' ');
     grammar.push_str(&name_rule);
     grammar.push(' ');
-    grammar.push_str(&gbnf_literal("\", \"arguments\": "));
+    grammar.push_str(&gbnf_literal(shape.between));
     grammar.push_str("j-object");
     grammar.push(' ');
-    grammar.push_str(&gbnf_literal("}\n</tool_call>"));
+    grammar.push_str(&gbnf_literal(shape.close));
     grammar.push('\n');
-    grammar
+    Some(grammar)
 }
 
 /// One string as a GBNF literal: quotes, backslashes and control characters are
@@ -303,8 +320,11 @@ fn gbnf_literal(text: &str) -> String {
 }
 
 /// Parse a whole completion in one call (the non-streaming path).
-pub fn parse_completion(text: &str) -> Result<(String, Vec<ToolCall>), ParseError> {
-    let mut parser = Parser::new();
+pub fn parse_completion(
+    text: &str,
+    format: &'static format::ToolFormat,
+) -> Result<(String, Vec<ToolCall>), ParseError> {
+    let mut parser = Parser::new(format);
     let mut events = parser.feed(text);
     events.extend(parser.finish()?);
     let mut content = String::new();
@@ -318,23 +338,43 @@ pub fn parse_completion(text: &str) -> Result<(String, Vec<ToolCall>), ParseErro
     Ok((content, calls))
 }
 
-#[derive(Deserialize)]
-struct Block<'a> {
-    name: String,
-    #[serde(borrow)]
-    arguments: Option<&'a RawValue>,
-}
-
-fn parse_block(json: &str) -> Result<ToolCall, ParseError> {
-    let block: Block = serde_json::from_str(json)
+/// Read one call object, picking the row's name and arguments keys.
+///
+/// The object is a map of raw values, so the arguments stay the model's own
+/// bytes (ADR-0063 decision 3); a JSON string argument is decoded because OpenAI
+/// sends the call's arguments as text.
+fn parse_block(json: &str, format: &format::ToolFormat) -> Result<ToolCall, ParseError> {
+    let object: HashMap<String, &RawValue> = serde_json::from_str(json)
         .map_err(|e| ParseError::new(format!("the call object does not parse: {e}")))?;
-    if block.name.trim().is_empty() {
+    let name = match object.get(format.name_key) {
+        Some(raw) => serde_json::from_str::<String>(raw.get()).map_err(|e| {
+            ParseError::new(format!(
+                "the call's `{}` is not a string: {e}",
+                format.name_key
+            ))
+        })?,
+        None => {
+            return Err(ParseError::new(format!(
+                "the call has no `{}`",
+                format.name_key
+            )))
+        }
+    };
+    if name.trim().is_empty() {
         return Err(ParseError::new("the call's `name` is empty"));
     }
-    let raw = block
-        .arguments
-        .ok_or_else(|| ParseError::new("the call has no `arguments`"))?;
+    let raw = object
+        .get(format.args_key)
+        .ok_or_else(|| ParseError::new(format!("the call has no `{}`", format.args_key)))?;
     let text = raw.get();
+    // `null` is the absent arm, the way `Option<&RawValue>` read it before the
+    // format table moved the key name into a row.
+    if text == "null" {
+        return Err(ParseError::new(format!(
+            "the call has no `{}`",
+            format.args_key
+        )));
+    }
     // A string argument is the call's text (OpenAI's shape); anything else is
     // carried as the bytes the model wrote.
     let arguments = if text.starts_with('"') {
@@ -344,10 +384,7 @@ fn parse_block(json: &str) -> Result<ToolCall, ParseError> {
     } else {
         text.to_string()
     };
-    Ok(ToolCall {
-        name: block.name,
-        arguments,
-    })
+    Ok(ToolCall { name, arguments })
 }
 
 enum RawStatus {

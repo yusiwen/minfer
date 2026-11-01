@@ -73,6 +73,7 @@ fn a_rejected_job_answers_503_and_an_sse_error_frame() {
             crate::server::InFlight::new(metrics.clone()),
             metrics,
             3,
+            &crate::server::toolcall::format::QWEN,
         );
         axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -123,6 +124,7 @@ fn a_streamed_error_frame_is_counted_by_class() {
             crate::server::InFlight::new(metrics_for_body.clone()),
             metrics_for_body,
             3,
+            &crate::server::toolcall::format::QWEN,
         );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
