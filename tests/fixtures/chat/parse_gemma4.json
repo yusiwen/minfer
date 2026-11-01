@@ -1,0 +1,175 @@
+{
+  "format": "gemma4",
+  "response_template": {
+    "defaults": {
+      "role": "assistant"
+    },
+    "start_anchor": [
+      "<|turn>model\n",
+      "<tool_response|>"
+    ],
+    "fields": {
+      "thinking": {
+        "open": "<|channel>thought\n",
+        "close": "<channel|>",
+        "content": "text"
+      },
+      "tool_calls": {
+        "open_pattern": "<\\|tool_call>call:(?P<name>\\w+)",
+        "close": "<tool_call|>",
+        "repeats": true,
+        "content": "json",
+        "content_args": {
+          "unquoted_keys": true,
+          "string_delims": [
+            [
+              "<|\"|>",
+              "<|\"|>"
+            ]
+          ]
+        },
+        "transform": {
+          "type": "function",
+          "function": {
+            "name": "{name}",
+            "arguments": "{content}"
+          }
+        }
+      },
+      "content": {
+        "close": [
+          "<turn|>",
+          "<|tool_response>",
+          "<eos>"
+        ],
+        "content": "text"
+      }
+    }
+  },
+  "prefix": "<|turn>model\n",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "provenance": {
+    "reference": "HuggingFaceTB transformers 5.17.0 transformers.utils.chat_parsing.parse_response with the gemma4 response-template fallback shipped in transformers/cli/serving/utils.py (_RESPONSE_TEMPLATE_FALLBACKS)",
+    "template_source": "released fallback; llama.cpp's common/parsers/gemma4.cpp is the second oracle",
+    "command": "uv run --with transformers==5.17.0 python scripts/gen_tool_call_family_fixtures.py --family gemma4",
+    "date": "2026-11-01"
+  },
+  "cases": [
+    {
+      "name": "single_call",
+      "completion": "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_calls",
+      "completion": "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_call>call:get_weather{city:<|\"|>Lyon<|\"|>}<tool_call|>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          },
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Lyon"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "content_before_the_call",
+      "completion": "Let me check.\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+      "expected": {
+        "content": "Let me check.",
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "number_value",
+      "completion": "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3}<tool_call|>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris",
+              "days": 3
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "nested_object",
+      "completion": "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,options:{units:<|\"|>metric<|\"|>}}<tool_call|>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris",
+              "options": {
+                "units": "metric"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "truncated_body",
+      "completion": "<|tool_call>call:get_weather{city:<|\"|>Par",
+      "error": "json: could not parse after dialect transforms.\nOriginal: '{city:<|\"|>Par'\nTransformed: '{\"city\":<|\"|>Par'\nError: Expecting value: line 1 column 9 (char 8)"
+    },
+    {
+      "name": "prose",
+      "completion": "Hello, world!",
+      "expected": {
+        "content": "Hello, world!",
+        "tool_calls": []
+      }
+    }
+  ]
+}

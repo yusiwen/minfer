@@ -34,6 +34,11 @@ pub enum BlockShape {
     /// `args_marker` is the name, and the JSON value after it is the arguments.
     /// The next open or EOS closes the block.
     NameThenArgs { args_marker: &'static str },
+    /// Gemma 4: `name_prefix` + name + a lenient `{…}` body, then `close`.
+    CallThenJson {
+        name_prefix: &'static str,
+        close: &'static str,
+    },
     /// Qwen3.5's XML body: `<function=NAME>` followed by repeated
     /// `<parameter=KEY>VALUE</parameter>`, then `function_close` and
     /// `block_close`. The values are text, not JSON, so the parser serializes
@@ -192,11 +197,32 @@ pub static QWEN35: ToolFormat = ToolFormat {
     grammar: None,
 };
 
+/// Gemma 4: `<|tool_call>call:NAME{…}<tool_call|>` (#710).
+///
+/// The body is lenient JSON: unquoted keys and `<|"|>` string delimiters. The
+/// parser reads it into a `serde_json::Value` and serializes the arguments to
+/// JSON text. The row is parse-only (`grammar: None`): the existing `j-object`
+/// grammar would produce standard JSON, which this parser does not accept, so a
+/// Gemma-dialect grammar is a separate increment.
+pub static GEMMA4: ToolFormat = ToolFormat {
+    id: "gemma4",
+    anchors: &["<|tool_call>", "call:"],
+    without: &[],
+    open: "<|tool_call>",
+    shape: BlockShape::CallThenJson {
+        name_prefix: "call:",
+        close: "<tool_call|>",
+    },
+    name_key: "name",
+    args_key: "arguments",
+    grammar: None,
+};
+
 /// The table, most specific first. `QWEN35` must precede `QWEN`: both open with
 /// `<tool_call>`, and only the XML row's anchor list includes `<function=`.
 /// `MISTRAL3` must precede `MISTRAL_NEMO`: the array row excludes `[ARGS]`, and
-/// this one requires it.
-static FORMATS: &[&ToolFormat] = &[&QWEN35, &MISTRAL3, &MISTRAL_NEMO, &LLAMA31, &QWEN];
+/// this one requires it. `GEMMA4` is anchored on `<|tool_call>` + `call:`.
+static FORMATS: &[&ToolFormat] = &[&GEMMA4, &QWEN35, &MISTRAL3, &MISTRAL_NEMO, &LLAMA31, &QWEN];
 
 /// Pick the row whose anchors all appear (and whose exclusions do not) in the
 /// template's source.
