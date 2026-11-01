@@ -1,0 +1,133 @@
+{
+  "format": "ministral3",
+  "response_template": {
+    "defaults": {
+      "role": "assistant"
+    },
+    "start_anchor": "[/INST]",
+    "fields": {
+      "tool_calls": {
+        "open_pattern": "\\s*\\[TOOL_CALLS\\](?P<name>[^\\[\\]]+)\\[ARGS\\]",
+        "close_pattern": "\\s*(?=\\[TOOL_CALLS\\]|\\Z)",
+        "content": "json",
+        "repeats": true,
+        "transform": {
+          "type": "function",
+          "function": {
+            "name": "{name}",
+            "arguments": "{content}"
+          }
+        }
+      },
+      "content": {
+        "close": "[TOOL_CALLS]",
+        "content": "text"
+      }
+    }
+  },
+  "prefix": "[INST] Weather in Paris? [/INST]",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "provenance": {
+    "reference": "HuggingFaceTB transformers 5.17.0 transformers.utils.chat_parsing.parse_response with an authored response_template for Ministral 3 `[TOOL_CALLS]name[ARGS]{…}` (llama.cpp `common_chat_parse_ministral_3`)",
+    "template_source": "authored from the family's published call syntax; llama.cpp's parser is the second oracle",
+    "command": "uv run --with transformers==5.17.0 python scripts/gen_tool_call_family_fixtures.py --family ministral3",
+    "date": "2026-11-01"
+  },
+  "cases": [
+    {
+      "name": "single_call",
+      "completion": "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_calls",
+      "completion": "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Lyon\"}",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          },
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Lyon"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "content_before_the_call",
+      "completion": "Let me check. [TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}",
+      "expected": {
+        "content": "Let me check.",
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "string_arguments",
+      "completion": "[TOOL_CALLS]f[ARGS]\"{\\\"city\\\": \\\"Paris\\\"}\"",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "f",
+            "arguments": "{\"city\": \"Paris\"}"
+          }
+        ]
+      }
+    },
+    {
+      "name": "truncated_arguments",
+      "completion": "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Par",
+      "error": "json parser could not parse region as JSON.\nContent: '{\"city\": \"Par'\nError: Unterminated string starting at: line 1 column 10 (char 9)"
+    },
+    {
+      "name": "prose",
+      "completion": "Hello, world!",
+      "expected": {
+        "content": "Hello, world!",
+        "tool_calls": []
+      }
+    }
+  ]
+}

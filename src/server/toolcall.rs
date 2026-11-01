@@ -205,6 +205,9 @@ impl Parser {
         if matches!(self.format.shape, format::BlockShape::XmlFunction { .. }) {
             return self.xml_step(out, eos);
         }
+        if matches!(self.format.shape, format::BlockShape::NameThenArgs { .. }) {
+            return self.name_args_step(out, eos);
+        }
         let len = match raw_value_len(&self.buf[start..]) {
             Ok(len) => len,
             Err(RawStatus::Eof) => {
@@ -305,6 +308,9 @@ impl Parser {
             }
             format::BlockShape::XmlFunction { .. } => {
                 unreachable!("the XML shape is dispatched before the JSON body parse")
+            }
+            format::BlockShape::NameThenArgs { .. } => {
+                unreachable!("the name-in-anchor shape is dispatched before the JSON body parse")
             }
         }
     }
@@ -425,6 +431,78 @@ impl Parser {
             )));
         }
     }
+
+    /// Consume one Ministral 3 `[TOOL_CALLS]name[ARGS]{…}` block (#709).
+    ///
+    /// The name is the text before `[ARGS]`; the JSON value after it is the
+    /// arguments object itself. One call per block; the next `[TOOL_CALLS]` or EOS
+    /// ends it. The arguments keep the model's own bytes, like the JSON rows.
+    fn name_args_step(&mut self, out: &mut Vec<Event>, eos: bool) -> Result<bool, ParseError> {
+        let format::BlockShape::NameThenArgs { args_marker } = self.format.shape else {
+            unreachable!("name_args_step is called only for the name-in-anchor shape")
+        };
+        let start = self.buf.len() - self.buf.trim_start().len();
+        let body = &self.buf[start..];
+        let Some(args_at) = body.find(args_marker) else {
+            if eos {
+                return Err(ParseError::new(
+                    "the block opened but holds no call (expected `[ARGS]`)",
+                ));
+            }
+            return Ok(false);
+        };
+        let name = body[..args_at].trim();
+        if name.is_empty() {
+            return Err(ParseError::new("the call's `name` is empty"));
+        }
+        let after_marker = start + args_at + args_marker.len();
+        let ws = self.buf[after_marker..].len() - self.buf[after_marker..].trim_start().len();
+        let value_start = after_marker + ws;
+        let len = match raw_value_len(&self.buf[value_start..]) {
+            Ok(len) => len,
+            Err(RawStatus::Eof) => {
+                if eos {
+                    return Err(ParseError::new(
+                        "the completion ended inside the call's arguments",
+                    ));
+                }
+                return Ok(false);
+            }
+            Err(RawStatus::Bad(detail)) => {
+                return Err(ParseError::new(format!(
+                    "the call's arguments do not parse: {detail} (near {:?})",
+                    truncate_at(&self.buf[value_start..], 160)
+                )))
+            }
+        };
+        let value_end = value_start + len;
+        let rest = &self.buf[value_end..];
+        let ws2 = rest.len() - rest.trim_start().len();
+        let next = &rest[ws2..];
+        let open = self.format.open;
+        if next.starts_with(open) {
+            let call = call_from_arguments(name, &self.buf[value_start..value_end])?;
+            out.push(Event::Call(call));
+            self.buf.drain(..value_end + ws2 + open.len());
+            // The next call starts now: stay in the block.
+            return Ok(true);
+        }
+        if next.is_empty() || open.starts_with(next) {
+            if eos {
+                let call = call_from_arguments(name, &self.buf[value_start..value_end])?;
+                out.push(Event::Call(call));
+                self.buf.clear();
+                self.in_block = false;
+                self.after_call = true;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        Err(ParseError::new(format!(
+            "expected `{open}` after the call's arguments, found {:?}",
+            truncate_at(next, 40)
+        )))
+    }
 }
 
 /// The GBNF for `tool_choice: "required"` (one of `names`) or a forced function.
@@ -466,8 +544,10 @@ pub fn forced_call_grammar(
     grammar.push(' ');
     grammar.push_str(&gbnf_literal(shape.between));
     grammar.push_str("j-object");
-    grammar.push(' ');
-    grammar.push_str(&gbnf_literal(shape.close));
+    if !shape.close.is_empty() {
+        grammar.push(' ');
+        grammar.push_str(&gbnf_literal(shape.close));
+    }
     grammar.push('\n');
     Some(grammar)
 }
@@ -583,6 +663,29 @@ fn call_from_object(
         text.to_string()
     };
     Ok(ToolCall { name, arguments })
+}
+
+/// Build a call whose name came from the anchor and whose arguments are the JSON
+/// value after `[ARGS]` (Ministral 3).
+///
+/// The object keeps the model's bytes; a JSON string is decoded, the same rule
+/// the wrapper rows use for their `arguments` field.
+fn call_from_arguments(name: &str, json: &str) -> Result<ToolCall, ParseError> {
+    let text = json.trim();
+    if text == "null" {
+        return Err(ParseError::new("the call has no arguments"));
+    }
+    let arguments = if text.starts_with('"') {
+        serde_json::from_str::<String>(text).map_err(|e| {
+            ParseError::new(format!("the call's arguments string does not decode: {e}"))
+        })?
+    } else {
+        text.to_string()
+    };
+    Ok(ToolCall {
+        name: name.to_string(),
+        arguments,
+    })
 }
 
 /// Serialize a Qwen3.5 parameter map to OpenAI's arguments string.
