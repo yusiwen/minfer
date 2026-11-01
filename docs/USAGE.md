@@ -451,7 +451,7 @@ them.
 | `"tools": [{"type":"function","function":{"name":"get_weather","parameters":{…}}}]` | the array is passed through verbatim — the client's key order and any unknown key included, because the template echoes each entry with `| tojson` |
 | `"tool_choice": "auto"` (or absent) | the definitions are rendered |
 | `"tool_choice": "none"` | the prompt is rendered **without** them; a call the model writes anyway is still extracted (the parser does not depend on `tools`) |
-| `"tool_choice": "required"` or `{"type":"function","function":{"name":…}}` | enforced with a grammar over the model's own call format: `<tool_call>` (Qwen2/Qwen3), `[TOOL_CALLS] [{…}]` (Mistral Nemo) or `<|python_tag|>{"name":…, "parameters":…}` (Llama 3.1). A template whose format the table does not recognise, or a recognised format with no grammar yet, is a named `400` |
+| `"tool_choice": "required"` or `{"type":"function","function":{"name":…}}` | enforced with a grammar over the model's own call format: `<tool_call>` (Qwen2/Qwen3), `[TOOL_CALLS] [{…}]` (Mistral Nemo) or `<|python_tag|>{"name":…, "parameters":…}` (Llama 3.1). A template whose format the table does not recognise, or a recognised format with no grammar yet (Qwen3.5's XML), is a named `400` |
 | `"tools": []` | `400` — "no tools" is the absence of the field |
 
 A malformed entry (not an object, `type` other than `"function"`, a missing or empty
@@ -491,23 +491,26 @@ Text outside a block stays `content`. A completion cut off inside a block is a `
 block, never a `200` with half a call in `content`.
 
 The block's syntax comes from the model's own template (one row of the format table, ADR-0066).
-Three formats are recognised:
+Four formats are recognised:
 
 - **Qwen2/Qwen3 (and Hermes):** `<tool_call>{"name": …, "arguments": …}</tool_call>`.
 - **Mistral Nemo / Magistral:** one `[TOOL_CALLS] [{"name": …, "arguments": …}, …]` array; the
   array may hold one call or several.
 - **Llama 3.1:** `<|python_tag|>{"name": …, "parameters": …}` per call, an optional `;` between
   calls; a completion that omits the tag is content, not a call.
+- **Qwen3.5:** `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`;
+  the values are text, the arguments are serialized to JSON, and the row is **parse-only** —
+  `tool_choice: "required"` on it is a named `400` until an XML grammar exists (#708).
 
-Qwen3.5's XML body (#708), Ministral 3's `[TOOL_CALLS]name[ARGS]{…}` (#709) and Gemma 4's
-`<|tool_call>call:name{…}` (#710) are not recognised yet; `tool_choice: "required"`/forced on
-those templates is a named `400`, never an unconstrained generation.
+Ministral 3's `[TOOL_CALLS]name[ARGS]{…}` (#709) and Gemma 4's `<|tool_call>call:name{…}` (#710)
+are not recognised yet; `tool_choice: "required"`/forced on those templates is a named `400`,
+never an unconstrained generation.
 
 `tool_choice: "required"` and a forced function are **enforced** with a grammar over the same
 row: the name is enumerated or fixed, so the returned call is the one demanded. A template the
-table does not recognise, a recognised row with no grammar shape yet, a combination with
-`grammar`/a non-text `response_format`, the speculative draft engine, or a forced name that is not
-in `tools` are each a named `400`.
+table does not recognise, a recognised row with no grammar shape yet (Qwen3.5's XML), a
+combination with `grammar`/a non-text `response_format`, the speculative draft engine, or a forced
+name that is not in `tools` are each a named `400`.
 
 ### Metrics and observability (F8)
 

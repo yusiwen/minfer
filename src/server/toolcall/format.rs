@@ -30,6 +30,14 @@ pub enum BlockShape {
     /// One JSON object per call; the next open, an optional `separator`, or EOS
     /// closes it.
     ObjectUntilNextOpen { separator: &'static str },
+    /// Qwen3.5's XML body: `<function=NAME>` followed by repeated
+    /// `<parameter=KEY>VALUE</parameter>`, then `function_close` and
+    /// `block_close`. The values are text, not JSON, so the parser serializes
+    /// the collected object back to JSON text.
+    XmlFunction {
+        function_close: &'static str,
+        block_close: &'static str,
+    },
 }
 
 /// One family's call syntax.
@@ -128,8 +136,35 @@ pub static LLAMA31: ToolFormat = ToolFormat {
     }),
 };
 
-/// The table, most specific first.
-static FORMATS: &[&ToolFormat] = &[&MISTRAL_NEMO, &LLAMA31, &QWEN];
+/// Qwen3.5: an XML-ish body inside the `<tool_call>` wrapper (#708).
+///
+/// The body is `<function=NAME>` followed by `<parameter=KEY>VALUE</parameter>`
+/// entries; the values are text, and the parser serializes the collected object
+/// to JSON text for OpenAI's `arguments` string. The row is parse-only:
+/// `tool_choice` sees `grammar: None` and answers a named 400, because an XML
+/// grammar over the tool's JSON schema is a second grammar compiler.
+///
+/// transformers 5.17.0's released `qwen3_5` fallback and llama.cpp's
+/// Qwen3-Coder/3.5 parser both wrap the markup this way.
+pub static QWEN35: ToolFormat = ToolFormat {
+    id: "qwen3_5",
+    anchors: &["<tool_call>", "<function="],
+    without: &[],
+    open: "<tool_call>",
+    shape: BlockShape::XmlFunction {
+        function_close: "</function>",
+        block_close: "</tool_call>",
+    },
+    // The JSON keys are unused by the XML shape; the fields stay because a row
+    // is one uniform description, and a future JSON-shaped sibling may share it.
+    name_key: "name",
+    args_key: "arguments",
+    grammar: None,
+};
+
+/// The table, most specific first. `QWEN35` must precede `QWEN`: both open with
+/// `<tool_call>`, and only the XML row's anchor list includes `<function=`.
+static FORMATS: &[&ToolFormat] = &[&QWEN35, &MISTRAL_NEMO, &LLAMA31, &QWEN];
 
 /// Pick the row whose anchors all appear (and whose exclusions do not) in the
 /// template's source.

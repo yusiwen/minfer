@@ -1,0 +1,160 @@
+{
+  "format": "qwen3_5",
+  "response_template": {
+    "defaults": {
+      "role": "assistant"
+    },
+    "start_anchor": "<|im_start|>assistant\n",
+    "fields": {
+      "thinking": {
+        "open": "<think>",
+        "close": "</think>",
+        "content": "text"
+      },
+      "tool_calls": {
+        "open_pattern": "\\s*<tool_call>\\s*<function=(?P<name>[^>\\n]+)>",
+        "close_pattern": "</function>\\s*</tool_call>",
+        "repeats": true,
+        "content": "xml-inline",
+        "content_args": {
+          "tag_pattern": "<parameter=(?P<key>[^>\\n]+)>\\s*(?P<value>.*?)\\s*</parameter>"
+        },
+        "transform": {
+          "type": "function",
+          "function": {
+            "name": "{name}",
+            "arguments": "{content}"
+          }
+        }
+      },
+      "content": {
+        "close_pattern": "\\s*(?:<\\|im_end\\|>|<\\|endoftext\\|>)",
+        "content": "text"
+      }
+    }
+  },
+  "prefix": "<|im_start|>assistant\n",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "provenance": {
+    "reference": "HuggingFaceTB transformers 5.17.0 transformers.utils.chat_parsing.parse_response with the qwen3_5 response-template fallback shipped in transformers/cli/serving/utils.py (_RESPONSE_TEMPLATE_FALLBACKS)",
+    "template_source": "released fallback; llama.cpp's common/parsers/qwen3-coder.cpp is the second oracle",
+    "command": "uv run --with transformers==5.17.0 python scripts/gen_tool_call_family_fixtures.py --family qwen3_5",
+    "date": "2026-11-01"
+  },
+  "cases": [
+    {
+      "name": "single_call",
+      "completion": "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n</tool_call>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_calls",
+      "completion": "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>Lyon</parameter>\n</function>\n</tool_call>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          },
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Lyon"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "content_before_the_call",
+      "completion": "Let me check.\n<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n</tool_call>",
+      "expected": {
+        "content": "Let me check.",
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_parameters",
+      "completion": "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n<parameter=unit>celsius</parameter>\n</function>\n</tool_call>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "Paris",
+              "unit": "celsius"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "unicode_and_html_in_a_value",
+      "completion": "<tool_call>\n<function=get_weather>\n<parameter=city>检索 <b> & 'c'</parameter>\n</function>\n</tool_call>",
+      "expected": {
+        "content": null,
+        "tool_calls": [
+          {
+            "name": "get_weather",
+            "arguments": {
+              "city": "检索 <b> & 'c'"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "truncated_parameter",
+      "completion": "<tool_call>\n<function=get_weather>\n<parameter=city>Par",
+      "error": "the reference's xml-inline returns an empty object for a truncated parameter; this engine refuses the incomplete block by name",
+      "diverges": "the reference accepts `{}` for a truncated `<parameter>`; #708 requires a named refusal instead of a half call"
+    },
+    {
+      "name": "prose",
+      "completion": "Hello, world!",
+      "expected": {
+        "content": "Hello, world!",
+        "tool_calls": []
+      }
+    }
+  ]
+}
