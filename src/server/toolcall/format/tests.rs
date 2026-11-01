@@ -80,3 +80,24 @@ fn the_qwen35_row_is_parse_only() {
         "an XML grammar over the tool schema is a separate increment; the row is a named 400"
     );
 }
+
+#[test]
+fn the_gemma4_row_is_detected_from_the_piped_tag_and_call_prefix() {
+    assert_eq!(
+        detected("<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>"),
+        Some("gemma4")
+    );
+    assert_eq!(
+        detected("<tool_call>{\"name\": …}"),
+        Some("qwen2"),
+        "the piped tag does not collide with `<tool_call>`"
+    );
+}
+
+#[test]
+fn the_gemma4_row_is_parse_only() {
+    assert!(
+        GEMMA4.grammar.is_none(),
+        "the existing j-object grammar is standard JSON; the Gemma dialect needs its own"
+    );
+}

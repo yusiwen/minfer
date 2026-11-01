@@ -356,3 +356,8 @@ symbol = "QWEN35"
 adr = "0068"
 what = "Ministral 3's name-in-anchor block is one more row: the name is the text before `[ARGS]`, the JSON value after it is the arguments, and the `tool_choice` grammar ends at the arguments"
 symbol = "MISTRAL3"
+
+[[governs]]
+adr = "0069"
+what = "Gemma 4's lenient-JSON block is a parse-only row: the parser reads `call:name{…}` with unquoted keys and `<|\"|>` strings, serializes the arguments to JSON text, and `tool_choice` stays a named 400"
+symbol = "GEMMA4"

@@ -208,6 +208,9 @@ impl Parser {
         if matches!(self.format.shape, format::BlockShape::NameThenArgs { .. }) {
             return self.name_args_step(out, eos);
         }
+        if matches!(self.format.shape, format::BlockShape::CallThenJson { .. }) {
+            return self.call_then_json_step(out, eos);
+        }
         let len = match raw_value_len(&self.buf[start..]) {
             Ok(len) => len,
             Err(RawStatus::Eof) => {
@@ -311,6 +314,9 @@ impl Parser {
             }
             format::BlockShape::NameThenArgs { .. } => {
                 unreachable!("the name-in-anchor shape is dispatched before the JSON body parse")
+            }
+            format::BlockShape::CallThenJson { .. } => {
+                unreachable!("the Gemma shape is dispatched before the JSON body parse")
             }
         }
     }
@@ -503,6 +509,87 @@ impl Parser {
             truncate_at(next, 40)
         )))
     }
+
+    /// Consume one Gemma 4 `<|tool_call>call:NAME{…}<tool_call|>` block (#710).
+    ///
+    /// The body is lenient JSON (unquoted keys, `<|"|>` strings); it is read into
+    /// a `serde_json::Value` and serialized to JSON text for OpenAI's
+    /// `arguments`. A complete body at EOS without the close is a usable call,
+    /// the same implicit-close rule the other rows use.
+    fn call_then_json_step(&mut self, out: &mut Vec<Event>, eos: bool) -> Result<bool, ParseError> {
+        let format::BlockShape::CallThenJson { name_prefix, close } = self.format.shape else {
+            unreachable!("call_then_json_step is called only for the Gemma shape")
+        };
+        let start = self.buf.len() - self.buf.trim_start().len();
+        let body = &self.buf[start..];
+        let Some(after_prefix) = body.strip_prefix(name_prefix) else {
+            if eos {
+                return Err(ParseError::new("the block opened but holds no call"));
+            }
+            if name_prefix.starts_with(body) {
+                return Ok(false);
+            }
+            return Err(ParseError::new(format!(
+                "expected `{name_prefix}` after the call block, found {:?}",
+                truncate_at(body, 40)
+            )));
+        };
+        let Some(brace) = after_prefix.find('{') else {
+            if eos {
+                return Err(ParseError::new("the call has no `{` body"));
+            }
+            return Ok(false);
+        };
+        let name = after_prefix[..brace].trim();
+        if name.is_empty() {
+            return Err(ParseError::new("the call's `name` is empty"));
+        }
+        let value_start = start + name_prefix.len() + brace;
+        let (value, len) = match gemma_json(&self.buf[value_start..]) {
+            Ok(pair) => pair,
+            Err(RawStatus::Eof) => {
+                if eos {
+                    return Err(ParseError::new(
+                        "the completion ended inside the call's body",
+                    ));
+                }
+                return Ok(false);
+            }
+            Err(RawStatus::Bad(detail)) => {
+                return Err(ParseError::new(format!(
+                    "the call's body does not parse: {detail} (near {:?})",
+                    truncate_at(&self.buf[value_start..], 160)
+                )))
+            }
+        };
+        let value_end = value_start + len;
+        let rest = &self.buf[value_end..];
+        let ws = rest.len() - rest.trim_start().len();
+        let tail = &rest[ws..];
+        if tail.starts_with(close) {
+            let call = call_from_value(name, &value)?;
+            out.push(Event::Call(call));
+            self.buf.drain(..value_end + ws + close.len());
+            self.in_block = false;
+            self.after_call = true;
+            return Ok(true);
+        }
+        if tail.is_empty() || close.starts_with(tail) {
+            if eos {
+                let call = call_from_value(name, &value)?;
+                out.push(Event::Call(call));
+                self.buf.clear();
+                self.in_block = false;
+                self.after_call = true;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        Err(ParseError::new(format!(
+            "expected `{close}` after the call's body, found {:?}",
+            truncate_at(tail, 40)
+        )))
+    }
 }
 
 /// The GBNF for `tool_choice: "required"` (one of `names`) or a forced function.
@@ -688,6 +775,16 @@ fn call_from_arguments(name: &str, json: &str) -> Result<ToolCall, ParseError> {
     })
 }
 
+/// Serialize a lenient Gemma body to OpenAI's arguments string.
+fn call_from_value(name: &str, value: &serde_json::Value) -> Result<ToolCall, ParseError> {
+    let arguments = serde_json::to_string(value)
+        .map_err(|e| ParseError::new(format!("the call's arguments do not serialize: {e}")))?;
+    Ok(ToolCall {
+        name: name.to_string(),
+        arguments,
+    })
+}
+
 /// Serialize a Qwen3.5 parameter map to OpenAI's arguments string.
 ///
 /// The XML values are text, so the object is built in memory and serialized as
@@ -719,6 +816,225 @@ fn raw_value_len(s: &str) -> Result<usize, RawStatus> {
         Some(Err(e)) => Err(RawStatus::Bad(e.to_string())),
         None => Err(RawStatus::Eof),
     }
+}
+
+/// A cursor over Gemma 4's lenient JSON body (#710).
+///
+/// The dialect has unquoted keys and `<|"|>` string delimiters; numbers,
+/// booleans, null, arrays and nested objects are JSON's. A partial token at the
+/// end of the buffer returns [`RawStatus::Eof`], so the streaming parser holds
+/// rather than refusing a call that is still arriving.
+struct GemmaJson<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl<'a> GemmaJson<'a> {
+    fn skip_ws(&mut self) {
+        while let Some(b) = self.text.as_bytes().get(self.at) {
+            if b.is_ascii_whitespace() {
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn value(&mut self) -> Result<serde_json::Value, RawStatus> {
+        self.skip_ws();
+        let rest = &self.text[self.at..];
+        if rest.starts_with("<|\"|>") || rest.starts_with('"') {
+            return Ok(serde_json::Value::String(self.string()?));
+        }
+        if !rest.is_empty() && "<|\"|>".starts_with(rest) {
+            return Err(RawStatus::Eof);
+        }
+        match rest.as_bytes().first().copied() {
+            None => Err(RawStatus::Eof),
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            Some(_) => {
+                for (literal, value) in [
+                    ("true", serde_json::Value::Bool(true)),
+                    ("false", serde_json::Value::Bool(false)),
+                    ("null", serde_json::Value::Null),
+                ] {
+                    if rest.starts_with(literal) {
+                        self.at += literal.len();
+                        return Ok(value);
+                    }
+                    if literal.starts_with(rest) {
+                        return Err(RawStatus::Eof);
+                    }
+                }
+                Err(RawStatus::Bad("expected a value".to_string()))
+            }
+        }
+    }
+
+    fn string(&mut self) -> Result<String, RawStatus> {
+        if self.text[self.at..].starts_with("<|\"|>") {
+            self.at += 5;
+            let start = self.at;
+            let Some(rel) = self.text[start..].find("<|\"|>") else {
+                return Err(RawStatus::Eof);
+            };
+            let value = self.text[start..start + rel].to_string();
+            self.at = start + rel + 5;
+            return Ok(value);
+        }
+        if self.text.as_bytes().get(self.at) != Some(&b'"') {
+            return Err(RawStatus::Bad("expected a string".to_string()));
+        }
+        let start = self.at;
+        let mut escaped = false;
+        let mut at = start + 1;
+        while at < self.text.len() {
+            let b = self.text.as_bytes()[at];
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                let slice = &self.text[start..=at];
+                let value = serde_json::from_str::<String>(slice)
+                    .map_err(|e| RawStatus::Bad(e.to_string()))?;
+                self.at = at + 1;
+                return Ok(value);
+            }
+            at += 1;
+        }
+        Err(RawStatus::Eof)
+    }
+
+    fn key(&mut self) -> Result<String, RawStatus> {
+        self.skip_ws();
+        if self.text[self.at..].starts_with("<|\"|>")
+            || self.text.as_bytes().get(self.at) == Some(&b'"')
+        {
+            return self.string();
+        }
+        let rest = &self.text[self.at..];
+        if !rest.is_empty() && "<|\"|>".starts_with(rest) {
+            return Err(RawStatus::Eof);
+        }
+        let start = self.at;
+        while let Some(b) = self.text.as_bytes().get(self.at) {
+            if b.is_ascii_alphanumeric() || *b == b'_' {
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        if self.at == start {
+            if self.at >= self.text.len() {
+                return Err(RawStatus::Eof);
+            }
+            return Err(RawStatus::Bad("expected a key".to_string()));
+        }
+        Ok(self.text[start..self.at].to_string())
+    }
+
+    fn object(&mut self) -> Result<serde_json::Value, RawStatus> {
+        self.at += 1; // `{`
+        let mut map = serde_json::Map::new();
+        loop {
+            self.skip_ws();
+            match self.text.as_bytes().get(self.at) {
+                None => return Err(RawStatus::Eof),
+                Some(b'}') => {
+                    self.at += 1;
+                    return Ok(serde_json::Value::Object(map));
+                }
+                Some(_) => {}
+            }
+            let key = self.key()?;
+            self.skip_ws();
+            if self.text.as_bytes().get(self.at) != Some(&b':') {
+                if self.at >= self.text.len() {
+                    return Err(RawStatus::Eof);
+                }
+                return Err(RawStatus::Bad("expected `:` after a key".to_string()));
+            }
+            self.at += 1;
+            let value = self.value()?;
+            map.insert(key, value);
+            self.skip_ws();
+            match self.text.as_bytes().get(self.at) {
+                None => return Err(RawStatus::Eof),
+                Some(b',') => self.at += 1,
+                Some(b'}') => {
+                    self.at += 1;
+                    return Ok(serde_json::Value::Object(map));
+                }
+                Some(_) => return Err(RawStatus::Bad("expected `,` or `}`".to_string())),
+            }
+        }
+    }
+
+    fn array(&mut self) -> Result<serde_json::Value, RawStatus> {
+        self.at += 1; // `[`
+        let mut values = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.text.as_bytes().get(self.at) {
+                None => return Err(RawStatus::Eof),
+                Some(b']') => {
+                    self.at += 1;
+                    return Ok(serde_json::Value::Array(values));
+                }
+                Some(_) => {}
+            }
+            values.push(self.value()?);
+            self.skip_ws();
+            match self.text.as_bytes().get(self.at) {
+                None => return Err(RawStatus::Eof),
+                Some(b',') => self.at += 1,
+                Some(b']') => {
+                    self.at += 1;
+                    return Ok(serde_json::Value::Array(values));
+                }
+                Some(_) => return Err(RawStatus::Bad("expected `,` or `]`".to_string())),
+            }
+        }
+    }
+
+    fn number(&mut self) -> Result<serde_json::Value, RawStatus> {
+        let start = self.at;
+        while let Some(b) = self.text.as_bytes().get(self.at) {
+            if b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E') {
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        if self.at == start {
+            if self.at >= self.text.len() {
+                return Err(RawStatus::Eof);
+            }
+            return Err(RawStatus::Bad("expected a number".to_string()));
+        }
+        let slice = &self.text[start..self.at];
+        if self.at >= self.text.len()
+            && (slice.ends_with('-')
+                || slice.ends_with('+')
+                || slice.ends_with('e')
+                || slice.ends_with('E')
+                || slice.ends_with('.'))
+        {
+            return Err(RawStatus::Eof);
+        }
+        let number = serde_json::from_str::<serde_json::Number>(slice)
+            .map_err(|e| RawStatus::Bad(e.to_string()))?;
+        Ok(serde_json::Value::Number(number))
+    }
+}
+
+fn gemma_json(text: &str) -> Result<(serde_json::Value, usize), RawStatus> {
+    let mut parser = GemmaJson { text, at: 0 };
+    let value = parser.value()?;
+    Ok((value, parser.at))
 }
 
 /// The length of the longest suffix of `text` that is a proper prefix of `tag`.

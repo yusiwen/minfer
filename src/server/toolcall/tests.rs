@@ -274,6 +274,7 @@ const MISTRAL_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_mist
 const LLAMA_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_llama31.json");
 const QWEN35_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_qwen35.json");
 const MISTRAL3_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_ministral3.json");
+const GEMMA4_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_gemma4.json");
 
 #[derive(serde::Deserialize)]
 struct FamilyFixture {
@@ -288,6 +289,7 @@ fn family_row(name: &str) -> &'static format::ToolFormat {
         "llama31" => &format::LLAMA31,
         "qwen3_5" => &format::QWEN35,
         "ministral3" => &format::MISTRAL3,
+        "gemma4" => &format::GEMMA4,
         other => panic!("the fixture names an unknown format: {other}"),
     }
 }
@@ -380,6 +382,11 @@ fn the_qwen35_reference_parses_identically() {
 #[test]
 fn the_ministral3_reference_parses_identically() {
     check_family_fixture(MISTRAL3_JSON, 6, true);
+}
+
+#[test]
+fn the_gemma4_reference_parses_identically() {
+    check_family_fixture(GEMMA4_JSON, 7, false);
 }
 
 // === Streaming: the deltas rebuild the non-streaming message =============
@@ -491,6 +498,7 @@ fn streamed_deltas_rebuild_each_family_call() {
         (LLAMA_JSON, &format::LLAMA31),
         (QWEN35_JSON, &format::QWEN35),
         (MISTRAL3_JSON, &format::MISTRAL3),
+        (GEMMA4_JSON, &format::GEMMA4),
     ] {
         let fx: FamilyFixture = serde_json::from_str(fixture).expect("parse family fixture");
         assert_eq!(fx.format, row.id);

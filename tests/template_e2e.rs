@@ -1001,3 +1001,62 @@ fn serve_enforces_tool_choice_on_the_ministral3_row() {
     serde_json::from_str::<serde_json::Value>(arguments)
         .unwrap_or_else(|e| panic!("arguments are not JSON: {e}\n{response}"));
 }
+
+/// #710: the Gemma 4 `<|tool_call>call:…` block is detected and parsed from a
+/// forced completion, and `tool_choice: "required"` on the same template is a
+/// named 400 (no Gemma-dialect grammar yet).
+#[test]
+fn serve_reads_the_gemma4_call_and_refuses_tool_choice() {
+    let model = test_model();
+    let template = template_file(
+        "gemma4-call.jinja",
+        "{% if false %}<|tool_call>call:{% endif %}{% if tools %}<tools>{{ tools | length }}</tools>{% endif %}{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}",
+    );
+    let mut server = Server::spawn_with_ctx(
+        "serve",
+        &model.to_string_lossy(),
+        18135,
+        Some(&template),
+        1024,
+    );
+    assert!(
+        server.wait_listening(),
+        "no banner; log so far:\n{}",
+        server.log()
+    );
+    let block = r#"root ::= "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>""#;
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+        "grammar": block,
+        "max_tokens": 512,
+        "seed": 42,
+    })
+    .to_string();
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
+    assert_eq!(status, 200, "body:\n{response}");
+    let parsed: serde_json::Value = serde_json::from_str(&response).expect("completion json");
+    let choice = &parsed["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "body:\n{response}");
+    let call = &choice["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "get_weather", "body:\n{response}");
+    let arguments: serde_json::Value =
+        serde_json::from_str(call["function"]["arguments"].as_str().unwrap())
+            .expect("the Gemma body serializes to JSON");
+    assert_eq!(arguments, serde_json::json!({"city": "Paris"}));
+
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        "tool_choice": "required",
+        "max_tokens": 8,
+    })
+    .to_string();
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
+    assert_eq!(status, 400, "body:\n{response}");
+    assert!(
+        response.contains("can parse but cannot constrain"),
+        "the refusal must name the parse-only format; body:\n{response}"
+    );
+}

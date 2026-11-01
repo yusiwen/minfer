@@ -262,6 +262,60 @@ MINISTRAL3_CASES = [
 ]
 
 
+GEMMA4_SPEC = {
+    "defaults": {"role": "assistant"},
+    "start_anchor": ["<|turn>model\n", "<tool_response|>"],
+    "fields": {
+        "thinking": {
+            "open": "<|channel>thought\n",
+            "close": "<channel|>",
+            "content": "text",
+        },
+        "tool_calls": {
+            "open_pattern": r"<\|tool_call>call:(?P<name>\w+)",
+            "close": "<tool_call|>",
+            "repeats": True,
+            "content": "json",
+            "content_args": {"unquoted_keys": True, "string_delims": [['<|"|>', '<|"|>']]},
+            "transform": {
+                "type": "function",
+                "function": {"name": "{name}", "arguments": "{content}"},
+            },
+        },
+        "content": {"close": ["<turn|>", "<|tool_response>", "<eos>"], "content": "text"},
+    },
+}
+GEMMA4_PREFIX = "<|turn>model\n"
+GEMMA4_CASES = [
+    (
+        "single_call",
+        '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>',
+    ),
+    (
+        "two_calls",
+        '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>'
+        '<|tool_call>call:get_weather{city:<|"|>Lyon<|"|>}<tool_call|>',
+    ),
+    (
+        "content_before_the_call",
+        'Let me check.\n<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>',
+    ),
+    (
+        "number_value",
+        '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,days:3}<tool_call|>',
+    ),
+    (
+        "nested_object",
+        '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,options:{units:<|"|>metric<|"|>}}<tool_call|>',
+    ),
+    (
+        "truncated_body",
+        '<|tool_call>call:get_weather{city:<|"|>Par',
+    ),
+    ("prose", "Hello, world!"),
+]
+
+
 def build(spec: dict, prefix: str, cases: list[tuple[str, str]]) -> list[dict]:
     from transformers.utils.chat_parsing import parse_response
 
@@ -290,6 +344,34 @@ def build(spec: dict, prefix: str, cases: list[tuple[str, str]]) -> list[dict]:
             }
         )
     return out
+
+
+def gemma4_document(spec: dict, prefix: str, cases: list[dict]) -> dict:
+    """The Gemma 4 fixture, whose reference is the released fallback."""
+    return {
+        "format": "gemma4",
+        "response_template": spec,
+        "prefix": prefix,
+        "tools": [GET_WEATHER],
+        "provenance": {
+            "reference": (
+                "HuggingFaceTB transformers 5.17.0 "
+                "transformers.utils.chat_parsing.parse_response with the gemma4 "
+                "response-template fallback shipped in transformers/cli/serving/utils.py "
+                "(_RESPONSE_TEMPLATE_FALLBACKS)"
+            ),
+            "template_source": (
+                "released fallback; llama.cpp's common/parsers/gemma4.cpp is the "
+                "second oracle"
+            ),
+            "command": (
+                "uv run --with transformers==5.17.0 python "
+                "scripts/gen_tool_call_family_fixtures.py --family gemma4"
+            ),
+            "date": "2026-11-01",
+        },
+        "cases": cases,
+    }
 
 
 def document(family: str, spec: dict, prefix: str, cases: list[dict], reference: str) -> dict:
@@ -401,6 +483,14 @@ def targets() -> dict[str, tuple[pathlib.Path, dict]]:
                 build(MINISTRAL3_SPEC, MINISTRAL3_PREFIX, MINISTRAL3_CASES),
                 "Ministral 3 `[TOOL_CALLS]name[ARGS]{…}` "
                 "(llama.cpp `common_chat_parse_ministral_3`)",
+            ),
+        ),
+        "gemma4": (
+            CHAT / "parse_gemma4.json",
+            gemma4_document(
+                GEMMA4_SPEC,
+                GEMMA4_PREFIX,
+                build(GEMMA4_SPEC, GEMMA4_PREFIX, GEMMA4_CASES),
             ),
         ),
         "qwen3_5": (
