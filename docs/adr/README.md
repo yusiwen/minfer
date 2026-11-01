@@ -186,6 +186,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0064](./0064-a-hash-that-does-not-resolve-is-history-only-where-the-document-says-so.md) | 2026-10-31 | a hash that does not resolve is history only where the document or the ledger says so | Accepted (amends ADR-0027) |
 | [0065](./0065-the-hash-marker-covers-the-block-below-it-not-the-document.md) | 2026-10-31 | the hash marker covers the block below it, not the document | Accepted (amends ADR-0064 decision 3) |
 | [0066](./0066-a-tool-call-format-is-a-table-row.md) | 2026-11-01 | a tool-call format is a table row, and the parser and the `tool_choice` grammar both read it | Accepted (amends ADR-0063) |
+| [0067](./0067-qwen3-5-xml-call-is-parsed-and-its-arguments-are-serialized-json.md) | 2026-11-01 | Qwen3.5's XML call is parsed, and its arguments are serialized JSON | Accepted (amends ADR-0066) |
 
 ## The template
 

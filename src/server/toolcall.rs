@@ -202,6 +202,9 @@ impl Parser {
             }
             return Ok(false);
         }
+        if matches!(self.format.shape, format::BlockShape::XmlFunction { .. }) {
+            return self.xml_step(out, eos);
+        }
         let len = match raw_value_len(&self.buf[start..]) {
             Ok(len) => len,
             Err(RawStatus::Eof) => {
@@ -300,6 +303,126 @@ impl Parser {
                     truncate_at(next, 40)
                 )))
             }
+            format::BlockShape::XmlFunction { .. } => {
+                unreachable!("the XML shape is dispatched before the JSON body parse")
+            }
+        }
+    }
+
+    /// Consume one Qwen3.5 XML block (#708).
+    ///
+    /// The body is `<function=NAME>` followed by repeated
+    /// `<parameter=KEY>VALUE</parameter>` entries, then `</function>` and
+    /// `</tool_call>`. Values are text and are serialized back to JSON text for
+    /// OpenAI's `arguments`; a complete function with no block close at EOS is a
+    /// usable call (the same implicit-close rule the JSON rows use), while a
+    /// truncated parameter is a refusal.
+    fn xml_step(&mut self, out: &mut Vec<Event>, eos: bool) -> Result<bool, ParseError> {
+        let format::BlockShape::XmlFunction {
+            function_close,
+            block_close,
+        } = self.format.shape
+        else {
+            unreachable!("xml_step is called only for the XML shape")
+        };
+        let start = self.buf.len() - self.buf.trim_start().len();
+        let body = &self.buf[start..];
+        let Some(after_open) = body.strip_prefix("<function=") else {
+            if eos {
+                return Err(ParseError::new("the block opened but holds no function"));
+            }
+            if "<function=".starts_with(body) {
+                return Ok(false);
+            }
+            return Err(ParseError::new(format!(
+                "expected `<function=` after the call block, found {:?}",
+                truncate_at(body, 40)
+            )));
+        };
+        let Some(name_end) = after_open.find('>') else {
+            if eos {
+                return Err(ParseError::new(
+                    "the completion ended inside the function's name",
+                ));
+            }
+            return Ok(false);
+        };
+        let name = after_open[..name_end].trim();
+        if name.is_empty() {
+            return Err(ParseError::new("the call's `name` is empty"));
+        }
+        let mut rest = &after_open[name_end + 1..];
+        let mut arguments: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        loop {
+            let ws = rest.trim_start();
+            if let Some(after) = ws.strip_prefix(function_close) {
+                let tail = after.trim_start();
+                if tail.starts_with(block_close) {
+                    let call = xml_call(name, &arguments)?;
+                    out.push(Event::Call(call));
+                    let consumed = start + (body.len() - tail.len()) + block_close.len();
+                    self.buf.drain(..consumed);
+                    self.in_block = false;
+                    self.after_call = true;
+                    return Ok(true);
+                }
+                if tail.is_empty() || block_close.starts_with(tail) {
+                    if eos {
+                        let call = xml_call(name, &arguments)?;
+                        out.push(Event::Call(call));
+                        self.buf.clear();
+                        self.in_block = false;
+                        self.after_call = true;
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                return Err(ParseError::new(format!(
+                    "expected `{block_close}` after `{function_close}`, found {:?}",
+                    truncate_at(tail, 40)
+                )));
+            }
+            if let Some(after) = ws.strip_prefix("<parameter=") {
+                let Some(key_end) = after.find('>') else {
+                    if eos {
+                        return Err(ParseError::new(
+                            "the completion ended inside a parameter's name",
+                        ));
+                    }
+                    return Ok(false);
+                };
+                let key = after[..key_end].trim();
+                if key.is_empty() {
+                    return Err(ParseError::new("a parameter has an empty name"));
+                }
+                let after_key = &after[key_end + 1..];
+                let Some(value_end) = after_key.find("</parameter>") else {
+                    if eos {
+                        return Err(ParseError::new(
+                            "the completion ended inside a parameter's value",
+                        ));
+                    }
+                    return Ok(false);
+                };
+                arguments.insert(
+                    key.to_string(),
+                    serde_json::Value::String(after_key[..value_end].trim().to_string()),
+                );
+                rest = &after_key[value_end + "</parameter>".len()..];
+                continue;
+            }
+            if ws.is_empty() || "<parameter=".starts_with(ws) || function_close.starts_with(ws) {
+                if eos {
+                    return Err(ParseError::new(
+                        "the completion ended inside the call's parameters",
+                    ));
+                }
+                return Ok(false);
+            }
+            return Err(ParseError::new(format!(
+                "expected `<parameter=` or `{function_close}` after the call's name, found {:?}",
+                truncate_at(ws, 40)
+            )));
         }
     }
 }
@@ -460,6 +583,22 @@ fn call_from_object(
         text.to_string()
     };
     Ok(ToolCall { name, arguments })
+}
+
+/// Serialize a Qwen3.5 parameter map to OpenAI's arguments string.
+///
+/// The XML values are text, so the object is built in memory and serialized as
+/// JSON; unlike the JSON rows, these are not the model's own bytes.
+fn xml_call(
+    name: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ToolCall, ParseError> {
+    let arguments = serde_json::to_string(arguments)
+        .map_err(|e| ParseError::new(format!("the call's arguments do not serialize: {e}")))?;
+    Ok(ToolCall {
+        name: name.to_string(),
+        arguments,
+    })
 }
 
 enum RawStatus {

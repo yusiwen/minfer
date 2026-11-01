@@ -272,6 +272,7 @@ fn the_transformers_reference_parses_identically() {
 
 const MISTRAL_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_mistral_nemo.json");
 const LLAMA_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_llama31.json");
+const QWEN35_JSON: &str = include_str!("../../../tests/fixtures/chat/parse_qwen35.json");
 
 #[derive(serde::Deserialize)]
 struct FamilyFixture {
@@ -284,16 +285,19 @@ fn family_row(name: &str) -> &'static format::ToolFormat {
     match name {
         "mistral_nemo" => &format::MISTRAL_NEMO,
         "llama31" => &format::LLAMA31,
+        "qwen3_5" => &format::QWEN35,
         other => panic!("the fixture names an unknown format: {other}"),
     }
 }
 
 /// Compare one family fixture against the reference, case for case.
 ///
-/// The authored `response_template` is the authority here (transformers ships no
-/// Mistral/Llama template); the fixture's provenance says so, and the parser's
-/// own bytes assertion covers the "the arguments are the model's bytes" rule.
-fn check_family_fixture(text: &str, expected_cases: usize) {
+/// The Mistral/Llama `response_template` is authored (transformers ships no
+/// template for them); the Qwen3.5 one is the released fallback. The parser's
+/// own bytes assertion covers the "the arguments are the model's bytes" rule for
+/// the JSON rows; the XML row serializes its arguments, so its callers pass
+/// `false`.
+fn check_family_fixture(text: &str, expected_cases: usize, bytes_in_completion: bool) {
     let fx: FamilyFixture = serde_json::from_str(text).expect("parse family fixture");
     let row = family_row(&fx.format);
     assert!(
@@ -309,7 +313,8 @@ fn check_family_fixture(text: &str, expected_cases: usize) {
         if case.error.is_some() {
             assert!(
                 got.is_err(),
-                "{}: the reference refused this completion, so this engine must too",
+                "{}: the reference refused this completion (or the case records a \
+                 deliberate refusal), so this engine must too",
                 case.name
             );
             seen += 1;
@@ -331,11 +336,13 @@ fn check_family_fixture(text: &str, expected_cases: usize) {
                     let parsed: serde_json::Value = serde_json::from_str(&got.arguments)
                         .unwrap_or_else(|e| panic!("{}: arguments are not JSON: {e}", case.name));
                     assert_eq!(&parsed, value, "{}", case.name);
-                    assert!(
-                        case.completion.contains(&got.arguments),
-                        "{}: an object's arguments are the block's own bytes",
-                        case.name
-                    );
+                    if bytes_in_completion {
+                        assert!(
+                            case.completion.contains(&got.arguments),
+                            "{}: an object's arguments are the block's own bytes",
+                            case.name
+                        );
+                    }
                 }
             }
         }
@@ -355,12 +362,17 @@ fn check_family_fixture(text: &str, expected_cases: usize) {
 
 #[test]
 fn the_mistral_nemo_reference_parses_identically() {
-    check_family_fixture(MISTRAL_JSON, 7);
+    check_family_fixture(MISTRAL_JSON, 7, true);
 }
 
 #[test]
 fn the_llama31_reference_parses_identically() {
-    check_family_fixture(LLAMA_JSON, 8);
+    check_family_fixture(LLAMA_JSON, 8, true);
+}
+
+#[test]
+fn the_qwen35_reference_parses_identically() {
+    check_family_fixture(QWEN35_JSON, 7, false);
 }
 
 // === Streaming: the deltas rebuild the non-streaming message =============
@@ -470,6 +482,7 @@ fn streamed_deltas_rebuild_each_family_call() {
     for (fixture, row) in [
         (MISTRAL_JSON, &format::MISTRAL_NEMO),
         (LLAMA_JSON, &format::LLAMA31),
+        (QWEN35_JSON, &format::QWEN35),
     ] {
         let fx: FamilyFixture = serde_json::from_str(fixture).expect("parse family fixture");
         assert_eq!(fx.format, row.id);
@@ -483,13 +496,14 @@ fn streamed_deltas_rebuild_each_family_call() {
             }
             let (want_content, want_calls) =
                 parse_completion(&case.completion, row).expect("non-streaming parse");
+            let chars: Vec<char> = case.completion.chars().collect();
             for split in [1usize, 2, 3, 5, 7, 4096] {
                 let mut parser = Parser::new(row);
                 let mut index = 0usize;
                 let mut payloads = Vec::new();
-                for chunk in case.completion.as_bytes().chunks(split) {
-                    let text = std::str::from_utf8(chunk).unwrap();
-                    for event in parser.feed(text) {
+                for chunk in chars.chunks(split) {
+                    let text: String = chunk.iter().collect();
+                    for event in parser.feed(&text) {
                         payloads.extend(types::chunks_for_tool_event(
                             "id", "m", 1, &mut index, &event,
                         ));

@@ -62,3 +62,21 @@ fn an_unterminated_comment_drops_the_rest() {
     assert_eq!(without_jinja_comments("a{# b #}c").as_ref(), "ac");
     assert_eq!(without_jinja_comments("plain").as_ref(), "plain");
 }
+
+#[test]
+fn the_qwen35_xml_row_is_detected_before_the_qwen_row() {
+    assert_eq!(detected("<tool_call>\n<function="), Some("qwen3_5"));
+    assert_eq!(
+        detected("<tool_call>{\"name\": …}"),
+        Some("qwen2"),
+        "a template without `<function=` keeps the Qwen2/Qwen3 row"
+    );
+}
+
+#[test]
+fn the_qwen35_row_is_parse_only() {
+    assert!(
+        QWEN35.grammar.is_none(),
+        "an XML grammar over the tool schema is a separate increment; the row is a named 400"
+    );
+}

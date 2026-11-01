@@ -191,7 +191,7 @@ touch behavior):
 | Prompt caching / KV reuse across requests | Slots keep their KV between requests; a shared-prefix matcher is future work |
 | SSE `stream_options.include_usage` | OpenAI extension, not in MVP scope |
 | Multimodal content arrays / embeddings | Non-goals (MVP) |
-| ~~Tool-call extraction~~ | shipped ([#614](https://github.com/yusiwen/minfer/issues/614), [#699](https://github.com/yusiwen/minfer/issues/699)): a call in the model's own format (Qwen `<tool_call>`, Mistral Nemo `[TOOL_CALLS] [{…}]`, Llama 3.1 `<|python_tag|>{"name":…, "parameters":…}`) becomes `message.tool_calls` (`finish_reason: "tool_calls"`), and `tool_choice: "required"`/a forced function are enforced by a grammar over the same format row (ADR-0066) |
+| ~~Tool-call extraction~~ | shipped ([#614](https://github.com/yusiwen/minfer/issues/614), [#699](https://github.com/yusiwen/minfer/issues/699), [#708](https://github.com/yusiwen/minfer/issues/708)): a call in the model's own format (Qwen `<tool_call>`, Mistral Nemo `[TOOL_CALLS] [{…}]`, Llama 3.1 `<|python_tag|>{"name":…, "parameters":…}`, Qwen3.5's XML body parsed with serialized-JSON arguments) becomes `message.tool_calls` (`finish_reason: "tool_calls"`), and `tool_choice: "required"`/a forced function are enforced by a grammar over the same format row (ADR-0066; the Qwen3.5 XML row is parse-only, a named 400 for `tool_choice`) |
 
 > **Update (2026-09-15):** the f16 KV cache, listed as deferred in rev 5, has
 > since shipped — `MINFER_CACHE_TYPE=f16` with auto-selection for 7B-class
@@ -334,14 +334,16 @@ through the template's replay branch, key order is preserved, and a template tha
 call is a `400` (`tool calls not rendered`) rather than a `200` with the call missing.
 
 A completion's call block becomes `choices[].message.tool_calls` (`finish_reason: "tool_calls"`;
-arguments as the model wrote them; a `call_…` id synthesised), and `tool_choice: "required"` / a
-forced function are enforced by a grammar on the same format row. The rows are Qwen2/Qwen3
-(`<tool_call>{"name":…, "arguments":…}`), Mistral Nemo/Magistral
-(`[TOOL_CALLS] [{"name":…, "arguments":…}, …]`) and Llama 3.1
-(`<|python_tag|>{"name":…, "parameters":…}`, an optional `;` between calls). A template the table
-does not recognise, a recognised row without a grammar, `grammar`/`response_format` conflicts and a
-forced name outside `tools` are named 400s (#614/#699, ADR-0063/ADR-0066). Qwen3.5's XML (#708),
-Ministral 3's `[ARGS]` form (#709) and Gemma 4 (#710) are tracked follow-ups.
+the JSON rows carry the arguments as the model wrote them, Qwen3.5 serializes its XML values; a
+`call_…` id synthesised), and `tool_choice: "required"` / a forced function are enforced by a
+grammar on the same format row. The rows are Qwen2/Qwen3 (`<tool_call>{"name":…, "arguments":…}`),
+Mistral Nemo/Magistral (`[TOOL_CALLS] [{"name":…, "arguments":…}, …]`), Llama 3.1
+(`<|python_tag|>{"name":…, "parameters":…}`, an optional `;` between calls) and Qwen3.5
+(`<tool_call><function=…><parameter=…>…</parameter></function></tool_call>`, parse-only: its XML
+arguments are serialized to JSON and `tool_choice` is a named 400). A template the table does not
+recognise, a recognised row without a grammar, `grammar`/`response_format` conflicts and a forced
+name outside `tools` are named 400s (#614/#699/#708, ADR-0063/ADR-0066/ADR-0067). Ministral 3's
+`[ARGS]` form (#709) and Gemma 4 (#710) are tracked follow-ups.
 
 ### Stop Strings
 

@@ -157,6 +157,67 @@ LLAMA_CASES = [
 ]
 
 
+QWEN35_SPEC = {
+    "defaults": {"role": "assistant"},
+    "start_anchor": "<|im_start|>assistant\n",
+    "fields": {
+        "thinking": {"open": "<think>", "close": "</think>", "content": "text"},
+        "tool_calls": {
+            "open_pattern": r"\s*<tool_call>\s*<function=(?P<name>[^>\n]+)>",
+            "close_pattern": r"</function>\s*</tool_call>",
+            "repeats": True,
+            "content": "xml-inline",
+            "content_args": {
+                "tag_pattern": r"<parameter=(?P<key>[^>\n]+)>\s*(?P<value>.*?)\s*</parameter>",
+            },
+            "transform": {
+                "type": "function",
+                "function": {"name": "{name}", "arguments": "{content}"},
+            },
+        },
+        "content": {
+            "close_pattern": r"\s*(?:<\|im_end\|>|<\|endoftext\|>)",
+            "content": "text",
+        },
+    },
+}
+QWEN35_PREFIX = "<|im_start|>assistant\n"
+QWEN35_CASES = [
+    (
+        "single_call",
+        "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n"
+        "</function>\n</tool_call>",
+    ),
+    (
+        "two_calls",
+        "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=get_weather>\n<parameter=city>Lyon</parameter>\n"
+        "</function>\n</tool_call>",
+    ),
+    (
+        "content_before_the_call",
+        "Let me check.\n<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>Paris</parameter>\n</function>\n</tool_call>",
+    ),
+    (
+        "two_parameters",
+        "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n"
+        "<parameter=unit>celsius</parameter>\n</function>\n</tool_call>",
+    ),
+    (
+        "unicode_and_html_in_a_value",
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>检索 <b> & 'c'</parameter>\n</function>\n</tool_call>",
+    ),
+    (
+        "truncated_parameter",
+        "<tool_call>\n<function=get_weather>\n<parameter=city>Par",
+    ),
+    ("prose", "Hello, world!"),
+]
+
+
 def build(spec: dict, prefix: str, cases: list[tuple[str, str]]) -> list[dict]:
     from transformers.utils.chat_parsing import parse_response
 
@@ -213,6 +274,56 @@ def document(family: str, spec: dict, prefix: str, cases: list[dict], reference:
     }
 
 
+def qwen35_cases() -> list[dict]:
+    """The Qwen3.5 cases, with the truncated-parameter divergence recorded.
+
+    transformers' `xml-inline` parser returns an empty arguments object when the
+    parameter never closes; #708 requires a named refusal instead of a half call,
+    so this case records the reference's acceptance and the engine's divergence.
+    """
+    cases = build(QWEN35_SPEC, QWEN35_PREFIX, QWEN35_CASES)
+    for case in cases:
+        if case["name"] == "truncated_parameter":
+            case.pop("expected", None)
+            case["error"] = (
+                "the reference's xml-inline returns an empty object for a truncated "
+                "parameter; this engine refuses the incomplete block by name"
+            )
+            case["diverges"] = (
+                "the reference accepts `{}` for a truncated `<parameter>`; #708 "
+                "requires a named refusal instead of a half call"
+            )
+    return cases
+
+
+def qwen35_document(spec: dict, prefix: str, cases: list[dict]) -> dict:
+    """The Qwen3.5 fixture, whose reference is the released fallback."""
+    return {
+        "format": "qwen3_5",
+        "response_template": spec,
+        "prefix": prefix,
+        "tools": [GET_WEATHER],
+        "provenance": {
+            "reference": (
+                "HuggingFaceTB transformers 5.17.0 "
+                "transformers.utils.chat_parsing.parse_response with the qwen3_5 "
+                "response-template fallback shipped in transformers/cli/serving/utils.py "
+                "(_RESPONSE_TEMPLATE_FALLBACKS)"
+            ),
+            "template_source": (
+                "released fallback; llama.cpp's common/parsers/qwen3-coder.cpp is the "
+                "second oracle"
+            ),
+            "command": (
+                "uv run --with transformers==5.17.0 python "
+                "scripts/gen_tool_call_family_fixtures.py --family qwen3_5"
+            ),
+            "date": "2026-11-01",
+        },
+        "cases": cases,
+    }
+
+
 def targets() -> dict[str, tuple[pathlib.Path, dict]]:
     return {
         "mistral_nemo": (
@@ -236,6 +347,10 @@ def targets() -> dict[str, tuple[pathlib.Path, dict]]:
                 'Llama 3.1 `{"name":…, "parameters":…}` '
                 "(llama.cpp `common_chat_parse_llama_3_1`)",
             ),
+        ),
+        "qwen3_5": (
+            CHAT / "parse_qwen35.json",
+            qwen35_document(QWEN35_SPEC, QWEN35_PREFIX, qwen35_cases()),
         ),
     }
 
