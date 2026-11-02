@@ -896,6 +896,98 @@ place: **measured, and not addressable by any structure or knob either engine ex
 Every A/B below this line must be **interleaved** (back-to-back pairs, compare ratios, never absolute
 ms across runs) and must record the **load average** it ran at.
 
+### §0.10 The drafter's rule was inverted, and a perfect drafter still loses a third (2026-11-02, #651)
+
+§0.9 closed with "measured, and not addressable by any structure or knob either engine exposes
+today". That verdict was about the *kernel*. This increment is about the *round's rule*, and it
+found a defect the four kernel attempts were all circling without touching: minfer's drafter and its
+verifier were not applying the same function.
+
+**The two instruments reconciled first.** The ledger in §0.9 puts `decode tg128` (25.52 t/s) and the
+spec run's sequential baseline (19.5 t/s) in one table; my first audit read that as a 24 % baseline
+defect. Re-measured on one sitting (load average recorded per arm, 3.2-5.2 for the CLI arms), it is
+not one:
+
+| probe (14B q4_K_M, `macbookpro`) | value |
+|---|---|
+| `bench tg128` (p512, n_ctx 656) | 20.89 t/s = 47.9 ms |
+| `bench tg64` (p50, n_ctx 130), 4 runs | 21.68 / 21.25 / 21.40 / 20.93 t/s = 47.2 ms |
+| CLI `-n 192` (n_ctx 4096) | 19.3 / 19.1 t/s = 51.2 / 51.9 ms forward |
+| CLI `-n 256` | 18.9 t/s = 52.5 ms |
+| CLI `-n 64`, 5 runs | 15.7 / 16.7 / 16.8 / 18.6 / 19.2 t/s (51.5-63.0 ms forward) |
+| CLI `-n 64 --n-ctx 128` | 17.7 t/s = 56.2 ms |
+| `MINFER_TIMING` split | sample **0.4-0.5 ms/tok (0.8 %)**, forward 99.2 % |
+
+So `n_ctx` is not a confound (128 and 4096 trade places), there is no hidden host cost (the sampler is
+0.8 % of the token), and the CLI sits **8 %** under `bench` once the run is long enough — not 24 %. A
+64-token CLI run is simply noisier (its own spread is ±8 %); its steady rate is 19.2 t/s. The
+record's two rows came from different sessions on a box whose *llama* baseline also read 13 % lower
+today (22.0 t/s against the record's 25.3), i.e. ambient drift, not an engine defect.
+
+**The control that found the defect: one model as both draft and target.** The proposals are then
+the same weights on the same row, so *every* proposal should survive; any rejection is the harness
+losing a row it cannot blame on the drafter. 64 tokens, raw 21-token prompt, greedy:
+
+| acceptance, one model on both sides | `d = 1` | `d = 2` | `d = 3` |
+|---|---|---|---|
+| `--repeat-penalty 1.0` (the filter is a no-op) | 85.3 % | **93.2 %** | 71.7 % |
+| `--repeat-penalty 1.1` (default), **raw argmax** (the shipped rule) | — | **51.6 %** | — |
+| `--repeat-penalty 1.1` (default), **filtered argmax** (this change) | 70.3 % | **58.6 %** | 50.7 % |
+
+Two findings, and only the second is large.
+
+1. **The rule was inverted.** The drafter took a raw argmax while the target's greedy pick is the
+   argmax of the *filtered* row (`logit bias → penalties → DRY`, `repeat_penalty` 1.1 by default over
+   64 tokens). The code comment argued the opposite ("a penalized proposal would only fail to
+   match"). Fixed by `spec::draft_proposal` + `sampler::apply_deterministic_filters` — one prefix,
+   two callers, the lazy window extended per proposal — worth **+7 points** at `d = 2`.
+2. **A perfect drafter still loses 7-29 %** (the `1.0` row is not 100 %). With identical weights on
+   both sides, the proposals disagree with the verify rows because the verify's per-row logits are
+   *not bitwise equal* to decode's: they are the tolerance class ADR-0010 already names (~0.01-0.05
+   logits, the batched prefill attention against the decode one). `repeat_penalty` then **amplifies**
+   it — dividing a positive logit by 1.1 is a 10 % relative demotion, which reorders a top-k whose
+   neighbours sit tenths apart, turning a 0.05-logit difference into 30-49 points.
+
+**What the fix buys on the real pair, stated as measured** (14B q4_K_M + 0.5B q4_K_M, same prompt):
+
+| arm | before | after |
+|---|---|---|
+| templated `n = 64` | 76.0 % / 2.56 tok/round / 21.0 t/s | 76.0 % / 2.56 / 21.1 |
+| templated `n = 192` | 58.5 % / 2.18 / 18.4 | 58.5 % / 2.18 / 17.8 |
+| raw prompt `n = 64` | 48.4 % / 2.00 / 16.9 | 48.4 % / 2.00 / 16.9 |
+| raw prompt `n = 192` | 39.3 % / 1.79 / 15.2 | **41.8 %** / 1.85 / 12.2 |
+
+i.e. **nothing at 64 tokens** (a production pair's proposals rarely cross the penalty boundary the
+way the self-control's do) and +2.5 points on the long raw arm. The fix's value here is that the rule
+is now right, not that the number moved. Identity: `scripts/identity_battery.sh` (7B q4_K_M + 0.5B,
+adaptive, `n = 200`) stays **4/4 identical**.
+
+**The yield arithmetic, which is now the whole ticket.** A `d = 2` round costs **118-122 ms** (phase
+split: verify 105.5-108.0 = 89-90 %, draft 9.0-10.3, full-accept repair 2.1-3.2, accept 1.0-1.35) and
+emits 2.18-2.56 tokens, against a **51.6 ms** sequential step. Break-even is therefore
+`118.1 / 51.6 = ` **2.29 tokens per round** — minfer clears it only while acceptance holds above ~70 %
+(2.56 at 64 tokens, 2.18 over 192). llama.cpp on the same box and models: 28.05 / 28.55 t/s against a
+22.0 t/s sequential rate, at 76.9 % → 73.9 % acceptance and 2.54 → 2.48 tokens/round, i.e. its
+break-even is `≈87 / 45.3 = ` **1.92** and it clears it while staying flat.
+
+**What is left, priced.** Not the kernel (four structures and ten attempts are measured out, §0.5-§0.9),
+and not the proposal rule (this increment). Two items, in order:
+
+1. **Make the verify's per-row logits bitwise-equal to decode's** — the `85-93 %` ceiling above. It is
+   the batched prefill attention against the decode one, so it is a kernel increment with a **name and
+   a number** this time, and it is the only thing that raises the ceiling under a penalty.
+2. **Decide what `repeat_penalty`'s default is worth.** At 1.1 it costs 25-35 points of spec
+   acceptance on a perfect drafter (93.2 % → 58.6 %); at 1.0 spec acceptance is near its ceiling but
+   the generated text repeats more (measured earlier: the 1.0 arm's *pair* acceptance fell, 76.0 % →
+   62.5 %, because the text degenerates). That is a product trade-off, not a round bug, and it should
+   be decided on text quality, not on this number.
+
+**Methodology notes.** Box `macbookpro` (macOS 27.0.1, Apple M4 Pro, 48 GiB), an active desktop:
+load averages 2.7-11.7 across these arms (a CleanMyMac scan pushed one window to 19 and those
+readings were discarded), `WindowServer` at 47-74 %. Every arm was run in one sitting, interleaved,
+and compared as a ratio; the absolute ms are **not** comparable to §0.6-§0.9 (llama's own sequential
+rate reads 13 % lower today).
+
 ### ✅ Done
 
 <!-- doc-hashes: history -->

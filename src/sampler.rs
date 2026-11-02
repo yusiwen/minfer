@@ -1033,6 +1033,44 @@ pub fn sample_mirostat_v1<R: Rng>(
     }
 }
 
+/// The **deterministic prefix** of the sampling pipeline: everything before the
+/// greedy shortcut that only *shifts* logits and consumes no RNG — logit bias,
+/// the repetition window, then DRY.
+///
+/// Single authority for two callers: [`sample_with_config_grammar`] (where the
+/// stochastic filters continue after it) and the speculative drafter, which
+/// must predict what the greedy shortcut will pick at a given row **without
+/// sampling it** (`spec::draft_proposal`). A drafter that skips this prefix is
+/// not "neutral": the target's greedy pick is the argmax of the *filtered* row,
+/// so every candidate the window demotes is rejected even when the drafter's
+/// model is right ([#651]).
+///
+/// `prev_tokens` is the caller's window, already trimmed by the caller; DRY
+/// trims to `dry_penalty_last_n` on its own.
+///
+/// [#651]: https://github.com/yusiwen/minfer/issues/651
+pub fn apply_deterministic_filters(logits: &mut [f32], cfg: &SamplerConfig, prev_tokens: &[u32]) {
+    apply_logit_bias(logits, &cfg.logit_bias);
+    apply_penalties(
+        logits,
+        prev_tokens,
+        cfg.repeat_penalty,
+        cfg.frequency_penalty,
+        cfg.presence_penalty,
+    );
+    if cfg.dry_multiplier > 0.0 {
+        apply_dry(
+            logits,
+            prev_tokens,
+            cfg.dry_multiplier,
+            cfg.dry_base,
+            cfg.dry_allowed_length,
+            cfg.dry_penalty_last_n,
+            &cfg.dry_breakers,
+        );
+    }
+}
+
 /// The complete pipeline, grammar-aware (F2, #47):
 ///
 /// ```text
@@ -1072,25 +1110,7 @@ pub fn sample_with_config_grammar<R: Rng>(
     grammar: &mut Option<GrammarState>,
     rng: &mut R,
 ) -> Result<SampledToken, SampleError> {
-    apply_logit_bias(logits, &cfg.logit_bias);
-    apply_penalties(
-        logits,
-        prev_tokens,
-        cfg.repeat_penalty,
-        cfg.frequency_penalty,
-        cfg.presence_penalty,
-    );
-    if cfg.dry_multiplier > 0.0 {
-        apply_dry(
-            logits,
-            prev_tokens,
-            cfg.dry_multiplier,
-            cfg.dry_base,
-            cfg.dry_allowed_length,
-            cfg.dry_penalty_last_n,
-            &cfg.dry_breakers,
-        );
-    }
+    apply_deterministic_filters(logits, cfg, prev_tokens);
     let constrained = match (cfg.grammar.as_ref(), grammar.as_mut()) {
         (Some(g), Some(st)) => {
             if logits.len() != g.n_vocab() {

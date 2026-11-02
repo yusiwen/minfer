@@ -460,21 +460,38 @@ impl SpecEngine {
         }
 
         // Draft phase: d forwards → d proposals for positions pos+1..pos+d.
-        // Raw draft argmax (no penalties — penalties are target-sampler
-        // semantics; a penalized proposal would only fail to match).
+        //
+        // Each proposal is selected the way the target will select at that same
+        // row: the argmax of the draft's logits **after the deterministic
+        // filter prefix** (`sampler::apply_deterministic_filters` — logit bias →
+        // penalties → DRY), over the window the target will see there, i.e.
+        // `prev_tokens` extended with every proposal already committed in this
+        // round (the same lazy window `accept_loop` builds).
+        //
+        // A raw argmax here is not a neutral shortcut: the target's greedy pick is
+        // the argmax of the *filtered* row, so any candidate the repetition window
+        // demotes is rejected even when the drafter's model is right. Measured on
+        // the same-model control (one model as both draft and target, 14B q4_K_M,
+        // `d = 2`): 51.6 % acceptance with the raw argmax against 58.6 % filtered
+        // at the default `repeat_penalty` 1.1 (#651). The rest of that control's
+        // loss is not this rule — with the penalty off it reaches only 93.2 %,
+        // because the verify's rows are tolerance-class, not bitwise, against
+        // decode; ADR-0072 prices both halves.
         let draft_t0 = std::time::Instant::now();
         let mut tok = next_token;
         let mut proposals = Vec::with_capacity(d);
+        let mut window = prev_tokens.clone();
         for k in 0..d {
-            let logits = self.draft.forward_graph_cached(
+            let mut logits = self.draft.forward_graph_cached(
                 &[tok],
                 &[pos + k],
                 1,
                 n_ctx,
                 &mut self.draft_cache,
             );
-            tok = argmax(&logits);
+            tok = draft_proposal(&mut logits, &s.cfg, &window);
             proposals.push(tok);
+            push_capped(&mut window, tok);
         }
         let draft_ms = draft_t0.elapsed().as_secs_f64() * 1e3;
         if let Some(ad) = self.adaptive.as_mut() {
@@ -555,6 +572,19 @@ impl SpecEngine {
         }
         emitted
     }
+}
+
+/// The draft's proposal for one row: the token the **target** would pick from
+/// the same logits — the argmax **after** the deterministic filter prefix
+/// (logit bias → penalties → DRY, `sampler::apply_deterministic_filters`).
+///
+/// Extracted as a pure function so the rule is pinned against
+/// `sampler::sample_with_config` with synthetic logits and no device (#651):
+/// the proposal must equal the target's own sample for the same row, and a raw
+/// argmax must not (that is the regression the gate guards).
+pub fn draft_proposal(logits: &mut [f32], cfg: &sampler::SamplerConfig, window: &[u32]) -> u32 {
+    sampler::apply_deterministic_filters(logits, cfg, window);
+    argmax(logits)
 }
 
 /// Lazy accept loop over the verify rows, extracted so the accept rule is

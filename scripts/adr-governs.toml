@@ -108,6 +108,16 @@ what = "speculative decoding refuses the features its identity contract cannot c
 path = "src/spec.rs"
 
 [[governs]]
+adr = "0072"
+what = "a draft proposal is the target's own filtered pick — the argmax after the deterministic prefix, never the raw argmax"
+symbol = "draft_proposal"
+
+[[governs]]
+adr = "0072"
+what = "the deterministic prefix is one function shared by the sampler and the drafter, so a stage added to it reaches both"
+symbol = "apply_deterministic_filters"
+
+[[governs]]
 adr = "0018"
 what = "the grammar mask is one stage inside the single sampler pipeline"
 path = "src/sampler.rs"
