@@ -592,23 +592,49 @@ impl Parser {
     }
 }
 
-/// The GBNF for `tool_choice: "required"` (one of `names`) or a forced function.
+/// The GBNF for `tool_choice: "required"` (every offered tool) or a forced function.
 ///
-/// It forces the model's own tool-call syntax from the format row (ADR-0066): the
-/// row's literals wrap a `name` fixed or enumerated at `ToolFormat::name_key`
-/// and a JSON object for the arguments (reusing the schema compiler's generic
-/// `j-object` rules). The result is the block this module parses, so extraction
-/// and the constraint agree by construction.
+/// It forces the model's own tool-call syntax from the format row (ADR-0066) and
+/// the selected tool's `parameters` schema (ADR-0070): each selected tool is one
+/// root alternative — the row's open/between/close literals around a literal name
+/// and a schema-compiled `args-i` rule. The result is the block this module
+/// parses, so extraction and the constraint agree by construction.
 ///
-/// `None` means the template's format is recognised but has no grammar shape yet;
-/// the caller answers a named `400` rather than accepting an unconstrained
-/// generation.
+/// `Ok(None)` means the template's format is recognised but has no grammar shape
+/// yet; the caller answers a named `400`. `Err` is a schema that cannot be
+/// compiled (also a named `400`), never a fallback to an unconstrained object.
 pub fn forced_call_grammar(
     format: &format::ToolFormat,
-    names: &[&str],
+    tools: &[crate::template::ToolJson],
     forced: Option<&str>,
-) -> Option<String> {
-    let shape = format.grammar?;
+) -> Result<Option<String>, String> {
+    let Some(shape) = format.grammar else {
+        return Ok(None);
+    };
+    let mut selected: Vec<(&str, serde_json::Value)> = Vec::new();
+    for tool in tools {
+        let Some(function) = tool.get("function") else {
+            continue;
+        };
+        let Some(name) = function.get("name").and_then(|name| name.as_str()) else {
+            continue;
+        };
+        if forced.is_some_and(|forced| forced != name) {
+            continue;
+        }
+        let parameters = match function.get("parameters") {
+            Some(parameters) => serde_json::to_value(parameters)
+                .map_err(|e| format!("tool_choice: `{name}`'s parameters do not serialize: {e}"))?,
+            // A tool without a schema still gets an object, not an unconstrained
+            // JSON value: the arguments are an object by OpenAI's shape.
+            None => serde_json::json!({"type": "object"}),
+        };
+        selected.push((name, parameters));
+    }
+    if selected.is_empty() {
+        return Err("tool_choice found no offered tool to constrain".to_string());
+    }
+
     let mut grammar = String::new();
     for (name, rhs) in crate::grammar::GENERIC_RULES {
         grammar.push_str(name);
@@ -616,27 +642,37 @@ pub fn forced_call_grammar(
         grammar.push_str(rhs);
         grammar.push('\n');
     }
-    let name_rule = match forced {
-        Some(name) => gbnf_literal(name),
-        None => names
-            .iter()
-            .map(|name| gbnf_literal(name))
-            .collect::<Vec<_>>()
-            .join(" | "),
-    };
-    grammar.push_str("root ::= ");
-    grammar.push_str(&gbnf_literal(shape.open));
-    grammar.push(' ');
-    grammar.push_str(&name_rule);
-    grammar.push(' ');
-    grammar.push_str(&gbnf_literal(shape.between));
-    grammar.push_str("j-object");
-    if !shape.close.is_empty() {
-        grammar.push(' ');
-        grammar.push_str(&gbnf_literal(shape.close));
+    let mut alternatives = Vec::new();
+    for (index, (name, schema)) in selected.iter().enumerate() {
+        let args_rule = format!("args-{index}");
+        let (rules, body) = crate::grammar::compile_schema_rules(schema, &args_rule)?;
+        for (rule, rhs) in rules {
+            grammar.push_str(&rule);
+            grammar.push_str(" ::= ");
+            grammar.push_str(&rhs);
+            grammar.push('\n');
+        }
+        grammar.push_str(&args_rule);
+        grammar.push_str(" ::= ");
+        grammar.push_str(&body);
+        grammar.push('\n');
+        let mut alternative = format!(
+            "{} {} {} {}",
+            gbnf_literal(shape.open),
+            gbnf_literal(name),
+            gbnf_literal(shape.between),
+            args_rule
+        );
+        if !shape.close.is_empty() {
+            alternative.push(' ');
+            alternative.push_str(&gbnf_literal(shape.close));
+        }
+        alternatives.push(alternative);
     }
+    grammar.push_str("root ::= ");
+    grammar.push_str(&alternatives.join("\n    | "));
     grammar.push('\n');
-    Some(grammar)
+    Ok(Some(grammar))
 }
 
 /// One string as a GBNF literal: quotes, backslashes and control characters are

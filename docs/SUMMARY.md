@@ -88,6 +88,7 @@
     - [0067. Qwen3.5's XML call is parsed, and its arguments are serialized JSON](./adr/0067-qwen3-5-xml-call-is-parsed-and-its-arguments-are-serialized-json.md)
     - [0068. Ministral 3 puts the name in the anchor](./adr/0068-ministral-3-puts-the-name-in-the-anchor.md)
     - [0069. Gemma 4's call is a lenient JSON body](./adr/0069-gemma-4-s-call-is-a-lenient-json-body.md)
+    - [0070. tool_choice constrains the arguments to the offered tool's schema](./adr/0070-tool-choice-constrains-the-arguments-to-the-offered-tool-schema.md)
 
 # Model Support
 

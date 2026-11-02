@@ -189,6 +189,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0067](./0067-qwen3-5-xml-call-is-parsed-and-its-arguments-are-serialized-json.md) | 2026-11-01 | Qwen3.5's XML call is parsed, and its arguments are serialized JSON | Accepted (amends ADR-0066) |
 | [0068](./0068-ministral-3-puts-the-name-in-the-anchor.md) | 2026-11-01 | Ministral 3 puts the name in the anchor, and the grammar ends at the arguments | Accepted (amends ADR-0066) |
 | [0069](./0069-gemma-4-s-call-is-a-lenient-json-body.md) | 2026-11-01 | Gemma 4's call is a lenient JSON body, and its arguments are serialized | Accepted (amends ADR-0066) |
+| [0070](./0070-tool-choice-constrains-the-arguments-to-the-offered-tool-schema.md) | 2026-11-01 | `tool_choice` constrains the arguments to the offered tool's schema | Accepted (amends ADR-0066) |
 
 ## The template
 

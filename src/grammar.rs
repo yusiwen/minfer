@@ -1876,6 +1876,36 @@ pub fn compile_schema_to_gbnf(schema: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// Compile one schema into its own rules plus the root rule body.
+///
+/// Every generated rule name starts with `prefix`, so several schemas can share
+/// one GBNF (the `tool_choice` arguments, one per offered tool). The generic
+/// `j-*` prelude is **not** included: the caller appends one copy of
+/// [`GENERIC_RULES`], which the bodies reference.
+pub(crate) fn compile_schema_rules(
+    schema: &Value,
+    prefix: &str,
+) -> Result<(Vec<(String, String)>, String), String> {
+    let mut defs = HashMap::new();
+    if let Some(obj) = schema.as_object() {
+        for key in ["$defs", "definitions"] {
+            if let Some(Value::Object(map)) = obj.get(key) {
+                for (name, sub) in map {
+                    defs.insert(name.clone(), sub.clone());
+                }
+            }
+        }
+    }
+    let mut c = JsonCompiler {
+        rules: Vec::new(),
+        defs,
+        def_rules: HashMap::new(),
+        counter: 0,
+    };
+    let body = c.compile(schema, prefix)?;
+    Ok((c.rules, body))
+}
+
 impl JsonCompiler {
     fn fresh(&mut self, hint: &str) -> String {
         let clean: String = hint

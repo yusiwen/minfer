@@ -361,3 +361,8 @@ symbol = "MISTRAL3"
 adr = "0069"
 what = "Gemma 4's lenient-JSON block is a parse-only row: the parser reads `call:name{…}` with unquoted keys and `<|\"|>` strings, serializes the arguments to JSON text, and `tool_choice` stays a named 400"
 symbol = "GEMMA4"
+
+[[governs]]
+adr = "0070"
+what = "`tool_choice`'s argument rule is the selected tool's `parameters` schema, compiled per offered tool into an `args-i` rule, and a schema that cannot be compiled is a named 400"
+symbol = "compile_schema_rules"

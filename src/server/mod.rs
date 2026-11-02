@@ -480,21 +480,20 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
                     .to_string(),
             ));
         };
-        let names: Vec<&str> = tools
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|tool| {
-                tool.get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(crate::template::ToolJson::as_str)
-            })
-            .collect();
-        let Some(grammar) = toolcall::forced_call_grammar(format, &names, forced) else {
-            return error_response(&ApiError::invalid_request(format!(
-                "the model's chat template emits the `{}` tool-call format, which this server \
-                 can parse but cannot constrain with a grammar yet",
-                format.id
-            )));
+        let grammar = match toolcall::forced_call_grammar(format, tools.unwrap_or(&[]), forced) {
+            Ok(Some(grammar)) => grammar,
+            Ok(None) => {
+                return error_response(&ApiError::invalid_request(format!(
+                    "the model's chat template emits the `{}` tool-call format, which this server \
+                     can parse but cannot constrain with a grammar yet",
+                    format.id
+                )))
+            }
+            Err(detail) => {
+                return error_response(&ApiError::invalid_request(format!(
+                    "tool_choice cannot constrain the offered tool's arguments: {detail}"
+                )))
+            }
         };
         params.grammar_source = Some(crate::grammar::GrammarSource::Gbnf(grammar));
     }
