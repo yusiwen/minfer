@@ -930,11 +930,11 @@ fn serve_enforces_tool_choice_on_the_mistral_and_llama_rows() {
     }
 }
 
-/// #708: the Qwen3.5 XML block is detected, parsed from a forced completion,
-/// and `tool_choice: "required"` on the same template is a named 400 (no XML
-/// grammar yet).
+/// #708/#715: the Qwen3.5 XML block is detected and parsed from a forced
+/// completion, and `tool_choice: "required"`/forced returns the XML call the
+/// grammar produced.
 #[test]
-fn serve_reads_the_qwen35_xml_call_and_refuses_tool_choice() {
+fn serve_reads_the_qwen35_xml_call_and_enforces_tool_choice() {
     let model = test_model();
     let template = template_file(
         "qwen35-xml.jinja",
@@ -955,13 +955,13 @@ fn serve_reads_the_qwen35_xml_call_and_refuses_tool_choice() {
     let tool = serde_json::json!({
         "type": "function",
         "function": {"name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
+            "parameters": {"type": "object", "properties": {"city": {"type": "string", "enum": ["Paris"]}},
                 "required": ["city"], "additionalProperties": false}},
     });
     let block = r#"root ::= "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n</tool_call>""#;
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
-        "tools": [tool],
+        "tools": [tool.clone()],
         "grammar": block,
         "max_tokens": 512,
         "seed": 42,
@@ -981,10 +981,50 @@ fn serve_reads_the_qwen35_xml_call_and_refuses_tool_choice() {
         serde_json::from_str(arguments).expect("the XML arguments serialize to JSON");
     assert_eq!(arguments, serde_json::json!({"city": "Paris"}));
 
-    // The same template cannot be constrained: the row is parse-only.
+    // #715: the row is no longer parse-only; the XML grammar constrains the name
+    // and the schema's parameters.
+    for choice in [
+        serde_json::json!("required"),
+        serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+    ] {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool.clone()],
+            "tool_choice": choice,
+            "max_tokens": 256,
+            "seed": 0,
+        })
+        .to_string();
+        let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
+        assert_eq!(status, 200, "choice {choice}: body:\n{response}");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("completion json");
+        let choice_out = &parsed["choices"][0];
+        assert_eq!(
+            choice_out["finish_reason"], "tool_calls",
+            "body:\n{response}"
+        );
+        let call = &choice_out["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "get_weather", "body:\n{response}");
+        let arguments = call["function"]["arguments"]
+            .as_str()
+            .expect("arguments are a JSON string");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(arguments).expect("arguments JSON"),
+            serde_json::json!({"city": "Paris"}),
+            "body:\n{response}"
+        );
+    }
+
+    // A schema construct the XML parameter grammar cannot express is a named 400,
+    // not an unconstrained call.
+    let nested = serde_json::json!({
+        "type": "function",
+        "function": {"name": "nested",
+            "parameters": {"type": "object", "properties": {"value": {"type": "object"}}}},
+    });
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        "tools": [nested],
         "tool_choice": "required",
         "max_tokens": 8,
     })
@@ -992,8 +1032,8 @@ fn serve_reads_the_qwen35_xml_call_and_refuses_tool_choice() {
     let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
     assert_eq!(status, 400, "body:\n{response}");
     assert!(
-        response.contains("can parse but cannot constrain"),
-        "the refusal must name the parse-only format; body:\n{response}"
+        response.contains("cannot constrain") && response.contains("object"),
+        "the refusal must name the XML schema construct; body:\n{response}"
     );
 }
 

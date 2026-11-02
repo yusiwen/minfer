@@ -366,3 +366,8 @@ symbol = "GEMMA4"
 adr = "0070"
 what = "`tool_choice`'s argument rule is the selected tool's `parameters` schema, compiled per offered tool into an `args-i` rule, and a schema that cannot be compiled is a named 400"
 symbol = "compile_schema_rules"
+
+[[governs]]
+adr = "0071"
+what = "Qwen3.5's `tool_choice` is its own XML grammar: the wrapper, a fixed/enumerated name, and flat scalar `<parameter=KEY>VALUE</parameter>` entries from the tool schema; an unsupported schema construct is a named 400"
+symbol = "xml_call_alternative"

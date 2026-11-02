@@ -75,19 +75,29 @@ pub struct ToolFormat {
     pub grammar: Option<GrammarShape>,
 }
 
-/// The literal pieces a `tool_choice` GBNF wraps around the name rule and the
-/// schema compiler's `j-object`.
-///
-/// `open` ends right before the name, `between` sits between the name and the
-/// arguments, and `close` follows the arguments. An **empty** `close` means the
-/// arguments end the block (Ministral 3's `[ARGS]` form). The Qwen row's
-/// literals include the newline and the key outside the object, because that is
-/// the block the parser extracts; the other rows do the same for their wrappers.
+/// How `tool_choice` wraps the name and the arguments for a row.
 #[derive(Debug, Clone, Copy)]
-pub struct GrammarShape {
-    pub open: &'static str,
-    pub between: &'static str,
-    pub close: &'static str,
+pub enum GrammarShape {
+    /// Literal pieces around a JSON arguments rule: `open` ends right before the
+    /// name, `between` sits between the name and the arguments, and `close`
+    /// follows them. An **empty** `close` means the arguments end the block
+    /// (Ministral 3's `[ARGS]` form).
+    Json {
+        open: &'static str,
+        between: &'static str,
+        close: &'static str,
+    },
+    /// Qwen3.5's XML wrapper: the block open is [`ToolFormat::open`], then
+    /// `<function=NAME>` and repeated `<parameter=KEY>VALUE</parameter>` entries.
+    /// The value rule is not the JSON schema compiler's; an XML grammar over the
+    /// tool schema is its own builder (ADR-0071).
+    Xml {
+        function_open: &'static str,
+        function_close: &'static str,
+        block_close: &'static str,
+        parameter_open: &'static str,
+        parameter_close: &'static str,
+    },
 }
 
 /// Qwen2/Qwen3 (and Hermes): the format #614 shipped, unchanged.
@@ -99,7 +109,7 @@ pub static QWEN: ToolFormat = ToolFormat {
     shape: BlockShape::ObjectThenClose("</tool_call>"),
     name_key: "name",
     args_key: "arguments",
-    grammar: Some(GrammarShape {
+    grammar: Some(GrammarShape::Json {
         open: "<tool_call>\n{\"name\": \"",
         between: "\", \"arguments\": ",
         close: "}\n</tool_call>",
@@ -118,7 +128,7 @@ pub static MISTRAL_NEMO: ToolFormat = ToolFormat {
     shape: BlockShape::ArrayAtEos,
     name_key: "name",
     args_key: "arguments",
-    grammar: Some(GrammarShape {
+    grammar: Some(GrammarShape::Json {
         open: "[TOOL_CALLS] [{\"name\": \"",
         between: "\", \"arguments\": ",
         close: "}]",
@@ -143,7 +153,7 @@ pub static MISTRAL3: ToolFormat = ToolFormat {
     // the uniform row description.
     name_key: "name",
     args_key: "arguments",
-    grammar: Some(GrammarShape {
+    grammar: Some(GrammarShape::Json {
         open: "[TOOL_CALLS]",
         between: "[ARGS]",
         close: "",
@@ -164,7 +174,7 @@ pub static LLAMA31: ToolFormat = ToolFormat {
     shape: BlockShape::ObjectUntilNextOpen { separator: ";" },
     name_key: "name",
     args_key: "parameters",
-    grammar: Some(GrammarShape {
+    grammar: Some(GrammarShape::Json {
         open: "<|python_tag|>{\"name\": \"",
         between: "\", \"parameters\": ",
         close: "}",
@@ -175,9 +185,9 @@ pub static LLAMA31: ToolFormat = ToolFormat {
 ///
 /// The body is `<function=NAME>` followed by `<parameter=KEY>VALUE</parameter>`
 /// entries; the values are text, and the parser serializes the collected object
-/// to JSON text for OpenAI's `arguments` string. The row is parse-only:
-/// `tool_choice` sees `grammar: None` and answers a named 400, because an XML
-/// grammar over the tool's JSON schema is a second grammar compiler.
+/// to JSON text for OpenAI's `arguments` string. `tool_choice` has an XML grammar
+/// (ADR-0071) over the tool's flat scalar schema: the parser's values are strings,
+/// so the grammar constrains the text and the keys, not the extracted JSON type.
 ///
 /// transformers 5.17.0's released `qwen3_5` fallback and llama.cpp's
 /// Qwen3-Coder/3.5 parser both wrap the markup this way.
@@ -194,7 +204,13 @@ pub static QWEN35: ToolFormat = ToolFormat {
     // is one uniform description, and a future JSON-shaped sibling may share it.
     name_key: "name",
     args_key: "arguments",
-    grammar: None,
+    grammar: Some(GrammarShape::Xml {
+        function_open: "<function=",
+        function_close: "</function>",
+        block_close: "</tool_call>",
+        parameter_open: "<parameter=",
+        parameter_close: "</parameter>",
+    }),
 };
 
 /// Gemma 4: `<|tool_call>call:NAME{…}<tool_call|>` (#710).
