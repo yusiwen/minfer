@@ -646,6 +646,26 @@ pub fn forced_call_grammar(
                 alternatives.push(xml_call_alternative(shape, format.open, name, schema)?);
             }
         }
+        format::GrammarShape::Gemma { .. } => {
+            push_gemma_rules(&mut grammar);
+            for (index, (name, schema)) in selected.iter().enumerate() {
+                let (rules, args) = gemma_schema_rules(schema, &format!("gemma-{index}"))?;
+                push_rules(&mut grammar, &rules);
+                let format::GrammarShape::Gemma { name_prefix, close } = shape else {
+                    unreachable!("the Gemma arm matched the Gemma shape")
+                };
+                let mut alternative = format!(
+                    "{} {} {} {}",
+                    gbnf_literal(format.open),
+                    gbnf_literal(name_prefix),
+                    gbnf_literal(name),
+                    args
+                );
+                alternative.push(' ');
+                alternative.push_str(&gbnf_literal(close));
+                alternatives.push(alternative);
+            }
+        }
     }
     grammar.push_str("root ::= ");
     grammar.push_str(&alternatives.join("\n    | "));
@@ -940,6 +960,410 @@ fn xml_scalar_text(value: &serde_json::Value) -> Result<String, String> {
         }
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => Err(
             "json-schema: an object/array value cannot be represented in the XML parameter text"
+                .to_string(),
+        ),
+    }
+}
+
+/// The Gemma dialect's global rules: `<|"|>` strings and the bare-key/object
+/// forms the parser's `GemmaJson` reads.
+fn push_gemma_rules(grammar: &mut String) {
+    let delim = gbnf_literal("<|\"|>");
+    push_rule(grammar, "g-string", &format!("{delim} [^<]* {delim}"));
+    push_rule(grammar, "g-key", "[A-Za-z0-9_]+ | g-string");
+    push_rule(
+        grammar,
+        "g-object",
+        "\"{\" j-ws \"}\" | \"{\" j-ws g-key j-ws \":\" j-ws g-value \
+         (j-ws \",\" j-ws g-key j-ws \":\" j-ws g-value)* j-ws \"}\"",
+    );
+    push_rule(
+        grammar,
+        "g-array",
+        "\"[\" j-ws \"]\" | \"[\" j-ws g-value (j-ws \",\" j-ws g-value)* j-ws \"]\"",
+    );
+    push_rule(
+        grammar,
+        "g-value",
+        "g-object | g-array | g-string | j-number | \"true\" | \"false\" | \"null\"",
+    );
+}
+
+/// The schema keywords the Gemma dialect understands; annotations are ignored,
+/// and every other keyword is a named refusal.
+const GEMMA_KEYWORDS: &[&str] = &[
+    "type",
+    "enum",
+    "const",
+    "anyOf",
+    "oneOf",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "description",
+    "title",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "$schema",
+];
+
+fn is_gemma_annotation(key: &str) -> bool {
+    matches!(
+        key,
+        "description"
+            | "title"
+            | "default"
+            | "examples"
+            | "deprecated"
+            | "readOnly"
+            | "writeOnly"
+            | "$schema"
+    )
+}
+
+struct GemmaCompiler {
+    rules: Vec<(String, String)>,
+    counter: usize,
+    prefix: String,
+}
+
+impl GemmaCompiler {
+    fn fresh(&mut self, hint: &str) -> String {
+        self.counter += 1;
+        let clean: String = hint
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("{}-{clean}-{}", self.prefix, self.counter)
+    }
+
+    fn rule(&mut self, hint: &str, body: String) -> String {
+        let name = self.fresh(hint);
+        self.rules.push((name.clone(), body));
+        name
+    }
+
+    /// The tool's `parameters` must be an object schema; the body is the object.
+    fn root(&mut self, schema: &serde_json::Value) -> Result<String, String> {
+        match schema {
+            serde_json::Value::Bool(true) => Ok("g-object".to_string()),
+            serde_json::Value::Bool(false) => {
+                Err("json-schema: `false` admits no value and cannot be compiled".to_string())
+            }
+            serde_json::Value::Object(object) => {
+                for key in object.keys() {
+                    if !GEMMA_KEYWORDS.contains(&key.as_str()) {
+                        return Err(format!(
+                            "json-schema: `{key}` cannot be expressed in the Gemma grammar"
+                        ));
+                    }
+                }
+                if ["anyOf", "oneOf", "enum", "const", "items"]
+                    .iter()
+                    .any(|key| object.contains_key(*key))
+                {
+                    return Err(
+                        "json-schema: the tool parameters must be an object schema".to_string()
+                    );
+                }
+                match object.get("type") {
+                    None => {
+                        if ["properties", "required", "additionalProperties"]
+                            .iter()
+                            .any(|key| object.contains_key(*key))
+                        {
+                            self.value(schema, "args")
+                        } else {
+                            Ok("g-object".to_string())
+                        }
+                    }
+                    Some(serde_json::Value::String(ty)) if ty == "object" => {
+                        self.value(schema, "args")
+                    }
+                    Some(serde_json::Value::String(ty)) => Err(format!(
+                        "json-schema: the tool parameters must be an object schema, got `{ty}`"
+                    )),
+                    Some(_) => Err("json-schema: `type` must be a string".to_string()),
+                }
+            }
+            other => Err(format!(
+                "json-schema: a schema must be an object or a boolean, got {}",
+                crate::grammar::json_type_name(other)
+            )),
+        }
+    }
+
+    fn value(&mut self, schema: &serde_json::Value, hint: &str) -> Result<String, String> {
+        let object = match schema {
+            serde_json::Value::Bool(true) => return Ok("g-value".to_string()),
+            serde_json::Value::Bool(false) => {
+                return Err(
+                    "json-schema: `false` admits no value and cannot be compiled".to_string(),
+                )
+            }
+            serde_json::Value::Object(object) => object,
+            other => {
+                return Err(format!(
+                    "json-schema: a schema must be an object or a boolean, got {}",
+                    crate::grammar::json_type_name(other)
+                ))
+            }
+        };
+        for key in object.keys() {
+            if !GEMMA_KEYWORDS.contains(&key.as_str()) {
+                return Err(format!(
+                    "json-schema: `{key}` cannot be expressed in the Gemma grammar"
+                ));
+            }
+        }
+        if object.contains_key("enum") || object.contains_key("const") {
+            if object.contains_key("enum") && object.contains_key("const") {
+                return Err("json-schema: `enum` and `const` cannot be combined".to_string());
+            }
+            if object.keys().any(|key| {
+                !is_gemma_annotation(key.as_str())
+                    && key.as_str() != "type"
+                    && key.as_str() != "enum"
+                    && key.as_str() != "const"
+            }) {
+                return Err(
+                    "json-schema: `enum`/`const` combined with other constraints cannot be \
+                     expressed"
+                        .to_string(),
+                );
+            }
+            if let Some(values) = object.get("enum") {
+                let values = values
+                    .as_array()
+                    .ok_or_else(|| "json-schema: `enum` must be an array of values".to_string())?;
+                if values.is_empty() {
+                    return Err("json-schema: `enum` must contain at least one value".to_string());
+                }
+                let mut alternatives = Vec::new();
+                for value in values {
+                    alternatives.push(gemma_literal(value)?);
+                }
+                return Ok(alternatives.join(" | "));
+            }
+            return gemma_literal(object.get("const").expect("the const arm"));
+        }
+        if object.contains_key("anyOf") || object.contains_key("oneOf") {
+            if object.contains_key("anyOf") && object.contains_key("oneOf") {
+                return Err("json-schema: `anyOf` and `oneOf` cannot be combined".to_string());
+            }
+            let key = if object.contains_key("anyOf") {
+                "anyOf"
+            } else {
+                "oneOf"
+            };
+            if object
+                .keys()
+                .any(|other| !is_gemma_annotation(other.as_str()) && other.as_str() != key)
+            {
+                return Err(
+                    "json-schema: a union combined with other constraints cannot be expressed"
+                        .to_string(),
+                );
+            }
+            let branches = object
+                .get(key)
+                .and_then(|branches| branches.as_array())
+                .ok_or_else(|| "json-schema: `anyOf`/`oneOf` must be an array".to_string())?;
+            if branches.is_empty() {
+                return Err("json-schema: `anyOf`/`oneOf` must not be empty".to_string());
+            }
+            let mut alternatives = Vec::new();
+            for (index, branch) in branches.iter().enumerate() {
+                alternatives.push(self.value(branch, &format!("{hint}-branch-{index}"))?);
+            }
+            return Ok(alternatives.join(" | "));
+        }
+        let ty = match object.get("type") {
+            None => None,
+            Some(serde_json::Value::String(ty)) => Some(ty.as_str()),
+            Some(_) => return Err("json-schema: `type` must be a string".to_string()),
+        };
+        let has_object = ["properties", "required", "additionalProperties"]
+            .iter()
+            .any(|key| object.contains_key(*key));
+        let has_array = object.contains_key("items");
+        if let Some(ty) = ty {
+            if ty != "object" && has_object {
+                return Err(format!(
+                    "json-schema: object keywords present but `type` is `{ty}`"
+                ));
+            }
+            if ty != "array" && has_array {
+                return Err(format!(
+                    "json-schema: array keywords present but `type` is `{ty}`"
+                ));
+            }
+        }
+        match ty {
+            None => {
+                if has_object {
+                    self.object(object, hint)
+                } else if has_array {
+                    self.array(object, hint)
+                } else {
+                    Ok("g-value".to_string())
+                }
+            }
+            Some("object") => self.object(object, hint),
+            Some("array") => self.array(object, hint),
+            Some("string") => Ok("g-string".to_string()),
+            Some("integer") => Ok("j-integer".to_string()),
+            Some("number") => Ok("j-number".to_string()),
+            Some("boolean") => Ok("\"true\" | \"false\"".to_string()),
+            Some("null") => Ok("\"null\"".to_string()),
+            Some(other) => Err(format!("json-schema: unknown type `{other}`")),
+        }
+    }
+
+    fn object(
+        &mut self,
+        object: &serde_json::Map<String, serde_json::Value>,
+        hint: &str,
+    ) -> Result<String, String> {
+        let properties = match object.get("properties") {
+            None => None,
+            Some(serde_json::Value::Object(properties)) => Some(properties),
+            Some(other) => {
+                return Err(format!(
+                    "json-schema: `properties` must be an object, got {}",
+                    crate::grammar::json_type_name(other)
+                ))
+            }
+        };
+        let required = match object.get("required") {
+            None => Vec::new(),
+            Some(serde_json::Value::Array(names)) => {
+                let mut out = Vec::new();
+                for name in names {
+                    match name {
+                        serde_json::Value::String(name) => out.push(name.as_str()),
+                        other => {
+                            return Err(format!(
+                                "json-schema: `required` entries must be strings, got {}",
+                                crate::grammar::json_type_name(other)
+                            ))
+                        }
+                    }
+                }
+                out
+            }
+            Some(other) => {
+                return Err(format!(
+                    "json-schema: `required` must be an array, got {}",
+                    crate::grammar::json_type_name(other)
+                ))
+            }
+        };
+        let mut entries = Vec::new();
+        if let Some(properties) = properties {
+            for name in &required {
+                if !properties.contains_key(*name) {
+                    return Err(format!(
+                        "json-schema: `required` names `{name}`, which is not declared in \
+                         `properties`"
+                    ));
+                }
+            }
+            for (name, property) in properties {
+                let key = gemma_key(name)?;
+                let value = self.value(property, &format!("{hint}-{name}"))?;
+                entries.push(format!("{key} j-ws \":\" j-ws ({value})"));
+            }
+        } else if !required.is_empty() {
+            return Err(
+                "json-schema: `required` names a property but `properties` is absent".to_string(),
+            );
+        }
+        let body = if entries.is_empty() {
+            "\"{\" j-ws \"}\"".to_string()
+        } else {
+            format!(
+                "\"{{\" j-ws {} j-ws \"}}\"",
+                entries.join(" j-ws \",\" j-ws ")
+            )
+        };
+        Ok(self.rule(&format!("{hint}-object"), body))
+    }
+
+    fn array(
+        &mut self,
+        object: &serde_json::Map<String, serde_json::Value>,
+        hint: &str,
+    ) -> Result<String, String> {
+        let body = match object.get("items") {
+            None => "g-array".to_string(),
+            Some(items) => {
+                let value = self.value(items, &format!("{hint}-item"))?;
+                format!(
+                    "\"[\" j-ws \"]\" | \"[\" j-ws ({value}) (j-ws \",\" j-ws ({value}))* \
+                     j-ws \"]\""
+                )
+            }
+        };
+        Ok(self.rule(&format!("{hint}-array"), body))
+    }
+}
+
+fn gemma_schema_rules(
+    schema: &serde_json::Value,
+    prefix: &str,
+) -> Result<(Vec<(String, String)>, String), String> {
+    let mut compiler = GemmaCompiler {
+        rules: Vec::new(),
+        counter: 0,
+        prefix: prefix.to_string(),
+    };
+    let root = compiler.root(schema)?;
+    Ok((compiler.rules, root))
+}
+
+/// A property name as the dialect writes it: bare when it is an identifier, a
+/// `<|"|>` string otherwise. A name containing `<` cannot be written safely.
+fn gemma_key(name: &str) -> Result<String, String> {
+    if name.contains('<') {
+        return Err(format!(
+            "json-schema: the property name `{name}` cannot be placed in a Gemma string"
+        ));
+    }
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Ok(gbnf_literal(name))
+    } else {
+        Ok(gbnf_literal(&format!("<|\"|>{name}<|\"|>")))
+    }
+}
+
+fn gemma_literal(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.contains('<') {
+                return Err(
+                    "json-schema: a string containing `<` cannot be represented in a Gemma \
+                     string"
+                        .to_string(),
+                );
+            }
+            Ok(gbnf_literal(&format!("<|\"|>{text}<|\"|>")))
+        }
+        serde_json::Value::Number(number) => Ok(gbnf_literal(&number.to_string())),
+        serde_json::Value::Bool(value) => Ok(gbnf_literal(if *value { "true" } else { "false" })),
+        serde_json::Value::Null => Ok(gbnf_literal("null")),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => Err(
+            "json-schema: an object/array enum value cannot be represented as a Gemma literal"
                 .to_string(),
         ),
     }

@@ -381,3 +381,8 @@ symbol = "compile_schema_rules"
 adr = "0071"
 what = "Qwen3.5's `tool_choice` is its own XML grammar: the wrapper, a fixed/enumerated name, and flat scalar `<parameter=KEY>VALUE</parameter>` entries from the tool schema; an unsupported schema construct is a named 400"
 symbol = "xml_call_alternative"
+
+[[governs]]
+adr = "0073"
+what = "Gemma 4's `tool_choice` is a dialect grammar: the `<|tool_call>call:NAME{…}<tool_call|>` wrapper, bare/`<|\"|>` keys, and the schema's objects/arrays/scalars in the lenient JSON syntax; an unsupported construct is a named 400"
+symbol = "gemma_schema_rules"

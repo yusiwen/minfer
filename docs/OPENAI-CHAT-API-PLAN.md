@@ -191,7 +191,7 @@ touch behavior):
 | Prompt caching / KV reuse across requests | Slots keep their KV between requests; a shared-prefix matcher is future work |
 | SSE `stream_options.include_usage` | OpenAI extension, not in MVP scope |
 | Multimodal content arrays / embeddings | Non-goals (MVP) |
-| ~~Tool-call extraction~~ | shipped ([#614](https://github.com/yusiwen/minfer/issues/614), [#699](https://github.com/yusiwen/minfer/issues/699), [#708](https://github.com/yusiwen/minfer/issues/708), [#709](https://github.com/yusiwen/minfer/issues/709), [#710](https://github.com/yusiwen/minfer/issues/710), [#715](https://github.com/yusiwen/minfer/issues/715)): a call in the model's own format (Qwen `<tool_call>`, Mistral Nemo `[TOOL_CALLS] [{…}]`, Ministral 3 `[TOOL_CALLS]name[ARGS]{…}`, Llama 3.1 `<|python_tag|>{"name":…, "parameters":…}`, Qwen3.5's XML body parsed with serialized-JSON arguments, Gemma 4's lenient `call:…{…}` body) becomes `message.tool_calls` (`finish_reason: "tool_calls"`), and `tool_choice: "required"`/a forced function are enforced by a grammar over the same format row and the selected tool's `parameters` schema (ADR-0066/ADR-0068/ADR-0069/ADR-0070; Qwen3.5's XML row has its own flat-scalar grammar, ADR-0071; the Gemma 4 lenient row is parse-only, a named 400 for `tool_choice`) |
+| ~~Tool-call extraction~~ | shipped ([#614](https://github.com/yusiwen/minfer/issues/614), [#699](https://github.com/yusiwen/minfer/issues/699), [#708](https://github.com/yusiwen/minfer/issues/708), [#709](https://github.com/yusiwen/minfer/issues/709), [#710](https://github.com/yusiwen/minfer/issues/710), [#715](https://github.com/yusiwen/minfer/issues/715), [#718](https://github.com/yusiwen/minfer/issues/718)): a call in the model's own format (Qwen `<tool_call>`, Mistral Nemo `[TOOL_CALLS] [{…}]`, Ministral 3 `[TOOL_CALLS]name[ARGS]{…}`, Llama 3.1 `<|python_tag|>{"name":…, "parameters":…}`, Qwen3.5's XML body parsed with serialized-JSON arguments, Gemma 4's lenient `call:…{…}` body) becomes `message.tool_calls` (`finish_reason: "tool_calls"`), and `tool_choice: "required"`/a forced function are enforced by a grammar over the same format row and the selected tool's `parameters` schema (ADR-0066/ADR-0068/ADR-0069/ADR-0070; Qwen3.5's XML row has its own flat-scalar grammar, ADR-0071; Gemma 4's lenient row has its own dialect grammar, ADR-0073) |
 
 > **Update (2026-09-15):** the f16 KV cache, listed as deferred in rev 5, has
 > since shipped — `MINFER_CACHE_TYPE=f16` with auto-selection for 7B-class
@@ -344,12 +344,12 @@ name is the anchor text, the JSON value after `[ARGS]` is the arguments), Llama 
 (`<|python_tag|>{"name":…, "parameters":…}`, an optional `;` between calls), Qwen3.5
 (`<tool_call><function=…><parameter=…>…</parameter></function></tool_call>`, XML grammar over a
 flat scalar schema; its arguments are serialized to JSON strings) and Gemma 4
-(`<|tool_call>call:…{…}<tool_call|>`, lenient JSON, parse-only). A template the table does not
-recognise, a recognised row without a grammar, `grammar`/`response_format` conflicts and a forced
-name outside `tools`, and a tool schema the grammar compiler cannot express are named 400s
-(#614/#699/#708/#709/#710/#713/#715,
-ADR-0063/ADR-0066/ADR-0067/ADR-0068/ADR-0069/ADR-0070/ADR-0071). The remaining tracker item is
-#718 (the Gemma-dialect grammar), not another format row.
+(`<|tool_call>call:…{…}<tool_call|>`, lenient JSON, with a dialect grammar). A template the table
+does not recognise, `grammar`/`response_format` conflicts, a forced name outside `tools`, and a
+tool schema the grammar compiler cannot express are named 400s
+(#614/#699/#708/#709/#710/#713/#715/#718,
+ADR-0063/ADR-0066/ADR-0067/ADR-0068/ADR-0069/ADR-0070/ADR-0071/ADR-0073). All six format rows can
+be constrained; the remaining work is not another format row.
 
 ### Stop Strings
 

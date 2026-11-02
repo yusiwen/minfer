@@ -451,7 +451,7 @@ them.
 | `"tools": [{"type":"function","function":{"name":"get_weather","parameters":{…}}}]` | the array is passed through verbatim — the client's key order and any unknown key included, because the template echoes each entry with `| tojson` |
 | `"tool_choice": "auto"` (or absent) | the definitions are rendered |
 | `"tool_choice": "none"` | the prompt is rendered **without** them; a call the model writes anyway is still extracted (the parser does not depend on `tools`) |
-| `"tool_choice": "required"` or `{"type":"function","function":{"name":…}}` | enforced with a grammar over the model's own call format and the selected tool's `parameters` schema: `<tool_call>` (Qwen2/Qwen3), `[TOOL_CALLS] [{…}]` (Mistral Nemo), `[TOOL_CALLS]name[ARGS]{…}` (Ministral 3), `<|python_tag|>{"name":…, "parameters":…}` (Llama 3.1) or `<tool_call><function=…>` (Qwen3.5). A template whose format the table does not recognise, or a recognised format with no grammar yet (Gemma 4's lenient body), is a named `400` |
+| `"tool_choice": "required"` or `{"type":"function","function":{"name":…}}` | enforced with a grammar over the model's own call format and the selected tool's `parameters` schema: `<tool_call>` (Qwen2/Qwen3), `[TOOL_CALLS] [{…}]` (Mistral Nemo), `[TOOL_CALLS]name[ARGS]{…}` (Ministral 3), `<|python_tag|>{"name":…, "parameters":…}` (Llama 3.1), `<tool_call><function=…>` (Qwen3.5) or `<|tool_call>call:…` (Gemma 4). A template whose format the table does not recognise, or a schema the grammar compiler cannot express, is a named `400` |
 | `"tools": []` | `400` — "no tools" is the absence of the field |
 
 A malformed entry (not an object, `type` other than `"function"`, a missing or empty
@@ -506,21 +506,22 @@ Six formats are recognised:
   over the tool's flat scalar schema (string/number/integer/boolean and enum/const); a nested or
   union schema is a named `400` (#715).
 - **Gemma 4:** `<|tool_call>call:NAME{city:<|"|>Paris<|"|>}<tool_call|>`; the body is lenient
-  JSON (unquoted keys, `<|"|>` strings), the arguments are serialized to JSON, and the row is
-  **parse-only** — `tool_choice: "required"` on it is a named `400` until a Gemma-dialect grammar
-  exists (#710).
+  JSON (unquoted keys, `<|"|>` strings), the arguments are serialized to JSON, and `tool_choice`
+  has a dialect grammar over the schema (objects, arrays and scalars; unsupported constructs are a
+  named `400`, #718).
 
-A template whose call format the table does not recognise is a named `400` for `tool_choice`;
-Gemma 4 is the one parse-only row — it parses calls but cannot constrain them yet.
+A template whose call format the table does not recognise is a named `400` for `tool_choice`; all
+six format rows can be constrained.
 
 `tool_choice: "required"` and a forced function are **enforced** with a grammar over the same
 row and the selected tool's `parameters` JSON Schema: the name is enumerated or fixed, and the
 arguments are limited to the schema's shape (a closed schema refuses extra keys), so the returned
 call is the one demanded. Qwen3.5's XML grammar uses the schema's keys and flat scalar text rules;
-the extracted values are strings (ADR-0067/ADR-0071). A template the table does not recognise, a
-recognised row with no grammar shape yet (Gemma 4's lenient body), a schema the grammar compiler
-cannot express, a combination with `grammar`/a non-text `response_format`, the speculative draft
-engine, or a forced name that is not in `tools` are each a named `400`.
+the extracted values are strings (ADR-0067/ADR-0071). Gemma 4's dialect grammar emits the schema's
+objects, arrays and scalars in the lenient syntax (ADR-0073). A template the table does not
+recognise, a schema the grammar compiler cannot express, a combination with `grammar`/a non-text
+`response_format`, the speculative draft engine, or a forced name that is not in `tools` are each
+a named `400`.
 
 ### Metrics and observability (F8)
 

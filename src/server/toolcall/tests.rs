@@ -697,3 +697,66 @@ fn the_qwen35_xml_grammar_constrains_the_parameters() {
         "the refusal must name the XML schema construct: {error}"
     );
 }
+
+#[test]
+fn the_gemma4_grammar_constrains_the_dialect_body() {
+    let tools = [tool(
+        "get_weather",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "enum": ["Paris"]},
+                "days": {"type": "integer"}
+            },
+            "required": ["city"]
+        }),
+    )];
+    let grammar = forced_call_grammar(&format::GEMMA4, &tools, None)
+        .expect("the schema is expressible in the Gemma dialect")
+        .expect("the Gemma row has a grammar shape");
+    assert!(grammar.contains("g-string"), "grammar:\n{grammar}");
+    let (pieces, eog) = byte_pieces();
+    let g = crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
+        .expect("the Gemma grammar compiles");
+    let witness = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3}<tool_call|>";
+    assert!(g.accepts(witness.as_bytes()), "grammar:\n{grammar}");
+    let extra = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3,evil:<|\"|>x<|\"|>}<tool_call|>";
+    assert!(
+        !g.accepts(extra.as_bytes()),
+        "only the schema's keys are in the language; grammar:\n{grammar}"
+    );
+
+    let nested = tool(
+        "nested",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "o": {"type": "object",
+                      "properties": {"x": {"type": "string"}},
+                      "required": ["x"]},
+                "a": {"type": "array", "items": {"type": "number"}}
+            }
+        }),
+    );
+    let grammar = forced_call_grammar(&format::GEMMA4, &[nested], None)
+        .expect("nested objects and arrays are expressible")
+        .expect("the Gemma row has a grammar shape");
+    let (pieces, eog) = byte_pieces();
+    let g = crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
+        .expect("the nested Gemma grammar compiles");
+    let witness = "<|tool_call>call:nested{a:[1,2],o:{x:<|\"|>y<|\"|>}}<tool_call|>";
+    assert!(g.accepts(witness.as_bytes()), "grammar:\n{grammar}");
+
+    let bad = tool(
+        "bad",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"type": "string", "pattern": "^a$"}}
+        }),
+    );
+    let error = forced_call_grammar(&format::GEMMA4, &[bad], None).unwrap_err();
+    assert!(
+        error.contains("pattern") || error.contains("cannot be expressed"),
+        "the refusal must name the unsupported construct: {error}"
+    );
+}
