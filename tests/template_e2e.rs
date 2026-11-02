@@ -579,7 +579,8 @@ fn serve_extracts_a_tool_call_from_the_completion_and_refuses_a_truncated_one() 
     let request = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function", "function": {"name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+            "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
+                "required": ["city"], "additionalProperties": false}}}],
         "grammar": block,
         "max_tokens": 96,
     })
@@ -610,7 +611,8 @@ fn serve_extracts_a_tool_call_from_the_completion_and_refuses_a_truncated_one() 
     let streaming = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function", "function": {"name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+            "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
+                "required": ["city"], "additionalProperties": false}}}],
         "grammar": block,
         "max_tokens": 96,
         "stream": true,
@@ -668,6 +670,14 @@ fn serve_extracts_a_tool_call_from_the_completion_and_refuses_a_truncated_one() 
 /// #614: `tool_choice: "required"` and a forced function stop being 400s — they
 /// constrain the sampling grammar to the model's `<tool_call>` syntax, and the
 /// extracted call matches what was demanded.
+/// The closed `get_weather` schema's arguments must carry `city` and nothing else.
+fn only_city(arguments: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(serde_json::Value::Object(object)) => object.len() == 1 && object.contains_key("city"),
+        _ => false,
+    }
+}
+
 #[test]
 fn serve_enforces_tool_choice_required_and_a_forced_function() {
     let model = test_model();
@@ -688,7 +698,8 @@ fn serve_enforces_tool_choice_required_and_a_forced_function() {
     let tool = serde_json::json!({
         "type": "function",
         "function": {"name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+            "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
+                "required": ["city"], "additionalProperties": false}},
     });
 
     for choice in [
@@ -715,7 +726,31 @@ fn serve_enforces_tool_choice_required_and_a_forced_function() {
             choice_out["message"]["tool_calls"][0]["function"]["name"], "get_weather",
             "body:\n{response}"
         );
+        let arguments = choice_out["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments are a JSON string");
+        assert!(
+            only_city(arguments),
+            "the closed schema must bound the arguments; body:\n{response}"
+        );
     }
+
+    // A schema the compiler cannot express is a named 400, not a fallback to the
+    // generic object.
+    let bad = serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "bad",
+            "parameters": {"type": "string", "format": "ipv4"}}}],
+        "tool_choice": "required",
+        "max_tokens": 8,
+    })
+    .to_string();
+    let (status, response) = server.request("POST", "/v1/chat/completions", Some(&bad));
+    assert_eq!(status, 400, "body:\n{response}");
+    assert!(
+        response.contains("cannot constrain") && response.contains("ipv4"),
+        "the refusal must name the schema construct; body:\n{response}"
+    );
 
     // A template with no recognised tool-call format is a named 400, not a
     // silently unconstrained generation.
@@ -801,7 +836,8 @@ fn serve_reads_the_mistral_and_llama_rows_from_a_forced_completion() {
         let body = serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"type": "function", "function": {"name": "get_weather",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+                "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
+                "required": ["city"], "additionalProperties": false}}}],
             "grammar": block,
             "max_tokens": 512,
             "seed": 42,
@@ -862,7 +898,8 @@ fn serve_enforces_tool_choice_on_the_mistral_and_llama_rows() {
         let body = serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"type": "function", "function": {"name": "get_weather",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+                "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
+                "required": ["city"], "additionalProperties": false}}}],
             "tool_choice": "required",
             "max_tokens": 1024,
             "seed": 0,
@@ -886,6 +923,10 @@ fn serve_enforces_tool_choice_on_the_mistral_and_llama_rows() {
             .expect("arguments are a JSON string");
         serde_json::from_str::<serde_json::Value>(arguments)
             .unwrap_or_else(|e| panic!("{name}: arguments are not JSON: {e}\n{response}"));
+        assert!(
+            only_city(arguments),
+            "{name}: the closed schema must bound the arguments; body:\n{response}"
+        );
     }
 }
 
@@ -914,7 +955,8 @@ fn serve_reads_the_qwen35_xml_call_and_refuses_tool_choice() {
     let tool = serde_json::json!({
         "type": "function",
         "function": {"name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+            "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
+                "required": ["city"], "additionalProperties": false}},
     });
     let block = r#"root ::= "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n</tool_call>""#;
     let body = serde_json::json!({
@@ -982,7 +1024,8 @@ fn serve_enforces_tool_choice_on_the_ministral3_row() {
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function", "function": {"name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+            "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
+                "required": ["city"], "additionalProperties": false}}}],
         "tool_choice": "required",
         "max_tokens": 1024,
         "seed": 0,
@@ -1000,6 +1043,10 @@ fn serve_enforces_tool_choice_on_the_ministral3_row() {
         .expect("arguments are a JSON string");
     serde_json::from_str::<serde_json::Value>(arguments)
         .unwrap_or_else(|e| panic!("arguments are not JSON: {e}\n{response}"));
+    assert!(
+        only_city(arguments),
+        "the closed schema must bound the arguments; body:\n{response}"
+    );
 }
 
 /// #710: the Gemma 4 `<|tool_call>call:…` block is detected and parsed from a
@@ -1028,7 +1075,8 @@ fn serve_reads_the_gemma4_call_and_refuses_tool_choice() {
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function", "function": {"name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+            "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
+                "required": ["city"], "additionalProperties": false}}}],
         "grammar": block,
         "max_tokens": 512,
         "seed": 42,

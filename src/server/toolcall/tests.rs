@@ -556,40 +556,79 @@ fn byte_pieces() -> (Vec<Option<Box<[u8]>>>, Vec<bool>) {
     (pieces, eog)
 }
 
+fn tool(name: &str, parameters: serde_json::Value) -> crate::template::ToolJson {
+    serde_json::from_value(serde_json::json!({
+        "type": "function",
+        "function": {"name": name, "parameters": parameters}
+    }))
+    .expect("a tool definition")
+}
+
+fn closed_city() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+        "additionalProperties": false
+    })
+}
+
 #[test]
-fn the_forced_call_grammar_wraps_the_json_object_and_names_the_tool() {
-    let grammar = forced_call_grammar(&format::QWEN, &["get_weather", "search_docs"], None)
+fn the_forced_call_grammar_uses_the_tool_schema_and_wraps_the_row() {
+    let tools = [
+        tool("get_weather", closed_city()),
+        tool("search_docs", closed_city()),
+    ];
+    let grammar = forced_call_grammar(&format::QWEN, &tools, None)
+        .expect("the tools' schemas compile")
         .expect("the Qwen row has a grammar shape");
-    assert!(grammar.contains("j-object"), "the JSON prelude is reused");
+    assert!(grammar.contains("args-0") && grammar.contains("args-1"));
     assert!(grammar.contains("\"get_weather\"") && grammar.contains("\"search_docs\""));
     let (pieces, eog) = byte_pieces();
-    crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
+    let g = crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
         .expect("the required-call grammar compiles");
-
-    let grammar = forced_call_grammar(
-        &format::QWEN,
-        &["get_weather", "search_docs"],
-        Some("get_weather"),
-    )
-    .expect("the Qwen row has a grammar shape");
-    assert!(grammar.contains("\"get_weather\""));
+    let witness = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+    assert!(g.accepts(witness.as_bytes()), "grammar:\n{grammar}");
+    let extra = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"evil\": 1}}\n</tool_call>";
     assert!(
-        !grammar.contains("\"search_docs\""),
+        !g.accepts(extra.as_bytes()),
+        "a closed schema must reject an extra key; grammar:\n{grammar}"
+    );
+
+    let forced = forced_call_grammar(&format::QWEN, &tools, Some("get_weather"))
+        .expect("the tool schema compiles")
+        .expect("the Qwen row has a grammar shape");
+    assert!(forced.contains("\"get_weather\""));
+    assert!(
+        !forced.contains("\"search_docs\""),
         "a forced name must not offer the other tools"
     );
     let (pieces, eog) = byte_pieces();
-    crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
+    let g = crate::grammar::Grammar::from_gbnf(&forced, pieces, eog)
         .expect("the forced-call grammar compiles");
+    assert!(g.accepts(witness.as_bytes()), "grammar:\n{forced}");
+}
+
+#[test]
+fn an_uncompilable_tool_schema_is_an_error() {
+    let bad = tool("f", serde_json::json!({"type": "string", "format": "ipv4"}));
+    let error = forced_call_grammar(&format::QWEN, &[bad], None).unwrap_err();
+    assert!(
+        error.contains("ipv4") || error.contains("not supported"),
+        "the error must name the unsupported construct: {error}"
+    );
 }
 
 #[test]
 fn the_family_grammar_shapes_are_the_rows() {
+    let tools = [tool("get_weather", closed_city())];
     for (row, open, args_key) in [
         (&format::MISTRAL_NEMO, "[TOOL_CALLS]", "arguments"),
         (&format::LLAMA31, "<|python_tag|>", "parameters"),
         (&format::MISTRAL3, "[TOOL_CALLS]", "[ARGS]"),
     ] {
-        let grammar = forced_call_grammar(row, &["get_weather"], Some("get_weather"))
+        let grammar = forced_call_grammar(row, &tools, Some("get_weather"))
+            .unwrap_or_else(|e| panic!("{}: the schema must compile: {e}", row.id))
             .unwrap_or_else(|| panic!("{} has a grammar shape", row.id));
         assert!(grammar.contains(open), "{}: {grammar}", row.id);
         assert!(grammar.contains(args_key), "{}: {grammar}", row.id);
@@ -604,7 +643,7 @@ fn a_format_without_a_grammar_answers_none_instead_of_guessing() {
     let mut row = format::QWEN;
     row.grammar = None;
     assert!(
-        forced_call_grammar(&row, &["get_weather"], None).is_none(),
+        matches!(forced_call_grammar(&row, &[], None), Ok(None)),
         "a recognised format without a grammar must reach the caller's named 400"
     );
 }
