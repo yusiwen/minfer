@@ -98,6 +98,13 @@ pub enum GrammarShape {
         parameter_open: &'static str,
         parameter_close: &'static str,
     },
+    /// Gemma 4's lenient-JSON wrapper: [`ToolFormat::open`], then
+    /// `name_prefix` + the name + a dialect body (`{key:<|"|>value<|"|>}`), then
+    /// `close`. The body is its own small schema compiler (ADR-0073).
+    Gemma {
+        name_prefix: &'static str,
+        close: &'static str,
+    },
 }
 
 /// Qwen2/Qwen3 (and Hermes): the format #614 shipped, unchanged.
@@ -217,9 +224,8 @@ pub static QWEN35: ToolFormat = ToolFormat {
 ///
 /// The body is lenient JSON: unquoted keys and `<|"|>` string delimiters. The
 /// parser reads it into a `serde_json::Value` and serializes the arguments to
-/// JSON text. The row is parse-only (`grammar: None`): the existing `j-object`
-/// grammar would produce standard JSON, which this parser does not accept, so a
-/// Gemma-dialect grammar is a separate increment.
+/// JSON text. `tool_choice` has a Gemma-dialect grammar (ADR-0073): bare keys and
+/// `<|"|>` strings inside `call:NAME{…}`, not the schema compiler's standard JSON.
 pub static GEMMA4: ToolFormat = ToolFormat {
     id: "gemma4",
     anchors: &["<|tool_call>", "call:"],
@@ -231,7 +237,10 @@ pub static GEMMA4: ToolFormat = ToolFormat {
     },
     name_key: "name",
     args_key: "arguments",
-    grammar: None,
+    grammar: Some(GrammarShape::Gemma {
+        name_prefix: "call:",
+        close: "<tool_call|>",
+    }),
 };
 
 /// The table, most specific first. `QWEN35` must precede `QWEN`: both open with

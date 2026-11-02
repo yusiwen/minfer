@@ -95,9 +95,9 @@ fn the_gemma4_row_is_detected_from_the_piped_tag_and_call_prefix() {
 }
 
 #[test]
-fn the_gemma4_row_is_parse_only() {
+fn the_gemma4_row_has_a_gemma_grammar() {
     assert!(
-        GEMMA4.grammar.is_none(),
-        "the existing j-object grammar is standard JSON; the Gemma dialect needs its own"
+        matches!(GEMMA4.grammar, Some(GrammarShape::Gemma { .. })),
+        "the lenient-JSON row carries its own grammar shape (ADR-0073)"
     );
 }

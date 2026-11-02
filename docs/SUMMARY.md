@@ -91,6 +91,7 @@
     - [0070. tool_choice constrains the arguments to the offered tool's schema](./adr/0070-tool-choice-constrains-the-arguments-to-the-offered-tool-schema.md)
     - [0071. Qwen3.5's XML call gets its own tool_choice grammar](./adr/0071-qwen3-5-s-xml-call-gets-its-own-tool-choice-grammar.md)
     - [0072. A draft proposal is the target's own filtered pick, computed from one shared prefix](./adr/0072-a-draft-proposal-is-the-target-s-own-filtered-pick.md)
+    - [0073. Gemma 4's lenient body gets a dialect tool_choice grammar](./adr/0073-gemma-4-s-lenient-body-gets-a-dialect-tool-choice-grammar.md)
 
 # Model Support
 

@@ -1089,11 +1089,11 @@ fn serve_enforces_tool_choice_on_the_ministral3_row() {
     );
 }
 
-/// #710: the Gemma 4 `<|tool_call>call:…` block is detected and parsed from a
-/// forced completion, and `tool_choice: "required"` on the same template is a
-/// named 400 (no Gemma-dialect grammar yet).
+/// #710/#718: the Gemma 4 `<|tool_call>call:…` block is detected and parsed
+/// from a forced completion, and `tool_choice: "required"`/forced returns the
+/// dialect call the grammar produced.
 #[test]
-fn serve_reads_the_gemma4_call_and_refuses_tool_choice() {
+fn serve_reads_the_gemma4_call_and_enforces_tool_choice() {
     let model = test_model();
     let template = template_file(
         "gemma4-call.jinja",
@@ -1111,12 +1111,16 @@ fn serve_reads_the_gemma4_call_and_refuses_tool_choice() {
         "no banner; log so far:\n{}",
         server.log()
     );
+    let tool = serde_json::json!({
+        "type": "function",
+        "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string", "enum": ["Paris"]}},
+                "required": ["city"], "additionalProperties": false}},
+    });
     let block = r#"root ::= "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>""#;
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "get_weather",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string", "maxLength": 16}},
-                "required": ["city"], "additionalProperties": false}}}],
+        "tools": [tool.clone()],
         "grammar": block,
         "max_tokens": 512,
         "seed": 42,
@@ -1134,9 +1138,48 @@ fn serve_reads_the_gemma4_call_and_refuses_tool_choice() {
             .expect("the Gemma body serializes to JSON");
     assert_eq!(arguments, serde_json::json!({"city": "Paris"}));
 
+    // #718: the dialect grammar constrains the name and the schema's keys/types.
+    for choice in [
+        serde_json::json!("required"),
+        serde_json::json!({"type": "function", "function": {"name": "get_weather"}}),
+    ] {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [tool.clone()],
+            "tool_choice": choice,
+            "max_tokens": 256,
+            "seed": 0,
+        })
+        .to_string();
+        let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
+        assert_eq!(status, 200, "choice {choice}: body:\n{response}");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("completion json");
+        let choice_out = &parsed["choices"][0];
+        assert_eq!(
+            choice_out["finish_reason"], "tool_calls",
+            "body:\n{response}"
+        );
+        let call = &choice_out["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "get_weather", "body:\n{response}");
+        let arguments = call["function"]["arguments"]
+            .as_str()
+            .expect("arguments are a JSON string");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(arguments).expect("arguments JSON"),
+            serde_json::json!({"city": "Paris"}),
+            "body:\n{response}"
+        );
+    }
+
+    // A string constraint the dialect grammar cannot express is a named 400.
+    let bad = serde_json::json!({
+        "type": "function",
+        "function": {"name": "bad",
+            "parameters": {"type": "object", "properties": {"x": {"type": "string", "pattern": "^a$"}}}},
+    });
     let body = serde_json::json!({
         "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        "tools": [bad],
         "tool_choice": "required",
         "max_tokens": 8,
     })
@@ -1144,7 +1187,7 @@ fn serve_reads_the_gemma4_call_and_refuses_tool_choice() {
     let (status, response) = server.request("POST", "/v1/chat/completions", Some(&body));
     assert_eq!(status, 400, "body:\n{response}");
     assert!(
-        response.contains("can parse but cannot constrain"),
-        "the refusal must name the parse-only format; body:\n{response}"
+        response.contains("cannot constrain") && response.contains("pattern"),
+        "the refusal must name the unsupported schema construct; body:\n{response}"
     );
 }
