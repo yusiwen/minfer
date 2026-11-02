@@ -26,10 +26,18 @@ prompts=(
 )
 
 pass=0; fail=0
+# `timeout` is coreutils, absent on a stock macOS — and the device box *is* a Mac,
+# so a missing binary must not be read as "every prompt produced no text"
+# (that misreports a clean 0/4 as a divergence). Fall back to gtimeout, then to
+# no cap at all: a hung run then fails the gate by taking forever, which is the
+# same signal, only slower.
+if command -v timeout >/dev/null 2>&1; then TMO=(timeout 600)
+elif command -v gtimeout >/dev/null 2>&1; then TMO=(gtimeout 600)
+else TMO=(); fi
 for i in "${!prompts[@]}"; do
   p="${prompts[$i]}"
-  seq_out=$(timeout 600 "$BIN" --greedy -n "$N" "$TARGET" "$p" 2>/dev/null | grep -vE "$STRIP")
-  spec_out=$(timeout 600 "$BIN" --greedy -n "$N" --spec-draft "$DRAFT" --spec-draft-adaptive "$TARGET" "$p" 2>/dev/null | grep -vE "$STRIP")
+  seq_out=$("${TMO[@]}" "$BIN" --greedy -n "$N" "$TARGET" "$p" 2>/dev/null | grep -vE "$STRIP")
+  spec_out=$("${TMO[@]}" "$BIN" --greedy -n "$N" --spec-draft "$DRAFT" --spec-draft-adaptive "$TARGET" "$p" 2>/dev/null | grep -vE "$STRIP")
   # Empty output = the run failed to produce text (missing binary/model);
   # an empty-vs-empty pair must NEVER count as an identity pass.
   if [ -z "$seq_out" ]; then
