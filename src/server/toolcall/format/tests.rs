@@ -74,10 +74,10 @@ fn the_qwen35_xml_row_is_detected_before_the_qwen_row() {
 }
 
 #[test]
-fn the_qwen35_row_is_parse_only() {
+fn the_qwen35_row_has_an_xml_grammar() {
     assert!(
-        QWEN35.grammar.is_none(),
-        "an XML grammar over the tool schema is a separate increment; the row is a named 400"
+        matches!(QWEN35.grammar, Some(GrammarShape::Xml { .. })),
+        "the XML row carries its own grammar shape (ADR-0071)"
     );
 }
 

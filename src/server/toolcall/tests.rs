@@ -647,3 +647,53 @@ fn a_format_without_a_grammar_answers_none_instead_of_guessing() {
         "a recognised format without a grammar must reach the caller's named 400"
     );
 }
+
+#[test]
+fn the_qwen35_xml_grammar_constrains_the_parameters() {
+    let tools = [tool(
+        "get_weather",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "enum": ["Paris"]},
+                "days": {"type": "integer"}
+            },
+            "required": ["city"]
+        }),
+    )];
+    let grammar = forced_call_grammar(&format::QWEN35, &tools, None)
+        .expect("the schema is expressible in XML")
+        .expect("the XML row has a grammar shape");
+    assert!(grammar.contains("<function="), "grammar:\n{grammar}");
+    let (pieces, eog) = byte_pieces();
+    let g = crate::grammar::Grammar::from_gbnf(&grammar, pieces, eog)
+        .expect("the XML grammar compiles");
+    let witness = "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n<parameter=days>3</parameter>\n</function>\n</tool_call>";
+    assert!(g.accepts(witness.as_bytes()), "grammar:\n{grammar}");
+    let extra = "<tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n<parameter=days>3</parameter>\n<parameter=evil>1</parameter>\n</function>\n</tool_call>";
+    assert!(
+        !g.accepts(extra.as_bytes()),
+        "only the schema's keys are in the language; grammar:\n{grammar}"
+    );
+
+    let forced = forced_call_grammar(&format::QWEN35, &tools, Some("get_weather"))
+        .expect("the schema is expressible in XML")
+        .expect("the XML row has a grammar shape");
+    let (pieces, eog) = byte_pieces();
+    let g = crate::grammar::Grammar::from_gbnf(&forced, pieces, eog)
+        .expect("the forced XML grammar compiles");
+    assert!(g.accepts(witness.as_bytes()), "grammar:\n{forced}");
+
+    let nested = tool(
+        "nested",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"value": {"type": "object"}}
+        }),
+    );
+    let error = forced_call_grammar(&format::QWEN35, &[nested], None).unwrap_err();
+    assert!(
+        error.contains("object") || error.contains("cannot be expressed"),
+        "the refusal must name the XML schema construct: {error}"
+    );
+}

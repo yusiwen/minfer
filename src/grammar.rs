@@ -3712,7 +3712,7 @@ fn is_annotation(key: &str) -> bool {
     )
 }
 
-fn json_type_name(v: &Value) -> &'static str {
+pub(crate) fn json_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",

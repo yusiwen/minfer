@@ -597,8 +597,9 @@ impl Parser {
 /// It forces the model's own tool-call syntax from the format row (ADR-0066) and
 /// the selected tool's `parameters` schema (ADR-0070): each selected tool is one
 /// root alternative — the row's open/between/close literals around a literal name
-/// and a schema-compiled `args-i` rule. The result is the block this module
-/// parses, so extraction and the constraint agree by construction.
+/// and a schema-compiled `args-i` rule. Qwen3.5's XML shape has its own
+/// flat-scalar `<parameter=…>` builder instead (ADR-0071). The result is the block
+/// this module parses, so extraction and the constraint agree by construction.
 ///
 /// `Ok(None)` means the template's format is recognised but has no grammar shape
 /// yet; the caller answers a named `400`. `Err` is a schema that cannot be
@@ -611,6 +612,51 @@ pub fn forced_call_grammar(
     let Some(shape) = format.grammar else {
         return Ok(None);
     };
+    let selected = selected_tools(tools, forced)?;
+    let mut grammar = String::new();
+    push_generic_rules(&mut grammar);
+    let mut alternatives = Vec::new();
+    match shape {
+        format::GrammarShape::Json {
+            open,
+            between,
+            close,
+        } => {
+            for (index, (name, schema)) in selected.iter().enumerate() {
+                let args_rule = format!("args-{index}");
+                let (rules, body) = crate::grammar::compile_schema_rules(schema, &args_rule)?;
+                push_rules(&mut grammar, &rules);
+                push_rule(&mut grammar, &args_rule, &body);
+                let mut alternative = format!(
+                    "{} {} {} {}",
+                    gbnf_literal(open),
+                    gbnf_literal(name),
+                    gbnf_literal(between),
+                    args_rule
+                );
+                if !close.is_empty() {
+                    alternative.push(' ');
+                    alternative.push_str(&gbnf_literal(close));
+                }
+                alternatives.push(alternative);
+            }
+        }
+        format::GrammarShape::Xml { .. } => {
+            for (name, schema) in &selected {
+                alternatives.push(xml_call_alternative(shape, format.open, name, schema)?);
+            }
+        }
+    }
+    grammar.push_str("root ::= ");
+    grammar.push_str(&alternatives.join("\n    | "));
+    grammar.push('\n');
+    Ok(Some(grammar))
+}
+
+fn selected_tools<'a>(
+    tools: &'a [crate::template::ToolJson],
+    forced: Option<&str>,
+) -> Result<Vec<(&'a str, serde_json::Value)>, String> {
     let mut selected: Vec<(&str, serde_json::Value)> = Vec::new();
     for tool in tools {
         let Some(function) = tool.get("function") else {
@@ -634,45 +680,269 @@ pub fn forced_call_grammar(
     if selected.is_empty() {
         return Err("tool_choice found no offered tool to constrain".to_string());
     }
+    Ok(selected)
+}
 
-    let mut grammar = String::new();
+fn push_generic_rules(grammar: &mut String) {
     for (name, rhs) in crate::grammar::GENERIC_RULES {
-        grammar.push_str(name);
-        grammar.push_str(" ::= ");
-        grammar.push_str(rhs);
-        grammar.push('\n');
+        push_rule(grammar, name, rhs);
+    }
+}
+
+fn push_rules(grammar: &mut String, rules: &[(String, String)]) {
+    for (name, rhs) in rules {
+        push_rule(grammar, name, rhs);
+    }
+}
+
+fn push_rule(grammar: &mut String, name: &str, body: &str) {
+    grammar.push_str(name);
+    grammar.push_str(" ::= ");
+    grammar.push_str(body);
+    grammar.push('\n');
+}
+
+/// One root alternative for Qwen3.5's XML block: the row's open literal, then
+/// `<function=NAME>`, the schema's parameters, `</function>` and `</tool_call>`.
+fn xml_call_alternative(
+    shape: format::GrammarShape,
+    block_open: &str,
+    name: &str,
+    schema: &serde_json::Value,
+) -> Result<String, String> {
+    let format::GrammarShape::Xml {
+        function_open,
+        function_close,
+        block_close,
+        parameter_open,
+        parameter_close,
+    } = shape
+    else {
+        unreachable!("xml_call_alternative is called only for the XML shape")
+    };
+    let entries = xml_parameters(schema)?;
+    let mut alternative = format!(
+        "{} j-ws {} {} \">\"",
+        gbnf_literal(block_open),
+        gbnf_literal(function_open),
+        gbnf_literal(name)
+    );
+    for (key, value) in entries {
+        alternative.push_str(" j-ws ");
+        alternative.push_str(&gbnf_literal(&format!("{parameter_open}{key}>")));
+        alternative.push('(');
+        alternative.push_str(&value);
+        alternative.push(')');
+        alternative.push_str(&gbnf_literal(parameter_close));
+    }
+    alternative.push_str(" j-ws ");
+    alternative.push_str(&gbnf_literal(function_close));
+    alternative.push_str(" j-ws ");
+    alternative.push_str(&gbnf_literal(block_close));
+    Ok(alternative)
+}
+
+/// The object keywords the XML parameter grammar understands; annotations are
+/// ignored, and every language-changing keyword not here is a named refusal.
+const XML_OBJECT_KEYWORDS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "description",
+    "title",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+
+/// The value keywords the XML parameter grammar understands. A value's JSON
+/// type is not representable (the parser stores text), only its text form.
+const XML_VALUE_KEYWORDS: &[&str] = &[
+    "type",
+    "enum",
+    "const",
+    "description",
+    "title",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+
+fn xml_parameters(schema: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
+    let object = match schema {
+        serde_json::Value::Bool(true) => return Ok(Vec::new()),
+        serde_json::Value::Bool(false) => {
+            return Err("json-schema: `false` admits no value and cannot be compiled".to_string())
+        }
+        serde_json::Value::Object(object) => object,
+        other => {
+            return Err(format!(
+                "json-schema: a tool parameters schema must be an object or a boolean, got {}",
+                crate::grammar::json_type_name(other)
+            ))
+        }
+    };
+    for key in object.keys() {
+        if !XML_OBJECT_KEYWORDS.contains(&key.as_str()) {
+            return Err(format!(
+                "json-schema: `{key}` cannot be expressed in the XML parameter grammar"
+            ));
+        }
+    }
+    match object.get("type") {
+        None => {}
+        Some(serde_json::Value::String(ty)) if ty == "object" => {}
+        Some(serde_json::Value::String(ty)) => {
+            return Err(format!(
+                "json-schema: the XML tool parameters must be an object schema, got `{ty}`"
+            ))
+        }
+        Some(_) => {
+            return Err("json-schema: `type` must be a string".to_string());
+        }
+    }
+    let required = match object.get("required") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(names)) => {
+            let mut out = Vec::new();
+            for name in names {
+                match name {
+                    serde_json::Value::String(name) => out.push(name.as_str()),
+                    other => {
+                        return Err(format!(
+                            "json-schema: `required` entries must be strings, got {}",
+                            crate::grammar::json_type_name(other)
+                        ))
+                    }
+                }
+            }
+            out
+        }
+        Some(other) => {
+            return Err(format!(
+                "json-schema: `required` must be an array, got {}",
+                crate::grammar::json_type_name(other)
+            ))
+        }
+    };
+    let properties = match object.get("properties") {
+        None => return Ok(Vec::new()),
+        Some(serde_json::Value::Object(properties)) => properties,
+        Some(other) => {
+            return Err(format!(
+                "json-schema: `properties` must be an object, got {}",
+                crate::grammar::json_type_name(other)
+            ))
+        }
+    };
+    for name in &required {
+        if !properties.contains_key(*name) {
+            return Err(format!(
+                "json-schema: `required` names `{name}`, which is not declared in `properties`"
+            ));
+        }
+    }
+    let mut entries = Vec::new();
+    for (name, property) in properties {
+        if name.contains('<') || name.contains('>') {
+            return Err(format!(
+                "json-schema: the parameter name `{name}` cannot be placed in an XML tag"
+            ));
+        }
+        if name.trim() != name {
+            return Err(format!(
+                "json-schema: the parameter name `{name}` has leading or trailing whitespace"
+            ));
+        }
+        entries.push((name.clone(), xml_value_rule(property)?));
+    }
+    Ok(entries)
+}
+
+fn xml_value_rule(schema: &serde_json::Value) -> Result<String, String> {
+    let object = match schema {
+        serde_json::Value::Bool(true) => return Ok("[^<]*".to_string()),
+        serde_json::Value::Bool(false) => {
+            return Err("json-schema: `false` admits no value and cannot be compiled".to_string())
+        }
+        serde_json::Value::Object(object) => object,
+        other => {
+            return Err(format!(
+                "json-schema: a parameter schema must be an object or a boolean, got {}",
+                crate::grammar::json_type_name(other)
+            ))
+        }
+    };
+    for key in object.keys() {
+        if !XML_VALUE_KEYWORDS.contains(&key.as_str()) {
+            return Err(format!(
+                "json-schema: `{key}` cannot be expressed in the XML parameter grammar"
+            ));
+        }
+    }
+    if let Some(values) = object.get("enum") {
+        let values = values
+            .as_array()
+            .ok_or_else(|| "json-schema: `enum` must be an array of values".to_string())?;
+        return xml_enum_rule(values);
+    }
+    if let Some(value) = object.get("const") {
+        return xml_scalar_text(value);
+    }
+    match object.get("type") {
+        None => Ok("[^<]*".to_string()),
+        Some(serde_json::Value::String(ty)) => match ty.as_str() {
+            "string" => Ok("[^<]*".to_string()),
+            "integer" => Ok("j-integer".to_string()),
+            "number" => Ok("j-number".to_string()),
+            "boolean" => Ok("\"true\" | \"false\"".to_string()),
+            "object" | "array" | "null" => Err(format!(
+                "json-schema: an XML parameter value cannot be a `{ty}` (the parser stores text)"
+            )),
+            other => Err(format!("json-schema: unknown type `{other}`")),
+        },
+        Some(_) => Err("json-schema: `type` must be a string".to_string()),
+    }
+}
+
+fn xml_enum_rule(values: &[serde_json::Value]) -> Result<String, String> {
+    if values.is_empty() {
+        return Err("json-schema: `enum` must contain at least one value".to_string());
     }
     let mut alternatives = Vec::new();
-    for (index, (name, schema)) in selected.iter().enumerate() {
-        let args_rule = format!("args-{index}");
-        let (rules, body) = crate::grammar::compile_schema_rules(schema, &args_rule)?;
-        for (rule, rhs) in rules {
-            grammar.push_str(&rule);
-            grammar.push_str(" ::= ");
-            grammar.push_str(&rhs);
-            grammar.push('\n');
-        }
-        grammar.push_str(&args_rule);
-        grammar.push_str(" ::= ");
-        grammar.push_str(&body);
-        grammar.push('\n');
-        let mut alternative = format!(
-            "{} {} {} {}",
-            gbnf_literal(shape.open),
-            gbnf_literal(name),
-            gbnf_literal(shape.between),
-            args_rule
-        );
-        if !shape.close.is_empty() {
-            alternative.push(' ');
-            alternative.push_str(&gbnf_literal(shape.close));
-        }
-        alternatives.push(alternative);
+    for value in values {
+        alternatives.push(xml_scalar_text(value)?);
     }
-    grammar.push_str("root ::= ");
-    grammar.push_str(&alternatives.join("\n    | "));
-    grammar.push('\n');
-    Ok(Some(grammar))
+    Ok(alternatives.join(" | "))
+}
+
+fn xml_scalar_text(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.contains('<') {
+                return Err(
+                    "json-schema: a string containing `<` cannot be represented in the XML \
+                     parameter text"
+                        .to_string(),
+                );
+            }
+            Ok(gbnf_literal(text))
+        }
+        serde_json::Value::Number(number) => Ok(gbnf_literal(&number.to_string())),
+        serde_json::Value::Bool(value) => Ok(gbnf_literal(if *value { "true" } else { "false" })),
+        serde_json::Value::Null => {
+            Err("json-schema: `null` cannot be represented in the XML parameter text".to_string())
+        }
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => Err(
+            "json-schema: an object/array value cannot be represented in the XML parameter text"
+                .to_string(),
+        ),
+    }
 }
 
 /// One string as a GBNF literal: quotes, backslashes and control characters are
