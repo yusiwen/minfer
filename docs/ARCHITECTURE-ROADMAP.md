@@ -884,6 +884,140 @@ hazards that the larger work would otherwise have to work around.
 
 ---
 
+## 6. Release sequence (2026-11-03)
+
+**Status: forward plan, dated 2026-11-03 — the durable record for a new session.** `AGENTS.md`
+routes "what is missing, and in what order" here, so this section is what a later reader (human or
+agent) finds without the chat that produced it. It answers one question: *which release carries
+what*.
+
+**The milestone rule.** A release's GitHub milestone is created **when that release's issue set is
+written**, and its description points back to this section. Empty milestones are not kept: a `0/0`
+milestone carries no scope, and a stale version number is worse than no number. Until a milestone
+exists, this section *is* the plan. A scope change is a change here, in the PR that makes it — not a
+comment somewhere else.
+
+**The coverage rule.** Every open item in §3, and every open family in
+[`MODEL-SUPPORT-ROADMAP.md`](./MODEL-SUPPORT-ROADMAP.md), appears exactly once in §6.2–§6.6, or in
+§6.7 with the reason it is not scheduled. A new gap gets a row here in the same PR that files its
+issue.
+
+### 6.1 Shipped: v0.0.9 (2026-11-03)
+
+v0.0.9 closed the Metal weight-format and KV campaign (f16/bf16 weights, packed Q8_0 KV, windowed
+prefill, the few-row MMA arm), the server's tool-calling chain (six call dialects, grammar-enforced
+`tool_choice`), the tokenizer engine dispatch, the JSON-Schema grammar extensions, and the GGUF
+convert/quantize/split tooling. The tag, the release notes and the platform assets are on GitHub;
+the suite records are in [`TEST-BASELINES.md`](./TEST-BASELINES.md).
+
+### 6.2 v0.0.10 — breadth + trust (open)
+
+**Goal.** The first non-Qwen family, and a Metal gate that is a CI check rather than a pasted record.
+
+| Issue | Scope |
+|---|---|
+| [#723](https://github.com/yusiwen/minfer/issues/723) | `llama` architecture: Llama 3.1/3.2/3.3 dense — no attention bias, tied lm_head, stop ids from the file |
+| [#724](https://github.com/yusiwen/minfer/issues/724) | llama3 RoPE scaling — low/high-frequency factors and `original_context_length` |
+| [#725](https://github.com/yusiwen/minfer/issues/725) | Llama real-model gate against a pinned llama.cpp reference |
+| [#674](https://github.com/yusiwen/minfer/issues/674) | self-hosted Mac runner — suite, frozen baseline, required check |
+| [#678](https://github.com/yusiwen/minfer/issues/678) | the MacBook record requirement, retired when #674 is green |
+| [#671](https://github.com/yusiwen/minfer/issues/671) | Metal decode fusions at `nt >= 2` (price first; stop at < 3 %) |
+| [#651](https://github.com/yusiwen/minfer/issues/651) | Metal speculative-decoding parity measurement |
+| [#664](https://github.com/yusiwen/minfer/issues/664) | Metal GEMM partial-tile store gate |
+| [#726](https://github.com/yusiwen/minfer/issues/726) | server structured logging and levels — the last §2.8 item |
+| [#727](https://github.com/yusiwen/minfer/issues/727) | the GPT-2 pre-rule group — a [#132](https://github.com/yusiwen/minfer/issues/132) slice |
+
+**Done means:** a cached Llama GGUF decodes on CPU with greedy tokens matching llama.cpp, and on
+both devices; and a Metal-path PR blocks on the runner check.
+
+### 6.3 v0.0.11 — MoE (Qwen3-MoE 30B-A3B)
+
+**Scope.** A design record first (routing, 3-D expert layout, grouped matmul, KV and memory budget,
+offload), then the router (top-k softmax), 3-D expert weights, a grouped GEMM (General
+Matrix-Multiply) on CPU, Metal and CUDA, the Qwen3-MoE model, and a real-model gate against
+llama.cpp.
+
+**Why here.** It is §3.17 and the model roadmap's first Tier-2 family. The IR pieces it needs have
+landed: zero-copy views, `split_parts`, and `Op::GetRows` for the routing shape. Qwen3-MoE 30B-A3B
+at Q4_K_M is about 17–18 GB, which fits the 48 GB M4 Pro used for the Metal gate.
+
+**Depends on.** Nothing new. **Size.** XL.
+
+### 6.4 v0.0.12 — MLA (Multi-head Latent Attention) and DeepSeek R1
+
+**Scope.** The latent KV (the compressed latent plus the RoPE part), the `wq_a` / `wq_b` /
+`wkv_a_mqa` / `wkv_b` weight chain, a new KV region shape and attention kernel, and a C5
+session-format version. DeepSeek-V3/R1 then reuses v0.0.11's MoE.
+
+**Why here.** It is the model roadmap's second Tier-2 family, the largest remaining model
+capability, and the one whose KV footprint gain matters most at long context. Its KV prerequisites
+(§3.1, §3.2, §3.7) are done.
+
+**Depends on.** v0.0.11 for R1 (the MLA half can start earlier). **Size.** XL. The session-format
+change needs an ADR and a migration story.
+
+### 6.5 v0.0.13 — serving at scale
+
+**Scope.** Mixed prefill+decode batches (§3.10's remainder), server-side context shift (the engine's
+C2 overflow handling wired into the serving model instead of a 400), server-driven KV compaction
+(§2.4's remainder), per-block offload tuning (§3.8–9's remainder), true cross-split overlap
+including the Metal side (§3.14's remainder), a worker recovery policy beyond the stall and panic
+handling already landed, and a concurrent load/soak gate.
+
+**Why here.** It is the last system-layer block. It has no hard dependency on the model work, so it
+can be reordered ahead of §6.4 if a serving release is more valuable at that point.
+
+**Size.** M–L.
+
+### 6.6 v0.0.14 — breadth wave 2 and the tail
+
+**Scope.** The remaining Tier-1 dense families (GLM-4-9B, InternLM2, Phi-3/Phi-4, Gemma 2 with
+`Gelu`/GeGLU and the sliding-window mask, Mistral/Ministral with interleaved RoPE), Qwen3-Next once
+the sliding-window mask and MoE exist, the rest of the tokenizer pre-rule catalogue and the
+`add_bos`/`add_sep` residuals ([#132](https://github.com/yusiwen/minfer/issues/132)),
+`stream_options.include_usage`, and the quant tail (Q2_K/Q3_K/IQ: support, or record a decided
+non-support).
+
+**Why here.** These are small ports that share one piece of work — the sliding-window mask used by
+Gemma 2 and Qwen3-Next — plus the tail items that need a decision rather than a campaign.
+
+**Depends on.** The sliding-window mask (shared); Qwen3-Next also on v0.0.11. **Size.** L.
+
+### 6.7 Backlog — no milestone
+
+| Item | Why not scheduled |
+|---|---|
+| Multimodal (Gemma 3 / Qwen3-VL) | No vision encoder or projector framework; a new subsystem, not a port. |
+| Llama 4 Scout | MoE plus interleaved attention; its training recipe is not the published dense contract, so the parity oracle is unclear. |
+| RWKV / Mamba / Jamba | State-space recurrence: different kernels, and a state model that is neither the per-layer KV region nor the cell store. |
+| Multi-device execution | Needs §6.5's true overlap first; no user request yet. |
+| [#633](https://github.com/yusiwen/minfer/issues/633) CUDA packed Q8_0 shape levers | [#212](https://github.com/yusiwen/minfer/issues/212) closed the residual with a recorded refutation; a quality-of-life item for hd-64 packed sessions. |
+
+### 6.8 Coverage check
+
+The §3 items with a recorded remainder, and where each lands:
+
+| §3 item | Where |
+|---|---|
+| 8–9 per-block offload tuning | v0.0.13 |
+| 10 mixed prefill+decode batches (E3's remainder) | v0.0.13 |
+| 14 true cross-split overlap and Metal | v0.0.13 |
+| 17 MoE | v0.0.11 |
+| 18 dense architecture wave | v0.0.10 ([#723](https://github.com/yusiwen/minfer/issues/723)) and v0.0.14 |
+| 20 tokenizer long tail | v0.0.10 ([#727](https://github.com/yusiwen/minfer/issues/727)) and v0.0.14 |
+
+Every other §3 item is recorded as done in §3's table. The model roadmap's Tier 1–2 families are all
+in §6.2–§6.6; Tier 3 is in §6.7.
+
+### 6.9 Updating this section
+
+- A release starts by writing its issues, then creating the milestone; the milestone description
+  links here in the same step.
+- A scope change is a PR to this section. A comment is not a plan of record.
+- Sizes are S/M/L, never dates: this document should not expire.
+
+---
+
 ## Appendix — evidence index
 
 | Area | Primary sources read |
