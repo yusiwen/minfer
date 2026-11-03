@@ -406,7 +406,7 @@ The prefill is one graph covering the entire prompt (`main.rs:`):
 server rejects any prompt longer than the slot context (`chat.rs:`);
 `new_slots` (`slot.rs:`) divides `n_ctx_total` equally per slot.
 `worker_loop` drains the queue **serially, one slot at a time** (`chat.rs:`),
-and every request starts from a fresh `GraphCache` (`chat.rs:77`). Default `--n-slots` is
+and every request starts from a fresh `GraphCache` (`chat.rs:84`). Default `--n-slots` is
 1 (`main.rs:529`), so the default server is strictly serial with a cold KV per
 request.
 
@@ -423,7 +423,7 @@ cannot be made correct first.
 
 Two smaller but immediate items sit in this layer:
 
-- ~~**Persistent server context.** `chat.rs:491` discards the `GraphCache` per
+- ~~**Persistent server context.** `chat.rs:508` discards the `GraphCache` per
   request. The comment justifies it as avoiding cross-request KV contamination
   (a real bug fixed in doc 97) — but the correct fix is sequence-aware KV
   invalidation (§2.4), not discarding the whole cache. As written, every request
@@ -439,7 +439,7 @@ Two smaller but immediate items sit in this layer:
   `forward_graph_cached`; the speculative path calls both models' forwards
   directly (`spec.rs`) and the tokenizer, sampler and stop-string paths were
   bare. A panic in any of them unwound `worker_loop`, dropping the bounded job
-  channel (capacity 64, `server/mod.rs:68`) — later requests got 503 — and the
+  channel (capacity 64, `server/mod.rs:69`) — later requests got 503 — and the
   queued jobs' `StreamEvent` senders, ending their SSE
   (Server-Sent Events) stream after an empty `[DONE]` rather than an error
   (`server/mod.rs:`). The whole per-job body now runs under
