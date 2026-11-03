@@ -498,6 +498,11 @@ fn strftime_now_uses_the_injected_clock_and_is_reproducible() {
     let b = render(tmpl).unwrap();
     assert_eq!(a, "2026-10-18T12:24:52");
     assert_eq!(a, b, "a fixed clock must render the same bytes twice");
+    // #723: the Llama 3.1/3.2 template's header date (`%d %b %Y`).
+    assert_eq!(
+        format_civil(fixed_clock(), "%d %b %Y").unwrap(),
+        "18 Oct 2026"
+    );
 }
 
 #[test]

@@ -68,6 +68,8 @@ impl ModelDef for FailingForward {
         SpecialTokens {
             eos: 0,
             im_end: None,
+            eot: None,
+            eom: None,
         }
     }
 

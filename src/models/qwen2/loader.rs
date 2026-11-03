@@ -22,6 +22,8 @@ pub struct HParams {
     pub rope_freq_scale: f32,
     pub eos_token_id: u32,
     pub im_end_token_id: Option<u32>,
+    pub eot_token_id: Option<u32>,
+    pub eom_token_id: Option<u32>,
     pub rope_style: RopeStyle,
     /// Actual KV embedding dimension (ne[1] of K weight).
     /// May differ from `n_head_kv * n_embd_head()` when the model uses
@@ -128,8 +130,23 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
     let n_ff = get_i64(ctx, "qwen2.feed_forward_length")
         .or_else(|| get_i64(ctx, "llama.feed_forward_length"))?;
 
+    // #723: the rope layout is the **architecture's**, not the family's. llama.cpp's
+    // `llama_model_rope_type` puts LLM_ARCH_LLAMA in the "normal RoPE, operating on
+    // pairs of consecutive head values" branch (`llama-model.cpp:3513-3515`) and
+    // Qwen2 in the NeoX branch, so the same loader has to ask the file which one
+    // it is. Ignoring this rotates every position with the wrong pairing: the
+    // values differ at every position, and a greedy run diverges immediately.
+    let rope_style = rope_style_for(ctx.get_key_val_str("general.architecture").as_deref());
+
     let eos = get_u32(ctx, "tokenizer.ggml.eos_token_id").unwrap_or(0);
     let im_end = find_token_id(ctx, "<|im_end|>").or(Some(eos));
+    // #723: Llama 3.x declares EOT/EOM as roles when the converter writes them,
+    // and only as vocabulary entries when it does not — llama.cpp looks the id
+    // up first and falls back to the token text (`llama-vocab.cpp:3012-3041`).
+    let eot =
+        get_u32(ctx, "tokenizer.ggml.eot_token_id").or_else(|| find_token_id(ctx, "<|eot_id|>"));
+    let eom =
+        get_u32(ctx, "tokenizer.ggml.eom_token_id").or_else(|| find_token_id(ctx, "<|eom_id|>"));
 
     Some(HParams {
         n_embd,
@@ -152,9 +169,24 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
             .unwrap_or(1.0),
         eos_token_id: eos,
         im_end_token_id: im_end,
-        rope_style: RopeStyle::NonInterleaved,
+        eot_token_id: eot,
+        eom_token_id: eom,
+        rope_style,
         n_kv_embd: n_head_kv * (n_embd / n_head), // default, updated from K weight shape below
     })
+}
+
+/// #723: the rope layout is the **architecture's**, not the family's. llama.cpp's
+/// `llama_model_rope_type` puts `LLM_ARCH_LLAMA` in the "normal RoPE, operating on
+/// pairs of consecutive head values" branch (`llama-model.cpp:3513-3515`) and the
+/// Qwen families in the NeoX (half-split) branch. The same loader serves both, so
+/// it asks the file which one it is; ignoring this rotates every position with the
+/// wrong pairing and a greedy run diverges from the first token.
+fn rope_style_for(arch: Option<&str>) -> RopeStyle {
+    match arch {
+        Some("llama") => RopeStyle::Interleaved,
+        _ => RopeStyle::NonInterleaved,
+    }
 }
 
 fn find_token_id(ctx: &GgufContext, target: &str) -> Option<u32> {
@@ -699,3 +731,6 @@ pub fn load(
     }
     Some(model)
 }
+
+#[cfg(test)]
+mod tests;

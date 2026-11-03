@@ -269,6 +269,8 @@ fn compile_grammar_turns_an_unsupported_schema_into_a_400() {
     let special = crate::models::SpecialTokens {
         eos: 0,
         im_end: None,
+        eot: None,
+        eom: None,
     };
 
     let req = ChatCompletionRequest::parse(

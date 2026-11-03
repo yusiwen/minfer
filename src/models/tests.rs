@@ -35,3 +35,31 @@ fn every_device_gathers_the_attn_map() {
         assert!(d.gathers_attn_map(), "{d:?} must gather a kv_map window");
     }
 }
+
+/// #723: a Llama file can declare an eos that is **not** its `<|eot_id|>` (the
+/// cached 3.2 file sets eos = eot, which is why the real-model run cannot show
+/// this), so the roles have to stand on their own rather than riding on the eos
+/// fallback.
+#[test]
+fn the_stop_set_is_eos_plus_the_declared_roles() {
+    let special = SpecialTokens {
+        eos: 1,
+        im_end: None,
+        eot: Some(2),
+        eom: Some(3),
+    };
+    assert!(special.is_stop(1), "eos is a stop id");
+    assert!(special.is_stop(2), "eot is a stop id");
+    assert!(special.is_stop(3), "eom is a stop id");
+    assert!(!special.is_stop(4), "an ordinary id is not");
+
+    // A Qwen-shaped set has no eot/eom, and its im_end still stops.
+    let qwen = SpecialTokens {
+        eos: 151645,
+        im_end: Some(151645),
+        eot: None,
+        eom: None,
+    };
+    assert!(qwen.is_stop(151645));
+    assert!(!qwen.is_stop(151646));
+}

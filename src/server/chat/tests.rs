@@ -75,6 +75,8 @@ fn stop_token_matches_eos_and_im_end() {
     let special = SpecialTokens {
         eos: 2,
         im_end: Some(7),
+        eot: None,
+        eom: None,
     };
     assert!(is_stop_token(2, &special));
     assert!(is_stop_token(7, &special));

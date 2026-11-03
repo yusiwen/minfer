@@ -349,6 +349,22 @@ pub trait ModelDef: Send + Sync {
 pub struct SpecialTokens {
     pub eos: u32,
     pub im_end: Option<u32>,
+    /// `tokenizer.ggml.eot_token_id`, or the vocabulary's `<|eot_id|>` token
+    /// (Llama 3.x). `None` for the Qwen families.
+    pub eot: Option<u32>,
+    /// `tokenizer.ggml.eom_token_id`, or the vocabulary's `<|eom_id|>` token
+    /// (Llama 3.1 tool turns). `None` for the Qwen families.
+    pub eom: Option<u32>,
+}
+
+impl SpecialTokens {
+    /// End of generation, as llama.cpp defines it: `special_eog_ids` is the
+    /// declared EOS plus the EOT/EOM roles (`llama-vocab.cpp:3275-3282`), so a
+    /// Llama turn that ends in `<|eot_id|>` or hands back a tool call with
+    /// `<|eom_id|>` stops exactly like one that ends in EOS.
+    pub fn is_stop(&self, id: u32) -> bool {
+        id == self.eos || Some(id) == self.im_end || Some(id) == self.eot || Some(id) == self.eom
+    }
 }
 
 /// Load a model from GGUF (single file or multi-part split), dispatching on
@@ -399,6 +415,13 @@ pub fn load_model_configured(
     let mut loaded: Box<dyn ModelDef> = match arch.as_str() {
         "qwen2" => Box::new(qwen2::loader::load(model, ns, offload)?),
         "qwen3" => Box::new(qwen3::loader::load(model, ns, offload)?),
+        // #723: Llama 3.1/3.2/3.3 dense. The loader and graph are the dense
+        // Qwen2 ones by construction: the loader reads `llama.*` metadata, ties
+        // `output.weight` to `token_embd` when the file has no lm_head, and
+        // tolerates a missing attention bias; the graph already runs the
+        // unfused chain when a bias is absent. What is Llama-specific is the
+        // stop set (`<|eot_id|>` / `<|eom_id|>`), resolved from the file.
+        "llama" => Box::new(qwen2::loader::load(model, ns, offload)?),
         other => {
             eprintln!("Unsupported architecture: '{}'", other);
             return None;
