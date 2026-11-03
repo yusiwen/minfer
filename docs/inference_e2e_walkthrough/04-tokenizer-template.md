@@ -579,8 +579,8 @@ determines its length (1 for ASCII, 2–4 for multi-byte, judged by the
 `0xC0`/`0xE0`/`0xF0` masks on the top bits), so the function scans forward
 until the next character would run past the end of the buffer, and returns the
 offset where the complete prefix ends — everything from there onward waits for
-the next token. The callers wire it into per-step emission: `server/chat.rs:162`
-appends newly decoded bytes to a full accumulator and `server/chat.rs:176`
+the next token. The callers wire it into per-step emission: `server/chat.rs:179`
+appends newly decoded bytes to a full accumulator and `server/chat.rs:193`
 flushes up to `emitted + complete_utf8_prefix_len(&full[emitted..])`;
 `conversation.rs:548/564` does the same for the REPL. (The CLI decode loop
 instead writes raw bytes straight to stdout and lets the terminal assemble the
