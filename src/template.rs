@@ -678,7 +678,17 @@ fn utc_now() -> CivilTime {
 /// The `strftime` directive subset `strftime_now` implements. The full CPython
 /// set is deliberately not claimed: an unknown directive is refused by name, the
 /// same policy the `str` methods follow.
-const SUPPORTED_STRFTIME: &str = "%Y %y %m %d %H %M %S %F %T %%";
+///
+/// `%b` is here because the published Llama 3.1/3.2 template formats its header
+/// date as `strftime_now("%d %b %Y")` — the one directive its render needs that
+/// the original six did not cover (#723).
+const SUPPORTED_STRFTIME: &str = "%Y %y %m %d %H %M %S %F %T %b %%";
+
+/// C-locale month abbreviations, which is what CPython's `time.strftime("%b")`
+/// produces unless `setlocale` changed it.
+const MONTH_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 pub(crate) fn format_civil(t: CivilTime, fmt: &str) -> Result<String, String> {
     let mut out = String::new();
@@ -699,6 +709,7 @@ pub(crate) fn format_civil(t: CivilTime, fmt: &str) -> Result<String, String> {
             'H' => out.push_str(&format!("{:02}", t.hour)),
             'M' => out.push_str(&format!("{:02}", t.minute)),
             'S' => out.push_str(&format!("{:02}", t.second)),
+            'b' => out.push_str(MONTH_ABBR[(t.month.clamp(1, 12) - 1) as usize]),
             'F' => out.push_str(&format!("{:04}-{:02}-{:02}", t.year, t.month, t.day)),
             'T' => out.push_str(&format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)),
             '%' => out.push('%'),

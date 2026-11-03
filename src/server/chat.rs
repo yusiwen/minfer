@@ -42,7 +42,7 @@ pub struct Job {
 }
 
 pub(crate) fn is_stop_token(id: u32, special: &SpecialTokens) -> bool {
-    id == special.eos || Some(id) == special.im_end
+    special.is_stop(id)
 }
 
 /// B2: length of the common token prefix of the slot's recorded sequence and

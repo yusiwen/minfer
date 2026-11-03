@@ -32,6 +32,8 @@ pub struct HParams {
     pub rope_freq_scale: f32,
     pub eos_token_id: u32,
     pub im_end_token_id: Option<u32>,
+    pub eot_token_id: Option<u32>,
+    pub eom_token_id: Option<u32>,
     pub rope_style: RopeStyle,
     /// Per-head Q/K dim — DECOUPLED from `n_embd / n_head` in Qwen3; read from
     /// `qwen3.attention.key_length` (128 for the 0.6B, vs n_embd/n_head = 64).
@@ -148,6 +150,10 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
 
     let eos = get_u32(ctx, "tokenizer.ggml.eos_token_id").unwrap_or(0);
     let im_end = find_token_id(ctx, "<|im_end|>").or(Some(eos));
+    let eot =
+        get_u32(ctx, "tokenizer.ggml.eot_token_id").or_else(|| find_token_id(ctx, "<|eot_id|>"));
+    let eom =
+        get_u32(ctx, "tokenizer.ggml.eom_token_id").or_else(|| find_token_id(ctx, "<|eom_id|>"));
 
     Some(HParams {
         n_embd,
@@ -170,6 +176,8 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
             .unwrap_or(1.0),
         eos_token_id: eos,
         im_end_token_id: im_end,
+        eot_token_id: eot,
+        eom_token_id: eom,
         rope_style: RopeStyle::NonInterleaved,
         n_embd_head,
         n_kv_embd: n_head_kv * n_embd_head, // default, updated from K weight shape below

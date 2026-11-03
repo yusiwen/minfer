@@ -2008,7 +2008,7 @@ fn main() {
 }
 
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
-    id == special.eos || Some(id) == special.im_end
+    special.is_stop(id)
 }
 
 /// Colors the Qwen3-style `<think>…</think>` block gray so the reasoning

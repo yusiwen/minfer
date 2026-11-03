@@ -62,6 +62,8 @@ fn app_state(metrics: Arc<ServerMetrics>) -> (Arc<AppState>, mpsc::Receiver<Job>
         special: crate::models::SpecialTokens {
             eos: 0,
             im_end: None,
+            eot: None,
+            eom: None,
         },
         spec_enabled: false,
         chat_template: None,

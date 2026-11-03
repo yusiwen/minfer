@@ -112,7 +112,12 @@ impl ModelDef for Qwen3Model {
     fn special_tokens(&self) -> SpecialTokens {
         let eos = self.hparams.eos_token_id;
         let im_end = self.hparams.im_end_token_id;
-        SpecialTokens { eos, im_end }
+        SpecialTokens {
+            eos,
+            im_end,
+            eot: self.hparams.eot_token_id,
+            eom: self.hparams.eom_token_id,
+        }
     }
 
     fn n_layer(&self) -> usize {
