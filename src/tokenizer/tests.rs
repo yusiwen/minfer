@@ -413,6 +413,84 @@ fn the_jina_v1_en_rule_is_the_plain_gpt2_split() {
     assert_eq!(G.number_run(), usize::MAX);
 }
 
+/// #727: the rest of llama.cpp's `LLAMA_VOCAB_PRE_TYPE_GPT2` **regex group** —
+/// `mpt`, `olmo`, `jais`, `trillion`, `granite-docling` share the plain GPT-2
+/// pattern, so each is `jina-v1-en`'s rule by value rather than a new split.
+/// The oracle is the group's single regex (`llama-vocab.cpp:372-380` at
+/// `c479922ac`); no member sets `ignore_merges`.
+#[test]
+fn the_gpt2_regex_group_aliases_jina_v1_en() {
+    let corpus = [
+        "hello world",
+        "a  b",
+        "x\n\ny",
+        "it's!!!",
+        "1234567890",
+        " 12 345",
+        "a\tb\nc",
+        "don't stop",
+        "",
+    ];
+    for pre in ["mpt", "olmo", "jais", "trillion", "granite-docling"] {
+        let rule = PreTokenizer::from_gguf(Some(pre)).unwrap_or_else(|e| panic!("{pre}: {e}"));
+        assert_eq!(rule, PreTokenizer::JinaV1En, "{pre} must be the GPT-2 rule");
+        for text in corpus {
+            assert_eq!(
+                rule.split(text),
+                PreTokenizer::JinaV1En.split(text),
+                "{pre} split differs on {text:?}"
+            );
+        }
+        // The two arms that would change under the llama3 rule, asserted from the
+        // literal GPT-2 shape so the check is not tautological for an alias.
+        assert_eq!(
+            rule.split("1234567890"),
+            vec!["1234567890"],
+            "{pre} must not group digits in threes"
+        );
+        assert_eq!(
+            rule.split("a  b"),
+            vec!["a", " ", " b"],
+            "{pre} must use the GPT-2 space arm"
+        );
+        assert!(!rule.ignores_merges(), "{pre} must not set ignore_merges");
+        assert!(!rule.applies_nfc(), "{pre} must not normalize");
+    }
+}
+
+/// #727: `smaug-bpe`/`dbrx` take **llama3's** pattern (`llama-vocab.cpp:302-307`
+/// at `c479922ac`, "same as llama3") but not its `ignore_merges` flag — the split
+/// is `llama-bpe`'s and the whole-piece shortcut stays off, which is exactly the
+/// combination neither `LlamaBpe` nor `JinaV1En` carries.
+#[test]
+fn smaug_and_dbrx_split_like_llama3_without_the_merge_shortcut() {
+    let corpus = [
+        "hello world",
+        "a  b",
+        "x\n\ny",
+        "it's!!!",
+        "1234567890",
+        "a\tb\nc",
+        "",
+    ];
+    for pre in ["smaug-bpe", "dbrx"] {
+        let rule = PreTokenizer::from_gguf(Some(pre)).unwrap_or_else(|e| panic!("{pre}: {e}"));
+        for text in corpus {
+            assert_eq!(
+                rule.split(text),
+                PreTokenizer::LlamaBpe.split(text),
+                "{pre} split differs on {text:?}"
+            );
+        }
+        assert!(!rule.ignores_merges(), "{pre} must not set ignore_merges");
+        assert!(!rule.applies_nfc(), "{pre} must not normalize");
+    }
+    // The distinction is real: the llama3 values do set the flag.
+    assert!(PreTokenizer::from_gguf(Some("llama-bpe"))
+        .unwrap()
+        .ignores_merges());
+}
+
 // === #132 S4: the whitespace engine =======================================
 
 #[test]
@@ -1283,6 +1361,22 @@ fn pre_tokenizer_selection_refuses_unknown_and_missing() {
         PreTokenizer::from_gguf(Some("lfm2")).unwrap(),
         PreTokenizer::Lfm2
     );
+    // #727: the llama3-regex pair without the merge shortcut, and the GPT-2 group.
+    assert_eq!(
+        PreTokenizer::from_gguf(Some("smaug-bpe")).unwrap(),
+        PreTokenizer::SmaugDbrx
+    );
+    assert_eq!(
+        PreTokenizer::from_gguf(Some("dbrx")).unwrap(),
+        PreTokenizer::SmaugDbrx
+    );
+    for pre in ["mpt", "olmo", "jais", "trillion", "granite-docling"] {
+        assert_eq!(
+            PreTokenizer::from_gguf(Some(pre)).unwrap(),
+            PreTokenizer::JinaV1En,
+            "{pre} must resolve to the GPT-2 rule"
+        );
+    }
     let err = PreTokenizer::from_gguf(Some("starcoder")).unwrap_err();
     assert!(
         err.contains("starcoder"),
@@ -1621,6 +1715,9 @@ impl PreTokenizer {
             Self::Qwen35 => "qwen35",
             Self::LlamaBpe => "llama-bpe",
             Self::Lfm2 => "lfm2",
+            // One variant covers two values: this is the canonical spelling, and a
+            // future fixture for the other one would have to declare the alias.
+            Self::SmaugDbrx => "smaug-bpe",
             Self::Gemma4 => "gemma4",
             Self::Whitespace => "whitespace",
             Self::JinaV1En => "jina-v1-en",
