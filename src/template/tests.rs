@@ -572,6 +572,10 @@ const CHAT_FIXTURES: &[(&str, &str)] = &[
         "qwen3-0.6b",
         include_str!("../../tests/fixtures/chat/qwen3-0.6b.json"),
     ),
+    (
+        "llama32-1b-instruct",
+        include_str!("../../tests/fixtures/chat/llama32-1b-instruct.json"),
+    ),
 ];
 
 #[test]
@@ -619,8 +623,21 @@ fn model_templates_render_byte_for_byte() {
                 .collect();
             let add_gen = case["add_generation_prompt"].as_bool().unwrap();
             let expected = case["expected"].as_str().unwrap();
-            let got = render_messages(template, &msgs, add_gen, bos)
-                .unwrap_or_else(|e| panic!("{slug}/{name} refused: {}", e.message()));
+            // A template that reads the clock (`strftime_now`) would make the
+            // fixture a daily diff; such a fixture records the instant it was
+            // rendered at, and the gate renders at the same one.
+            let got = match fx["clock_unix"].as_i64() {
+                Some(unix) => render_at(
+                    civil_from_unix(unix),
+                    Some(template),
+                    &messages_from_parts(&msgs),
+                    None,
+                    add_gen,
+                    bos,
+                ),
+                None => render_messages(template, &msgs, add_gen, bos),
+            }
+            .unwrap_or_else(|e| panic!("{slug}/{name} refused: {}", e.message()));
             assert_eq!(
                 got, expected,
                 "{slug}/{name}: rendered prompt differs from the transformers reference\n\
@@ -682,8 +699,18 @@ fn an_override_file_renders_the_committed_reference_byte_for_byte() {
                 })
                 .collect();
             let add_gen = case["add_generation_prompt"].as_bool().unwrap();
-            let got = render_messages(&resolved, &msgs, add_gen, bos)
-                .unwrap_or_else(|e| panic!("{slug}/{name} refused: {}", e.message()));
+            let got = match fx["clock_unix"].as_i64() {
+                Some(unix) => render_at(
+                    civil_from_unix(unix),
+                    Some(&resolved),
+                    &messages_from_parts(&msgs),
+                    None,
+                    add_gen,
+                    bos,
+                ),
+                None => render_messages(&resolved, &msgs, add_gen, bos),
+            }
+            .unwrap_or_else(|e| panic!("{slug}/{name} refused: {}", e.message()));
             assert_eq!(
                 got,
                 case["expected"].as_str().unwrap(),
@@ -693,8 +720,8 @@ fn an_override_file_renders_the_committed_reference_byte_for_byte() {
         }
     }
     assert_eq!(
-        cases_checked, 28,
-        "4 fixtures x 7 cases must all be checked through the override"
+        cases_checked, 35,
+        "5 fixtures x 7 cases must all be checked through the override"
     );
 }
 
