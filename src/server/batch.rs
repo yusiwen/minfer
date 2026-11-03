@@ -111,6 +111,12 @@ struct SlotState {
 
 /// One in-flight request's decoding state.
 struct Run {
+    /// #726: the request id (from [`Job`]), so the finished line names the same
+    /// request the admitted line did.
+    id: String,
+    /// #726: when the engine started placing this request (before its prefill),
+    /// which is what the finished line's `ms` measures.
+    admitted: std::time::Instant,
     tx: mpsc::Sender<StreamEvent>,
     params: SamplingParams,
     /// F3 (#48): the request's sampler configuration, resolved once (it owns the
@@ -558,11 +564,14 @@ impl BatchEngine {
             return;
         };
         match self.save_slots(&path) {
-            Ok((bytes, slots)) => eprintln!(
+            Ok((bytes, slots)) => crate::server::log::debug(format_args!(
                 "[server] slot snapshot: {slots} slot(s), {bytes} byte(s) → {}",
                 path.display()
-            ),
-            Err(e) => eprintln!("[server] slot snapshot failed ({}): {e}", path.display()),
+            )),
+            Err(e) => crate::server::log::warn(format_args!(
+                "[server] slot snapshot failed ({}): {e}",
+                path.display()
+            )),
         }
     }
 
@@ -628,14 +637,16 @@ impl BatchEngine {
                 self.slots[idx].cap = slot.cap;
                 // Say it once per growth: a reclaimed slot's prefix hint is gone and
                 // rows may have moved, and silence would make both invisible.
-                eprintln!(
+                crate::server::log::info(format_args!(
                     "[server] slot {idx}: capacity {before} -> {} cells for a request wanting \
                      {want} (released {reclaimed} idle slot(s); {} run(s) moved)",
                     slot.cap,
                     moves.len()
-                );
+                ));
             }
-            Err(e) => eprintln!("[server] slot {idx}: cannot grow to {want} cells ({e})"),
+            Err(e) => crate::server::log::warn(format_args!(
+                "[server] slot {idx}: cannot grow to {want} cells ({e})"
+            )),
         }
     }
 
@@ -822,16 +833,16 @@ impl BatchEngine {
             Ok(()) => {
                 self.slots[idx].cached_tokens = self.slots[src].cached_tokens[..rows].to_vec();
                 self.prefix_rows_copied += rows;
-                eprintln!(
+                crate::server::log::info(format_args!(
                     "[server] slot {idx}: {verb} {rows} prefix row(s) from slot {src} instead of \
                      prefilling them"
-                );
+                ));
                 rows
             }
             Err(e) => {
-                eprintln!(
+                crate::server::log::warn(format_args!(
                     "[server] slot {idx}: prefix {fail} from slot {src} failed ({e}); prefilling"
-                );
+                ));
                 own
             }
         }
@@ -927,12 +938,12 @@ impl BatchEngine {
         let logits = guarded_forward_batch(model, &batch, 1, self.n_ctx_total, &mut self.cache)
             .map_err(|e| e.message)?;
         if trace {
-            eprintln!(
+            crate::server::log::debug(format_args!(
                 "[batch] batched prefill: {} prompts, {} tokens, {:.0} ms",
                 placed.len(),
                 batch.len(),
                 t0.elapsed().as_secs_f64() * 1e3
-            );
+            ));
         }
         let k = placed.len();
         if logits.len() % k != 0 {
@@ -1088,18 +1099,21 @@ impl BatchEngine {
             if i + 1 < n_spans && self.has_pending_decode() {
                 self.interleaved_ticks += 1;
                 if let Err(e) = self.tick(model, tokenizer) {
-                    eprintln!("[server] interleaved decode step failed: {}", e.message);
+                    crate::server::log::error(format_args!(
+                        "[server] interleaved decode step failed: {}",
+                        e.message
+                    ));
                 }
             }
         }
         if trace {
-            eprintln!(
+            crate::server::log::debug(format_args!(
                 "[batch] single prefill: slot {idx}, {} tokens in {n_spans} forward(s) \
                  (n_batch {}), {:.0} ms",
                 nt - feed_from,
                 self.n_batch,
                 t0.elapsed().as_secs_f64() * 1e3
-            );
+            ));
         }
         if live_on {
             crate::live::attach_step(&last_logits);
@@ -1114,12 +1128,12 @@ impl BatchEngine {
         self.prefill_fed += nt - feed_from;
         let track = !std::env::var("MINFER_NO_PREFIX_REUSE").map_or(false, |v| v == "1");
         if track {
-            eprintln!(
+            crate::server::log::info(format_args!(
                 "[server] slot {idx} prefill fed {}/{} prompt tokens ({} reused from its KV)",
                 nt - feed_from,
                 nt,
                 feed_from
-            );
+            ));
         }
         self.slots[idx].cached_tokens.clear();
         if track {
@@ -1131,6 +1145,8 @@ impl BatchEngine {
         let cfg = job.params.sampler_config();
         let grammar_state = cfg.grammar.as_ref().map(|g| g.state());
         self.slots[idx].run = Some(Run {
+            id: job.id.clone(),
+            admitted: job.admitted,
             tx: job.tx,
             mirostat: crate::sampler::MirostatState::new(cfg.mirostat_tau),
             grammar_state,
@@ -1236,14 +1252,14 @@ impl BatchEngine {
                         )
                     })
                     .collect();
-                eprintln!("[batch] rows: {}", rows_desc.join(" "));
-                eprintln!(
+                crate::server::log::debug(format_args!("[batch] rows: {}", rows_desc.join(" ")));
+                crate::server::log::debug(format_args!(
                     "[batch] decode step: {} sequence(s), {} tokens, {:.1} ms ({:.1} ms/token)",
                     rows.len(),
                     batch.len(),
                     t0.elapsed().as_secs_f64() * 1e3,
                     t0.elapsed().as_secs_f64() * 1e3 / batch.len() as f64
-                );
+                ));
             }
             let nv = logits.len() / rows.len();
             debug_assert_eq!(logits.len(), nv * rows.len());
@@ -1355,7 +1371,7 @@ impl BatchEngine {
             Err(e) => {
                 // The grammar allows nothing more: end the turn with the reason
                 // printed. Everything already delivered is a valid prefix.
-                eprintln!("[grammar] {e}");
+                crate::server::log::warn(format_args!("[grammar] {e}"));
                 return Ok(StepOutcome::Finish("stop"));
             }
         };
@@ -1449,11 +1465,11 @@ impl BatchEngine {
         for &idx in rows {
             self.fail(idx, e.clone());
         }
-        eprintln!(
+        crate::server::log::error(format_args!(
             "[server] decode step failed ({}); answered {} run(s) and released their slot(s)",
             e.message,
             rows.len()
-        );
+        ));
     }
 
     /// #196: answer **every** run still occupying a slot — the `fail_batch` shape
@@ -1538,12 +1554,23 @@ impl BatchEngine {
                 }
             }
             if complete < run.full.len() {
-                eprintln!(
+                crate::server::log::warn(format_args!(
                     "[server] dropped {} trailing byte(s) of an incomplete UTF-8 character",
                     run.full.len() - complete
-                );
+                ));
             }
         }
+        crate::server::log::event(
+            crate::server::log::Level::Info,
+            "request.finished",
+            &[
+                ("id", &run.id),
+                ("slot", &idx.to_string()),
+                ("reason", &reason),
+                ("tokens", &run.completion_tokens.to_string()),
+                ("ms", &run.admitted.elapsed().as_millis().to_string()),
+            ],
+        );
         let _ = run.tx.blocking_send(StreamEvent::Finish {
             reason: reason.clone(),
             tokens: run.completion_tokens,
@@ -1751,14 +1778,22 @@ pub fn serve_loop(
                 metrics
                     .jobs_dropped_total
                     .fetch_add(queued, std::sync::atomic::Ordering::Relaxed);
-                eprintln!("[server] drain: answered {queued} queued job(s) with 503");
+                crate::server::log::warn(format_args!(
+                    "[server] drain: answered {queued} queued job(s) with 503"
+                ));
             }
         } else {
             // Admit at most one job per idle slot, oldest first, so every admitted
             // job finds a slot and a younger arrival cannot overtake an older one.
+            // #726: the queue depth at admission — what is waiting in the worker's
+            // deque plus what is still in the transport channel.
+            let queued = pending.len() + job_rx.len();
             let take = engine.idle_slots().min(pending.len());
             if take > 0 {
                 let group: Vec<Job> = pending.drain(..take).collect();
+                // The ids before `admit` consumes the jobs: the two lines of one
+                // request must name the same id, and `admit` returns slots only.
+                let ids: Vec<String> = group.iter().map(|j| j.id.clone()).collect();
                 // `admitted` counts every job that *left* the queue (whether the
                 // engine could place it or not), so `requests_total - admitted` is
                 // exactly what is still waiting and cannot drift on a rejection.
@@ -1766,11 +1801,31 @@ pub fn serve_loop(
                     .jobs_admitted_total
                     .fetch_add(take as u64, std::sync::atomic::Ordering::Relaxed);
                 let answers = engine.admit(model, tokenizer, group);
-                let dropped = answers.iter().filter(|r| r.is_err()).count() as u64;
-                for r in answers {
-                    if let Err(e) = r {
-                        // The engine could not place the request (no idle slot).
-                        eprintln!("[server] job rejected: {}", e.message);
+                let mut dropped = 0u64;
+                for (id, answer) in ids.iter().zip(answers) {
+                    match answer {
+                        Ok(slot) => crate::server::log::event(
+                            crate::server::log::Level::Info,
+                            "request.admitted",
+                            &[
+                                ("id", id),
+                                ("slot", &slot.to_string()),
+                                ("queued", &queued.to_string()),
+                            ],
+                        ),
+                        Err(e) => {
+                            // The engine could not place the request (no idle slot).
+                            dropped += 1;
+                            crate::server::log::event(
+                                crate::server::log::Level::Error,
+                                "request.rejected",
+                                &[
+                                    ("id", id),
+                                    ("queued", &queued.to_string()),
+                                    ("reason", &e.message),
+                                ],
+                            );
+                        }
                     }
                 }
                 if dropped > 0 {
@@ -1796,9 +1851,9 @@ pub fn serve_loop(
                 metrics
                     .jobs_dropped_total
                     .fetch_add(overflow as u64, std::sync::atomic::Ordering::Relaxed);
-                eprintln!(
+                crate::server::log::warn(format_args!(
                     "[server] queue full ({queue_max} waiting): answered {overflow} job(s) with 503"
-                );
+                ));
             }
         }
         metrics
@@ -1833,13 +1888,13 @@ pub fn serve_loop(
                             metrics
                                 .worker_pending
                                 .store(0, std::sync::atomic::Ordering::Relaxed);
-                            eprintln!(
+                            crate::server::log::error(format_args!(
                                 "[server] the worker stalled: {STALL_STEP_LIMIT} consecutive \
                                  steps left the engine busy without advancing its work counter \
                                  ({} run(s), {} queued job(s) answered with 500); stopping the \
                                  worker",
                                 runs, queued
-                            );
+                            ));
                             engine.publish_metrics(metrics);
                             break;
                         }
@@ -1848,7 +1903,7 @@ pub fn serve_loop(
                     }
                 }
                 Err(e) => {
-                    eprintln!("[server] step failed: {}", e.message);
+                    crate::server::log::error(format_args!("[server] step failed: {}", e.message));
                     // #151: `tick` answered the failed batch and released its
                     // slots before returning this error, so the engine moved even
                     // though `work_units` did not. That is progress, not a wedge.
@@ -1863,10 +1918,10 @@ pub fn serve_loop(
             let lagging = engine
                 .fail_lagging_runs(RUN_STALL_STEP_LIMIT, &ApiError::server(RUN_STALLED_MESSAGE));
             if lagging > 0 {
-                eprintln!(
+                crate::server::log::warn(format_args!(
                     "[server] {lagging} run(s) made no progress for {RUN_STALL_STEP_LIMIT} \
                      step(s); answered 500 and released their slot(s)"
-                );
+                ));
             }
         }
         engine.publish_metrics(metrics);

@@ -34,6 +34,8 @@ fn serve_on(
             tok,
             slot,
             Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: prompt,
                 params: sampling_params(max_tokens),
                 tx,

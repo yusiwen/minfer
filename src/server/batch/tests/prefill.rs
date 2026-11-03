@@ -113,6 +113,8 @@ fn a_chunked_prefill_answers_like_an_unchunked_one() {
                 &*model,
                 &tok,
                 Job {
+                    id: String::new(),
+                    admitted: std::time::Instant::now(),
                     input_ids: ids.clone(),
                     params: sampling_params(8),
                     tx,
@@ -266,6 +268,8 @@ fn a_repeated_chunked_prefill_stops_rebuilding() {
                 &*model,
                 &tok,
                 Job {
+                    id: String::new(),
+                    admitted: std::time::Instant::now(),
                     input_ids: ids.clone(),
                     params: sampling_params(4),
                     tx,
@@ -330,6 +334,8 @@ fn a_long_prefill_keeps_another_slot_decoding() {
                 &tok,
                 1,
                 Job {
+                    id: String::new(),
+                    admitted: std::time::Instant::now(),
                     input_ids: short.clone(),
                     params: sampling_params(48),
                     tx: tx1,
@@ -359,6 +365,8 @@ fn a_long_prefill_keeps_another_slot_decoding() {
                 &tok,
                 0,
                 Job {
+                    id: String::new(),
+                    admitted: std::time::Instant::now(),
                     input_ids: long.clone(),
                     params: sampling_params(4),
                     tx: tx0,

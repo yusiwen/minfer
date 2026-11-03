@@ -72,6 +72,16 @@ pub fn run_viz(
     // validated before the model loaded; the resolver below still re-checks it.
     template_override: Option<&str>,
 ) {
+    // #726: resolve the log threshold once, before any worker or handler exists,
+    // so a level cannot change under a running request and a typo is a named
+    // refusal rather than a silent default.
+    match crate::server::log::from_env() {
+        Ok(level) => crate::server::log::init(level),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = super::slot::new_slots(n_slots, n_ctx);
     let n_ctx_slot = n_ctx / n_slots.max(1);
@@ -457,6 +467,8 @@ async fn viz_run(State(state): State<Arc<VizState>>, body: String) -> Response {
         .app
         .job_tx
         .send(Job {
+            id: format!("viz-{}", uuid::Uuid::new_v4().simple()),
+            admitted: std::time::Instant::now(),
             input_ids,
             params,
             tx,

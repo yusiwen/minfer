@@ -108,6 +108,8 @@ fn install_pending_run(
     let rng = StdRng::seed_from_u64(params.seed);
     engine.slots[idx].cached_tokens = vec![1, 2, 3];
     engine.slots[idx].run = Some(Run {
+        id: String::new(),
+        admitted: std::time::Instant::now(),
         tx,
         params,
         cfg,
@@ -351,6 +353,8 @@ fn the_stall_answers_every_queued_job_exactly_once() {
         let (tx, rx) = mpsc::channel::<StreamEvent>(8);
         rxs.push(rx);
         let job = Job {
+            id: String::new(),
+            admitted: std::time::Instant::now(),
             input_ids: vec![1, 2, 3],
             params: sampling_params(2),
             tx,
@@ -503,6 +507,8 @@ fn a_spinning_run_is_answered_and_the_worker_keeps_serving() {
         rxs.push(rx);
         job_tx
             .blocking_send(Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: tok.encode(prompt),
                 params: sampling_params(8),
                 tx,

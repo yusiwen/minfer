@@ -6,6 +6,7 @@
 
 pub mod batch;
 pub mod chat;
+pub mod log;
 pub mod metrics;
 pub mod slot;
 pub mod toolcall;
@@ -115,6 +116,16 @@ pub fn run(
     // resolver below still re-checks the winner.
     template_override: Option<&str>,
 ) {
+    // #726: resolve the log threshold once, before any worker or handler exists,
+    // so a level cannot change under a running request and a typo is a named
+    // refusal rather than a silent default.
+    match crate::server::log::from_env() {
+        Ok(level) => crate::server::log::init(level),
+        Err(e) => {
+            crate::server::log::info(format_args!("Error: {e}"));
+            std::process::exit(1);
+        }
+    }
     let (job_tx, job_rx) = mpsc::channel::<Job>(64);
     let slots = slot::new_slots(n_slots, n_ctx);
     let n_ctx_slot = n_ctx / n_slots.max(1);
@@ -132,12 +143,12 @@ pub fn run(
         Err(e) => {
             // #601: a refused startup is a non-zero exit, like every other one in
             // this function (the bind failure below uses the same status).
-            eprintln!("Error: {}", e.message());
+            crate::server::log::info(format_args!("Error: {}", e.message()));
             std::process::exit(1);
         }
     };
     if startup.announce_chatml {
-        eprintln!("{}", crate::template::CHATML_NOTICE);
+        crate::server::log::warn(format_args!("{}", crate::template::CHATML_NOTICE));
     }
     let template = startup.text;
 
@@ -191,15 +202,15 @@ pub fn run(
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .unwrap_or_else(|e| {
-                eprintln!("Error: failed to bind {addr}: {e}");
+                crate::server::log::warn(format_args!("Error: failed to bind {addr}: {e}"));
                 std::process::exit(1);
             });
-        eprintln!("minfer server listening on http://{addr}");
-        eprintln!(
+        crate::server::log::error(format_args!("minfer server listening on http://{addr}"));
+        crate::server::log::warn(format_args!(
             "[server] graceful drain: on SIGINT/SIGTERM, new requests are refused and in-flight \
              requests get up to {} ms (MINFER_DRAIN_MS)",
             drain.as_millis()
-        );
+        ));
         serve_with_shutdown(listener, router(state), metrics.clone(), drain).await
     });
 
@@ -282,11 +293,17 @@ pub async fn serve_with_shutdown(
         // Set `draining` *before* the watch fires, so a request that races the
         // signal sees the refusal rather than queueing behind the shutdown.
         signal_metrics.draining.store(true, Ordering::SeqCst);
-        eprintln!(
-            "[server] {sig}: draining — refusing new requests; {} request(s) in flight, \
-             up to {} ms to finish",
-            signal_metrics.in_flight.load(Ordering::SeqCst),
-            deadline.as_millis()
+        crate::server::log::event(
+            crate::server::log::Level::Info,
+            "drain.started",
+            &[
+                ("signal", sig),
+                (
+                    "in_flight",
+                    &signal_metrics.in_flight.load(Ordering::SeqCst).to_string(),
+                ),
+                ("deadline_ms", &deadline.as_millis().to_string()),
+            ],
         );
         let _ = shutdown_tx.send(true);
     });
@@ -326,15 +343,21 @@ pub async fn serve_with_shutdown(
     )
     .await;
     match outcome {
-        DrainOutcome::Clean => {
-            eprintln!("[server] drain complete: every in-flight request finished")
-        }
+        DrainOutcome::Clean => crate::server::log::event(
+            crate::server::log::Level::Info,
+            "drain.finished",
+            &[("outcome", "clean"), ("in_flight", "0")],
+        ),
         DrainOutcome::Forced { in_flight } => {
             metrics.drain_abandoned.store(in_flight, Ordering::SeqCst);
-            eprintln!(
-                "[server] drain deadline ({} ms) reached with {in_flight} request(s) still in \
-                 flight; abandoning them and exiting",
-                deadline.as_millis()
+            crate::server::log::event(
+                crate::server::log::Level::Warn,
+                "drain.finished",
+                &[
+                    ("outcome", "forced"),
+                    ("in_flight", &in_flight.to_string()),
+                    ("deadline_ms", &deadline.as_millis().to_string()),
+                ],
             );
         }
     }
@@ -558,6 +581,10 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
 
     let (tx, rx) = mpsc::channel::<StreamEvent>(64);
     let job = Job {
+        // #726: the id the client's response already carries, so the worker's
+        // admitted/finished lines name the same request.
+        id: id.clone(),
+        admitted: std::time::Instant::now(),
         input_ids,
         params,
         tx,
