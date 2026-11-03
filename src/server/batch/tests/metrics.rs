@@ -62,6 +62,8 @@ fn serve_loop_publishes_the_queue_and_running_depth() {
             rxs.push(rx);
             job_tx
                 .blocking_send(Job {
+                    id: String::new(),
+                    admitted: std::time::Instant::now(),
                     input_ids: p,
                     params: sampling_params(128),
                     tx,
@@ -178,6 +180,8 @@ fn serve_loop_publishes_the_queue_and_running_depth() {
         let (tx, rx) = mpsc::channel::<StreamEvent>(1024);
         one_rxs.push(rx);
         tx1.blocking_send(Job {
+            id: String::new(),
+            admitted: std::time::Instant::now(),
             input_ids: p,
             params: sampling_params(2),
             tx,
@@ -311,6 +315,8 @@ fn published_metrics_move_as_requests_are_served() {
             &tok,
             0,
             Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: prompt.clone(),
                 params: sampling_params(4),
                 tx,
@@ -391,6 +397,8 @@ fn published_metrics_move_as_requests_are_served() {
             &tok,
             0,
             Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: long.clone(),
                 params: sampling_params(64),
                 tx: ltx,
@@ -443,6 +451,8 @@ fn published_metrics_move_as_requests_are_served() {
             &tok,
             1,
             Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: short,
                 params: sampling_params(2),
                 tx: stx,

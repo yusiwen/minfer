@@ -709,9 +709,12 @@ automatically — that is ticket A1.
 the running/in-flight counts; per-op timing is available under
 `MINFER_OP_TIMING` (off by default, measured at the scheduler's per-node
 dispatch); and SIGINT/SIGTERM drains gracefully, bounded by `MINFER_DRAIN_MS`.
-Still missing: **structured logging and levels** (the server prints free-form
-startup lines), and **worker-restart supervision** (a panicking job is isolated
-per request by `run_job_isolated`, but a dead worker thread is not restarted).
+Structured logging and levels landed with
+[#726](https://github.com/yusiwen/minfer/issues/726) (`MINFER_LOG` fixes the
+threshold once, and a request's admitted/finished lines are one event each); the
+remaining §2.8 item is **worker-restart supervision** (a panicking job is
+isolated per request by `run_job_isolated`, but a dead worker thread is not
+restarted).
 The trace/viz stack remains a *development* instrument, not an operations one.
 🟡 for a research engine, 🟠 the moment it is deployed.
 

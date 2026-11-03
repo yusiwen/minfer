@@ -7,6 +7,7 @@ use std::time::Instant;
 mod batching;
 mod http;
 mod kv_sharing;
+mod logging;
 mod metrics;
 mod prefill;
 mod slots;
@@ -86,6 +87,8 @@ fn run_batched(
         queue.push((
             i,
             Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: p.clone(),
                 params: sampling_params(max_tokens),
                 tx,
@@ -170,6 +173,8 @@ fn run_serial(
                 tok,
                 i,
                 Job {
+                    id: String::new(),
+                    admitted: std::time::Instant::now(),
                     input_ids: p.clone(),
                     params: sampling_params(max_tokens),
                     tx,

@@ -590,6 +590,18 @@ Flags:
 - `MINFER_DRAIN_MS` — how long a graceful shutdown may take, in milliseconds
   (default `30000`). A value that is not a whole number of milliseconds is
   reported and the default is used; `0` means "stop now". See below.
+- `MINFER_LOG` — the server's log threshold: `off`, `error`, `warn` (default),
+  `info` or `debug`. It is resolved **once at startup**; an unknown spelling
+  refuses to start rather than silently picking a level. Lines are one per event
+  on stderr, shaped `level=<lvl> event=<name> key=value …` (a free-form
+  diagnostic keeps its text as `level=<lvl> msg="…"`). At `info` a request
+  produces exactly one `request.admitted` (id, slot, queue depth) and one
+  `request.finished` (id, reason, tokens, ms) line, both carrying the id the
+  client's response uses; the drain produces `drain.started` / `drain.finished`,
+  and a queue-full or engine rejection its own event. The startup banner and a
+  command-line error are program output, not log lines, and are printed at every
+  level. `MINFER_LOG=off` therefore silences the event log while the banner still
+  names the listening address.
 
 ```bash
 MINFER_OP_TIMING=1 ./target/release/minfer serve --n-ctx 4096 --n-slots 1 qwen2.5-0.5b-instruct-q4_0

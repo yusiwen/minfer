@@ -195,6 +195,8 @@ fn run_serial(
         &input_ids,
         params,
         &tx,
+        "test-request",
+        std::time::Instant::now(),
     )
     .expect("generate");
     drop(tx);

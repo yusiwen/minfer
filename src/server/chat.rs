@@ -29,6 +29,13 @@ pub enum StreamEvent {
 /// (the handler tokenizes so context-overflow checks happen before queuing).
 #[derive(Clone)]
 pub struct Job {
+    /// #726: the request id the client sees (`chatcmpl-…`), carried into the
+    /// worker so `request.admitted` and `request.finished` name the same
+    /// request. Tests that do not read the log leave it empty.
+    pub id: String,
+    /// #726: when the handler queued the request — the finished line's `ms`
+    /// measures from here, so it includes the wait and the prefill.
+    pub admitted: std::time::Instant,
     pub input_ids: Vec<u32>,
     pub params: SamplingParams,
     pub tx: mpsc::Sender<StreamEvent>,
@@ -80,6 +87,8 @@ pub fn generate(
     input_ids: &[u32],
     params: &SamplingParams,
     tx: &mpsc::Sender<StreamEvent>,
+    id: &str,
+    admitted: std::time::Instant,
 ) -> Result<(), ApiError> {
     if input_ids.is_empty() {
         return Err(ApiError::invalid_request("prompt tokenizes to nothing"));
@@ -93,6 +102,8 @@ pub fn generate(
         input_ids,
         params,
         tx,
+        id,
+        admitted,
         None,
     )
 }
@@ -115,6 +126,8 @@ pub fn generate_spec(
     input_ids: &[u32],
     params: &SamplingParams,
     tx: &mpsc::Sender<StreamEvent>,
+    id: &str,
+    admitted: std::time::Instant,
     spec: &mut crate::spec::SpecEngine,
 ) -> Result<(), ApiError> {
     // F2 (#47): a verify round samples several rows from one automaton state, so
@@ -142,6 +155,8 @@ pub fn generate_spec(
         input_ids,
         params,
         tx,
+        id,
+        admitted,
         Some(spec),
     )
 }
@@ -156,6 +171,8 @@ fn generate_seq(
     input_ids: &[u32],
     params: &SamplingParams,
     tx: &mpsc::Sender<StreamEvent>,
+    id: &str,
+    admitted: std::time::Instant,
     mut spec: Option<&mut crate::spec::SpecEngine>,
 ) -> Result<(), ApiError> {
     if input_ids.is_empty() {
@@ -225,12 +242,12 @@ fn generate_seq(
     let mut current_pos = nt;
     // One line per request: makes the reuse (or its absence) observable in
     // production, and it is what B3's measurement reads.
-    eprintln!(
+    crate::server::log::info(format_args!(
         "[server] prefill fed {}/{} prompt tokens ({} reused from the slot's KV)",
         nt - feed_from,
         nt,
         feed_from
-    );
+    ));
     // Rows 0..nt now hold `input_ids` (the reused prefix because it matched,
     // the fed suffix because it was just written).
     cached_tokens.clear();
@@ -444,7 +461,7 @@ fn generate_seq(
             Err(e) => {
                 // The grammar allows nothing more: stop the turn with the reason
                 // on stderr. The text emitted so far is a valid prefix.
-                eprintln!("[grammar] {e}");
+                crate::server::log::warn(format_args!("[grammar] {e}"));
                 finish_reason = "stop";
                 break;
             }
@@ -528,12 +545,23 @@ fn generate_seq(
             emit(&full, emitted, complete, tx)?;
         }
         if complete < full.len() {
-            eprintln!(
+            crate::server::log::warn(format_args!(
                 "[server] dropped {} trailing byte(s) of an incomplete UTF-8 character",
                 full.len() - complete
-            );
+            ));
         }
     }
+    crate::server::log::event(
+        crate::server::log::Level::Info,
+        "request.finished",
+        &[
+            ("id", id),
+            ("slot", "0"),
+            ("reason", finish_reason),
+            ("tokens", &completion_tokens.to_string()),
+            ("ms", &admitted.elapsed().as_millis().to_string()),
+        ],
+    );
     let _ = tx.blocking_send(StreamEvent::Finish {
         reason: finish_reason.to_string(),
         tokens: completion_tokens,
@@ -615,9 +643,9 @@ where
             // `Any`, so passing the Box by reference would downcast against the
             // Box type and always report a non-string payload.
             let msg = panic_message(&*payload);
-            eprintln!(
+            crate::server::log::error(format_args!(
                 "[server] job panicked: {msg} — the worker thread survives and the slot is released"
-            );
+            ));
             let _ = tx.blocking_send(StreamEvent::Err(ApiError::server(format!(
                 "internal error: {msg}"
             ))));
@@ -708,21 +736,21 @@ pub fn worker_loop(
     let requested = std::env::var("MINFER_BATCH").ok();
     if let Some(v) = requested.as_deref() {
         if v != "0" && v != "1" {
-            eprintln!(
+            crate::server::log::warn(format_args!(
                 "[server] MINFER_BATCH={v:?} is neither \"0\" nor \"1\"; using the default for this device"
-            );
+            ));
         }
     }
     let device = model.device();
     let mode = batch_mode(requested.as_deref(), device);
-    eprintln!(
+    crate::server::log::info(format_args!(
         "[server] batching: {} (device {}; MINFER_BATCH=1 forces it on, =0 forces it off)",
         match mode {
             BatchMode::Batched => "on",
             BatchMode::Serial => "off",
         },
         device.name()
-    );
+    ));
     if spec_cfg.is_none() && mode == BatchMode::Batched {
         let n_ctx_total: usize = slots.iter().map(|s| s.n_ctx_slot).sum();
         match super::batch::BatchEngine::new(&*model, slots.len(), n_ctx_total) {
@@ -734,7 +762,7 @@ pub fn worker_loop(
                     std::env::var("MINFER_N_BATCH").ok().as_deref(),
                 );
                 engine.set_prefill_chunk(n_batch);
-                eprintln!(
+                crate::server::log::info(format_args!(
                     "[server] prefill chunks: {} ({}; MINFER_N_BATCH=0 disables chunking)",
                     if n_batch == 0 {
                         "off".to_string()
@@ -746,11 +774,11 @@ pub fn worker_loop(
                     } else {
                         "default"
                     }
-                );
-                eprintln!(
+                ));
+                crate::server::log::info(format_args!(
                     "[server] continuous batching: {} slot(s), {n_ctx_total} KV rows shared",
                     engine.n_slots()
-                );
+                ));
                 // C5 S2: resume the slot contexts, and rewrite the snapshot whenever a
                 // request completes. Printed at startup for the same reason the batching
                 // mode is: the cost of the snapshot is a decision, and a decision nobody
@@ -758,26 +786,26 @@ pub fn worker_loop(
                 if let Some(path) = &slots_file {
                     let p = std::path::Path::new(path);
                     match engine.load_slots(p, &*model) {
-                        Ok((slots, bytes)) => eprintln!(
+                        Ok((slots, bytes)) => crate::server::log::info(format_args!(
                             "[server] resumed {slots} slot(s), {bytes} byte(s) of KV from {path} \
                              — a request whose prompt matches a slot's tokens prefills only its delta"
-                        ),
-                        Err(e) => eprintln!("[server] {e}; starting with empty slots"),
+                        )),
+                        Err(e) => crate::server::log::warn(format_args!("[server] {e}; starting with empty slots")),
                     }
-                    eprintln!(
+                    crate::server::log::info(format_args!(
                         "[server] slot snapshot: {} (about {} MiB per completed request)",
                         path,
                         engine.snapshot_bytes() / (1024 * 1024)
-                    );
+                    ));
                     engine.set_slots_file(Some(p.to_path_buf()));
                 }
                 // #150: the queue bound, printed for the same reason as the mode:
                 // a request that waits (or is refused) is a policy decision.
                 let queue_max = super::batch::queue_max_from_env();
-                eprintln!(
+                crate::server::log::info(format_args!(
                     "[server] queue: up to {queue_max} request(s) wait for a slot \
                      (MINFER_QUEUE_MAX); beyond that the newest is answered 503"
-                );
+                ));
                 super::batch::serve_loop(
                     &*model,
                     &tokenizer,
@@ -788,17 +816,19 @@ pub fn worker_loop(
                 );
             }
             Err(e) => {
-                eprintln!("[server] continuous batching unavailable ({e}); serving serially");
+                crate::server::log::warn(format_args!(
+                    "[server] continuous batching unavailable ({e}); serving serially"
+                ));
                 worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics);
             }
         }
         return;
     }
     if let Some(path) = &slots_file {
-        eprintln!(
+        crate::server::log::info(format_args!(
             "[server] note: the slot snapshot ({path}) covers the shared-arena (batched) \
              engine; this server serves serially, so nothing will be resumed or saved"
-        );
+        ));
     }
     worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics);
 }
@@ -855,6 +885,15 @@ fn worker_loop_serial(
             .running
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let Some(slot_idx) = slots.iter().position(|s| s.state == SlotState::Idle) else {
+            crate::server::log::event(
+                crate::server::log::Level::Error,
+                "request.rejected",
+                &[
+                    ("id", &job.id),
+                    ("queued", &job_rx.len().to_string()),
+                    ("reason", "no idle slot"),
+                ],
+            );
             let _ = job
                 .tx
                 .blocking_send(StreamEvent::Err(ApiError::unavailable("no idle slot")));
@@ -879,6 +918,17 @@ fn worker_loop_serial(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
+        // #726: the queue depth the request waited behind, and the slot it landed
+        // on — the pair the `request.admitted` line names.
+        crate::server::log::event(
+            crate::server::log::Level::Info,
+            "request.admitted",
+            &[
+                ("id", &job.id),
+                ("slot", &slot_idx.to_string()),
+                ("queued", &job_rx.len().to_string()),
+            ],
+        );
         slot.state = SlotState::Processing;
         metrics
             .running
@@ -921,6 +971,8 @@ fn worker_loop_serial(
                 &job.input_ids,
                 &job.params,
                 &job.tx,
+                &job.id,
+                job.admitted,
                 spec,
             ),
             None => generate(
@@ -932,6 +984,8 @@ fn worker_loop_serial(
                 &job.input_ids,
                 &job.params,
                 &job.tx,
+                &job.id,
+                job.admitted,
             ),
         });
         // A panic may have written part of a KV row, so the record is no longer

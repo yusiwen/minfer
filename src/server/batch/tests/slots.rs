@@ -64,6 +64,8 @@ fn a_slot_snapshot_resumes_the_context_without_re_prefilling() {
             &*model,
             &tok,
             Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: prompt.clone(),
                 params: sampling_params(4),
                 tx,
@@ -108,6 +110,8 @@ fn a_slot_snapshot_resumes_the_context_without_re_prefilling() {
         &*model,
         &tok,
         Job {
+            id: String::new(),
+            admitted: std::time::Instant::now(),
             input_ids: prompt.clone(),
             params: sampling_params(4),
             tx,
@@ -150,6 +154,8 @@ fn a_slot_snapshot_resumes_the_context_without_re_prefilling() {
         &*model,
         &tok,
         Job {
+            id: String::new(),
+            admitted: std::time::Instant::now(),
             input_ids: continuation.clone(),
             params: sampling_params(2),
             tx,

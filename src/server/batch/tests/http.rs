@@ -27,6 +27,8 @@ fn a_rejected_job_answers_503_and_an_sse_error_frame() {
         .build()
         .expect("test runtime");
     let job = |tx: mpsc::Sender<StreamEvent>| Job {
+        id: String::new(),
+        admitted: std::time::Instant::now(),
         input_ids: vec![1, 2, 3],
         params: sampling_params(4),
         tx,
@@ -108,6 +110,8 @@ fn a_streamed_error_frame_is_counted_by_class() {
     let metrics = Arc::new(crate::server::metrics::ServerMetrics::new());
     let _ = reject(
         Job {
+            id: String::new(),
+            admitted: std::time::Instant::now(),
             input_ids: vec![1, 2, 3],
             params: sampling_params(4),
             tx,
@@ -186,6 +190,8 @@ fn a_job_queued_behind_a_busy_slot_is_served_when_it_frees() {
         rxs.push(rx);
         job_tx
             .blocking_send(Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: tok.encode(prompt),
                 params: sampling_params(8),
                 tx,
@@ -279,6 +285,8 @@ fn a_job_beyond_the_queue_bound_is_answered_with_503() {
         rxs.push(rx);
         job_tx
             .blocking_send(Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: tok.encode(prompt),
                 params: sampling_params(8),
                 tx,
@@ -366,6 +374,8 @@ fn a_drain_answers_queued_jobs_with_503() {
         rxs.push(rx);
         job_tx
             .blocking_send(Job {
+                id: String::new(),
+                admitted: std::time::Instant::now(),
                 input_ids: tok.encode(prompt),
                 params: sampling_params(8),
                 tx,
