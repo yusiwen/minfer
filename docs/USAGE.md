@@ -201,7 +201,7 @@ escaping, `indent` honoured, any other keyword refused by name. A tools-free ren
 (transformers' `tools=None`).
 
 `strftime_now(fmt)` is available to templates, with a fixed directive subset:
-`%Y %y %m %d %H %M %S %F %T %%`. Any other directive is refused by name rather
+`%Y %y %m %d %H %M %S %F %T %b %%`. Any other directive is refused by name rather
 than printed literally. A template that prints the current time is
 non-deterministic by nature: the conversation path detects that the turn's
 rendering does not extend the previous one and re-renders the whole history

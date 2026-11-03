@@ -30,7 +30,7 @@ A minimal local LLM inference engine built from scratch in Rust.
 - **CPU: AVX2 / NEON+SDOT** — all 8 quant dots SIMD'd on NEON+SDOT, 5 of 8 on AVX2 (Q4_0, Q8_0, Q4_K/Q5_K/Q6_K) + persistent thread pool
 - **GPU: Metal** — fused flash attention, simdgroup GEMM, precompiled `.metallib`, f16 KV cache
 - **GPU: CUDA** — default-on int8 tensor-core MMQ path: **~3581 tok/s @7B q4_K_m prefill = 1.080× llama.cpp**; CUDA Graph capture, flash attention, memory/speed opt-out gates
-- **Qwen2 / Qwen3** — GQA, SwiGLU, RoPE, RMSNorm; Qwen3 decoupled head dim + per-head Q/K norm
+- **Qwen2 / Qwen3 / Llama 3.x** — GQA, SwiGLU, RoPE, RMSNorm; Qwen3 decoupled head dim + per-head Q/K norm; Llama 3.x tied lm_head, no attention bias and its own stop set
 - **Model download** — Hugging Face Hub / Ollama, resumable
 - **Multi-turn conversation CLI** (`--cnv`) — incremental prefill, session persistence
 - **OpenAI-compatible server** (`serve`) — `/v1/chat/completions` streaming, multi-slot

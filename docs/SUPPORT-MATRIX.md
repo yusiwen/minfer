@@ -324,24 +324,33 @@ verification record.
 ### How Architecture Detection Works
 
 minfer reads the `general.architecture` string from the GGUF metadata header.
-Only the exact values `"qwen2"` and `"qwen3"` (case-sensitive) are accepted. Any
-other value produces a clear error:
+The exact values `"qwen2"`, `"qwen3"` and `"llama"` (case-sensitive) are
+accepted; any other value produces a clear error:
 
 ```text
-Unsupported architecture: 'llama'
+Unsupported architecture: 'gemma3'
 ```
 
-The loader will **not** silently misinterpret a non-Qwen2 model — it fails
-immediately with a descriptive message. All model-agnostic components (BPE
-tokenizer, Jinja2 chat template renderer, samplers) are ready for additional
-architectures once the graph construction (`build_graph`) is added.
+`llama` (Llama 3.1/3.2/3.3 dense) shares the dense Qwen2 loader and graph: the
+loader reads `llama.*` metadata, ties `output.weight` to `token_embd` when the
+file has no separate lm_head, and tolerates a missing attention bias. What the
+file itself decides, and the loader follows, is the **rope layout** — Llama
+rotates pairs of consecutive head values (`Interleaved`) while the Qwen families
+rotate the two halves (`NonInterleaved`, NeoX) — plus the stop set
+(`tokenizer.ggml.eot_token_id`/`eom_token_id`, or the vocabulary's
+`<|eot_id|>`/`<|eom_id|>`). The llama3 frequency factors a file carries as
+`rope_freqs.weight` are [#724](https://github.com/yusiwen/minfer/issues/724)'s
+contract; until then a table-carrying model runs the plain formula.
+
+The loader will **not** silently misinterpret an unknown architecture — it fails
+immediately with a descriptive message.
 
 ### Hyperparameter Keys
 
-The Qwen2 loader reads GGUF keys from both `qwen2.*` and `llama.*` prefixes.
-The `llama.*` fallback exists for compatibility with older GGUF converters that
-used the `llama.` prefix as a de-facto standard for Llama-family hyperparameters.
-This does **not** mean Llama architecture is supported.
+The loader reads GGUF keys from both `qwen2.*` and `llama.*` prefixes, so one
+loader serves the Qwen2/Qwen3 dense files and the Llama 3.x ones; the
+architecture string decides the two contracts that genuinely differ (rope layout
+and stop set).
 
 ### Adding a New Architecture
 
