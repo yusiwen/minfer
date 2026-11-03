@@ -420,12 +420,15 @@ no `(?!\S)` arm (so `a  b` grouped the two interior spaces instead of splitting
 off the first) and no `\s*[\r\n]+` arm. The rules now come from
 `tokenizer.ggml.pre`:
 
-| `pre` value (aliases) | Rule | Reference regex (from `tokenizer.json`) | Input normalizer |
-|---|---|---|---|
-| `qwen2` (`deepseek-r1-qwen`) | Qwen2/Qwen2.5/Qwen3 | `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)\|[^\r\n\p{L}\p{N}]?\p{L}+\|\p{N}\| ?[^\s\p{L}\p{N}]+[\r\n]*\|\s*[\r\n]+\|\s+(?!\S)\|\s+` | **NFC** |
-| `qwen35` | Qwen3.5 (letter runs also consume `\p{M}`) | same, with `[\p{L}\p{M}]+` and `[^\s\p{L}\p{M}\p{N}]` | **NFC** |
-| `llama-bpe` (`llama3`, `llama-v3`) | Llama 3.x (#132 S3, 2026-10-15) | same as `qwen2`, with `\p{N}{1,3}` in place of `\p{N}` — digits group **three at a time** | none (`"normalizer": null`) |
-| `lfm2` | LiquidAI LFM2 (#132 S3, 2026-10-15) | **byte-identical** to `llama-bpe`'s pattern (verified on `LiquidAI/LFM2-1.2B@40f3da0d`) | none (`"normalizer": null`) |
+| `pre` value (aliases) | Rule | Reference pattern | Oracle | Input normalizer |
+|---|---|---|---|---|
+| `qwen2` (`deepseek-r1-qwen`) | Qwen2/Qwen2.5/Qwen3 | `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)\|[^\r\n\p{L}\p{N}]?\p{L}+\|\p{N}\| ?[^\s\p{L}\p{N}]+[\r\n]*\|\s*[\r\n]+\|\s+(?!\S)\|\s+` | the families' `tokenizer.json` `Split` | **NFC** |
+| `qwen35` | Qwen3.5 (letter runs also consume `\p{M}`) | same, with `[\p{L}\p{M}]+` and `[^\s\p{L}\p{M}\p{N}]` | Qwen3.5's `tokenizer.json` | **NFC** |
+| `llama-bpe` (`llama3`, `llama-v3`), plus `falcon3`, `falcon-h1`, `pixtral`, `midm-2.0`, `jina-v5-nano` and `lfm2` | Llama 3.x (#132 S3, 2026-10-15), with `ignore_merges` | same as `qwen2`, with `\p{N}{1,3}` in place of `\p{N}` — digits group **three at a time** | llama.cpp pre-type `LLAMA_VOCAB_PRE_TYPE_LLAMA3` (`llama-vocab.cpp:2286-2298` at `c479922ac`); `lfm2`'s pattern verified byte-identical on `LiquidAI/LFM2-1.2B@40f3da0d` | none (`"normalizer": null`) |
+| `smaug-bpe`, `dbrx` | Llama 3.x pattern **without** `ignore_merges` (#727) | same as `llama-bpe` | llama.cpp's DBRX/SMAUG regex (`:302-307` at `c479922ac`, "same as llama3"); neither value's switch sets the flag (`:2393`/`:2396`) | none |
+| `jina-v1-en`, plus `mpt`, `olmo`, `jais`, `trillion`, `granite-docling` | plain GPT-2 (#132 S3, 2026-10-17; #727) | `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)\| ?\p{L}+\| ?\p{N}+\| ?[^\s\p{L}\p{N}]+ \| \s+(?!\S)` | llama.cpp's `LLAMA_VOCAB_PRE_TYPE_GPT2` regex group (`:372-380` at `c479922ac`); rule-equivalence unit test against `jina-v1-en` over the shared corpus — no id fixture yet (§3.4) | none |
+| `gemma4` | newline runs, **derived from the model value** (#132 S4) | `[^\n]+\|[\n]+` | ADR-0048 | none |
+| `whitespace` | whitespace cut and **dropped** (#132 S4) | `\s+` | llama.cpp #18756, ADR-0053 | none (lower-casing off) |
 
 A `pre` value therefore answers two questions: which pattern splits the text, and whether the
 input is normalized first. Both come from the family's reference `tokenizer.json`, because the
@@ -435,12 +438,14 @@ Every other value — **including a missing key** — is a refused load:
 `Tokenizer::load` returns `Err` naming the value and the supported set. A guess
 here is exactly the "wrong split" the ticket forbids.
 
-The classic GPT-2 rule was in the first draft of this design and was dropped
-before implementation for a concrete reason: GPT-2's `tokenizer.json` carries no
-`Split` pattern at all (its pre-tokenizer is a bare `ByteLevel`), so there is no
-independent regex reference to gate the rule against, and this engine's
-supported architectures do not use it. Shipping it ungated would have been a
-guess wearing the name of a rule; it is refused by name instead.
+Rows that share one pattern are aliases, not variants: `mpt`/`olmo`/`jais`/`trillion`/
+`granite-docling` are the pattern llama.cpp's `LLAMA_VOCAB_PRE_TYPE_GPT2` group uses, so
+they resolve to `jina-v1-en`'s rule. `smaug-bpe`/`dbrx` are the llama3 pattern with the
+merge shortcut **off** — they are *not* folded into `llama-bpe` because `ignore_merges`
+is a separate flag there, and the whole-piece path differs. The GPT-2 rule itself is
+`jina-v1-en` (ADR-0054): GPT-2's `tokenizer.json` carries no `Split` pattern (its
+pre-tokenizer is a bare `ByteLevel`), so the rule's oracle is llama.cpp's splitter plus
+the rule-equivalence unit test, not a transformers fixture.
 
 The splitter is hand-written (a port of llama.cpp's
 `unicode_regex_split_custom_qwen2` / `_qwen35` / `_llama3` / `_gpt2`) rather
@@ -506,21 +511,9 @@ invariant violation that aborts with the byte value.
 
 * **NFC normalization** — *now applied* (F7's accepted gap, closed by
   [#132](https://github.com/yusiwen/minfer/issues/132) S1 on 2026-10-14); see §3.6.
-* **`whitespace`** — refused by name at load (`none` is accepted as a
-  vocabulary-less file, ADR-0052).
-  (§3.0). SentencePiece (`llama`, ADR-0045), WordPiece (`bert`, ADR-0046),
-  unigram (`t5`, ADR-0047), gemma4 (ADR-0048), rwkv (ADR-0049), plamo2
-  (ADR-0050) and hybriddna (ADR-0051) are implemented;
-  each remaining value is a different algorithm with its own vocabulary shape and
-  its own reference, so it lands with an ADR and a fixture, not as another match
-  arm. For the two that remain, what is missing is an **artifact**, not a converter:
-  `whitespace` (added for Jina's models, llama.cpp #18756) has no GGUF carrying the
-  value that I could find — the public Jina GGUFs use `gpt2` with `pre = jina-v1-en`,
-  a rule minfer does not accept either — and `none`/`no_vocab` is a **vocabulary-less**
-  model type (llama.cpp creates `tokenizer.ggml.vocab_size` dummy tokens and its
-  `tokenize` aborts), so it is a product decision rather than a tokenizer to port.
-  `hybriddna` was in this list on the wrong grounds — it does have an artifact
-  (`HuggingFaceBio/Carbon-3B-GGUF`) and landed in ADR-0051.
+* **`none` / `no_vocab`** — a **vocabulary-less** model type (llama.cpp creates
+  `tokenizer.ggml.vocab_size` dummy tokens and its `tokenize` aborts), so it is a
+  product decision rather than a tokenizer to port (ADR-0052).
 * **llama.cpp's name-based special-token override** (its `</s>`, `<|tool_response>`
   and friends are forced to CONTROL whatever the file says): deliberately not
   implemented (ADR-0043). A text containing one of those names therefore
@@ -529,13 +522,14 @@ invariant violation that aborts with the byte value.
 * **BERT's `clean_text`** (dropping control characters and normalizing whitespace
   before the word split): not implemented, and no artifact in the gate
   distinguishes it — recorded in ADR-0046 rather than written blind.
-* **The remaining `ignore_merges` pre-tokenizers** (`falcon3`, `falcon-h1`,
-  `pixtral`, `tekken`, …) and **multi-regex** pre-tokenizers (`default`,
-  `deepseek-llm`, `deepseek-coder`, `deepseek-v3`, `falcon`, `starcoder`, `mpt`,
-  `refact`, …): refused by name at load. Each one needs its own pattern check and
-  its own pair of fixtures — llama.cpp maps several of them onto the same
-  pre-type with an *adapted* regex, which is exactly why the value, not the
-  family, is what gets accepted.
+* **The pre-types not in §3.1** — the multi-regex ones (`default`, `deepseek-llm`,
+  `deepseek-coder`, `deepseek-v3`, `falcon`, `starcoder`, `refact`, `tekken`, …) and
+  values llama.cpp maps to a rule other than the one their name suggests: refused by
+  name at load. Each needs its own pattern check and its own pair of fixtures —
+  llama.cpp maps several of them onto the same pre-type with an *adapted* regex, which
+  is exactly why the value, not the family, is what gets accepted. `jina-v2-en` is not
+  a value in the pinned llama.cpp at all, so it needs a reference first (ADR-0054's
+  residual).
 * **`byte_encode = false`** SPM-style BPE (`whitespace` pre-tokenizer) and the
   `<0xXX>` byte fallback for it: refused by name at load.
 

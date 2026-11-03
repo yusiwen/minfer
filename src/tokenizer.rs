@@ -68,6 +68,14 @@ pub enum PreTokenizer {
     /// normalizer either. It is its own variant so the fixture and the refusal
     /// name the value the file actually carries.
     Lfm2,
+    /// `smaug-bpe` and `dbrx`: llama.cpp's `LLAMA_VOCAB_PRE_TYPE_SMAUG` /
+    /// `_DBRX`, whose pattern is **llama3's** (`llama-vocab.cpp:302-307` at
+    /// `c479922ac`, "same as llama3") — but whose pre-types do **not** set
+    /// `ignore_merges` (only the `llama3` value group does, `:2286-2298`;
+    /// `dbrx`/`smaug-bpe` at `:2393`/`:2396` do not). The split is therefore
+    /// `llama-bpe`'s while the whole-piece shortcut stays off, which is exactly
+    /// the combination neither `LlamaBpe` nor `JinaV1En` carries.
+    SmaugDbrx,
     /// `jina-v1-en`: the **plain GPT-2** rule —
     /// `(?i:'s|'t|'re|'ve|'m|'ll|'d)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)`.
     /// A piece may start with **one space** (the other rules allow a preceding
@@ -92,21 +100,37 @@ impl PreTokenizer {
             // (`llama-vocab.cpp:2158-2169`): same regex, plus `ignore_merges`.
             Some("falcon3") | Some("falcon-h1") | Some("pixtral") | Some("midm-2.0")
             | Some("jina-v5-nano") => Ok(Self::LlamaBpe),
+            // llama3's split with the merge shortcut **off**: the two values whose
+            // own pre-types sit beside that group without inheriting the flag.
+            Some("smaug-bpe") | Some("dbrx") => Ok(Self::SmaugDbrx),
             Some("lfm2") => Ok(Self::Lfm2),
             Some("whitespace") => Ok(Self::Whitespace),
             Some("jina-v1-en") => Ok(Self::JinaV1En),
+            // The rest of llama.cpp's `LLAMA_VOCAB_PRE_TYPE_GPT2` **regex group**
+            // (`llama-vocab.cpp:372-380` at `c479922ac`): the plain GPT-2 pattern,
+            // which is `JinaV1En`'s rule exactly. No member sets `ignore_merges`.
+            Some("mpt")
+            | Some("olmo")
+            | Some("jais")
+            | Some("trillion")
+            | Some("granite-docling") => Ok(Self::JinaV1En),
             Some("gemma4") => Ok(Self::Gemma4),
             Some(other) => Err(format!(
                 "tokenizer.ggml.pre = \"{other}\" is not supported by minfer's byte-level BPE \
                  pre-tokenizer (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"; \
-                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\"; \"gemma4\"; \
-                 \"whitespace\"). \
+                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; the llama3-regex group \
+                 \"falcon3\", \"falcon-h1\", \"pixtral\", \"midm-2.0\", \"jina-v5-nano\"; \
+                 \"smaug-bpe\", \"dbrx\"; \"lfm2\"; \"jina-v1-en\"; the GPT-2-regex group \
+                 \"mpt\", \"olmo\", \"jais\", \"trillion\", \"granite-docling\"; \"whitespace\"; \
+                 \"gemma4\"). \
                  Refusing to tokenize rather than split with the wrong rule."
             )),
             None => Err(
                 "tokenizer.ggml.pre is missing, so the pre-tokenization rule is unknown; minfer \
                  refuses to guess (supported: \"qwen2\", alias \"deepseek-r1-qwen\"; \"qwen35\"; \
-                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"lfm2\"; \"gemma4\")"
+                 \"llama-bpe\", aliases \"llama3\", \"llama-v3\"; \"smaug-bpe\", \"dbrx\"; \
+                 \"lfm2\"; \"jina-v1-en\", and the GPT-2-regex group \"mpt\", \"olmo\", \"jais\", \
+                 \"trillion\", \"granite-docling\"; \"whitespace\"; \"gemma4\")"
                     .to_string(),
             ),
         }
@@ -115,7 +139,8 @@ impl PreTokenizer {
     /// Whether llama.cpp sets `ignore_merges` for this rule: a pre-split piece that is
     /// **itself** a vocabulary entry is emitted whole, before the merge ranks get a
     /// say (`llama-vocab.cpp:626-630`). True for the whole `LLAMA_VOCAB_PRE_TYPE_LLAMA3`
-    /// group (`:2155-2169`), which is where `llama-bpe` and `lfm2` sit too.
+    /// value group (`:2155-2169`), which is where `llama-bpe` and `lfm2` sit too.
+    /// `smaug-bpe`/`dbrx` share that group's *regex* but not the flag.
     fn ignores_merges(self) -> bool {
         matches!(self, Self::LlamaBpe | Self::Lfm2)
     }
@@ -128,7 +153,7 @@ impl PreTokenizer {
     /// piece), Llama 3.x's is `\p{N}{1,3}` (up to three).
     fn number_run(self) -> usize {
         match self {
-            Self::LlamaBpe | Self::Lfm2 => 3,
+            Self::LlamaBpe | Self::Lfm2 | Self::SmaugDbrx => 3,
             // `gemma4` and `whitespace` never reach the letter/number arms (their own
             // splits run), so this is the unused arm of an exhaustive match.
             Self::Qwen2 | Self::Qwen35 | Self::Gemma4 | Self::Whitespace => 1,
@@ -156,7 +181,12 @@ impl PreTokenizer {
     pub fn applies_nfc(self) -> bool {
         match self {
             Self::Qwen2 | Self::Qwen35 => true,
-            Self::LlamaBpe | Self::Lfm2 | Self::Gemma4 | Self::Whitespace | Self::JinaV1En => false,
+            Self::LlamaBpe
+            | Self::SmaugDbrx
+            | Self::Lfm2
+            | Self::Gemma4
+            | Self::Whitespace
+            | Self::JinaV1En => false,
         }
     }
 
