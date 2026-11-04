@@ -406,12 +406,15 @@ are the only KV store.
 
 Architectures that share Qwen2's tensor naming convention (LLaMA, Mistral,
 Phi) are the easiest ports. The `RopeStyle` enum defines both Qwen2
-(non-interleaved) and Llama (interleaved) pairings, but **only the
-non-interleaved form is wired up**: both loaders hard-code it
-(`models/qwen2/loader.rs:155`, `models/qwen3/loader.rs:181`) and the CUDA
-backend refuses the interleaved style (`graph/cuda_backend.rs:1676`). A family
-that needs interleaved RoPE requires a loader change plus a CUDA kernel — see
-`docs/MODEL-SUPPORT-ROADMAP.md`, "Cost model: what a port actually costs".
+(non-interleaved) and Llama (interleaved) pairings; the **loader reads the
+architecture** to pick one ([#723](https://github.com/yusiwen/minfer/issues/723)),
+so a Llama file is not hard-coded to Qwen's layout, and all three backends serve
+both layouts (CUDA's used to refuse the interleaved one —
+[#735](https://github.com/yusiwen/minfer/issues/735) added
+`rope_f32_interleaved`, a separate kernel so the NEOX path stays bit-identical
+to the fused epilogue). A family that needs a third layout still requires a
+loader change plus backend kernels — see `docs/MODEL-SUPPORT-ROADMAP.md`,
+"Cost model: what a port actually costs".
 
 ---
 

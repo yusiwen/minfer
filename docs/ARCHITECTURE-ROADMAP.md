@@ -198,9 +198,10 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    whether a neighbouring op could be moved so the op becomes supportable. In
    practice this is masked today because the supported models build a *single*
    GPU split on both GPU backends (`CUDA-BACKEND-DESIGN.md:313-315`), but it is
-   exactly what breaks the first time an op is unsupported — e.g. interleaved
-   RoPE on CUDA (`cuda_backend.rs:1676`), or `QkvBiasRopeStore`, which only CUDA
-   advertises (`cuda_backend.rs:2110`) while Metal refuses it (`metal_backend.rs:700`).
+   exactly what breaks the first time an op is unsupported — e.g. `Softmax` on
+   both device backends (`src/graph/op_matrix.rs`), or `QkvBiasRopeStore`, which
+   only CUDA advertises (`cuda_backend.rs:2109`) while Metal refuses it
+   (`metal_backend.rs:700`).
 2. **Synchronous, host-mediated cross-backend movement.** — **partly closed by
    F5** ([#58](https://github.com/yusiwen/minfer/issues/58), 2026-09-24): the
    boundary is now two registered phases. Phase A (`copy_across` →
@@ -808,10 +809,12 @@ behavioural defects found while executing the plan, already fixed.
    (`MetalBackend::supports_op` returns `false` for it). Neither is documented in `SUPPORT-MATRIX.md`.~~
    **Documented in A8**: `SUPPORT-MATRIX.md` now has an "Operator Coverage by
    Backend" table; the asymmetry is visible rather than silent.
-6. **CUDA RoPE is non-interleaved only** (`cuda_backend.rs:1676`), so any model
-   needing the interleaved style splits every layer between CUDA and CPU,
-   producing two host round trips per layer (§2.2); `docs/ARCHITECTURE.md:409-413`
-   now states that limitation rather than advertising both styles.
+6. ~~**CUDA RoPE is non-interleaved only**~~ — **Fixed in
+   [#735](https://github.com/yusiwen/minfer/issues/735)**: the kernel takes the
+   layout as a parameter (`rope_f32_interleaved` is a separate kernel so the NEOX
+   path stays bit-identical), so a model needing the interleaved style rotates on
+   the device instead of splitting every layer between CUDA and CPU. The
+   historical cost it recorded: two host round trips per layer (§2.2).
 7. ~~**Stale `unreachable!("CUDA pool not implemented")`** in the non-CUDA arms —
    the string and any `unreachable!` are gone from `alloc.rs`.~~ **Fixed in [#57](https://github.com/yusiwen/minfer/issues/57)** (`cdf41b2`).
 8. ~~**Dead fields in the reuse identity**: `CParams.n_batch` and
@@ -825,7 +828,7 @@ behavioural defects found while executing the plan, already fixed.
 9. ~~**Single-entry cross-backend staging** (`GraphAllocator::cross_staging`), mitigated by
    the consumer-side filter at `scheduler::cross_input_ready`.~~ **Fixed in A5** — keyed
    by `(graph uid, node, dst_backend)`; two foreign consumers can now be served.
-10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2438`), so the
+10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2439`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
     with `copy_to_host` (`alloc.rs:`).
 11. **CUDA pool never releases device memory** (`cuda_backend.rs:`),
