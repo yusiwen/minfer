@@ -49,7 +49,7 @@ command = "cargo test --release"
 date = "2026-11-04"
 passed = 669
 failed = 0
-ignored = 45
+ignored = 46
 integration_passed = 32
 integration_failed = 0
 integration_ignored = 6
@@ -66,7 +66,7 @@ command = "cargo test --release"
 date = "2026-11-04"
 passed = 670
 failed = 0
-ignored = 46
+ignored = 47
 integration_passed = 32
 integration_failed = 0
 integration_ignored = 6
@@ -81,7 +81,7 @@ box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "real-model"
 command = "PARALLEL=0 scripts/real_model_gates.sh and the parallel form"
 date = "2026-10-19"
-passed = 45
+passed = 46
 failed = 0
 live_check = false
 note = "measured on dgxspark 2026-10-19: 44 passed / 0 failed on the serial form (122.49 s) and on the default parallel form (56.88 s); #150/#198/#157 added four #[ignore]d gates (queued-job-served, queue-bound 503, drain refusal, per-run stall under MINFER_TEST_TICK=spin) and removed the #121 rejection gate, so the set is 44 gates; the one failure this row carried before (43 / 1) was #616 -- the stale `q4_K` refusal arm in f6_quantize_end_to_end_stays_within_the_stated_bound -- fixed by asserting over KNOWN_UNSUPPORTED instead of a hand-picked name #203's `#[ignore]`d type-selection gate joins the set on every box (44 -> 45 here, derived)."
@@ -96,7 +96,7 @@ command = "scripts/cuda_test.sh"
 date = "2026-10-20"
 passed = 697
 failed = 0
-ignored = 51
+ignored = 52
 # #207: this row is a recorded measurement (CI has no GPU) refreshed only on a
 # device run, but it counts the same test binary plus the device-gated tests, so a
 # feature-independent test added by a CPU-only ticket moves it too.
@@ -119,7 +119,7 @@ box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "real-model"
 command = "FEATURES=cuda scripts/real_model_gates.sh"
 date = "2026-10-19"
-passed = 51
+passed = 52
 failed = 0
 projection_key = "cpu-real-model"
 projection_box = "dgxspark (aarch64, GB10 sm_121)"
@@ -135,7 +135,7 @@ box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "real-model"
 command = "FEATURES=cuda scripts/real_model_gates.sh"
 date = "2026-10-19"
-passed = 51
+passed = 52
 failed = 0
 projection_key = "cpu-real-model"
 projection_box = "dgxspark (aarch64, GB10 sm_121)"
@@ -153,7 +153,7 @@ command = "cargo test --release --no-fail-fast"
 date = "2026-10-08"
 passed = 654
 failed = 0
-ignored = 47
+ignored = 48
 integration_passed = 24
 integration_failed = 0
 integration_ignored = 6
@@ -168,7 +168,7 @@ box = "macbook (macOS 27.0.1, Apple M4 Pro)"
 suite = "real-model"
 command = "PARALLEL=0 scripts/real_model_gates.sh (serial)"
 date = "2026-10-08"
-passed = 47
+passed = 48
 failed = 0
 live_check = false
 note = "recorded measurement; no residual — #362 gave Metal the set-valued kv_map gather, so a_store_inside_a_shared_prefix_takes_a_private_row passes; the set is 45 because #310's macOS-only #[ignore]d metal_q8_0_kv_answers_like_f32_on_a_real_model gate joined the --ignored set (44 -> 45), after #315's gate had taken it 42 -> 43; since #310 enabled Metal's packed read, the gate drives the production capability directly (no test seam); its count is DERIVED at 46 (2026-10-13): #204's platform-neutral `#[ignore]`d F6 gate joined the set, and it is a no-op on a box without the derived references #203's `#[ignore]`d type-selection gate joins the set (46 -> 47, derived)."
@@ -183,7 +183,7 @@ command = "compute-sanitizer --tool memcheck over scripts/cuda_test.sh"
 date = "2026-10-01"
 passed = 649
 failed = 0
-ignored = 44
+ignored = 45
 api_errors = 0
 # Same #207 projection as the CUDA unit row: the sanitizer run is that same suite.
 projection_key = "cpu-unit"
