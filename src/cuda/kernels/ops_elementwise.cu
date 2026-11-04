@@ -285,6 +285,36 @@ __global__ void rope_f32(
     }
 }
 
+// ─── RoPE, interleaved pairs (in-place) ─────────────────────
+// #735: Llama 3.x rotates (x[2i], x[2i+1]) — the same pairing Metal's kernel
+// takes. Kept as a separate kernel so `rope_f32` stays bit-identical to the
+// fused epilogue's `minfer_rope_pair` (the bitwise probe in `d38_probe_tests`).
+
+__global__ void rope_f32_interleaved(
+    float* x,
+    int n_head, int n_dims, int nt,
+    float freq_base, float freq_scale,
+    const int* positions
+) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    if (t >= nt || h >= n_head) return;
+
+    int half = n_dims / 2;
+    int base = (t * n_head + h) * n_dims;
+
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        float freq = freq_scale / powf(freq_base, (2.0f * i) / n_dims);
+        float theta = positions[t] * freq;
+        float cs = cosf(theta), sn = sinf(theta);
+        int j = base + 2 * i;
+        int j2 = j + 1;
+        float x0 = x[j], x1 = x[j2];
+        x[j]  = x0 * cs - x1 * sn;
+        x[j2] = x0 * sn + x1 * cs;
+    }
+}
+
 extern "C" {
 
 void launch_swiglu_f32_off(
@@ -416,13 +446,17 @@ void launch_f32_bits_to_i32(
 void launch_rope_f32(
     float* x, int n_head, int n_dims, int nt,
     float freq_base, float freq_scale,
-    const int* positions, cudaStream_t stream
+    const int* positions, int style, cudaStream_t stream
 ) {
     int block_sz = 64; // threads per head dimension
     dim3 block(block_sz, 1, 1);
     dim3 grid(nt, n_head, 1);
     minfer_launch_prelude("launch:rope_f32", "rope_f32");
-    rope_f32<<<grid, minfer_launch_block("launch:rope_f32", block), 0, stream>>>(x, n_head, n_dims, nt, freq_base, freq_scale, positions);
+    if (style == 1) {
+        rope_f32_interleaved<<<grid, minfer_launch_block("launch:rope_f32", block), 0, stream>>>(x, n_head, n_dims, nt, freq_base, freq_scale, positions);
+    } else {
+        rope_f32<<<grid, minfer_launch_block("launch:rope_f32", block), 0, stream>>>(x, n_head, n_dims, nt, freq_base, freq_scale, positions);
+    }
     minfer_launch_ok("launch:rope_f32", "rope_f32");
 }
 }

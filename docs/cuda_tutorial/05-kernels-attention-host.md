@@ -625,7 +625,7 @@ is load-bearing for §3.5: a captured graph bakes in device *pointers*, so any
 pool churn invalidates every capture, and `pool_gen` detects that.
 
 **`execute_node`: the dispatch.** The trait method
-(`execute_node` (`cuda_backend.rs:2344`)) is a thin wrapper: it calls
+(`execute_node` (`cuda_backend.rs:2345`)) is a thin wrapper: it calls
 `execute_node_inner` and, if the node failed *while a capture window was
 open*, aborts the window first (`abort_capture` (`cuda_backend.rs:900`) — a doomed window
 must never be closed into a cached graph). The real dispatch is one big match
@@ -687,7 +687,7 @@ fn alloc_buffer(&mut self, size: usize) -> usize {
 }
 ```
 
-(`alloc_buffer` (`cuda_backend.rs:2291`).) Three conventions to notice. *Exact-size
+(`alloc_buffer` (`cuda_backend.rs:2292`).) Three conventions to notice. *Exact-size
 reuse*: the free list matches byte length, so a recycled buffer is always big
 enough. *`pool_gen` on every path*: fresh alloc or reuse, both bump it, because
 both can change the node→pointer mapping a captured graph depends on. *No
@@ -695,9 +695,9 @@ panics on OOM*: `cuda_malloc` logs and returns null, and the null buffer fails
 cleanly as an `Err` from `ptr_of` at execute time — never a panic inside the
 allocator (`ptr_of` (`cuda_backend.rs:630`); `stream_guard` is a shim, not a lock).
 `free_buffer` never calls `cudaFree` — it recycles
-(`free_buffer` (`cuda_backend.rs:2318`)), which is what lets the persistent KV regions
+(`free_buffer` (`cuda_backend.rs:2319`)), which is what lets the persistent KV regions
 and the per-step scratch share one arena; `alloc_fresh`
-(`alloc_fresh` (`cuda_backend.rs:2328`)) bypasses the free list when a buffer's *id* is
+(`alloc_fresh` (`cuda_backend.rs:2329`)) bypasses the free list when a buffer's *id* is
 still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
 (`cuda_backend.rs:859`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
@@ -716,10 +716,10 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
     None
 }
 ```
-(`read_host` (`cuda_backend.rs:2438`).) Reading device memory back to the host is
+(`read_host` (`cuda_backend.rs:2439`).) Reading device memory back to the host is
 *always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:642`:
 `state.sync()` then a pinned-staging readback); `write_host`
-(`write_host` (`cuda_backend.rs:2445`)) is the input-fill path — a pinned-staged *async*
+(`write_host` (`cuda_backend.rs:2446`)) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
 The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — is
 AGENTS rule 5 (`AGENTS.md:117` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three

@@ -208,8 +208,10 @@ fn cuda_fused_qkv_epilogue_bitwise() {
             st.add_bias_f32(d_q, dbq, nqt, 1);
             st.add_bias_f32(d_k, dbk, nkt, 1);
             st.add_bias_f32(d_v, dbv, nkt, 1);
-            st.rope_f32(d_q, nh, hd, 1, freq_base, freq_scale, dpos);
-            st.rope_f32(d_k, nk, hd, 1, freq_base, freq_scale, dpos);
+            // style 0 = NEOX, the layout these probes measure (#735 added the
+            // interleaved twin; the probes stay on the Qwen layout).
+            st.rope_f32(d_q, nh, hd, 1, freq_base, freq_scale, dpos, 0);
+            st.rope_f32(d_k, nk, hd, 1, freq_base, freq_scale, dpos, 0);
             let dk_u = dev_alloc(ctx_elems * kv_bytes);
             let dv_u = dev_alloc(ctx_elems * kv_bytes);
             if kv_f16 {

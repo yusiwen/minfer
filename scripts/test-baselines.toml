@@ -93,8 +93,8 @@ key = "cuda-unit"
 box = "dgxspark (aarch64, GB10 sm_121)"
 suite = "unit"
 command = "scripts/cuda_test.sh"
-date = "2026-10-20"
-passed = 697
+date = "2026-11-04"
+passed = 760
 failed = 0
 ignored = 52
 # #207: this row is a recorded measurement (CI has no GPU) refreshed only on a

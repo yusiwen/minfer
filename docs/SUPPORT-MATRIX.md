@@ -254,7 +254,7 @@ set-valued `kv_map` attention window (`Device::gathers_attn_map`), and a packed
 | `KvcacheStore` | ✅ | ✅ | ✅ |
 | `SwiGLU` (fused) | ✅ | ✅ | ✅ |
 | `RoPE` non-interleaved | ✅ | ✅ | ✅ |
-| `RoPE` interleaved | ✅ | ✅ | ❌ |
+| `RoPE` interleaved | ✅ | ✅ | ✅ — the kernel takes the layout as a parameter (`rope_f32`'s `style`, the same encoding Metal's uses), so Llama 3.x rotates on the device instead of on the CPU ([#735](https://github.com/yusiwen/minfer/issues/735)); the fused QKV epilogues stay NEOX-only |
 | `FusedQKV` (decode) | ❌ | ✅ | ✅ |
 | `FusedFFN` (decode) | ❌ | ✅ | ✅ |
 | `FusedQkvNorm` (Qwen3 decode) | ❌ | ✅ | ✅ |

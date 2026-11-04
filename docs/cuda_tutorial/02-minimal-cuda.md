@@ -204,7 +204,7 @@ the same memory, which would forbid reordering loads and stores). The bias
 vector itself is 896 × 4 B = 3.5 KB, re-read by every token's block — small
 enough to stay hot in L2 cache across blocks.
 
-The launcher builds that 2-D grid `launch_add_bias_f32` (`src/cuda/kernels/ops_elementwise.cu:353`): 64
+The launcher builds that 2-D grid `launch_add_bias_f32` (`src/cuda/kernels/ops_elementwise.cu:383`): 64
 threads in x per block, `dim3 grid(n, (d + 63) / 64, 1)` — the same ceil-div
 over the column axis, 896 columns → 14 blocks in y. For one decode token
 (`n = 1`) the grid is 1 × 14 blocks of 64 threads — 896 threads for 896
@@ -250,7 +250,7 @@ a node may alias its input only when it is the sole consumer and runs on the
 same backend — §3 shows the D2D (device-to-device) copy the backend stages
 when the allocator did *not* alias it). Both launch through their launchers'
 ceil-div grid of 256-thread blocks (
-`launch_add_f32` (`src/cuda/kernels/ops_elementwise.cu:363`), `launch_silu_f32` `:385-392`), and every
+`launch_add_f32` (`src/cuda/kernels/ops_elementwise.cu:393`), `launch_silu_f32` `:385-392`), and every
 launcher in the file ends with `, stream)`: the entry-point family is uniform
 so the Rust side can target any stream uniformly. Why that matters is §2.4.
 
@@ -636,7 +636,7 @@ a split run as plain launches (warmup — llama.cpp's protocol), the 3rd opens
 the capture window, `synchronize()` closes it (instantiate + launch once +
 cache, `close_capture_or_sync` (`src/graph/cuda_backend.rs:573`)), and every later execution is a
 single `graph_launch_exec` (`src/graph/cuda_backend.rs:496`). The
-backend's `CudaBackend::synchronize` (`src/graph/cuda_backend.rs:2477`) is the
+backend's `CudaBackend::synchronize` (`src/graph/cuda_backend.rs:2478`) is the
 split-boundary drain point from §2.2: bind its own stream, clear the
 per-execution memos, then `close_capture_or_sync`. Replay is gated by
 `MINFER_NO_CUDA_GRAPH=1` (falls back to per-kernel launches — §5 makes the
@@ -748,12 +748,12 @@ CUDA node takes; the layered picture first (the one diagram of this chapter):
  `Op::Silu` (cuda_backend.rs:1026)   Op::Silu arm               (guards → Err or launch)
      │   in_bufs[0].id != out_buf.id?  → copy_d2d (D2D stage)
      ▼
- `silu_f32` (src/cuda/methods/elementwise.rs:145)         CudaState::silu_f32        (thin unsafe wrapper)
+ `silu_f32` (src/cuda/methods/elementwise.rs:146)         CudaState::silu_f32        (thin unsafe wrapper)
      │   self.stream() = this backend's bound cudaStream_t
      ▼
  `launch_silu_f32` (src/cuda/methods/elementwise.rs:39)               extern "C" launch_silu_f32 (FFI declaration)
      ▼
- `launch_silu_f32` (ops_elementwise.cu:385) launch_silu_f32            (grid = ceil-div, <<<>>>)
+ `launch_silu_f32` (ops_elementwise.cu:415) launch_silu_f32            (grid = ceil-div, <<<>>>)
      ▼
  `silu_f32` (ops_elementwise.cu:189) __global__ silu_f32         (index → guard → math)
      ▼
@@ -787,7 +787,7 @@ under the alias rule (sole consumer + same backend); when the liveness
 allocator did *not* alias the two buffers (they are distinct pool slots), the
 backend stages a device-to-device copy first so the in-place kernel can never
 write a buffer some other node still needs. `copy_d2d`
-`copy_d2d` (`src/graph/cuda_backend.rs:1949`) resolves both pool slots to device
+`copy_d2d` (`src/graph/cuda_backend.rs:1948`) resolves both pool slots to device
 pointers, refuses on a byte-size mismatch (`Err` — the §2.2 contract), and
 enqueues `cudaMemcpyDeviceToDevice` on the backend's bound stream. Two GPU operations
 (copy + kernel) for the price of one node, both asynchronous, both ordered by

@@ -499,8 +499,9 @@ Pool rules worth restating because they carry correctness weight:
 - **Unconditionally supported**: `Input`, `Add`, `Mul`, `Silu`, `SwiGLU`, `RmsNorm`, `QkNorm`,
   `MatMul`, `Attn`, `KvcacheStore`, `KvcacheLoad`, `View`, `Reshape`, `Permute`, `GetRows`,
   `FusedQKV`, `QkvBiasRopeStore`, `FusedQkvNorm`, `FusedFFN`.
-- **Conditional**: `RoPE` only for `RopeStyle::NonInterleaved` (the neox layout; the only style the
-  supported architectures emit).
+- **Conditional**: the fused epilogues (`FusedQKV`, `QkvBiasRopeStore`, `FusedQkvNorm`) stay neox-only;
+  the standalone `RoPE` takes the layout as a parameter (`style`: neox or interleaved, [#735]) so a
+  Llama 3.x file rotates on the device.
 - **Everything else** (`Scale`, `Softmax`, `BatchMatMul`) stays on CPU — and so does every fused
   arm on a CPU-only engine, because no fused op has a CPU kernel.
 
@@ -515,7 +516,7 @@ Two layers of checks are deliberately *not* in `supports_op`:
    fallback. Guards include: `transpose_b` unsupported; quantized matmul `id % 32 == 0`; `RmsNorm`/
    `QkNorm` dim a nonzero multiple of 4 (the float4 kernel); attention `nkt == n_head_kv * hd`,
    `hd == hd_kv`, `hd` a multiple of 4 in 1..=128, `n_head % n_head_kv == 0`; the fused decode nodes
-   `nt == 1`; `RoPE` neox; `KvcacheStore`'s output buffer must be the K region; a missing declared
+   `nt == 1`; the fused epilogues' rope neox (the standalone `RoPE` takes either layout); `KvcacheStore`'s output buffer must be the K region; a missing declared
    norm weight is an error.
 
 ### 4.4 Execution dispatch
@@ -538,7 +539,7 @@ Two layers of checks are deliberately *not* in `supports_op`:
 | `RmsNorm` | prefill producer-fused `rms_norm_quant_nw`/`rms_norm_quant` → decode `rms_norm_quant_on_gpu` → `rms_norm` | prefill `n >= 16 && d % 256 == 0`; decode `n == 1 && d % 32 == 0 && !MINFER_NO_DECODE_A_FUSE` |
 | `QkNorm` | `rms_norm` with `d = hd` over the flat `[nt*nh, hd]` view | `hd % 4 == 0`, nonzero, divides the element count |
 | `MatMul` | `matmul_f32_ptr_layout` + optional `add_bias_f32` | see the family table below |
-| `RoPE` | `copy_d2d` if not aliased, then `rope_f32` | neox; `hd` even |
+| `RoPE` | `copy_d2d` if not aliased, then `rope_f32` (neox) or `rope_f32_interleaved` (#735, selected by the node's `style`) | `hd` even |
 | `KvcacheStore` | `store_kv_f32` / `store_kv_f16`, or `store_kv_q8_0` for a packed cache (K then V), per `kv_layout` | `out_buf == k_id`; `nt = elems(K_in)/nkt`; the rows are the `cells` input (C6) — device data, not re-validated against `n_ctx` here (the allocator's `kv_cells_for_seq` and `fill_input_i32` own that). The packed store maps one thread to one `(row, 32-element block)` and uses the CPU's quantizer, so both backends write the same bytes |
 | `Attn` | f32/f16: `nt == 1` → `gqa_attn_split`; `1 < nt <= 16` → `gqa_attn_split_batched`; `nt > 16` → `gqa_attn_f16kv` (FA prefill when `hd == 128 && !MINFER_NO_FA_PREFILL`, else legacy) or `gqa_attn_f32`. **q8_0** (C4 S2b): `nt == 1` → `gqa_attn_split_q8_0` (the same 1-warp split-K body, `rpw_gate = 0` — the hybrid 4-warp body is f16-typed); every `nt > 1` → `gqa_attn_f32` (the batched split kernel's bitwise-identity purpose is not claimed for Q8_0, and `fa_prefill_kv` is f16-typed shared-memory staging) | the attention guards of §4.3; the batched verify path is bitwise-equal per position. A packed cache must therefore refuse `--spec-draft` (`spec::SpecEngine::new`), and its prefill is correct but off the tuned FA route |
 | `Attn` **windowed** (`explicit_span`) | the same entry points, instantiated with `CAUSAL = false`; `bound` carries `[lo, hi)` pairs (`bound[t]` = `lo`, `bound[nt + t]` = `hi`) instead of `positions`, and every per-row limit must come from `hi`. All three window modes are instantiated per layout | `cuda_windowed_attention_matches_causal_for_long_windows` sweeps `(nh, nk, hd)` × `n` × `start` × **both KV dtypes**; `cuda_map_window_matches_the_span_over_the_same_rows` sweeps all three layouts (f32/f16/q8_0) over the same rows. The then-named `fa_prefill_f16kv` used `bound[t]` (the window's `lo`) as the causal limit until 2026-09-19, which made every non-zero-start prefill attend to a single row — see `ARCHITECTURE-EXECUTION-PLAN.md` §14 row 0 |
@@ -870,7 +871,7 @@ The plan's original risk table, with its resolution:
 | 4 | Legacy default-stream implicit sync is load-bearing | **Resolved**: explicit `sync()` before every D2H |
 | 5 | Pool never shrinks → VRAM high-water mark | **Accepted**: same policy as CPU/Metal; `Drop` frees; documented |
 | 6 | Q5_K/F32-weight models silently fall back to CPU | **Mostly resolved**: Q5_K/Q5_1/Q5_0 and F32 matmul kernels landed; the gate remains all-or-nothing and logs the failing tensor |
-| 7 | RoPE kernel is neox-only | **Accepted**: guard + `Err`; all supported models are neox |
+| 7 | RoPE kernel is neox-only | **Resolved** ([#735](https://github.com/yusiwen/minfer/issues/735)): `rope_f32_interleaved` is a separate kernel so `rope_f32` stays bit-identical to the fused epilogue's `minfer_rope_pair`; the standalone node takes either layout, the fused epilogues remain neox. Device parity: `cuda_rope_matches_the_scalar_reference_in_both_layouts` |
 | 8 | No CUDA CI | **Open, deferred** (8h②): device-gated tests skip gracefully; GB10 is the reference bench |
 | 9 | F32-activation CUDA vs Q8_0-activation CPU logits differ by design | **Accepted**: gates use greedy-text equality + tolerance classes, never cross-path bitwise |
 

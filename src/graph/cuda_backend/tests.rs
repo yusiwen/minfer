@@ -21,6 +21,7 @@ mod matmul;
 mod mmvq;
 mod pool;
 mod prefill;
+mod rope;
 mod staging;
 mod weights;
 /// Init the CUDA singleton; silent-skip the test when no device answers
