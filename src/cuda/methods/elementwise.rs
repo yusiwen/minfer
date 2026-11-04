@@ -52,6 +52,7 @@ extern "C" {
         freq_base: f32,
         freq_scale: f32,
         positions: *const i32,
+        style: i32,
         stream: *mut std::ffi::c_void,
     );
 }
@@ -168,6 +169,8 @@ impl CudaState {
         }
     }
 
+    /// `style`: 0 = NEOX (the two halves), 1 = interleaved (consecutive pairs,
+    /// Llama 3.x) — the same encoding the Metal kernel takes (#735).
     pub fn rope_f32(
         &self,
         x: *mut std::ffi::c_void,
@@ -177,6 +180,7 @@ impl CudaState {
         freq_base: f32,
         freq_scale: f32,
         positions: *mut std::ffi::c_void,
+        style: i32,
     ) {
         let stream = self.stream();
         unsafe {
@@ -188,6 +192,7 @@ impl CudaState {
                 freq_base,
                 freq_scale,
                 positions as *const i32,
+                style,
                 stream,
             );
         }

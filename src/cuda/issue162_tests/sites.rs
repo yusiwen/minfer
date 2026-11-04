@@ -233,7 +233,7 @@ fn cuda_issue162_every_launch_site_names_itself_and_leaves_no_latch() {
         launch_f32_bits_to_i32(ctx.cf(0), ctx.i32(1), 64, st);
     });
     go!(&["launch:rope_f32"], || unsafe {
-        launch_rope_f32(ctx.f(0), 4, 64, 2, 10000.0, 1.0, ctx.ci32(1), st);
+        launch_rope_f32(ctx.f(0), 4, 64, 2, 10000.0, 1.0, ctx.ci32(1), 1, st);
     });
     go!(&["launch:store_kv_f32"], || unsafe {
         launch_store_kv_f32(ctx.cf(0), ctx.f(1), 64, 2, ctx.ci32(2), st);

@@ -170,7 +170,7 @@ Line by line:
   `__restrict__` qualifiers promise the compiler the three buffers do not
   alias, which lets nvcc keep the loads before the store.
 
-The launcher — `launch_add_f32` (`src/cuda/kernels/ops_elementwise.cu:363`):
+The launcher — `launch_add_f32` (`src/cuda/kernels/ops_elementwise.cu:393`):
 
 ```c
 void launch_add_f32(
@@ -241,7 +241,7 @@ __global__ void add_bias_f32(
   exceed one block's width (a 0.5B layer has `d = 896`; a 7B one has 3,584 or
   18,944), so the launcher folds the remainder into `grid.y`:
   `grid(n, (d + 63) / 64)` with 64 threads per block
-  (`launch_add_bias_f32`, `ops_elementwise.cu:353`). For 896: `grid.y = 14`,
+  (`launch_add_bias_f32`, `ops_elementwise.cu:383`). For 896: `grid.y = 14`,
   so a 30-token prefill launches 30 × 14 = 420 blocks of 64.
 - **`y[t * d + i] += b[i];`** — in-place accumulate. The bias vector `b[i]`
   is read by every row, so it stays hot in L2 across the grid.
@@ -553,7 +553,7 @@ that carries the idea.
 | Kernel (file:line) | Purpose | The one interesting line |
 |---|---|---|
 | `convert_f32_f16_kernel` (`gemm_wmma.cu:203`) | f32 activations → f16, feeding the wmma prefill GEMM | `:208` — `base = (…blockIdx.x * blockDim.x + threadIdx.x) * 8`: the thread index is **multiplied by 8**; each thread `float4`-loads 8 f32 and stores 4 `__half2` (`:213`), 8× fewer transactions for the same traffic (the P1 comment at `:206`). Launcher `launch_convert_f16` `:833` sizes the grid over `n/8`. |
-| `f32_bits_to_i32` (`ops_elementwise.cu:249`) | positions/token ids arrive as I32-as-f32 bit patterns; rope/store/attention kernels want raw `int*` | `:256` — `dst[tid] = __float_as_int(src[tid]);` the whole kernel *is* that line: one device-side bit reinterpretation pass, so the per-layer path never syncs with the host (comment `:243`). Rust entry `bits_to_i32` `src/cuda/methods/kvstore.rs:181`, called from `positions_i32` (`cuda_backend.rs:1967`, launch `:1997`). |
+| `f32_bits_to_i32` (`ops_elementwise.cu:249`) | positions/token ids arrive as I32-as-f32 bit patterns; rope/store/attention kernels want raw `int*` | `:256` — `dst[tid] = __float_as_int(src[tid]);` the whole kernel *is* that line: one device-side bit reinterpretation pass, so the per-layer path never syncs with the host (comment `:243`). Rust entry `bits_to_i32` `src/cuda/methods/kvstore.rs:181`, called from `positions_i32` (`cuda_backend.rs:1966`, launch `:1997`). |
 | `gather_rows_f32` (`ops_misc.cu:145`) | the quant-free `GetRows`: `out[t*n+i] = x[ids[t]*n+i]` | `:157` — `out[idx] = src[(long long)id * n + i];` the classic gather: one flat index decoded into `(t, i)`, the id looked up per thread. Same `(1, 18)`-style dispatch you saw in §3.3 is what routes F32 embeddings and the tail-row selects here. |
 
 All three are one-thread-per-element kernels with the usual ceil-div launcher;

@@ -1314,7 +1314,7 @@ impl CudaBackend {
                 }
                 if !matches!(meta.rope_style, RopeStyle::NonInterleaved) {
                     return Err(format!(
-                        "cuda: {}: qkv epilogue rope style {:#?} not supported (rope_f32 is neox/non-interleaved only)",
+                        "cuda: {}: qkv epilogue rope style {:#?} not supported (this fused epilogue is neox-only; the standalone rope handles both, #735)",
                         node.name, meta.rope_style
                     ));
                 }
@@ -1378,7 +1378,7 @@ impl CudaBackend {
                 }
                 if !matches!(meta.rope_style, RopeStyle::NonInterleaved) {
                     return Err(format!(
-                        "cuda: {}: fused qkv rope style {:#?} not supported (rope_f32 is neox/non-interleaved only)",
+                        "cuda: {}: fused qkv rope style {:#?} not supported (this fused epilogue is neox-only; the standalone rope handles both, #735)",
                         node.name, meta.rope_style
                     ));
                 }
@@ -1476,8 +1476,8 @@ impl CudaBackend {
                 }
                 if !matches!(meta.rope_style, RopeStyle::NonInterleaved) {
                     return Err(format!(
-                        "cuda: {}: fused qkv norm rope style {:#?} not supported (rope_f32 is \
-                         neox/non-interleaved only)",
+                        "cuda: {}: fused qkv norm rope style {:#?} not supported (this fused \
+                         epilogue is neox-only; the standalone rope handles both, #735)",
                         node.name, meta.rope_style
                     ));
                 }
@@ -1671,11 +1671,9 @@ impl CudaBackend {
             }
 
             Op::RoPE { style } => {
-                if !matches!(style, RopeStyle::NonInterleaved) {
-                    return Err(format!(
-                        "cuda: rope style {style:?} not supported (kernel is neox/non-interleaved only)"
-                    ));
-                }
+                // Both layouts are implemented in the kernel (#735): the fused
+                // epilogues below stay NEOX-only, but the standalone rope serves
+                // Llama 3.x's interleaved pairing.
                 let meta = match &node.meta {
                     NodeMeta::Rope(m) => m,
                     other => return Err(format!("rope node missing RoPEMeta: {other:?}")),
@@ -1699,6 +1697,7 @@ impl CudaBackend {
                     meta.freq_base,
                     meta.freq_scale,
                     pos,
+                    *style as i32,
                 );
                 Ok(())
             }
@@ -2116,7 +2115,9 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::FusedFFN => true,
         // MatMul ttype gating happens at the model level (weights must all
         // be registered on CUDA — same all-or-nothing rule as Metal).
-        Op::RoPE { style } => matches!(style, RopeStyle::NonInterleaved),
+        // #735: the standalone rope implements both pairings, so the layout is
+        // not a capability limit any more (the fused epilogues still are NEOX).
+        Op::RoPE { .. } => true,
         _ => false,
     }
 }

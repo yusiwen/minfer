@@ -973,7 +973,9 @@ fn support_table_matches_support_matrix_doc() {
             },
             true,
             true,
-            false,
+            // #735: the CUDA kernel takes the layout as a parameter now, so the
+            // mirror moves with `docs/SUPPORT-MATRIX.md`'s row.
+            true,
         ),
         ("FusedQKV", Op::FusedQKV { layer: 0 }, false, true, true),
         ("FusedFFN", Op::FusedFFN, false, true, true),
