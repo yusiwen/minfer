@@ -250,7 +250,7 @@ a node may alias its input only when it is the sole consumer and runs on the
 same backend — §3 shows the D2D (device-to-device) copy the backend stages
 when the allocator did *not* alias it). Both launch through their launchers'
 ceil-div grid of 256-thread blocks (
-`launch_add_f32` (`src/cuda/kernels/ops_elementwise.cu:393`), `launch_silu_f32` `:385-392`), and every
+`launch_add_f32` (`src/cuda/kernels/ops_elementwise.cu:393`), `launch_silu_f32` `:415-422`), and every
 launcher in the file ends with `, stream)`: the entry-point family is uniform
 so the Rust side can target any stream uniformly. Why that matters is §2.4.
 

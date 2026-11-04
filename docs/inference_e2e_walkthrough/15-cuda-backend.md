@@ -527,7 +527,7 @@ the ops it has no kernel for (a standalone `Softmax` node; the `Scale` node)
 and RoPE in a layout it does not implement:
 
 ```rust
-// src/graph/cuda_backend.rs:2074 (`supports_op`) (abridged to the decision arms)
+// src/graph/cuda_backend.rs (`supports_op`) (abridged to the decision arms)
 fn supports_op(&self, op: &Op, dtype: DType) -> bool {
     if dtype != DType::F32 {
         return false;
