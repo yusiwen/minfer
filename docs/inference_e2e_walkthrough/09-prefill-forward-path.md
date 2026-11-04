@@ -779,7 +779,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   memory-bound split of §2.3, visible in two numbers.
 - **`MINFER_TIMING=1`** — decomposes the decode side one level further
   (`main.rs:1727-1732`): per token it times the sampler call (`t_samp`,
-  accumulated at `main.rs:1888`) and the `forward` call (`t_fwd`, `main.rs:1808`
+  accumulated at `main.rs:1888`) and the `forward` call (`t_fwd`, `main.rs:1735`
   on the speculative path and `main.rs:1929` on the plain one — "CPU encode + GPU
   exec + logits download" per the comment), then prints one line
   (`main.rs:1943-1945`), e.g. `[MINFER_TIMING] over 512 tokens:
