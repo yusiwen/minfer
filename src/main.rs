@@ -1647,6 +1647,11 @@ fn main() {
         // too, and a Metal-only gate here used to drop its FusedQKV nodes.
         let (fuse_qkv, fuse_ffn) =
             crate::graph::json::preview_fuse_flags(input_ids.len(), metal_on, cuda_on);
+        // #736: `gpu` means "a device participates" everywhere else (`CParams.gpu`,
+        // `ModelDef::device`, the fusion gates). Passing `metal_on` alone left the
+        // exporter's allocator without CUDA, so every exported node claimed CPU on a
+        // CUDA-only box.
+        let device = crate::graph::json::export_placement(metal_on, cuda_on);
         let model_name = std::path::Path::new(&model_path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1657,7 +1662,7 @@ fn main() {
             &model_name,
             input_ids.len(),
             params.n_ctx,
-            metal_on,
+            device,
             fuse_qkv,
             fuse_ffn,
         );
@@ -1965,13 +1970,17 @@ fn main() {
         let cuda_on = false;
         // Decode-graph gates, shared with the dump block (and the engine).
         let (fuse_qkv, fuse_ffn) = crate::graph::json::preview_fuse_flags(1, metal_on, cuda_on);
+        // #736: the placement flag is "a device participates", exactly as in the
+        // dump block and the engine; and the prefill preview takes the same fusion
+        // gate as the engine (a hardcoded `false` shifted its node ids).
+        let device = crate::graph::json::export_placement(metal_on, cuda_on);
         let prefill_graph = export_graph_json(
             &*model,
             &model_name,
             input_ids.len(),
             params.n_ctx,
-            metal_on,
-            false,
+            device,
+            fuse_qkv,
             fuse_ffn,
         );
         let decode_graph = export_graph_json(
@@ -1979,7 +1988,7 @@ fn main() {
             &model_name,
             1,
             params.n_ctx,
-            metal_on,
+            device,
             fuse_qkv,
             fuse_ffn,
         );

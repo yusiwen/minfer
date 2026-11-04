@@ -77,6 +77,14 @@ pub fn preview_fuse_flags(nt: usize, metal_on: bool, cuda_on: bool) -> (bool, bo
     )
 }
 
+/// #736: the placement flag the exporters pass as `gpu` — "a device
+/// participates", the same meaning `CParams.gpu`, `ModelDef::device` and the
+/// fusion gates use. Passing `metal_on` alone left the exporter's allocator
+/// without CUDA on a CUDA-only box, so every exported/traced node claimed the CPU.
+pub fn export_placement(metal_on: bool, cuda_on: bool) -> bool {
+    metal_on || cuda_on
+}
+
 /// Build the graph the runtime would execute for `gparams` (mirroring the
 /// cache: build → assign → FusionPass), so node ids/ops always match what the
 /// scheduler actually ran. Used by `--dump-graph*`, the P2 trace, and the P3

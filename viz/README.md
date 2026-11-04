@@ -390,8 +390,10 @@ Right — filters & view:
   the prefill and decode graphs. Each phase has its own coloring from the last run.
 - **Layered layout**: `start` → `blk.0 … blk.N` → `end`, one row per transformer layer.
   Click a **row label** to collapse/expand that layer.
-- **Node coloring**: each box is one operator node. The fill color is the backend
-  (Metal blue / CPU yellow / CUDA green) **and** is tinted by that node's data magnitude
+- **Node coloring**: each box is one operator node. The fill color is the backend the node was
+  **assigned** to at build time (Metal blue / CPU yellow / CUDA green — the scheduler's answer, not a
+  builder default; #736 fixed a call site that read `metal_on` alone, so a CUDA-only run's graph
+  claimed the CPU) **and** is tinted by that node's data magnitude
   (abs-mean, blue → red) for the current/last step. A **dashed border** means a fused operator
   (e.g. `QKV✚`, `FFN✚`, `swiglu`).
 - **Edges**: tensor data flow. KV edges (to/from the KV cache) are drawn differently and can be
