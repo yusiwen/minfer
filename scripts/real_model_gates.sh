@@ -55,6 +55,11 @@
 # The device set's second configuration is a second run of the same command:
 #   MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf \
 #     FEATURES=cuda scripts/real_model_gates.sh
+#
+# #725 adds a Llama gate: `MINFER_LLAMA_TEST_MODEL=<cached Llama 3.x GGUF>` runs
+# `llama_greedy_tokens_match_the_pinned_llama_cpp_reference` (32 ids against the
+# committed llama.cpp reference). It is green on the CPU; the device form is red
+# until #737 is fixed, and skipping when the variable is unset prints why.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
