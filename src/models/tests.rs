@@ -79,8 +79,10 @@ fn the_stop_set_is_eos_plus_the_declared_roles() {
 /// Unset `MINFER_LLAMA_TEST_MODEL` is a **named skip**, never a silent pass; a set
 /// path whose bytes are not the pinned file is a failure (the ids are only
 /// meaningful for that exact artifact). It lives here, not under
-/// `models/qwen2/graph/`, because that path is a Metal-path trigger and this gate
-/// needs no device code.
+/// `models/qwen2/graph/`, because it is a fixture plus a loop over the public
+/// `forward` — it contains no per-backend code of its own. Since #723 it does
+/// **drive** the box's device on purpose (see the `MpsState::init` call in the
+/// body): a gate that claims a device class must actually run there.
 ///
 /// [#725]: https://github.com/yusiwen/minfer/issues/725
 /// [`docs/GATE-CONTRACT.md`]: https://github.com/yusiwen/minfer/blob/master/docs/GATE-CONTRACT.md
@@ -181,6 +183,16 @@ fn llama_greedy_tokens_match_the_pinned_llama_cpp_reference() {
         path.display()
     );
 
+    // #723: on macOS nothing initialises MPS in a test process, so `model.device()`
+    // answered `Cpu`, the forwards ran on the CPU, and the device arm this file grew in
+    // #740 could never run on the only box that has Metal — the gate measured the CPU
+    // under a device-shaped selector. The CLI initialises MPS before the load
+    // (`main.rs`), and the loaders register weights against the live state, so the order
+    // matters: init, then load. `MINFER_DISABLE_MPS=1` keeps the CPU arm reachable, which
+    // is what that variable means everywhere else.
+    #[cfg(target_os = "macos")]
+    crate::metal::MpsState::init();
+
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
     // A parallel test loading another architecture swaps same-named weight-registry
@@ -194,12 +206,35 @@ fn llama_greedy_tokens_match_the_pinned_llama_cpp_reference() {
     let n_ctx = 2048usize;
     let got = greedy_steps(&*model, &prompt_ids, want.len(), n_ctx);
 
-    if cfg!(feature = "cuda") {
-        // #740: on a device build the ids are pinned as the **device golden** (the
-        // device reads f32 activations where the CPU quantizes to Q8_0, so a
-        // near-tie can legitimately flip), and the prefix on which the two arms
-        // agree must stay inside the measured cross-class tolerance.
-        let dev = &fx["device"];
+    // #740 gave the gate a device arm; #723's Metal half found the *selector* behind
+    // it was still a build property. `cfg!(feature = "cuda")` asks what the crate was
+    // compiled with, not where the forwards ran: a macOS release build carries no
+    // `cuda` feature and still executes every `forward` on Metal (`Qwen2Graph::device`),
+    // so it silently took the CPU arm and demanded token-exactness from a numeric
+    // class that cannot promise it (rule 9: the CPU quantizes activations to Q8_0, the
+    // devices read f32). `ModelDef::device` is the single authority for "a device
+    // participates" (E6), so the arm follows it, and the fixture carries one golden
+    // per class.
+    let class = match model.device() {
+        Device::Cpu => None,
+        Device::Metal => Some("metal"),
+        Device::Cuda => Some("cuda"),
+    };
+
+    if let Some(key) = class {
+        // On a device the ids are pinned as that device's **golden** (its logits
+        // differ from the CPU's by class, so a near-tie can legitimately flip), and
+        // the prefix on which the two arms agree must stay inside the measured
+        // cross-class tolerance.
+        let dev = &fx["device"][key];
+        assert!(
+            !dev.is_null(),
+            "llama_pin({key}): this run's forwards execute on the {key} device, but \
+             tests/fixtures/llama/reference_tokens.json records no `device.{key}` golden. \
+             Run this gate on that box and record the ids it produces (the `cuda` block is \
+             the shape) — a device arm never falls back to the CPU's ids, because that asks \
+             one numeric class to answer for another"
+        );
         let golden = fixture_ids(dev, "ids");
         let tol = dev["tolerance"].as_f64().expect("device.tolerance") as f32;
         let cpu_top2 = fx["cpu_top2"].as_array().expect("cpu_top2");
@@ -213,17 +248,20 @@ fn llama_greedy_tokens_match_the_pinned_llama_cpp_reference() {
         }
         assert!(
             bad.is_empty(),
-            "llama_pin(device): {model_name} diverged from the recorded device golden at {} of \
+            "llama_pin({key}): {model_name} diverged from the recorded {key} golden at {} of \
              {} ids (first difference at index {}, got {}, expected {})\n\
              got:      {:?}\n\
-             expected: {:?}",
+             expected: {:?}\n\
+             recorded: {} on {}",
             bad.len(),
             golden.len(),
             bad[0],
             got.ids[bad[0]],
             golden[bad[0]],
             got.ids,
-            golden
+            golden,
+            dev["reference"].as_str().unwrap_or("?"),
+            dev["box"].as_str().unwrap_or("?")
         );
 
         let mut prefix = 0usize;
@@ -239,25 +277,37 @@ fn llama_greedy_tokens_match_the_pinned_llama_cpp_reference() {
         }
         assert!(
             prefix > 0,
-            "llama_pin(device): no agreeing prefix — the device golden and the CPU reference \
-             disagree from step 0, so the cross-class tolerance cannot be checked"
+            "llama_pin({key}): no agreeing prefix — {key} and the CPU reference disagree from \
+             step 0, so the cross-class tolerance cannot be checked"
         );
         assert!(
             worst <= tol,
-            "llama_pin(device): the agreeing prefix's top logit moved {worst:.4} > the class \
+            "llama_pin({key}): the agreeing prefix's top logit moved {worst:.4} > the class \
              tolerance {tol} at step {}",
             prefix - 1
         );
-        eprintln!(
-            "llama_pin(device): {model_name} matched the recorded device golden on {} ids; the \
-             first {prefix} steps agree with the CPU arm within {worst:.4} (class tolerance \
-             {tol}), and the trajectories diverge at step {prefix} (a near-tie: CPU margin \
-             {:.4}, device margin {:.4})",
-            golden.len(),
-            (cpu_top2[prefix][0][1].as_f64().unwrap() - cpu_top2[prefix][1][1].as_f64().unwrap())
-                as f32,
-            (got.top2[prefix][0].1 - got.top2[prefix][1].1)
-        );
+        // A full agreement is the good case, and it is also the case where indexing
+        // `cpu_top2[prefix]` would panic: the step that would report the divergence
+        // does not exist.
+        if prefix < got.ids.len() {
+            eprintln!(
+                "llama_pin({key}): {model_name} matched the recorded {key} golden on {} ids; \
+                 the first {prefix} steps agree with the CPU arm within {worst:.4} (class \
+                 tolerance {tol}), and the trajectories diverge at step {prefix} (a near-tie: \
+                 CPU margin {:.4}, {key} margin {:.4})",
+                golden.len(),
+                (cpu_top2[prefix][0][1].as_f64().unwrap()
+                    - cpu_top2[prefix][1][1].as_f64().unwrap()) as f32,
+                (got.top2[prefix][0].1 - got.top2[prefix][1].1)
+            );
+        } else {
+            eprintln!(
+                "llama_pin({key}): {model_name} matched the recorded {key} golden on {} ids and \
+                 agreed with the CPU arm on all {prefix} steps (worst top-logit |Δ| {worst:.4}, \
+                 class tolerance {tol})",
+                golden.len()
+            );
+        }
     } else {
         // The CPU arm is the correctness gate: token-exact against llama.cpp.
         let mut bad = Vec::new();
