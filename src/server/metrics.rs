@@ -342,6 +342,11 @@ pub struct ServerMetrics {
     /// `jobs_dropped_total`: that counts saturation rejections (`503 no idle
     /// slot`), this counts the worker itself giving up.
     pub worker_stalled_total: AtomicU64,
+    /// [#731]: times the worker stopped and stayed stopped. `worker_stalled_total`
+    /// names one way to die (the #196 bound); this one counts every transition the
+    /// supervisor observed — a panic, a clean drain, or the stall — so a scrape
+    /// separates "it gave up" from "it is down".
+    pub worker_stops_total: AtomicU64,
     /// Jobs in the worker's `pending` deque right now (exact, worker-published).
     pub worker_pending: AtomicU64,
     /// Requests occupying an engine slot right now (worker-published).
@@ -373,6 +378,7 @@ pub struct MetricsSnapshot {
     pub running: u64,
     pub jobs_dropped_total: u64,
     pub worker_stalled_total: u64,
+    pub worker_stops_total: u64,
     /// #157: terminal errors by `ApiError::error_type`, sorted by class so a
     /// scrape is deterministic.
     pub requests_failed: Vec<(&'static str, u64)>,
@@ -448,6 +454,7 @@ impl ServerMetrics {
             running: self.running.load(r),
             jobs_dropped_total: self.jobs_dropped_total.load(r),
             worker_stalled_total: self.worker_stalled_total.load(r),
+            worker_stops_total: self.worker_stops_total.load(r),
             requests_failed: {
                 let mut failed = self
                     .requests_failed
@@ -565,6 +572,13 @@ pub fn render(m: &MetricsSnapshot) -> String {
         "Times the worker's counted no-progress bound tripped: consecutive steps left the engine busy without advancing its work counter, so every live and queued request was answered 500 and the worker stopped.",
         "counter",
         m.worker_stalled_total,
+    );
+    sample(
+        &mut out,
+        "minfer_worker_stops_total",
+        "Times the worker stopped and stayed stopped: a panic outside the isolated job, the counted no-progress bound, or the drain. Every later request is refused with the worker's state, never a bare \"shutting down\".",
+        "counter",
+        m.worker_stops_total,
     );
     sample(
         &mut out,

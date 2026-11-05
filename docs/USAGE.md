@@ -388,7 +388,15 @@ soon as a slot frees and a younger arrival cannot overtake it. While it waits,
 `minfer_worker_pending_jobs` is the worker's own share of it (the decision is
 [ADR-0059](adr/0059-the-batched-worker-queues-against-a-bound-and-fails-a-lagging-run.md)).
 
-Only two cases answer an error, both `503 unavailable_error`:
+A third case answers an error: if the inference worker has **stopped** (a panic
+outside the per-request isolation, or the counted no-progress bound), every later
+request is refused `503 unavailable_error` with a message that names the state
+(`the inference worker is down: …`) rather than the old "shutting down" from a
+send error; `/metrics` exposes `minfer_worker_stops_total` and the log carries one
+`worker.stopped` event for the transition
+([#731](https://github.com/yusiwen/minfer/issues/731)).
+
+Only two saturation cases answer an error, both `503 unavailable_error`:
 
 - the queue is full: the **newest** arrival is refused
   (`{"error":{"code":503,"message":"the queue is full","type":"unavailable_error"}}`),

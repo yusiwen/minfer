@@ -440,7 +440,7 @@ Two smaller but immediate items sit in this layer:
   `forward_graph_cached`; the speculative path calls both models' forwards
   directly (`spec.rs`) and the tokenizer, sampler and stop-string paths were
   bare. A panic in any of them unwound `worker_loop`, dropping the bounded job
-  channel (capacity 64, `server/mod.rs:69`) — later requests got 503 — and the
+  channel (capacity 64, `server/mod.rs:74`) — later requests got 503 — and the
   queued jobs' `StreamEvent` senders, ending their SSE
   (Server-Sent Events) stream after an empty `[DONE]` rather than an error
   (`server/mod.rs:`). The whole per-job body now runs under
@@ -770,7 +770,7 @@ work predates the tracker has no issue, and the plan is its record.
 |---|---|---|---|
 | 23 | **Op × dtype × backend matrix test**. — **done in A1** | §2.8 | M |
 | 24 | **CI**: run tests on macOS, add a Linux CPU job, add a CUDA build job. — **done in A2** | §2.8 | S |
-| 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. — **done in F8** ([#51](https://github.com/yusiwen/minfer/issues/51), 2026-09-24; the only member of the A-era batch that had no ticket). Structured logging/levels and worker supervision were **not** part of the ticket and remain open in §2.8 | §2.8 | M |
+| 25 | **Metrics/observability**: `/metrics`, KV occupancy, queue depth, per-op timing under a flag, graceful drain. — **done in F8** ([#51](https://github.com/yusiwen/minfer/issues/51), 2026-09-24; the only member of the A-era batch that had no ticket). Structured logging/levels ([#726](https://github.com/yusiwen/minfer/issues/726)) and worker supervision ([#731](https://github.com/yusiwen/minfer/issues/731)) were **not** part of the ticket and landed after it, closing §2.8 | §2.8 | M |
 | 26 | **Remove the dead identity fields**: delete `CParams.n_batch`; keep `GraphParams.n_seqs` marked *reserved for item 3* (decision recorded in `ARCHITECTURE-EXECUTION-PLAN.md` §8). — **done in A7; fully closed in E2**, which deleted `n_seqs` too after item 3 showed it was redundant, not just unread | §2.5 | S |
 | 27 | **Re-key the cross-backend staging map** by `(node, dst_backend)`. — **done in A5** | §2.2 | S |
 | 28 | **CPU per-op allocations**: `cpu_backend.rs:` clones the K/V sources on every store node and `:195` allocates a `Vec<&[f32]>` per node. — **closed in A6 as not worth doing**: the allocation removal measured −1.2 % prefill / −1.8 % decode and was reverted (the loop is weight-streaming bound) | §2.3 | S |
