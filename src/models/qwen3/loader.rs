@@ -209,6 +209,9 @@ fn find_token_id(ctx: &GgufContext, target: &str) -> Option<u32> {
 fn load_tensor(
     ctx: &GgufContext,
     raw: &'static [u8],
+    // [#745] the part's mapping: the tensor holds a handle so its bytes outlive
+    // the `GgufModel` it was read from.
+    owner: &std::sync::Arc<crate::gguf::MmapFile>,
     ti: &crate::gguf::GgufTensorInfo,
     ns: &str,
     plan: crate::graph::offload::OffloadPlan,
@@ -242,7 +245,8 @@ fn load_tensor(
         strides[j] = strides[j - 1] * shape[j - 1] as usize;
     }
 
-    let mut tensor = Tensor::from_data_borrowed_with_strides(ttype, &shape, &strides, src);
+    let mut tensor = Tensor::from_data_borrowed_with_strides(ttype, &shape, &strides, src)
+        .with_owner(owner.clone());
     tensor.set_name(&reg_name);
 
     // E5: register only when the offload plan puts this tensor's block on the device (see
@@ -475,19 +479,35 @@ pub fn load(
     #[cfg(target_os = "macos")]
     if let Some(mps) = crate::metal::MpsState::get() {
         for part in &model.parts {
-            mps.register_part(part.data);
+            mps.register_part(part.data, part.mmap.clone());
         }
     }
 
     let load_one = |n: &str| -> Option<Tensor> {
         tensor_map.get(n).map(|(pi, ti)| {
             let part = &model.parts[*pi];
-            load_tensor(&part.ctx, &part.data, ti, ns, plan, &device_bytes)
+            load_tensor(
+                &part.ctx,
+                &part.data,
+                &part.mmap,
+                ti,
+                ns,
+                plan,
+                &device_bytes,
+            )
         })
     };
     let load_ti = |(pi, ti): &(usize, &crate::gguf::GgufTensorInfo)| -> Tensor {
         let part = &model.parts[*pi];
-        load_tensor(&part.ctx, &part.data, ti, ns, plan, &device_bytes)
+        load_tensor(
+            &part.ctx,
+            &part.data,
+            &part.mmap,
+            ti,
+            ns,
+            plan,
+            &device_bytes,
+        )
     };
 
     // Token embedding

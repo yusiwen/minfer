@@ -325,13 +325,16 @@ slices of the *mapping*. The difference is not academic:
    storage.
 
 The cost of mmap is honesty about lifetime: the mapping must outlive every
-slice borrowed from it. minfer's answer is the simplest correct one — the
-`MmapFile` is deliberately *leaked* (`Box::leak`, line 1999) so its backing
-memory lives until process exit, and every tensor slice is `&'static [u8]`.
-For a process whose whole purpose is to run one model, that is not a leak in
-any meaningful sense; it is a pool that is freed by `exit`. (The alternatives
-— `Arc<MmapFile>` reference counting, or self-referential structs — buy
-nothing here and cost real complexity; §3.3.)
+slice borrowed from it. minfer's answer is **ownership, not a leak** ([#745],
+[ADR-0075](../adr/0075-a-model-owns-the-mapping-it-reads.md)): the `GgufPart` holds
+an `Arc<MmapFile>`, every weight `Tensor` read out of it holds a handle too, and
+the last handle left anywhere — the model, a cloned tensor, a Metal zero-copy
+part registration — is what unmaps the file and closes its descriptor. The
+`'static` on the tensor's slice therefore means "the owner keeps it alive", not
+"nobody ever frees it": a model can be dropped, and a process that loads models
+in sequence (the tooling, the test suite, a server at model-swap time) gets its
+address space and its descriptors back. (§3.3 records why the leak was chosen
+first and what changed.)
 
 ### 2.6 Multi-part files: many GGUFs, one model
 
@@ -414,8 +417,10 @@ pub struct GgufContext {
 
 pub struct GgufPart {
     pub ctx: GgufContext,
-    /// `'static` slice of the (leaked, process-lifetime) mmap of the part file.
+    /// A `'static` view of `mmap`'s pages (the owner below keeps it alive).
     pub data: &'static [u8],
+    /// The mapping `data` points into — the handle that owns it.
+    pub mmap: std::sync::Arc<MmapFile>,
 }
 
 pub struct GgufModel {
@@ -712,16 +717,17 @@ while mapped, but holding it makes the lifetime story trivially airtight.
 than a null check. And the comment records a measured fact from
 `docs/METAL_OPTIMIZATIONS.md` (#39): the *first* GPU touch of file-backed
 pages costs ~44 ms of page/TLB setup, which Metal's `register_part` pays once
-at load, on purpose, outside the timed region. `as_slice()`
-(lines 1930–1932) turns the pointer into `&[u8]`; `Drop` (lines 1935–1942)
-calls `munmap` — though with the leak below, it effectively never runs.
+at load, on purpose, outside the timed region. `as_slice()` turns the pointer
+into `&[u8]`, `as_static_slice()` into the `'static` form a tensor stores, and
+`Drop` calls `munmap` + flips the `alive` flag a gate can assert on — the drop
+that releases the descriptor is the same one that unmaps the pages.
 
-**(i) The entry point: parts, leak, merge** (`gguf.rs` lines 1998–2014):
+**(i) The entry point: parts, ownership, merge** (`gguf.rs`, `load_gguf_model`):
 
 ```rust
 pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
-    let mmap0 = Box::leak(Box::new(MmapFile::map(path)?));
-    let data0: &'static [u8] = mmap0.as_slice();
+    let mmap0 = std::sync::Arc::new(MmapFile::map(path)?);
+    let data0: &'static [u8] = mmap0.as_static_slice();
     let ctx0 = GgufContext::init_from_data(data0)?;
     let split_count = ctx0
         .get_key_val_i64("split.count")
@@ -733,23 +739,25 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
             parts: vec![GgufPart {
                 ctx: ctx0,
                 data: data0,
+                mmap: mmap0,
             }],
         });
     }
 ```
 
-`Box::leak` is the `'static` trick from §2.5: `MmapFile::map` returns an owned
-value; leaking it converts ownership into a process-lifetime guarantee, which
-is exactly the borrow lifetime every downstream tensor slice needs. Then
-either the fast path (no split: parse and return) or the split path — checks
-first (`split.no` must be 0, lines 2016–2025; filename-derived part list must
+`Arc` is the `'static` trick from §2.5: `MmapFile::map` returns an owned value,
+and the `Arc` keeps it alive as long as *anything* still points into its pages —
+the model, a cloned weight tensor, a Metal zero-copy registration. Nothing is
+leaked, so the load path is also the drop path: when the last handle goes,
+`MmapFile::drop` runs `munmap` and closes the fd. Then either the fast path (no
+split: parse and return) or the split path — checks first (`split.no` must be 0, lines 2016–2025; filename-derived part list must
 match `split.count`, lines 2027–2034), then parse each part in order:
 
 ```rust
 let mut parts = Vec::with_capacity(split_count);
 for (i, p) in part_paths.iter().enumerate() {
-    let mmap = Box::leak(Box::new(MmapFile::map(p)?));
-    let data: &'static [u8] = mmap.as_slice();
+    let mmap = std::sync::Arc::new(MmapFile::map(p)?);
+    let data: &'static [u8] = mmap.as_static_slice();
     let ctx = GgufContext::init_from_data(data)?;
     let no = ctx
         .get_key_val_i64("split.no")
@@ -759,7 +767,7 @@ for (i, p) in part_paths.iter().enumerate() {
         eprintln!("GGUF: split {p:?} has split.no={no}, expected {i}");
         return None;
     }
-    parts.push(GgufPart { ctx, data });
+    parts.push(GgufPart { ctx, data, mmap });
 }
 Some(GgufModel { parts })
 ```
@@ -860,8 +868,8 @@ another. Inside `Tensor` (`tensor.rs` lines 201–214), the slice becomes
 ```rust
 /// Create a weight tensor as a Borrowed slice of the mmap'd GGUF file
 /// (zero-copy load — the file pages are shared with the CPU/GPU instead of
-/// being copied per tensor). The slice must be 'static: the gguf loader
-/// leaks the Mmap for the process lifetime.
+/// being copied per tensor). The slice is 'static because the loader attaches
+/// the mapping's handle with `with_owner`: the tensor keeps its own bytes alive.
 pub fn from_data_borrowed_with_strides(
     ttype: TensorType,
     shape: &[i64; 4],
@@ -872,6 +880,7 @@ pub fn from_data_borrowed_with_strides(
         ttype, shape: *shape, strides: *strides,
         data: std::borrow::Cow::Borrowed(data),
         name: String::new(),
+        owner: None,
     }
 }
 ```
@@ -921,15 +930,21 @@ net, for multi-GB read-only files on machines that also want GPU access to
 the same bytes, there is no contest — llama.cpp made the identical call
 (`llama_mmap`), and minfer is explicitly in that lineage.
 
-**Leak-for-`'static` vs `Arc<MmapFile>`.** The tensors that borrow the mapping
+**Leak-for-`'static` vs an owned mapping.** The tensors that borrow the mapping
 sit inside a `ModelDef` behind `Box<dyn ModelDef>`, get cloned, and get
 registered by name in two or three registries (CPU tensors, Metal buffers,
-CUDA device copies). Threading an `Arc` through all of them (or a
-self-referential struct crate) would infect every signature with a lifetime
-story that never varies in practice: the model lives for the whole process.
-`Box::leak` states that invariant once, at the only place that could violate
-it. The `Drop` impl still exists and is correct — it runs if a non-leaked
-mapping (e.g. a future tool) is dropped — but the load path never triggers it.
+CUDA device copies). The first version of this page argued that threading an
+`Arc` through all of them would infect every signature with a lifetime story
+that never varies in practice — "the model lives for the whole process" — and
+leaked the mapping instead. [#745] found the premise false: the tooling, the
+test suite and a reloading server all load models more than once, and each load
+kept a mapping and a descriptor until exit (macOS's 16 384-fd default makes it
+visible). The chosen shape is the smallest one that survives that: a `GgufPart`
+owns its `Arc`, a `Tensor` carries the same handle, a lifetime never appears in
+a signature, and `Tensor::with_owner` is the one new API. The alternatives —
+`Tensor<'a>` through every backend, a `TensorData::Mapped(range)` enum, a
+self-referential-struct crate — are in [ADR-0075](../adr/0075-a-model-owns-the-mapping-it-reads.md)
+beside what each would cost.
 
 **Raw bytes now, decode never-at-load.** The tempting alternative is
 "dequantize everything to f32 at load" — one clean uniform representation,
@@ -982,11 +997,13 @@ redundancy is an assertion.
   equal the running padded sum (lines 1694–1703). A file with gaps (or with
   padding computed at a different width) is rejected here — not at first
   inference.
-- **The mapping must outlive every slice.** The `Box::leak` at lines 1999 and
-  2038 is load-bearing: drop or unmap early and every weight tensor in the
-  process is a use-after-free. Corollary: model loading is one-way — there is
-  no unload-and-load-another within a process (the server keeps one model per
-  slot, per `docs/ARCHITECTURE.md` §2).
+- **The mapping must outlive every slice.** The `Arc` handles in `GgufPart` and
+  in every weight `Tensor` are load-bearing: unmap while one slice is still
+  reachable and the process has a use-after-free. Corollary: model loading is no
+  longer one-way — a model can be dropped and another loaded, and the release is
+  observable (`src/gguf/tests.rs` asserts the mapping's flag and the fd), with
+  the one device exception ADR-0075 records (a Metal zero-copy part registration
+  holds the pages until MPS is torn down).
 - **`ne[0]` must be a multiple of the block size** (line 1627). This is why a
   model whose vocabulary isn't divisible by 32 cannot be exported as Q8_0
   without padding — `docs/QWEN3-SUPPORT-PLAN.md` records Qwen3's vocab

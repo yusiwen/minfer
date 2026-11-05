@@ -126,6 +126,15 @@ pub struct Tensor {
     pub strides: [usize; 4], // nb[0..3]: stride in bytes per dimension
     pub data: std::borrow::Cow<'static, [u8]>,
     pub name: String,
+    /// [#745]: when `data` is a `Borrowed` slice **into a file mapping**, this is
+    /// that mapping. The two live or die together: cloning a tensor bumps the
+    /// reference count, so a weight tensor that outlives the `GgufModel` it was
+    /// read from keeps its pages alive, and the last handle unmaps the file.
+    ///
+    /// `None` for an owned tensor and for a genuinely `'static` slice (a fixture,
+    /// a `&'static [u8]` literal) — the case the previous `Box::leak` assumed for
+    /// everything.
+    pub owner: Option<std::sync::Arc<crate::gguf::MmapFile>>,
 }
 
 // ggml-parity Tensor API: the graph path exercises this subset (borrowed
@@ -145,6 +154,7 @@ impl Tensor {
             strides: [0; 4],
             data: std::borrow::Cow::Owned(Vec::new()),
             name: String::new(),
+            owner: None,
         };
 
         // Compute strides (ggml.h lines 673-676 + gguf.cpp lines 728-732)
@@ -173,6 +183,7 @@ impl Tensor {
             strides: [0; 4],
             data: std::borrow::Cow::Owned(data),
             name: String::new(),
+            owner: None,
         };
 
         // Compute strides
@@ -203,7 +214,16 @@ impl Tensor {
             strides: *strides,
             data: std::borrow::Cow::Borrowed(data),
             name: String::new(),
+            owner: None,
         }
+    }
+
+    /// [#745]: record the file mapping `data` was borrowed from, so the tensor is
+    /// self-contained — it keeps its own bytes alive regardless of what happens to
+    /// the `GgufModel` it was read from.
+    pub fn with_owner(mut self, owner: std::sync::Arc<crate::gguf::MmapFile>) -> Self {
+        self.owner = Some(owner);
+        self
     }
 
     /// Set tensor name
