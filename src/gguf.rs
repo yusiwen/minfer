@@ -1701,7 +1701,18 @@ pub struct MmapFile {
     ptr: *mut u8,
     len: usize,
     _file: std::fs::File, // keeps the fd alive for the mapping's lifetime
+    /// [#745]: flipped by `Drop`. It exists so a gate can assert that dropping the
+    /// last handle really unmapped the file — "the mapping is gone" is otherwise
+    /// only observable through `/proc/self/maps`, which no macOS test can read.
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+// [#745]: a read-only file mapping is safe to share between threads — the pages are
+// immutable, and `munmap` happens only when the last `Arc<MmapFile>` goes. Without
+// this, `Tensor` (which carries a handle) would stop being `Send`, and `ModelDef`
+// requires `Send + Sync`.
+unsafe impl Send for MmapFile {}
+unsafe impl Sync for MmapFile {}
 
 // Generic POSIX mmap (Linux + macOS; the syscall ABI is identical on both).
 #[cfg(unix)]
@@ -1756,12 +1767,39 @@ impl MmapFile {
                 ptr: ptr as *mut u8,
                 len,
                 _file: file,
+                alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             })
         }
     }
 
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+
+    /// The bytes as a `'static` slice.
+    ///
+    /// **The caller must keep an owning handle (`Arc<MmapFile>`, or a `Tensor`
+    /// carrying one) for as long as the slice is reachable.** That is the whole
+    /// cost of not leaking: the lifetime is carried by the owner, not by the type.
+    /// [`GgufPart`] and [`crate::tensor::Tensor`] are the two guards.
+    pub fn as_static_slice(&self) -> &'static [u8] {
+        let bytes = self.as_slice();
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) }
+    }
+
+    /// [#745]: a handle that turns false when this mapping is unmapped — the
+    /// observable a gate can assert on any OS.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn alive(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.alive.clone()
+    }
+
+    /// [#745] the mapping's own file descriptor. A test uses it to prove the fd is
+    /// closed by the same drop that unmaps.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn raw_fd(&self) -> i32 {
+        use std::os::unix::io::AsRawFd;
+        self._file.as_raw_fd()
     }
 }
 
@@ -1771,14 +1809,23 @@ impl Drop for MmapFile {
         unsafe {
             munmap(self.ptr as *mut std::ffi::c_void, self.len);
         }
+        self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 /// One GGUF part: its parsed context + the raw file bytes (data section).
+///
+/// [#745]: the part **owns** its mapping. `data` is a `'static` view of it because
+/// the byte slice outlives every `&GgufPart` borrow, and `mmap` is the handle that
+/// makes that sound: the two fields are constructed together, the part is never
+/// cloned without both, and dropping the last handle (here, in a `Tensor`, or in
+/// the Metal part registration) unmaps the file and closes its fd.
 pub struct GgufPart {
     pub ctx: GgufContext,
-    /// `'static` slice of the (leaked, process-lifetime) mmap of the part file.
+    /// A `'static` view of `mmap`'s pages (see the struct doc).
     pub data: &'static [u8],
+    /// The mapping `data` points into — the owner that keeps it alive.
+    pub mmap: std::sync::Arc<MmapFile>,
 }
 
 /// A model loaded from one GGUF file, or from the N parts of a split.
@@ -1826,11 +1873,16 @@ pub fn resolve_splits(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>>
 
 /// Load a GGUF model from `path` (a single file or the FIRST part of a split),
 /// assembling all parts. Aligned with llama.cpp: part 0 must be loaded first.
-/// Each part file is mmap'd (zero-copy; the Mmap is leaked for the process
-/// lifetime so weight tensors can hold `&'static` slices into it).
+///
+/// Each part file is mmap'd (zero-copy). [#745] the mapping is **owned**, not
+/// leaked: it stays alive exactly as long as this model — or any `Tensor` read out
+/// of it, or a Metal zero-copy part registration — holds a handle, and the last
+/// one unmaps the file and closes its fd. Loading and dropping models in one
+/// process (a server, the tooling, the test suite) therefore no longer accumulates
+/// address space and descriptors.
 pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
-    let mmap0 = Box::leak(Box::new(MmapFile::map(path)?));
-    let data0: &'static [u8] = mmap0.as_slice();
+    let mmap0 = std::sync::Arc::new(MmapFile::map(path)?);
+    let data0: &'static [u8] = mmap0.as_static_slice();
     let ctx0 = GgufContext::init_from_data(data0)?;
     let split_count = ctx0
         .get_key_val_i64("split.count")
@@ -1842,6 +1894,7 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
             parts: vec![GgufPart {
                 ctx: ctx0,
                 data: data0,
+                mmap: mmap0,
             }],
         });
     }
@@ -1868,8 +1921,8 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
 
     let mut parts = Vec::with_capacity(split_count);
     for (i, p) in part_paths.iter().enumerate() {
-        let mmap = Box::leak(Box::new(MmapFile::map(p)?));
-        let data: &'static [u8] = mmap.as_slice();
+        let mmap = std::sync::Arc::new(MmapFile::map(p)?);
+        let data: &'static [u8] = mmap.as_static_slice();
         let ctx = GgufContext::init_from_data(data)?;
         let no = ctx
             .get_key_val_i64("split.no")
@@ -1879,7 +1932,7 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
             eprintln!("GGUF: split {p:?} has split.no={no}, expected {i}");
             return None;
         }
-        parts.push(GgufPart { ctx, data });
+        parts.push(GgufPart { ctx, data, mmap });
     }
     Some(GgufModel { parts })
 }

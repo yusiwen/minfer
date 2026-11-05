@@ -84,6 +84,18 @@
 
 # ---- cpu: 45 dead item(s), union of aarch64 + x86_64 ----
 [[cpu]]
+name = "alive"
+kind = "fn"
+file = "src/gguf.rs"
+reason = "Read by `gguf::tests` only (#745): the flag a gate asserts on to prove a dropped model really unmapped its file, which no production caller needs."
+
+[[cpu]]
+name = "raw_fd"
+kind = "fn"
+file = "src/gguf.rs"
+reason = "Read by `gguf::tests` only (#745): the mapping's descriptor, asserted to stop pointing at the model file after a drop; production never inspects it."
+
+[[cpu]]
 name = "AutoWithBudget"
 kind = "variant"
 file = "src/graph/offload.rs"
@@ -743,3 +755,14 @@ kind = "field"
 file = "src/conversation.rs"
 reason = "Read by `conversation::tests`; the streaming path hands each delta to the caller as it is produced, so no production code reads the assembled field."
 
+[[cuda]]
+name = "alive"
+kind = "fn"
+file = "src/gguf.rs"
+reason = "Read by `gguf::tests` only (#745): the flag a gate asserts on to prove a dropped model really unmapped its file, which no production caller needs."
+
+[[cuda]]
+name = "raw_fd"
+kind = "fn"
+file = "src/gguf.rs"
+reason = "Read by `gguf::tests` only (#745): the mapping's descriptor, asserted to stop pointing at the model file after a drop; production never inspects it."

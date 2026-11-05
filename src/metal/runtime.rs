@@ -563,10 +563,16 @@ impl MpsState {
     /// newBufferWithBytesNoCopy requires a page-aligned base (llama
     /// ggml_metal_buffer_map, ggml-metal-device.m:1701). Weights from this part
     /// are then registered as (buffer, offset) into this one buffer.
-    pub fn register_part(&self, data: &'static [u8]) {
+    /// [#745] `owner` is the GGUF part's mapping. The zero-copy buffer below makes
+    /// the GPU read the mapped pages directly, so the mapping must outlive the
+    /// `MTLBuffer`; holding a handle here is what makes that true after the model
+    /// (or any tensor) is dropped. The registration itself is process-lifetime, so
+    /// on macOS a loaded model's pages stay mapped until MPS is torn down — that is
+    /// a bounded, *needed* hold, unlike the leak this replaces.
+    pub fn register_part(&self, data: &'static [u8], owner: std::sync::Arc<crate::gguf::MmapFile>) {
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = data;
+            let _ = (data, owner);
         }
         #[cfg(target_os = "macos")]
         {
@@ -592,7 +598,7 @@ impl MpsState {
                 .mmap_parts
                 .lock()
                 .unwrap()
-                .push((base, data.len(), buf.clone()));
+                .push((base, data.len(), buf.clone(), owner));
             // GPU-side warm-up (METAL_OPTIMIZATIONS #39): the FIRST GPU access to
             // file-backed (mmap) pages costs ~44 ms of one-time page/TLB setup.
             // Doing a dummy full-buffer read HERE (at model load, outside the
@@ -635,8 +641,8 @@ impl MpsState {
                 let parts = self.inner.mmap_parts.lock().unwrap();
                 parts
                     .iter()
-                    .find(|(base, len, _)| ptr >= *base && ptr + data.len() <= base + len)
-                    .map(|(base, _, buf)| (buf.clone(), (ptr - base) as u64))
+                    .find(|(base, len, _, _)| ptr >= *base && ptr + data.len() <= base + len)
+                    .map(|(base, _, buf, _)| (buf.clone(), (ptr - base) as u64))
             } else {
                 None
             };

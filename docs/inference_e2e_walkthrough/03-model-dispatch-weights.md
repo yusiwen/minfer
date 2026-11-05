@@ -147,8 +147,11 @@ The single most important data decision of this stage: a loaded weight tensor
 is a *view*, not a copy. The `Tensor` type stores its payload as
 `std::borrow::Cow<'static, [u8]>` — a Rust "clone-on-write" enum that here is
 always the `Borrowed` variant, i.e. a plain `(pointer, length)` slice pointing
-into the mmap'd GGUF file. The `'static` lifetime works because doc 02's
-loader `Box::leak`s each mmap for the process lifetime (`gguf.rs:`).
+into the mmap'd GGUF file. The `'static` lifetime is a *promise* the tensor
+carries with it: the loader attaches the mapping's handle (`Tensor::owner`,
+[#745](https://github.com/yusiwen/minfer/issues/745)), so a cloned weight keeps
+its own pages alive and the last handle unmaps the file
+([ADR-0075](../adr/0075-a-model-owns-the-mapping-it-reads.md)).
 
 Three consequences follow, and each one answers a "why not the obvious
 alternative":
