@@ -78,9 +78,10 @@ __device__ __forceinline__ void q8_0_quantize_block(const float* x, unsigned cha
 // drift: the Qwen3 gate compares the fused node against `Op::RoPE` +
 // `Op::KvcacheStore` and would see any difference as a logit delta.
 __device__ __forceinline__ float2 minfer_rope_pair(
-    float x0, float x1, int d, int hd, int pos, float freq_base, float freq_scale
+    float x0, float x1, int d, int hd, int pos, float freq_base, float freq_scale,
+    const RopeFreqs& freqs
 ) {
-    float freq = freq_scale / powf(freq_base, (2.0f * d) / hd);
+    float freq = minfer_rope_freq(freqs, d, hd, freq_base, freq_scale);
     float theta = pos * freq;
     float cs = cosf(theta), sn = sinf(theta);
     return make_float2(x0 * cs - x1 * sn, x0 * sn + x1 * cs);
@@ -141,6 +142,7 @@ __global__ void attn_bias_rope_store_f32(
     float* __restrict__ kv_v,
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions,
     const int* cells,
     int kv_is_f16
@@ -166,7 +168,7 @@ __global__ void attn_bias_rope_store_f32(
         const int j  = base + d;
         const int j2 = j + half_dim;
         const float2 r = minfer_rope_pair(
-            q[j] + bias_q[j], q[j2] + bias_q[j2], d, hd, pos, freq_base, freq_scale);
+            q[j] + bias_q[j], q[j2] + bias_q[j2], d, hd, pos, freq_base, freq_scale, freqs);
         q[j]  = r.x;
         q[j2] = r.y;
     } else if (u < qpairs + kpairs) {
@@ -178,7 +180,7 @@ __global__ void attn_bias_rope_store_f32(
         const int j  = base + d;
         const int j2 = j + half_dim;
         const float2 r = minfer_rope_pair(
-            k[j] + bias_k[j], k[j2] + bias_k[j2], d, hd, pos, freq_base, freq_scale);
+            k[j] + bias_k[j], k[j2] + bias_k[j2], d, hd, pos, freq_base, freq_scale, freqs);
         const float r0 = r.x;
         const float r1 = r.y;
         k[j]  = r0;
@@ -231,6 +233,7 @@ __global__ void attn_bias_rope_store_q8_0(
     unsigned char* __restrict__ kv_v,
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions,
     const int* cells,
     size_t row_bytes
@@ -254,7 +257,7 @@ __global__ void attn_bias_rope_store_q8_0(
         const int j  = base + d;
         const int j2 = j + half_dim;
         const float2 r = minfer_rope_pair(
-            q[j] + bias_q[j], q[j2] + bias_q[j2], d, hd, pos, freq_base, freq_scale);
+            q[j] + bias_q[j], q[j2] + bias_q[j2], d, hd, pos, freq_base, freq_scale, freqs);
         q[j]  = r.x;
         q[j2] = r.y;
     } else if (u < qpairs + kblks) {
@@ -275,7 +278,7 @@ __global__ void attn_bias_rope_store_q8_0(
             const int ja = head * hd + dd;
             const int jb = ja + half_dim;
             const float2 r = minfer_rope_pair(
-                k[ja] + bias_k[ja], k[jb] + bias_k[jb], dd, hd, pos, freq_base, freq_scale);
+                k[ja] + bias_k[ja], k[jb] + bias_k[jb], dd, hd, pos, freq_base, freq_scale, freqs);
             x[i] = (d < half_dim) ? r.x : r.y;
         }
         q8_0_quantize_block(x, kv_k + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
@@ -312,6 +315,7 @@ __global__ void attn_rope_store_f32(
     float* __restrict__ kv_v,
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions,
     const int* cells,
     int kv_is_f16
@@ -335,7 +339,7 @@ __global__ void attn_rope_store_f32(
         const int base = head * hd;
         const int j  = base + d;
         const int j2 = j + half_dim;
-        const float2 r = minfer_rope_pair(q[j], q[j2], d, hd, pos, freq_base, freq_scale);
+        const float2 r = minfer_rope_pair(q[j], q[j2], d, hd, pos, freq_base, freq_scale, freqs);
         q[j]  = r.x;
         q[j2] = r.y;
     } else if (u < qpairs + kpairs) {
@@ -346,7 +350,7 @@ __global__ void attn_rope_store_f32(
         const int base = head * hd;
         const int j  = base + d;
         const int j2 = j + half_dim;
-        const float2 r = minfer_rope_pair(k[j], k[j2], d, hd, pos, freq_base, freq_scale);
+        const float2 r = minfer_rope_pair(k[j], k[j2], d, hd, pos, freq_base, freq_scale, freqs);
         k[j]  = r.x;
         k[j2] = r.y;
         if (kv_is_f16) {
@@ -381,6 +385,7 @@ __global__ void attn_rope_store_q8_0(
     unsigned char* __restrict__ kv_v,
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions,
     const int* cells,
     size_t row_bytes
@@ -401,7 +406,7 @@ __global__ void attn_rope_store_q8_0(
         const int base = head * hd;
         const int j  = base + d;
         const int j2 = j + half_dim;
-        const float2 r = minfer_rope_pair(q[j], q[j2], d, hd, pos, freq_base, freq_scale);
+        const float2 r = minfer_rope_pair(q[j], q[j2], d, hd, pos, freq_base, freq_scale, freqs);
         q[j]  = r.x;
         q[j2] = r.y;
     } else if (u < qpairs + kblks) {
@@ -416,7 +421,7 @@ __global__ void attn_rope_store_q8_0(
             const int dd = (d < half_dim) ? d : d - half_dim;
             const int ja = head * hd + dd;
             const int jb = ja + half_dim;
-            const float2 r = minfer_rope_pair(k[ja], k[jb], dd, hd, pos, freq_base, freq_scale);
+            const float2 r = minfer_rope_pair(k[ja], k[jb], dd, hd, pos, freq_base, freq_scale, freqs);
             x[i] = (d < half_dim) ? r.x : r.y;
         }
         q8_0_quantize_block(x, kv_k + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
@@ -482,6 +487,7 @@ void launch_attn_bias_rope_store(
     void* kv_k, void* kv_v,
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions, const int* cells, int kv_is_f16,
     cudaStream_t stream
 ) {
@@ -493,7 +499,7 @@ void launch_attn_bias_rope_store(
         q, k, v,
         (const float*)bias_q, (const float*)bias_k, (const float*)bias_v,
         (float*)kv_k, (float*)kv_v,
-        nqt, nkt, hd, freq_base, freq_scale, positions, cells, kv_is_f16);
+        nqt, nkt, hd, freq_base, freq_scale, freqs, positions, cells, kv_is_f16);
     minfer_launch_ok("launch:attn_bias_rope_store", "attn_bias_rope_store_f32");
 }
 
@@ -506,6 +512,7 @@ void launch_attn_bias_rope_store_q8_0(
     void* kv_k, void* kv_v,
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions, const int* cells, size_t row_bytes,
     cudaStream_t stream
 ) {
@@ -517,7 +524,7 @@ void launch_attn_bias_rope_store_q8_0(
         q, k, v,
         (const float*)bias_q, (const float*)bias_k, (const float*)bias_v,
         (unsigned char*)kv_k, (unsigned char*)kv_v,
-        nqt, nkt, hd, freq_base, freq_scale, positions, cells, row_bytes);
+        nqt, nkt, hd, freq_base, freq_scale, freqs, positions, cells, row_bytes);
     minfer_launch_ok("launch:attn_bias_rope_store_q8_0", "attn_bias_rope_store_q8_0");
 }
 
@@ -530,6 +537,7 @@ void launch_attn_rope_store(
     void* kv_k, void* kv_v,
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions, const int* cells, int kv_is_f16,
     cudaStream_t stream
 ) {
@@ -539,7 +547,7 @@ void launch_attn_rope_store(
     minfer_launch_prelude("launch:attn_rope_store", "attn_rope_store_f32");
     attn_rope_store_f32<<<grid, minfer_launch_block("launch:attn_rope_store", block), 0, stream>>>(
         q, k, v, (float*)kv_k, (float*)kv_v,
-        nqt, nkt, hd, freq_base, freq_scale, positions, cells, kv_is_f16);
+        nqt, nkt, hd, freq_base, freq_scale, freqs, positions, cells, kv_is_f16);
     minfer_launch_ok("launch:attn_rope_store", "attn_rope_store_f32");
 }
 
@@ -548,6 +556,7 @@ void launch_attn_rope_store_q8_0(
     void* kv_k, void* kv_v,
     int nqt, int nkt, int hd,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions, const int* cells, size_t row_bytes,
     cudaStream_t stream
 ) {
@@ -557,7 +566,7 @@ void launch_attn_rope_store_q8_0(
     minfer_launch_prelude("launch:attn_rope_store_q8_0", "attn_rope_store_q8_0");
     attn_rope_store_q8_0<<<grid, minfer_launch_block("launch:attn_rope_store_q8_0", block), 0, stream>>>(
         q, k, v, (unsigned char*)kv_k, (unsigned char*)kv_v,
-        nqt, nkt, hd, freq_base, freq_scale, positions, cells, row_bytes);
+        nqt, nkt, hd, freq_base, freq_scale, freqs, positions, cells, row_bytes);
     minfer_launch_ok("launch:attn_rope_store_q8_0", "attn_rope_store_q8_0");
 }
 }

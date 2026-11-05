@@ -383,6 +383,7 @@ fn graph_metal_layer0_isolation() {
         let rm = |hd_, nh_| crate::graph::ops::RoPEMeta {
             freq_base: hp.rope_freq_base,
             freq_scale: hp.rope_freq_scale,
+            freqs: None,
             n_head: nh_,
             hd: hd_,
         };

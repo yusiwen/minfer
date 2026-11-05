@@ -563,7 +563,7 @@ persistent KV regions. So the model wiring applies an **all-or-nothing
 gate** before the graph is even built:
 
 ```rust
-// src/models/qwen2/graph.rs:776 (`device`) (abridged)
+// src/models/qwen2/graph.rs:780 (`device`) (abridged)
 // CUDA participation (Phase 7): requires a usable device AND every
 // matmul weight registered on the CUDA registry in a kernel-supported
 // type (all-or-nothing; 7e③ moved the embedding gather on device, so
@@ -579,7 +579,7 @@ cparams: CParams {
 },
 ```
 
-`weights_on_cuda` (`qwen2/graph.rs:881`) walks every weight the graph reads
+`weights_on_cuda` (`qwen2/graph.rs:885`) walks every weight the graph reads
 — embedding, output head, every layer's norms/biases/matmul weights — and
 requires each to be (a) registered and (b) a type with a matching kernel.
 The type check is per *role*: matmul weights admit all eight quant types
@@ -600,7 +600,7 @@ kernel's structural invariants, and launches. The wrapper adds one
 capture-window duty:
 
 ```rust
-// src/graph/cuda_backend.rs:2345 (`execute_node`)
+// src/graph/cuda_backend.rs:2360 (`execute_node`)
 fn execute_node(
     &mut self,
     node: &CNode,
@@ -911,7 +911,7 @@ counter per key), and `capturing` (an open capture window, closed by
 `synchronize`):
 
 ```rust
-// src/graph/cuda_backend.rs:459 (`graph_replay_step`) (abridged)
+// src/graph/cuda_backend.rs:462 (`graph_replay_step`) (abridged)
 let key = (uid, range);
 if let Some(pos) = self.graph_execs
     .iter().position(|g| g.uid == uid && g.range == range)
@@ -975,11 +975,11 @@ Every line answers a "what could go wrong":
   stream and capture runs in `cudaStreamCaptureModeThreadLocal`, so another
   backend's stream work (the CPU-side fills of a mixed split boundary, another
   model slot's launches) cannot be recorded into this graph. `stream_guard`
-  survives as a `None`-returning shim (`cuda_backend.rs:556`) so the historical
+  survives as a `None`-returning shim (`cuda_backend.rs:559`) so the historical
   call sites read as the no-ops they now are.
 
 Closing the window happens in `synchronize` → `close_capture_or_sync`
-(`cuda_backend.rs:560`): end capture, **instantiate**, launch once so the
+(`cuda_backend.rs:563`): end capture, **instantiate**, launch once so the
 step still produces output, and cache the exec. If instantiate/launch fails, the
 recorded launches never executed —
 this step's outputs are undefined, and the code says so out loud (graphs
@@ -999,7 +999,7 @@ The pool mirrors Metal's (doc 14): a `Vec<CudaBuf>` plus a byte-length-matched
 free list. Two details are CUDA-specific:
 
 ```rust
-// src/graph/cuda_backend.rs:2292 (`alloc_buffer`) (alloc_buffer)
+// src/graph/cuda_backend.rs:2307 (`alloc_buffer`) (alloc_buffer)
 fn alloc_buffer(&mut self, size: usize) -> usize {
     let _sg = self.stream_guard(); // cudaMalloc syncs the device
     let bytes = size * 4;

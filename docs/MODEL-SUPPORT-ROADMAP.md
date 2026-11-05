@@ -45,24 +45,25 @@ Four items are **not** covered by that estimate and apply to every port:
 1. **Decode-fusion weight registration.** The decode path fuses QKV
    (`blk.{i}.attn_qkv`) and gate+up (`blk.{i}.ffn_gu`) only when the loader has
    registered the concatenated tensors — once for Metal and once for CUDA
-   (`models/qwen2/loader.rs:457`, `:520`; `models/qwen3/loader.rs:434`, `:476`)
+   (`models/qwen2/loader.rs:463`, `:549`; `models/qwen3/loader.rs:461`, `:503`)
    — plus the matching `qkv_concat_available` / `gu_concat_available`
    predicates (`models/qwen2/graph.rs:`). Skip them and the port is
    still **correct**, but decode fusion silently disables: no error, just a
    slower decode path.
 2. **RoPE style.** `rope_style` is hard-coded to `NonInterleaved` in both
-   loaders (`models/qwen2/loader.rs:171`, `models/qwen3/loader.rs:178`).
+   loaders (`models/qwen2/loader.rs:174`, `models/qwen3/loader.rs:181`).
    `RopeStyle::Interleaved` exists and the CPU implements it
    (`graph/cpu_backend.rs:`), but CUDA refuses it
-   (`graph/cuda_backend.rs:1324`) and no loader ever selects it. A family
+   (`graph/cuda_backend.rs:1327`) and no loader ever selects it. A family
    needing interleaved RoPE (Llama 1/2, Mistral 7B v0.1) needs a loader change
    **and** a CUDA kernel, or must be converted to the non-interleaved
    convention.
-3. **RoPE scaling.** Only `*.rope.freq_base` and `*.rope.frequency_scale` are
-   read (`models/qwen2/loader.rs:`). The long-context scaling types
-   (`rope.scaling.type = llama3`, i.e. the low/high-frequency factors in
-   Llama 3.1+) are not implemented, so a Llama 3.x port is correct at short
-   context and wrong past the original training window until this lands.
+3. **RoPE scaling — done for `llama3`** ([#724](https://github.com/yusiwen/minfer/issues/724),
+   [ADR-0074](adr/0074-the-llama3-rope-table-is-read-from-the-gguf.md)). The per-pair
+   factor table is read from the file (`rope_freqs.weight` globally or per block,
+   or the `llama3` metadata spelling) and divides each pair's inverse frequency in
+   every rope kernel. `linear`/`yarn`/`longrope` are refused by name, so a file
+   declaring one fails at load instead of running the wrong rope.
 4. **Chat template.** minijinja 2.21 exposes no `str` methods natively; since
    F7 ([#50](https://github.com/yusiwen/minfer/issues/50)) minfer installs an
    unknown-method hook implementing the Python `str` methods with CPython
@@ -92,7 +93,7 @@ instead of being hand-written per backend.
 | **Llama 3.1/3.2/3.3/3.4** | no attention bias (optional in the IR), RoPE variant, SwiGLU gate/up order | **RoPE scaling** (cost model #3) — short context works without it, long context does not; concat-weight registration (#1) | smallest + rope work |
 | **Mistral 7B** | same as Llama 3 (no bias) | **Interleaved RoPE** for v0.1 (cost model #2): loader + CUDA kernel; or convert to the non-interleaved convention | small–medium |
 | **InternLM2** | ~none | concat-weight registration (#1) only | smallest |
-| **Phi-3/Phi-4** | qkv bias, RoPE variant, no norm | qkv bias is already supported (`models/qwen2/loader.rs:435`); verify the RoPE variant | small |
+| **Phi-3/Phi-4** | qkv bias, RoPE variant, no norm | qkv bias is already supported (`models/qwen2/loader.rs:441`); verify the RoPE variant | small |
 | **GLM-4-9B** | dense, minor attention details | none known beyond #1 | small |
 | **Gemma 2** | GeGLU, shared QKV layer, **alternating SWA** | **`Gelu` op** (absent from `Op`, `graph/ops.rs` — GeGLU needs it) and a **sliding-window mask** in the attention kernels (adjacent to `ARCHITECTURE-ROADMAP.md` §3 item 2, but a distinct parameter — a window bound rather than a cell set); GeGLU itself is a five-site change unless `§3 item 7` lands first | medium |
 

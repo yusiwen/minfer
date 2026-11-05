@@ -264,6 +264,7 @@ __global__ void rope_f32(
     float* x,
     int n_head, int n_dims, int nt,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions
 ) {
     int t = blockIdx.x;
@@ -274,7 +275,7 @@ __global__ void rope_f32(
     int base = (t * n_head + h) * n_dims;
 
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
-        float freq = freq_scale / powf(freq_base, (2.0f * i) / n_dims);
+        float freq = minfer_rope_freq(freqs, i, n_dims, freq_base, freq_scale);
         float theta = positions[t] * freq;
         float cs = cosf(theta), sn = sinf(theta);
         int j = base + i;
@@ -294,6 +295,7 @@ __global__ void rope_f32_interleaved(
     float* x,
     int n_head, int n_dims, int nt,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions
 ) {
     int t = blockIdx.x;
@@ -304,7 +306,7 @@ __global__ void rope_f32_interleaved(
     int base = (t * n_head + h) * n_dims;
 
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
-        float freq = freq_scale / powf(freq_base, (2.0f * i) / n_dims);
+        float freq = minfer_rope_freq(freqs, i, n_dims, freq_base, freq_scale);
         float theta = positions[t] * freq;
         float cs = cosf(theta), sn = sinf(theta);
         int j = base + 2 * i;
@@ -446,6 +448,7 @@ void launch_f32_bits_to_i32(
 void launch_rope_f32(
     float* x, int n_head, int n_dims, int nt,
     float freq_base, float freq_scale,
+    RopeFreqs freqs,
     const int* positions, int style, cudaStream_t stream
 ) {
     int block_sz = 64; // threads per head dimension
@@ -453,9 +456,9 @@ void launch_rope_f32(
     dim3 grid(nt, n_head, 1);
     minfer_launch_prelude("launch:rope_f32", "rope_f32");
     if (style == 1) {
-        rope_f32_interleaved<<<grid, minfer_launch_block("launch:rope_f32", block), 0, stream>>>(x, n_head, n_dims, nt, freq_base, freq_scale, positions);
+        rope_f32_interleaved<<<grid, minfer_launch_block("launch:rope_f32", block), 0, stream>>>(x, n_head, n_dims, nt, freq_base, freq_scale, freqs, positions);
     } else {
-        rope_f32<<<grid, minfer_launch_block("launch:rope_f32", block), 0, stream>>>(x, n_head, n_dims, nt, freq_base, freq_scale, positions);
+        rope_f32<<<grid, minfer_launch_block("launch:rope_f32", block), 0, stream>>>(x, n_head, n_dims, nt, freq_base, freq_scale, freqs, positions);
     }
     minfer_launch_ok("launch:rope_f32", "rope_f32");
 }

@@ -11,6 +11,7 @@ kernel void kernel_rope_f32(
     constant float & freq_scale [[buffer(5)]],
     constant int * positions [[buffer(6)]],
     constant int & rope_style [[buffer(7)]],
+    constant RopeFreqs & freqs [[buffer(8)]],
     uint3 tid [[thread_position_in_grid]]   // (dim, head, token)
 ) {
     int half_dim = n_dims / 2;
@@ -19,7 +20,7 @@ kernel void kernel_rope_f32(
     int t = tid.z;       // 0..nt-1
     if (t >= nt || h >= n_head || d >= half_dim) return;
     int base = (t * n_head + h) * n_dims;
-    float freq = freq_scale / pow(freq_base, (2.0 * d) / n_dims);
+    float freq = rope_freq(freqs, d, n_dims, freq_base, freq_scale);
     float theta = positions[t] * freq;
     float cs = cos(theta), sn = sin(theta);
     int i0, i1;

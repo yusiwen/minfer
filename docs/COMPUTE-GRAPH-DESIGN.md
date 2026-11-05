@@ -1587,3 +1587,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0013](adr/0013-cpu-quantizes-activations-device-reads-f32.md) — The CPU quantizes activations to Q8_0; a device reads f32
 - [ADR-0004](adr/0004-the-batching-default-follows-the-device.md) — The batching default follows the device
 - [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — The KV storage format is a per-engine gate, not a process-wide global
+- [ADR-0074](adr/0074-the-llama3-rope-table-is-read-from-the-gguf.md) — The llama3 rope table is read from the GGUF, not re-derived from four numbers

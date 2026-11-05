@@ -9,6 +9,24 @@
 use super::*;
 
 #[cfg(target_os = "macos")]
+/// #724: the `RopeFreqs` value to hand a kernel. "No scaling" is spelled as a
+/// zero table (`n == 0`) rather than an omitted argument, so the kernel's own
+/// branch — the same one the CPU reference takes — selects the unscaled formula.
+fn freqs_arg(freqs: Option<&crate::vec_ops::RopeFreqs>) -> crate::vec_ops::RopeFreqs {
+    freqs.copied().unwrap_or_default()
+}
+
+/// The struct as the bytes Metal's `setBytes` wants. Layout identity between this
+/// `#[repr(C)]` type and `struct RopeFreqs` in `common.h` is the contract.
+fn freqs_bytes(freqs: &crate::vec_ops::RopeFreqs) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            freqs as *const crate::vec_ops::RopeFreqs as *const u8,
+            std::mem::size_of::<crate::vec_ops::RopeFreqs>(),
+        )
+    }
+}
+
 impl MpsCommandBuffer<'_> {
     pub fn quant_matmul_f32_on_gpu_buf(
         &self,
@@ -1145,6 +1163,7 @@ impl MpsCommandBuffer<'_> {
         nt: usize,
         freq_base: f32,
         freq_scale: f32,
+        freqs: Option<&crate::vec_ops::RopeFreqs>,
         positions: &MetalBuffer,
         rope_style: i32,
         off: usize,
@@ -1168,6 +1187,8 @@ impl MpsCommandBuffer<'_> {
                 .setBuffer_offset_atIndex(Some(&**(positions)), (0) as usize, (6) as usize)
         };
         self.set_params(7, &rope_style);
+        let freqs = freqs_arg(freqs);
+        self.set_bytes(8, freqs_bytes(&freqs));
         // P7: one thread per (dim, head, token) instead of one per (token, head)
         self.dispatch_3d((n_dims / 2) as u64, n_head as u64, nt as u64, 1, 1, 1);
     }
@@ -2310,6 +2331,7 @@ impl MpsCommandBuffer<'_> {
         hd: usize,
         freq_base: f32,
         freq_scale: f32,
+        freqs: Option<&crate::vec_ops::RopeFreqs>,
         pos: i32,
         rope_style: i32,
         f16: bool,
@@ -2348,6 +2370,8 @@ impl MpsCommandBuffer<'_> {
         self.set_params(11, &pos);
         self.set_params(12, &rope_style);
         self.set_params(13, &(if f16 { 1 } else { 0 }));
+        let freqs = freqs_arg(freqs);
+        self.set_bytes(14, freqs_bytes(&freqs));
         let grid = nqt / 2 + nkt / 2 + nkt;
         self.dispatch_1d(grid as u64, 256);
     }
@@ -2369,6 +2393,7 @@ impl MpsCommandBuffer<'_> {
         hd: usize,
         freq_base: f32,
         freq_scale: f32,
+        freqs: Option<&crate::vec_ops::RopeFreqs>,
         pos: i32,
         rope_style: i32,
         f16: bool,
@@ -2396,6 +2421,8 @@ impl MpsCommandBuffer<'_> {
         self.set_params(8, &pos);
         self.set_params(9, &rope_style);
         self.set_params(10, &(if f16 { 1 } else { 0 }));
+        let freqs = freqs_arg(freqs);
+        self.set_bytes(11, freqs_bytes(&freqs));
         let grid = nqt / 2 + nkt / 2 + nkt;
         self.dispatch_1d(grid as u64, 256);
     }

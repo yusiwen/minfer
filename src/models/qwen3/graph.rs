@@ -143,6 +143,7 @@ impl Qwen3Graph {
                         nk,
                         freq_base: hp.rope_freq_base,
                         freq_scale: hp.rope_freq_scale,
+                        freqs: hp.rope_freqs.map(Box::new),
                         rope_style: hp.rope_style,
                         kv_elems: nkt * n_ctx,
                         row_elems: params.cparams.kv_format.row_elems(nkt),
@@ -171,6 +172,7 @@ impl Qwen3Graph {
                     RoPEMeta {
                         freq_base: hp.rope_freq_base,
                         freq_scale: hp.rope_freq_scale,
+                        freqs: hp.rope_freqs.map(Box::new),
                         n_head: nh,
                         hd,
                     },
@@ -182,6 +184,7 @@ impl Qwen3Graph {
                     RoPEMeta {
                         freq_base: hp.rope_freq_base,
                         freq_scale: hp.rope_freq_scale,
+                        freqs: hp.rope_freqs.map(Box::new),
                         n_head: nk,
                         hd,
                     },

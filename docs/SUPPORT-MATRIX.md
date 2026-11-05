@@ -254,6 +254,7 @@ set-valued `kv_map` attention window (`Device::gathers_attn_map`), and a packed
 | `KvcacheStore` | ✅ | ✅ | ✅ |
 | `SwiGLU` (fused) | ✅ | ✅ | ✅ |
 | `RoPE` non-interleaved | ✅ | ✅ | ✅ |
+| `RoPE` llama3 scaling | ✅ | ✅ | ✅ — the per-pair factor table is read from the file and divides each pair's inverse frequency; absent, the kernel evaluates the pre-table expression exactly ([#724](https://github.com/yusiwen/minfer/issues/724), [ADR-0074](adr/0074-the-llama3-rope-table-is-read-from-the-gguf.md)) |
 | `RoPE` interleaved | ✅ | ✅ | ✅ — the kernel takes the layout as a parameter (`rope_f32`'s `style`, the same encoding Metal's uses), so Llama 3.x rotates on the device instead of on the CPU ([#735](https://github.com/yusiwen/minfer/issues/735)); the fused QKV epilogues stay NEOX-only |
 | `FusedQKV` (decode) | ❌ | ✅ | ✅ |
 | `FusedFFN` (decode) | ❌ | ✅ | ✅ |
@@ -338,9 +339,19 @@ file itself decides, and the loader follows, is the **rope layout** — Llama
 rotates pairs of consecutive head values (`Interleaved`) while the Qwen families
 rotate the two halves (`NonInterleaved`, NeoX) — plus the stop set
 (`tokenizer.ggml.eot_token_id`/`eom_token_id`, or the vocabulary's
-`<|eot_id|>`/`<|eom_id|>`). The llama3 frequency factors a file carries as
-`rope_freqs.weight` are [#724](https://github.com/yusiwen/minfer/issues/724)'s
-contract; until then a table-carrying model runs the plain formula.
+`<|eot_id|>`/`<|eom_id|>`).
+
+**RoPE scaling types** ([#724](https://github.com/yusiwen/minfer/issues/724), [ADR-0074](adr/0074-the-llama3-rope-table-is-read-from-the-gguf.md)):
+`llama3` is supported, and it is read from the file rather than re-derived. Three
+spellings reach the same per-pair factor table — the global `rope_freqs.weight`
+tensor llama.cpp's converter writes (what both cached Llama files carry), a
+per-block `blk.N.rope_freqs.weight` (every block must agree; a file that disagrees
+is refused), or `{arch}.rope.scaling.type = "llama3"` metadata with `factor`,
+`original_context_length` and the band factors. `none` and an absent key mean no
+scaling. **`linear`, `yarn` and `longrope` are refused by name** — this engine
+implements none of them, and treating one as `none` would rotate every position by
+the wrong angle. A model with no table computes exactly the pre-#724 expression,
+bit for bit.
 
 The pinned `Llama-3.2-1B-Instruct-Q4_K_M.gguf` decodes on all three backends: [#723](https://github.com/yusiwen/minfer/issues/723) measured `metal` on **547 of 547** graph nodes on a MacBook (macOS 27.2, Apple M4 Pro, 2026-11-05, 98.4 tok/s) and the recorded CUDA golden on GB10, on the same file and the same 32-step loop the real-model gate uses.
 

@@ -6,7 +6,7 @@
 //! (`positions`), so the graph topology never depends on `n_past`.
 
 use crate::tensor::TensorType;
-use crate::vec_ops::RopeStyle;
+use crate::vec_ops::{RopeFreqs, RopeStyle};
 
 /// Attention mode.
 ///
@@ -236,6 +236,10 @@ pub struct RoPEMeta {
     pub freq_scale: f32,
     pub n_head: usize,
     pub hd: usize,
+    /// #724: the `llama3` per-pair frequency factors, `None` when the file carries
+    /// no scaling — the kernels then evaluate today's `freq_scale / base^(2d/hd)`
+    /// unchanged (bit-identical, not merely close).
+    pub freqs: Option<Box<RopeFreqs>>,
 }
 
 /// Attention params. `layer` lets the backend resolve the layer's K/V regions
@@ -285,6 +289,10 @@ pub struct FusedQkvMeta {
     pub freq_base: f32,
     pub freq_scale: f32,
     pub rope_style: RopeStyle,
+    /// #724: the `llama3` per-pair frequency factors, `None` when the file carries
+    /// no scaling — the kernels then evaluate today's `freq_scale / base^(2d/hd)`
+    /// unchanged (bit-identical, not merely close).
+    pub freqs: Option<Box<RopeFreqs>>,
     /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
     pub kv_elems: usize,
     /// C4/#144: f32 words one KV *cell* occupies in the persistent region —
@@ -310,6 +318,10 @@ pub struct QkvBiasRopeStoreMeta {
     pub freq_base: f32,
     pub freq_scale: f32,
     pub rope_style: RopeStyle,
+    /// #724: the `llama3` per-pair frequency factors, `None` when the file carries
+    /// no scaling — the kernels then evaluate today's `freq_scale / base^(2d/hd)`
+    /// unchanged (bit-identical, not merely close).
+    pub freqs: Option<Box<RopeFreqs>>,
     /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
     pub kv_elems: usize,
     /// C4/#144: f32 words one KV cell occupies (see [`FusedQkvMeta::row_elems`]).
@@ -353,6 +365,10 @@ pub struct FusedQkvNormMeta {
     pub freq_base: f32,
     pub freq_scale: f32,
     pub rope_style: RopeStyle,
+    /// #724: the `llama3` per-pair frequency factors, `None` when the file carries
+    /// no scaling — the kernels then evaluate today's `freq_scale / base^(2d/hd)`
+    /// unchanged (bit-identical, not merely close).
+    pub freqs: Option<Box<RopeFreqs>>,
     /// KV region element count (nkt * n_ctx) — for the allocator's ensure_kv.
     pub kv_elems: usize,
     /// C4/#144: f32 words one KV cell occupies (see [`FusedQkvMeta::row_elems`]).

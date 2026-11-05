@@ -35,6 +35,9 @@ pub struct HParams {
     pub eot_token_id: Option<u32>,
     pub eom_token_id: Option<u32>,
     pub rope_style: RopeStyle,
+    /// #724: the `llama3` per-pair frequency factors, `None` when the file
+    /// declares no scaling (see `models::rope_scaling`).
+    pub rope_freqs: Option<crate::vec_ops::RopeFreqs>,
     /// Per-head Q/K dim — DECOUPLED from `n_embd / n_head` in Qwen3; read from
     /// `qwen3.attention.key_length` (128 for the 0.6B, vs n_embd/n_head = 64).
     /// `n_rot = n_embd_head` and the QK scale is `1/sqrt(n_embd_head)`.
@@ -179,6 +182,8 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
         eot_token_id: eot,
         eom_token_id: eom,
         rope_style: RopeStyle::NonInterleaved,
+        // #724: resolved from the tensor index / metadata in `load`.
+        rope_freqs: None,
         n_embd_head,
         n_kv_embd: n_head_kv * n_embd_head, // default, updated from K weight shape below
     })
@@ -418,6 +423,28 @@ pub fn load(
     for (pi, part) in model.parts.iter().enumerate() {
         for ti in &part.ctx.info {
             tensor_map.insert(ti.name.clone(), (pi, ti));
+        }
+    }
+
+    // #724: the `llama3` rope-scaling table, when the file carries one. Qwen3
+    // files do not, but the contract (tensor wins, unknown type refused by name)
+    // is the same one the shared loader follows, so it is asked here too.
+    let arch = ctx
+        .get_key_val_str("general.architecture")
+        .unwrap_or_default();
+    match crate::models::rope_scaling::resolve(
+        &model.parts,
+        &tensor_map,
+        &arch,
+        hparams.n_embd_head as usize,
+        hparams.n_layer as usize,
+        hparams.rope_freq_base,
+        tn::rope_freqs,
+    ) {
+        Ok(table) => hparams.rope_freqs = table,
+        Err(e) => {
+            eprintln!("minfer: {e}");
+            return None;
         }
     }
 

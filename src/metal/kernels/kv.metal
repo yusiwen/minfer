@@ -122,6 +122,7 @@ kernel void kernel_attn_bias_rope_store(
     constant        int & pos [[buffer(11)]],
     constant        int & rope_style [[buffer(12)]],
     constant        int & kv_is_f16 [[buffer(13)]],
+    constant    RopeFreqs & freqs [[buffer(14)]],
     uint tid [[thread_position_in_grid]]
 ) {
     const int half_dim = hd / 2;
@@ -139,7 +140,7 @@ kernel void kernel_attn_bias_rope_store(
         const int i1 = (rope_style == 1) ? (base + 2 * d + 1) : (base + d + half_dim);
         float x0 = bqkv[i0] + bias_q[i0];
         float x1 = bqkv[i1] + bias_q[i1];
-        const float freq = freq_scale / pow(freq_base, (2.0 * d) / hd);
+        const float freq = rope_freq(freqs, d, hd, freq_base, freq_scale);
         const float theta = pos * freq;
         const float cs = cos(theta), sn = sin(theta);
         bqkv[i0] = x0 * cs - x1 * sn;
@@ -154,7 +155,7 @@ kernel void kernel_attn_bias_rope_store(
         const int k0 = nqt + j0, k1 = nqt + j1;
         float x0 = bqkv[k0] + bias_k[j0];
         float x1 = bqkv[k1] + bias_k[j1];
-        const float freq = freq_scale / pow(freq_base, (2.0 * d) / hd);
+        const float freq = rope_freq(freqs, d, hd, freq_base, freq_scale);
         const float theta = pos * freq;
         const float cs = cos(theta), sn = sin(theta);
         float r0 = x0 * cs - x1 * sn;

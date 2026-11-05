@@ -193,6 +193,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0071](./0071-qwen3-5-s-xml-call-gets-its-own-tool-choice-grammar.md) | 2026-11-01 | Qwen3.5's XML call gets its own `tool_choice` grammar | Accepted (amends ADR-0067) |
 | [0072](./0072-a-draft-proposal-is-the-target-s-own-filtered-pick.md) | 2026-11-02 | a draft proposal is the target's own filtered pick, computed from one shared prefix | Accepted |
 | [0073](./0073-gemma-4-s-lenient-body-gets-a-dialect-tool-choice-grammar.md) | 2026-11-02 | Gemma 4's lenient body gets a dialect `tool_choice` grammar | Accepted (amends ADR-0069) |
+| [0074](./0074-the-llama3-rope-table-is-read-from-the-gguf.md) | 2026-11-05 | The llama3 rope table is read from the GGUF, not re-derived from four numbers | Accepted |
 
 ## The template
 

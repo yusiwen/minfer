@@ -25,6 +25,9 @@ pub struct HParams {
     pub eot_token_id: Option<u32>,
     pub eom_token_id: Option<u32>,
     pub rope_style: RopeStyle,
+    /// #724: the `llama3` per-pair frequency factors, `None` when the file
+    /// declares no scaling (see `models::rope_scaling`).
+    pub rope_freqs: Option<crate::vec_ops::RopeFreqs>,
     /// Actual KV embedding dimension (ne[1] of K weight).
     /// May differ from `n_head_kv * n_embd_head()` when the model uses
     /// separate KV head dimensions (e.g. Qwen2.5-0.5B: kv_dim=128 vs n_embd=896).
@@ -172,6 +175,9 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
         eot_token_id: eot,
         eom_token_id: eom,
         rope_style,
+        // #724: resolved from the tensor index / metadata in `load`, which is the
+        // only place that sees both. `None` until then, and for unscaled files.
+        rope_freqs: None,
         n_kv_embd: n_head_kv * (n_embd / n_head), // default, updated from K weight shape below
     })
 }
@@ -482,6 +488,29 @@ pub fn load(
         let part = &model.parts[*pi];
         load_tensor(&part.ctx, &part.data, ti, ns, plan, &device_bytes)
     };
+
+    // #724: the `llama3` rope-scaling table, resolved before the first weight is
+    // read. A file that declares a scaling this engine does not implement is
+    // refused **here**, by name — the alternative is to apply the wrong rope at
+    // every position and call it a numerics bug later.
+    let arch = ctx
+        .get_key_val_str("general.architecture")
+        .unwrap_or_default();
+    match crate::models::rope_scaling::resolve(
+        &model.parts,
+        &tensor_map,
+        &arch,
+        hparams.n_embd_head() as usize,
+        hparams.n_layer as usize,
+        hparams.rope_freq_base,
+        tn::rope_freqs,
+    ) {
+        Ok(table) => hparams.rope_freqs = table,
+        Err(e) => {
+            eprintln!("minfer: {e}");
+            return None;
+        }
+    }
 
     // Token embedding
     let tok_embd = load_one(tn::TOKEN_EMBD)?;

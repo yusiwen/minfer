@@ -375,7 +375,7 @@ the per-layer path needs no host sync (and stays CUDA-Graph-replayable)"
 `f32_bits_to_i32` (`ops_elementwise.cu:249`).
 
 Filling happens at a strict moment: after `alloc_graph`, *before* the
-scheduler runs `forward_batch` (`models/qwen2/graph.rs:465`): `cache.current()` → three
+scheduler runs `forward_batch` (`models/qwen2/graph.rs`): `cache.current()` → three
 `fill_input_i32` calls). That ordering is exactly why inputs must be pinned
 out of the recycling pool (§2.2 rule 2) — the fills would otherwise fight
 each other over a shared buffer before any node had executed (§3.4, bug 2b).
@@ -455,7 +455,7 @@ planted persistent region `allocator_survives_rebuild` (`cache/tests.rs:159`).
   allocator's CPU pool is the same object weight registration went through
   `GraphAllocator` (`alloc.rs:107`) delegates to `self.cpu.register_weight`).
 - Host data for inputs: `&[u32]` token ids, positions, tail ids
-  `forward_batch` (`models/qwen2/graph.rs:465`).
+  `forward_batch` (`models/qwen2/graph.rs`).
 
 **Out:**
 
@@ -941,7 +941,7 @@ longer matters.
   at rebuild (§2.7).
 - KV positions are data: the region is sized `n_kv_embd × n_ctx`, and a
   position ≥ `n_ctx` is a loud error, not an overflow (`cpu_backend.rs:359`),
-  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:393`).
+  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:397`).
 - Dead nodes get no buffer and the scheduler skips them — so adding an op the
   fusion pass orphans cannot corrupt memory, it just does nothing — skipped
   where `node_buffer` (`scheduler.rs:`, the bufferless-node skip) reads `None`.

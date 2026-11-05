@@ -331,6 +331,7 @@ fn kv_defrag_moves_the_bytes_and_opens_the_run() {
         n_head_kv: 1,
         hd: ROW,
         style: crate::vec_ops::RopeStyle::NonInterleaved,
+        freqs: None,
     };
     let (kid, vid) = alloc.kv_pair(0).unwrap();
     let pattern = |base: f32| -> Vec<f32> {

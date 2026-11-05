@@ -386,3 +386,8 @@ symbol = "xml_call_alternative"
 adr = "0073"
 what = "Gemma 4's `tool_choice` is a dialect grammar: the `<|tool_call>call:NAME{…}<tool_call|>` wrapper, bare/`<|\"|>` keys, and the schema's objects/arrays/scalars in the lenient JSON syntax; an unsupported construct is a named 400"
 symbol = "gemma_schema_rules"
+
+[[governs]]
+adr = "0074"
+what = "a rope frequency table comes from the file (`rope_freqs.weight`, per-block or the `llama3` metadata spelling) and rides in the node metadata as per-pair factors; an unscaled model keeps the exact pre-table expression and an unknown scaling type is refused by name"
+symbol = "RopeFreqs"

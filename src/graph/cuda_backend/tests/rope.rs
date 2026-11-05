@@ -70,6 +70,7 @@ fn cuda_rope_matches_the_scalar_reference_in_both_layouts() {
                 freq_scale,
                 n_head,
                 hd,
+                freqs: None,
             },
         );
         b.output(r);

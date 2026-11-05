@@ -83,6 +83,7 @@ fn the_minimal_attention_graph_is_offset_invariant_to_rounding() {
             freq_scale,
             n_head: nh_,
             hd,
+            freqs: None,
         };
         let q_r = b.rope(qq, pos, RopeStyle::NonInterleaved, rope(nh));
         let k_r = b.rope(kk, pos, RopeStyle::NonInterleaved, rope(nk));
@@ -365,6 +366,7 @@ fn embedding_and_rope() {
             freq_scale: 1.0,
             n_head: 2,
             hd: 2,
+            freqs: None,
         },
     );
     gb.output(rope);
@@ -398,6 +400,7 @@ fn embedding_and_rope() {
         2,
         10000.0,
         1.0,
+        None,
         RopeStyle::NonInterleaved,
     );
     for i in 0..8 {
@@ -700,6 +703,7 @@ fn a_packed_physical_shift_moves_v_verbatim_and_requantizes_k() {
         n_head_kv: 1,
         hd,
         style: RopeStyle::NonInterleaved,
+        freqs: None,
     };
     let row_elems = KvFormat::Q8_0.row_elems(nkt);
     let (before_k_words, before_v_words) = h.alloc.copy_kv_to_cpu(0).unwrap();
@@ -849,6 +853,7 @@ fn the_qkv_epilogue_sizes_its_kv_region_by_n_kv_embd() {
             freq_base: 10_000.0,
             freq_scale: 1.0,
             rope_style: crate::vec_ops::RopeStyle::NonInterleaved,
+            freqs: None,
             kv_elems: nkt * n_ctx,
             row_elems: crate::graph::kvformat::KvFormat::F32.row_elems(nkt),
         },

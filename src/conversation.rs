@@ -247,13 +247,14 @@ impl Engine for GraphEngine<'_> {
         // the existing `copy_kv_to_cpu` / `write_host` pair), so it needs no
         // backend kernel — but a backend that cannot hand its KV to the host
         // fails here and the caller re-renders.
-        let (freq_base, freq_scale) = self.model.rope_params();
+        let params = self.model.rope_params();
         let rope = crate::graph::kvcache::KvRope {
-            freq_base,
-            freq_scale,
+            freq_base: params.freq_base,
+            freq_scale: params.freq_scale,
             n_head_kv: self.model.n_head_kv(),
             hd: self.model.n_embd_head(),
             style: self.model.rope_style(),
+            freqs: params.freqs,
         };
         self.cache.alloc().kv_rm(start, len, &rope)
     }

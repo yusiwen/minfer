@@ -600,7 +600,16 @@ impl Backend for CpuBackend {
                 // positions are I32 bit patterns in ins[1]
                 let pos: Vec<usize> = (0..nt).map(|t| ins[1][t].to_bits() as usize).collect();
                 out.copy_from_slice(ins[0]);
-                cpu_rope(out, &pos, nh, hd, meta.freq_base, meta.freq_scale, *style);
+                cpu_rope(
+                    out,
+                    &pos,
+                    nh,
+                    hd,
+                    meta.freq_base,
+                    meta.freq_scale,
+                    meta.freqs.as_deref(),
+                    *style,
+                );
                 Ok(())
             }
             Op::Softmax { dim } => {
@@ -854,6 +863,11 @@ impl Backend for CpuBackend {
 }
 
 /// RoPE per-head (same math as forward.rs's apply_rope).
+///
+/// #724: `freqs` is the `llama3` per-pair factor table the file carries, and the
+/// per-pair inverse frequency comes from `vec_ops::rope_inv_freq` — the same
+/// expression the device kernels mirror — so an unscaled model (`None`) computes
+/// exactly what this function computed before the table existed.
 pub(crate) fn cpu_rope(
     x: &mut [f32],
     pos: &[usize],
@@ -861,19 +875,20 @@ pub(crate) fn cpu_rope(
     hd: usize,
     freq_base: f32,
     freq_scale: f32,
+    freqs: Option<&crate::vec_ops::RopeFreqs>,
     style: RopeStyle,
 ) {
     let half = hd / 2;
-    let mut freqs = [0.0f32; 128];
-    for i in 0..half {
-        freqs[i] = freq_scale / freq_base.powf((2 * i) as f32 / hd as f32);
+    let mut table = [0.0f32; 128];
+    for (i, slot) in table.iter_mut().enumerate().take(half) {
+        *slot = crate::vec_ops::rope_inv_freq(freq_base, freq_scale, freqs, i, hd);
     }
     for t in 0..pos.len() {
         let p = pos[t] as f32;
         for h in 0..nh {
             let b = t * nh * hd + h * hd;
             for i in 0..half {
-                let th = p * freqs[i];
+                let th = p * table[i];
                 let (sn, cs) = th.sin_cos();
                 let (i0, i1) = match style {
                     RopeStyle::NonInterleaved => (b + i, b + i + half),

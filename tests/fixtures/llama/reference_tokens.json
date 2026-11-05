@@ -391,39 +391,39 @@
         578,
         6864,
         315,
-        9822,
+        10057,
         374,
-        12366,
+        20437,
         13,
         578,
         6864,
         315,
-        9822,
+        15704,
         374,
-        12366,
+        22463,
         13,
         578,
         6864,
         315,
-        9822,
+        18157,
         374,
-        12366,
+        25048,
         13,
         578,
         6864,
         315,
-        9822,
+        34411,
         374,
-        12366,
+        81801,
         13,
         578,
         6864
       ],
       "box": "dgxspark (aarch64, GB10 sm_121, CUDA 13.0)",
-      "date": "2026-11-04",
+      "date": "2026-11-05",
       "reference": "minfer's CUDA arm, recorded by the gate itself (the same 32-step loop)",
       "tolerance": 0.5,
-      "note": "The device class reads f32 activations while the CPU quantizes to Q8_0, so per-token logits differ by ~0.18 (measured max 0.1761 over the agreeing prefix). The two arms agree on the first 5 steps; step 5 is a near-tie (CPU margin 0.2015) that the device flips, after which the model degenerates and the trajectories differ. Recorded on dgxspark's CUDA arm; `device.metal` reproduced the same 32 ids on the MacBook, which makes this a property of the numeric class (#737, #740, #723)."
+      "note": "#724 re-recorded: with the file's `rope_freqs.weight` table applied (llama.cpp always did; this engine did not until #724) the CUDA arm reproduces llama.cpp's 32 ids token for token. The pre-#724 record was a seven-token cycle (9822 at step 5) that #737 attributed to the f32-activation class; on CUDA it was the missing table. Step 5 is a 0.04-logit tie in every implementation measured: llama.cpp 0.0367 for 10057, CUDA now on 10057, Metal 0.0419 for 9822, the CPU 0.027 for 9822. Measured 2026-11-05 with the gate itself on the same 32-step loop."
     },
     "metal": {
       "ids": [
@@ -464,7 +464,33 @@
       "date": "2026-11-05",
       "reference": "minfer's Metal arm, recorded by the gate itself (the same 32-step loop)",
       "tolerance": 0.5,
-      "note": "The Metal arm produced these 32 ids on the MacBook, byte-identical to `device.cuda` and differing from llama.cpp's at the same 8 indices (5, 7, 12, 14, 19, 21, 26, 28): the agreeing prefix is the same 5 steps, worst top-logit |\u0394| 0.1787 against the CPU reference (class tolerance 0.5), and step 5 is the same near-tie (CPU margin 0.2015, metal margin 0.0475). So #737's six-token cycle is the f32-activation class, not a CUDA kernel defect \u2014 Metal is the second backend and the control. Measured 2026-11-05 with the gate itself on the same 32-step loop (#723); the gate initialises MPS before the load, so the run really is on the device."
+      "note": "#723's Metal record, re-measured 2026-11-05 with #724's rope table applied: the gate still reproduces these 32 ids, and the agreeing prefix's worst top-logit |\u0394| against the recorded CPU reference is 0.1735 (class tolerance 0.5). #724 moved CUDA across the step-5 tie (to llama.cpp's 10057) and left Metal on the cycle side \u2014 metal margin 0.0419 for 9822 against llama.cpp's 0.0367 for 10057 \u2014 so the cycle is a 0.04-margin coin flip of the device class, not a Metal kernel defect, and not something the rope table resolves for every backend."
     }
-  }
+  },
+  "rope_table": {
+    "tensor": "rope_freqs.weight",
+    "n": 32,
+    "head_dim": 64,
+    "factor": 32.0,
+    "original_context_length": 8192,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "note": "the file carries one global f32 table (values: fifteen 1.0, then 1.6513293, 3.2922628, 9.666731, then thirteen 32.0). llama.cpp's rope divides each pair's angle by its entry (`theta_base/freq_factor`), and #724 made this engine do the same; a run that drops the table is bit-identical only at short context, because the affected pairs rotate by <=0.05 rad over the first 32 positions."
+  },
+  "cpu": {
+    "agreeing_prefix": 5,
+    "tie": {
+      "step": 5,
+      "candidates": [
+        10057,
+        9822
+      ],
+      "llama_cpp_margin": 0.0367,
+      "engine_margin": -0.027,
+      "note": "measured 2026-11-05: llama.cpp b11829 (184f65360) on the same file reports 10057 at logprob -1.5233 and 9822 at -1.5600 (margin 0.0367); this engine's CPU run lands on 9822 by 0.0270. Both apply the file's rope table; the ~0.064 difference is the CPU/CPU numeric class (quantized activations, accumulation order), and it is larger than llama.cpp's own margin."
+    },
+    "note": "the CPU arm is token-exact up to a near-tie that llama.cpp itself resolves by 0.037; #724's contract is that the engine follows the reference's *table*, not that it resolves every tie the same way. The 8192-token gate (scaled_reference_tokens.json) carries the exact-id claim, where the margins are not ties.",
+    "tolerance": 0.5
+  },
+  "cpu_top2_note": "the CPU trajectory minfer produced at the time this pin was recorded (before #724 applied the file's rope table). It is the cross-class reference the device arms check their agreeing prefix against: unscaled, it is also the trajectory llama.cpp follows, because the table moves only the low-frequency pairs and step 5 is the one place where that is worth more than the class difference."
 }

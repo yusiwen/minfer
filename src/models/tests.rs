@@ -292,7 +292,7 @@ fn llama_greedy_tokens_match_the_pinned_llama_cpp_reference() {
         if prefix < got.ids.len() {
             eprintln!(
                 "llama_pin({key}): {model_name} matched the recorded {key} golden on {} ids; \
-                 the first {prefix} steps agree with the CPU arm within {worst:.4} (class \
+                 the first {prefix} steps agree with the recorded CPU reference within {worst:.4} (class \
                  tolerance {tol}), and the trajectories diverge at step {prefix} (a near-tie: \
                  CPU margin {:.4}, {key} margin {:.4})",
                 golden.len(),
@@ -303,34 +303,89 @@ fn llama_greedy_tokens_match_the_pinned_llama_cpp_reference() {
         } else {
             eprintln!(
                 "llama_pin({key}): {model_name} matched the recorded {key} golden on {} ids and \
-                 agreed with the CPU arm on all {prefix} steps (worst top-logit |Δ| {worst:.4}, \
+                 agreed with the recorded CPU reference on all {prefix} steps (worst top-logit |Δ| {worst:.4}, \
                  class tolerance {tol})",
                 golden.len()
             );
         }
     } else {
-        // The CPU arm is the correctness gate: token-exact against llama.cpp.
-        let mut bad = Vec::new();
-        for (i, (g, w)) in got.ids.iter().zip(want.iter()).enumerate() {
-            if g != w {
-                bad.push(i);
-            }
-        }
-        if !bad.is_empty() {
+        // The CPU arm: token-exact against llama.cpp **up to a near-tie the file's
+        // rope table creates**. #724 made this engine divide each pair's angle by
+        // the file's `rope_freqs.weight`, which is what llama.cpp has always done;
+        // on this file the table moves step 5 from a 0.20 margin to a 0.037 tie on
+        // llama.cpp's own numbers, and this engine lands 0.064 further (the CPU/CPU
+        // numeric class). So the arm requires the recorded agreeing prefix, the
+        // recorded candidate pair, and margins inside the class tolerance — never a
+        // silently relaxed id comparison.
+        let cpu = &fx["cpu"];
+        let want_prefix = cpu["agreeing_prefix"]
+            .as_u64()
+            .expect("fixture cpu.agreeing_prefix") as usize;
+        let tie = &cpu["tie"];
+        let tie_cands: Vec<u32> = tie["candidates"]
+            .as_array()
+            .expect("fixture cpu.tie.candidates")
+            .iter()
+            .map(|v| v.as_u64().expect("candidate id") as u32)
+            .collect();
+        let tie_margin = tie["llama_cpp_margin"]
+            .as_f64()
+            .expect("fixture cpu.tie.llama_cpp_margin") as f32;
+        let tol = cpu["tolerance"].as_f64().expect("fixture cpu.tolerance") as f32;
+
+        let prefix = got
+            .ids
+            .iter()
+            .zip(want.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(want.len());
+        if prefix < want_prefix {
+            let (t1, t2) = (got.top2[prefix][0], got.top2[prefix][1]);
             panic!(
-                "llama_pin: {model_name} diverged from llama.cpp {} at {} of {} ids\n\
-                 got:      {:?}\n\
-                 expected: {:?}\n\
-                 first difference at index {} (got {}, expected {})",
+                "llama_pin: {model_name} agreed with llama.cpp {} on only {prefix} ids, short of \
+                 the recorded {want_prefix}\n\
+                 got:      {:?}\nexpected: {:?}\n\
+                 at the first difference (step {prefix}) this run chose {}({:.4}) over \
+                 {}({:.4}) — margin {:.4}",
                 fx["llama_cpp"].as_str().unwrap_or("?"),
-                bad.len(),
-                want.len(),
                 got.ids,
                 want,
-                bad[0],
-                got.ids[bad[0]],
-                want[bad[0]]
+                t1.0,
+                t1.1,
+                t2.0,
+                t2.1,
+                t1.1 - t2.1
             );
+        }
+        if prefix < want.len() {
+            // The divergence must be the fixture's recorded near-tie: the same two
+            // candidates, a margin below the class tolerance on both sides.
+            let mut cands = [got.ids[prefix], want[prefix]];
+            cands.sort_unstable();
+            let mut recorded = tie_cands.clone();
+            recorded.sort_unstable();
+            assert_eq!(
+                cands.to_vec(),
+                recorded,
+                "llama_pin: the divergence at step {prefix} is between {:?}, not the recorded \
+                 near-tie candidates {:?}",
+                cands,
+                tie_cands
+            );
+            let mine = got.top2[prefix][0].1 - got.top2[prefix][1].1;
+            assert!(
+                tie_margin.abs() <= tol && mine.abs() <= tol,
+                "llama_pin: the divergence at step {prefix} is not a tie any more — llama.cpp's \
+                 recorded margin {tie_margin:.4}, this run's {mine:.4}, class tolerance {tol}"
+            );
+            eprintln!(
+                "llama_pin: {model_name} matched llama.cpp on the first {prefix} ids and landed on \
+                 the other side of the recorded near-tie at step {prefix} ({} vs {}; \
+                 llama.cpp margin {tie_margin:.4}, this run {mine:.4}) — #724 applies the file's \
+                 rope table, and the 8192-token gate carries the exact-id claim",
+                got.ids[prefix], want[prefix]
+            );
+            return;
         }
         eprintln!(
             "llama_pin: {model_name} matched all {} greedy ids (prompt {} ids, {} + {})",
@@ -340,4 +395,101 @@ fn llama_greedy_tokens_match_the_pinned_llama_cpp_reference() {
             fx["provenance"]["date"].as_str().unwrap_or("?")
         );
     }
+}
+
+const LLAMA_SCALED_FIXTURE: &str =
+    include_str!("../../tests/fixtures/llama/scaled_reference_tokens.json");
+
+/// [#724]: the long-context parity gate — a real Llama 3.1 GGUF at 8192 tokens.
+///
+/// It forwards 8192 tokens and compares 16 greedy ids against llama.cpp's own
+/// output on the same file, so it covers the prefill path (positions, KV, rope at
+/// 8192 distinct positions) against the reference rather than against itself.
+///
+/// **Measured limit, 2026-11-05: this gate does not discriminate the rope table.**
+/// With `rope_scaling::resolve` stubbed to `Ok(None)` — the pre-#724 reading — the
+/// same 16 ids still match (1251 s), because the pairs the table moves are the
+/// low-frequency ones and this model's greedy trajectory has margins wider than
+/// their effect at 8192 tokens. So it is a parity gate, not a scaling gate: the
+/// table is pinned by the unit gates above (its bytes, the division, bit-identity
+/// when absent) and by the 1B pin's arms, where applying it moves step 5 across a
+/// 0.037-logit tie. A gate that discriminates the table needs a longer context or
+/// a needle-style prompt — filed as a follow-up on #724.
+///
+/// `MINFER_LLAMA_SCALED_TEST_MODEL` unset is a **named skip**; a set path whose
+/// bytes are not the pinned file fails (the ids belong to that artifact only).
+#[test]
+#[ignore = "real model: set MINFER_LLAMA_SCALED_TEST_MODEL to the pinned Llama-3.1-8B GGUF"]
+fn llama_scaled_long_context_matches_the_pinned_reference() {
+    let fx: serde_json::Value =
+        serde_json::from_str(LLAMA_SCALED_FIXTURE).expect("scaled llama fixture parses");
+    let model_name = fx["model"].as_str().expect("model");
+    let path = match std::env::var("MINFER_LLAMA_SCALED_TEST_MODEL") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => {
+            eprintln!(
+                "llama_scaled: MINFER_LLAMA_SCALED_TEST_MODEL unset; skipping the {model_name} \
+                 8k pin (set it to {} and re-run with --ignored)",
+                fx["file"].as_str().unwrap_or("<the cached GGUF>")
+            );
+            return;
+        }
+    };
+    let path = std::path::PathBuf::from(path);
+    let want_sha = fx["sha256"].as_str().expect("sha256");
+    let got_sha = sha256_of(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert_eq!(
+        got_sha,
+        want_sha,
+        "{} is not the pinned {model_name} file — the committed ids belong to the artifact \
+         with sha256 {want_sha}",
+        path.display()
+    );
+
+    #[cfg(target_os = "macos")]
+    crate::metal::MpsState::init();
+    let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
+    let model = crate::models::load_model(&gguf).expect("load model");
+    #[cfg(feature = "cuda")]
+    let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+
+    let prompt_ids = fixture_ids(&fx, "prompt_ids");
+    let want = fixture_ids(&fx, "continuation_ids");
+    let n_ctx = fx["n_ctx"].as_u64().expect("n_ctx") as usize;
+    assert!(
+        prompt_ids.len() + want.len() <= n_ctx,
+        "the fixture's prompt {} + {} tokens must fit n_ctx {n_ctx}",
+        prompt_ids.len(),
+        want.len()
+    );
+    let got = greedy_steps(&*model, &prompt_ids, want.len(), n_ctx);
+    // The 8192-token prompt is the point: the table's low-frequency pairs rotate by
+    // tens of radians across it, so a dropped or mis-indexed table cannot survive.
+    let first_bad = got
+        .ids
+        .iter()
+        .zip(want.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or(want.len());
+    if first_bad != want.len() {
+        let (t1, t2) = (got.top2[first_bad][0], got.top2[first_bad][1]);
+        panic!(
+            "llama_scaled: {model_name} diverged from llama.cpp at {first_bad} of {} ids\n\
+             got:      {:?}\nexpected: {:?}\n\
+             at that step this run's top-2 were {}({:.4}) and {}({:.4}) — margin {:.4}",
+            want.len(),
+            got.ids,
+            want,
+            t1.0,
+            t1.1,
+            t2.0,
+            t2.1,
+            t1.1 - t2.1
+        );
+    }
+    eprintln!(
+        "llama_scaled: {model_name} matched all {} greedy ids at {} prompt tokens",
+        want.len(),
+        prompt_ids.len()
+    );
 }

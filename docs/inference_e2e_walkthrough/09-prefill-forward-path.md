@@ -433,7 +433,7 @@ adds exactly one concern:
 
 ```
 main.rs:1615  model.forward(&input_ids, &positions, 1, ctx)
-  │           trait method (models/mod.rs:222): the architecture-agnostic
+  │           trait method (models/mod.rs:224): the architecture-agnostic
   ▼           signature; callers must guarantee positions[i] < n_ctx
 qwen2/mod.rs:   impl ModelDef for Qwen2Model
   │           one line: graph::Qwen2Graph::forward(self, tokens, positions, n_out, n_ctx)

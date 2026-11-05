@@ -712,7 +712,7 @@ fn non_matmul_bandwidth_profile() {
         ),
         (
             "rope_f32 (q: 14h x 64d)",
-            Box::new(|cb| cb.rope_f32(&bqkv, nh, hd, 1, 1e6, 1.0, &pos, 0, 0)),
+            Box::new(|cb| cb.rope_f32(&bqkv, nh, hd, 1, 1e6, 1.0, None, &pos, 0, 0)),
             400,
         ),
         (
@@ -738,6 +738,7 @@ fn non_matmul_bandwidth_profile() {
                     hd,
                     1e6,
                     1.0,
+                    None,
                     (nkv - 1) as i32,
                     0,
                     false,
