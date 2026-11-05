@@ -25,6 +25,7 @@ use rand::rngs::StdRng;
 use rand::Rng;
 
 /// CLI inputs (`--spec-draft <model>`, `--spec-draft-n <d>`).
+#[derive(Clone)]
 pub struct SpecConfig {
     pub draft_path: String,
     /// static depth, or the depth CAP when `adaptive` is set

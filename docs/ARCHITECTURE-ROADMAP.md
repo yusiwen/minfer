@@ -712,10 +712,19 @@ the running/in-flight counts; per-op timing is available under
 dispatch); and SIGINT/SIGTERM drains gracefully, bounded by `MINFER_DRAIN_MS`.
 Structured logging and levels landed with
 [#726](https://github.com/yusiwen/minfer/issues/726) (`MINFER_LOG` fixes the
-threshold once, and a request's admitted/finished lines are one event each); the
-remaining §2.8 item is **worker-restart supervision** (a panicking job is
-isolated per request by `run_job_isolated`, but a dead worker thread is not
-restarted).
+threshold once, and a request's admitted/finished lines are one event each); **worker supervision** landed with
+[#731](https://github.com/yusiwen/minfer/issues/731): a panicking job is isolated
+per request by `run_job_isolated`, and a worker that dies any other way is
+**classified, logged once (`worker.stopped`), counted
+(`minfer_worker_stops_total`) and published**, so every later request is refused
+with a message that names the state instead of a bare "shutting down". The
+supervisor also **restarts** a worker that ended with its resources intact (the
+#196 no-progress bound): bounded backoff (100 ms doubling to 2 s), at most five
+attempts, `worker.restarted`/`minfer_worker_restarts_total` per restart, and
+`worker.disabled` at the cap. A **panic** unwinds past the return, so the model
+and queue are gone — it disables rather than restarts, which is why the two exits
+are classified differently. The §2.8 item is closed.
+
 The trace/viz stack remains a *development* instrument, not an operations one.
 🟡 for a research engine, 🟠 the moment it is deployed.
 

@@ -104,6 +104,11 @@ impl WorkerStatus {
         self.code.store(exit.code(), Ordering::SeqCst);
     }
 
+    /// A respawn puts the status back before its first request can arrive.
+    pub fn mark_running(&self) {
+        self.code.store(RUNNING, Ordering::SeqCst);
+    }
+
     pub fn is_stopped(&self) -> bool {
         self.code.load(Ordering::SeqCst) != RUNNING
     }
@@ -121,71 +126,160 @@ impl WorkerStatus {
     }
 }
 
-/// Watch the worker's thread and record how it ended. Runs on its own thread so
-/// `serve::run`'s shutdown wait is unchanged.
-pub fn supervise_worker(
-    handle: std::thread::JoinHandle<WorkerResources>,
+/// #731 A: how many times a worker that ended with its resources intact is
+/// restarted before the server disables instead.
+pub const MAX_WORKER_RESTARTS: u32 = 5;
+
+/// The backoff before restart `attempt` (1-based): 100, 200, 400, 800, 1600 ms,
+/// capped at 2 s. Pure, so the policy is unit-tested (#731 A).
+pub fn restart_backoff_ms(attempt: u32) -> u64 {
+    const BASE_MS: u64 = 100;
+    const CAP_MS: u64 = 2_000;
+    BASE_MS
+        .saturating_mul(1u64 << attempt.saturating_sub(1).min(5))
+        .min(CAP_MS)
+}
+
+/// A stopped worker is restartable only when the loop **returned** its resources
+/// (the #196 bound) and only below the cap. A panic unwound past the return, so
+/// the model and the queue are gone — that exit disables, it cannot restart.
+pub fn can_restart(exit: WorkerExit, restarts: u32, max_restarts: u32) -> bool {
+    exit == WorkerExit::Stalled && restarts < max_restarts
+}
+
+/// The restart policy, injectable so a gate can run a zero-delay, two-attempt
+/// version of the production sequence.
+#[derive(Clone, Copy)]
+pub struct RestartPolicy {
+    pub max_restarts: u32,
+    pub backoff: fn(u32) -> u64,
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            max_restarts: MAX_WORKER_RESTARTS,
+            backoff: restart_backoff_ms,
+        }
+    }
+}
+
+/// The supervisor's view of a worker incarnation.
+pub type WorkerHandle = std::thread::JoinHandle<WorkerResources>;
+/// Respawn a worker from the resources the previous one handed back.
+pub type WorkerSpawner = Box<dyn FnMut(WorkerResources) -> WorkerHandle + Send>;
+
+/// Watch the worker and, when it can be restarted, restart it with a bounded
+/// backoff — otherwise publish the stop and disable (#731 A).
+///
+/// One `worker.stopped` event per death, one `worker.restarted` per restart, and
+/// one `worker.disabled` when the server gives up (a panic, or the cap). The
+/// queue is answered with the named refusal on every death, so a queued request
+/// never outlives the loop that would have run it.
+pub fn run_supervisor(
+    first: WorkerHandle,
+    mut respawn: WorkerSpawner,
     status: Arc<WorkerStatus>,
     metrics: Arc<ServerMetrics>,
+    done: Option<std::sync::mpsc::Sender<()>>,
+    policy: RestartPolicy,
 ) {
-    // `join` distinguishes a panic (`Err`) from the loop's own return value; the
-    // resources are kept for the restart slice, which is why they are not dropped
-    // before the exit is classified.
-    let (exit, resources) = match handle.join() {
-        Ok(res) => (res.exit, Some(res)),
-        Err(_) => (WorkerExit::Panic, None),
-    };
-    status.mark(exit);
-    metrics.worker_stops_total.fetch_add(1, Ordering::Relaxed);
-    let level = if exit == WorkerExit::Shutdown {
-        super::log::Level::Info
-    } else {
-        super::log::Level::Error
-    };
-    let (slots, device) = resources
-        .as_ref()
-        .map_or(("0".to_string(), "none".to_string()), |r| {
-            (
-                r.slots.len().to_string(),
-                r.model.device().name().to_string(),
-            )
-        });
-    super::log::event(
-        level,
-        "worker.stopped",
-        &[
-            ("reason", exit.reason()),
-            ("slots", &slots),
-            ("device", &device),
-        ],
-    );
-    // The queue outlives the loop: answer what is still waiting with the same
-    // named refusal a new request gets, and count it the way a queued refusal is
-    // counted (left the queue, could not be placed), so `queue_depth` stays
-    // `requests_total - jobs_admitted_total`.
-    if let Some(mut resources) = resources {
-        let reason = status.refusal_message();
-        let mut answered = 0u64;
-        while let Ok(job) = resources.job_rx.try_recv() {
-            let _ = job.tx.blocking_send(super::chat::StreamEvent::Err(
-                super::types::ApiError::unavailable(reason),
-            ));
-            answered += 1;
+    let mut handle = first;
+    let mut restarts: u32 = 0;
+    loop {
+        // `join` distinguishes a panic (`Err`) from the loop's own return value.
+        let (exit, mut resources) = match handle.join() {
+            Ok(res) => (res.exit, Some(res)),
+            Err(_) => (WorkerExit::Panic, None),
+        };
+        let level = if exit == WorkerExit::Shutdown {
+            super::log::Level::Info
+        } else {
+            super::log::Level::Error
+        };
+        status.mark(exit);
+        metrics.worker_stops_total.fetch_add(1, Ordering::Relaxed);
+        let (slots, device) =
+            resources
+                .as_ref()
+                .map_or(("0".to_string(), "none".to_string()), |r| {
+                    (
+                        r.slots.len().to_string(),
+                        r.model.device().name().to_string(),
+                    )
+                });
+        super::log::event(
+            level,
+            "worker.stopped",
+            &[
+                ("reason", exit.reason()),
+                ("slots", &slots),
+                ("device", &device),
+            ],
+        );
+        // The queue outlives the loop: answer what is still waiting with the same
+        // named refusal a new request gets, and count it the way a queued refusal
+        // is counted (left the queue, could not be placed).
+        if let Some(r) = resources.as_mut() {
+            let reason = status.refusal_message();
+            let mut answered = 0u64;
+            while let Ok(job) = r.job_rx.try_recv() {
+                let _ = job.tx.blocking_send(super::chat::StreamEvent::Err(
+                    super::types::ApiError::unavailable(reason),
+                ));
+                answered += 1;
+            }
+            if answered > 0 {
+                metrics
+                    .jobs_admitted_total
+                    .fetch_add(answered, Ordering::Relaxed);
+                metrics
+                    .jobs_dropped_total
+                    .fetch_add(answered, Ordering::Relaxed);
+                super::log::warn(format_args!(
+                    "[server] worker stopped: answered {answered} queued job(s) with 503"
+                ));
+            }
         }
-        if answered > 0 {
-            metrics
-                .jobs_admitted_total
-                .fetch_add(answered, Ordering::Relaxed);
-            metrics
-                .jobs_dropped_total
-                .fetch_add(answered, Ordering::Relaxed);
-            super::log::warn(format_args!(
-                "[server] worker down: answered {answered} queued job(s) with 503"
-            ));
+        if exit == WorkerExit::Shutdown {
+            break;
         }
-        // B: disable. A replaces this drop with a bounded-backoff respawn from the
-        // same resources (the tokenizer is cloned in `serve::run` for that).
-        drop(resources);
+        if !can_restart(exit, restarts, policy.max_restarts) {
+            super::log::event(
+                super::log::Level::Error,
+                "worker.disabled",
+                &[
+                    ("reason", exit.reason()),
+                    ("restarts", &restarts.to_string()),
+                ],
+            );
+            break;
+        }
+        let Some(resources) = resources else {
+            // Unreachable: `can_restart` refuses `Panic`.
+            break;
+        };
+        restarts += 1;
+        let delay = (policy.backoff)(restarts);
+        metrics
+            .worker_restarts_total
+            .fetch_add(1, Ordering::Relaxed);
+        super::log::event(
+            super::log::Level::Warn,
+            "worker.restarted",
+            &[
+                ("attempt", &restarts.to_string()),
+                ("after_ms", &delay.to_string()),
+            ],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        status.mark_running();
+        handle = respawn(resources);
+    }
+    // The server's bounded shutdown wait (F8) is for the *final* stop, not a
+    // restart.
+    if let Some(done) = done {
+        let _ = done.send(());
     }
 }
 
