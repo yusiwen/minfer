@@ -96,6 +96,7 @@ fn rope_shift_matches_roping_at_the_new_position() {
         n_head_kv: 2,
         hd: 4,
         style: RopeStyle::NonInterleaved,
+        freqs: None,
     };
     // Rope a row at `pos` exactly the way the kernels do.
     fn rope_at(x: &mut [f32], pos: usize, rope: &KvRope) {

@@ -216,10 +216,11 @@ fn offset_sensitivity_is_narrowed_to_multi_query_attention() {
 
     // 1 token is the discriminator: with a single key the softmax weight is 1
     // and V is unrotated, so *any* offset must give bit-identical logits.
-    let (freq_base, freq_scale) = model.rope_params();
+    let params = model.rope_params();
     let rope = KvRope {
-        freq_base,
-        freq_scale,
+        freq_base: params.freq_base,
+        freq_scale: params.freq_scale,
+        freqs: params.freqs,
         n_head_kv: model.n_head_kv(),
         hd: model.n_embd_head(),
         style: model.rope_style(),
@@ -317,7 +318,7 @@ fn layer_0_is_offset_consistent_within_the_rotation_rounding_class() {
     let ids = tok.encode("The capital of France is");
     let n = ids.len();
     let n_ctx = 256;
-    let (freq_base, freq_scale) = model.rope_params();
+    let params = model.rope_params();
     let style = model.rope_style();
     let hd = model.n_embd_head();
 

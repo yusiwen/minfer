@@ -167,7 +167,7 @@ to f32 it would be 2 GB — 7× more, copied at load time, for zero benefit.
 **Why does cloning a `Tensor` not copy bytes?** Because `Cow::Borrowed`
 clones as pointer + length. That is what makes it affordable for the graph
 path to re-register all weights on every graph (re)build (`t.clone()` at
-`qwen2/graph.rs:354`) — the clone duplicates a small struct and a name
+`qwen2/graph.rs:358`) — the clone duplicates a small struct and a name
 string, not gigabytes. The one caveat — registries still guard against
 re-registration when a caller hands them *owned* bytes — has a measured war
 story attached, told with excerpt 10.

@@ -22,7 +22,7 @@ pub use f16::mat_mul_f16;
 #[cfg(test)]
 pub use f16::{dot_f16_f32, dot_f16_f32_scalar, f16_dot_path, F16DotPath};
 pub use rms_norm::{rms_norm_f32, rms_norm_fused_f32};
-pub use rope::RopeStyle;
+pub use rope::{llama3_freqs, rope_inv_freq, RopeFreqs, RopeParams, RopeStyle};
 pub use silu::{vec_silu_f32, vec_swiglu_f32};
 pub use softmax::{vec_soft_max_f32, vec_soft_max_inplace_f32};
 pub use vec::{

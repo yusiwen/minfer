@@ -270,10 +270,11 @@ fn a_packed_kv_cache_answers_like_the_f32_one() {
             cache.alloc().kv_set_capacity(n_ctx);
             let positions: Vec<usize> = (0..shift_n).collect();
             let mut l = model.forward_graph_cached(&shift_text, &positions, 1, n_ctx, &mut cache);
-            let (freq_base, freq_scale) = model.rope_params();
+            let params = model.rope_params();
             let rope = crate::graph::kvcache::KvRope {
-                freq_base,
-                freq_scale,
+                freq_base: params.freq_base,
+                freq_scale: params.freq_scale,
+                freqs: params.freqs,
                 n_head_kv: model.n_head_kv(),
                 hd: model.n_embd_head(),
                 style: model.rope_style(),

@@ -91,8 +91,12 @@ impl ModelDef for FailingForward {
     fn rope_style(&self) -> crate::vec_ops::RopeStyle {
         crate::vec_ops::RopeStyle::NonInterleaved
     }
-    fn rope_params(&self) -> (f32, f32) {
-        (10_000.0, 1.0)
+    fn rope_params(&self) -> crate::vec_ops::RopeParams {
+        crate::vec_ops::RopeParams {
+            freq_base: 10_000.0,
+            freq_scale: 1.0,
+            freqs: None,
+        }
     }
 }
 /// Put a live request on `idx` whose next token is already committed and

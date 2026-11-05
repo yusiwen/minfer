@@ -151,7 +151,7 @@ Design notes a beginner should keep:
 
 Worked example: `x = [1, 2, 3, 4]`, `eps ≈ 0`. `mean(x²) = (1+4+9+16)/4 = 7.5`; `scale = 1/√7.5 ≈ 0.365`; normalized `x ≈ [0.365, 0.730, 1.095, 1.461]`, then element-wise multiplied by the learned gains.
 
-#### 3.2.2 RoPE — the node arm (`cpu_backend.rs:592`) and `cpu_rope` (`:857`)
+#### 3.2.2 RoPE — the node arm (`cpu_backend.rs:592`) and `cpu_rope` (`:871`)
 
 The `RoPE` node arm shows the two conventions this series keeps meeting — positions decoded from f32 bits, and in-place execution:
 

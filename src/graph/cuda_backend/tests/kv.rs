@@ -308,6 +308,7 @@ fn cuda_kv_q8_0_roundtrip_attn() {
         RoPEMeta {
             freq_base: 10000.0,
             freq_scale: 1.0,
+            freqs: None,
             n_head: nh,
             hd,
         },
@@ -486,6 +487,7 @@ fn cuda_kv_q8_0_roundtrip_attn() {
             RoPEMeta {
                 freq_base: 10000.0,
                 freq_scale: 1.0,
+                freqs: None,
                 n_head: nh,
                 hd,
             },
@@ -749,6 +751,7 @@ fn cuda_q8_0_fused_epilogue_matches_the_cpu_quantizer() {
             hd,
             fb,
             fs,
+            crate::vec_ops::RopeFreqs::none(),
             pp,
             cc,
             row_bytes,
@@ -932,6 +935,7 @@ fn cuda_qkv_norm_epilogue_matches_the_cpu_quantizer() {
             hd,
             fb,
             fs,
+            crate::vec_ops::RopeFreqs::none(),
             cb.ptr_of(b_p).unwrap(),
             cb.ptr_of(b_c).unwrap(),
             crate::cuda::KV_LAYOUT_F32,
@@ -962,6 +966,7 @@ fn cuda_qkv_norm_epilogue_matches_the_cpu_quantizer() {
             hd,
             fb,
             fs,
+            crate::vec_ops::RopeFreqs::none(),
             cb.ptr_of(b_p).unwrap(),
             cb.ptr_of(b_c).unwrap(),
             row_bytes,
@@ -1081,6 +1086,7 @@ fn cuda_rope_kv_attn_roundtrip() {
         RoPEMeta {
             freq_base: 10000.0,
             freq_scale: 1.0,
+            freqs: None,
             n_head: nh,
             hd,
         },
@@ -1168,6 +1174,7 @@ fn cuda_rope_kv_attn_roundtrip() {
         hd,
         10000.0,
         1.0,
+        None,
         RopeStyle::NonInterleaved,
     );
     assert_close("rope", &qgot, &qref, 1e-4);
@@ -1269,6 +1276,7 @@ fn cuda_kv_f16_roundtrip_attn() {
         RoPEMeta {
             freq_base: 10000.0,
             freq_scale: 1.0,
+            freqs: None,
             n_head: nh,
             hd,
         },
@@ -1364,6 +1372,7 @@ fn cuda_kv_f16_roundtrip_attn() {
         hd,
         10000.0,
         1.0,
+        None,
         RopeStyle::NonInterleaved,
     );
     assert_close("rope(f16 kv)", &qgot, &qref, 1e-4);

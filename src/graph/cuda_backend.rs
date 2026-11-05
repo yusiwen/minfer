@@ -378,6 +378,7 @@ impl CudaBackend {
         hd: usize,
         freq_base: f32,
         freq_scale: f32,
+        freqs: &crate::vec_ops::RopeFreqs,
         positions: *mut std::ffi::c_void,
         cells: *mut std::ffi::c_void,
     ) {
@@ -396,6 +397,7 @@ impl CudaBackend {
                 hd,
                 freq_base,
                 freq_scale,
+                *freqs,
                 positions,
                 cells,
                 self.kv_row_bytes(nkt),
@@ -415,6 +417,7 @@ impl CudaBackend {
                 hd,
                 freq_base,
                 freq_scale,
+                *freqs,
                 positions,
                 cells,
                 self.kv_layout,
@@ -1357,6 +1360,7 @@ impl CudaBackend {
                     meta.hd,
                     meta.freq_base,
                     meta.freq_scale,
+                    &freqs_arg(meta.freqs.as_deref()),
                     pos,
                     cells,
                 );
@@ -1446,6 +1450,7 @@ impl CudaBackend {
                     meta.hd,
                     meta.freq_base,
                     meta.freq_scale,
+                    &freqs_arg(meta.freqs.as_deref()),
                     pos,
                     cells,
                 );
@@ -1582,6 +1587,7 @@ impl CudaBackend {
                         meta.hd,
                         meta.freq_base,
                         meta.freq_scale,
+                        freqs_arg(meta.freqs.as_deref()),
                         pos,
                         cells,
                         self.kv_row_bytes(meta.nkt),
@@ -1598,6 +1604,7 @@ impl CudaBackend {
                         meta.hd,
                         meta.freq_base,
                         meta.freq_scale,
+                        freqs_arg(meta.freqs.as_deref()),
                         pos,
                         cells,
                         self.kv_layout,
@@ -1696,6 +1703,7 @@ impl CudaBackend {
                     nt,
                     meta.freq_base,
                     meta.freq_scale,
+                    freqs_arg(meta.freqs.as_deref()),
                     pos,
                     *style as i32,
                 );
@@ -2269,6 +2277,13 @@ pub fn entry() -> super::registry::BackendEntry {
 /// F4: register the CUDA backend (`--features cuda`).
 pub fn register(registry: &mut super::registry::Registry) {
     registry.register_entry(entry());
+}
+
+/// #724: the `RopeFreqs` value a launch needs, with "no scaling" spelled as a
+/// zero table (`n == 0`) so the kernel's branch — not a missing argument —
+/// selects the unscaled expression.
+fn freqs_arg(freqs: Option<&crate::vec_ops::RopeFreqs>) -> crate::vec_ops::RopeFreqs {
+    freqs.copied().unwrap_or_default()
 }
 
 impl Backend for CudaBackend {

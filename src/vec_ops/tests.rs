@@ -352,3 +352,157 @@ fn bf16_and_f16_matmul_agree_bitwise_when_the_values_are_equal() {
         );
     }
 }
+
+// === #724: llama3 rope scaling ===
+
+/// The table is the **contract** with llama.cpp's converter (`conversion/llama.py`,
+/// `LlamaModel.generate_extra_tensors`, build b11829 / `184f65360`): the reference
+/// engine reads these numbers back from `rope_freqs.weight` and divides each pair's
+/// angle by them, so a drift here diverges from the reference at every position
+/// while every other gate stays green.
+///
+/// The pinned numbers below are **the bytes of two real files**, read out of their
+/// `rope_freqs.weight` tensor (f32, offset 43 095 6544 / 7 831 456):
+///
+/// - `unsloth/Llama-3.1-8B-Instruct-GGUF` Q4_K_M: base 500000, factor 8, original
+///   context 8192, band 1..4, head dim 128 → 64 pairs. High-frequency pairs are
+///   untouched, the low-frequency ones are divided by 8, and seven pairs ramp
+///   continuously between the two.
+/// - `unsloth/Llama-3.2-1B-Instruct-GGUF` Q4_K_M: factor 32, head dim 64 → 32
+///   pairs, with only three pairs in the ramp.
+///
+/// The tolerance is 1e-6 relative, not zero: the converter iterates a **torch f32**
+/// frequency tensor, and `torch.pow(f32)` and this crate's `powf` may round the
+/// last bit differently. The tensor path — the shape real llama.cpp files carry —
+/// reads the file's bytes, so the reference comparison there is exact.
+#[test]
+fn llama3_table_matches_the_converter() {
+    let t = llama3_freqs(500000.0, 8.0, 8192.0, 1.0, 4.0, 128).expect("llama3 table");
+    assert_eq!(t.len(), 64);
+    #[rustfmt::skip]
+    const WANT: [f32; 64] = [
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.2074838876724243, 1.5534145832061768, 2.026313066482544,
+        2.6945300102233887, 3.684253215789795, 5.257327079772949, 8.0,
+        8.0, 8.0, 8.0, 8.0,
+        8.0, 8.0, 8.0, 8.0,
+        8.0, 8.0, 8.0, 8.0,
+        8.0, 8.0, 8.0, 8.0,
+        8.0, 8.0, 8.0, 8.0,
+        8.0, 8.0, 8.0, 8.0,
+        8.0, 8.0, 8.0, 8.0,
+    ];
+    for (d, want) in WANT.iter().enumerate() {
+        let got = t.at(d);
+        assert!(
+            (got - want).abs() <= 1e-6 * want.abs(),
+            "pair {d}: got {got}, want {want}"
+        );
+    }
+    // The 1B file's table: factor 32, three pairs in the ramp.
+    let t = llama3_freqs(500000.0, 32.0, 8192.0, 1.0, 4.0, 64).expect("llama3 table");
+    assert_eq!(t.len(), 32);
+    #[rustfmt::skip]
+    const WANT_1B: [f32; 32] = [
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.6513292789459229,
+        3.2922627925872803, 9.666730880737305, 32.0, 32.0,
+        32.0, 32.0, 32.0, 32.0,
+        32.0, 32.0, 32.0, 32.0,
+        32.0, 32.0, 32.0, 32.0,
+    ];
+    for (d, want) in WANT_1B.iter().enumerate() {
+        let got = t.at(d);
+        assert!(
+            (got - want).abs() <= 1e-6 * want.abs(),
+            "1B pair {d}: got {got}, want {want}"
+        );
+    }
+}
+
+/// A second config whose band edges land on different pairs, so the boundary
+/// comparisons are exercised and not just the two flat regions.
+#[test]
+fn llama3_table_band_edges_are_continuous() {
+    let t = llama3_freqs(10000.0, 4.0, 64.0, 1.0, 2.0, 16).expect("small table");
+    let want = [1.0f32, 1.0, 3.788_686_3, 4.0, 4.0, 4.0, 4.0, 4.0];
+    assert_eq!(t.len(), want.len());
+    for (d, w) in want.iter().enumerate() {
+        assert!(
+            (t.at(d) - w).abs() <= 1e-5,
+            "pair {d}: got {}, want {w}",
+            t.at(d)
+        );
+    }
+}
+
+/// The degenerate band (two equal factors) is refused by name rather than
+/// dividing by zero — llama.cpp's converter carries the same comment for Llama 4.
+#[test]
+fn llama3_refuses_a_degenerate_band() {
+    let e = llama3_freqs(10000.0, 8.0, 8192.0, 4.0, 4.0, 128).unwrap_err();
+    assert!(e.contains("high_freq_factor > low_freq_factor"), "{e}");
+    let e = llama3_freqs(10000.0, 0.0, 8192.0, 1.0, 4.0, 128).unwrap_err();
+    assert!(e.contains("factor > 0"), "{e}");
+    let e = llama3_freqs(10000.0, 8.0, 8192.0, 1.0, 4.0, 129).unwrap_err();
+    assert!(e.contains("even head dim"), "{e}");
+    let e = llama3_freqs(
+        10000.0,
+        8.0,
+        8192.0,
+        1.0,
+        4.0,
+        2 * (super::rope::ROPE_FREQS_MAX + 1),
+    )
+    .unwrap_err();
+    assert!(e.contains("over this build's limit"), "{e}");
+}
+
+/// Issue #724's second acceptance criterion: an unscaled model is **bit-identical**
+/// to the pre-#724 expression, not merely close. `None` (and the empty table) must
+/// reproduce the old arithmetic exactly, which is what keeps every pinned Qwen and
+/// Llama golden valid.
+#[test]
+fn no_table_is_bit_identical_to_the_old_expression() {
+    for hd in [64usize, 128] {
+        for base in [10_000.0f32, 500_000.0] {
+            for d in 0..hd / 2 {
+                let old = 1.0f32 / base.powf((2 * d) as f32 / hd as f32);
+                let got = rope_inv_freq(base, 1.0, None, d, hd);
+                assert_eq!(got.to_bits(), old.to_bits(), "hd {hd} base {base} d {d}");
+                let empty = RopeFreqs::none();
+                let got = rope_inv_freq(base, 1.0, Some(&empty), d, hd);
+                assert_eq!(got.to_bits(), old.to_bits(), "empty table, d {d}");
+            }
+        }
+    }
+}
+
+/// A table divides the pair's inverse frequency, which is exactly what llama.cpp's
+/// rope does with the tensor (`theta_base / freq_factor`).
+#[test]
+fn a_table_divides_the_pair_frequency() {
+    let t = RopeFreqs::from_slice(&[1.0, 2.0, 4.0, 8.0]).expect("table");
+    assert_eq!(t.len(), 4);
+    for d in 0..4 {
+        let unscaled = rope_inv_freq(10_000.0, 1.0, None, d, 8);
+        let scaled = rope_inv_freq(10_000.0, 1.0, Some(&t), d, 8);
+        let want = unscaled / [1.0, 2.0, 4.0, 8.0][d];
+        assert!((scaled - want).abs() <= 1e-7 * want.abs(), "pair {d}");
+    }
+    // Past the table's end nothing is scaled (a table narrower than `hd/2` is a
+    // file error the loader refuses, but the accessor must not read past it).
+    assert_eq!(t.at(4), 1.0);
+    // And the table's own bounds: empty and over-long are refused, not truncated.
+    assert!(RopeFreqs::from_slice(&[]).is_none());
+    let over = vec![1.0f32; super::rope::ROPE_FREQS_MAX + 1];
+    assert!(RopeFreqs::from_slice(&over).is_none());
+}

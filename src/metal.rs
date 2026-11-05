@@ -349,6 +349,25 @@ impl MpsCommandBuffer<'_> {
         };
     }
 
+    /// Copy a small constant argument (e.g. the `RopeFreqs` table) into a buffer
+    /// slot — the sized-up sibling of `set_params`. Metal's `setBytes` limit is
+    /// 4 KB per argument; the assert names both sizes rather than letting the
+    /// driver truncate.
+    fn set_bytes(&self, idx: u64, bytes: &[u8]) {
+        assert!(
+            bytes.len() <= 4096,
+            "setBytes argument at index {idx} is {} bytes, over Metal's 4 KB limit",
+            bytes.len()
+        );
+        unsafe {
+            self.enc.setBytes_length_atIndex(
+                NonNull::new(bytes.as_ptr() as *const std::ffi::c_void as *mut c_void).unwrap(),
+                bytes.len(),
+                (idx) as usize,
+            )
+        };
+    }
+
     /// GPU memory barrier (2026-08-19 fix). Metal does NOT guarantee
     /// write visibility between dispatches in a single compute command encoder;
     /// without an explicit barrier, a kernel that reads a buffer written by a

@@ -146,8 +146,12 @@ impl ModelDef for Qwen2Model {
     fn rope_style(&self) -> crate::vec_ops::RopeStyle {
         self.hparams.rope_style
     }
-    fn rope_params(&self) -> (f32, f32) {
-        (self.hparams.rope_freq_base, self.hparams.rope_freq_scale)
+    fn rope_params(&self) -> crate::vec_ops::RopeParams {
+        crate::vec_ops::RopeParams {
+            freq_base: self.hparams.rope_freq_base,
+            freq_scale: self.hparams.rope_freq_scale,
+            freqs: self.hparams.rope_freqs,
+        }
     }
 }
 
@@ -157,6 +161,12 @@ impl ModelDef for Qwen2Model {
 
 pub mod tensor_names {
     pub const TOKEN_EMBD: &str = "token_embd.weight";
+
+    /// #724: the `llama3` per-pair frequency factors llama.cpp's converter writes
+    /// (one tensor per block; the supported files repeat one table for all blocks).
+    pub fn rope_freqs(i: usize) -> String {
+        format!("blk.{i}.rope_freqs.weight")
+    }
     pub const OUTPUT_NORM: &str = "output_norm.weight";
     pub const OUTPUT: &str = "output.weight";
     pub const OUTPUT_BIAS: &str = "output.bias";

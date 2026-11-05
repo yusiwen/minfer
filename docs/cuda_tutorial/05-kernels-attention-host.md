@@ -367,17 +367,17 @@ projection matmuls, three small jobs remain before attention can run: add the
 attention biases (if the model has them), rotate q and k by RoPE, and write k/v
 into the persistent KV cache. The unfused graph spent **seven launches** on
 these (`add_bias` ×3, `rope` ×2, `store_kv` ×2 — the count in the kernel's
-header comment, `kv_store.cu:115-132`; TECH-PRIMER §6.4 prices the whole
+header comment, `kv_store.cu:116-133`; TECH-PRIMER §6.4 prices the whole
 campaign at "−310 launches/step"). This kernel is one launch that does all of
 it, ending with K/V in exactly the layout the next kernel reads.
 
-**Thread mapping.** The launcher `launch_attn_bias_rope_store` (`kv_store.cu:479`) is a flat 1-D
+**Thread mapping.** The launcher `launch_attn_bias_rope_store` (`kv_store.cu:484`) is a flat 1-D
 grid of 256-thread blocks over `total = nqt/2 + nkt/2 + nkt` — one thread per
 *RoPE pair* for q (`nqt/2`), one per RoPE pair for k (`nkt/2`), one per element
 for v (`nkt`); `nqt = nh·hd` and `nkt = nk·hd` are the q and k section widths
 of the (single) token's QKV output. Each thread branches on which section its
 linear id `u` falls in — three sections, one kernel
-`attn_bias_rope_store_f32` (`kv_store.cu:133`):
+`attn_bias_rope_store_f32` (`kv_store.cu:134`):
 
 ```c
 __global__ void attn_bias_rope_store_f32(
@@ -399,11 +399,11 @@ __global__ void attn_bias_rope_store_f32(
     const int row = cells[0];              // C6: the row the store lands on
 ```
 
-`positions[0]`/`cells[0]` are read *on the device* — the comment at `kv_store.cu:131-132` calls
+`positions[0]`/`cells[0]` are read *on the device* — the comment at `kv_store.cu:132-133` calls
 this out: "no host scalar crosses the launch — CUDA Graph capture/replay safe". A captured graph
 freezes its kernel arguments, so a host-side `n_past` would be baked in and wrong on every replay; device data is re-read each time.
 
-**Section 1 — q: bias + RoPE in place** `attn_bias_rope_store_f32` (`kv_store.cu:133`):
+**Section 1 — q: bias + RoPE in place** `attn_bias_rope_store_f32` (`kv_store.cu:134`):
 
 ```c
 if (u < qpairs) {
@@ -427,12 +427,12 @@ This is verbatim `rope_f32` (`ops_elementwise.cu:263`) with the bias add
 folded into the loads — same NEOX pairing `(j, j + hd/2)`, same frequency
 expression, same `cosf/sinf`. "Verbatim" is a hard requirement: the fused
 kernel had to be *bit-identical* to the seven-kernel chain it replaced (the
-header comment, `kv_store.cu:115-132`, lists each correspondence) —
+header comment, `kv_store.cu:116-133`, lists each correspondence) —
 fusion is only free when the answer does not change. The A/B proof lives in
-the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1246`
+the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1253`
 exercises the f16 round trip end to end).
 
-**Section 2 — k: bias + RoPE + store into the cache** `attn_bias_rope_store_f32` (`kv_store.cu:133`).
+**Section 2 — k: bias + RoPE + store into the cache** `attn_bias_rope_store_f32` (`kv_store.cu:134`).
 The first twelve lines are the q-section math with `bias_k`/`k` swapped — same
 pairing, same frequency, same rotation. The new part is what happens after the
 rotation: the rotated values are written *both* back to the k buffer *and* into
@@ -461,7 +461,7 @@ in the standalone `store_kv_f32` (`kv_store.cu:11`); the f16 branch converts on 
 with `__float2half` (round-to-nearest), the identical conversion the unfused
 `store_kv_f16` path uses — again for bit-identity.
 
-**Section 3 — v: bias + store** `attn_bias_rope_store_f32` (`kv_store.cu:133`): v gets no RoPE
+**Section 3 — v: bias + store** `attn_bias_rope_store_f32` (`kv_store.cu:134`): v gets no RoPE
 (only q and k are rotated), so its threads add the bias and store one element
 each, same `row * nkt + j` addressing into the V region.
 
@@ -490,12 +490,12 @@ launches it.
 
 **Two ways to call the same kernel.** The `q/k/v` parameters are *pointer-form
 section bases*, which lets one kernel serve both decode layer classes
-`attn_bias_rope_store_f32` (`kv_store.cu:133`): the **concat class** points all three into one
+`attn_bias_rope_store_f32` (`kv_store.cu:134`): the **concat class** points all three into one
 concatenated matmul output (`q = base`, `k = base + nqt`, `v = base + 2·nkt`;
 the Rust arm does this pointer arithmetic at (`cuda_backend.rs:`, the `Op::FusedQKV` section bases), and
 the **mixed-quant class** (e.g. a model where `attn_v` is Q6_K and cannot join
 the concat) points them at three separate matmul outputs
-(`Op::QkvBiasRopeStore`, arm at `cuda_backend.rs:1299`). One device kernel,
+(`Op::QkvBiasRopeStore`, arm at `cuda_backend.rs:1302`). One device kernel,
 two graph topologies, zero duplicated math.
 
 ### 3.3 KV in device memory — where the cache actually lives
@@ -530,7 +530,7 @@ allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:114` ("Compute Graph 
 rebuilds and hold their contents across decode steps: two device buffers per layer nobody may recycle.
 
 **Size and layout.** The size comes from the graph builder:
-`kv_elems: nkt * n_ctx` (`kv_elems` (`src/models/qwen2/graph.rs:158`)), where
+`kv_elems: nkt * n_ctx` (`kv_elems` (`src/models/qwen2/graph.rs:159`)), where
 `nkt = n_head_kv · hd` (the `n_kv_embd` dimension) and `n_ctx` is the
 capacity. So the brief question — "[n_past][kv_heads*head_dim]?" — resolves
 like this in the store code:
@@ -571,7 +571,7 @@ needs a host round trip to learn where the history ends.
 **f16 KV: half the bytes, same addresses.** The per-engine `kv_layout` tag
 (`cuda_backend.rs:46`, the `KV_LAYOUT_*` code) is fixed when the backend is built from the
 engine's resolved `KvFormat` (`src/graph/kvformat.rs` is the single authority): `load_model_configured`
-(`src/models/mod.rs:407`) resolves it from `MINFER_CACHE_TYPE` and stamps it through
+(`src/models/mod.rs:411`) resolves it from `MINFER_CACHE_TYPE` and stamps it through
 `GraphAllocator::set_kv_format`. When the tag is f16, every store converts to `__half` and
 every attention read converts back; §3.2's kernel shows both sides of that. The
 `store_kv_f16` header comment states the trade (`kv_store.cu:23-30`): "halves attention
@@ -579,17 +579,17 @@ read bandwidth", and the Rust `store_kv_f16` doc comment (`src/cuda/methods/kvst
 print — *the region stays f32-sized; the f16 view uses the first half of the bytes*:
 allocation does not shrink, the bytes written per store and read per attention call do
 (§4 does the arithmetic). The correctness story for the f16 round trip is test
-`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1246`).
+`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1253`).
 
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
 copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1092`) maps the node to
 `pair[0]`; the CUDA arm comments "out_buf IS the region — no kernel" at
-(`cuda_backend.rs:942`, the `KvcacheLoad` arm comment). So the whole path — matmul, fused tail, cache,
+(`cuda_backend.rs:945`, the `KvcacheLoad` arm comment). So the whole path — matmul, fused tail, cache,
 attention, next layer — touches pool device memory and crosses no host
 boundary. The one structural guard on that layout: attention requires
 `hd == hd_kv` and `nkt == n_head_kv · hd` (the kernels stride KV rows by
 `nkt`), and violations return `Err`, not a workaround
-`execute_node_inner` (`cuda_backend.rs:916`); the same guard has a GPU_SAFETY audit entry,
+`execute_node_inner` (`cuda_backend.rs:919`); the same guard has a GPU_SAFETY audit entry,
 `docs/GPU_SAFETY.md:105` (§3 "Audit findings (2026-08-02) — status", the H1 finding).
 
 ### 3.4 The Rust host side — `cuda_backend.rs` as a `Backend`
@@ -625,11 +625,11 @@ is load-bearing for §3.5: a captured graph bakes in device *pointers*, so any
 pool churn invalidates every capture, and `pool_gen` detects that.
 
 **`execute_node`: the dispatch.** The trait method
-(`execute_node` (`cuda_backend.rs:2345`)) is a thin wrapper: it calls
+(`execute_node` (`cuda_backend.rs:2360`)) is a thin wrapper: it calls
 `execute_node_inner` and, if the node failed *while a capture window was
-open*, aborts the window first (`abort_capture` (`cuda_backend.rs:900`) — a doomed window
+open*, aborts the window first (`abort_capture` (`cuda_backend.rs:903`) — a doomed window
 must never be closed into a cached graph). The real dispatch is one big match
-at `execute_node_inner` (`cuda_backend.rs:916`):
+at `execute_node_inner` (`cuda_backend.rs:919`):
 
 ```rust
 match &node.op {
@@ -660,7 +660,7 @@ Three representative arms:
   (`store_kv_q8_0`/`store_kv_f16`/`store_kv_f32`, `cuda_backend.rs:`) once per region.
 
 Every arm ends `Ok(())` or returns `Err(String)`; there is no third outcome.
-The match's fallthrough makes the policy explicit `execute_node_inner` (`cuda_backend.rs:916`):
+The match's fallthrough makes the policy explicit `execute_node_inner` (`cuda_backend.rs:919`):
 
 ```rust
 op => Err(format!(
@@ -687,19 +687,19 @@ fn alloc_buffer(&mut self, size: usize) -> usize {
 }
 ```
 
-(`alloc_buffer` (`cuda_backend.rs:2292`).) Three conventions to notice. *Exact-size
+(`alloc_buffer` (`cuda_backend.rs:2307`).) Three conventions to notice. *Exact-size
 reuse*: the free list matches byte length, so a recycled buffer is always big
 enough. *`pool_gen` on every path*: fresh alloc or reuse, both bump it, because
 both can change the node→pointer mapping a captured graph depends on. *No
 panics on OOM*: `cuda_malloc` logs and returns null, and the null buffer fails
 cleanly as an `Err` from `ptr_of` at execute time — never a panic inside the
-allocator (`ptr_of` (`cuda_backend.rs:630`); `stream_guard` is a shim, not a lock).
+allocator (`ptr_of` (`cuda_backend.rs:633`); `stream_guard` is a shim, not a lock).
 `free_buffer` never calls `cudaFree` — it recycles
-(`free_buffer` (`cuda_backend.rs:2319`)), which is what lets the persistent KV regions
+(`free_buffer` (`cuda_backend.rs:2334`)), which is what lets the persistent KV regions
 and the per-step scratch share one arena; `alloc_fresh`
-(`alloc_fresh` (`cuda_backend.rs:2329`)) bypasses the free list when a buffer's *id* is
+(`alloc_fresh` (`cuda_backend.rs:2344`)) bypasses the free list when a buffer's *id* is
 still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
-(`cuda_backend.rs:859`, the `Drop` impl) frees the pool, the positions scratch, and every
+(`cuda_backend.rs:862`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
 "Backends own their buffer pools; the allocator is the single owner"
 (`AGENTS.md:120` ("Compute Graph — core rules", rule 8)) — the `GraphAllocator` decides *which* buffer a node gets and
@@ -716,10 +716,10 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
     None
 }
 ```
-(`read_host` (`cuda_backend.rs:2439`).) Reading device memory back to the host is
-*always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:642`:
+(`read_host` (`cuda_backend.rs:2454`).) Reading device memory back to the host is
+*always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:645`:
 `state.sync()` then a pinned-staging readback); `write_host`
-(`write_host` (`cuda_backend.rs:2446`)) is the input-fill path — a pinned-staged *async*
+(`write_host` (`cuda_backend.rs:2461`)) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
 The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — is
 AGENTS rule 5 (`AGENTS.md:117` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
@@ -747,7 +747,7 @@ fn synchronize(&mut self) {
 }
 ```
 
-(`close_capture_or_sync` (`cuda_backend.rs:573`).) `synchronize` takes the blocking form and
+(`close_capture_or_sync` (`cuda_backend.rs:576`).) `synchronize` takes the blocking form and
 `retire` the non-blocking one (#138): memos expire, an open capture window
 closes here, and the actual wait is `CudaState::sync` (`src/cuda/methods/events.rs:143`) —
 `cudaGetLastError` checked, then `cudaStreamSynchronize`, and its error code
@@ -768,17 +768,17 @@ that tax without changing the kernels. The scheduler asks the CUDA backend,
 before executing a split, whether it wants to replay a capture
 (`BackendScheduler::execute` (`src/graph/scheduler.rs:137`); the ask itself is one line,
 `c.graph_replay(graph.uid, split.node_range, …)` at `graph_replay` (`src/graph/scheduler.rs:295`). On
-the backend, `graph_replay_step` (`cuda_backend.rs:459`) runs a three-run
+the backend, `graph_replay_step` (`cuda_backend.rs:462`) runs a three-run
 protocol: the first two executions of a (graph uid, node range) go through
-normal per-node launches (`graph_runs` counter, `graph_replay_step` (`cuda_backend.rs:459`)); on
+normal per-node launches (`graph_runs` counter, `graph_replay_step` (`cuda_backend.rs:462`)); on
 the third, the backend opens a *capture window* (`graph_begin_capture`,
 with **no** stream lock since #188 — the window opens on this backend's own stream,
-in `cudaStreamCaptureModeThreadLocal`, `graph_replay_step` (`cuda_backend.rs:459`) — from then until `synchronize`,
+in `cudaStreamCaptureModeThreadLocal`, `graph_replay_step` (`cuda_backend.rs:462`) — from then until `synchronize`,
 every kernel the dispatch enqueues is *recorded*, not executed. At the
-boundary, `close_capture_or_sync` (`cuda_backend.rs:573`) instantiates
+boundary, `close_capture_or_sync` (`cuda_backend.rs:576`) instantiates
 the recorded graph, launches it once, and caches the exec; every later step
 replays the whole split as **one** `graph_launch_exec` call
-`graph_replay_step` (`cuda_backend.rs:459`). N per-node launches collapse into one.
+`graph_replay_step` (`cuda_backend.rs:462`). N per-node launches collapse into one.
 
 That sounds fragile — it would be, if anything the kernels read could change
 between steps. Two invariants hold it up. First, **positions are data**
@@ -787,14 +787,14 @@ buffer *contents* change, and those are rewritten before replay — TECH-PRIMER
 §8's "why replay is safe in minfer's design"
 (`docs/CUDA-TECH-PRIMER.md:338-343` (§8 "CUDA Graphs — capture once, replay many (Phase 7")). Second, **pool generations**: any
 buffer (re)allocation bumps `pool_gen`, and a replay whose captured `pool_gen`
-differs is destroyed and re-captured `graph_replay_step` (`cuda_backend.rs:459`).
+differs is destroyed and re-captured `graph_replay_step` (`cuda_backend.rs:462`).
 
 **`MINFER_NO_CUDA_GRAPH=1` is the A/B revert.** It forces
 `GraphMode::Disabled` at construction `with_layout` (`cuda_backend.rs:204`), which makes
-`graph_replay_step` (`cuda_backend.rs:459`) return `false` — every step
+`graph_replay_step` (`cuda_backend.rs:462`) return `false` — every step
 runs the plain per-node launch path. It is also the *recovery* switch: any
 capture/replay failure disables graphs for the rest of the session with a loud
-message saying exactly that (`cuda_backend.rs:499` and `:545`, the two "graphs disabled for this session" messages). TECH-PRIMER
+message saying exactly that (`cuda_backend.rs:502` and `:548`, the two "graphs disabled for this session" messages). TECH-PRIMER
 §8 calls it "the A/B control used by every graph-adjacent step doc"
 (`docs/CUDA-TECH-PRIMER.md:336-337` (§8 "CUDA Graphs — capture once, replay many (Phase 7")). A related hard rule: nothing inside a
 capture window may sync — a debug readback corrupts the capture, the 7e②
@@ -838,19 +838,19 @@ backend than its split is an assignment bug and returns `Err` with both named (`
 answer to "what if a weight has an unsupported type" is to decide *at build
 time*, all-or-nothing: CUDA participation requires a device **and** every
 weight registered with a kernel-supported type
-(`Qwen2Graph::device` (`src/models/qwen2/graph.rs:776`),
+(`Qwen2Graph::device` (`src/models/qwen2/graph.rs`),
 `cuda_on = … && Self::weights_on_cuda(model)`). `weights_on_cuda`
-`weights_on_cuda` (`src/models/qwen2/graph.rs:881`) walks every tensor — embedding,
+`weights_on_cuda` (`src/models/qwen2/graph.rs:885`) walks every tensor — embedding,
 per-layer wq/wk/wv/wo, gate/up/down, norms, biases — and on failure prints the
 exact loser: `"CUDA GATE: weight '{}' (type {:?}) has no CUDA kernel or is not registered"` —
-the gate is `Qwen2Graph::device` (`src/models/qwen2/graph.rs:776`). That either routes the
+the gate is `Qwen2Graph::device` (`src/models/qwen2/graph.rs`). That either routes the
 whole model to CPU (loudly, at build time, recorded in `CParams.gpu`) or
 admits the graph as fully-GPU. What is *forbidden* is the third option:
 discovering mid-run that a kernel is missing and quietly falling back. If a
 weight lookup still fails inside `execute_node`, it is
-`Err` naming the weight (`execute_node_inner` (`cuda_backend.rs:916`)); an unhandled op is `Err`
-`execute_node_inner` (`cuda_backend.rs:916`); a kernel-invariant violation is `Err` with the
-actual values `execute_node_inner` (`cuda_backend.rs:916`). AGENTS states the contract once:
+`Err` naming the weight (`execute_node_inner` (`cuda_backend.rs:919`)); an unhandled op is `Err`
+`execute_node_inner` (`cuda_backend.rs:919`); a kernel-invariant violation is `Err` with the
+actual values `execute_node_inner` (`cuda_backend.rs:919`). AGENTS states the contract once:
 "kernel-invariant violations return `Err` from `execute_node` — never a
 silent CPU fallback; backend assignment is decided at build time"
 (`AGENTS.md:107` ("GPU Safety", the Err-never-fallback contract)); TECH-PRIMER §7 repeats it
@@ -906,7 +906,7 @@ per position *touched*, though the regions stay f32-sized in allocation
 (§3.3). The flip side is precision: K/V are rounded to f16 on store and every
 downstream kernel reads the rounded values — which is why the parity tests
 compare against the *f16-rounded* reference, not f32
-(`cuda_kv_f16_roundtrip_attn`, `cuda_backend/tests/kv.rs:1246`).
+(`cuda_kv_f16_roundtrip_attn`, `cuda_backend/tests/kv.rs:1253`).
 
 **Prefill attention: the tiling win in one number.** The legacy per-(token,
 head) kernel re-read the K history once per query token per head: at 7B @2K

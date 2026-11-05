@@ -3,13 +3,15 @@
 
 pub mod qwen2;
 pub mod qwen3;
+/// #724: the `llama3` rope-scaling contract (tensor shape and metadata shape).
+pub mod rope_scaling;
 /// #167: the one CUDA per-tensor weight-registration rule both loaders share.
 pub mod weight_reg;
 
 use crate::gguf::GgufModel;
 use crate::graph::cache::GraphCache;
 use crate::graph::offload::OffloadPlan;
-use crate::vec_ops::RopeStyle;
+use crate::vec_ops::{RopeParams, RopeStyle};
 
 /// E5: what the loader decided about layer offload, and what it measured while registering
 /// weights. Stored on the model, so `device()`, the graph builder and the startup report all
@@ -338,10 +340,12 @@ pub trait ModelDef: Send + Sync {
     fn n_vocab(&self) -> usize;
     fn rope_style(&self) -> RopeStyle;
 
-    /// RoPE base and frequency scale (`(freq_base, freq_scale)`). The context
-    /// shift re-ropes stored K rows after a position change, which needs both
-    /// (Phase C / C2).
-    fn rope_params(&self) -> (f32, f32);
+    /// RoPE base, frequency scale and (for a `llama3`-scaled model, #724) the
+    /// per-pair factor table. The context shift re-ropes stored K rows after a
+    /// position change, which needs all three (Phase C / C2) — passing a base and
+    /// a scale but not the table would rotate a scaled model's K rows by the
+    /// unscaled angles.
+    fn rope_params(&self) -> RopeParams;
 }
 
 /// Token IDs used by the sampler to stop generation.

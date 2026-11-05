@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use super::BufRef;
-use crate::vec_ops::RopeStyle;
+use crate::vec_ops::{RopeFreqs, RopeStyle};
 
 /// Sequence identifier. C1 has exactly one implicit sequence; C2/E add more.
 pub type SeqId = u32;
@@ -1406,6 +1406,9 @@ pub struct KvRope {
     /// Per-head width.
     pub hd: usize,
     pub style: RopeStyle,
+    /// #724: the `llama3` per-pair frequency factors, `None` for an unscaled model
+    /// (the shift then rotates by today's expression unchanged).
+    pub freqs: Option<RopeFreqs>,
 }
 
 /// Re-rope `k` in place so that every row that was written at position `p`
@@ -1435,7 +1438,14 @@ pub fn rope_shift_kv(k: &mut [f32], rows: usize, delta: isize, rope: &KvRope) {
     // The shift is a rotation by `-delta * freq_i`, the same for every row.
     let angles: Vec<f32> = (0..half)
         .map(|i| {
-            let freq = rope.freq_scale / rope.freq_base.powf((2 * i) as f32 / hd as f32);
+            // #724: one expression, shared with the kernels' reference.
+            let freq = crate::vec_ops::rope_inv_freq(
+                rope.freq_base,
+                rope.freq_scale,
+                rope.freqs.as_ref(),
+                i,
+                hd,
+            );
             -(delta as f32) * freq
         })
         .collect();

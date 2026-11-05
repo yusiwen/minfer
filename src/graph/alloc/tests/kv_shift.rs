@@ -36,6 +36,7 @@ fn shift_rope() -> crate::graph::kvcache::KvRope {
         n_head_kv: 1,
         hd: ROW,
         style: crate::vec_ops::RopeStyle::NonInterleaved,
+        freqs: None,
     }
 }
 

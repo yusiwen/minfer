@@ -178,10 +178,11 @@ fn a_compaction_between_steps_keeps_the_continuation() {
     let n = subject.len();
     let holder = 8usize; // cells reserved below the subject, released to force a move
     let step_tok = subject[n - 1]; // the fed token only has to match on both sides
-    let (freq_base, freq_scale) = model.rope_params();
+    let params = model.rope_params();
     let rope = KvRope {
-        freq_base,
-        freq_scale,
+        freq_base: params.freq_base,
+        freq_scale: params.freq_scale,
+        freqs: params.freqs,
         n_head_kv: model.n_head_kv(),
         hd: model.n_embd_head(),
         style: model.rope_style(),
@@ -376,10 +377,11 @@ fn kv_rm_is_exact_and_the_window_shift_is_a_named_tolerance_class() {
     let abc: Vec<u32> = a.iter().chain(&b).chain(&c).copied().collect();
     let bc: Vec<u32> = b.iter().chain(&c).copied().collect();
     let nkt = model.n_kv_embd();
-    let (freq_base, freq_scale) = model.rope_params();
+    let params = model.rope_params();
     let rope = KvRope {
-        freq_base,
-        freq_scale,
+        freq_base: params.freq_base,
+        freq_scale: params.freq_scale,
+        freqs: params.freqs,
         n_head_kv: model.n_head_kv(),
         hd: model.n_embd_head(),
         style: model.rope_style(),

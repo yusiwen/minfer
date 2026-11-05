@@ -294,3 +294,10 @@ hash = "34eaf10"
 kind = "pre-rewrite"
 source = "minfer (pre-rewrite label)"
 reason = "one of the two §3.5 split-GGUF labels"
+
+[[exempt]]
+
+hash = "184f65360"
+kind = "foreign"
+source = "llama.cpp"
+reason = "the llama.cpp build (b11829) whose converter and loader #724 read the llama3 rope table out of, and the reference the two 2026-11-05 long-context measurements were produced against (ADR-0074, the 8192-token fixture's provenance)"

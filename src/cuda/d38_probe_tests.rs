@@ -165,6 +165,7 @@ fn cuda_fused_qkv_epilogue_bitwise() {
                 hd,
                 freq_base,
                 freq_scale,
+                crate::vec_ops::RopeFreqs::none(),
                 dpos,
                 dpos,
                 if kv_f16 { KV_LAYOUT_F16 } else { KV_LAYOUT_F32 },
@@ -193,6 +194,7 @@ fn cuda_fused_qkv_epilogue_bitwise() {
                 hd,
                 freq_base,
                 freq_scale,
+                crate::vec_ops::RopeFreqs::none(),
                 dpos,
                 dpos,
                 if kv_f16 { KV_LAYOUT_F16 } else { KV_LAYOUT_F32 },
@@ -210,8 +212,28 @@ fn cuda_fused_qkv_epilogue_bitwise() {
             st.add_bias_f32(d_v, dbv, nkt, 1);
             // style 0 = NEOX, the layout these probes measure (#735 added the
             // interleaved twin; the probes stay on the Qwen layout).
-            st.rope_f32(d_q, nh, hd, 1, freq_base, freq_scale, dpos, 0);
-            st.rope_f32(d_k, nk, hd, 1, freq_base, freq_scale, dpos, 0);
+            st.rope_f32(
+                d_q,
+                nh,
+                hd,
+                1,
+                freq_base,
+                freq_scale,
+                crate::vec_ops::RopeFreqs::none(),
+                dpos,
+                0,
+            );
+            st.rope_f32(
+                d_k,
+                nk,
+                hd,
+                1,
+                freq_base,
+                freq_scale,
+                crate::vec_ops::RopeFreqs::none(),
+                dpos,
+                0,
+            );
             let dk_u = dev_alloc(ctx_elems * kv_bytes);
             let dv_u = dev_alloc(ctx_elems * kv_bytes);
             if kv_f16 {

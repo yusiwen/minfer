@@ -471,6 +471,7 @@ fn build_rope(b: &mut GraphBuilder) -> (NodeId, Inputs, Vec<f32>, Vec<Tensor>) {
             freq_scale: 1.0,
             n_head: 1,
             hd: 2,
+            freqs: None,
         },
     );
     let a = vec![1.0, 0.0];

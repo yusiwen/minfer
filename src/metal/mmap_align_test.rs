@@ -315,7 +315,7 @@ fn attn_rope_store_isolated() {
 
         let cb = mps.cmd_buffer();
         cb.attn_rope_store(
-            &bqkv, &kv_k, &kv_v, nqt, nkt, hd, freq_base, freq_scale, pos, rope_style, kv_f16,
+            &bqkv, &kv_k, &kv_v, nqt, nkt, hd, freq_base, freq_scale, None, pos, rope_style, kv_f16,
         );
         cb.submit().expect("submit");
 

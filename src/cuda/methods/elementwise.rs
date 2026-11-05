@@ -51,6 +51,7 @@ extern "C" {
         nt: i32,
         freq_base: f32,
         freq_scale: f32,
+        freqs: crate::vec_ops::RopeFreqs,
         positions: *const i32,
         style: i32,
         stream: *mut std::ffi::c_void,
@@ -179,6 +180,7 @@ impl CudaState {
         nt: usize,
         freq_base: f32,
         freq_scale: f32,
+        freqs: crate::vec_ops::RopeFreqs,
         positions: *mut std::ffi::c_void,
         style: i32,
     ) {
@@ -191,6 +193,7 @@ impl CudaState {
                 nt as i32,
                 freq_base,
                 freq_scale,
+                freqs,
                 positions as *const i32,
                 style,
                 stream,
