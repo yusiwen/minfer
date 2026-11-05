@@ -391,3 +391,9 @@ symbol = "gemma_schema_rules"
 adr = "0074"
 what = "a rope frequency table comes from the file (`rope_freqs.weight`, per-block or the `llama3` metadata spelling) and rides in the node metadata as per-pair factors; an unscaled model keeps the exact pre-table expression and an unknown scaling type is refused by name"
 symbol = "RopeFreqs"
+
+[[governs]]
+adr = "0075"
+what = "a GGUF part owns its mapping (`GgufPart::mmap`) and a tensor carries a handle into it (`Tensor::owner`), so the last handle unmaps the file and closes its fd; the Metal zero-copy part registration holds a handle of its own"
+symbol = "as_static_slice"
+

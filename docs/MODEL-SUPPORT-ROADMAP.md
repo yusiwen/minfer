@@ -45,7 +45,7 @@ Four items are **not** covered by that estimate and apply to every port:
 1. **Decode-fusion weight registration.** The decode path fuses QKV
    (`blk.{i}.attn_qkv`) and gate+up (`blk.{i}.ffn_gu`) only when the loader has
    registered the concatenated tensors — once for Metal and once for CUDA
-   (`models/qwen2/loader.rs:463`, `:549`; `models/qwen3/loader.rs:461`, `:503`)
+   (`models/qwen2/loader.rs:467`, `:569`; `models/qwen3/loader.rs:465`, `:523`)
    — plus the matching `qkv_concat_available` / `gu_concat_available`
    predicates (`models/qwen2/graph.rs:`). Skip them and the port is
    still **correct**, but decode fusion silently disables: no error, just a
@@ -93,7 +93,7 @@ instead of being hand-written per backend.
 | **Llama 3.1/3.2/3.3/3.4** | no attention bias (optional in the IR), RoPE variant, SwiGLU gate/up order | **RoPE scaling** (cost model #3) — short context works without it, long context does not; concat-weight registration (#1) | smallest + rope work |
 | **Mistral 7B** | same as Llama 3 (no bias) | **Interleaved RoPE** for v0.1 (cost model #2): loader + CUDA kernel; or convert to the non-interleaved convention | small–medium |
 | **InternLM2** | ~none | concat-weight registration (#1) only | smallest |
-| **Phi-3/Phi-4** | qkv bias, RoPE variant, no norm | qkv bias is already supported (`models/qwen2/loader.rs:441`); verify the RoPE variant | small |
+| **Phi-3/Phi-4** | qkv bias, RoPE variant, no norm | qkv bias is already supported (`models/qwen2/loader.rs:445`); verify the RoPE variant | small |
 | **GLM-4-9B** | dense, minor attention details | none known beyond #1 | small |
 | **Gemma 2** | GeGLU, shared QKV layer, **alternating SWA** | **`Gelu` op** (absent from `Op`, `graph/ops.rs` — GeGLU needs it) and a **sliding-window mask** in the attention kernels (adjacent to `ARCHITECTURE-ROADMAP.md` §3 item 2, but a distinct parameter — a window bound rather than a cell set); GeGLU itself is a five-site change unless `§3 item 7` lands first | medium |
 
