@@ -342,6 +342,8 @@ rotate the two halves (`NonInterleaved`, NeoX) — plus the stop set
 `rope_freqs.weight` are [#724](https://github.com/yusiwen/minfer/issues/724)'s
 contract; until then a table-carrying model runs the plain formula.
 
+The pinned `Llama-3.2-1B-Instruct-Q4_K_M.gguf` decodes on all three backends: [#723](https://github.com/yusiwen/minfer/issues/723) measured `metal` on **547 of 547** graph nodes on a MacBook (macOS 27.2, Apple M4 Pro, 2026-11-05, 98.4 tok/s) and the recorded CUDA golden on GB10, on the same file and the same 32-step loop the real-model gate uses.
+
 The loader will **not** silently misinterpret an unknown architecture — it fails
 immediately with a descriptive message.
 
