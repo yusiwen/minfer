@@ -55,27 +55,52 @@ fn the_trace_names_the_backend_each_node_ran_on() {
 
     // A CUDA build that initialised a device must name it; the CLI prints the
     // line on the first device use, so it is also the "is there a device" probe.
-    let device_run = cfg!(feature = "cuda") && stderr.contains("CUDA: using");
-    if device_run {
-        assert!(
-            counts.get("cuda").copied().unwrap_or(0) > 0,
-            "a device run's trace must mark the nodes it ran on the device, got {counts:?}\n\
-             stderr:\n{stderr}"
-        );
+    // #736's selector was a build property the day it was written: `cfg!(feature =
+    // "cuda")` is false in a macOS release build that still runs every node on Metal, so
+    // the "a CPU run must not claim a device node" arm fired on a genuine Metal run and
+    // this test went red on the MacBook (found by #723's Metal smoke, 2026-11-05 — CI's
+    // `build-macos` only compiles). The run declares its own placement on stderr: CUDA
+    // names the card it initialised, and a device holding blocks prints
+    // `minfer: offload: … on <device>`. The arm follows that line, and every node must
+    // name *some* backend — an unassigned node exports as `none`, which is the actual
+    // shape of the bug #736 fixed.
+    let device = if stderr.contains("CUDA: using") {
+        Some("cuda")
+    } else if stderr.contains("on metal") {
+        Some("metal")
     } else {
-        assert_eq!(
-            counts.get("cuda").copied().unwrap_or(0),
-            0,
-            "a CPU run must not claim a device node, got {counts:?}"
-        );
+        None
+    };
+    for name in ["cuda", "metal"] {
+        let named = counts.get(name).copied().unwrap_or(0);
+        if device == Some(name) {
+            assert!(
+                named > 0,
+                "the run announced {name} but the trace marks no {name} node, got {counts:?}\n\
+                 stderr:\n{stderr}"
+            );
+        } else {
+            assert_eq!(
+                named, 0,
+                "a run that announced {device:?} must not claim {name} nodes, got {counts:?}\n\
+                 stderr:\n{stderr}"
+            );
+        }
     }
+    assert_eq!(
+        counts.get("none").copied().unwrap_or(0),
+        0,
+        "every node must name the backend it ran on (an unassigned node exports as `none`), \
+         got {counts:?}"
+    );
     assert!(
-        counts.get("cpu").copied().unwrap_or(0) > 0,
-        "every graph has CPU nodes (inputs, get_rows, ...), got {counts:?}"
+        counts.values().sum::<usize>() > 0,
+        "the trace must name at least one node, got {counts:?}"
     );
     eprintln!(
-        "trace backends: {counts:?} (device_run={device_run}, cuda_build={})",
-        cfg!(feature = "cuda")
+        "trace backends: {counts:?} (device={device:?}, cuda_build={}, metal_build={})",
+        cfg!(feature = "cuda"),
+        cfg!(target_os = "macos")
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
