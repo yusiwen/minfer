@@ -347,6 +347,9 @@ pub struct ServerMetrics {
     /// supervisor observed — a panic, a clean drain, or the stall — so a scrape
     /// separates "it gave up" from "it is down".
     pub worker_stops_total: AtomicU64,
+    /// [#731 A]: times the supervisor restarted a worker that ended with its
+    /// resources intact (the #196 bound), within the restart cap.
+    pub worker_restarts_total: AtomicU64,
     /// Jobs in the worker's `pending` deque right now (exact, worker-published).
     pub worker_pending: AtomicU64,
     /// Requests occupying an engine slot right now (worker-published).
@@ -379,6 +382,7 @@ pub struct MetricsSnapshot {
     pub jobs_dropped_total: u64,
     pub worker_stalled_total: u64,
     pub worker_stops_total: u64,
+    pub worker_restarts_total: u64,
     /// #157: terminal errors by `ApiError::error_type`, sorted by class so a
     /// scrape is deterministic.
     pub requests_failed: Vec<(&'static str, u64)>,
@@ -455,6 +459,7 @@ impl ServerMetrics {
             jobs_dropped_total: self.jobs_dropped_total.load(r),
             worker_stalled_total: self.worker_stalled_total.load(r),
             worker_stops_total: self.worker_stops_total.load(r),
+            worker_restarts_total: self.worker_restarts_total.load(r),
             requests_failed: {
                 let mut failed = self
                     .requests_failed
@@ -579,6 +584,13 @@ pub fn render(m: &MetricsSnapshot) -> String {
         "Times the worker stopped and stayed stopped: a panic outside the isolated job, the counted no-progress bound, or the drain. Every later request is refused with the worker's state, never a bare \"shutting down\".",
         "counter",
         m.worker_stops_total,
+    );
+    sample(
+        &mut out,
+        "minfer_worker_restarts_total",
+        "Times the supervisor restarted a worker that ended with its resources intact (the counted no-progress bound), within the restart cap. A panic loses the resources and disables instead.",
+        "counter",
+        m.worker_restarts_total,
     );
     sample(
         &mut out,

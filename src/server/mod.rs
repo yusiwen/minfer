@@ -167,13 +167,20 @@ pub fn run(
     let worker_tokenizer = tokenizer.clone();
     let worker_metrics = metrics.clone();
     // #731: one supervision point. The worker hands its resources back on the
-    // way out (slice A restarts from them); B classifies the exit, publishes it in
-    // `WorkerStatus` and counts it, so every later request is refused by name.
+    // way out; the supervisor classifies the exit, publishes it in `WorkerStatus`
+    // (so requests are refused by name), counts it, and — slice A — restarts a
+    // worker that ended with its resources intact, with a bounded backoff. The
+    // restart needs a tokenizer/spec/snapshot copy that outlives the first
+    // incarnation, so they are cloned here.
     let worker_status = Arc::new(worker::WorkerStatus::new());
     let supervisor_status = worker_status.clone();
     let supervisor_metrics = metrics.clone();
+    let supervisor_tokenizer = worker_tokenizer.clone();
+    let supervisor_spec = spec_cfg.clone();
+    let supervisor_slots_file = slots_file.clone();
+    let respawn_metrics = metrics.clone();
     let worker = std::thread::spawn(move || {
-        let out = chat::worker_loop(
+        chat::worker_loop(
             model,
             worker_tokenizer,
             slots,
@@ -181,12 +188,28 @@ pub fn run(
             spec_cfg,
             slots_file,
             worker_metrics,
-        );
-        let _ = worker_done_tx.send(());
-        out
+        )
     });
+    let respawn = move |res: worker::WorkerResources| {
+        let tokenizer = supervisor_tokenizer.clone();
+        let spec = supervisor_spec.clone();
+        let slots_file = supervisor_slots_file.clone();
+        let metrics = respawn_metrics.clone();
+        std::thread::spawn(move || {
+            chat::worker_loop(
+                res.model, tokenizer, res.slots, res.job_rx, spec, slots_file, metrics,
+            )
+        })
+    };
     std::thread::spawn(move || {
-        worker::supervise_worker(worker, supervisor_status, supervisor_metrics)
+        worker::run_supervisor(
+            worker,
+            Box::new(respawn),
+            supervisor_status,
+            supervisor_metrics,
+            Some(worker_done_tx),
+            worker::RestartPolicy::default(),
+        )
     });
 
     let model_name = gguf
