@@ -12,6 +12,7 @@ pub mod slot;
 pub mod toolcall;
 pub mod types;
 pub mod viz;
+pub mod worker;
 
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
@@ -59,6 +60,10 @@ pub struct AppState {
     /// combination before queueing.
     pub spec_enabled: bool,
     pub chat_template: Option<String>,
+    /// [#731]: the worker's liveness. A stopped worker refuses every request with
+    /// a message that names the state, never a bare "shutting down" from a
+    /// closed channel.
+    pub worker: Arc<worker::WorkerStatus>,
     pub created: i64,
 }
 
@@ -161,8 +166,14 @@ pub fn run(
     let spec_enabled = spec_cfg.is_some();
     let worker_tokenizer = tokenizer.clone();
     let worker_metrics = metrics.clone();
+    // #731: one supervision point. The worker hands its resources back on the
+    // way out (slice A restarts from them); B classifies the exit, publishes it in
+    // `WorkerStatus` and counts it, so every later request is refused by name.
+    let worker_status = Arc::new(worker::WorkerStatus::new());
+    let supervisor_status = worker_status.clone();
+    let supervisor_metrics = metrics.clone();
     let worker = std::thread::spawn(move || {
-        chat::worker_loop(
+        let out = chat::worker_loop(
             model,
             worker_tokenizer,
             slots,
@@ -172,6 +183,10 @@ pub fn run(
             worker_metrics,
         );
         let _ = worker_done_tx.send(());
+        out
+    });
+    std::thread::spawn(move || {
+        worker::supervise_worker(worker, supervisor_status, supervisor_metrics)
     });
 
     let model_name = gguf
@@ -190,6 +205,7 @@ pub fn run(
         special,
         spec_enabled,
         chat_template: template,
+        worker: worker_status.clone(),
         created: now_unix(),
     });
 
@@ -226,7 +242,6 @@ pub fn run(
             ),
         }
     }
-    let _ = worker;
 }
 
 /// What a drain did: every in-flight request finished, or the deadline expired
@@ -430,6 +445,16 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: String) -> R
             .requests_rejected_total
             .fetch_add(1, Ordering::SeqCst);
         return error_response(&ApiError::unavailable("server is draining"));
+    }
+    // #731: a dead worker refuses by name **before** any work (tokenize, template,
+    // grammar), so the client never sees the old send-error "shutting down" for a
+    // crashed worker and never waits on a queue nobody drains.
+    if state.worker.is_stopped() {
+        state
+            .metrics
+            .requests_rejected_total
+            .fetch_add(1, Ordering::SeqCst);
+        return error_response(&ApiError::unavailable(state.worker.refusal_message()));
     }
     let req = match ChatCompletionRequest::parse(body.as_bytes()) {
         Ok(r) => r,

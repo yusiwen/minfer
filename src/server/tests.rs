@@ -66,6 +66,7 @@ fn app_state(metrics: Arc<ServerMetrics>) -> (Arc<AppState>, mpsc::Receiver<Job>
             eom: None,
         },
         spec_enabled: false,
+        worker: std::sync::Arc::new(crate::server::worker::WorkerStatus::new()),
         chat_template: None,
         created: 0,
     });
@@ -153,6 +154,46 @@ async fn a_draining_server_refuses_new_work_and_says_so_in_metrics() {
         body.contains("minfer_requests_rejected_total 1\n"),
         "{body}"
     );
+}
+
+/// #731: after the worker dies, **every** later request is refused with a
+/// message that names the state — never the old bare "shutting down" from a
+/// closed channel, and never a hang.
+#[tokio::test]
+async fn a_stopped_worker_refuses_every_request_by_name() {
+    let metrics = Arc::new(ServerMetrics::new());
+    let (state, _rx) = app_state(metrics.clone());
+    state.worker.mark(crate::server::worker::WorkerExit::Panic);
+    let addr = serve(router(state)).await;
+
+    for attempt in 0..2 {
+        let (head, body) = post_json(
+            addr,
+            "/v1/chat/completions",
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert!(
+            head.starts_with("HTTP/1.1 503"),
+            "attempt {attempt}: status line: {head}"
+        );
+        assert!(
+            body.contains("inference worker is down"),
+            "attempt {attempt}: the refusal must name the worker: {body}"
+        );
+        assert!(
+            !body.contains("shutting down"),
+            "attempt {attempt}: a dead worker is not a drain: {body}"
+        );
+    }
+    assert_eq!(metrics.requests_rejected_total.load(Ordering::SeqCst), 2);
+    // Nothing reached the queue, so nothing is in flight.
+    assert_eq!(metrics.requests_total.load(Ordering::SeqCst), 0);
+    assert_eq!(metrics.in_flight.load(Ordering::SeqCst), 0);
+
+    // The metric family exists even without a supervisor run (0 here).
+    let (_, body) = get(addr, "/metrics").await;
+    assert!(body.contains("minfer_worker_stops_total"), "{body}");
 }
 
 /// A drain that finishes in time reports `Clean`.

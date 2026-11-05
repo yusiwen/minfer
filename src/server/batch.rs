@@ -1187,7 +1187,9 @@ impl BatchEngine {
             TickSeam::Spin => {
                 self.work_units += 1;
                 return Ok(());
-            }
+            } // #731: outside `run_job_isolated`, so the unwind reaches the worker
+              // thread and the supervisor sees a panic — exactly the failure the
+              // supervision exists for.
         }
         // (1) one forward for every slot with a committed-but-unwritten token.
         let mut tokens: Vec<u32> = Vec::new();
@@ -1734,7 +1736,10 @@ pub fn serve_loop(
     engine: &mut BatchEngine,
     metrics: &super::metrics::ServerMetrics,
     queue_max: usize,
-) {
+) -> (mpsc::Receiver<Job>, super::worker::WorkerExit) {
+    // #731: the loop hands its queue back with the reason it ended, so the
+    // supervisor can restart it without rebuilding the channel or the model.
+    let mut exit = super::worker::WorkerExit::Shutdown;
     let mut pending: VecDeque<Job> = VecDeque::new();
     let queue_max = queue_max.max(1);
     // #196: consecutive steps that left the engine busy with a frozen work
@@ -1896,6 +1901,7 @@ pub fn serve_loop(
                                 runs, queued
                             ));
                             engine.publish_metrics(metrics);
+                            exit = super::worker::WorkerExit::Stalled;
                             break;
                         }
                     } else {
@@ -1929,6 +1935,7 @@ pub fn serve_loop(
             break;
         }
     }
+    (job_rx, exit)
 }
 
 #[cfg(test)]

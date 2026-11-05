@@ -179,6 +179,7 @@ pub fn run_viz(
         tokenizer: Arc::new(tokenizer),
         special,
         spec_enabled: false,
+        worker: std::sync::Arc::new(crate::server::worker::WorkerStatus::new()),
         chat_template: template,
         created: super::now_unix(),
     });

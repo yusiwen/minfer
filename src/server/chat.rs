@@ -710,7 +710,7 @@ pub fn worker_loop(
     spec_cfg: Option<crate::spec::SpecConfig>,
     slots_file: Option<String>,
     metrics: std::sync::Arc<super::metrics::ServerMetrics>,
-) {
+) -> super::worker::WorkerResources {
     // E2/E6: the plain path *can* batch every ready slot into one forward per
     // step, and **whether that is a win is a property of the device** — measured
     // end to end at `--n-slots 4`: 0.88x on Qwen2.5-0.5B Q4_0 and 0.49x on 7B
@@ -806,7 +806,7 @@ pub fn worker_loop(
                     "[server] queue: up to {queue_max} request(s) wait for a slot \
                      (MINFER_QUEUE_MAX); beyond that the newest is answered 503"
                 ));
-                super::batch::serve_loop(
+                let (job_rx, exit) = super::batch::serve_loop(
                     &*model,
                     &tokenizer,
                     job_rx,
@@ -814,15 +814,22 @@ pub fn worker_loop(
                     &metrics,
                     queue_max,
                 );
+                // #731: the loop hands its queue back (and why it ended) so the
+                // supervisor can restart it (slice A) instead of reloading.
+                return super::worker::WorkerResources {
+                    model,
+                    slots,
+                    job_rx,
+                    exit,
+                };
             }
             Err(e) => {
                 crate::server::log::warn(format_args!(
                     "[server] continuous batching unavailable ({e}); serving serially"
                 ));
-                worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics);
+                return worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics);
             }
         }
-        return;
     }
     if let Some(path) = &slots_file {
         crate::server::log::info(format_args!(
@@ -830,7 +837,7 @@ pub fn worker_loop(
              engine; this server serves serially, so nothing will be resumed or saved"
         ));
     }
-    worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics);
+    worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics)
 }
 
 /// The pre-E2 loop: one request at a time, each on its own slot cache. Kept for
@@ -848,7 +855,7 @@ fn worker_loop_serial(
     mut job_rx: mpsc::Receiver<Job>,
     spec_cfg: Option<crate::spec::SpecConfig>,
     metrics: &super::metrics::ServerMetrics,
-) {
+) -> super::worker::WorkerResources {
     // doc 97: one draft engine per slot (each slot's draft KV is isolated
     // exactly like its target KV). The draft model is small (0.5B-class) and
     // loaded once at worker startup.
@@ -1006,6 +1013,12 @@ fn worker_loop_serial(
         let backend = crate::graph::kvsession::backend_of(model.device());
         let snapshot = super::metrics::kv_snapshot_from(slot.cache.alloc(), backend);
         metrics.publish_kv(&snapshot);
+    }
+    super::worker::WorkerResources {
+        model,
+        slots,
+        job_rx,
+        exit: super::worker::WorkerExit::Shutdown,
     }
 }
 

@@ -27,6 +27,7 @@ fn state() -> (Arc<VizState>, mpsc::Receiver<Job>) {
             eom: None,
         },
         spec_enabled: false,
+        worker: std::sync::Arc::new(crate::server::worker::WorkerStatus::new()),
         chat_template: None,
         created: 0,
     });

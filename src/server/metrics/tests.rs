@@ -16,6 +16,7 @@ fn empty_snapshot() -> MetricsSnapshot {
         running: 0,
         jobs_dropped_total: 0,
         worker_stalled_total: 0,
+        worker_stops_total: 0,
         requests_failed: Vec::new(),
         prompt_tokens_total: 0,
         completion_tokens_total: 0,
