@@ -232,9 +232,12 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
         }
     };
     eprintln!("Loading model: {model_path} ...");
-    let Some(gguf_model) = crate::gguf::load_gguf_model(std::path::Path::new(&model_path)) else {
-        eprintln!("Error: failed to parse GGUF: {model_path}");
-        return 1;
+    let gguf_model = match crate::gguf::load_gguf_model(std::path::Path::new(&model_path)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
     };
     let ctx = &gguf_model.parts[0].ctx;
     let model = match crate::models::load_model(&gguf_model) {

@@ -278,12 +278,9 @@ pub fn run_quantize(prog: &str, args: &[String]) -> i32 {
         return 1;
     }
     let model = match crate::gguf::load_gguf_model(in_path) {
-        Some(m) => m,
-        None => {
-            eprintln!(
-                "Error: minfer quantize: failed to read GGUF from {}",
-                in_path.display()
-            );
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: minfer quantize: {e}");
             return 1;
         }
     };
@@ -487,12 +484,9 @@ pub fn run_split(prog: &str, args: &[String]) -> i32 {
         return 1;
     }
     let model = match crate::gguf::load_gguf_model(in_path) {
-        Some(m) => m,
-        None => {
-            eprintln!(
-                "Error: minfer split: failed to read GGUF from {}",
-                in_path.display()
-            );
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: minfer split: {e}");
             return 1;
         }
     };

@@ -117,10 +117,8 @@ fn logits_greedy_on(
 /// deliberately differently-encoded file before it reports a failure — see
 /// `tests/quantize_bounds.rs`).
 fn tensor_payloads_equal(a_path: &Path, b_path: &Path) -> Result<usize, String> {
-    let ma = crate::gguf::load_gguf_model(a_path)
-        .ok_or_else(|| format!("{} does not parse", a_path.display()))?;
-    let mb = crate::gguf::load_gguf_model(b_path)
-        .ok_or_else(|| format!("{} does not parse", b_path.display()))?;
+    let ma = crate::gguf::load_gguf_model(a_path).map_err(|e| e.to_string())?;
+    let mb = crate::gguf::load_gguf_model(b_path).map_err(|e| e.to_string())?;
     let mut index = std::collections::HashMap::new();
     for (pi, part) in ma.parts.iter().enumerate() {
         for ti in &part.ctx.info {

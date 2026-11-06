@@ -1103,13 +1103,9 @@ fn main() {
             //
             // [#580]: https://github.com/yusiwen/minfer/issues/580
             let gguf_model = match gguf::load_gguf_model(std::path::Path::new(&model_path)) {
-                Some(model) => model,
-                None => {
-                    eprintln!(
-                        "Error: '{}' is not a GGUF file minfer can parse; the loader's reason is \
-                         printed above",
-                        model_path
-                    );
+                Ok(model) => model,
+                Err(e) => {
+                    eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
             };
@@ -1250,8 +1246,8 @@ fn main() {
     // === Load GGUF (single file or multi-part split) ===
     println!("Loading model: {} ...", model_path);
     let gguf_model = match gguf::load_gguf_model(std::path::Path::new(&model_path)) {
-        Some(m) => m,
-        None => {
+        Ok(m) => m,
+        Err(e) => {
             let p = std::path::Path::new(&model_path);
             if p.is_dir() {
                 // A directory is almost always a cache dir with several .gguf
@@ -1285,9 +1281,7 @@ fn main() {
                 eprintln!("Error: file not found: {model_path}");
                 eprintln!("       run `minfer list` to see cached models");
             } else {
-                eprintln!(
-                    "Error: failed to parse GGUF: {model_path} (not a valid GGUF or corrupt)"
-                );
+                eprintln!("Error: {e}");
             }
             std::process::exit(1);
         }

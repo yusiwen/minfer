@@ -320,7 +320,7 @@ impl SpecEngine {
             .to_string_lossy()
             .into_owned();
         let gguf = crate::gguf::load_gguf_model(std::path::Path::new(&draft_path))
-            .ok_or_else(|| format!("spec draft: failed to parse GGUF: {draft_path}"))?;
+            .map_err(|e| format!("spec draft: {e}"))?;
         // Namespaced load: the CUDA/Metal weight registries are process-global
         // and name-keyed, so the draft's tensors (same GGUF names as the
         // target's) must not collide — an unprefixed second load silently

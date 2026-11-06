@@ -235,7 +235,7 @@ fn a_missing_part_is_refused() {
     let missing = dir.join("m-00002-of-00002.gguf");
     std::fs::remove_file(&missing).unwrap();
     assert!(
-        crate::gguf::load_gguf_model(&entry).is_none(),
+        crate::gguf::load_gguf_model(&entry).is_err(),
         "a split with a missing part must not load"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -249,7 +249,7 @@ fn a_part_with_the_wrong_split_index_is_refused() {
     let dst = dir.join("m-00002-of-00002.gguf");
     std::fs::copy(&src, &dst).unwrap();
     assert!(
-        crate::gguf::load_gguf_model(&entry).is_none(),
+        crate::gguf::load_gguf_model(&entry).is_err(),
         "split.no must match the part's position"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -262,7 +262,7 @@ fn a_filename_count_that_disagrees_with_split_count_is_refused() {
     let renamed = dir.join("m-00001-of-00003.gguf");
     std::fs::rename(&entry, &renamed).unwrap();
     assert!(
-        crate::gguf::load_gguf_model(&renamed).is_none(),
+        crate::gguf::load_gguf_model(&renamed).is_err(),
         "a count mismatch between filename and split.count must not load"
     );
     let _ = std::fs::remove_dir_all(&dir);
