@@ -198,7 +198,7 @@ attention is causal all-pairs work over `nt` queries (doc 11); decode has
 **one** query, whose scan a *data* window bounds: the allocator resolves it
 from the KV cell store and hands it to the kernel as the `attn_span` /
 `kv_map` input (E1, C8b). The CPU path decodes that window — `decode_window`
-(`cpu_backend.rs:692`):
+(`cpu_backend.rs:691`):
 
 ```rust
                 // E1/C8b S2: the allowed cells are an explicit input, not a bound
