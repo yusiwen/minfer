@@ -940,7 +940,7 @@ longer matters.
 - Split-boundary staging always allocates fresh; it rejoins the free list only
   at rebuild (§2.7).
 - KV positions are data: the region is sized `n_kv_embd × n_ctx`, and a
-  position ≥ `n_ctx` is a loud error, not an overflow (`cpu_backend.rs:359`),
+  position ≥ `n_ctx` is a loud error, not an overflow (`cpu_backend.rs:358`),
   plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:397`).
 - Dead nodes get no buffer and the scheduler skips them — so adding an op the
   fusion pass orphans cannot corrupt memory, it just does nothing — skipped

@@ -151,7 +151,7 @@ Design notes a beginner should keep:
 
 Worked example: `x = [1, 2, 3, 4]`, `eps ≈ 0`. `mean(x²) = (1+4+9+16)/4 = 7.5`; `scale = 1/√7.5 ≈ 0.365`; normalized `x ≈ [0.365, 0.730, 1.095, 1.461]`, then element-wise multiplied by the learned gains.
 
-#### 3.2.2 RoPE — the node arm (`cpu_backend.rs:592`) and `cpu_rope` (`:871`)
+#### 3.2.2 RoPE — the node arm (`cpu_backend.rs:591`) and `cpu_rope` (`:870`)
 
 The `RoPE` node arm shows the two conventions this series keeps meeting — positions decoded from f32 bits, and in-place execution:
 
@@ -208,7 +208,7 @@ pub(crate) fn cpu_rope(x: &mut [f32], pos: &[usize], nh: usize, hd: usize,
 
 Worked example: `hd = 4` (`half = 2`), `base = 10⁴` → `freqs = [1.0, 10⁻¹]`. Token at `pos = 2`, pair 0: angle `2×1.0 = 2 rad` → `(x0,x1) ← (x0·cos2 − x1·sin2, x0·sin2 + x1·cos2)`. Pair 1 rotates 10× slower — exactly the "fine vs coarse" structure of §2.3.
 
-#### 3.2.3 The KV store / load pair — `cpu_backend.rs:143` and `:381`
+#### 3.2.3 The KV store / load pair — `cpu_backend.rs:142` and `:380`
 
 The store arm is where "KV positions are data" becomes memory writes:
 
@@ -239,9 +239,9 @@ Two things to internalize:
 
 - ② is the entire KV cache write: a `memcpy` of one K row and one V row to `position × row_width` inside the layer's persistent regions. No scaling, no math — the K/V rows arriving on `in_bufs[0..1]` were already computed by the `W_k`/`W_v` matmuls and rotated by RoPE.
 - ① is the doc 08 error contract in miniature: a position out of range is a **topology/contract violation**, so it returns `Err` and aborts the run — it never silently clamps and continues, because a clamped write would corrupt a *different* token's cache row and you would see it a thousand tokens later as subtly wrong text.
-- The **load** arm is one line (`cpu_backend.rs:381`): `Op::KvcacheLoad { .. } => Ok(())`. The load node's output buffer *is* the K region (doc 07 mapped it directly), so "loading" is a bookkeeping view — no data moves. The scheduler's build-order guarantee (doc 08) is what makes the view safe: this layer's store always executes before this layer's attention.
+- The **load** arm is one line (`cpu_backend.rs:380`): `Op::KvcacheLoad { .. } => Ok(())`. The load node's output buffer *is* the K region (doc 07 mapped it directly), so "loading" is a bookkeeping view — no data moves. The scheduler's build-order guarantee (doc 08) is what makes the view safe: this layer's store always executes before this layer's attention.
 
-#### 3.2.4 GQA attention — the `Attn` arm (`cpu_backend.rs:388`) and `attn_heads` (`:572`)
+#### 3.2.4 GQA attention — the `Attn` arm (`cpu_backend.rs:387`) and `attn_heads` (`:571`)
 
 The node arm resolves the regions and computes one derived quantity — the *current* KV length:
 
