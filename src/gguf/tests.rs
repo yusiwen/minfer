@@ -347,3 +347,90 @@ fn a_reload_after_a_forward_releases_the_mapping_and_loads_a_different_model() {
     );
     let _ = std::fs::remove_file(&temp);
 }
+
+/// [#745] A CUDA reload must register the second model's weights.
+///
+/// The CUDA weight registry is name-keyed and used to reuse a same-name+size
+/// device copy for *any* model. Two checkpoints of one architecture have the
+/// same tensor names and sizes but different bytes, so that reuse silently served
+/// the first model's weights. The model fingerprint in [`GgufModel`] is what lets
+/// `register_weight` tell "reload of the same file" (reuse is correct) from "a
+/// different model" (copy).
+#[cfg(feature = "cuda")]
+fn toy_with_changed_weight(label: &str) -> std::path::PathBuf {
+    let path = toy_gguf();
+    let temp = std::env::temp_dir().join(format!("minfer-745-{label}-{}.gguf", std::process::id()));
+    std::fs::copy(&path, &temp).expect("copy the toy fixture");
+    let off = {
+        let gguf = load_gguf_model(&path).expect("the toy GGUF loads");
+        let ctx = &gguf.parts[0].ctx;
+        let ti = ctx
+            .info
+            .iter()
+            .find(|t| t.name == "blk.0.attn_norm.weight")
+            .expect("the toy has blk.0.attn_norm.weight");
+        ctx.offset + ti.offset as usize
+    };
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temp)
+        .expect("open the copied fixture");
+    f.seek(SeekFrom::Start(off as u64))
+        .expect("seek to the weight");
+    let mut byte = [0u8; 1];
+    f.read_exact(&mut byte).expect("read the weight byte");
+    f.seek(SeekFrom::Start(off as u64))
+        .expect("seek back to the weight");
+    f.write_all(&[byte[0] ^ 0xFF])
+        .expect("change the weight byte");
+    temp
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn a_cuda_reload_registers_the_second_models_weights() {
+    crate::cuda::CudaState::init();
+    if crate::cuda::CudaState::get().is_none() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let path = toy_gguf();
+    let temp = toy_with_changed_weight("cuda-reload");
+    let load = |p: &std::path::Path| {
+        let gguf = load_gguf_model(p).expect("the toy GGUF loads");
+        let model = crate::models::load_model_with(
+            &gguf,
+            "",
+            crate::graph::offload::OffloadRequest::Layers(1),
+        )
+        .expect("the toy model loads");
+        assert_eq!(
+            model.device(),
+            crate::models::Device::Cuda,
+            "this gate needs the CUDA path"
+        );
+        (gguf, model)
+    };
+    let (gguf_a, model_a) = load(&path);
+    let mut cache_a = crate::graph::cache::GraphCache::new();
+    let logits_a = model_a.forward_graph_cached(&[1], &[0], 1, 16, &mut cache_a);
+    assert!(!logits_a.is_empty(), "the forward step must produce logits");
+    drop(model_a);
+    drop(cache_a);
+    drop(gguf_a);
+
+    let (gguf_b, model_b) = load(&temp);
+    let mut cache_b = crate::graph::cache::GraphCache::new();
+    let logits_b = model_b.forward_graph_cached(&[1], &[0], 1, 16, &mut cache_b);
+    assert_ne!(
+        logits_a, logits_b,
+        "the second model reused the first model's device weights; the CUDA registry must \
+         key same-name+size reuse by the model, not just the shape"
+    );
+    drop(model_b);
+    drop(cache_b);
+    drop(gguf_b);
+    let _ = std::fs::remove_file(&temp);
+}

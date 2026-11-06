@@ -96,6 +96,12 @@ file = "src/gguf.rs"
 reason = "Read by `gguf::tests` only (#745): the mapping's descriptor, asserted to stop pointing at the model file after a drop; production never inspects it."
 
 [[cpu]]
+name = "fingerprint"
+kind = "field"
+file = "src/gguf.rs"
+reason = "Read by `CudaState::begin_model`/`register_weight` under `#[cfg(feature = \"cuda\")]` only (#745); a CPU build carries the model identity but has no CUDA registry to read it."
+
+[[cpu]]
 name = "AutoWithBudget"
 kind = "variant"
 file = "src/graph/offload.rs"

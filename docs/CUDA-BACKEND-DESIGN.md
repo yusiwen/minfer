@@ -813,8 +813,10 @@ The hard rules live in `docs/GPU_SAFETY.md` (CUDA section); this is how the back
    `minfer_launch_smem` (an over-limit dynamic smem request) make the *real* launch fail.
 6. **Same-stream ordering is the async-fill contract**; the pinned ring syncs on wrap and never
    hands a slot back early.
-7. **Weight-registry ownership**: name+size reuse, different-size replace with a deliberate, bounded
-   leak (a live captured graph may still reference the old buffer).
+7. **Weight-registry ownership**: name+size reuse only for the **same model** (the registry carries
+   the model's fingerprint from `GgufModel`); a same-name+size registration from a different model
+   replaces the entry, as does a different-size one, with a deliberate, bounded leak (a live
+   captured graph may still reference the old buffer).
 8. **Device limits are queried at runtime** (SM count, compute capability, free memory); the only
    hardcoded shape knowledge is the compiled target list and the documented kernel invariants.
 

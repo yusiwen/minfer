@@ -371,6 +371,13 @@ pub fn load(
     // lock across several forwards.
     #[cfg(feature = "cuda")]
     let _model_load_guard = crate::cuda::CudaState::model_load_guard();
+    // [#745] tell the name-keyed CUDA registry which model the next
+    // registrations belong to; a same-name+size entry from another model must
+    // be replaced, not reused.
+    #[cfg(feature = "cuda")]
+    if let Some(cuda) = crate::cuda::CudaState::get() {
+        cuda.begin_model(model.fingerprint);
+    }
     let ctx = &model.parts[0].ctx;
     let mut hparams = hparams_from_gguf(ctx)?;
     let n_layer = hparams.n_layer as usize;
