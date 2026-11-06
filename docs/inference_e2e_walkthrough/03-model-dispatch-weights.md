@@ -653,14 +653,15 @@ Excerpt 9 — CUDA's upload-once registry. (`src/cuda/methods/weights.rs:`, abri
             let w = self.weights.lock().unwrap();
             if let Some((_, size)) = w.get(name) {
                 if *size == data.len() {
-                    // Device weights are immutable: same name + size ⇒ the
-                    // same GGUF tensor ... Reuse the existing device copy
-                    // instead of leaking one buffer per load.
-                    return;
+                    // Device weights are immutable within a model: same
+                    // name + size + model ⇒ the same GGUF tensor. Reuse ...
+                    if same_model { return; }
+                    // A different model reusing the name and byte size falls
+                    // through to a fresh device copy; the old buffer is
+                    // deliberately NOT freed — a live captured graph may still
+                    // reference it; ...
                 }
-                // Different size ...: replace the entry. The stale buffer is
-                // deliberately NOT freed — a live captured graph may still
-                // reference it; ...
+                // Different size ...: replace the entry, same non-free rule.
             }
         }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();

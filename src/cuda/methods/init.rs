@@ -276,6 +276,8 @@ impl CudaState {
             staging: Mutex::new(HashMap::new()),
             readback: Mutex::new(None),
             weights: Mutex::new(HashMap::new()),
+            weight_models: Mutex::new(HashMap::new()),
+            model_id: std::sync::atomic::AtomicU64::new(0),
             w16_cache: Mutex::new(HashMap::new()),
             w16_enabled: std::sync::atomic::AtomicBool::new(false),
             cc: std::sync::atomic::AtomicI32::new(major * 100 + minor),

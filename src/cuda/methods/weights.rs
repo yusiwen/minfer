@@ -15,25 +15,44 @@ extern "C" {
 }
 
 impl CudaState {
+    /// [#745] mark the model whose weights the next registrations belong to.
+    ///
+    /// The registry is name-keyed, and same-name+same-size reuse is only safe
+    /// for the *same* model: two checkpoints of one architecture register the
+    /// same names and sizes with different bytes. A reload of the same file
+    /// keeps its fingerprint, so the per-load reuse (the test suite's many
+    /// reloads) still applies; a different model with identical shapes falls
+    /// through to a fresh device copy.
+    pub fn begin_model(&self, fingerprint: u64) {
+        self.model_id
+            .store(fingerprint, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn register_weight(&self, name: &str, data: &[u8]) {
         if data.is_empty() {
             return;
         }
+        let model_id = self.model_id.load(std::sync::atomic::Ordering::Relaxed);
         {
             let w = self.weights.lock().unwrap();
             if let Some((_, size)) = w.get(name) {
                 if *size == data.len() {
-                    // Device weights are immutable: same name + size ⇒ the
-                    // same GGUF tensor (single-model-per-process today, and
-                    // unit tests reload the same file). Reuse the existing
-                    // device copy instead of leaking one buffer per load.
-                    return;
+                    let same_model =
+                        self.weight_models.lock().unwrap().get(name).copied() == Some(model_id);
+                    if same_model {
+                        // Device weights are immutable within a model: same
+                        // name + size + model ⇒ the same GGUF tensor. Reuse the
+                        // device copy instead of leaking one buffer per load.
+                        return;
+                    }
+                    // A different model reusing the name and byte size: fall
+                    // through and register a fresh device copy. The old buffer
+                    // is deliberately NOT freed — a live captured graph may
+                    // still reference it; the leak is bounded by the number of
+                    // distinct (model, tensor) registrations.
                 }
                 // Different size (a different architecture registered the
-                // same tensor name): replace the entry. The stale buffer is
-                // deliberately NOT freed — a live captured graph may still
-                // reference it; the leak is bounded by the number of
-                // distinct (arch, tensor) shapes ever loaded.
+                // same tensor name): replace the entry, same non-free rule.
             }
         }
         // ANCHOR: register_weight
@@ -95,6 +114,10 @@ impl CudaState {
             .lock()
             .unwrap()
             .insert(name.to_string(), (CudaPtr(ptr), data.len()));
+        self.weight_models
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), model_id);
         // ANCHOR_END: register_weight
     }
 

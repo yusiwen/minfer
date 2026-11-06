@@ -1826,6 +1826,41 @@ impl GgufPart {
 /// A model loaded from one GGUF file, or from the N parts of a split.
 pub struct GgufModel {
     pub parts: Vec<GgufPart>,
+    /// [#745] a process-local identity for the file(s) this model was read from.
+    ///
+    /// The CUDA weight registry is name-keyed; a same-name+same-size registration
+    /// is only safe to reuse for the *same* model. This fingerprint (path + inode +
+    /// length + mtime, over every split part) is what lets that registry tell a
+    /// reload of the same file from a different model with identical shapes. It is
+    /// deliberately not a content hash: hashing 4.4 GB at load would cost more than
+    /// the reuse saves, and the four metadata fields are enough for a file that is
+    /// replaced or rewritten between loads.
+    ///
+    /// Read by the CUDA registry's model identity (#745); a CPU build has no
+    /// CUDA registry, so the field is named there but has no reader.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub fingerprint: u64,
+}
+
+fn model_fingerprint(paths: &[&std::path::Path]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in paths {
+        p.hash(&mut h);
+        if let Ok(md) = std::fs::metadata(p) {
+            md.len().hash(&mut h);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                md.dev().hash(&mut h);
+                md.ino().hash(&mut h);
+            }
+            if let Ok(modified) = md.modified() {
+                modified.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
 }
 
 /// Parse a split filename `name-0000X-of-0000Y.gguf` → (prefix, zero-based idx, count).
@@ -1896,6 +1931,7 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
                 ctx: ctx0,
                 mmap: mmap0,
             }],
+            fingerprint: model_fingerprint(&[path]),
         });
     }
 
@@ -1911,6 +1947,8 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
     }
 
     let part_paths = resolve_splits(path)?;
+    let fingerprint =
+        model_fingerprint(&part_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>());
     if part_paths.len() != split_count {
         eprintln!(
             "GGUF: split count mismatch: filename implies {} parts, split.count = {split_count}",
@@ -1933,7 +1971,7 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
         }
         parts.push(GgufPart { ctx, mmap });
     }
-    Some(GgufModel { parts })
+    Some(GgufModel { parts, fingerprint })
 }
 
 #[cfg(test)]

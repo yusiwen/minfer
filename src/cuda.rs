@@ -614,6 +614,14 @@ pub struct CudaState {
     /// the per-decode-step logits readback (608 KB on 0.5B/7B-class vocab).
     readback: Mutex<Option<PinnedBuf>>,
     weights: Mutex<HashMap<String, (CudaPtr, usize)>>,
+    /// [#745] the model fingerprint each registered name belongs to. The
+    /// name+size reuse below is only safe within one model: two checkpoints of
+    /// the same architecture register the same names and sizes but different
+    /// bytes, and a reload must not silently serve the first one's weights.
+    weight_models: Mutex<HashMap<String, u64>>,
+    /// [#745] the fingerprint of the model currently loading, set by
+    /// `begin_model` before the loader registers anything.
+    model_id: std::sync::atomic::AtomicU64,
     /// 8p: persistent per-weight f16 dequant cache, keyed by the device
     /// weight pointer → (f16 copy, bytes). The two-pass prefill GEMM used
     /// to dequantize W on EVERY call (288 ms per 7B @2K forward); weights
