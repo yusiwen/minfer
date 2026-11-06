@@ -462,6 +462,15 @@ fn a_dropped_model_releases_its_metal_registration() {
         crate::models::Device::Metal,
         "this gate needs the Metal path"
     );
+    assert!(
+        model
+            .as_any()
+            .downcast_ref::<crate::models::qwen2::Qwen2Model>()
+            .expect("the toy fixture is a Qwen2 model")
+            .metal_registration()
+            .is_some(),
+        "the model must own its Metal registration"
+    );
     let mut cache = crate::graph::cache::GraphCache::new();
     let logits = model.forward_graph_cached(&[1], &[0], 1, 16, &mut cache);
     assert!(!logits.is_empty(), "the forward step must produce logits");

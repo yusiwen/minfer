@@ -49,6 +49,16 @@ pub struct Qwen3Model {
     pub metal: Option<std::sync::Arc<crate::metal::ModelRegistration>>,
 }
 
+#[cfg(target_os = "macos")]
+impl Qwen3Model {
+    /// [#745] the Metal registration handle this model owns (its Drop releases
+    /// the buffers and then the mapping handles). Public so the ownership is
+    /// inspectable; production reads it through the field's Drop.
+    pub fn metal_registration(&self) -> Option<&std::sync::Arc<crate::metal::ModelRegistration>> {
+        self.metal.as_ref()
+    }
+}
+
 impl ModelDef for Qwen3Model {
     fn forward(&self, tokens: &[u32], positions: &[usize], n_out: usize, n_ctx: usize) -> Vec<f32> {
         graph::Qwen3Graph::forward(self, tokens, positions, n_out, n_ctx)
