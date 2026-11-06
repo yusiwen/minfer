@@ -45,7 +45,7 @@ Four items are **not** covered by that estimate and apply to every port:
 1. **Decode-fusion weight registration.** The decode path fuses QKV
    (`blk.{i}.attn_qkv`) and gate+up (`blk.{i}.ffn_gu`) only when the loader has
    registered the concatenated tensors — once for Metal and once for CUDA
-   (`models/qwen2/loader.rs:471`, `:557`; `models/qwen3/loader.rs:469`, `:511`)
+   (`models/qwen2/loader.rs:471`, `:559`; `models/qwen3/loader.rs:469`, `:513`)
    — plus the matching `qkv_concat_available` / `gu_concat_available`
    predicates (`models/qwen2/graph.rs:`). Skip them and the port is
    still **correct**, but decode fusion silently disables: no error, just a

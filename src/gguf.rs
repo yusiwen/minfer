@@ -1909,10 +1909,10 @@ pub fn resolve_splits(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>>
 /// of it, or a Metal zero-copy part registration — holds a handle, and the last
 /// one unmaps the file and closes its fd. On a CPU or CUDA host, loading and
 /// dropping models in one process (a server, the tooling, the test suite)
-/// therefore no longer accumulates address space and descriptors. On macOS a live
-/// Metal registration holds the pages until MPS is torn down (the zero-copy
-/// `MTLBuffer` points at them), so the host release applies only where no such
-/// registration exists.
+/// therefore no longer accumulates address space and descriptors. On macOS the
+/// zero-copy `MTLBuffer` keeps the pages mapped while the model's registration is
+/// alive; the model owns that registration (ADR-0077), so the buffers are released
+/// before the mapping when the model — and the `GraphCache` that uses it — drops.
 ///
 /// No `'static` view exists: [`GgufPart::data`] borrows from the part, and a
 /// weight tensor carries its own [`crate::tensor::TensorData::Mapped`] range plus
