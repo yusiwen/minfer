@@ -39,6 +39,12 @@ pub struct Qwen2Model {
     /// the graph builder and the allocator read it, so no test or second model can
     /// change it out from under this engine.
     pub kv_format: crate::graph::kvformat::KvFormat,
+    /// [#745] the model's Metal registration. The loader creates it before the
+    /// first part/weight registration; dropping the last clone releases the
+    /// device buffers and then the mapping handles. `None` off macOS or when MPS
+    /// is unavailable.
+    #[cfg(target_os = "macos")]
+    pub metal: Option<std::sync::Arc<crate::metal::ModelRegistration>>,
 }
 
 impl Qwen2Model {

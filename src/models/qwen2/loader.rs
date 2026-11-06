@@ -471,6 +471,8 @@ pub fn load(
     // part (page-aligned base) BEFORE any weight is registered, so weights are
     // wrapped as (buffer, offset) into the part buffer instead of being copied.
     #[cfg(target_os = "macos")]
+    let metal_registration = crate::metal::MpsState::get().map(|mps| mps.begin_registration());
+    #[cfg(target_os = "macos")]
     if let Some(mps) = crate::metal::MpsState::get() {
         for part in &model.parts {
             mps.register_part(part.data(), part.mmap.clone());
@@ -704,6 +706,8 @@ pub fn load(
         // C4 per-engine: the loader stamps the resolved format after `device()` is
         // known (`models::load_model_configured`); F32 until then.
         kv_format: crate::graph::kvformat::KvFormat::F32,
+        #[cfg(target_os = "macos")]
+        metal: metal_registration,
     };
 
     // E5: verify the plan against what actually got registered. `device()` answers "can the

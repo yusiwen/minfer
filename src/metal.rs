@@ -284,7 +284,7 @@ struct MpsStateInner {
     // page-aligned base, so per-tensor offsets are passed via setBuffer:offset:).
     // The byte length is the registered weight's own extent — the E4 gate's
     // "weights" term (issue #299), the analogue of CUDA's per-entry `size`.
-    weights: std::sync::Mutex<std::collections::HashMap<String, (MetalBuffer, u64, usize)>>,
+    weights: std::sync::Mutex<std::collections::HashMap<String, (MetalBuffer, u64, usize, u64)>>,
     // Registered mmap'd GGUF parts: (base_ptr, len, Metal buffer). register_weight
     // resolves a weight slice to (buffer, offset) by pointer-range containment.
     /// `(base, len, buffer, mapping)` — [#745] the mapping keeps the zero-copy
@@ -295,8 +295,14 @@ struct MpsStateInner {
             usize,
             MetalBuffer,
             std::sync::Arc<crate::gguf::MmapFile>,
+            u64,
         )>,
     >,
+    /// [#745] next/current model-registration id. A registration owns the parts
+    /// and weights created while it is current; dropping the model's token
+    /// removes them (buffers first, then the mapping handles).
+    next_registration: std::sync::atomic::AtomicU64,
+    current_registration: std::sync::atomic::AtomicU64,
     // Scratch for the mmap-part warmup dispatch (register_part).
     buf_positions: std::sync::Mutex<MetalBuffer>,
     buf_attn_partial: std::sync::Mutex<MetalBuffer>,
@@ -576,3 +582,30 @@ mod tests;
 
 #[cfg(test)]
 mod mmap_align_test;
+
+/// [#745] one loaded model's Metal registrations (zero-copy part buffers and
+/// their weight entries). The loader creates one per model, the model holds it,
+/// and the last clone's drop releases the device buffers before the mappings.
+///
+/// The engine contract: a `GraphCache`/backend may reference these buffers by
+/// name; drop the cache before (or with) the model, never use it afterwards.
+#[cfg(target_os = "macos")]
+pub struct ModelRegistration {
+    id: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl ModelRegistration {
+    pub(crate) fn new(id: u64) -> Self {
+        Self { id }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ModelRegistration {
+    fn drop(&mut self) {
+        if let Some(mps) = MpsState::get() {
+            mps.release_registration(self.id);
+        }
+    }
+}

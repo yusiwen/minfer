@@ -41,6 +41,12 @@ pub struct Qwen3Model {
     /// C4 per-engine (issue #99): the KV storage format this engine resolved from
     /// `MINFER_CACHE_TYPE` at load (`F32` until `ModelDef::set_kv_format` stamps it).
     pub kv_format: crate::graph::kvformat::KvFormat,
+    /// [#745] the model's Metal registration. The loader creates it before the
+    /// first part/weight registration; dropping the last clone releases the
+    /// device buffers and then the mapping handles. `None` off macOS or when MPS
+    /// is unavailable.
+    #[cfg(target_os = "macos")]
+    pub metal: Option<std::sync::Arc<crate::metal::ModelRegistration>>,
 }
 
 impl ModelDef for Qwen3Model {
