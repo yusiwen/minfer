@@ -212,81 +212,138 @@ fn a_loaded_model_keeps_its_mapping_until_it_is_dropped() {
     );
 }
 
-/// [#745] A reload is a load → drop → load, and it leaves nothing behind.
+/// [#745] A reload after a **forward** releases the engine's mapping, and the
+/// second model is a different model.
 ///
-/// This is the acceptance shape the ticket asks for — a *count*, not "looks fine":
-/// two loads release the first mapping and its fd before the second takes one. It
-/// also pins the zero-copy win the leak was paying for: every weight tensor must
-/// still point *inside* its part's mapping, so an `Arc` thread did not quietly turn
-/// the borrowed view into a per-tensor copy.
+/// The earlier gate loaded the same file twice without building a graph; that
+/// proved the loader's handle, not the engine's. `forward_graph_cached` puts every
+/// weight into the `GraphCache`'s CPU backend as a `Tensor` clone, so the drop
+/// order that matters is model + cache. The second half changes one weight byte in
+/// a copy of the toy and asserts the output moves — the identity a name-keyed
+/// device registry can silently break.
 #[test]
-fn a_reload_releases_the_first_mapping_and_keeps_the_view_borrowed() {
+fn a_reload_after_a_forward_releases_the_mapping_and_loads_a_different_model() {
     #[cfg(target_os = "macos")]
     if crate::metal::MpsState::get().is_some() {
         eprintln!("745: skipped — MPS's part registration holds each mapping on purpose");
         return;
     }
     let path = toy_gguf();
-    let mut first = None;
-    for round in 0..2 {
-        let (model, alive, fd) = {
-            let gguf = load_gguf_model(&path).expect("the toy GGUF loads");
-            let part = &gguf.parts[0];
-            let mmap = part.mmap.clone();
-            let (alive, fd) = (mmap.alive(), mmap.raw_fd());
-            let model = crate::models::load_model(&gguf).expect("the toy model loads");
-            // Zero-copy: every weight tensor's slice is inside the mapping, not a copy.
-            let base = mmap.as_slice().as_ptr() as usize;
-            let end = base + mmap.as_slice().len();
-            let qwen = model
-                .as_any()
-                .downcast_ref::<crate::models::qwen2::Qwen2Model>()
-                .expect("the toy fixture is a Qwen2 model");
-            let mut checked = 0usize;
-            for layer in &qwen.layers {
-                for w in [
-                    &layer.attn_norm,
-                    &layer.wq,
-                    &layer.wk,
-                    &layer.wv,
-                    &layer.wo,
-                    &layer.ffn_norm,
-                    &layer.ffn_gate,
-                    &layer.ffn_up,
-                    &layer.ffn_down,
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    let p = w.data().as_ptr() as usize;
-                    assert!(
-                        p >= base && p + w.data().len() <= end,
-                        "round {round}: weight {} is not a view of the part's mapping",
-                        w.name
-                    );
-                    checked += 1;
-                }
-            }
-            assert!(checked > 0, "the toy model must expose weights to check");
-            (model, alive, fd)
-        };
-        // Drop first, then assert: the handle the model holds is the thing under test.
-        drop(model);
-        assert!(
-            !alive.load(std::sync::atomic::Ordering::SeqCst),
-            "round {round}: the mapping survived the model drop"
-        );
-        if round == 0 {
-            first = Some(fd);
+    let gguf_a = load_gguf_model(&path).expect("the toy GGUF loads");
+    let mmap_a = gguf_a.parts[0].mmap.clone();
+    let alive_a = mmap_a.alive();
+    let fd = mmap_a.raw_fd();
+    // A weight's byte offset in the *file* (the toy is a single part).
+    let weight_off = {
+        let ctx = &gguf_a.parts[0].ctx;
+        let ti = ctx
+            .info
+            .iter()
+            .find(|t| t.name == "blk.0.attn_norm.weight")
+            .expect("the toy has blk.0.attn_norm.weight");
+        ctx.offset + ti.offset as usize
+    };
+    // Force the CPU path: this gate is about the host mapping and the graph cache,
+    // not about a device's copied weights (that is the CUDA identity follow-up).
+    let model_a = crate::models::load_model_with(
+        &gguf_a,
+        "",
+        crate::graph::offload::OffloadRequest::Layers(0),
+    )
+    .expect("the toy model loads");
+    let mut cache_a = crate::graph::cache::GraphCache::new();
+    let logits_a = model_a.forward_graph_cached(&[1], &[0], 1, 16, &mut cache_a);
+    assert!(!logits_a.is_empty(), "the forward step must produce logits");
+    // Zero-copy: every weight tensor's slice is inside the part's mapping.
+    let base = mmap_a.as_slice().as_ptr() as usize;
+    let end = base + mmap_a.as_slice().len();
+    let qwen = model_a
+        .as_any()
+        .downcast_ref::<crate::models::qwen2::Qwen2Model>()
+        .expect("the toy fixture is a Qwen2 model");
+    let mut checked = 0usize;
+    for layer in &qwen.layers {
+        for w in [
+            &layer.attn_norm,
+            &layer.wq,
+            &layer.wk,
+            &layer.wv,
+            &layer.wo,
+            &layer.ffn_norm,
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            &layer.ffn_down,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let p = w.data().as_ptr() as usize;
+            assert!(
+                p >= base && p + w.data().len() <= end,
+                "weight {} is not a view of the part's mapping",
+                w.name
+            );
+            checked += 1;
         }
     }
-    // On Linux the first round's descriptor must not still be the model file.
+    assert!(checked > 0, "the toy model must expose weights to check");
+    // The test's own handle must go too, or it (not the engine) keeps the mapping.
+    drop(mmap_a);
+    drop(model_a);
+    drop(cache_a);
+    drop(gguf_a);
+    assert!(
+        !alive_a.load(std::sync::atomic::Ordering::SeqCst),
+        "the forward's graph cache kept the mapping alive after model + cache drop"
+    );
     #[cfg(target_os = "linux")]
-    if let Some(fd) = first {
-        assert_ne!(
-            fd_target(fd).as_deref(),
-            Some(path.as_path()),
-            "the first load's fd {fd} is still open after a full reload cycle"
-        );
+    assert_ne!(
+        fd_target(fd).as_deref(),
+        Some(path.as_path()),
+        "the first load's fd {fd} is still open after model + cache drop"
+    );
+
+    // A *different* model with the same shapes: copy the toy, flip one weight byte,
+    // and check the output actually moves.
+    let temp = std::env::temp_dir().join(format!("minfer-745-reload-{}.gguf", std::process::id()));
+    std::fs::copy(&path, &temp).expect("copy the toy fixture");
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temp)
+            .expect("open the copied fixture");
+        f.seek(SeekFrom::Start(weight_off as u64))
+            .expect("seek to the weight");
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).expect("read the weight byte");
+        f.seek(SeekFrom::Start(weight_off as u64))
+            .expect("seek back to the weight");
+        f.write_all(&[byte[0] ^ 0xFF])
+            .expect("change the weight byte");
     }
+    let gguf_b = load_gguf_model(&temp).expect("the modified toy GGUF loads");
+    let alive_b = gguf_b.parts[0].mmap.alive();
+    let model_b = crate::models::load_model_with(
+        &gguf_b,
+        "",
+        crate::graph::offload::OffloadRequest::Layers(0),
+    )
+    .expect("the modified toy model loads");
+    let mut cache_b = crate::graph::cache::GraphCache::new();
+    let logits_b = model_b.forward_graph_cached(&[1], &[0], 1, 16, &mut cache_b);
+    assert_ne!(
+        logits_a, logits_b,
+        "the changed weight must change the output; a name+size-keyed registry that \
+         reused the first model's weights would fail this"
+    );
+    drop(model_b);
+    drop(cache_b);
+    drop(gguf_b);
+    assert!(
+        !alive_b.load(std::sync::atomic::Ordering::SeqCst),
+        "the second model's mapping survived model + cache drop"
+    );
+    let _ = std::fs::remove_file(&temp);
 }
