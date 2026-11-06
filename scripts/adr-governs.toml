@@ -412,3 +412,13 @@ adr = "0076"
 what = "the mapping's lifetime is its `Arc` handle's; the unsafe `as_static_slice` escape does not exist"
 symbol = "MmapFile"
 
+
+[[governs]]
+adr = "0077"
+what = "a Metal model registration is released with the model: buffers before mappings, and a GraphCache must be dropped with (or before) its model"
+symbol = "ModelRegistration"
+
+[[governs]]
+adr = "0077"
+what = "the Metal part/weight registry is model-scoped; a model's zero-copy buffers do not outlive the mapping they alias"
+symbol = "MpsState"

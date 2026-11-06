@@ -1015,9 +1015,9 @@ redundancy is an assertion.
   escape with: `GgufPart::data()` borrows from the part, and a tensor's bytes are
   a range plus the handle. Corollary: model loading is no longer one-way — a model
   can be dropped and another loaded, and the release is observable
-  (`src/gguf/tests.rs` asserts the mapping's flag and the fd), with the one device
-  exception ADR-0076 records (a Metal zero-copy part registration holds the pages
-  until MPS is torn down).
+  (`src/gguf/tests.rs` asserts the mapping's flag and the fd). The Metal
+  registration is model-scoped too (ADR-0077): the model + its `GraphCache` release
+  the zero-copy buffers and then the mapping; MPS itself remains process-scoped.
 - **`ne[0]` must be a multiple of the block size** (line 1627). This is why a
   model whose vocabulary isn't divisible by 32 cannot be exported as Q8_0
   without padding — `docs/QWEN3-SUPPORT-PLAN.md` records Qwen3's vocab

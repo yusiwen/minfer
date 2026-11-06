@@ -599,10 +599,9 @@ impl MpsState {
     /// are then registered as (buffer, offset) into this one buffer.
     /// [#745] `owner` is the GGUF part's mapping. The zero-copy buffer below makes
     /// the GPU read the mapped pages directly, so the mapping must outlive the
-    /// `MTLBuffer`; holding a handle here is what makes that true after the model
-    /// (or any tensor) is dropped. The registration itself is process-lifetime, so
-    /// on macOS a loaded model's pages stay mapped until MPS is torn down — that is
-    /// a bounded, *needed* hold, unlike the leak this replaces.
+    /// `MTLBuffer`; holding a handle here is what makes that true. The registration
+    /// is **model-scoped** (ADR-0077): the loader's `ModelRegistration` tags this
+    /// entry, and dropping the model removes it — buffers first, then the mapping.
     ///
     /// `data` is a plain borrow: the buffer keeps the pointer and the owner keeps
     /// the pages mapped, so no `'static` slice is needed (or stored).

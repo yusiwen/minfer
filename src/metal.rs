@@ -287,8 +287,9 @@ struct MpsStateInner {
     weights: std::sync::Mutex<std::collections::HashMap<String, (MetalBuffer, u64, usize, u64)>>,
     // Registered mmap'd GGUF parts: (base_ptr, len, Metal buffer). register_weight
     // resolves a weight slice to (buffer, offset) by pointer-range containment.
-    /// `(base, len, buffer, mapping)` — [#745] the mapping keeps the zero-copy
-    /// buffer's pages valid after the model that registered them is dropped.
+    /// `(base, len, buffer, mapping, registration)` — [#745] the mapping keeps the
+    /// zero-copy buffer's pages valid while the entry exists; the model's
+    /// `ModelRegistration` removes it on drop, buffers before mappings (ADR-0077).
     mmap_parts: std::sync::Mutex<
         Vec<(
             usize,

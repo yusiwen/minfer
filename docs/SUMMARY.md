@@ -95,6 +95,7 @@
     - [0074. The llama3 rope table is read from the GGUF, not re-derived from four numbers](./adr/0074-the-llama3-rope-table-is-read-from-the-gguf.md)
     - [0075. A model owns the mapping it reads, and a tensor carries a handle into it](./adr/0075-a-model-owns-the-mapping-it-reads.md)
     - [0076. A tensor's bytes are a mapping handle plus a range, never a `'static` view of a mapping](./adr/0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md)
+    - [0077. A Metal registration is released with its model, and the cache belongs to the engine](./adr/0077-a-metal-registration-is-released-with-its-model.md)
 
 # Model Support
 

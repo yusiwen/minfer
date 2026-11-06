@@ -196,6 +196,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0074](./0074-the-llama3-rope-table-is-read-from-the-gguf.md) | 2026-11-05 | The llama3 rope table is read from the GGUF, not re-derived from four numbers | Accepted |
 | [0075](./0075-a-model-owns-the-mapping-it-reads.md) | 2026-11-05 | A model owns the mapping it reads, and a tensor carries a handle into it | Superseded by [0076](./0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md) |
 | [0076](./0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md) | 2026-11-06 | A tensor's bytes are a mapping handle plus a range, never a `'static` view of a mapping | Accepted (supersedes ADR-0075) |
+| [0077](./0077-a-metal-registration-is-released-with-its-model.md) | 2026-11-06 | A Metal registration is released with its model, and the cache belongs to the engine | Accepted |
 
 ## The template
 

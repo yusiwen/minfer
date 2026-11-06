@@ -115,6 +115,11 @@ and the struct is `unsafe impl Send/Sync` on that basis.
   stdlib call** (`mmap`'s guarantee), not a shape or kernel invariant, and `register_part` returns
   `()` so there is no `Result` for the value to travel in — the one asymmetry the release-build rule
   allows.
+- **Model-scoped release ([ADR-0077](adr/0077-a-metal-registration-is-released-with-its-model.md)).**
+  The loader creates one `ModelRegistration` before the first registration; the registry tags every
+  part and weight with its id. The model owns the `Arc`, and the last clone's drop removes the weight
+  buffers first, then the part buffers and their `Arc<MmapFile>` handles. A `GraphCache` may reference
+  a registered buffer by name, so it must be dropped with the model — the cache belongs to the engine.
 - **Per-weight offsets.** `register_weight(name, data)` records `(part buffer, byte offset)`; the
   executor resolves any weight through `state.weight_buf(name) -> Option<(MetalBuffer, u64)>` and
   passes the offset to the kernel. `MINFER_WEIGHT_COPY=1` forces a copy per weight for A/B.
@@ -754,7 +759,8 @@ CParams.gpu = metal_on || cuda_on
   staging ring and no `pool_gen`.
 - **Weights are zero-copy** over the mmap'd GGUF parts, with the ~44 ms first-touch page cost paid
   at load by a dummy warm-up read (`METAL_OPTIMIZATIONS.md` §0 Done #39). `MINFER_WEIGHT_COPY=1` forces
-  per-weight copies.
+  per-weight copies. The model's registration is released on drop (ADR-0077), buffers before mappings;
+  MPS's device, queues, pipelines and scratch remain process-scoped.
 - **E4 charges the registered weights ([#299](https://github.com/yusiwen/minfer/issues/299)).** The
   registry (`MpsStateInner::weights`) stores each weight's own byte extent, and
   `MpsState::weights_bytes` sums it (recovering a poisoned lock rather than reporting `0`, the CUDA
