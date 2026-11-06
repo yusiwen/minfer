@@ -654,7 +654,7 @@ fn dump_real_q4k_tensor() {
                 let start = part.ctx.offset + info.offset as usize;
                 let n = info.ne.iter().product::<i64>();
                 let bytes = info.type_.type_size() * n as usize / info.type_.blck_size() as usize;
-                found = Some((info.type_, info.ne, &part.data[start..start + bytes]));
+                found = Some((info.type_, info.ne, &part.data()[start..start + bytes]));
                 break;
             }
         }
@@ -704,7 +704,7 @@ fn dump_real_q5k_tensor() {
                 let start = part.ctx.offset + info.offset as usize;
                 let n = info.ne.iter().product::<i64>();
                 let bytes = info.type_.type_size() * n as usize / info.type_.blck_size() as usize;
-                found = Some((info.type_, info.ne, &part.data[start..start + bytes]));
+                found = Some((info.type_, info.ne, &part.data()[start..start + bytes]));
                 break;
             }
         }

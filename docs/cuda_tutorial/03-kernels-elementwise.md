@@ -402,13 +402,13 @@ version, which is worth knowing because it explains *when* you will see these
 kernels in a profile:
 
 - The **persistent f16 weight cache** (Phase 8p) is warmed **at load time**
-  by the model loaders: `enable_w16_cache` (`src/models/qwen2/loader.rs:766`) + `warm_w16`
+  by the model loaders: `enable_w16_cache` (`src/models/qwen2/loader.rs:747`) + `warm_w16`
   (`:690`) per weight. `warm_w16` (`src/cuda/methods/prefill_f16.rs:89`) maps
   `TensorType` → the same type ids and calls
   `w16_get`, which launches the dequant). But only for models whose matmul
   weights total ≥ `W16_ENABLE_BYTES` (`src/cuda.rs:599`) = 2 GiB **and**
   when the int8 MMQ prefill path is not active
-  (`mmq_active` (`qwen2/loader.rs:764`)). A 0.5B Q4_0 model is far below that bar (its
+  (`mmq_active` (`qwen2/loader.rs:745`)). A 0.5B Q4_0 model is far below that bar (its
   largest tensor, `tok_embd`, is 76.6 MB in Q4_0 — §4.1) and therefore runs
   **no** dequant at load today.
 - Otherwise `launch_dequant_f16` runs **per call** into a scratch buffer,

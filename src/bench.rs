@@ -227,7 +227,7 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
         return 1;
     };
     // Size (GiB) comes from the GGUF itself, summed over all split parts.
-    let total_bytes: u64 = gguf_model.parts.iter().map(|p| p.data.len() as u64).sum();
+    let total_bytes: u64 = gguf_model.parts.iter().map(|p| p.data().len() as u64).sum();
     let ctx = &gguf_model.parts[0].ctx;
     // Parameter count: sum of tensor element counts (llama-bench's n_params).
     // Split GGUFs list disjoint tensor subsets per part (parts[0].info holds

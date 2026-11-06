@@ -94,6 +94,7 @@
     - [0073. Gemma 4's lenient body gets a dialect tool_choice grammar](./adr/0073-gemma-4-s-lenient-body-gets-a-dialect-tool-choice-grammar.md)
     - [0074. The llama3 rope table is read from the GGUF, not re-derived from four numbers](./adr/0074-the-llama3-rope-table-is-read-from-the-gguf.md)
     - [0075. A model owns the mapping it reads, and a tensor carries a handle into it](./adr/0075-a-model-owns-the-mapping-it-reads.md)
+    - [0076. A tensor's bytes are a mapping handle plus a range, never a `'static` view of a mapping](./adr/0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md)
 
 # Model Support
 

@@ -131,7 +131,7 @@ pub fn run_viz(
     // F7 (#50) + S1 (#133): one resolver, refusing to start with an unrenderable
     // template before the worker thread exists.
     let startup = match crate::template::startup_template(
-        super::chat_template_from_gguf(&gguf.parts[0].data).as_deref(),
+        super::chat_template_from_gguf(gguf.parts[0].data()).as_deref(),
         template_override,
     ) {
         Ok(s) => s,

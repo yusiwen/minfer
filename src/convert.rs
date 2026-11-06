@@ -1281,7 +1281,7 @@ impl QuantizePlan {
         contract: crate::quantize::FmaContract,
     ) -> io::Result<()> {
         let s = &self.sources[i];
-        let src = &model.parts[s.part].data[s.offset..s.offset + s.src_nbytes];
+        let src = &model.parts[s.part].data()[s.offset..s.offset + s.src_nbytes];
         if s.preserved {
             return w.write_all(src);
         }

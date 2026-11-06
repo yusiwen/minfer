@@ -4,7 +4,7 @@
 > model, with weights wired into every backend** → tokenizer + template (04).
 > **Code**: `models/mod.rs::load_model` (dispatch), `models/qwen2/loader.rs::load`
 > and `models/qwen3/loader.rs::load` (the two implementations), `main.rs:`
-> (GPU init + legacy KV cache), `tensor.rs` (`Cow<'static,[u8]>` weight bytes),
+> (GPU init + legacy KV cache), `tensor.rs` (`TensorData` weight bytes),
 > `graph/alloc.rs::register_weight`, `src/metal/::register_weight` /
 > `cuda.rs::register_weight` (per-backend registries),
 > `models/qwen2/graph.rs::weights_on_gpu` (the GPU participation gate).
@@ -75,8 +75,8 @@ feature, not laziness.
 The stage has five players. It is worth naming them once, because the rest of
 the doc is just their handshakes.
 
-1. **`GgufModel`** (doc 02) — metadata key/values, the tensor index, and
-   `&'static [u8]` slices into the mmap'd file parts.
+1. **`GgufModel`** (doc 02) — metadata key/values, the tensor index, and the
+   `Arc<MmapFile>` parts whose bytes `part.data()` borrows.
 2. **`load_model`** (`models/mod.rs`) — reads `general.architecture` and picks
    the implementation. This is the *dispatch*.
 3. **The per-architecture loader** (`models/qwen2/loader.rs`,
@@ -144,14 +144,14 @@ loading exactly once, keeps the side effects all-or-nothing too.
 ### 2.3 Weights stay raw bytes
 
 The single most important data decision of this stage: a loaded weight tensor
-is a *view*, not a copy. The `Tensor` type stores its payload as
-`std::borrow::Cow<'static, [u8]>` — a Rust "clone-on-write" enum that here is
-always the `Borrowed` variant, i.e. a plain `(pointer, length)` slice pointing
-into the mmap'd GGUF file. The `'static` lifetime is a *promise* the tensor
-carries with it: the loader attaches the mapping's handle (`Tensor::owner`,
-[#745](https://github.com/yusiwen/minfer/issues/745)), so a cloned weight keeps
-its own pages alive and the last handle unmaps the file
-([ADR-0075](../adr/0075-a-model-owns-the-mapping-it-reads.md)).
+is a *view*, not a copy. The `Tensor` type stores its payload as a `TensorData`:
+in production that is the `Mapped { map, off, len }` variant — a range of the
+mmap'd GGUF part plus the `Arc<MmapFile>` that keeps the pages alive. There is no
+`'static` slice and no separate owner field; a cloned weight bumps the same `Arc`,
+so it keeps its own pages alive and the last handle unmaps the file
+([ADR-0076](../adr/0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md)).
+`Deref<Target = [u8]>` keeps the read sites (`len`, indexing, `as_ptr`, `to_vec`)
+unchanged.
 
 Three consequences follow, and each one answers a "why not the obvious
 alternative":
@@ -167,13 +167,13 @@ nibbles, `block.rs:`), which is ≈ 0.56 bytes per value. A
 0.5-billion-parameter checkpoint is then ≈ 0.28 GB of file bytes; dequantized
 to f32 it would be 2 GB — 7× more, copied at load time, for zero benefit.
 
-**Why does cloning a `Tensor` not copy bytes?** Because `Cow::Borrowed`
-clones as pointer + length. That is what makes it affordable for the graph
+**Why does cloning a `Tensor` not copy bytes?** Because a mapped weight's
+`TensorData` is an `Arc` plus a `(off, len)` range; `clone()` bumps the `Arc` and
+copies the range, not the weight. That is what makes it affordable for the graph
 path to re-register all weights on every graph (re)build (`t.clone()` at
-`qwen2/graph.rs:358`) — the clone duplicates a small struct and a name
-string, not gigabytes. The one caveat — registries still guard against
-re-registration when a caller hands them *owned* bytes — has a measured war
-story attached, told with excerpt 10.
+`qwen2/graph.rs:358`) — the clone duplicates a small struct and a name string,
+not gigabytes. The registries still skip a same-name registration; excerpt 10
+states the current reason.
 
 **Why do GPU backends get their own representation?** Because "the weight"
 means something different per backend: on CPU it *is* the mmap bytes; on
@@ -283,9 +283,9 @@ architecture is a copy-and-edit job (§5).
 **In:** the `GgufModel` from doc 02. Concretely, per part: `ctx.kv` (metadata
 key/values), `ctx.info` (tensor index; each entry has `name`, `type_`, `ne[4]`
 shape, and `offset` — offset from the start of the part's data section), and
-`part.data: &'static [u8]` (the mmap'd bytes). A weight's file position is
-`ctx.offset + ti.offset`, where `ctx.offset` is where the data section starts
-in the file (`gguf.rs:`).
+`part.data()` (the mmap'd bytes, borrowed from `part.mmap`). A weight's file
+position is `ctx.offset + ti.offset`, where `ctx.offset` is where the data
+section starts in the file (`gguf.rs:`).
 
 **Out:** three things.
 
@@ -462,12 +462,12 @@ tokenizer data is the ground truth (it arrives next stage). And `n_kv_embd`
 starts as the naive product, purely so the struct is initialized; the loader
 immediately overwrites it from the K weight's real shape.
 
-Excerpt 5 — a weight tensor is born as a borrowed slice, then handed to the
+Excerpt 5 — a weight tensor is born as a mapping range, then handed to the
 GPU registries. (`src/models/qwen2/loader.rs:`, abridged; the CUDA
 branch at :221-285 is discussed in the annotations)
 
 ```rust
-fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &GgufTensorInfo) -> Tensor {
+fn load_tensor(ctx: &GgufContext, owner: &Arc<MmapFile>, ti: &GgufTensorInfo) -> Tensor {
     let ttype = TensorType::from_ggml_type(ti.type_);
     ...
     let off = ctx.offset + ti.offset as usize;
@@ -475,11 +475,9 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &GgufTensorInfo) -> Te
     let bs = ti.type_.blck_size() as usize; // values per block
     let n = (shape[0] * shape[1] * shape[2] * shape[3]) as usize;
     let nbytes = (n / bs) * ts;
-    // Borrow the tensor bytes straight from the mmap'd part file (zero-copy —
-    // the file pages are shared with the CPU and GPU instead of a per-tensor copy).
-    let src = &raw[off..off + nbytes];
-    ...
-    let mut tensor = Tensor::from_data_borrowed_with_strides(ttype, &shape, &strides, src);
+    // A range of the part's mapping, with the handle: zero-copy, and no
+    // `'static` slice to outlive the owner.
+    let mut tensor = Tensor::from_mapped(ttype, &shape, &strides, owner.clone(), off, nbytes);
 
     // Register weight tensors with GPU backends.
     #[cfg(target_os = "macos")]
@@ -501,9 +499,10 @@ fn load_tensor(ctx: &GgufContext, raw: &'static [u8], ti: &GgufTensorInfo) -> Te
 
 Annotations: byte size comes from the GGML type's block size, not from a
 `TensorType` guess — the comment notes this is "always correct regardless of
-TensorType mapping". `src` is a sub-slice of the mmap: constructing the
-tensor did one range check and zero copies, and the registration is woven
-into the same walk rather than done as a second pass over the model. On
+TensorType mapping". The range is validated once, in `TensorData::mapped`:
+constructing the tensor did one bounds check and zero copies, and the
+registration is woven into the same walk rather than done as a second pass over
+the model. On
 Metal, essentially everything quantized plus f32 gets registered — the
 shader kernels handle the block formats natively. The CUDA branch is pickier
 and does more work at registration: Q6_K weights are repacked into padded
@@ -603,7 +602,7 @@ Excerpt 8 — Metal's zero-copy registry. (`src/metal/`, annotated
 condensation of `register_part` :2320-2372 and `register_weight` :2374-2424)
 
 ```rust
-    pub fn register_part(&self, data: &'static [u8]) {
+    pub fn register_part(&self, data: &[u8], owner: Arc<MmapFile>) {
         let page = 16384; // macOS page size on Apple Silicon
         let base = data.as_ptr() as usize;
         debug_assert!(base % page == 0, "mmap'd GGUF part not page-aligned");
@@ -692,13 +691,12 @@ Excerpt 10 — CPU registration: the cheapest one. (`src/graph/cpu_backend.rs:`)
 ```rust
     /// Register a weight tensor by name (Phase 6 wires this from the model).
     pub fn register_weight(&mut self, name: &str, t: Tensor) {
-        // Skip re-registration of an already-known weight: Tensor carries its
-        // bytes as Cow::Owned, so the `t.clone()` at the model call sites
-        // deep-copies the full weight set (~4.4 GB on 7B) on EVERY graph
-        // (re)build — measured as a ~635 ms pure-CPU stall at the
-        // prefill→decode graph switch (no CUDA calls, no kernels). Model
-        // weights are immutable after load (weights_version guards any future
-        // change), so a same-name registration always carries the same data.
+        // Skip re-registration of an already-known weight. A Tensor clone is a
+        // handle (an owned Vec, or a mapped range that bumps an Arc), never a
+        // deep copy of the weight bytes; the skip keeps a rebuild from churning
+        // the map. Model weights are immutable after load (weights_version
+        // guards any future change), so a same-name registration always carries
+        // the same data.
         if self.weights.contains_key(name) {
             return;
         }

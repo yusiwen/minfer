@@ -146,7 +146,7 @@ fn server_batch_matches_serial_and_is_faster() {
                 // in #242) was a *different* path and produced a 13-token
                 // prompt where the server's is 34 — which is why the first
                 // bisect compared unequal inputs.
-                let tpl = crate::server::chat_template_from_gguf(&gguf.parts[0].data);
+                let tpl = crate::server::chat_template_from_gguf(gguf.parts[0].data());
                 let msgs = vec![("user".to_string(), Some(p.to_string()))];
                 tok.encode(
                     &crate::template::render_messages_opt(

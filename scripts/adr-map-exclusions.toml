@@ -30,6 +30,8 @@
 
 0003 = "superseded: ADR-0005 made Metal a first-class backend, so 'Metal is out of scope for this round' governs no current contract — a map that needs this decision lists ADR-0005 instead"
 
+0075 = "superseded: ADR-0076 replaced the `'static` view with a typed mapping range, so B1's owner-beside-a-slice contract governs no current document; a map that needs this decision lists ADR-0076 instead"
+
 0022 = "process-decision: how a defect in a frozen ADR is corrected (a new ADR plus a two-way `Corrects:` link), which is a rule about the corpus itself; its home is `docs/adr/README.md`, whose contract is the index, not a design document"
 
 0026 = "process-decision: the change classifier carries no docs-path exception — ADR-0025's follow-through, about `scripts/classify_changes.py`, not about a design document's contract"

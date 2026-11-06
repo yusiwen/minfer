@@ -569,7 +569,10 @@ impl MpsState {
     /// (or any tensor) is dropped. The registration itself is process-lifetime, so
     /// on macOS a loaded model's pages stay mapped until MPS is torn down — that is
     /// a bounded, *needed* hold, unlike the leak this replaces.
-    pub fn register_part(&self, data: &'static [u8], owner: std::sync::Arc<crate::gguf::MmapFile>) {
+    ///
+    /// `data` is a plain borrow: the buffer keeps the pointer and the owner keeps
+    /// the pages mapped, so no `'static` slice is needed (or stored).
+    pub fn register_part(&self, data: &[u8], owner: std::sync::Arc<crate::gguf::MmapFile>) {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (data, owner);

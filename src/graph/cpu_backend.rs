@@ -75,13 +75,12 @@ impl CpuBackend {
 
     /// Register a weight tensor by name (Phase 6 wires this from the model).
     pub fn register_weight(&mut self, name: &str, t: Tensor) {
-        // Skip re-registration of an already-known weight: Tensor carries its
-        // bytes as Cow::Owned, so the `t.clone()` at the model call sites
-        // deep-copies the full weight set (~4.4 GB on 7B) on EVERY graph
-        // (re)build — measured as a ~635 ms pure-CPU stall at the
-        // prefill→decode graph switch (no CUDA calls, no kernels). Model
-        // weights are immutable after load (weights_version guards any future
-        // change), so a same-name registration always carries the same data.
+        // Skip re-registration of an already-known weight. A Tensor clone is a
+        // handle (an owned Vec, or a mapped range that bumps an Arc), never a
+        // deep copy of the weight bytes; the skip keeps a rebuild from churning
+        // the map. Model weights are immutable after load (weights_version
+        // guards any future change), so a same-name registration always carries
+        // the same data.
         if self.weights.contains_key(name) {
             return;
         }

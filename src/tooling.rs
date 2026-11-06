@@ -413,7 +413,7 @@ pub fn write_verbatim(
         let ti = &ctx.info[i];
         let off = ctx.offset + ti.offset as usize;
         let n = ti.nbytes();
-        w.write_all(&part.data[off..off + n])
+        w.write_all(&part.data()[off..off + n])
     };
     gguf_write::write_split(
         out_dir,
