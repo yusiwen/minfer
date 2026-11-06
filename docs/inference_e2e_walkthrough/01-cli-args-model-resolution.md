@@ -187,7 +187,7 @@ number consistent for the whole run.
 ### 2.5 Modes: where the same parsed data goes
 
 The parsed state fans out into mode-specific structs, and each mode takes a
-different subset. In `run_conversation` (`src/main.rs:2159`), the
+different subset. In `run_conversation` (`src/main.rs:2153`), the
 conversation gets a `ConversationSpec` (template, special tokens, `seed`,
 `n_ctx`, system prompt) plus a `TurnParams` (all the sampling knobs *plus*
 `stop_strings`) — every field is copied out of `GenParams`, so the
@@ -297,7 +297,7 @@ with an error** — a safety feature. But `bench` legitimately uses `-p` /
 the prefill test, per `src/bench.rs:`) that collide with nothing in
 the inference flag set yet would still be rejected there, and `--n-ctx`
 means something different again (bench sizes KV as pp+tg+16 unless
-overridden, `src/bench.rs:244`). Giving bench the raw tail
+overridden, `src/bench.rs:247`). Giving bench the raw tail
 `&raw_args[2..]` and its own hand-rolled loop (`src/bench.rs:62`:
 "Parse (hand-rolled, bench-local flags)") keeps each flag space
 self-consistent: bench flags stay llama-bench-shaped, inference flags stay
@@ -670,7 +670,7 @@ while the server-like modes explicitly take an *empty* prompt — they would
 otherwise hang waiting on a stdin that nobody will write. Conversation mode
 splits the difference: an optional positional becomes the first turn, and
 further turns come from the REPL's own reader (`read_user_input`,
-`src/main.rs:1232`), never from this one-shot read.
+`src/main.rs:1228`), never from this one-shot read.
 
 #### `--n-ctx` at the moment it starts to matter
 
@@ -786,7 +786,7 @@ because the seed is stable.
   have.
 - **Split models enter through part 0.** Both resolution paths (cached-name
   collapse, `match_model` group expansion) guarantee the returned path is
-  `…-00001-of-0000N.gguf`, because `gguf::resolve_splits` (`gguf.rs:1889`)
+  `…-00001-of-0000N.gguf`, because `gguf::resolve_splits` (`gguf.rs:1962`)
   refuses to act as the entry when handed a later part. The resolver and
   the loader co-own that convention.
 - **Server-like modes never consume stdin.** `serve`/`viz`/`--cnv` read
