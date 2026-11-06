@@ -443,7 +443,7 @@ for the whole process, keyed by name in the registry
 (`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `CudaState::weights` (`src/cuda.rs:616`)), and
 the registry's replace rule deliberately leaks the stale buffer because a
 live captured CUDA Graph may still reference the old pointer
-`register_weight` (`src/cuda/methods/weights.rs:18`)) — leaking *by decision, with a bound and a comment*
+`register_weight` (`src/cuda/methods/weights.rs:31`)) — leaking *by decision, with a bound and a comment*
 is legitimate, because the alternative (freeing memory a captured graph still
 points at) is a use-after-free the GPU hits mid-replay. Scratch buffers, in
 contrast, are pooled: the backend frees every pool buffer in its `Drop`
@@ -477,7 +477,7 @@ file: *register a weight → use it → (never) free it*.
    (`:93-96`):
    `self.weights.lock().unwrap().insert(name.to_string(), (CudaPtr(ptr), data.len()))`.
    From here the *only* way to reach the buffer is
-   `get_weight_ptr` (`src/cuda/methods/weights.rs:569`) — the registry is the single owner, and dispatchers
+   `get_weight_ptr` (`src/cuda/methods/weights.rs:592`) — the registry is the single owner, and dispatchers
    resolve by name at execution time.
 4. **Use.** A decode step later, dispatch resolves the name to a device
    pointer and passes it to a launcher. The Rust side of `add_f32`
