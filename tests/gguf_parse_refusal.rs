@@ -42,8 +42,8 @@ fn a_non_gguf_file_is_refused_by_name_not_by_panic() {
         "the loader's specific reason must reach stderr; stderr was:\n{stderr}"
     );
     assert!(
-        stderr.contains("not a GGUF file minfer can parse"),
-        "the refusal must name the failure; stderr was:\n{stderr}"
+        stderr.contains("not-a-gguf.bin"),
+        "the refusal must name the file; stderr was:\n{stderr}"
     );
     let _ = std::fs::remove_file(&path);
 }

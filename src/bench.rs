@@ -222,9 +222,12 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
 
     // === Load GGUF (single file or multi-part split) ===
     eprintln!("Loading model: {} ...", model_path);
-    let Some(gguf_model) = crate::gguf::load_gguf_model(std::path::Path::new(&model_path)) else {
-        eprintln!("Error: failed to parse GGUF: {model_path}");
-        return 1;
+    let gguf_model = match crate::gguf::load_gguf_model(std::path::Path::new(&model_path)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
     };
     // Size (GiB) comes from the GGUF itself, summed over all split parts.
     let total_bytes: u64 = gguf_model.parts.iter().map(|p| p.data().len() as u64).sum();

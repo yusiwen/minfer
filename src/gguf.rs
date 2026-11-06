@@ -4,6 +4,25 @@ use std::fmt;
 use std::mem;
 use std::ptr;
 
+// [#745] S3: the parser's failure notes are both the reason a load fails and the
+// text a caller can put in an error. A thread-local, not a field: the parser is a
+// deep `Option` chain (~70 exits) whose signatures predate the named error.
+thread_local! {
+    static GGUF_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record the reason a parse step failed. The public loader takes the last note
+/// and returns it in [`GgufLoadError`]; the note is not printed here, so a caller
+/// decides (the CLI prints the error once, a test can assert on it).
+macro_rules! gguf_note {
+    ($($arg:tt)*) => {{
+        GGUF_LAST_ERROR.with(|slot| {
+            *slot.borrow_mut() = Some(format!($($arg)*));
+        });
+    }};
+}
+
 // === Constants (from gguf.h) ===
 
 pub const GGUF_MAGIC: [u8; 4] = [b'G', b'G', b'U', b'F'];
@@ -822,16 +841,18 @@ impl<'a> GgufReader<'a> {
     fn read_string(&mut self) -> Option<String> {
         let size: u64 = self.read_val()?;
         if size > GGUF_MAX_STRING_LENGTH {
-            eprintln!(
+            gguf_note!(
                 "GGUF: string length {} exceeds maximum {}",
-                size, GGUF_MAX_STRING_LENGTH
+                size,
+                GGUF_MAX_STRING_LENGTH
             );
             return None;
         }
         if size > self.nbytes_remain {
-            eprintln!(
+            gguf_note!(
                 "GGUF: string length {} exceeds remaining file size {} bytes",
-                size, self.nbytes_remain
+                size,
+                self.nbytes_remain
             );
             return None;
         }
@@ -969,9 +990,12 @@ impl GgufContext {
                     } else {
                         '?'
                     };
-                    eprintln!(
+                    gguf_note!(
                         "GGUF: invalid magic characters: '{}{}{}{}', expected 'GGUF'",
-                        c0, c1, c2, c3
+                        c0,
+                        c1,
+                        c2,
+                        c3
                     );
                     return None;
                 }
@@ -986,22 +1010,22 @@ impl GgufContext {
             if let Some(version) = gr.read_val::<u32>() {
                 ctx.version = version;
                 if ctx.version == 0 {
-                    eprintln!("GGUF: bad GGUF version: {}", ctx.version);
+                    gguf_note!("GGUF: bad GGUF version: {}", ctx.version);
                     ok = false;
                 }
                 // endianness check (gguf.cpp lines 490-500)
                 if ok && (ctx.version & 0x0000FFFF) == 0x00000000 {
-                    eprintln!("GGUF: failed to load model: this GGUF file version {} is extremely large, is there a mismatch between the host and model endianness?", ctx.version);
+                    gguf_note!("GGUF: failed to load model: this GGUF file version {} is extremely large, is there a mismatch between the host and model endianness?", ctx.version);
                     ok = false;
                 }
                 if ok && ctx.version == 1 {
-                    eprintln!(
+                    gguf_note!(
                         "GGUF: GGUFv1 is no longer supported, please use a more up-to-date version"
                     );
                     ok = false;
                 }
                 if ok && ctx.version > GGUF_VERSION {
-                    eprintln!("GGUF: this GGUF file is version {} but this software only supports up to version {}", ctx.version, GGUF_VERSION);
+                    gguf_note!("GGUF: this GGUF file is version {} but this software only supports up to version {}", ctx.version, GGUF_VERSION);
                     ok = false;
                 }
             } else {
@@ -1015,7 +1039,7 @@ impl GgufContext {
                 if n_tensors < 0
                     || n_tensors > (usize::MAX / mem::size_of::<GgufTensorInfo>()) as i64
                 {
-                    eprintln!(
+                    gguf_note!(
                         "GGUF: number of tensors is {} but must be in [0, {}]",
                         n_tensors,
                         usize::MAX / mem::size_of::<GgufTensorInfo>()
@@ -1031,7 +1055,7 @@ impl GgufContext {
             if let Some(v) = gr.read_val::<i64>() {
                 n_kv = v;
                 if n_kv < 0 || n_kv > (usize::MAX / mem::size_of::<GgufKv>()) as i64 {
-                    eprintln!(
+                    gguf_note!(
                         "GGUF: number of key value pairs is {} but must be in [0, {}]",
                         n_kv,
                         usize::MAX / mem::size_of::<GgufKv>()
@@ -1044,7 +1068,7 @@ impl GgufContext {
         }
 
         if !ok {
-            eprintln!("GGUF: failed to read header");
+            gguf_note!("GGUF: failed to read header");
             return None;
         }
 
@@ -1055,7 +1079,7 @@ impl GgufContext {
                 match gr.read_string() {
                     Some(s) => key = s,
                     None => {
-                        eprintln!("GGUF: encountered length_error while reading key {}", i);
+                        gguf_note!("GGUF: encountered length_error while reading key {}", i);
                         ok = false;
                         break;
                     }
@@ -1064,7 +1088,7 @@ impl GgufContext {
                 // check for duplicate keys
                 for j in 0..ctx.kv.len() {
                     if key == ctx.kv[j].key {
-                        eprintln!("GGUF: duplicate key '{}' for tensors {} and {}", key, j, i);
+                        gguf_note!("GGUF: duplicate key '{}' for tensors {} and {}", key, j, i);
                         ok = false;
                         break;
                     }
@@ -1378,7 +1402,7 @@ impl GgufContext {
                         }
                     }
                     GgufType::Array => {
-                        eprintln!("GGUF: key '{}' has invalid GGUF type Array", key);
+                        gguf_note!("GGUF: key '{}' has invalid GGUF type Array", key);
                         ok = false;
                         break;
                     }
@@ -1386,7 +1410,7 @@ impl GgufContext {
             }
 
             if !ok {
-                eprintln!("GGUF: failed to read key-value pairs");
+                gguf_note!("GGUF: failed to read key-value pairs");
                 return None;
             }
             assert!(ctx.kv.len() as i64 == n_kv);
@@ -1400,7 +1424,7 @@ impl GgufContext {
             };
 
             if ctx.alignment == 0 || (ctx.alignment & (ctx.alignment - 1)) != 0 {
-                eprintln!("GGUF: alignment {} is not a power of 2", ctx.alignment);
+                gguf_note!("GGUF: alignment {} is not a power of 2", ctx.alignment);
                 return None;
             }
         }
@@ -1421,7 +1445,7 @@ impl GgufContext {
                 match gr.read_string() {
                     Some(s) => name = s,
                     None => {
-                        eprintln!(
+                        gguf_note!(
                             "GGUF: encountered length_error while reading tensor name {}",
                             i
                         );
@@ -1430,7 +1454,7 @@ impl GgufContext {
                     }
                 }
                 if name.len() >= GGML_MAX_NAME {
-                    eprintln!(
+                    gguf_note!(
                         "GGUF: tensor name {} is too long: {} >= {}",
                         i,
                         name.len(),
@@ -1444,9 +1468,11 @@ impl GgufContext {
                 // check for duplicate tensor names
                 for j in 0..i {
                     if info.name == ctx.info[j as usize].name {
-                        eprintln!(
+                        gguf_note!(
                             "GGUF: duplicate tensor name '{}' for tensors {} and {}",
-                            info.name, j, i
+                            info.name,
+                            j,
+                            i
                         );
                         ok = false;
                         break;
@@ -1467,9 +1493,11 @@ impl GgufContext {
                     }
                 };
                 if n_dims > GGML_MAX_DIMS as u32 {
-                    eprintln!(
+                    gguf_note!(
                         "GGUF: tensor '{}' has invalid number of dimensions: {} > {}",
-                        info.name, n_dims, GGML_MAX_DIMS
+                        info.name,
+                        n_dims,
+                        GGML_MAX_DIMS
                     );
                     ok = false;
                     break;
@@ -1485,7 +1513,7 @@ impl GgufContext {
                             }
                         }
                         if info.ne[j] < 0 {
-                            eprintln!("GGUF: tensor '{}' dimension {} has invalid number of elements: {} < 0", info.name, j, info.ne[j]);
+                            gguf_note!("GGUF: tensor '{}' dimension {} has invalid number of elements: {} < 0", info.name, j, info.ne[j]);
                             ok = false;
                             break;
                         }
@@ -1505,7 +1533,7 @@ impl GgufContext {
                         || (i64::MAX / n2 <= n0 * n1)
                         || (i64::MAX / n3 <= n0 * n1 * n2)
                     {
-                        eprintln!("GGUF: total number of elements in tensor '{}' with shape ({}, {}, {}, {}) is >= {}",
+                        gguf_note!("GGUF: total number of elements in tensor '{}' with shape ({}, {}, {}, {}) is >= {}",
                             info.name, n0, n1, n2, n3, i64::MAX);
                         ok = false;
                         break;
@@ -1527,9 +1555,11 @@ impl GgufContext {
                 }
                 let type_val = info.type_ as i32;
                 if type_val < 0 || type_val >= GGML_TYPE_COUNT {
-                    eprintln!(
+                    gguf_note!(
                         "GGUF: tensor '{}' has invalid ggml type {}. should be in [0, {})",
-                        info.name, type_val, GGML_TYPE_COUNT
+                        info.name,
+                        type_val,
+                        GGML_TYPE_COUNT
                     );
                     ok = false;
                     break;
@@ -1539,7 +1569,7 @@ impl GgufContext {
 
                 // check that row size is divisible by block size
                 if blck_size == 0 || info.ne[0] % blck_size != 0 {
-                    eprintln!("GGUF: tensor '{}' of type {} ({}) has {} elements per row, not a multiple of block size ({})",
+                    gguf_note!("GGUF: tensor '{}' of type {} ({}) has {} elements per row, not a multiple of block size ({})",
                         info.name, type_val, info.type_.type_name(), info.ne[0], blck_size);
                     ok = false;
                     break;
@@ -1548,7 +1578,7 @@ impl GgufContext {
                 // check that size in bytes is representable
                 let nelements = ggml_nelements(&info.ne);
                 if ok && (nelements / blck_size) as u64 > (usize::MAX / type_size) as u64 {
-                    eprintln!(
+                    gguf_note!(
                         "GGUF: tensor '{}' with shape ({}, {}, {}, {}) has a size in bytes > {}",
                         info.name,
                         info.ne[0],
@@ -1585,7 +1615,7 @@ impl GgufContext {
         }
 
         if !ok {
-            eprintln!("GGUF: failed to read tensor info");
+            gguf_note!("GGUF: failed to read tensor info");
             return None;
         }
         assert!(ctx.info.len() as i64 == n_tensors);
@@ -1594,7 +1624,7 @@ impl GgufContext {
         if n_tensors > 0 {
             let aligned_offset = ggml_pad(gr.tell() as usize, ctx.alignment);
             if !gr.seek(aligned_offset as u64) {
-                eprintln!("GGUF: failed to seek to beginning of data section");
+                gguf_note!("GGUF: failed to seek to beginning of data section");
                 return None;
             }
         }
@@ -1613,7 +1643,7 @@ impl GgufContext {
         match data_section_size(&ctx.info, gr.data.len().saturating_sub(ctx.offset)) {
             Ok(size) => ctx.size = size,
             Err(msg) => {
-                eprintln!("{msg}");
+                gguf_note!("{msg}");
                 return None;
             }
         }
@@ -1743,8 +1773,20 @@ impl MmapFile {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let file = std::fs::File::open(path).ok()?;
-            let len = file.metadata().ok()?.len() as usize;
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(e) => {
+                    gguf_note!("cannot open {}: {e}", path.display());
+                    return None;
+                }
+            };
+            let len = match file.metadata() {
+                Ok(m) => m.len() as usize,
+                Err(e) => {
+                    gguf_note!("cannot stat {}: {e}", path.display());
+                    return None;
+                }
+            };
             let ptr = unsafe {
                 mmap(
                     std::ptr::null_mut(),
@@ -1842,6 +1884,37 @@ pub struct GgufModel {
     pub fingerprint: u64,
 }
 
+/// [#745] S3: a load failure as a value, with the file and the parser's reason.
+///
+/// The response replaces `Option` + a stderr print: a caller (the CLI, the
+/// tooling, an embedder) can render it, match on it, or hand it to its own error
+/// type, and the reason is no longer only on a stream.
+#[derive(Debug, Clone)]
+pub struct GgufLoadError {
+    pub path: std::path::PathBuf,
+    pub reason: String,
+}
+
+impl fmt::Display for GgufLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "failed to load '{}': {}",
+            self.path.display(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for GgufLoadError {}
+
+// The trait requires it; the mapping handle is immutable and `Send + Sync`, so
+// this is a compile-time promise rather than a test-only claim.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<GgufModel>();
+};
+
 fn model_fingerprint(paths: &[&std::path::Path]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1917,7 +1990,26 @@ pub fn resolve_splits(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>>
 /// No `'static` view exists: [`GgufPart::data`] borrows from the part, and a
 /// weight tensor carries its own [`crate::tensor::TensorData::Mapped`] range plus
 /// the handle.
-pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
+///
+/// A failure is a [`GgufLoadError`] (the path plus the parser's last reason); the
+/// parser's `Option` chain is wrapped, so callers no longer have to read a stderr
+/// print to learn why a load failed.
+pub fn load_gguf_model(path: &std::path::Path) -> Result<GgufModel, GgufLoadError> {
+    GGUF_LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
+    load_gguf_model_inner(path).ok_or_else(|| {
+        let reason = GGUF_LAST_ERROR
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap_or_else(|| {
+                "GGUF: the file could not be parsed (truncated or malformed)".to_string()
+            });
+        GgufLoadError {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })
+}
+
+fn load_gguf_model_inner(path: &std::path::Path) -> Option<GgufModel> {
     let mmap0 = std::sync::Arc::new(MmapFile::map(path)?);
     let ctx0 = GgufContext::init_from_data(mmap0.as_slice())?;
     let split_count = ctx0
@@ -1940,7 +2032,7 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
         .map(|v| v as usize)
         .unwrap_or(0);
     if split_no != 0 {
-        eprintln!(
+        gguf_note!(
             "GGUF: split.no = {split_no} — must load the first split (00001-of-{split_count})"
         );
         return None;
@@ -1950,7 +2042,7 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
     let fingerprint =
         model_fingerprint(&part_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>());
     if part_paths.len() != split_count {
-        eprintln!(
+        gguf_note!(
             "GGUF: split count mismatch: filename implies {} parts, split.count = {split_count}",
             part_paths.len()
         );
@@ -1966,7 +2058,7 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
             .map(|v| v as usize)
             .unwrap_or(0);
         if no != i {
-            eprintln!("GGUF: split {p:?} has split.no={no}, expected {i}");
+            gguf_note!("GGUF: split {p:?} has split.no={no}, expected {i}");
             return None;
         }
         parts.push(GgufPart { ctx, mmap });

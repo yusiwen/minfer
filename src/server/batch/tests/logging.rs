@@ -11,7 +11,7 @@ use super::*;
 fn toy_model() -> Option<(Box<dyn ModelDef>, Tokenizer)> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/toy/toy-qwen2-f32.gguf");
-    let gguf = crate::gguf::load_gguf_model(&path)?;
+    let gguf = crate::gguf::load_gguf_model(&path).ok()?;
     let tok = Tokenizer::load(&gguf.parts[0].ctx).ok()?;
     let model = crate::models::load_model(&gguf)?;
     Some((model, tok))

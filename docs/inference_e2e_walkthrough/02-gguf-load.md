@@ -394,7 +394,7 @@ minfer doesn't consult it; the ggml type tag per tensor is the operative fact.)
 **In:** a `&Path` — one `.gguf` file, which is either a whole model or part
 00001 of a split. Nothing else: no config, no sidecar files.
 
-**Out:** `Option<GgufModel>` (`None` ⇒ error already printed, `main.rs` exits).
+**Out:** `Result<GgufModel, GgufLoadError>` — the `Err` carries the path and the parser's last reason; the CLI prints it once and exits (`main.rs`).
 The two structs (`gguf.rs` lines 602–623, 1945–1954):
 
 ```rust
@@ -731,7 +731,9 @@ the drop that releases the descriptor is the same one that unmaps the pages.
 **(i) The entry point: parts, ownership, merge** (`gguf.rs`, `load_gguf_model`):
 
 ```rust
-pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
+pub fn load_gguf_model(path: &std::path::Path) -> Result<GgufModel, GgufLoadError> {
+    // The body below is `load_gguf_model_inner`, the old `Option` chain; the
+    // outer call turns its last `gguf_note!` into the returned error.
     let mmap0 = std::sync::Arc::new(MmapFile::map(path)?);
     let ctx0 = GgufContext::init_from_data(mmap0.as_slice())?;
     let split_count = ctx0
