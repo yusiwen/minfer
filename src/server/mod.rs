@@ -141,7 +141,7 @@ pub fn run(
     // of 500-ing per request. A GGUF with no template at all still uses ChatML,
     // and says so once.
     let startup = match crate::template::startup_template(
-        chat_template_from_gguf(&gguf.parts[0].data).as_deref(),
+        chat_template_from_gguf(gguf.parts[0].data()).as_deref(),
         template_override,
     ) {
         Ok(s) => s,

@@ -194,7 +194,8 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0072](./0072-a-draft-proposal-is-the-target-s-own-filtered-pick.md) | 2026-11-02 | a draft proposal is the target's own filtered pick, computed from one shared prefix | Accepted |
 | [0073](./0073-gemma-4-s-lenient-body-gets-a-dialect-tool-choice-grammar.md) | 2026-11-02 | Gemma 4's lenient body gets a dialect `tool_choice` grammar | Accepted (amends ADR-0069) |
 | [0074](./0074-the-llama3-rope-table-is-read-from-the-gguf.md) | 2026-11-05 | The llama3 rope table is read from the GGUF, not re-derived from four numbers | Accepted |
-| [0075](./0075-a-model-owns-the-mapping-it-reads.md) | 2026-11-05 | A model owns the mapping it reads, and a tensor carries a handle into it | Accepted (amends the walkthrough's leaked-mmap decision) |
+| [0075](./0075-a-model-owns-the-mapping-it-reads.md) | 2026-11-05 | A model owns the mapping it reads, and a tensor carries a handle into it | Superseded by [0076](./0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md) |
+| [0076](./0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md) | 2026-11-06 | A tensor's bytes are a mapping handle plus a range, never a `'static` view of a mapping | Accepted (supersedes ADR-0075) |
 
 ## The template
 

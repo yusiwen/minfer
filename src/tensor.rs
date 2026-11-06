@@ -109,6 +109,99 @@ impl TensorType {
     }
 }
 
+// === Tensor data: owned or a mapping range (#745) ===
+
+/// The bytes of a tensor — and, when they are a range of a GGUF part, the
+/// mapping handle that keeps that range alive.
+///
+/// [#745] A weight tensor is not a `'static` slice of a leaked mapping. The
+/// mapping is owned by the model, and a tensor is free to outlive the
+/// `GgufModel` it was read from, so the bytes carry their owner: `Mapped` holds
+/// the `Arc<MmapFile>` plus an `(off, len)` range, and the last clone of either
+/// unmaps the file.
+///
+/// `Deref<Target = [u8]>` is deliberate: every read site keeps the same syntax
+/// (`len`, indexing, `as_ptr`, `to_vec`, iteration), so the typed view costs
+/// the constructors, not the consumers.
+#[derive(Clone)]
+pub struct TensorData {
+    inner: TensorDataInner,
+}
+
+#[derive(Clone)]
+enum TensorDataInner {
+    /// A scratch/owned buffer. Test-only: production tensors are ranges of a
+    /// GGUF part; `Tensor::new`/`Tensor::from_data` build the scratch case.
+    #[cfg(test)]
+    Owned(Vec<u8>),
+    /// A range of a read-only file mapping, with the handle that keeps it alive.
+    Mapped {
+        map: std::sync::Arc<crate::gguf::MmapFile>,
+        off: usize,
+        len: usize,
+    },
+}
+
+impl TensorData {
+    #[cfg(test)]
+    pub(crate) fn owned(bytes: Vec<u8>) -> Self {
+        Self {
+            inner: TensorDataInner::Owned(bytes),
+        }
+    }
+
+    /// A range of `map`. The range is checked here, once, so `deref` needs no
+    /// `unsafe` and a malformed range fails at construction instead of inside a
+    /// kernel read.
+    pub(crate) fn mapped(
+        map: std::sync::Arc<crate::gguf::MmapFile>,
+        off: usize,
+        len: usize,
+    ) -> Self {
+        let end = off
+            .checked_add(len)
+            .unwrap_or_else(|| panic!("tensor range {off}+{len} overflows usize"));
+        assert!(
+            end <= map.as_slice().len(),
+            "tensor range {off}..{end} is past the mapping's {} bytes",
+            map.as_slice().len()
+        );
+        Self {
+            inner: TensorDataInner::Mapped { map, off, len },
+        }
+    }
+}
+
+impl std::ops::Deref for TensorData {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match &self.inner {
+            #[cfg(test)]
+            TensorDataInner::Owned(bytes) => bytes,
+            TensorDataInner::Mapped { map, off, len } => &map.as_slice()[*off..*off + *len],
+        }
+    }
+}
+
+impl AsRef<[u8]> for TensorData {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl std::fmt::Debug for TensorData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.inner {
+            #[cfg(test)]
+            TensorDataInner::Owned(bytes) => write!(f, "TensorData::Owned({} bytes)", bytes.len()),
+            TensorDataInner::Mapped { off, len, .. } => {
+                write!(f, "TensorData::Mapped({off}..{})", off + len)
+            }
+        }
+    }
+}
+
 // === Tensor struct (ggml.h lines 667-699, simplified) ===
 
 /// n-dimensional tensor
@@ -116,25 +209,16 @@ impl TensorType {
 ///   type  → ttype
 ///   ne[]  → shape (number of elements per dimension)
 ///   nb[]  → strides (stride in bytes per dimension)
-///   data  → Owned Vec (scratch tensors) or a Borrowed slice of the mmap'd
-///           GGUF file (weight tensors — zero-copy load, 2026-08-21)
+///   data  → `TensorData`: an owned scratch buffer, or a range of the mmap'd
+///           GGUF part (weight tensors — zero-copy load, [#745])
 ///   name  → name
 #[derive(Clone)]
 pub struct Tensor {
     pub ttype: TensorType,
     pub shape: [i64; 4],     // ne[0..3]: number of elements per dimension
     pub strides: [usize; 4], // nb[0..3]: stride in bytes per dimension
-    pub data: std::borrow::Cow<'static, [u8]>,
+    pub data: TensorData,
     pub name: String,
-    /// [#745]: when `data` is a `Borrowed` slice **into a file mapping**, this is
-    /// that mapping. The two live or die together: cloning a tensor bumps the
-    /// reference count, so a weight tensor that outlives the `GgufModel` it was
-    /// read from keeps its pages alive, and the last handle unmaps the file.
-    ///
-    /// `None` for an owned tensor and for a genuinely `'static` slice (a fixture,
-    /// a `&'static [u8]` literal) — the case the previous `Box::leak` assumed for
-    /// everything.
-    pub owner: Option<std::sync::Arc<crate::gguf::MmapFile>>,
 }
 
 // ggml-parity Tensor API: the graph path exercises this subset (borrowed
@@ -152,9 +236,8 @@ impl Tensor {
             ttype,
             shape: *shape,
             strides: [0; 4],
-            data: std::borrow::Cow::Owned(Vec::new()),
+            data: TensorData::owned(Vec::new()),
             name: String::new(),
-            owner: None,
         };
 
         // Compute strides (ggml.h lines 673-676 + gguf.cpp lines 728-732)
@@ -168,7 +251,7 @@ impl Tensor {
 
         // Allocate data
         let nbytes = tensor.nbytes();
-        tensor.data = std::borrow::Cow::Owned(vec![0u8; nbytes]);
+        tensor.data = TensorData::owned(vec![0u8; nbytes]);
 
         tensor
     }
@@ -181,9 +264,8 @@ impl Tensor {
             ttype,
             shape: *shape,
             strides: [0; 4],
-            data: std::borrow::Cow::Owned(data),
+            data: TensorData::owned(data),
             name: String::new(),
-            owner: None,
         };
 
         // Compute strides
@@ -198,32 +280,28 @@ impl Tensor {
         tensor
     }
 
-    /// Create a weight tensor as a Borrowed slice of the mmap'd GGUF file
-    /// (zero-copy load — the file pages are shared with the CPU/GPU instead of
-    /// being copied per tensor). The slice must be 'static: the gguf loader
-    /// leaks the Mmap for the process lifetime.
-    pub fn from_data_borrowed_with_strides(
+    /// Create a weight tensor as a range of an mmap'd GGUF part (zero-copy load —
+    /// the file pages are shared with the CPU/GPU instead of being copied per
+    /// tensor).
+    ///
+    /// [#745] `map` is the part's mapping and `(off, len)` is the tensor's payload
+    /// inside it. The tensor carries the handle, so it keeps its own bytes alive
+    /// even after the `GgufModel` is dropped; the range is validated here.
+    pub fn from_mapped(
         ttype: TensorType,
         shape: &[i64; 4],
         strides: &[usize; 4],
-        data: &'static [u8],
+        map: std::sync::Arc<crate::gguf::MmapFile>,
+        off: usize,
+        len: usize,
     ) -> Self {
         Tensor {
             ttype,
             shape: *shape,
             strides: *strides,
-            data: std::borrow::Cow::Borrowed(data),
+            data: TensorData::mapped(map, off, len),
             name: String::new(),
-            owner: None,
         }
-    }
-
-    /// [#745]: record the file mapping `data` was borrowed from, so the tensor is
-    /// self-contained — it keeps its own bytes alive regardless of what happens to
-    /// the `GgufModel` it was read from.
-    pub fn with_owner(mut self, owner: std::sync::Arc<crate::gguf::MmapFile>) -> Self {
-        self.owner = Some(owner);
-        self
     }
 
     /// Set tensor name

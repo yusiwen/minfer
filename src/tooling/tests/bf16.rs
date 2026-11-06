@@ -34,8 +34,8 @@ fn bf16_vs_f16_weight_value_diffs(a_path: &Path, b_path: &Path) -> (usize, usize
                 .get(&ti.name)
                 .unwrap_or_else(|| panic!("tensor '{}' only in the bf16 file", ti.name));
             assert_eq!(nb, ti.nbytes(), "tensor {} size", ti.name);
-            let a = &ma.parts[pi].data[part.ctx.offset + ti.offset as usize..][..ti.nbytes()];
-            let b = &mb.parts[pb].data[ob..ob + nb];
+            let a = &ma.parts[pi].data()[part.ctx.offset + ti.offset as usize..][..ti.nbytes()];
+            let b = &mb.parts[pb].data()[ob..ob + nb];
             match (ti.type_, tb_type) {
                 (crate::gguf::GgmlType::BF16, crate::gguf::GgmlType::F16) => {
                     for i in 0..nb / 2 {

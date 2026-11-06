@@ -1293,7 +1293,7 @@ fn main() {
         }
     };
     let n_parts = gguf_model.parts.len();
-    let total_bytes: usize = gguf_model.parts.iter().map(|p| p.data.len()).sum();
+    let total_bytes: usize = gguf_model.parts.iter().map(|p| p.data().len()).sum();
     println!(
         "File: {} bytes ({:.1} MB) in {n_parts} part(s)",
         total_bytes,
@@ -1499,7 +1499,7 @@ fn main() {
         let code = run_conversation(
             model,
             &tokenizer,
-            &gguf_model.parts[0].data,
+            &gguf_model.parts[0].data(),
             chat_template_override.as_deref(),
             &params,
             system_prompt,
@@ -1552,7 +1552,7 @@ fn main() {
         prompt.clone()
     } else {
         match template::render_single_turn(
-            get_chat_template(&gguf_model.parts[0].data).as_deref(),
+            get_chat_template(gguf_model.parts[0].data()).as_deref(),
             chat_template_override.as_deref(),
             &prompt,
             bos_text,

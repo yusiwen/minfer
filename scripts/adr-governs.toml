@@ -393,7 +393,22 @@ what = "a rope frequency table comes from the file (`rope_freqs.weight`, per-blo
 symbol = "RopeFreqs"
 
 [[governs]]
-adr = "0075"
-what = "a GGUF part owns its mapping (`GgufPart::mmap`) and a tensor carries a handle into it (`Tensor::owner`), so the last handle unmaps the file and closes its fd; the Metal zero-copy part registration holds a handle of its own"
-symbol = "as_static_slice"
+adr = "0076"
+what = "a tensor's bytes are an owned buffer or a mapping handle plus a range — a `'static` view of a mapping is not constructible"
+symbol = "TensorData"
+
+[[governs]]
+adr = "0076"
+what = "a weights tensor is a mapping handle plus a range, not a `'static` slice beside a public owner field"
+symbol = "Tensor"
+
+[[governs]]
+adr = "0076"
+what = "a GGUF part owns its mapping and exposes it as a borrow tied to the part, never as `'static`"
+symbol = "GgufPart"
+
+[[governs]]
+adr = "0076"
+what = "the mapping's lifetime is its `Arc` handle's; the unsafe `as_static_slice` escape does not exist"
+symbol = "MmapFile"
 

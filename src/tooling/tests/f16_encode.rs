@@ -38,7 +38,7 @@ fn tensor_of<'a>(
         .find(|t| t.name == name)
         .unwrap_or_else(|| panic!("tensor {name} missing"));
     let base = part.ctx.offset + ti.offset as usize;
-    (ti, &part.data[base..base + ti.nbytes()])
+    (ti, &part.data()[base..base + ti.nbytes()])
 }
 /// #169: every target's 1-D rule, asserted on the **types read back from
 /// the written file** (not on the plan), with the payload of a preserved

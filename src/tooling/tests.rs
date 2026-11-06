@@ -139,8 +139,8 @@ fn tensor_payloads_equal(a_path: &Path, b_path: &Path) -> Result<usize, String> 
                 return Err(format!("tensor {} size {} != {}", ti.name, na, ti.nbytes()));
             }
             let (xa, xb) = (
-                &ma.parts[*pa].data[*oa..*oa + *na],
-                &mb.parts[pi].data[off..off + ti.nbytes()],
+                &ma.parts[*pa].data()[*oa..*oa + *na],
+                &mb.parts[pi].data()[off..off + ti.nbytes()],
             );
             if xa != xb {
                 let diff = xa.iter().zip(xb).filter(|(p, q)| p != q).count();

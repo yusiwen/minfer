@@ -165,12 +165,15 @@ fn split_writes_parts_the_reader_merges_back() {
             "qwen2"
         );
         // Each part is a complete file whose length matches its own index.
-        assert_eq!(part.data.len(), part.ctx.get_data_offset() + part.ctx.size);
+        assert_eq!(
+            part.data().len(),
+            part.ctx.get_data_offset() + part.ctx.size
+        );
         for ti in &part.ctx.info {
             names.push(ti.name.clone());
             let base = part.ctx.get_data_offset();
             assert_eq!(
-                part.data[base + ti.offset as usize],
+                part.data()[base + ti.offset as usize],
                 (i + 1) as u8,
                 "part {i} tensor {} payload",
                 ti.name

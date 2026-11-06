@@ -329,10 +329,10 @@ than one graph execution:
 
 Mechanically, the K region does double duty as the store node's *output
 buffer* — `node_to_buf` (`alloc.rs:`: "the node's buffer = the K region") — and the CPU
-executor enforces that contract `supports_op` (`cpu_backend.rs:129`): "KV store out
+executor enforces that contract `supports_op` (`cpu_backend.rs:128`): "KV store out
 buffer must be the K region"). The V region is a sibling the kernel reaches
 through the `kv_pair` handle (§3.2, excerpt 8). The load node executes as a
-no-op — it is a *view* of the K region `execute_node` (`cpu_backend.rs:308`).
+no-op — it is a *view* of the K region `execute_node` (`cpu_backend.rs:307`).
 
 ### 2.6 Filling inputs: why f32 buffers, and the I32 bit-pattern ride
 
@@ -347,10 +347,10 @@ kernels run the inverse, `x.to_bits()`, recovering the exact integer:
 
 | consumer | code |
 |---|---|
-| embedding row gather (CPU) | `ins[0][t].to_bits()` → token id `execute_node` (`cpu_backend.rs:308`) |
-| generic get_rows (CPU) | `ins[1][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:308`) |
-| RoPE positions (CPU) | `ins[1][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:308`) |
-| attention positions (CPU) | `ins[2][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:308`) |
+| embedding row gather (CPU) | `ins[0][t].to_bits()` → token id `execute_node` (`cpu_backend.rs:307`) |
+| generic get_rows (CPU) | `ins[1][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:307`) |
+| RoPE positions (CPU) | `ins[1][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:307`) |
+| attention positions (CPU) | `ins[2][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:307`) |
 | CUDA kernels | device-side `__float_as_int` in one pass `gather_rows_f32` (`ops_misc.cu:145`) |
 
 Why this trick at all? Because of the uniform-pool decision. The alternatives

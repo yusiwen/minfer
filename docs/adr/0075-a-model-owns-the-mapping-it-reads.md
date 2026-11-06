@@ -1,6 +1,6 @@
 # 0075. A model owns the mapping it reads, and a tensor carries a handle into it
 
-- Status: Accepted
+- Status: Superseded by ADR-0076
 - Date: 2026-11-05
 - Issues: #745
 - Amends: the leaked-mmap decision recorded in `docs/inference_e2e_walkthrough/02-gguf-load.md` §2.5 and §3.3

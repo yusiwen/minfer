@@ -193,13 +193,13 @@ fn raw_f32_table(part: &GgufPart, ti: &GgufTensorInfo) -> Result<Vec<f32>, Strin
     let off = part.ctx.offset + ti.offset as usize;
     let n = ti.ne[0].max(0) as usize;
     let end = off + n * 4;
-    let bytes = part.data.get(off..end).ok_or_else(|| {
+    let bytes = part.data().get(off..end).ok_or_else(|| {
         format!(
             "{}: {} bytes at offset {} run past the part's {}",
             ti.name,
             n * 4,
             off,
-            part.data.len()
+            part.data().len()
         )
     })?;
     Ok(bytes

@@ -43,7 +43,7 @@ fn f6_rewriting_a_gguf_is_bitwise_and_metadata_equivalent() {
         assert_eq!(ta.ne, tb.ne, "tensor {} shape", ta.name);
         assert_eq!(ta.type_, tb.type_, "tensor {} type", ta.name);
         assert_eq!(ta.nbytes(), tb.nbytes(), "tensor {} bytes", ta.name);
-        let sa = &model.parts[0].data
+        let sa = &model.parts[0].data()
             [a.offset + ta.offset as usize..a.offset + ta.offset as usize + ta.nbytes()];
         let sb = &rb[b.offset + tb.offset as usize..b.offset + tb.offset as usize + tb.nbytes()];
         assert_eq!(sa, sb, "tensor {} payload", ta.name);

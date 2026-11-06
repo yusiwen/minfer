@@ -326,14 +326,14 @@ slices of the *mapping*. The difference is not academic:
 
 The cost of mmap is honesty about lifetime: the mapping must outlive every
 slice borrowed from it. minfer's answer is **ownership, not a leak** ([#745],
-[ADR-0075](../adr/0075-a-model-owns-the-mapping-it-reads.md)): the `GgufPart` holds
-an `Arc<MmapFile>`, every weight `Tensor` read out of it holds a handle too, and
-the last handle left anywhere — the model, a cloned tensor, a Metal zero-copy
-part registration — is what unmaps the file and closes its descriptor. The
-`'static` on the tensor's slice therefore means "the owner keeps it alive", not
-"nobody ever frees it": a model can be dropped, and a process that loads models
-in sequence (the tooling, the test suite, a server at model-swap time) gets its
-address space and its descriptors back. (§3.3 records why the leak was chosen
+[ADR-0076](../adr/0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md)):
+the `GgufPart` holds an `Arc<MmapFile>`, and a weight tensor's bytes are a
+`TensorData::Mapped { map, off, len }` — the handle and the range together, with
+no `'static` slice. The last handle left anywhere — the model, a cloned tensor, a
+Metal zero-copy part registration — is what unmaps the file and closes its
+descriptor. Dropping a model is therefore a real release, and a process that loads
+models in sequence (the tooling, the test suite, a server at model-swap time) gets
+its address space and its descriptors back. (§3.3 records why the leak was chosen
 first and what changed.)
 
 ### 2.6 Multi-part files: many GGUFs, one model
@@ -369,7 +369,7 @@ GgufModel
     │   ├── version, alignment      format facts
     │   ├── kv: Vec<GgufKv>         metadata: keys → typed values/arrays
     │   └── info: Vec<GgufTensorInfo>  name, ne[4], nb[4], type, offset
-    └── data: &'static [u8]         the mmap'd file bytes (whole file)
+    └── mmap: Arc<MmapFile>          the whole file; `data()` borrows its bytes
 ```
 
 Who reads what next:
@@ -417,10 +417,16 @@ pub struct GgufContext {
 
 pub struct GgufPart {
     pub ctx: GgufContext,
-    /// A `'static` view of `mmap`'s pages (the owner below keeps it alive).
-    pub data: &'static [u8],
-    /// The mapping `data` points into — the handle that owns it.
+    /// The mapping that owns this part's bytes.
     pub mmap: std::sync::Arc<MmapFile>,
+}
+
+impl GgufPart {
+    /// The borrow is tied to the part (and therefore to the mapping's handle);
+    /// it is never a `'static` view.
+    pub fn data(&self) -> &[u8] {
+        self.mmap.as_slice()
+    }
 }
 
 pub struct GgufModel {
@@ -718,17 +724,16 @@ than a null check. And the comment records a measured fact from
 `docs/METAL_OPTIMIZATIONS.md` (#39): the *first* GPU touch of file-backed
 pages costs ~44 ms of page/TLB setup, which Metal's `register_part` pays once
 at load, on purpose, outside the timed region. `as_slice()` turns the pointer
-into `&[u8]`, `as_static_slice()` into the `'static` form a tensor stores, and
-`Drop` calls `munmap` + flips the `alive` flag a gate can assert on — the drop
-that releases the descriptor is the same one that unmaps the pages.
+into a `&[u8]` tied to the mapping, a tensor stores a **range** of it behind its
+`Arc`, and `Drop` calls `munmap` + flips the `alive` flag a gate can assert on —
+the drop that releases the descriptor is the same one that unmaps the pages.
 
 **(i) The entry point: parts, ownership, merge** (`gguf.rs`, `load_gguf_model`):
 
 ```rust
 pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
     let mmap0 = std::sync::Arc::new(MmapFile::map(path)?);
-    let data0: &'static [u8] = mmap0.as_static_slice();
-    let ctx0 = GgufContext::init_from_data(data0)?;
+    let ctx0 = GgufContext::init_from_data(mmap0.as_slice())?;
     let split_count = ctx0
         .get_key_val_i64("split.count")
         .map(|v| v as usize)
@@ -738,27 +743,26 @@ pub fn load_gguf_model(path: &std::path::Path) -> Option<GgufModel> {
         return Some(GgufModel {
             parts: vec![GgufPart {
                 ctx: ctx0,
-                data: data0,
                 mmap: mmap0,
             }],
         });
     }
 ```
 
-`Arc` is the `'static` trick from §2.5: `MmapFile::map` returns an owned value,
-and the `Arc` keeps it alive as long as *anything* still points into its pages —
-the model, a cloned weight tensor, a Metal zero-copy registration. Nothing is
-leaked, so the load path is also the drop path: when the last handle goes,
-`MmapFile::drop` runs `munmap` and closes the fd. Then either the fast path (no
-split: parse and return) or the split path — checks first (`split.no` must be 0, lines 2016–2025; filename-derived part list must
+`Arc` is the ownership handle from §2.5: `MmapFile::map` returns an owned value,
+and the `Arc` keeps it alive as long as *anything* still holds a range of its
+pages — the model, a cloned weight tensor, a Metal zero-copy registration.
+Nothing is leaked, so the load path is also the drop path: when the last handle
+goes, `MmapFile::drop` runs `munmap` and closes the fd. Then either the fast path
+(no split: parse and return) or the split path — checks first (`split.no` must be
+0, lines 2016–2025; filename-derived part list must
 match `split.count`, lines 2027–2034), then parse each part in order:
 
 ```rust
 let mut parts = Vec::with_capacity(split_count);
 for (i, p) in part_paths.iter().enumerate() {
     let mmap = std::sync::Arc::new(MmapFile::map(p)?);
-    let data: &'static [u8] = mmap.as_static_slice();
-    let ctx = GgufContext::init_from_data(data)?;
+    let ctx = GgufContext::init_from_data(mmap.as_slice())?;
     let no = ctx
         .get_key_val_i64("split.no")
         .map(|v| v as usize)
@@ -767,7 +771,7 @@ for (i, p) in part_paths.iter().enumerate() {
         eprintln!("GGUF: split {p:?} has split.no={no}, expected {i}");
         return None;
     }
-    parts.push(GgufPart { ctx, data, mmap });
+    parts.push(GgufPart { ctx, mmap });
 }
 Some(GgufModel { parts })
 ```
@@ -845,9 +849,6 @@ let ts = ti.type_.type_size();
 let bs = ti.type_.blck_size() as usize;
 let n = (shape[0] * shape[1] * shape[2] * shape[3]) as usize;
 let nbytes = (n / bs) * ts;
-// Borrow the tensor bytes straight from the mmap'd part file (zero-copy —
-// the file pages are shared with the CPU and GPU instead of a per-tensor copy).
-let src = &raw[off..off + nbytes];
 
 let mut strides = [0usize; 4];
 strides[0] = ts;
@@ -856,40 +857,46 @@ for j in 2..4 {
     strides[j] = strides[j - 1] * shape[j - 1] as usize;
 }
 
-let mut tensor = Tensor::from_data_borrowed_with_strides(ttype, &shape, &strides, src);
+let mut tensor = Tensor::from_mapped(ttype, &shape, &strides, owner.clone(), off, nbytes);
 ```
 
 The stride recomputation (loader lines 192–197) is deliberately identical to
 the parser's (§3.2 f) — same formula, same result, and a cross-check: if the
 two ever disagreed, tensors would be sliced with one geometry and walked with
-another. Inside `Tensor` (`tensor.rs` lines 201–214), the slice becomes
-`Cow::Borrowed`:
+another. Inside `Tensor` (`tensor.rs`), the bytes are a `TensorData` range, not a
+borrowed `'static` slice:
 
 ```rust
-/// Create a weight tensor as a Borrowed slice of the mmap'd GGUF file
-/// (zero-copy load — the file pages are shared with the CPU/GPU instead of
-/// being copied per tensor). The slice is 'static because the loader attaches
-/// the mapping's handle with `with_owner`: the tensor keeps its own bytes alive.
-pub fn from_data_borrowed_with_strides(
-    ttype: TensorType,
-    shape: &[i64; 4],
-    strides: &[usize; 4],
-    data: &'static [u8],
-) -> Self {
-    Tensor {
-        ttype, shape: *shape, strides: *strides,
-        data: std::borrow::Cow::Borrowed(data),
-        name: String::new(),
-        owner: None,
+pub struct TensorData {
+    inner: TensorDataInner,
+}
+
+enum TensorDataInner {
+    /// Test-only scratch; production tensors are ranges of a GGUF part.
+    #[cfg(test)]
+    Owned(Vec<u8>),
+    /// A range of a read-only file mapping, with the handle that keeps it alive.
+    Mapped { map: std::sync::Arc<MmapFile>, off: usize, len: usize },
+}
+
+impl std::ops::Deref for TensorData {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match &self.inner {
+            #[cfg(test)]
+            TensorDataInner::Owned(bytes) => bytes,
+            TensorDataInner::Mapped { map, off, len } => &map.as_slice()[*off..*off + *len],
+        }
     }
 }
 ```
 
-**Cow** (clone-on-write) is Rust's "borrowed until someone needs to modify
-it" enum: scratch/activation tensors are `Cow::Owned(Vec<u8>)`, weights are
-`Cow::Borrowed(&'static [u8])` — same type, two ownership stories, and a
-`clone()` of a weight tensor copies *nothing* (the `t.clone()` at model call
-sites is free for borrowed data; `graph/cpu_backend.rs` line 37 notes this).
+`Deref` is why the typed view costs the constructors rather than the consumers:
+`len`, indexing, `as_ptr`, `to_vec` and iteration keep their syntax, while the
+range and its `Arc` are the only way to reach the bytes. `TensorData::mapped`
+validates the range once (no overflow, no end past the mapping), so `deref` needs
+no `unsafe`. A `clone()` of a weight bumps the same `Arc`; there is no separate
+`owner` field that could be dropped on its own.
 
 And the final link in the zero-copy chain, doc 14's anchor
 (`src/metal/` lines 2330–2344):
@@ -912,11 +919,12 @@ let buf = unsafe {
 };
 ```
 
-The GPU buffer *is* the file's pages — `data` here is exactly the
-`&'static [u8]` this doc's mmap produced, registered per part before any
-weight is wrapped as `(buffer, offset)` (loader lines 322–327). mmap's
-page-aligned return value is what makes `newBufferWithBytesNoCopy` legal; a
-heap `Vec` could never qualify.
+The GPU buffer *is* the file's pages — `data` here is the part's `&[u8]`, the
+same pages this doc's mmap produced, registered per part before any weight is
+wrapped as `(buffer, offset)` (loader lines 322–327). The registration stores the
+`Arc<MmapFile>` alongside the buffer, so the pages cannot be unmapped while the
+GPU reads them. mmap's page-aligned return value is what makes
+`newBufferWithBytesNoCopy` legal; a heap `Vec` could never qualify.
 
 ### 3.3 Design choices (why this shape and not another)
 
@@ -925,7 +933,7 @@ tolerance, page-cache sharing, GPU mapping). The honest costs: a mapping is
 address-space (irrelevant on 64-bit), pages can fault mid-inference if the
 file is truncated underneath you (llama.cpp documents this failure mode —
 minfer's download layer size-checks resumes for the same reason, per
-`docs/ARCHITECTURE.md` §9), and lifetime needs the leak discipline below. On
+`docs/ARCHITECTURE.md` §9), and lifetime needs the ownership discipline below. On
 net, for multi-GB read-only files on machines that also want GPU access to
 the same bytes, there is no contest — llama.cpp made the identical call
 (`llama_mmap`), and minfer is explicitly in that lineage.
@@ -939,12 +947,16 @@ that never varies in practice — "the model lives for the whole process" — an
 leaked the mapping instead. [#745] found the premise false: the tooling, the
 test suite and a reloading server all load models more than once, and each load
 kept a mapping and a descriptor until exit (macOS's 16 384-fd default makes it
-visible). The chosen shape is the smallest one that survives that: a `GgufPart`
-owns its `Arc`, a `Tensor` carries the same handle, a lifetime never appears in
-a signature, and `Tensor::with_owner` is the one new API. The alternatives —
-`Tensor<'a>` through every backend, a `TensorData::Mapped(range)` enum, a
-self-referential-struct crate — are in [ADR-0075](../adr/0075-a-model-owns-the-mapping-it-reads.md)
-beside what each would cost.
+visible). [#751] removed the leak by owning the `Arc` but kept the view as a
+`'static` slice plus a public `owner` field; that still left a safe
+use-after-free path for any caller that dropped the handle first.
+[ADR-0076](../adr/0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md)
+replaced the view with a typed migration: a `TensorData::Mapped { map, off, len }`
+owns the handle and the range together, `Deref` keeps every read site's syntax,
+and neither `GgufPart` nor `Tensor` can hand out a `'static` slice of a mapping.
+The alternatives — `Tensor<'a>` through every backend, a cached slice beside the
+range, a self-referential-struct crate — are in ADR-0076 beside what each would
+cost.
 
 **Raw bytes now, decode never-at-load.** The tempting alternative is
 "dequantize everything to f32 at load" — one clean uniform representation,
@@ -973,7 +985,7 @@ metadata element; metadata is 1.39% of the file.
 *not* hold tensor data (the `gguf.cpp`-parity comment says so, lines 621–622:
 "data … handled by the caller"). The parse produces *coordinates*; the mmap is
 the *territory*. That separation is what lets the same `GgufModel` serve the
-CPU path (slice → `Cow::Borrowed`), the Metal path (`newBufferWithBytesNoCopy`
+CPU path (range → `TensorData::Mapped`), the Metal path (`newBufferWithBytesNoCopy`
 on the same pointer), and the CUDA path (device copies made once at
 registration, from the same slices) without the parser knowing any backend
 exists.
@@ -997,13 +1009,15 @@ redundancy is an assertion.
   equal the running padded sum (lines 1694–1703). A file with gaps (or with
   padding computed at a different width) is rejected here — not at first
   inference.
-- **The mapping must outlive every slice.** The `Arc` handles in `GgufPart` and
-  in every weight `Tensor` are load-bearing: unmap while one slice is still
-  reachable and the process has a use-after-free. Corollary: model loading is no
-  longer one-way — a model can be dropped and another loaded, and the release is
-  observable (`src/gguf/tests.rs` asserts the mapping's flag and the fd), with
-  the one device exception ADR-0075 records (a Metal zero-copy part registration
-  holds the pages until MPS is torn down).
+- **The mapping must outlive every range.** The `Arc` handles in `GgufPart` and
+  in every `TensorData::Mapped` are load-bearing: unmap while one range is still
+  reachable and the process has a use-after-free. There is no `'static` slice to
+  escape with: `GgufPart::data()` borrows from the part, and a tensor's bytes are
+  a range plus the handle. Corollary: model loading is no longer one-way — a model
+  can be dropped and another loaded, and the release is observable
+  (`src/gguf/tests.rs` asserts the mapping's flag and the fd), with the one device
+  exception ADR-0076 records (a Metal zero-copy part registration holds the pages
+  until MPS is torn down).
 - **`ne[0]` must be a multiple of the block size** (line 1627). This is why a
   model whose vocabulary isn't divisible by 32 cannot be exported as Q8_0
   without padding — `docs/QWEN3-SUPPORT-PLAN.md` records Qwen3's vocab
