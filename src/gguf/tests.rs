@@ -434,3 +434,42 @@ fn a_cuda_reload_registers_the_second_models_weights() {
     drop(gguf_b);
     let _ = std::fs::remove_file(&temp);
 }
+
+/// [#745] A dropped model releases its Metal registrations, and the mapping goes
+/// with them once the engine's cache is gone too.
+///
+/// The zero-copy `MTLBuffer` aliases the mapping, so the part registration must
+/// keep the pages alive while the buffer exists; `ModelRegistration` drops the
+/// weight buffers first, then the part buffers, then the `Arc<MmapFile>` handles.
+/// The graph cache holds `Tensor` clones, so the engine's release is model +
+/// cache, not the model alone.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dropped_model_releases_its_metal_registration() {
+    crate::metal::MpsState::init();
+    if crate::metal::MpsState::get().is_none() {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    let path = toy_gguf();
+    let gguf = load_gguf_model(&path).expect("the toy GGUF loads");
+    let alive = gguf.parts[0].mmap.alive();
+    let model =
+        crate::models::load_model_with(&gguf, "", crate::graph::offload::OffloadRequest::Layers(1))
+            .expect("the toy model loads");
+    assert_eq!(
+        model.device(),
+        crate::models::Device::Metal,
+        "this gate needs the Metal path"
+    );
+    let mut cache = crate::graph::cache::GraphCache::new();
+    let logits = model.forward_graph_cached(&[1], &[0], 1, 16, &mut cache);
+    assert!(!logits.is_empty(), "the forward step must produce logits");
+    drop(model);
+    drop(cache);
+    drop(gguf);
+    assert!(
+        !alive.load(std::sync::atomic::Ordering::SeqCst),
+        "the Metal registration kept the mapping alive after model + cache drop"
+    );
+}

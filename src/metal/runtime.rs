@@ -424,6 +424,8 @@ impl MpsState {
                 pl_warmup,
                 weights: std::sync::Mutex::new(std::collections::HashMap::new()),
                 mmap_parts: std::sync::Mutex::new(Vec::new()),
+                next_registration: std::sync::atomic::AtomicU64::new(0),
+                current_registration: std::sync::atomic::AtomicU64::new(0),
                 buf_attn_partial: std::sync::Mutex::new(dummy_buf.clone()),
                 buf_positions: std::sync::Mutex::new(dummy_buf.clone()),
                 buf_attn_scores: std::sync::Mutex::new(dummy_buf.clone()),
@@ -466,6 +468,38 @@ impl MpsState {
         });
     }
 
+    /// [#745] Start a model-scoped registration: the parts and weights created
+    /// until this model is dropped are tagged with a fresh id. The loader calls
+    /// this before `register_part`/`register_weight`, and the model holds the
+    /// returned handle; its drop removes the buffers before the mapping handles.
+    #[cfg(target_os = "macos")]
+    pub fn begin_registration(&self) -> std::sync::Arc<crate::metal::ModelRegistration> {
+        let id = self
+            .inner
+            .next_registration
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.inner
+            .current_registration
+            .store(id, std::sync::atomic::Ordering::Relaxed);
+        std::sync::Arc::new(crate::metal::ModelRegistration::new(id))
+    }
+
+    /// [#745] Remove one model's registrations. Weight buffers go first so no
+    /// `MTLBuffer` outlives the mapping it aliases; the `mmap_parts` retain then
+    /// drops the part buffers and, last, the `Arc<MmapFile>` handles.
+    #[cfg(target_os = "macos")]
+    pub fn release_registration(&self, id: u64) {
+        {
+            let mut weights = self.inner.weights.lock().unwrap();
+            weights.retain(|_, (_, _, _, reg)| *reg != id);
+        }
+        {
+            let mut parts = self.inner.mmap_parts.lock().unwrap();
+            parts.retain(|(_, _, _, _, reg)| *reg != id);
+        }
+    }
+
     pub fn has_weight(&self, name: &str) -> bool {
         #[cfg(not(target_os = "macos"))]
         {
@@ -492,7 +526,7 @@ impl MpsState {
                 .lock()
                 .unwrap()
                 .get(name)
-                .map(|(buf, off, _len)| (buf.clone(), *off))
+                .map(|(buf, off, _len, _reg)| (buf.clone(), *off))
         }
     }
 
@@ -515,7 +549,7 @@ impl MpsState {
             crate::graph::alloc::weights_from_lock(
                 self.inner.weights.lock(),
                 "Metal weight registry",
-                |w| w.values().map(|(_, _, len)| *len).sum(),
+                |w| w.values().map(|(_, _, len, _)| *len).sum(),
             )
         }
     }
@@ -597,11 +631,15 @@ impl MpsState {
                     )
                     .unwrap()
             };
-            self.inner
-                .mmap_parts
-                .lock()
-                .unwrap()
-                .push((base, data.len(), buf.clone(), owner));
+            self.inner.mmap_parts.lock().unwrap().push((
+                base,
+                data.len(),
+                buf.clone(),
+                owner,
+                self.inner
+                    .current_registration
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ));
             // GPU-side warm-up (METAL_OPTIMIZATIONS #39): the FIRST GPU access to
             // file-backed (mmap) pages costs ~44 ms of one-time page/TLB setup.
             // Doing a dummy full-buffer read HERE (at model load, outside the
@@ -644,8 +682,8 @@ impl MpsState {
                 let parts = self.inner.mmap_parts.lock().unwrap();
                 parts
                     .iter()
-                    .find(|(base, len, _, _)| ptr >= *base && ptr + data.len() <= base + len)
-                    .map(|(base, _, buf, _)| (buf.clone(), (ptr - base) as u64))
+                    .find(|(base, len, _, _, _)| ptr >= *base && ptr + data.len() <= base + len)
+                    .map(|(base, _, buf, _, _)| (buf.clone(), (ptr - base) as u64))
             } else {
                 None
             };
@@ -671,11 +709,17 @@ impl MpsState {
                     (b, 0u64)
                 }
             };
-            self.inner
-                .weights
-                .lock()
-                .unwrap()
-                .insert(name.to_string(), (buf, off, data.len()));
+            self.inner.weights.lock().unwrap().insert(
+                name.to_string(),
+                (
+                    buf,
+                    off,
+                    data.len(),
+                    self.inner
+                        .current_registration
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ),
+            );
         }
     }
 
