@@ -447,8 +447,11 @@ fn a_cuda_reload_registers_the_second_models_weights() {
 #[cfg(target_os = "macos")]
 fn macos_open_fds_to(path: &std::path::Path) -> usize {
     let pid = std::process::id().to_string();
+    // `-d '^mem'` excludes lsof's memory-mapped-file rows: the mapping is not an
+    // open descriptor, the `File` that owns the fd is. Without it the same file
+    // is counted twice (fd + mem) and the baseline assertion is off by one.
     let out = std::process::Command::new("/usr/sbin/lsof")
-        .args(["-p", &pid, "-Fn"])
+        .args(["-p", &pid, "-a", "-d", "^mem", "-Fn"])
         .output()
         .expect("run lsof");
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
