@@ -356,7 +356,7 @@ fn a_reload_after_a_forward_releases_the_mapping_and_loads_a_different_model() {
 /// the first model's weights. The model fingerprint in [`GgufModel`] is what lets
 /// `register_weight` tell "reload of the same file" (reuse is correct) from "a
 /// different model" (copy).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", target_os = "macos"))]
 fn toy_with_changed_weight(label: &str) -> std::path::PathBuf {
     let path = toy_gguf();
     let temp = std::env::temp_dir().join(format!("minfer-745-{label}-{}.gguf", std::process::id()));
@@ -435,41 +435,139 @@ fn a_cuda_reload_registers_the_second_models_weights() {
     let _ = std::fs::remove_file(&temp);
 }
 
-/// [#745] A dropped model releases its Metal registrations, and the mapping goes
-/// with them once the engine's cache is gone too.
+/// [#752] A Metal reload: load, forward, drop, then load a *different* model.
 ///
 /// The zero-copy `MTLBuffer` aliases the mapping, so the part registration must
 /// keep the pages alive while the buffer exists; `ModelRegistration` drops the
-/// weight buffers first, then the part buffers, then the `Arc<MmapFile>` handles.
-/// The graph cache holds `Tensor` clones, so the engine's release is model +
-/// cache, not the model alone.
+/// weight buffers first, then the part buffers, then the `Arc<MmapFile>` handles
+/// (ADR-0077). The graph cache holds `Tensor` clones, so the engine's release is
+/// model + cache, not the model alone. This gate is the two-model shape #752 asks
+/// for: the first model's mapping and fd must be gone before the second model
+/// runs, and the second model must not reuse the first model's registration.
+#[cfg(target_os = "macos")]
+fn macos_open_fds_to(path: &std::path::Path) -> usize {
+    let pid = std::process::id().to_string();
+    let out = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-p", &pid, "-Fn"])
+        .output()
+        .expect("run lsof");
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = target.to_string_lossy();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with('n') && l[1..].ends_with(target.as_ref()))
+        .count()
+}
+
 #[cfg(target_os = "macos")]
 #[test]
-fn a_dropped_model_releases_its_metal_registration() {
+fn a_metal_reload_releases_the_first_mapping_and_runs_a_different_model() {
     crate::metal::MpsState::init();
     if crate::metal::MpsState::get().is_none() {
         eprintln!("skipping: no Metal device");
         return;
     }
-    let path = toy_gguf();
-    let gguf = load_gguf_model(&path).expect("the toy GGUF loads");
-    let alive = gguf.parts[0].mmap.alive();
-    let model =
-        crate::models::load_model_with(&gguf, "", crate::graph::offload::OffloadRequest::Layers(1))
-            .expect("the toy model loads");
+    let toy = toy_gguf();
+    let a_path =
+        std::env::temp_dir().join(format!("minfer-752-metal-a-{}.gguf", std::process::id()));
+    let b_path = toy_with_changed_weight("metal-reload-b");
+    std::fs::copy(&toy, &a_path).expect("copy the toy fixture for model A");
+
+    let load = |p: &std::path::Path| {
+        let gguf = load_gguf_model(p).expect("the toy GGUF loads");
+        let alive = gguf.parts[0].mmap.alive();
+        let model = crate::models::load_model_with(
+            &gguf,
+            "",
+            crate::graph::offload::OffloadRequest::Layers(1),
+        )
+        .expect("the toy model loads");
+        assert_eq!(
+            model.device(),
+            crate::models::Device::Metal,
+            "this gate needs the Metal path"
+        );
+        (gguf, model, alive)
+    };
+
+    let (gguf_a, model_a, alive_a) = load(&a_path);
     assert_eq!(
-        model.device(),
-        crate::models::Device::Metal,
-        "this gate needs the Metal path"
+        macos_open_fds_to(&a_path),
+        1,
+        "the live model must hold exactly one fd for its file"
     );
-    let mut cache = crate::graph::cache::GraphCache::new();
-    let logits = model.forward_graph_cached(&[1], &[0], 1, 16, &mut cache);
-    assert!(!logits.is_empty(), "the forward step must produce logits");
-    drop(model);
-    drop(cache);
-    drop(gguf);
+    let mut cache_a = crate::graph::cache::GraphCache::new();
+    let logits_a = model_a.forward_graph_cached(&[1], &[0], 1, 16, &mut cache_a);
+    assert!(!logits_a.is_empty(), "the forward step must produce logits");
+    // Zero-copy: every weight is a range of the part mapping, not a copy.
+    let mmap = gguf_a.parts[0].mmap.clone();
+    let base = mmap.as_slice().as_ptr() as usize;
+    let end = base + mmap.as_slice().len();
+    let qwen = model_a
+        .as_any()
+        .downcast_ref::<crate::models::qwen2::Qwen2Model>()
+        .expect("the toy fixture is a Qwen2 model");
+    let mut checked = 0usize;
+    for layer in &qwen.layers {
+        for w in [
+            &layer.attn_norm,
+            &layer.wq,
+            &layer.wk,
+            &layer.wv,
+            &layer.wo,
+            &layer.ffn_norm,
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            &layer.ffn_down,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let p = w.data().as_ptr() as usize;
+            assert!(
+                p >= base && p + w.data().len() <= end,
+                "weight {} is not a view of the part's mapping",
+                w.name
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "the toy model must expose weights to check");
+    drop(mmap);
+    drop(model_a);
+    drop(cache_a);
+    drop(gguf_a);
     assert!(
-        !alive.load(std::sync::atomic::Ordering::SeqCst),
-        "the Metal registration kept the mapping alive after model + cache drop"
+        !alive_a.load(std::sync::atomic::Ordering::SeqCst),
+        "the first model's Metal registration kept its mapping alive"
     );
+    assert_eq!(
+        macos_open_fds_to(&a_path),
+        0,
+        "the first model's fd must be closed after model + cache drop"
+    );
+
+    // A different model with the same tensor names/sizes: the registration id
+    // and the fingerprint keep it from reusing model A's buffers.
+    let (gguf_b, model_b, alive_b) = load(&b_path);
+    let mut cache_b = crate::graph::cache::GraphCache::new();
+    let logits_b = model_b.forward_graph_cached(&[1], &[0], 1, 16, &mut cache_b);
+    assert_ne!(
+        logits_a, logits_b,
+        "the second model produced the first model's logits; the Metal registration was reused"
+    );
+    drop(model_b);
+    drop(cache_b);
+    drop(gguf_b);
+    assert!(
+        !alive_b.load(std::sync::atomic::Ordering::SeqCst),
+        "the second model's Metal registration kept its mapping alive"
+    );
+    assert_eq!(
+        macos_open_fds_to(&b_path),
+        0,
+        "the second model's fd must be closed after model + cache drop"
+    );
+    let _ = std::fs::remove_file(&a_path);
+    let _ = std::fs::remove_file(&b_path);
 }

@@ -192,6 +192,26 @@ fn llama_greedy_tokens_match_the_pinned_llama_cpp_reference() {
     // is what that variable means everywhere else.
     #[cfg(target_os = "macos")]
     crate::metal::MpsState::init();
+    // [#752] run the pinned arm *after* a Metal reload: load, forward, drop, so
+    // the zero-copy registration-release path has run in this process before the
+    // Llama model is loaded and the 32 pinned ids are checked.
+    #[cfg(target_os = "macos")]
+    {
+        let toy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/toy/toy-qwen2-f32.gguf");
+        let toy_gguf = crate::gguf::load_gguf_model(&toy).expect("toy GGUF for the reload");
+        let toy_model = crate::models::load_model_with(
+            &toy_gguf,
+            "",
+            crate::graph::offload::OffloadRequest::Layers(1),
+        )
+        .expect("toy model for the reload");
+        let mut cache = crate::graph::cache::GraphCache::new();
+        let _ = toy_model.forward_graph_cached(&[1], &[0], 1, 16, &mut cache);
+        drop(toy_model);
+        drop(cache);
+        drop(toy_gguf);
+    }
 
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
