@@ -244,12 +244,16 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
 
     // === Model ===
     let model = match crate::models::load_model(&gguf_model) {
-        Some(m) => m,
-        None => {
-            eprintln!("Error: failed to load model");
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: {e}");
             return 1;
         }
     };
+    eprintln!("Loaded: {} layers", model.n_layer());
+    if let Some(line) = model.offload_report() {
+        eprintln!("minfer: {line}");
+    }
     let tokenizer = match crate::tokenizer::Tokenizer::load(ctx) {
         Ok(t) => t,
         Err(e) => {

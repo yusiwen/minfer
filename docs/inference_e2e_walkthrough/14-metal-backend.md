@@ -417,7 +417,7 @@ Finally the state is built with the device, the **runtime-queried limits**, and 
 The registration chain starts in the loader (doc 03). `load_tensor` (`models/qwen2/loader.rs:`) hands every weight tensor's raw bytes to the Metal registry as it is parsed:
 
 ```rust
-// src/models/qwen2/loader.rs:215 (`load_tensor`)
+// src/models/qwen2/loader.rs:212 (`load_tensor`)
     // Register weight tensors with GPU backends.
     #[cfg(target_os = "macos")]
     if let Some(mps) = crate::metal::MpsState::get() {

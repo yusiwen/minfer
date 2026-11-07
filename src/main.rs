@@ -1275,7 +1275,19 @@ fn main() {
         // The request is already in `gpu_layers_request`; the load prints where the blocks
         // landed (E5). Nothing else to do here.
     }
-    let model = models::load_model_with(&gguf_model, "", gpu_layers_request).expect("load model");
+    let model = match models::load_model_with(&gguf_model, "", gpu_layers_request) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    // #763 S3: the loader no longer prints these; the CLI renders the engine's
+    // answer. The sequence (`Loaded: N layers`, `Model loaded.`) is documented.
+    eprintln!("Loaded: {} layers", model.n_layer());
+    if let Some(line) = model.offload_report() {
+        eprintln!("minfer: {line}");
+    }
     if meta_flag {
         dump_key_tensors(ctx);
     } else {
