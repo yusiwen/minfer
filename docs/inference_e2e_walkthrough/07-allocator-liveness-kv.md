@@ -866,7 +866,7 @@ One more consistency requirement hides here: because `ensure_kv` sizes on
 *first use only* (excerpt 5), prefill and decode must pass the **same** `n_ctx`
 so the regions created during prefill are correctly sized for every decode
 step — the comment "Computed ONCE so prefill and decode size the same KV
-regions" `main.rs:1589` pins that.
+regions" `main.rs:1545` pins that.
 
 **Why are inputs f32 buffers at all?** Because the pool is uniform and the
 two numeric paths agree on f32 as the interchange format: GPU backends read

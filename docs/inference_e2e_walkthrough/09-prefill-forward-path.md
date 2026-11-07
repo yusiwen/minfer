@@ -114,7 +114,7 @@ data:
 This indirection is what lets *one* graph topology serve prefill *and* decode:
 prefill fills `positions` with `0, 1, 2, …, nt-1`; the decode loop fills it
 with one running number (`current_pos`, starting at the prompt length,
-`main.rs:897`, incrementing per step, `main.rs:997`). If positions were
+`main.rs:852`, incrementing per step, `main.rs:952`). If positions were
 instead baked into the topology (say, attention shaped to read exactly
 `n_past + nt` cache rows), the graph would have to be rebuilt on *every*
 decode step, because `n_past` changes every step — and the params-only reuse
@@ -184,7 +184,7 @@ problem bounded.
 ### 2.4 Why only the last token's logits (`n_out = 1`)
 
 The prefill forward's fourth argument is `n_out`, and the CLI passes `1`
-(`main.rs:1609`). This is the tail-row optimization whose *topology* doc 05
+(`main.rs:1565`). This is the tail-row optimization whose *topology* doc 05
 §2.8 built; here is the *why*.
 
 A transformer is **causal**: token `t`'s hidden state is computed only from
@@ -227,8 +227,8 @@ let ctx = params.n_ctx.max(input_ids.len());
 ```
 
 and passes that single number to *every* forward of the run — prefill at
-`main.rs:1609`, each decode step at `main.rs:1923`. The comment above it
-(`main.rs:1585-1589`) records the three facts that make this the right shape:
+`main.rs:1565`, each decode step at `main.rs:1879`. The comment above it
+(`main.rs:1541-1545`) records the three facts that make this the right shape:
 
 1. `n_ctx` **sizes the graph's KV regions** — the allocator carves each
    layer's K and V regions as `n_kv_embd × n_ctx` f32 elements, once (doc 07
@@ -238,7 +238,7 @@ and passes that single number to *every* forward of the run — prefill at
    tax).
 2. It **never shrinks below the prompt length** (`max`): the prompt itself
    needs `nt` KV slots, positions `0..nt`, and the decode loop continues at
-   `current_pos = input_ids.len()` (`main.rs:897`) — if `ctx < prompt len`,
+   `current_pos = input_ids.len()` (`main.rs:852`) — if `ctx < prompt len`,
    the very first decode position would overflow the regions.
 3. The model **clamps again** to `max_seq_len` (`n_ctx.min(max_seq_len)`,
    `graph.rs:392`): a prompt longer than the model was trained for is capped
@@ -315,17 +315,17 @@ G3-reduced path; the comment records its removal as R3-A2), and from there
 the value travels by **move**, Rust's zero-byte ownership transfer:
 
 ```rust
-let logits = model.forward(&input_ids, &positions, 1, ctx);  // owned Vec, main.rs:1609
-let last_logits: Vec<f32> = logits;      // move, main.rs:1611
+let logits = model.forward(&input_ids, &positions, 1, ctx);  // owned Vec, main.rs:1565
+let last_logits: Vec<f32> = logits;      // move, main.rs:1567
 ...
-let mut logits = last_logits;            // move into the decode binding, main.rs:1696
+let mut logits = last_logits;            // move into the decode binding, main.rs:1652
 ...
 let sampled = sampler::sample_with_config(&mut logits, ...); // borrow, mutate in place
 ...
-logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:1923
+logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:1879
 ```
 
-The decode loop's comment (`main.rs:1915-1916`) states the stakes: *forward()
+The decode loop's comment (`main.rs:1871-1872`) states the stakes: *forward()
 returns n_out\*nv logits (n_out=1 for single-token decode, exactly n_vocab),
 so move the Vec in place instead of copying 607 KB/token.* At ~300 decode
 tokens/second, an extra 608 KB copy per token would be ~180 MB/s of pure
@@ -354,7 +354,7 @@ from the decode side.
   node, same shape.
 - `n_out = 1` — the tail-row count (§2.4).
 - `ctx = max(params.n_ctx, nt)` — the KV region width for the whole run
-  (§2.5); `params.n_ctx` defaults to 4096 (`main.rs:74`).
+  (§2.5); `params.n_ctx` defaults to 4096 (`main.rs:44`).
 - `kv_cache` — **gone (#252)**. Until [#252] the call passed a legacy
   `KVCache` created in `main.rs`; the graph path always **ignored** it (the
   callee bound it as `_kv`) and the graph owns KV in its persistent regions.
@@ -427,12 +427,12 @@ caliber.
 
 #### The call chain — four hops, one delegation each
 
-`main.rs:1609` calls through the architecture-agnostic trait object
+`main.rs:1565` calls through the architecture-agnostic trait object
 (`Box<dyn ModelDef>`), so the static type knows nothing about Qwen. Each hop
 adds exactly one concern:
 
 ```
-main.rs:1609  model.forward(&input_ids, &positions, 1, ctx)
+main.rs:1565  model.forward(&input_ids, &positions, 1, ctx)
   │           trait method (models/mod.rs:224): the architecture-agnostic
   ▼           signature; callers must guarantee positions[i] < n_ctx
 qwen2/mod.rs:   impl ModelDef for Qwen2Model
@@ -588,7 +588,7 @@ ONLY inputs to graph reuse". The batch's composition — sequence count, cell
 rows, attention windows — is deliberately *not* here: it is data, refilled
 per forward (A7/E2).)
 
-#### The trace phase boundary (`src/trace.rs:`, CLI at `main.rs:790-797`)
+#### The trace phase boundary (`src/trace.rs:`, CLI at `main.rs:745-752`)
 
 ```rust
 /// CLI: mark the start of a phase (prefill / decode). Repeated calls within the
@@ -612,7 +612,7 @@ page can show the whole prefill execution node by node. Note the phase
 *naming* lives in the CLI, not the engine: the engine has `GraphType`, the
 trace has human-facing labels.
 
-#### The timing calibers (`src/main.rs:807-813`, `837`, `1000-1017`)
+#### The timing calibers (`src/main.rs:762-768`, `837`, `1000-1017`)
 
 Three stopwatches, three printed calibers — and the differences between them
 are the point:
@@ -745,7 +745,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
 - **`n_ctx` is a run-level constant.** Passing a different `n_ctx` to decode
   than to prefill breaks the run (§2.5, Q3): either silently (regions sized
   on first use) or loudly (the preflight assert). This is why the comment
-  says "computed ONCE" — and why `main.rs:1923` passes the *same* `ctx`
+  says "computed ONCE" — and why `main.rs:1879` passes the *same* `ctx`
   binding, not a recomputation.
 - **The legacy `kv_cache` argument is gone (#252).** It was dead on this path
   from the start — nothing read it in `forward_batch` — and [#252] deleted it
@@ -778,11 +778,11 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   in the thousands of tok/s and decode in the hundreds — the compute-bound vs
   memory-bound split of §2.3, visible in two numbers.
 - **`MINFER_TIMING=1`** — decomposes the decode side one level further
-  (`main.rs:1726-1731`): per token it times the sampler call (`t_samp`,
+  (`main.rs:1682-1687`): per token it times the sampler call (`t_samp`,
   accumulated at `main.rs`) and the `forward` call (`t_fwd`, `main.rs`
-  on the speculative path and `main.rs:1928` on the plain one — "CPU encode + GPU
+  on the speculative path and `main.rs:1884` on the plain one — "CPU encode + GPU
   exec + logits download" per the comment), then prints one line
-  (`main.rs:1942-1944`), e.g. `[MINFER_TIMING] over 512 tokens:
+  (`main.rs:1898-1900`), e.g. `[MINFER_TIMING] over 512 tokens:
   sample 0.02 ms/tok (1.2%), forward 3.30 ms/tok (98.8%)`. One
   paragraph is all it needs: it exists to answer "is my decode time
   *inference* or *sampling/streaming*?" — on every model in the support
