@@ -504,7 +504,7 @@ At forward time, before the graph is built or reused, the model asks a yes/no qu
 `metal_available()` (`metal_backend.rs:`) is just `MpsState::get().is_some()` — device present, not disabled. `weights_on_gpu` (`:721-777`) is the gate itself: it enumerates *every* tensor name the graph will read (embedding, output norm, lm_head, output bias, then per layer the norm, `wq/bq/wk/bk/wv/bv/wo`, the FFN norm, `ffn_gate/ffn_up/ffn_down`) and requires all of them in the Metal registry:
 
 ```rust
-// src/models/qwen2/graph.rs:815 (`weights_on_gpu`) (tail of weights_on_gpu)
+// src/models/qwen2/graph.rs:817 (`weights_on_gpu`) (tail of weights_on_gpu)
         #[cfg(target_os = "macos")]
         {
             let Some(mps) = crate::metal::MpsState::get() else {
