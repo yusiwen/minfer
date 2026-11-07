@@ -1882,7 +1882,7 @@ pub fn compile_schema_to_gbnf(schema: &Value) -> Result<String, String> {
 /// one GBNF (the `tool_choice` arguments, one per offered tool). The generic
 /// `j-*` prelude is **not** included: the caller appends one copy of
 /// [`GENERIC_RULES`], which the bodies reference.
-pub(crate) fn compile_schema_rules(
+pub fn compile_schema_rules(
     schema: &Value,
     prefix: &str,
 ) -> Result<(Vec<(String, String)>, String), String> {

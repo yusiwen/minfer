@@ -767,7 +767,7 @@ launches once, then submit them all with a single replay call) remove most of
 that tax without changing the kernels. The scheduler asks the CUDA backend,
 before executing a split, whether it wants to replay a capture
 (`BackendScheduler::execute` (`src/graph/scheduler.rs:137`); the ask itself is one line,
-`c.graph_replay(graph.uid, split.node_range, …)` at `graph_replay` (`src/graph/scheduler.rs:295`). On
+`c.graph_replay(graph.uid, split.node_range, …)` at `graph_replay` (`src/graph/scheduler.rs:299`). On
 the backend, `graph_replay_step` (`cuda_backend.rs:468`) runs a three-run
 protocol: the first two executions of a (graph uid, node range) go through
 normal per-node launches (`graph_runs` counter, `graph_replay_step` (`cuda_backend.rs:468`)); on

@@ -314,7 +314,7 @@ fn load_tensor(
                 ttype,
                 tensor.data(),
                 &tensor.shape,
-                crate::gguf_write::ggml_n_dims(&ti.ne) as usize,
+                crate::gguf::ggml_n_dims(&ti.ne) as usize,
             );
             device_bytes.set(device_bytes.get() + tensor.data().len());
         }

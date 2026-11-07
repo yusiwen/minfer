@@ -28,15 +28,15 @@ serde_json = { version = "1", features = ["raw_value"] }
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "preserve_order"] }
 
 # OpenAI-compatible HTTP server (OPENAI-CHAT-API-PLAN.md, Phase 2+)
-axum = "0.7"
+axum = { version = "0.7", optional = true }
 # `time` + `signal` are F8's (#51): the bounded graceful drain needs
 # `tokio::time::timeout` and the SIGINT/SIGTERM handlers. Both are platform-neutral
 # (no new crate, no new dependency), so the macOS and CUDA builds are unaffected.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-tower-http = { version = "0.6", features = ["cors"] }
-uuid = { version = "1", features = ["v4"] }
-futures-util = "0.3"
+tokio = { version = "1", optional = true, features = ["sync"] }
+tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
+tower-http = { version = "0.6", optional = true, features = ["cors"] }
+uuid = { version = "1", optional = true, features = ["v4"] }
+futures-util = { version = "0.3", optional = true }
 
 # Test-only. `AsyncReadExt`/`AsyncWriteExt` are what F8's `/metrics` test drives a
 # real HTTP/1.1 request with; the production `tokio` dependency stays without
@@ -55,12 +55,29 @@ sha2 = "0.10"
 
 [features]
 # Defaults keep `cargo build --release` producing today's binary. A consumer of
-# the engine uses `default-features = false` (ADR-0079); S2 makes the server's
-# dependencies optional, S9 turns the macOS Metal backend into a feature.
+# the engine uses `default-features = false` (ADR-0079); S9 turns the macOS
+# Metal backend into a feature.
 default = ["cli"]
 # The application layer: the binary and the modules only it uses.
 cli = ["server", "tooling"]
-server = []
+# The OpenAI-compatible HTTP server (axum + tokio), which includes `viz`.
+server = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:tokio-stream",
+    "dep:tower-http",
+    "dep:uuid",
+    "dep:futures-util",
+    "tokio/rt-multi-thread",
+    "tokio/macros",
+    "tokio/net",
+    "tokio/time",
+    "tokio/signal",
+    "observe",
+]
+# `live`/`viz` observation hooks. Off in a consumer build, where the engine core
+# must not need tokio (S2).
+observe = ["dep:tokio", "tokio/sync"]
 tooling = []
 
 cuda = []
