@@ -152,7 +152,7 @@ execute them as **identity copies** (`cpu_backend.rs:`,
 `cuda_backend.rs:`, `metal_backend.rs` likewise) — the allocator has no
 aliasing for views, so a view costs a full tensor copy. The builder appends
 sources before consumers, so node-id order *is* the execution order
-(`scheduler.rs:214`).
+(`scheduler.rs:218`).
 
 **Gap.** 🔴 Strided, zero-copy views and multi-output nodes were missing — **closed by D1 (2026-09-19)**: views are zero-copy with allocator-known aliasing, and `GraphBuilder::split_parts` exposes a node's single output as independent parts, so what remains under this header is model work (item 17), not IR work. Without
 them the IR cannot express slicing, concatenation, or a copy between

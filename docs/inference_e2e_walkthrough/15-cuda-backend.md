@@ -906,7 +906,7 @@ graph.
 #### 3.2.8 CUDA Graph capture/replay, the state machine
 
 `graph_replay_step` is called by the scheduler before each CUDA split
-executes (`scheduler.rs:201`) and returns whether replay covered the whole
+executes (`scheduler.rs:204`) and returns whether replay covered the whole
 node loop. Three states live in the backend: `graph_execs` (the captured,
 instantiated graphs keyed by `(uid, range)`), `graph_runs` (the warmup
 counter per key), and `capturing` (an open capture window, closed by
