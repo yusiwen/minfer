@@ -187,7 +187,7 @@ number consistent for the whole run.
 ### 2.5 Modes: where the same parsed data goes
 
 The parsed state fans out into mode-specific structs, and each mode takes a
-different subset. In `run_conversation` (`src/main.rs:2153`), the
+different subset. In `run_conversation` (`src/main.rs:2108`), the
 conversation gets a `ConversationSpec` (template, special tokens, `seed`,
 `n_ctx`, system prompt) plus a `TurnParams` (all the sampling knobs *plus*
 `stop_strings`) — every field is copied out of `GenParams`, so the
@@ -345,7 +345,7 @@ fallback:
 
 (`src/main.rs:`, condensed.) Three details carry the design:
 
-- **`next_val`** (`src/main.rs:554`) is a closure that peeks at
+- **`next_val`** (`src/main.rs:509`) is a closure that peeks at
   `raw_args[i+1]` and records `parse_err = Some("missing value for …")` if
   it is absent — the error is *remembered* and reported after the whole
   parse, so the user sees one clean message, not an early exit mid-list.

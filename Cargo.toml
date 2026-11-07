@@ -6,6 +6,12 @@ description = "A minimal local LLM inference engine built from scratch in Rust"
 license = "MIT"
 repository = "https://github.com/yusiwen/minfer"
 
+
+[[bin]]
+name = "minfer"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
 rand = "0.8"
 regex = "1"
@@ -48,6 +54,15 @@ tokio = { version = "1", features = ["io-util"] }
 sha2 = "0.10"
 
 [features]
+# Defaults keep `cargo build --release` producing today's binary. A consumer of
+# the engine uses `default-features = false` (ADR-0079); S2 makes the server's
+# dependencies optional, S9 turns the macOS Metal backend into a feature.
+default = ["cli"]
+# The application layer: the binary and the modules only it uses.
+cli = ["server", "tooling"]
+server = []
+tooling = []
+
 cuda = []
 # llama.cpp-style choice of how the CUDA runtime is linked: with `cuda_static`
 # the cudart archive (libcudart_static.a) is linked statically so the resulting

@@ -362,7 +362,7 @@ finds every possible match exactly once, in O(len(stop)) time.
 | Value | Type / shape | From |
 |---|---|---|
 | `logits` | `&mut Vec<f32>`, exactly `n_vocab` entries (151,936 for Qwen ≈ 0.6 MB) | the last forward (docs 09–11); prefill for the first step, one-token decode for every later step |
-| `params.temp` | `f32`, default 0.8 (0 = greedy) | `GenParams` (`src/main.rs:73`) |
+| `params.temp` | `f32`, default 0.8 (0 = greedy) | `GenParams` (`src/main.rs:43`) |
 | `params.top_k` | `usize`, default 40 | :68 |
 | `params.top_p` | `f32`, default 0.95 | :69 |
 | `params.repeat_penalty` | `f32`, default 1.1 | :70 |
