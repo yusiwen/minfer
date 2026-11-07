@@ -859,7 +859,7 @@ driver's one-time first-submit setup, which scales with total buffer bytes:
 289 ms at n_ctx 40960 vs 106 ms at 4096 — a 3× tax on the *first* token
 (`docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §2). The fix put the choice in the CLI's
 hands (`--n-ctx`, default 4096; doc 01 covered that side) and clamped it:
-`main.rs` computes `ctx` as the larger of `params.n_ctx` and `input_ids` (`main.rs:1553`) — a long prompt
+`main.rs` computes `ctx` as the larger of `params.n_ctx` and `input_ids` (`main.rs:1554`) — a long prompt
 must never overflow the notepad — and the model clamps again with
 `Qwen2Graph::forward` (`src/models/qwen2/graph.rs:`), which applies `n_ctx.min(max_seq_len)`.
 One more consistency requirement hides here: because `ensure_kv` sizes on

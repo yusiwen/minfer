@@ -16,6 +16,7 @@
 //! platform-gated, each carries its own cached `OnceLock`, and a Metal-only
 //! change cannot be compiled on the Linux host this slice was written on.
 
+use crate::graph::registry::BackendFilter;
 use std::sync::OnceLock;
 
 /// Everything the engine core needs to know before it runs, in one value.
@@ -25,6 +26,11 @@ use std::sync::OnceLock;
 /// `MINFER_NO_*=1` variable sets them to `false`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
+    // ── engine scope ────────────────────────────────────────────────────
+    /// The backends this engine may use (`--backend` / `MINFER_BACKENDS`).
+    /// The application resolves the names and sets this before installing;
+    /// `from_env` leaves it as [`BackendFilter::all`].
+    pub backends: BackendFilter,
     // ── graph shape / fusion ────────────────────────────────────────────
     /// `MINFER_NO_FUSE_QKV` (inverted).
     pub fuse_qkv: bool,
@@ -91,6 +97,7 @@ impl Default for EngineConfig {
     /// The built-in defaults: every optimisation on, every diagnostic off.
     fn default() -> Self {
         Self {
+            backends: BackendFilter::all(),
             fuse_qkv: true,
             fuse_ffn: true,
             ffn_composition: None,
@@ -130,6 +137,7 @@ impl EngineConfig {
         // to prove every knob has a documented home, so a dynamic `var(name)`
         // helper would hide them from the gate.
         Self {
+            backends: BackendFilter::all(),
             fuse_qkv: !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
             fuse_ffn: !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1"),
             ffn_composition: std::env::var("MINFER_FFN_COMPOSITION").ok(),
