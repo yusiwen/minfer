@@ -197,10 +197,10 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    trips; the assignment never considers the cost of the resulting movement, or
    whether a neighbouring op could be moved so the op becomes supportable. In
    practice this is masked today because the supported models build a *single*
-   GPU split on both GPU backends (`CUDA-BACKEND-DESIGN.md:313-315`), but it is
+   GPU split on both GPU backends (`CUDA-BACKEND-DESIGN.md:356-358`), but it is
    exactly what breaks the first time an op is unsupported — e.g. `Softmax` on
    both device backends (`src/graph/op_matrix.rs`), or `QkvBiasRopeStore`, which
-   only CUDA advertises (`cuda_backend.rs:2117`) while Metal refuses it
+   only CUDA advertises (`cuda_backend.rs:2127`) while Metal refuses it
    (`metal_backend.rs:700`).
 2. **Synchronous, host-mediated cross-backend movement.** — **partly closed by
    F5** ([#58](https://github.com/yusiwen/minfer/issues/58), 2026-09-24): the
@@ -268,7 +268,7 @@ scan a free list for an exact byte-length match and otherwise allocate fresh.
 2. **No size classes / no rounding.** Because matching is exact, a workload
    touching *k* distinct activation shapes ends up with *k* sets of live
    buffers. The pool is a per-`GraphCache` high-water mark that never shrinks
-   (documented as accepted debt, `CUDA-BACKEND-DESIGN.md:447`) — but that was
+   (documented as accepted debt, `CUDA-BACKEND-DESIGN.md:490`) — but that was
    reasoned about for a fixed-shape CLI run, not for a server whose prompt
    lengths vary per request. **E4 S2 (2026-09-23)** rounds every pooled
    activation to its class, so shapes inside one class share a buffer across
@@ -430,7 +430,7 @@ Two smaller but immediate items sit in this layer:
   invalidation (§2.4), not discarding the whole cache. As written, every request
   pays KV + pool re-allocation (≈235 MB for 7B at `n_ctx=4096`, f16) and
   invalidates the CUDA Graph capture warm-up (`pool_gen` bump,
-  `cuda_backend.rs:1345`).~~ **Fixed in B2**: the slot keeps its cache and a
+  `cuda_backend.rs:1355`).~~ **Fixed in B2**: the slot keeps its cache and a
   record of the tokens its rows hold; a request reuses the KV only when its
   prompt starts with exactly that sequence. Measured end-to-end (0.5B Q4_0,
   219-token second turn): prefill 219 → 16 tokens, time-to-first-token
@@ -463,7 +463,7 @@ scheduler's execute match (`scheduler.rs:`); the functions are registry-driven n
 
 GPU participation is decided by an all-or-nothing model-level gate: every weight
 must be registered on the GPU or the model runs on CPU (`ARCHITECTURE.md §5.2`;
-`CUDA-BACKEND-DESIGN.md:251-255`). The engine enumerates devices and honours
+`CUDA-BACKEND-DESIGN.md:294-298`). The engine enumerates devices and honours
 `--gpu N` but uses exactly one (`src/cuda/methods/init.rs:`); there is no
 `tensor_split`, no peer copies, and no remote-device backend.
 
@@ -674,7 +674,7 @@ precisely to break reuse on a weight swap, but nothing produces such a swap. �
 parity-only stubs that no architecture emits (`Scale`, `Softmax`, `View`,
 `Reshape`, `Permute`, `AttnMode::Mha` — `COMPUTE-GRAPH-DESIGN.md §1.3`), and
 `View`/`Reshape`/`Permute` execute as copies. CUDA additionally refuses
-`transpose_b` matmul (`cuda_backend.rs:1615`), and Metal refuses
+`transpose_b` matmul (`cuda_backend.rs:1625`), and Metal refuses
 `QkvBiasRopeStore` (`metal_backend.rs:700`) —
 so the two GPU backends do not implement the same op set, and a model's decode
 path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
@@ -837,7 +837,7 @@ behavioural defects found while executing the plan, already fixed.
 9. ~~**Single-entry cross-backend staging** (`GraphAllocator::cross_staging`), mitigated by
    the consumer-side filter at `scheduler::cross_input_ready`.~~ **Fixed in A5** — keyed
    by `(graph uid, node, dst_backend)`; two foreign consumers can now be served.
-10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2454`), so the
+10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2464`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
     with `copy_to_host` (`alloc.rs:`).
 11. **CUDA pool never releases device memory** (`cuda_backend.rs:`),
