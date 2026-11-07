@@ -772,3 +772,9 @@ name = "raw_fd"
 kind = "fn"
 file = "src/gguf.rs"
 reason = "Read by `gguf::tests` only (#745): the mapping's descriptor, asserted to stop pointing at the model file after a drop; production never inspects it."
+
+[[cuda]]
+name = "lease"
+kind = "field"
+file = "src/graph/cuda_backend.rs"
+reason = "Held only for its Drop (ADR-0078): CapturedGraph owns a CaptureLease so a model drop retains the weights a live captured exec may replay; reading the guard in production would be a no-op."
