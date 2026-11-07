@@ -180,6 +180,12 @@ struct CapturedGraph {
     range: (usize, usize),
     pool_gen: u64,
     kv_layout: i32,
+    /// [#758] retention lease on the weight registry. The recorded kernels hold
+    /// raw weight pointers, so while this exec can still be replayed a model drop
+    /// must retain (not free) the weights it referenced; dropping the lease is
+    /// what reaps them. Held only for its `Drop` — the exec's own field is `exec`.
+    #[cfg_attr(not(test), allow(dead_code))] // held only for its Drop: ADR-0078
+    lease: crate::cuda::CaptureLease,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,6 +591,10 @@ impl CudaBackend {
                     range: key.1,
                     pool_gen: self.pool_gen,
                     kv_layout: self.kv_layout,
+                    // The exec's kernels resolve weight pointers at capture time;
+                    // from here until this graph is dropped a model drop must keep
+                    // those buffers (ADR-0078).
+                    lease: crate::cuda::CaptureLease::acquire(),
                 });
                 if block {
                     self.state_sync();

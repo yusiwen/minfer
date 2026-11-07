@@ -15,17 +15,27 @@ extern "C" {
 }
 
 impl CudaState {
-    /// [#745] mark the model whose weights the next registrations belong to.
+    /// [#758] start a new model registration and make it the current owner of
+    /// everything the loader registers next.
     ///
-    /// The registry is name-keyed, and same-name+same-size reuse is only safe
-    /// for the *same* model: two checkpoints of one architecture register the
-    /// same names and sizes with different bytes. A reload of the same file
-    /// keeps its fingerprint, so the per-load reuse (the test suite's many
-    /// reloads) still applies; a different model with identical shapes falls
-    /// through to a fresh device copy.
-    pub fn begin_model(&self, fingerprint: u64) {
+    /// The returned handle is stored in the model. Its `Drop` calls
+    /// [`Self::release_registration`], which frees the model's device buffers —
+    /// immediately when no captured graph is live, or when the last capture is
+    /// dropped if one still references them (the CaptureLease contract).
+    ///
+    /// The registration id is **not** the model fingerprint: two loads of the same
+    /// file share the fingerprint (so the same-name+size device copy is reused) but
+    /// are separate owners, and each must be releasable on its own.
+    pub fn begin_model(&self, fingerprint: u64) -> std::sync::Arc<CudaModelRegistration> {
+        let id = self
+            .next_model_reg
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         self.model_id
+            .store(id, std::sync::atomic::Ordering::Relaxed);
+        self.model_fp
             .store(fingerprint, std::sync::atomic::Ordering::Relaxed);
+        std::sync::Arc::new(CudaModelRegistration::new(id))
     }
 
     pub fn register_weight(&self, name: &str, data: &[u8]) {
@@ -33,26 +43,32 @@ impl CudaState {
             return;
         }
         let model_id = self.model_id.load(std::sync::atomic::Ordering::Relaxed);
+        let model_fp = self.model_fp.load(std::sync::atomic::Ordering::Relaxed);
         {
             let w = self.weights.lock().unwrap();
-            if let Some((_, size)) = w.get(name) {
+            if let Some((old_ptr, size)) = w.get(name) {
                 if *size == data.len() {
                     let same_model =
-                        self.weight_models.lock().unwrap().get(name).copied() == Some(model_id);
+                        self.weight_models.lock().unwrap().get(name).copied() == Some(model_fp);
                     if same_model {
                         // Device weights are immutable within a model: same
                         // name + size + model ⇒ the same GGUF tensor. Reuse the
-                        // device copy instead of leaking one buffer per load.
+                        // device copy instead of leaking one buffer per load —
+                        // and add this registration as an owner, so a second
+                        // live load of the same file cannot free it under the
+                        // first.
+                        let ptr = old_ptr.0 as usize;
+                        drop(w);
+                        self.add_owner(ptr, model_id);
                         return;
                     }
-                    // A different model reusing the name and byte size: fall
-                    // through and register a fresh device copy. The old buffer
-                    // is deliberately NOT freed — a live captured graph may
-                    // still reference it; the leak is bounded by the number of
-                    // distinct (model, tensor) registrations.
+                    // A different model reusing the name and byte size: register
+                    // a fresh device copy. The old buffer stays in the ownership
+                    // ledger under its own registration (and is freed when that
+                    // registration releases, or reaped when its captures go).
                 }
-                // Different size (a different architecture registered the
-                // same tensor name): replace the entry, same non-free rule.
+                // Different size (a different architecture registered the same
+                // tensor name): same replace-and-ledger rule.
             }
         }
         // ANCHOR: register_weight
@@ -117,8 +133,270 @@ impl CudaState {
         self.weight_models
             .lock()
             .unwrap()
-            .insert(name.to_string(), model_id);
+            .insert(name.to_string(), model_fp);
+        // [#758] record the buffer in the ownership ledger. The name map above is
+        // only the "current buffer for this name" lookup; freeing follows owners,
+        // so a replaced buffer is charged to the E4 budget until its model goes.
+        let owners = if model_id == 0 {
+            Vec::new()
+        } else {
+            vec![model_id]
+        };
+        self.model_allocs.lock().unwrap().insert(
+            ptr as usize,
+            DeviceAlloc {
+                ptr: CudaPtr(ptr),
+                size: data.len(),
+                owners,
+                retired: false,
+            },
+        );
         // ANCHOR_END: register_weight
+    }
+
+    /// [#758] add `reg_id` as an owner of the allocation at `ptr`, if the ledger
+    /// knows it. This is the same-fingerprint reuse path: two live loads of one
+    /// file share a device copy, so neither may free it while the other lives.
+    fn add_owner(&self, ptr: usize, reg_id: u64) {
+        if reg_id == 0 {
+            return;
+        }
+        if let Some(alloc) = self.model_allocs.lock().unwrap().get_mut(&ptr) {
+            if !alloc.owners.contains(&reg_id) {
+                alloc.owners.push(reg_id);
+            }
+        }
+    }
+
+    /// [#758] record a lazily-built device cache allocation (the prefill f16
+    /// weight copy, `w16_cache`) against the registrations that own its source
+    /// weight, so a model drop frees it with the rest of that model's memory.
+    /// `source_ptr` is the raw weight's device pointer the cache is keyed by.
+    pub(crate) fn record_cache_alloc(
+        &self,
+        source_ptr: usize,
+        ptr: *mut std::ffi::c_void,
+        bytes: usize,
+    ) {
+        let mut allocs = self.model_allocs.lock().unwrap();
+        let owners = match allocs.get(&source_ptr) {
+            Some(source) => source.owners.clone(),
+            None => {
+                // A pre-ledger (test-only) registration has no owner; fall back to
+                // the current model so a real load's cache still has a release
+                // path, and an unattributed one simply stays for the process.
+                let id = self.model_id.load(std::sync::atomic::Ordering::Relaxed);
+                if id == 0 {
+                    Vec::new()
+                } else {
+                    vec![id]
+                }
+            }
+        };
+        allocs.insert(
+            ptr as usize,
+            DeviceAlloc {
+                ptr: CudaPtr(ptr),
+                size: bytes,
+                owners,
+                retired: false,
+            },
+        );
+    }
+
+    /// [#758] release one model registration.
+    ///
+    /// Every allocation loses this owner; an allocation whose owner list becomes
+    /// empty is either freed now (no live captured graph) or retired and kept for
+    /// [`Self::reap_retired`] (a live capture may still replay a kernel over it).
+    /// The name map entry is removed only while it still points at the released
+    /// buffer: a newer model may already have replaced that name.
+    pub(crate) fn release_registration(&self, id: u64) {
+        let captures = self.live_captures.load(std::sync::atomic::Ordering::SeqCst);
+        let mut freed: Vec<usize> = Vec::new();
+        let mut released: Vec<(usize, usize)> = Vec::new();
+        let mut freed_bytes = 0usize;
+        let mut retained_bytes = 0usize;
+        {
+            let mut allocs = self.model_allocs.lock().unwrap();
+            let keys: Vec<usize> = allocs.keys().copied().collect();
+            for key in keys {
+                let Some(alloc) = allocs.get_mut(&key) else {
+                    continue;
+                };
+                if let Some(pos) = alloc.owners.iter().position(|owner| *owner == id) {
+                    alloc.owners.remove(pos);
+                    if alloc.owners.is_empty() {
+                        released.push((key, alloc.size));
+                    }
+                }
+            }
+            for (ptr, _) in &released {
+                if captures == 0 {
+                    if let Some(done) = allocs.remove(ptr) {
+                        freed_bytes += done.size;
+                        freed.push(done.ptr.0 as usize);
+                    }
+                } else {
+                    if let Some(alloc) = allocs.get_mut(ptr) {
+                        alloc.retired = true;
+                        retained_bytes += alloc.size;
+                    }
+                }
+            }
+        }
+        if released.is_empty() {
+            return;
+        }
+        let released: std::collections::HashSet<usize> =
+            released.iter().map(|(ptr, _)| *ptr).collect();
+        self.forget_released(&released);
+        if !freed.is_empty() {
+            self.free_device_allocs(&freed);
+        }
+        if retained_bytes > 0 {
+            *self.last_release.lock().unwrap() = Some(ReleaseOutcome::Retained {
+                bytes: retained_bytes,
+                captures,
+            });
+            eprintln!(
+                "CUDA: retained {retained_bytes} bytes of device weights after their model was \
+                 dropped: {captures} captured graph(s) still reference them; they are freed when \
+                 the last capture is dropped"
+            );
+        } else if freed_bytes > 0 {
+            *self.last_release.lock().unwrap() = Some(ReleaseOutcome::Freed { bytes: freed_bytes });
+        }
+    }
+
+    /// [#758] free every retired allocation once no capture can reference it.
+    ///
+    /// Called by the last [`CaptureLease`] drop, which is the only point where the
+    /// answer changes from "a live exec may replay over these bytes" to "no live
+    /// exec exists".
+    pub(crate) fn reap_retired(&self) {
+        if self.live_captures.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            return;
+        }
+        let mut ptrs: Vec<usize> = Vec::new();
+        let mut bytes = 0usize;
+        {
+            let mut allocs = self.model_allocs.lock().unwrap();
+            let dead: Vec<usize> = allocs
+                .iter()
+                .filter(|(_, alloc)| alloc.retired && alloc.owners.is_empty())
+                .map(|(ptr, _)| *ptr)
+                .collect();
+            for ptr in dead {
+                if let Some(alloc) = allocs.remove(&ptr) {
+                    bytes += alloc.size;
+                    ptrs.push(alloc.ptr.0 as usize);
+                }
+            }
+        }
+        if ptrs.is_empty() {
+            return;
+        }
+        let released: std::collections::HashSet<usize> = ptrs.iter().copied().collect();
+        self.forget_released(&released);
+        self.free_device_allocs(&ptrs);
+        *self.last_release.lock().unwrap() = Some(ReleaseOutcome::Freed { bytes });
+        eprintln!(
+            "CUDA: released {bytes} bytes of retained device weights after the last captured \
+             graph referencing them was dropped"
+        );
+    }
+
+    /// [#758] remove every name and companion-plane entry that points at a
+    /// released allocation.
+    ///
+    /// The `weights`/`weight_models` maps are the name → current buffer lookup, so
+    /// only a name still pointing at the released buffer is removed — a newer
+    /// model may have replaced it in the meantime.
+    fn forget_released(&self, ptrs: &std::collections::HashSet<usize>) {
+        let dead: Vec<String> = {
+            let mut weights = self.weights.lock().unwrap();
+            let dead: Vec<String> = weights
+                .iter()
+                .filter(|(_, (ptr, _))| ptrs.contains(&(ptr.0 as usize)))
+                .map(|(name, _)| name.clone())
+                .collect();
+            for name in &dead {
+                weights.remove(name);
+            }
+            dead
+        };
+        {
+            let mut models = self.weight_models.lock().unwrap();
+            for name in &dead {
+                models.remove(name);
+            }
+        }
+        {
+            let mut padded = self.padded_weights.lock().unwrap();
+            for name in &dead {
+                padded.remove(name);
+            }
+        }
+        // Companion planes: keyed by the main weight pointer (q6k/q4k/w16) or by
+        // the raw q8_0 pointer (q80_p32 pair). Drop any entry whose key or value
+        // names a released allocation.
+        self.q6k_exp
+            .lock()
+            .unwrap()
+            .retain(|k, v| !ptrs.contains(k) && !ptrs.contains(&(v.0 as usize)));
+        self.q6k_dpl
+            .lock()
+            .unwrap()
+            .retain(|k, v| !ptrs.contains(k) && !ptrs.contains(&(v.0 as usize)));
+        self.q6k_dsc
+            .lock()
+            .unwrap()
+            .retain(|k, v| !ptrs.contains(k) && !ptrs.contains(&(v.0 as usize)));
+        self.q4k_dsc
+            .lock()
+            .unwrap()
+            .retain(|k, v| !ptrs.contains(k) && !ptrs.contains(&(v.0 as usize)));
+        self.q80_p32
+            .lock()
+            .unwrap()
+            .retain(|k, v| !ptrs.contains(k) && !ptrs.contains(&v.0) && !ptrs.contains(&v.1));
+        self.w16_cache
+            .lock()
+            .unwrap()
+            .retain(|k, v| !ptrs.contains(k) && !ptrs.contains(&(v.0 .0 as usize)));
+    }
+
+    /// [#758] synchronize the context stream, then free the given allocations.
+    ///
+    /// Registration copied on the context's own stream, so draining that stream is
+    /// what makes "no queued operation still writes these bytes" true before the
+    /// driver recycles them.
+    fn free_device_allocs(&self, ptrs: &[usize]) {
+        unsafe {
+            cudaStreamSynchronize(self.context_stream());
+        }
+        for ptr in ptrs {
+            unsafe {
+                cudaFree(*ptr as *mut std::ffi::c_void);
+            }
+        }
+    }
+
+    /// [#758] the outcome of the last registration release or reaping pass.
+    /// Test-only (#238): the two device acceptance gates assert the named
+    /// `Retained` outcome and the final `Freed` reaping.
+    #[cfg(test)]
+    pub(crate) fn last_release(&self) -> Option<ReleaseOutcome> {
+        *self.last_release.lock().unwrap()
+    }
+
+    /// [#758] how many captured graphs currently hold a retention lease.
+    /// Test-only (#238): the negative gate asserts a capture is live before it
+    /// drops the model.
+    #[cfg(test)]
+    pub(crate) fn live_captures(&self) -> usize {
+        self.live_captures.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Issue #188 probe, **test-only**: the pre-#188 registration H2D path, a

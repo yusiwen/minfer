@@ -322,8 +322,10 @@ fn f167_qwen3_q4k_registers_the_dsc_plane_exactly() {
             ),
             "the q4_K Qwen3 model did not come up on the device"
         );
-        drop(model);
 
+        // [#758] the planes are model-owned: inspect them while the model is
+        // alive. Dropping it now releases the ledger entries, which is what the
+        // new device tests assert; the inspection must happen first.
         let mut got: Vec<String> = state
             .q4dsc_planes()
             .into_iter()
@@ -383,6 +385,8 @@ fn f167_qwen3_q4k_registers_the_dsc_plane_exactly() {
             names.len(),
             "two weights share one plane buffer"
         );
+
+        drop(model);
 
         // Negative arms, each under its own namespace: a q8_0 Qwen3 (whose payload
         // is *longer* than q4_K's, so the payload gate is the only refuser) and a

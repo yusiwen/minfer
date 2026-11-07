@@ -435,6 +435,319 @@ fn a_cuda_reload_registers_the_second_models_weights() {
     let _ = std::fs::remove_file(&temp);
 }
 
+/// [#758] Copy a real GGUF and flip one byte inside its first tensor's payload.
+///
+/// The copy keeps every tensor name and shape but has a different fingerprint
+/// (path + inode + length + mtime, #745), so it stands for a second checkpoint of
+/// the same architecture — the "same shapes, different weights" reload arm.
+#[cfg(feature = "cuda")]
+fn cuda_copy_with_flipped_weight(src: &std::path::Path, label: &str) -> std::path::PathBuf {
+    let gguf = load_gguf_model(src).expect("the source GGUF loads");
+    let (off, len) = {
+        let ctx = &gguf.parts[0].ctx;
+        let ti = ctx
+            .info
+            .iter()
+            .find(|t| t.nbytes() >= 128)
+            .expect("the model has a tensor payload");
+        (ctx.offset + ti.offset as usize, ti.nbytes())
+    };
+    drop(gguf);
+    let dst = std::env::temp_dir().join(format!("minfer-{label}-{}.gguf", std::process::id()));
+    std::fs::copy(src, &dst).expect("copy the source GGUF");
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&dst)
+        .expect("open the copied GGUF");
+    // Halfway through the tensor, then 16 bytes in: a K-quant block's first bytes
+    // are the f16 d/dmin scale pair, so this lands in the quantized values instead
+    // of turning a scale into an infinity/NaN.
+    let pos = off + len / 2 + 16;
+    f.seek(SeekFrom::Start(pos as u64))
+        .expect("seek to the weight payload");
+    let mut byte = [0u8; 1];
+    f.read_exact(&mut byte).expect("read the payload byte");
+    f.seek(SeekFrom::Start(pos as u64))
+        .expect("seek back to the payload byte");
+    f.write_all(&[byte[0] ^ 0xFF])
+        .expect("flip the payload byte");
+    dst
+}
+
+/// [#758] Acceptance #1, device half: after a reload, free device memory returns
+/// to the pre-reload baseline and the two models produce different outputs.
+///
+/// Load A, run four forwards through one `GraphCache` (the third captures the
+/// decode split), record the free bytes, drop model + cache, and assert
+/// `cudaMemGetInfo` reports the baseline again within 128 MiB. Then load B — a copy
+/// of A with one weight byte flipped — forward it, and assert the logits differ
+/// (#755's identity property, kept green here). `weights_bytes()` must also return
+/// to its baseline: it now sums the ownership ledger, so a retained buffer would
+/// keep being charged, and it must be **exact** (the free-bytes bound is the
+/// looser one).
+///
+/// A warm-up cycle with B runs first, and the baseline is recorded after it. The
+/// CUDA context's one-time growth (kernel module pages, the state-level prefill
+/// scratches, graph-exec runtime bookkeeping) is not per-model weight memory;
+/// charging it to the tolerance would make the bound meaningless. The measured
+/// residual after a reload on GB10 is 50–59 MiB of that non-weight state, so the
+/// tolerance is 128 MiB — still far below the 727 MiB of device weights a leaked
+/// model holds, which is what this gate must catch. The measured reload is still
+/// A → B: the two paths have different fingerprints, so same-name+size reuse
+/// cannot hide a retained buffer.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "device memory: set MINFER_CUDA_RELOAD_TEST_MODEL to the cached 0.5B GGUF"]
+fn a_cuda_reload_frees_the_first_models_device_weights() {
+    let path = match std::env::var("MINFER_CUDA_RELOAD_TEST_MODEL") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            eprintln!("skipping: MINFER_CUDA_RELOAD_TEST_MODEL unset");
+            return;
+        }
+    };
+    crate::cuda::CudaState::init();
+    let Some(state) = crate::cuda::CudaState::get() else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    const TOL: usize = 128 << 20;
+    let free = |state: &crate::cuda::CudaState| match state.device_memory() {
+        crate::graph::allocplan::DeviceMemory::Reported { free, total } => (free, total),
+        other => panic!("cudaMemGetInfo must answer; got {other:?}"),
+    };
+    let b_path = cuda_copy_with_flipped_weight(&path, "758-cuda-reload-b");
+    let load = |p: &std::path::Path| {
+        let gguf = load_gguf_model(p).expect("the real GGUF loads");
+        let model = crate::models::load_model_with(
+            &gguf,
+            "",
+            crate::graph::offload::OffloadRequest::Layers(usize::MAX),
+        )
+        .expect("the real model loads");
+        assert_eq!(
+            model.device(),
+            crate::models::Device::Cuda,
+            "this gate needs the CUDA path"
+        );
+        (gguf, model)
+    };
+    let forward = |model: &dyn crate::models::ModelDef,
+                   cache: &mut crate::graph::cache::GraphCache| {
+        // Four decode steps: the third captures the split, the fourth replays it.
+        let mut logits = Vec::new();
+        for step in 0..4usize {
+            logits = model.forward_graph_cached(&[1], &[step], 1, 32, cache);
+        }
+        logits
+    };
+
+    // Warm-up: one full load/forward/drop cycle with B, so the baseline below
+    // includes everything the process grows once for CUDA. B is a different file
+    // from the measured A, so this cannot pre-populate A's names.
+    {
+        let (gguf, model) = load(&b_path);
+        let mut cache = crate::graph::cache::GraphCache::new();
+        let _ = forward(&*model, &mut cache);
+        drop(model);
+        drop(cache);
+        drop(gguf);
+        match state.last_release() {
+            Some(crate::cuda::ReleaseOutcome::Freed { bytes }) => assert!(
+                bytes > 0,
+                "the warm-up model's registration must have owned device buffers"
+            ),
+            other => panic!("the warm-up drop did not free its weights: {other:?}"),
+        }
+    }
+    let (baseline_free, total) = free(state);
+    let baseline_weights = state.weights_bytes();
+
+    let (gguf_a, model_a) = load(&path);
+    let mut cache_a = crate::graph::cache::GraphCache::new();
+    let logits_a = forward(&*model_a, &mut cache_a);
+    assert!(!logits_a.is_empty(), "the forward step must produce logits");
+    let (live_free, _) = free(state);
+    assert!(
+        live_free + TOL < baseline_free,
+        "model A's weights must occupy device memory while it is loaded: baseline {baseline_free} \
+         B, live {live_free} B"
+    );
+    let live_weights = state.weights_bytes();
+    assert!(
+        live_weights > baseline_weights,
+        "model A's device weights must be charged to the ledger: baseline {baseline_weights} B, \
+         live {live_weights} B"
+    );
+
+    drop(model_a);
+    drop(cache_a);
+    drop(gguf_a);
+    let (after_free, _) = free(state);
+    let after_weights = state.weights_bytes();
+    assert_eq!(
+        after_weights, baseline_weights,
+        "the dropped model's device weights are still charged: baseline {baseline_weights} B, \
+         after {after_weights} B"
+    );
+    assert!(
+        after_free + TOL >= baseline_free,
+        "a replaced weight kept its device buffer (#758): free bytes after dropping model + \
+         cache are {after_free}, below the pre-reload baseline {baseline_free} by more than the \
+         {TOL} B tolerance (total {total})"
+    );
+
+    let (gguf_b, model_b) = load(&b_path);
+    let mut cache_b = crate::graph::cache::GraphCache::new();
+    let logits_b = forward(&*model_b, &mut cache_b);
+    assert_ne!(
+        logits_a, logits_b,
+        "the second model produced the first model's logits; a name+size-keyed registry that \
+         served A's buffers would fail this (#755)"
+    );
+    drop(model_b);
+    drop(cache_b);
+    drop(gguf_b);
+    let _ = std::fs::remove_file(&b_path);
+    eprintln!(
+        "cuda_reload_free: total={total} baseline_free={baseline_free} live_free={live_free} \
+         after_free={after_free} tolerance={TOL} baseline_weights={baseline_weights} \
+         live_weights={live_weights} after_weights={after_weights}"
+    );
+}
+
+/// [#758] Acceptance #2, the negative arm: a captured graph that still references
+/// a weight blocks the free, by name.
+///
+/// Load A, forward four times (the third captures the decode split), then drop the
+/// model but **keep** the cache. The registration release must report
+/// `ReleaseOutcome::Retained` and keep charging the bytes, because a live exec's
+/// recorded kernels hold A's raw weight pointers. Dropping the cache drops the last
+/// `CaptureLease`, which reaps the retired allocations — the freeing is deferred,
+/// never skipped, and never a silent dangling pointer.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "device memory: set MINFER_CUDA_RELOAD_TEST_MODEL to the cached 0.5B GGUF"]
+fn a_cuda_release_is_retained_while_a_capture_is_live() {
+    let path = match std::env::var("MINFER_CUDA_RELOAD_TEST_MODEL") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            eprintln!("skipping: MINFER_CUDA_RELOAD_TEST_MODEL unset");
+            return;
+        }
+    };
+    crate::cuda::CudaState::init();
+    let Some(state) = crate::cuda::CudaState::get() else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    const TOL: usize = 128 << 20;
+    let free = |state: &crate::cuda::CudaState| match state.device_memory() {
+        crate::graph::allocplan::DeviceMemory::Reported { free, total } => (free, total),
+        other => panic!("cudaMemGetInfo must answer; got {other:?}"),
+    };
+    let load = || {
+        let gguf = load_gguf_model(&path).expect("the real GGUF loads");
+        let model = crate::models::load_model_with(
+            &gguf,
+            "",
+            crate::graph::offload::OffloadRequest::Layers(usize::MAX),
+        )
+        .expect("the real model loads");
+        assert_eq!(
+            model.device(),
+            crate::models::Device::Cuda,
+            "this gate needs the CUDA path"
+        );
+        (gguf, model)
+    };
+    let forward = |model: &dyn crate::models::ModelDef,
+                   cache: &mut crate::graph::cache::GraphCache| {
+        let mut logits = Vec::new();
+        for step in 0..4usize {
+            logits = model.forward_graph_cached(&[1], &[step], 1, 32, cache);
+        }
+        logits
+    };
+
+    // Warm-up: one load/forward/drop, so the context's one-time growth is in the
+    // baseline and the reload below registers A's names from scratch.
+    {
+        let (gguf, model) = load();
+        let mut cache = crate::graph::cache::GraphCache::new();
+        let _ = forward(&*model, &mut cache);
+        drop(model);
+        drop(cache);
+        drop(gguf);
+    }
+    let (baseline_free, _) = free(state);
+    let baseline_weights = state.weights_bytes();
+
+    let (gguf, model) = load();
+    let mut cache = crate::graph::cache::GraphCache::new();
+    let logits = forward(&*model, &mut cache);
+    assert!(!logits.is_empty(), "the forward step must produce logits");
+    assert!(
+        state.live_captures() > 0,
+        "four forwards through one cache must leave a captured graph holding a lease"
+    );
+    // Drop the model, keep the cache: the captured graph still references A.
+    drop(model);
+    drop(gguf);
+    let retained = match state.last_release() {
+        Some(crate::cuda::ReleaseOutcome::Retained { bytes, captures }) => {
+            assert!(bytes > 0, "the retained release must name its bytes");
+            assert!(captures > 0, "the retained release must name its captures");
+            bytes
+        }
+        other => panic!(
+            "a live captured graph must make the release retain, not free (or skip): {other:?}"
+        ),
+    };
+    let weights_while_retained = state.weights_bytes();
+    assert!(
+        weights_while_retained > baseline_weights,
+        "retained weights must stay charged to the E4 ledger: baseline {baseline_weights} B, \
+         retained {weights_while_retained} B"
+    );
+    let (free_while_retained, _) = free(state);
+    assert!(
+        free_while_retained + TOL < baseline_free,
+        "retaining must actually keep the bytes resident: baseline {baseline_free} B, retained \
+         {free_while_retained} B"
+    );
+
+    // Dropping the cache drops the captured graphs and their leases; the last one
+    // reaps the retired allocations.
+    drop(cache);
+    match state.last_release() {
+        Some(crate::cuda::ReleaseOutcome::Freed { bytes }) => assert!(
+            bytes >= retained,
+            "the reaped bytes ({bytes}) must cover the retained weights ({retained})"
+        ),
+        other => panic!("dropping the last capture must reap the retained weights: {other:?}"),
+    }
+    let weights_after = state.weights_bytes();
+    assert_eq!(
+        weights_after, baseline_weights,
+        "the reaped weights are still charged: baseline {baseline_weights} B, after {weights_after} B"
+    );
+    let (free_after, _) = free(state);
+    assert!(
+        free_after + TOL >= baseline_free,
+        "free bytes after the capture lease is dropped are {free_after}, below the baseline \
+         {baseline_free} by more than {TOL} B — the reaping did not return the weight buffers"
+    );
+    eprintln!(
+        "cuda_retain_lease: baseline_free={baseline_free} retained_free={free_while_retained} \
+         reaped_free={free_after} tolerance={TOL} baseline_weights={baseline_weights} \
+         retained_bytes={retained} weights_while_retained={weights_while_retained} \
+         weights_after={weights_after}"
+    );
+}
+
 /// [#752] A Metal reload: load, forward, drop, then load a *different* model.
 ///
 /// The zero-copy `MTLBuffer` aliases the mapping, so the part registration must

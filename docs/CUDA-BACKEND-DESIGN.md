@@ -116,10 +116,13 @@ only through `&mut self` (mirroring `MetalBackend`).
 
 Every graph-referenced tensor is uploaded once at model load and referenced by name afterwards:
 
-- `CudaState::register_weight(name, data)` allocates and H2D-copies; the same name **and** size is a
-  no-op (reloading the same GGUF must not leak a second device model), while a different size
-  replaces the entry and deliberately leaks the stale buffer, because a live captured graph may
-  still reference it. The leak is bounded by the number of distinct (architecture, tensor) shapes.
+- `CudaState::register_weight(name, data)` allocates and H2D-copies; the same name, size **and**
+  model fingerprint is a reuse of the same device copy (reloading the same GGUF must not leak a
+  second device model), while a different fingerprint or size replaces the entry with a fresh
+  device copy. The replaced buffer is **not** leaked: it stays in the ownership ledger under its
+  own model registration and is freed when that registration is released — or retained until the
+  last captured graph referencing it is dropped. The whole lifetime contract and the ledger are
+  below.
 - `has_weight_of_size(name, raw_len)` is the size-aware gate used by the model wiring; it matches
   repacked weights by their **original** raw length, so a foreign-architecture entry reads as "not
   registered" and that model stays on CPU.
@@ -159,6 +162,46 @@ Every graph-referenced tensor is uploaded once at model load and referenced by n
   weights exceed 2 GiB **and** MMQ is off; `MINFER_NO_W16CACHE=1` reverts.
 - `ModelLoadGuard` (reentrant, process-wide) serializes loader registration so two models with
   same-named tensors cannot interleave, and real-model tests hold it across their forwards.
+
+#### Weight lifetime and the ownership ledger (#758, ADR-0078)
+
+The name map (`weights`) is a **lookup**, not an ownership record. Ownership is
+`model_allocs: HashMap<usize, DeviceAlloc>` — every model-scoped device allocation
+with its pointer, size, owner registration ids and a `retired` flag. The loader
+calls `begin_model(fingerprint) -> Arc<CudaModelRegistration>` before the first
+weight registration and stores the handle on the model (`Qwen2Model::cuda` /
+`Qwen3Model::cuda`); the registration id is separate from the fingerprint, so two
+loads of one file share the fingerprint (and reuse the device copy) yet remain
+separately releasable.
+
+The contract, in the four states an allocation can be in:
+
+1. **Owned** — one or more live registrations list it. The name map serves the
+   current buffer; `get_weight_ptr` is unchanged.
+2. **Replaced** — a different fingerprint registered the same name. A new
+   allocation becomes the name's current buffer; the old allocation keeps its
+   owner and stays charged.
+3. **Released** — the model's `Arc<CudaModelRegistration>` dropped. The id leaves
+   every owner list; an allocation with no owners left is freed immediately
+   (`cudaFree` after the context stream is synchronized), its current names and
+   companion-plane entries removed. `ReleaseOutcome::Freed { bytes }` records it.
+4. **Retired** — the same release, but at least one captured graph is live. The
+   buffer is kept and `ReleaseOutcome::Retained { bytes, captures }` names why; the
+   names are removed (a dropped model must not be served), the bytes stay charged.
+   `CapturedGraph` owns a `CaptureLease`; the last lease's drop frees every retired
+   allocation and records `Freed { bytes }`. Every path that clears or replaces
+   captured execs (`CudaBackend::drop`, `set_kv_layout`, the graph-mode toggles, a
+   `pool_gen`/layout mismatch) drops leases naturally.
+
+`weights_bytes()` sums **the ledger** (retired allocations included), not the name
+map, so E4's weights term and `cudaMemGetInfo` describe the same memory. The
+companion planes (q6_K exp/dsc/dpl, q4_K dsc, q8_0 p32) and the lazily-built f16
+prefill cache are ledger entries too — they are freed with the weight, not left for
+the process lifetime. The two device gates are
+`a_cuda_reload_frees_the_first_models_device_weights` (free bytes return to the
+pre-reload baseline within 128 MiB, outputs differ) and
+`a_cuda_release_is_retained_while_a_capture_is_live` (the named `Retained` outcome,
+then the deferred reap).
 
 The graph-side CPU registry is separate: `register_graph_weights` registers into the allocator's CPU
 backend, which is what a CPU split of a mixed graph executes from; the CUDA registry is filled by the
@@ -1126,3 +1169,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0035](adr/0035-the-q4k-dsc-plane-admission-is-two-gates.md) — The q4_K dsc plane is admitted by two gates, and the payload test is equality
 - [ADR-0036](adr/0036-bf16-gets-its-own-device-kernels.md) — bf16 weights get their own device kernels, not a dtype flag on the f16 ones
 - [ADR-0038](adr/0038-the-per-tensor-registration-dispatch-is-one-shared-rule.md) — The per-tensor registration dispatch is one shared rule, not a copy per loader
+- [ADR-0078](adr/0078-a-cuda-weight-is-released-with-its-model-and-a-capture-holds-a-lease.md) — A CUDA weight is released with its model, and a live captured graph holds a lease

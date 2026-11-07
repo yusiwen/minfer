@@ -350,13 +350,15 @@ pub fn load(
     // lock across several forwards.
     #[cfg(feature = "cuda")]
     let _model_load_guard = crate::cuda::CudaState::model_load_guard();
-    // [#745] tell the name-keyed CUDA registry which model the next
-    // registrations belong to; a same-name+size entry from another model must
-    // be replaced, not reused.
+    // [#758] start the model registration the next weight registrations are
+    // tagged with. It also carries the [#745] model identity, so a same-name+size
+    // entry from another model is replaced rather than reused.
+    // The returned registration is the model's handle on its device
+    // allocations: dropping the last clone releases them (or retires them while a
+    // captured graph holds a lease — ADR-0078).
     #[cfg(feature = "cuda")]
-    if let Some(cuda) = crate::cuda::CudaState::get() {
-        cuda.begin_model(model.fingerprint);
-    }
+    let cuda_registration =
+        crate::cuda::CudaState::get().map(|cuda| cuda.begin_model(model.fingerprint));
     let ctx = &model.parts[0].ctx;
     let mut hparams = hparams_from_gguf(ctx)?;
 
@@ -674,6 +676,8 @@ pub fn load(
         // C4 per-engine: the loader stamps the resolved format after `device()` is
         // known (`models::load_model_configured`); F32 until then.
         kv_format: crate::graph::kvformat::KvFormat::F32,
+        #[cfg(feature = "cuda")]
+        cuda: cuda_registration,
         #[cfg(target_os = "macos")]
         metal: metal_registration,
     };

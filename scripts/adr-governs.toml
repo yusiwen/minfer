@@ -422,3 +422,28 @@ symbol = "ModelRegistration"
 adr = "0077"
 what = "the Metal part/weight registry is model-scoped; a model's zero-copy buffers do not outlive the mapping they alias"
 symbol = "MpsState"
+
+[[governs]]
+adr = "0078"
+what = "a CUDA weight allocation belongs to a model registration: the loader hands the model a `CudaModelRegistration`, and dropping it releases the model's device buffers"
+symbol = "CudaModelRegistration"
+
+[[governs]]
+adr = "0078"
+what = "the ownership ledger (pointer, size, owner registrations, retired flag) is what a release frees from and what the E4 weights term sums"
+symbol = "DeviceAlloc"
+
+[[governs]]
+adr = "0078"
+what = "a release frees an unowned allocation or defers it as `Retained` while a captured graph is live, and the last capture lease reaps it"
+symbol = "release_registration"
+
+[[governs]]
+adr = "0078"
+what = "a captured exec holds a retention lease on the weight registry, so dropping the model cannot free a buffer it may still replay over"
+symbol = "CaptureLease"
+
+[[governs]]
+adr = "0078"
+what = "`weights_bytes()` sums the ledger, retired bytes included, so the E4 weights term and cudaMemGetInfo describe the same memory"
+path = "src/cuda/methods/accounting.rs"

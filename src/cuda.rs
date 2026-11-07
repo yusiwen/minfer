@@ -72,6 +72,105 @@ struct CudaPtr(*mut std::ffi::c_void);
 unsafe impl Send for CudaPtr {}
 unsafe impl Sync for CudaPtr {}
 
+/// [#758] A model-scoped handle into the CUDA weight ledger.
+///
+/// The loader creates one before the first weight registration and stores it in the
+/// model (`Qwen2Model::cuda` / `Qwen3Model::cuda`). Dropping the last clone releases
+/// that model's device allocations: an allocation whose owner list becomes empty is
+/// freed immediately, unless a captured CUDA graph is still live — then it is
+/// `retired` and reaped when the last capture is dropped. This is the device-memory
+/// counterpart of the Metal `ModelRegistration` (ADR-0077); the decision is
+/// ADR-0078.
+pub struct CudaModelRegistration {
+    id: u64,
+}
+
+impl CudaModelRegistration {
+    /// The id the ledger tags this model's allocations with.
+    pub(crate) fn new(id: u64) -> Self {
+        Self { id }
+    }
+
+    /// The id the ledger tags this model's allocations with (introspection/tests).
+    /// Test-only (#238): the production reader is the ledger itself; a gate asserts
+    /// the released registration is the one that owned the dropped model's buffers.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for CudaModelRegistration {
+    fn drop(&mut self) {
+        if let Some(state) = CudaState::get() {
+            state.release_registration(self.id);
+        }
+    }
+}
+
+/// [#758] One model-scoped device allocation and the registrations that own it.
+///
+/// The ledger — not the name map — is what `weights_bytes()` sums: a replaced
+/// weight stays allocated (and charged) until its model registration is released,
+/// so the E4 weights term and `cudaMemGetInfo` cannot disagree.
+struct DeviceAlloc {
+    ptr: CudaPtr,
+    size: usize,
+    /// Registration ids that own this buffer. Same-name+same-size+same-fingerprint
+    /// reuse adds the current registration instead of allocating a second copy.
+    owners: Vec<u64>,
+    /// A registration released this allocation while a captured graph was live; the
+    /// bytes stay resident until [`CudaState::reap_retired`] frees them.
+    retired: bool,
+}
+
+/// [#758] What the last registration release (or reaping pass) did.
+///
+/// `Retained` is the named refusal the negative acceptance arm asserts: a live
+/// captured graph holds a lease on the weights, so the release keeps the bytes and
+/// says why. They are freed — as `Freed` — when the last capture is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    Freed { bytes: usize },
+    Retained { bytes: usize, captures: usize },
+}
+
+/// [#758] RAII lease a live [`CapturedGraph`] holds on the weight ledger.
+///
+/// Holding one keeps a released model's allocations from being freed. Dropping the
+/// last lease makes `CudaState` reap every retired allocation. `CapturedGraph` owns
+/// the lease, and every `graph_execs.clear()`/destruction path drops it naturally.
+pub struct CaptureLease {
+    live: bool,
+}
+
+impl CaptureLease {
+    pub(crate) fn acquire() -> Self {
+        match CudaState::get() {
+            Some(state) => {
+                state.live_captures.fetch_add(1, Ordering::SeqCst);
+                CaptureLease { live: true }
+            }
+            None => CaptureLease { live: false },
+        }
+    }
+}
+
+impl Drop for CaptureLease {
+    fn drop(&mut self) {
+        if !self.live {
+            return;
+        }
+        if let Some(state) = CudaState::get() {
+            // The last lease dropping is the only time reaping can be correct: any
+            // earlier capture may still replay a kernel over the retired buffers.
+            if state.live_captures.fetch_sub(1, Ordering::SeqCst) == 1 {
+                state.reap_retired();
+            }
+        }
+    }
+}
+
 // Sized buffer for cudaGetDeviceProperties (avoids fragile field-by-field layout).
 // Only the first 256 bytes (device name) are read; extra padding handles any CUDA version.
 #[repr(C)]
@@ -619,9 +718,28 @@ pub struct CudaState {
     /// the same architecture register the same names and sizes but different
     /// bytes, and a reload must not silently serve the first one's weights.
     weight_models: Mutex<HashMap<String, u64>>,
-    /// [#745] the fingerprint of the model currently loading, set by
-    /// `begin_model` before the loader registers anything.
+    /// [#758] the registration id of the model currently loading, set by
+    /// `begin_model` before the loader registers anything. Distinct from the
+    /// fingerprint: two loads of one file share the fingerprint but own separate
+    /// allocations.
     model_id: std::sync::atomic::AtomicU64,
+    /// [#758] the fingerprint of the model currently loading — the identity
+    /// `register_weight` uses to decide reuse versus a fresh device copy.
+    model_fp: std::sync::atomic::AtomicU64,
+    /// [#758] next registration id (0 is reserved for "no registration": a direct
+    /// `register_weight` in a test that never called `begin_model`).
+    next_model_reg: std::sync::atomic::AtomicU64,
+    /// [#758] every model-scoped device allocation, keyed by the pointer as
+    /// `usize`. This is the ownership ledger: a released registration frees each
+    /// allocation whose owner list becomes empty, unless a captured graph still
+    /// holds a lease (`retired`). `weights_bytes()` sums it, so retained bytes are
+    /// charged to the E4 budget while they are resident.
+    model_allocs: Mutex<HashMap<usize, DeviceAlloc>>,
+    /// [#758] captured graphs currently alive. Non-zero retains a dropped model's
+    /// allocations instead of freeing them; the last lease's drop reaps them.
+    live_captures: AtomicUsize,
+    /// [#758] the named outcome of the last release/reap (diagnostics + gates).
+    last_release: Mutex<Option<ReleaseOutcome>>,
     /// 8p: persistent per-weight f16 dequant cache, keyed by the device
     /// weight pointer → (f16 copy, bytes). The two-pass prefill GEMM used
     /// to dequantize W on EVERY call (288 ms per 7B @2K forward); weights
