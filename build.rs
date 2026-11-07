@@ -497,6 +497,12 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={out_dir}");
     println!("cargo:rustc-link-lib=static=cuda_kernels");
+    // #763 S1: with a library target, rustc records `cuda_kernels` as a native
+    // dependency of `minfer`'s rlib and deduplicates the build script's own
+    // directive, which can leave the archive scanned before the example's
+    // references. A raw linker argument bypasses that dedupe; `-L {out_dir}` is
+    // already on the line.
+    println!("cargo:rustc-link-arg-examples=-lcuda_kernels");
 
     // How is the CUDA runtime linked? Exactly like llama.cpp: a single build
     // flag toggles the cudart archive vs the shared library (there GGML_STATIC
