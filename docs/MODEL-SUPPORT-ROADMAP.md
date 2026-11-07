@@ -54,7 +54,7 @@ Four items are **not** covered by that estimate and apply to every port:
    loaders (`models/qwen2/loader.rs:171`, `models/qwen3/loader.rs:178`).
    `RopeStyle::Interleaved` exists and the CPU implements it
    (`graph/cpu_backend.rs:`), but CUDA refuses it
-   (`graph/cuda_backend.rs:1337`) and no loader ever selects it. A family
+   (`graph/cuda_backend.rs:1333`) and no loader ever selects it. A family
    needing interleaved RoPE (Llama 1/2, Mistral 7B v0.1) needs a loader change
    **and** a CUDA kernel, or must be converted to the non-interleaved
    convention.

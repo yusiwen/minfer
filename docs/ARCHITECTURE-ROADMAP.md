@@ -200,8 +200,8 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    GPU split on both GPU backends (`CUDA-BACKEND-DESIGN.md:356-358`), but it is
    exactly what breaks the first time an op is unsupported — e.g. `Softmax` on
    both device backends (`src/graph/op_matrix.rs`), or `QkvBiasRopeStore`, which
-   only CUDA advertises (`cuda_backend.rs:2127`) while Metal refuses it
-   (`metal_backend.rs:700`).
+   only CUDA advertises (`cuda_backend.rs:2123`) while Metal refuses it
+   (`metal_backend.rs:698`).
 2. **Synchronous, host-mediated cross-backend movement.** — **partly closed by
    F5** ([#58](https://github.com/yusiwen/minfer/issues/58), 2026-09-24): the
    boundary is now two registered phases. Phase A (`copy_across` →
@@ -408,7 +408,7 @@ server rejects any prompt longer than the slot context (`chat.rs:`);
 `new_slots` (`slot.rs:`) divides `n_ctx_total` equally per slot.
 `worker_loop` drains the queue **serially, one slot at a time** (`chat.rs:`),
 and every request starts from a fresh `GraphCache` (`chat.rs:84`). Default `--n-slots` is
-1 (`main.rs:484`), so the default server is strictly serial with a cold KV per
+1 (`main.rs:488`), so the default server is strictly serial with a cold KV per
 request.
 
 **Gap.** 🔴 This is the largest capability difference between what minfer does
@@ -430,7 +430,7 @@ Two smaller but immediate items sit in this layer:
   invalidation (§2.4), not discarding the whole cache. As written, every request
   pays KV + pool re-allocation (≈235 MB for 7B at `n_ctx=4096`, f16) and
   invalidates the CUDA Graph capture warm-up (`pool_gen` bump,
-  `cuda_backend.rs:1355`).~~ **Fixed in B2**: the slot keeps its cache and a
+  `cuda_backend.rs:1351`).~~ **Fixed in B2**: the slot keeps its cache and a
   record of the tokens its rows hold; a request reuses the KV only when its
   prompt starts with exactly that sequence. Measured end-to-end (0.5B Q4_0,
   219-token second turn): prefill 219 → 16 tokens, time-to-first-token
@@ -674,7 +674,7 @@ precisely to break reuse on a weight swap, but nothing produces such a swap. �
 parity-only stubs that no architecture emits (`Scale`, `Softmax`, `View`,
 `Reshape`, `Permute`, `AttnMode::Mha` — `COMPUTE-GRAPH-DESIGN.md §1.3`), and
 `View`/`Reshape`/`Permute` execute as copies. CUDA additionally refuses
-`transpose_b` matmul (`cuda_backend.rs:1625`), and Metal refuses
+`transpose_b` matmul (`cuda_backend.rs:1621`), and Metal refuses
 `QkvBiasRopeStore` (`metal_backend.rs:698`) —
 so the two GPU backends do not implement the same op set, and a model's decode
 path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
@@ -837,7 +837,7 @@ behavioural defects found while executing the plan, already fixed.
 9. ~~**Single-entry cross-backend staging** (`GraphAllocator::cross_staging`), mitigated by
    the consumer-side filter at `scheduler::cross_input_ready`.~~ **Fixed in A5** — keyed
    by `(graph uid, node, dst_backend)`; two foreign consumers can now be served.
-10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2464`), so the
+10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2460`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
     with `copy_to_host` (`alloc.rs:`).
 11. **CUDA pool never releases device memory** (`cuda_backend.rs:`),

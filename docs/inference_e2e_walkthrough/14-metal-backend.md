@@ -86,7 +86,7 @@ When does Metal *not* win? The doc records the counterexamples as guardrails: th
 Three rules decide whether any node runs on Metal, all resolved **before the graph exists**:
 
 1. **Priority order Metal → CUDA → CPU.** `GraphAllocator::supports` (`alloc.rs:`) asks backends in that fixed order and returns the first yes. If Metal is enabled, it wins every op it supports; CUDA (when compiled in) gets the leftovers it can run; CPU mops up the rest. Doc 15's backend joins the same queue.
-2. **Metal is enabled only if the whole model made it to the GPU.** The gate (`models/qwen2/graph.rs:640`, §3.2.6) requires *every* weight the graph reads — embeddings, all 28+ layer weights and biases, norms, lm_head — to be registered in the Metal registry (`has_weight`). One missing tensor ⇒ `metal_on = false` ⇒ the entire graph runs on CPU. This is the **all-weights-registered gate**: all-or-nothing participation, never a partial run where some layers are on the GPU and some on the CPU (which would be correct-but-mysterious; a split boundary per layer would also hammer the sync path).
+2. **Metal is enabled only if the whole model made it to the GPU.** The gate (`models/qwen2/graph.rs:638`, §3.2.6) requires *every* weight the graph reads — embeddings, all 28+ layer weights and biases, norms, lm_head — to be registered in the Metal registry (`has_weight`). One missing tensor ⇒ `metal_on = false` ⇒ the entire graph runs on CPU. This is the **all-weights-registered gate**: all-or-nothing participation, never a partial run where some layers are on the GPU and some on the CPU (which would be correct-but-mysterious; a split boundary per layer would also hammer the sync path).
 3. **Participation is part of graph identity.** The gate's outcome is recorded in `CParams.gpu` (`graph/params.rs:27`), and `GraphParams` is the *only* thing graph reuse compares (doc 13). So "was the GPU on" is baked into the cached graph: a change (MPS unavailable, weights not registered) changes `CParams.gpu`, fails `try_reuse`, and forces a rebuild with the new assignment — rather than silently reusing a graph whose backend assignments no longer hold.
 
 And the failure posture, which the repo treats as a hard rule: **kernel-invariant violations return `Err` from `execute_node` — never a silent CPU fallback.** If a weight is somehow not registered when a matmul executes, the arm returns `Err("weight '...' not on GPU")` and the run aborts with that message; if an op reaches the Metal arm that `supports_op` rejected, the arm returns `Err` too (`metal_backend.rs:`). The reasoning (`GPU_SAFETY.md` §2.3): a silent fallback *masks* a broken invariant — the model would keep producing text while the user has no idea half the graph silently ran somewhere else, or that a shape assumption was violated. Loud failure at the offending node is debuggable; quiet degradation is not. (Frontier guards that sit *below* the graph layer — dispatch-time checks like `gpu_abort` for device-limit overruns — print the actual values and exit, for the same reason.)
@@ -141,7 +141,7 @@ unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
 ```
 
-Three fields carry the design. `state` is a `&'static MpsState` — the device layer is a process-wide singleton (`static MPS: OnceLock<Option<MpsState>>`, `src/metal/`), created once by `MpsState::init()` from `main.rs:638` before the model loads; every backend instance just borrows it. `pool`/`free` implement the `Backend` buffer-pool contract: `pool[id]` is a shared `MTLBuffer`, and `free` is the recycle list the allocator's liveness analysis drives (doc 07). `cb_ptr` is the oddest: the in-flight command buffer is stored as a raw pointer to a leaked `Box`, because the objc2 command-buffer type is `!Send`/`!Sync` and Rust's borrow checker would otherwise forbid the pattern *create the buffer on first op → keep appending on later ops → submit at the split end* while also letting `cb()` hand out a `&'static mut` that does not borrow `self` (so encode methods can still touch the pool). The comment block is the safety argument: all access is sequential through `&mut self` on the single scheduler thread. This is also why `unsafe impl Send/Sync` appears — Metal objects are thread-safe in reality, but objc2 cannot prove it, so the type asserts it with the reasoning written out (`src/metal/` says the same for `MpsState`).
+Three fields carry the design. `state` is a `&'static MpsState` — the device layer is a process-wide singleton (`static MPS: OnceLock<Option<MpsState>>`, `src/metal/`), created once by `MpsState::init()` from `main.rs:642` before the model loads; every backend instance just borrows it. `pool`/`free` implement the `Backend` buffer-pool contract: `pool[id]` is a shared `MTLBuffer`, and `free` is the recycle list the allocator's liveness analysis drives (doc 07). `cb_ptr` is the oddest: the in-flight command buffer is stored as a raw pointer to a leaked `Box`, because the objc2 command-buffer type is `!Send`/`!Sync` and Rust's borrow checker would otherwise forbid the pattern *create the buffer on first op → keep appending on later ops → submit at the split end* while also letting `cb()` hand out a `&'static mut` that does not borrow `self` (so encode methods can still touch the pool). The comment block is the safety argument: all access is sequential through `&mut self` on the single scheduler thread. This is also why `unsafe impl Send/Sync` appears — Metal objects are thread-safe in reality, but objc2 cannot prove it, so the type asserts it with the reasoning written out (`src/metal/` says the same for `MpsState`).
 
 The command buffer is created lazily on the first op of a split:
 
@@ -166,7 +166,7 @@ The command buffer is created lazily on the first op of a split:
 #### 3.2.2 Capability table: `supports_op` and `supports_fused`
 
 ```rust
-// src/graph/metal_backend.rs:673 (`supports_op`) (abridged to the shape; full match in tree)
+// src/graph/metal_backend.rs:675 (`supports_op`) (abridged to the shape; full match in tree)
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         match op {
             Op::Input => true,
@@ -234,7 +234,7 @@ The recycle logic is an exact-size free-list search: reuse any dead buffer whose
 `execute_node` (`metal_backend.rs:`) is a 782-line `match &node.op` (the `match` opens at `:941`), and every arm follows the same rhythm: resolve metadata → look up weights by name → **encode** one or two kernel launches into `cb` → `Ok(())`. Nothing waits; the submit happens at the split boundary. The `MatMul` arm is the cleanest example:
 
 ```rust
-// src/graph/metal_backend.rs:1038 (`MatMul`)
+// src/graph/metal_backend.rs:1036 (`MatMul`)
             Op::MatMul { .. } => {
                 let meta = match &node.meta {
                     NodeMeta::MatMul(m) => m,
@@ -312,7 +312,7 @@ The guard is audit finding **M1** from `GPU_SAFETY.md` §3: the K-quant shaders 
 The **attention arm** (`metal_backend.rs:`) is the largest, and its opening is the safety story:
 
 ```rust
-// src/graph/metal_backend.rs:1204 (`nkt`) (guards; dispatch decision follows)
+// src/graph/metal_backend.rs:1202 (`nkt`) (guards; dispatch decision follows)
                 // GPU safety (H1): kernel_gqa_attn strides KV by nk*hd
                 if meta.nkt != meta.n_head_kv * meta.hd {
                     return Err(format!(
@@ -478,10 +478,10 @@ The same loader file also pre-builds the **fusion weights**: when `wq/wk/wv` sha
 
 #### 3.2.8 The all-weights-registered gate and `CParams.gpu`
 
-At forward time, before the graph is built or reused, the model asks a yes/no question (`models/qwen2/graph.rs:780`, `device`):
+At forward time, before the graph is built or reused, the model asks a yes/no question (`models/qwen2/graph.rs:778`, `device`):
 
 ```rust
-// src/models/qwen2/graph.rs:780 (`device`)
+// src/models/qwen2/graph.rs:778 (`device`)
         // GPU availability is part of the reuse identity (backend assignment
         // lives in the built graph, not in the params' other fields). Uses
         // attributes rather than `cfg!()` so the `metal_backend` path is not
@@ -644,7 +644,7 @@ Walk it as three defenses. **(1) A completion handler on a semaphore**: `addComp
     }
 ```
 
-This is §2.2's promise made concrete: `read_host` reinterprets the Metal buffer's `contents()` pointer as a Rust `&[f32]` — no copy, no sync — and `write_host` is `memcpy` with a length check. The two call patterns that matter: **inputs** are written here *before* the split's nodes encode (the scheduler skips `Op::Input` nodes precisely because "data pre-filled by the allocator", `scheduler.rs:`), and **outputs** are read after the split's sync — the logits path ends with `alloc.copy_to_cpu(graph.outputs[0])` (`models/qwen2/graph.rs:628`), which lands here once the final submit's completion handler has fired. Reading a buffer whose producing kernels are still *encoded but not submitted* would be the classic race; the one-command-buffer-per-split discipline plus the bounded submit is what makes these plain views safe.
+This is §2.2's promise made concrete: `read_host` reinterprets the Metal buffer's `contents()` pointer as a Rust `&[f32]` — no copy, no sync — and `write_host` is `memcpy` with a length check. The two call patterns that matter: **inputs** are written here *before* the split's nodes encode (the scheduler skips `Op::Input` nodes precisely because "data pre-filled by the allocator", `scheduler.rs:`), and **outputs** are read after the split's sync — the logits path ends with `alloc.copy_to_cpu(graph.outputs[0])` (`models/qwen2/graph.rs:626`), which lands here once the final submit's completion handler has fired. Reading a buffer whose producing kernels are still *encoded but not submitted* would be the classic race; the one-command-buffer-per-split discipline plus the bounded submit is what makes these plain views safe.
 
 There is one more readback path, used only by the trace/viz tooling (`MINFER_TRACE`, the viz server): `capture_split` (`metal_backend.rs:`) encodes a *blit* pass — `encode_captures` (`src/metal/encode.rs`), a GPU→GPU copy into per-split staging buffers appended *after* all the split's kernels — so the capture reads this step's data without forcing a per-node flush. The scheduler queues `(node, staging)` pairs during the split (`scheduler.rs:`) and drains them in `flush_metal_captures` right after the boundary sync (`:394-417`). It is a nice illustration of the submit model: even debug tooling has to work *with* the async pipeline, by scheduling its reads into the same command buffer.
 
@@ -789,7 +789,7 @@ no f16 KV kernel).
 
 - **Quant-shape assumptions get refused, not absorbed.** The K-quant `id % 256` guard (§3.2.4, audit M1) exists because the failure mode is *wrong numbers, no crash* — the worst kind. The same audit table accepts genuinely low-risk gaps with reasoning (L1: matmul pointers computed past the buffer for out-of-range rows but reads guarded; L2: `store_kv` trusts the host to keep positions < capacity, which doc 07's region sizing guarantees). Every accepted risk is written down with its mitigation — the audit doc is the invariant ledger.
 
-- **The registry and the graph must agree on shapes.** `FusedQkvNorm`'s per-head norms assume the concat layout (`q` at byte 0, `k` at `nqt*4` via `off_k` — `metal_backend.rs:`); `attn_bias_rope_store` assumes the same packing; the f16 KV kernels assume the region's first half is theirs (§3.1). These cross-file layout contracts are exactly where doc 10's lesson applies: they are tested with real-scale isolation tests (`metal_attn_kv_real_scale`, `metal_store_real_dims`, … — the `#[cfg(test)]` module at `metal_backend.rs:1142`), not just small shapes, because the transposed-output bug of doc 10 hid from `nt == 1` tests.
+- **The registry and the graph must agree on shapes.** `FusedQkvNorm`'s per-head norms assume the concat layout (`q` at byte 0, `k` at `nqt*4` via `off_k` — `metal_backend.rs:`); `attn_bias_rope_store` assumes the same packing; the f16 KV kernels assume the region's first half is theirs (§3.1). These cross-file layout contracts are exactly where doc 10's lesson applies: they are tested with real-scale isolation tests (`metal_attn_kv_real_scale`, `metal_store_real_dims`, … — the `#[cfg(test)]` module at `metal_backend.rs:1140`), not just small shapes, because the transposed-output bug of doc 10 hid from `nt == 1` tests.
 
 - **A shader typo must fail at startup, not at token 500.** §3.2.6's pipeline table makes every kernel name a startup-checked fact; the `metal_pipelines_compile` test pins it in CI. The Q5_0 incident (2026-08-06) — a duplicate symbol that silently downgraded the process to CPU and "looked like GPU throttling" — is the reason this is treated as an invariant rather than an annoyance.
 

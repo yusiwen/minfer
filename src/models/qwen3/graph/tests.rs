@@ -239,11 +239,11 @@ fn fused_qkv_norm_matches_unfused_decode() {
             fuse_qkv: false,
             ..crate::config::get().clone()
         };
-        let (pb, db) = crate::config::with_config(no_fuse, || {
+        let (pb, db, b) = crate::config::with_config(no_fuse, || {
             let mut b = GraphCache::new();
             let pb = Qwen3Graph::forward_cached(&q3, &ids, &positions, 1, n_ctx, &mut b);
             let db = Qwen3Graph::forward_cached(&q3, &[next], &[nt], 1, n_ctx, &mut b);
-            (pb, db)
+            (pb, db, b)
         });
 
         // prefill never fuses (nt>1) → both prefills must be bit-identical;

@@ -91,7 +91,7 @@ The loop also decides **when to stop**. Three gates live in (or beside) the
 loop: the sampled token is the end-of-text sentinel `is_stop_token` (`main.rs1955`),
 the generated *byte stream* now ends with a user-supplied stop string
 `match_stop_suffix` (`main.rs1722`), or the `-n` token cap is reached (the `while` condition
-itself, the loop head (`main.rs:1861`). Doc 12 introduced these; here we see them as the
+itself, the loop head (`main.rs:1865`). Doc 12 introduced these; here we see them as the
 loop's control flow.
 
 Finally, there is a longer-timescale version of the same trick: a multi-turn
@@ -397,7 +397,7 @@ instead of the next forward (§3.2 walks the code):
    doc 12 §3 owns the matcher). The matching bytes are truncated out of the
    kept text; already-printed bytes stay in the terminal, llama.cpp-style.
 3. **The `-n` cap.** The `while` condition `generated.len() < params.n_predict`
-   the loop head (`main.rs:1861`), default 512 in `GenParams::default` (`main.rs:`). In conversation mode a
+   the loop head (`main.rs:1865`), default 512 in `GenParams::default` (`main.rs:`). In conversation mode a
    fourth gate joins: the write cursor reaching `n_ctx` stops cleanly
    instead of overflowing the KV regions (`conversation.rs:`, the cursor guard).
 
@@ -417,12 +417,12 @@ and is only read:
 
 | Data | Type / shape | Where it comes from | Where it goes |
 |---|---|---|---|
-| `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`src/models/qwen2/graph.rs:661`) |
-| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`main.rs`) — starts at `input_ids.len()`, incremented once per step at `current_pos` (`main.rs`) | same, `src/models/qwen2/graph.rs:663`; the KV store uses it as the write slot, attention as the last readable slot |
+| `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`src/models/qwen2/graph.rs:659`) |
+| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`main.rs`) — starts at `input_ids.len()`, incremented once per step at `current_pos` (`main.rs`) | same, `src/models/qwen2/graph.rs:661`; the KV store uses it as the write slot, attention as the last readable slot |
 | K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
-| logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `src/models/qwen2/graph.rs:`) | moved into the loop's `logits` variable (`main.rs:1902-1916`, the `logits = model.forward(...)` assignment) for the next sample |
+| logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `src/models/qwen2/graph.rs:`) | moved into the loop's `logits` variable (`main.rs:1906-1920`, the `logits = model.forward(...)` assignment) for the next sample |
 | `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens — `recent_window` (`main.rs:1695, 1746-1751`) | the sampler's repeat/frequency/presence penalties (doc 12) |
-| `generated` | `Vec<u32>` | pushed per step (`main.rs:1886`, the `generated.push(...)` call) | stop checks, final stats; decode_bytes streams it to stdout |
+| `generated` | `Vec<u32>` | pushed per step (`main.rs:1890`, the `generated.push(...)` call) | stop checks, final stats; decode_bytes streams it to stdout |
 
 Two details of this table deserve unpacking.
 
@@ -488,7 +488,7 @@ hand the loop plays with on every iteration:
 - `current_pos = input_ids.len()`: the first generated token will be written
   at KV slot `nt` — the slot *after* the prompt. The KV regions were sized
   for `n_ctx` slots, and `ctx = params.n_ctx.max(input_ids.len())`
-  (`main.rs:1568-1582`, the `ctx` computation) guaranteed at prefill time that the prompt fits; from here
+  (`main.rs:1572-1586`, the `ctx` computation) guaranteed at prefill time that the prompt fits; from here
   the cursor only ever increments.
 - `special` carries the model's stop-token ids (eos, and `<|im_end|>` when
   the model defines one) — gate 1 of §2.7.
@@ -575,7 +575,7 @@ Reading it as a state machine, one iteration:
 5. **Gate: stop strings** — the tail of the excerpt: the token's bytes join
    `full`, and `match_stop_suffix` (`main.rs1722`) tests whether it
    now *ends* with a stop string; on a hit the text is truncated before the
-   match, else the new bytes are flushed to stdout (`main.rs:1891-1903`).
+   match, else the new bytes are flushed to stdout (`main.rs:1895-1907`).
 
 Only when all three gates pass does the iteration continue to the forward —
 the loop never runs the transformer for a token it has already decided to
@@ -707,7 +707,7 @@ and it probes GPU availability (`metal_on` / `cuda_on`), which feeds the
 #### The reuse decision itself `GraphCache` (`src/graph/cache.rs:`)
 
 With params in hand, the cache is asked one question
-(`src/models/qwen2/graph.rs:609`): `if !cache.try_reuse(&params).expect("re-map
+(`src/models/qwen2/graph.rs:607`): `if !cache.try_reuse(&params).expect("re-map
 onto a cached graph") { … }`. Here is the whole machinery:
 
 ```rust
@@ -852,7 +852,7 @@ the batch's `out_rows` (`src/models/qwen2/graph.rs`) — that input *only
 exists in prefill graphs* (`n_out < nt`), so its presence is data too.
 
 Finally `sched.execute(graph, alloc)` runs one scheduler walk
-(`src/models/qwen2/graph.rs:696`), and the output buffer is copied back as the returned
+(`src/models/qwen2/graph.rs:694`), and the output buffer is copied back as the returned
 logits (`src/models/qwen2/graph.rs:`). With G3 active the output buffer already holds
 exactly `n_out × n_vocab` values, so the return is either the buffer itself
 or a truncated copy — never a full-`nt` logits matrix (doc 09 covered the
@@ -1031,7 +1031,7 @@ Prefill computes attention and projections for all `nt` tokens (it must —
 every token's K/V goes into the cache), but only the *last* token's logits
 are wanted. So after the last layer's attention output projection, two
 `GetRows` nodes gather just the `n_out` tail rows (`tail_ids` is filled
-with `nt-1, …, nt-n_out` at `src/models/qwen2/graph.rs:681`), and the remaining FFN +
+with `nt-1, …, nt-n_out` at `src/models/qwen2/graph.rs:679`), and the remaining FFN +
 residual + lm_head run on `n_out` rows instead of `nt`. With `n_out = 1`
 and a 2000-token prompt, that saves a 2000-row lm_head GEMM — a 151,936
 column × 2000 row output — per run. In decode, `n_out == nt == 1`, the
@@ -1225,7 +1225,7 @@ as live for the whole step — `last_use` (`alloc.rs:`) — so that a liveness r
 can never clobber `token_ids` after it was filled but before its consumer
 ran. On a rebuild, `node_to_buf` is cleared and re-derived — the input
 *fill* in `forward_cached` happens *after* `alloc_graph` has produced the
-new mapping (`src/models/qwen2/graph.rs:645` before `src/models/qwen2/graph.rs:`), so fills always
+new mapping (`src/models/qwen2/graph.rs:643` before `src/models/qwen2/graph.rs:`), so fills always
 land in the buffers the scheduler will read.
 
 **4. Stale-but-unread KV after rollback.** `/regen` rewinds the cursor
@@ -1265,9 +1265,9 @@ by quota, and those are exactly the runs where the model would have kept
 going anyway.
 
 **8. `n_ctx` is computed once, before prefill, for both phases.**
-`ctx = params.n_ctx.max(input_ids.len())` (`main.rs:1568-1582`, the `ctx` computation) with the comment
+`ctx = params.n_ctx.max(input_ids.len())` (`main.rs:1572-1586`, the `ctx` computation) with the comment
 "Computed ONCE so prefill and decode size the same KV regions"
-(`main.rs:1582`, the "Computed ONCE" comment). If prefill and the first decode step disagreed on
+(`main.rs:1586`, the "Computed ONCE" comment). If prefill and the first decode step disagreed on
 `ctx`, they would disagree on `CParams`, the params comparison would fail,
 and — worse — `ensure_kv` would have sized regions from the prefill graph
 that the decode graph considers too small. One variable, computed early,
@@ -1291,9 +1291,9 @@ The decode loop and the reuse machinery are unusually observable — most of
 the evidence is on stderr of any plain run.
 
 - **The run header itself.** `Prefill: N tokens in …` vs
-  `Generated: M tokens in … (tok/s)` (`main.rs:1598-1609, 1854-1858`, the two rate headers) — two
+  `Generated: M tokens in … (tok/s)` (`main.rs:1602-1613, 1854-1858`, the two rate headers) — two
   deliberately different calibers (pure-decode rate vs blended rate,
-  `main.rs:1976-1989`, the pure-decode-vs-blended caliber comment). The gap between the two numbers *is* this
+  `main.rs:1980-1993`, the pure-decode-vs-blended caliber comment). The gap between the two numbers *is* this
   document's §2.2 argument, measured.
 - **`MINFER_TIMING=1`.** Splits the per-token wall clock into sampling vs
   forward milliseconds — `t_samp`/`t_fwd` (`main.rs1675, 1800-1804`). Expect sampling in the
@@ -1314,7 +1314,7 @@ the evidence is on stderr of any plain run.
   the other.
 - **`--dump-graph <dot>` / `--dump-graph-json <path>`.** Exits after
   exporting the graph the runtime *would* use — labeled `"decode"` when the
-  prompt is one token and `"prefill"` otherwise (`main.rs:1645-1656, 1545-1548`, the `kind` label).
+  prompt is one token and `"prefill"` otherwise (`main.rs:1649-1660, 1545-1548`, the `kind` label).
   Compare a prefill dump against a decode dump (feed a 1-token prompt) to
   see exactly which nodes the rebuild adds or removes.
 - **`MINFER_GRAPH_DUMP=<dir>`.** Writes `logits_decode.f32` plus every
