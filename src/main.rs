@@ -405,10 +405,6 @@ fn decode_token(tokenizer: &tokenizer::Tokenizer, id: u32) -> Vec<u8> {
 }
 
 fn main() {
-    // #763 S4: the engine reads `config::get()`, never the environment. The CLI is
-    // the one place that maps the documented `MINFER_*` interface into it, before
-    // any engine, device or graph exists.
-    minfer::config::install(minfer::config::EngineConfig::from_env());
     let raw_args: Vec<String> = std::env::args().collect();
     let prog = raw_args[0].clone();
 
@@ -430,7 +426,12 @@ fn main() {
             std::process::exit(1);
         }
     };
-    minfer::graph::registry::install_filter(backend_filter);
+    // #763 S4/S5: the engine reads `config::get()`, never the environment, and
+    // the fence is the config's `backends` field. Install once, here, before any
+    // device, graph or allocator exists; a second install would be ignored.
+    let mut engine_config = minfer::config::EngineConfig::from_env();
+    engine_config.backends = backend_filter;
+    minfer::config::install(engine_config);
 
     // `bench` subcommand: parsed separately (its -p/-n/-r/-o flags are
     // bench-local and must not collide with the global inference options,
@@ -1118,7 +1119,7 @@ fn main() {
     // message distinct from "unknown backend" and from "not compiled into this
     // build", and never a silent fall back to the CPU.
     if let Err(e) =
-        minfer::graph::registry::check_available(minfer::graph::registry::active_filter())
+        minfer::graph::registry::check_available(&minfer::graph::registry::active_filter())
     {
         eprintln!("Error: {e}");
         std::process::exit(1);

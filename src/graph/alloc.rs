@@ -210,7 +210,7 @@ impl Default for GraphAllocator {
             budget: HashMap::new(),
             offload: None,
             kv: super::kvcache::KvCache::new(),
-            filter: super::registry::active_filter().clone(),
+            filter: super::registry::active_filter(),
             persistent: Vec::new(),
         }
     }
@@ -435,7 +435,7 @@ impl GraphAllocator {
 
     /// F4: the backends this run may offer (the `--backend` / `MINFER_BACKENDS`
     /// fence). Production installs it once at startup through
-    /// `registry::install_filter`, before any allocator exists — so the field's
+    /// `config::get().backends` or a `registry::with_filter` scope — so the field's
     /// default is already the run's fence. These two are the per-allocator test
     /// surface (the device-gated assignment gate needs to fence one allocator
     /// without touching the process).

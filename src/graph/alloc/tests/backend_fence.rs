@@ -14,7 +14,7 @@ fn a_fresh_allocator_inherits_the_runs_backend_filter() {
     let alloc = GraphAllocator::new();
     assert_eq!(
         alloc.backend_filter(),
-        crate::graph::registry::active_filter()
+        &crate::graph::registry::active_filter()
     );
     // The process-wide default is unfiltered in the test binary (nothing
     // installs a fence here), so the assignment is unchanged for every
@@ -143,4 +143,49 @@ fn set_kv_format_stamps_the_cuda_layout_per_engine() {
     );
     assert_eq!(alloc.kv_format(), KvFormat::F16);
     assert_eq!(alloc.cuda().unwrap().kv_format(), KvFormat::F16);
+}
+
+/// #763 S5: the fence belongs to the **engine**, not the process.
+///
+/// An allocator built inside a scope inherits that scope's fence, and the
+/// process default is back as soon as the scope ends — which is what lets two
+/// engines in one process disagree about which backends they may use.
+#[test]
+fn a_scoped_engine_carries_its_own_fence_and_restores_the_default() {
+    use crate::graph::registry::{active_filter, with_filter, BackendFilter};
+
+    let cpu = BackendFilter::from_names(["cpu"]).expect("cpu is a backend name");
+    assert!(active_filter().is_unfiltered(), "the test process default");
+
+    let (seen, support) = with_filter(cpu.clone(), || {
+        let alloc = GraphAllocator::new();
+        (
+            alloc.backend_filter().clone(),
+            alloc.supports(&Op::Input, DType::F32),
+        )
+    });
+    assert_eq!(seen, cpu, "the allocator inherits the engine's fence");
+    assert_eq!(support, Some(Backend::CPU));
+    assert!(
+        active_filter().is_unfiltered(),
+        "leaving the scope must restore the process configuration"
+    );
+}
+
+/// Nested scopes compose: an inner engine sees its own fence, and the outer
+/// engine's fence is back when the inner one ends.
+#[test]
+fn two_engine_scopes_see_their_own_fence() {
+    use crate::graph::registry::{active_filter, with_filter, BackendFilter};
+
+    let cpu = BackendFilter::from_names(["cpu"]).expect("cpu is a backend name");
+    let all = BackendFilter::all();
+    with_filter(cpu.clone(), || {
+        assert_eq!(active_filter(), cpu);
+        with_filter(all.clone(), || {
+            assert_eq!(active_filter(), all, "the inner engine's fence");
+        });
+        assert_eq!(active_filter(), cpu, "the outer engine's fence is restored");
+    });
+    assert!(active_filter().is_unfiltered());
 }

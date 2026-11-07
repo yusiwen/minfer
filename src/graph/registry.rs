@@ -526,19 +526,33 @@ pub fn check_available(filter: &BackendFilter) -> Result<(), String> {
     Ok(())
 }
 
-/// The process-wide filter the graph builders and the allocator read, installed
-/// once at startup. Unset = [`BackendFilter::all`].
-static ACTIVE_FILTER: OnceLock<BackendFilter> = OnceLock::new();
-
-/// Install the run's filter. Called once, at startup, before any allocator or
-/// graph exists.
-pub fn install_filter(filter: BackendFilter) {
-    let _ = ACTIVE_FILTER.set(filter);
+thread_local! {
+    /// The fence of the engine running on this thread (#763 S5). Set by
+    /// [`with_filter`], read by the graph builders and the allocator.
+    static SCOPED_FILTER: std::cell::RefCell<Option<BackendFilter>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// The filter in force (every backend when nothing was installed).
-pub fn active_filter() -> &'static BackendFilter {
-    ACTIVE_FILTER.get_or_init(BackendFilter::all)
+/// The fence in force: this thread's scoped engine filter, else the installed
+/// configuration's ([`crate::config::EngineConfig::backends`]). Every backend
+/// when neither is set.
+pub fn active_filter() -> BackendFilter {
+    SCOPED_FILTER
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| crate::config::get().backends.clone())
+}
+
+/// Run `f` with `filter` as the fence on this thread — one engine's own
+/// `--backend` choice, without touching another engine's. The previous scope is
+/// restored on return, so nested scopes compose; outside any scope the answer is
+/// the process configuration's.
+pub fn with_filter<T>(filter: BackendFilter, f: impl FnOnce() -> T) -> T {
+    let prev = SCOPED_FILTER.with(|cell| cell.replace(Some(filter)));
+    let out = f();
+    SCOPED_FILTER.with(|cell| {
+        cell.replace(prev);
+    });
+    out
 }
 
 #[cfg(test)]

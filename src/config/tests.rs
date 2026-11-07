@@ -10,6 +10,7 @@ fn defaults_keep_every_optimisation_on() {
     assert!(c.avx2 && c.avx512 && c.neon && c.f16_rowb && c.context_shift);
     assert!(!c.packed_kv_stage && !c.metal_sync_ops && !c.sync_copies && !c.op_profile);
     assert!(c.kv_cache_type.is_none() && c.gpu_layers.is_none() && c.gpu_mem.is_none());
+    assert_eq!(c.backends, crate::graph::registry::BackendFilter::all());
 }
 
 #[test]

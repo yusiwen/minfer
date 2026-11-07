@@ -216,7 +216,8 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
     crate::metal::MpsState::init();
     #[cfg(feature = "cuda")]
     crate::cuda::CudaState::init();
-    if let Err(e) = crate::graph::registry::check_available(crate::graph::registry::active_filter())
+    if let Err(e) =
+        crate::graph::registry::check_available(&crate::graph::registry::active_filter())
     {
         eprintln!("Error: {e}");
         return 1;
