@@ -8,17 +8,24 @@ use super::*;
 impl CudaState {
     /// Bytes of device-resident weights this state holds (E4: the feasibility gate
     /// charges the budget for them, so "weights + activations" is one comparison).
-    /// Sums the registry; the padded-plane companions are accounted by their own
-    /// registers and are deliberately not double-counted here.
     ///
-    /// A poisoned lock is recovered rather than answered with `0`: this registry is
-    /// append-only, so the map behind a poison is still valid, and reporting 0 would
-    /// silently *under*-charge the budget by every resident weight (issue #122's
-    /// fail-open twin).
+    /// [#758] Sums the **ownership ledger**, not the name map. The name map holds
+    /// only the current buffer per name; a replaced buffer stays resident until its
+    /// model registration releases it (and, while a captured graph is live, until
+    /// the last capture is dropped). Counting the ledger is what keeps this term
+    /// equal to what `cudaMemGetInfo` reports as unavailable, so a reloading server
+    /// cannot under-charge its budget by the replaced buffers.
+    ///
+    /// A poisoned lock is recovered rather than answered with `0`: the ledger is
+    /// append-only, so the map behind a poison is still valid, and reporting 0
+    /// would silently *under*-charge the budget by every resident weight (issue
+    /// #122's fail-open twin).
     pub fn weights_bytes(&self) -> usize {
-        crate::graph::alloc::weights_from_lock(self.weights.lock(), "CUDA weight registry", |w| {
-            w.values().map(|(_, size)| *size).sum()
-        })
+        crate::graph::alloc::weights_from_lock(
+            self.model_allocs.lock(),
+            "CUDA weight ledger",
+            |ledger| ledger.values().map(|alloc| alloc.size).sum(),
+        )
     }
 
     /// Device memory free/total in bytes, queried now (E4's default budget uses `free`).

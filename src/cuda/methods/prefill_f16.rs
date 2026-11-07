@@ -170,6 +170,10 @@ impl CudaState {
             .lock()
             .unwrap()
             .insert(wptr as usize, (CudaPtr(ptr), bytes));
+        // [#758] a lazily-built cache buffer is model-scoped device memory too:
+        // record it against the registrations that own the weight it caches, so a
+        // model drop frees it with the weight instead of leaving it behind.
+        self.record_cache_alloc(wptr as usize, ptr, bytes);
         Some(ptr)
     }
 

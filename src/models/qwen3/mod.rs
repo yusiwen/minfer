@@ -41,6 +41,13 @@ pub struct Qwen3Model {
     /// C4 per-engine (issue #99): the KV storage format this engine resolved from
     /// `MINFER_CACHE_TYPE` at load (`F32` until `ModelDef::set_kv_format` stamps it).
     pub kv_format: crate::graph::kvformat::KvFormat,
+    /// [#758] the model's CUDA registration. The loader creates it before the
+    /// first weight registration; dropping the last clone releases the model's
+    /// device allocations (or retires them until the last captured graph that
+    /// references them is dropped — ADR-0078). `None` in a build without the
+    /// `cuda` feature or when the device is unavailable.
+    #[cfg(feature = "cuda")]
+    pub cuda: Option<std::sync::Arc<crate::cuda::CudaModelRegistration>>,
     /// [#745] the model's Metal registration. The loader creates it before the
     /// first part/weight registration; dropping the last clone releases the
     /// device buffers and then the mapping handles. `None` off macOS or when MPS
@@ -69,6 +76,13 @@ impl ModelDef for Qwen3Model {
     /// Where this model's forwards run (E6) — delegated to the graph's single
     /// authority, so the server's batching default and `CParams.gpu` agree.
     fn device(&self) -> crate::models::Device {
+        // [#758] a live CUDA model owns a registration; without one it has no
+        // release path for the weight buffers it registered, so it must not claim
+        // the device (the CUDA twin of the Metal gate below).
+        #[cfg(feature = "cuda")]
+        if crate::cuda::CudaState::get().is_some() && self.cuda.is_none() {
+            return crate::models::Device::Cpu;
+        }
         // [#745] a live MPS model owns a registration; without one it cannot
         // be the Metal path (the registration is what keeps the pages mapped).
         #[cfg(target_os = "macos")]

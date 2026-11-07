@@ -485,17 +485,19 @@ acceptance probe needs in order to measure the capture mode against the
 *historical* setup.
 
 The listing is the source itself (an `ANCHOR` block, included by mdBook, so it
-cannot drift from `weights.rs`). Two ownership rules sit just above the
-anchor: a re-registration with the **same name and size reuses the existing
-device copy** (unit tests reload the same file; weights are immutable, so
-there is nothing to refresh), while a *different* size replaces the entry and
-**deliberately leaks the stale buffer** — a live captured CUDA Graph may
-still reference the old address, and the leak is bounded by the number of
-distinct tensor shapes ever loaded. Device memory ownership is serious
-enough that this rule got its own bullet in `docs/GPU_SAFETY.md`. Inside the
-listing, the padded-flag comment states the third: a plain re-registration
-must clear a stale Q6_K marker, or the padded-224 kernel would read a raw-210
-buffer.
+cannot drift from `weights.rs`). The ownership rule that sits just above the
+anchor has two halves: a re-registration with the **same name, size and model
+fingerprint reuses the existing device copy** (unit tests reload the same file;
+weights are immutable, so there is nothing to refresh), while a *different*
+fingerprint or size gets a fresh device copy. The replaced buffer is **not**
+leaked — it stays in the ownership ledger under its own model registration and
+is freed when that registration is released, or retained until the last captured
+CUDA Graph referencing it is dropped (ADR-0078,
+`docs/CUDA-BACKEND-DESIGN.md` §2.3 "Weight lifetime and the ownership ledger").
+Device memory ownership is serious enough that this rule got its own bullet in
+`docs/GPU_SAFETY.md`. Inside the listing, the padded-flag comment states the
+third: a plain re-registration must clear a stale Q6_K marker, or the padded-224
+kernel would read a raw-210 buffer.
 
 Special layouts register through special entries. The important one is Q6_K:
 the raw 210-byte block stride forces 1-byte-per-instruction weight loads that

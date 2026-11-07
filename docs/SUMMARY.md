@@ -96,6 +96,7 @@
     - [0075. A model owns the mapping it reads, and a tensor carries a handle into it](./adr/0075-a-model-owns-the-mapping-it-reads.md)
     - [0076. A tensor's bytes are a mapping handle plus a range, never a `'static` view of a mapping](./adr/0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md)
     - [0077. A Metal registration is released with its model, and the cache belongs to the engine](./adr/0077-a-metal-registration-is-released-with-its-model.md)
+    - [0078. A CUDA weight is released with its model, and a live captured graph holds a lease](./adr/0078-a-cuda-weight-is-released-with-its-model-and-a-capture-holds-a-lease.md)
 
 # Model Support
 
