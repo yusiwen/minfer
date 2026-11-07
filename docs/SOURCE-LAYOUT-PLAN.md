@@ -55,7 +55,7 @@ Each step appends its dated record here when it lands (gates run, counts, box la
    `src/graph/allocplan.rs:67`) and the pure **policy** (`budget_decision`/`weight_budget`,
    `allocplan.rs:124` + `graph/offload.rs:310`, with callers in `graph/alloc.rs:889/908` and both
    loaders) are **already device-agnostic and CI-tested**; the **device answer** has exactly **one**
-   implementation (`CudaState::device_memory()`, `src/cuda/methods/accounting.rs:31`, reached through
+   implementation (`CudaState::device_memory()`, `src/cuda/methods/accounting.rs:38`, reached through
    the CUDA-only resolver `models::device_memory()` at `src/models/mod.rs:76`, 3 call sites), and no
    `Backend` trait hook for it exists. [#53](https://github.com/yusiwen/minfer/issues/53) adds the
    second answer *behind that existing resolver*, so nothing has to move to make it possible; whether

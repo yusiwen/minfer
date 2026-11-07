@@ -342,7 +342,7 @@ segfaults; all D2H (device-to-host) traffic goes through `cudaMemcpy`
 same-stream ordering is the correctness contract for async fills (`docs/GPU_SAFETY.md:232`, `:238`). Rule 1's Rust shape is on
 the elementwise dispatch arm: the backend checks the kernel's preconditions
 *before* launching and returns a formatted `Err` naming the node
-(`src/graph/cuda_backend.rs:1001`, the `Op::Add` arm) — `Op::Add` rejects input-size
+(`src/graph/cuda_backend.rs:1011`, the `Op::Add` arm) — `Op::Add` rejects input-size
 mismatches with `Err(format!("cuda: {}: add input size mismatch", node.name))`
 before calling `add_f32`). That is the boundary between the two error worlds:
 *host-visible* checks are ordinary Rust `Result`s raised before launch;
@@ -381,8 +381,8 @@ cost: pinned memory is a scarce OS resource (over-allocating it degrades the
 whole machine, not just your process). minfer keeps small, ring-shaped pinned
 pools only where asynchrony pays — the 8-slot × 2 MB staging ring for input
 fills (`write_input_async`, `src/cuda/methods/copy.rs:29`), a grow-on-demand D2H
-readback buffer for per-step logits (`PinnedBuf`, `src/cuda.rs:417`), and the
-capture staging pool (`CaptureStaging`, `src/cuda.rs:437`) — with a
+readback buffer for per-step logits (`PinnedBuf`, `src/cuda.rs:516`), and the
+capture staging pool (`CaptureStaging`, `src/cuda.rs:536`) — with a
 synchronous pageable fallback whenever pinned allocation fails.
 `docs/GPU_SAFETY.md:238` (CUDA rule 6) states the rule that makes this safe: *same-stream
 ordering* — the async fill is safe because every consumer kernel is enqueued
@@ -436,18 +436,18 @@ Initialization — the idiom where acquiring a resource in a constructor and
 releasing it in a destructor ties the resource's lifetime to an object's, so
 drops and panics cannot leak it) is how minfer keeps the *host-side* CUDA
 resources leak-proof: every pinned allocation has a `Drop` impl calling
-`cudaFreeHost` (`PinnedPool` `src/cuda.rs:399`, `PinnedBuf` `src/cuda.rs:`,
+`cudaFreeHost` (`PinnedPool` `src/cuda.rs:498`, `PinnedBuf` `src/cuda.rs:`,
 `CaptureStaging` `src/cuda.rs:`). Device memory is the interesting
 half-exception. A *weight* buffer is not RAII-managed at all: weights live
 for the whole process, keyed by name in the registry
-(`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `CudaState::weights` (`src/cuda.rs:616`)), and
+(`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `CudaState::weights` (`src/cuda.rs:715`)), and
 the registry's replace rule deliberately leaks the stale buffer because a
 live captured CUDA Graph may still reference the old pointer
-`register_weight` (`src/cuda/methods/weights.rs:31`)) — leaking *by decision, with a bound and a comment*
+`register_weight` (`src/cuda/methods/weights.rs:41`)) — leaking *by decision, with a bound and a comment*
 is legitimate, because the alternative (freeing memory a captured graph still
 points at) is a use-after-free the GPU hits mid-replay. Scratch buffers, in
 contrast, are pooled: the backend frees every pool buffer in its `Drop`
-(`src/graph/cuda_backend.rs:862`, `impl Drop for CudaBackend`), and `CudaState` offers the raw pair
+(`src/graph/cuda_backend.rs:872`, `impl Drop for CudaBackend`), and `CudaState` offers the raw pair
 `cuda_malloc`/`cuda_free` (`src/cuda/methods/buffers.rs:21`) for pool use.
 
 **One complete ownership path, walked.** The simplest non-toy path in the
@@ -477,7 +477,7 @@ file: *register a weight → use it → (never) free it*.
    (`:93-96`):
    `self.weights.lock().unwrap().insert(name.to_string(), (CudaPtr(ptr), data.len()))`.
    From here the *only* way to reach the buffer is
-   `get_weight_ptr` (`src/cuda/methods/weights.rs:592`) — the registry is the single owner, and dispatchers
+   `get_weight_ptr` (`src/cuda/methods/weights.rs:870`) — the registry is the single owner, and dispatchers
    resolve by name at execution time.
 4. **Use.** A decode step later, dispatch resolves the name to a device
    pointer and passes it to a launcher. The Rust side of `add_f32`
@@ -496,7 +496,7 @@ file: *register a weight → use it → (never) free it*.
    owns them until exit; the OS reclaims the context). For pool scratch:
    `CudaBackend::drop` frees every pool buffer with `cudaFree` (a
    context-wide call); the pre-#188 stream lock is gone, and the Drop now
-   first binds this backend's own stream with `self.bind()` (`src/graph/cuda_backend.rs:869`) for the teardown's host-side transfers. For the
+   first binds this backend's own stream with `self.bind()` (`src/graph/cuda_backend.rs:879`) for the teardown's host-side transfers. For the
    grow-on-demand scratch slots there is a middle pattern, `get_or_grow`
    (`src/cuda/methods.rs`): if the slot's allocation is too small, *free
    the old buffer then allocate the new one*, only under the slot's own
@@ -618,7 +618,7 @@ every SM cannot physically run side by side — streams give the GPU
 
 **minfer's actual stream usage.** The surprise: for all that machinery, each
 engine's backend runs **one** non-blocking stream, created when the backend is
-built (`with_layout`, `src/graph/cuda_backend.rs:204`); `stream()` (`src/cuda/methods/stream.rs:18`)
+built (`with_layout`, `src/graph/cuda_backend.rs:210`); `stream()` (`src/cuda/methods/stream.rs:18`)
 answers that bound stream, falling back to the context stream (`try_new`, `src/cuda/methods/init.rs:55`) only for an unbound caller. Why one stream, when
 streams exist for overlap? First, the workload is a dependency chain — a
 decode step is a strict sequence (norm → matmul → rope → attention → … →
@@ -628,15 +628,15 @@ step, each a few µs of host time — so minfer's answer was not streams but
 **CUDA Graph capture/replay**: record the whole step's launches once, then
 replay the graph as a single launch. Capture is *per-stream* (only work
 enqueued on the capturing stream is recorded) and opens in thread-local mode,
-so each backend captures into its own stream; `stream_guard` (`src/graph/cuda_backend.rs:559`) is
+so each backend captures into its own stream; `stream_guard` (`src/graph/cuda_backend.rs:565`) is
 now a `None`-returning shim — [#188](https://github.com/yusiwen/minfer/issues/188) took the stream-work
 serialization away, and a caller must not rely on mutual exclusion there. The state machine lives in
-`graph_replay_step` (`src/graph/cuda_backend.rs:462`): executions 1–2 of
+`graph_replay_step` (`src/graph/cuda_backend.rs:468`): executions 1–2 of
 a split run as plain launches (warmup — llama.cpp's protocol), the 3rd opens
 the capture window, `synchronize()` closes it (instantiate + launch once +
-cache, `close_capture_or_sync` (`src/graph/cuda_backend.rs:576`)), and every later execution is a
-single `graph_launch_exec` (`src/graph/cuda_backend.rs:499`). The
-backend's `CudaBackend::synchronize` (`src/graph/cuda_backend.rs:2493`) is the
+cache, `close_capture_or_sync` (`src/graph/cuda_backend.rs:582`)), and every later execution is a
+single `graph_launch_exec` (`src/graph/cuda_backend.rs:505`). The
+backend's `CudaBackend::synchronize` (`src/graph/cuda_backend.rs:2503`) is the
 split-boundary drain point from §2.2: bind its own stream, clear the
 per-execution memos, then `close_capture_or_sync`. Replay is gated by
 `MINFER_NO_CUDA_GRAPH=1` (falls back to per-kernel launches — §5 makes the
@@ -745,7 +745,7 @@ CUDA node takes; the layered picture first (the one diagram of this chapter):
  scheduler.rs  : execute_node(node, backend)          (pure Rust, safe)
      │
      ▼
- `Op::Silu` (cuda_backend.rs:1029)   Op::Silu arm               (guards → Err or launch)
+ `Op::Silu` (cuda_backend.rs:1039)   Op::Silu arm               (guards → Err or launch)
      │   in_bufs[0].id != out_buf.id?  → copy_d2d (D2D stage)
      ▼
  `silu_f32` (src/cuda/methods/elementwise.rs:147)         CudaState::silu_f32        (thin unsafe wrapper)
@@ -766,7 +766,7 @@ CUDA node takes; the layered picture first (the one diagram of this chapter):
 The scheduler calls `execute_node` on whichever backend was assigned at build
 time (assignment is decided *before* execution — the
 never-silently-fallback rule from `docs/GPU_SAFETY.md`). The CUDA backend's
-`Op::Silu` arm (`src/graph/cuda_backend.rs:1029`, the arm in `execute_node_inner`) is seven lines:
+`Op::Silu` arm (`src/graph/cuda_backend.rs:1039`, the arm in `execute_node_inner`) is seven lines:
 
 ```rust
 // `Op::Silu` (src/graph/cuda_backend.rs:)
@@ -787,7 +787,7 @@ under the alias rule (sole consumer + same backend); when the liveness
 allocator did *not* alias the two buffers (they are distinct pool slots), the
 backend stages a device-to-device copy first so the in-place kernel can never
 write a buffer some other node still needs. `copy_d2d`
-`copy_d2d` (`src/graph/cuda_backend.rs:1956`) resolves both pool slots to device
+`copy_d2d` (`src/graph/cuda_backend.rs:1966`) resolves both pool slots to device
 pointers, refuses on a byte-size mismatch (`Err` — the §2.2 contract), and
 enqueues `cudaMemcpyDeviceToDevice` on the backend's bound stream. Two GPU operations
 (copy + kernel) for the price of one node, both asynchronous, both ordered by

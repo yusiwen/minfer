@@ -109,7 +109,7 @@ is against the old path, not against the pre-round figure):
 > (**532 / 0 / 43** unit, **21 / 0 / 6** integration; the +1 is #329's dispatch-refusal gate). **The Metal-vs-CPU
 > *logits* row cannot be taken from `graph_metal_matches_cpu_logits`**: in the
 > graph era both `ModelDef::forward` and `forward_graph` route through
-> `Qwen2Graph::forward` (`src/models/qwen2/mod.rs:62`/`:108`), so its
+> `Qwen2Graph::forward` (`src/models/qwen2/mod.rs:69`/`:122`), so its
 > `max |Δ| = 0` compares the Metal graph with itself — the test's "CPU reference"
 > comment is stale. Filed as [#324](https://github.com/yusiwen/minfer/issues/324); no
 > parity regression is implied. The
