@@ -128,9 +128,6 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
         }
         found
     };
-    if n_vocab == 0 {
-        eprintln!("Warning: could not determine vocabulary size from GGUF");
-    }
 
     let n_embd = get_i64(ctx, "qwen3.embedding_length")
         .or_else(|| get_i64(ctx, "llama.embedding_length"))?;
@@ -340,7 +337,7 @@ pub fn load(
     model: &crate::gguf::GgufModel,
     ns: &str,
     offload: crate::graph::offload::OffloadRequest,
-) -> Option<super::Qwen3Model> {
+) -> Result<super::Qwen3Model, String> {
     #[cfg(feature = "cuda")]
     // Same rationale as qwen2/loader.rs: block until CUDA init completes so
     // per-tensor registration is all-or-nothing (no partial gate flips).
@@ -360,7 +357,11 @@ pub fn load(
     let cuda_registration =
         crate::cuda::CudaState::get().map(|cuda| cuda.begin_model(model.fingerprint));
     let ctx = &model.parts[0].ctx;
-    let mut hparams = hparams_from_gguf(ctx)?;
+    let mut hparams = hparams_from_gguf(ctx).ok_or_else(|| {
+        "GGUF metadata: cannot determine hparams (qwen2.*/llama.* embedding_length, \
+         attention.head_count, block_count, feed_forward_length)"
+            .to_string()
+    })?;
 
     // E5: resolve the offload plan before the first weight is registered (see qwen2's twin).
     let n_layer = hparams.n_layer as usize;
@@ -370,10 +371,7 @@ pub fn load(
         offload::OffloadRequest::Default => {
             match offload::OffloadRequest::parse(env_request.as_deref()) {
                 Ok(r) => r,
-                Err(e) => {
-                    eprintln!("minfer: {e}");
-                    return None;
-                }
+                Err(e) => return Err(e),
             }
         }
         explicit => explicit,
@@ -390,10 +388,7 @@ pub fn load(
                 .or_else(|| std::env::var("MINFER_GPU_MEM").ok());
             let budget = match offload::weight_budget(&mem, cap.as_deref()) {
                 Ok(b) => b,
-                Err(e) => {
-                    eprintln!("minfer: {e}");
-                    return None;
-                }
+                Err(e) => return Err(e),
             };
             let reserve = budget / 4;
             let k = offload::fit_blocks(budget, &per_block, reserve);
@@ -416,10 +411,7 @@ pub fn load(
                 crate::models::device_available(),
             ) {
                 Ok(p) => p,
-                Err(e) => {
-                    eprintln!("minfer: {e}");
-                    return None;
-                }
+                Err(e) => return Err(e),
             };
             (plan, source)
         }
@@ -452,10 +444,7 @@ pub fn load(
         tn::rope_freqs,
     ) {
         Ok(table) => hparams.rope_freqs = table,
-        Err(e) => {
-            eprintln!("minfer: {e}");
-            return None;
-        }
+        Err(e) => return Err(e),
     }
 
     // Qwen3 KV dim = n_head_kv * n_embd_head = 8*128 = 1024 (override from the
@@ -503,7 +492,8 @@ pub fn load(
     };
 
     // Token embedding
-    let tok_embd = load_one(tn::TOKEN_EMBD)?;
+    let tok_embd = load_one(tn::TOKEN_EMBD)
+        .ok_or_else(|| format!("missing tensor `{}` (token embedding)", tn::TOKEN_EMBD))?;
 
     // Output norm
     let output_norm = load_one(tn::OUTPUT_NORM);
@@ -658,8 +648,6 @@ pub fn load(
         layers.push(layer);
     }
 
-    eprintln!("Loaded: {} layers", n_layer);
-
     let mut model = super::Qwen3Model {
         hparams,
         tok_embd: Some(tok_embd),
@@ -686,11 +674,15 @@ pub fn load(
     if !model.offload.plan.is_cpu_only()
         && super::graph::Qwen3Graph::device(&model) == crate::models::Device::Cpu
     {
-        eprintln!(
-"minfer: {} of {} blocks were asked onto the device ({}), but their weights are not usable there — running on CPU",
-            model.offload.plan.gpu_layers, model.offload.plan.n_layers, model.offload.source
-        );
+        let asked = model.offload.plan.gpu_layers;
+        let source = model.offload.source.clone();
         model.offload = crate::models::OffloadState::cpu_only(n_layer);
+        // A placement nobody can see is a placement nobody can debug: the CLI
+        // prints `offload_report()`, so the fallback travels in the report rather
+        // than on stderr from the library (#763 S3).
+        model.offload.source = format!(
+            "{source} — {asked} block(s) were asked onto the device, but their weights are not usable there; running on CPU"
+        );
     }
 
     // 8p: warm the persistent per-weight f16 dequant cache at load.
@@ -739,5 +731,5 @@ pub fn load(
         }
     }
 
-    Some(model)
+    Ok(model)
 }

@@ -116,9 +116,6 @@ pub fn hparams_from_gguf(ctx: &GgufContext) -> Option<HParams> {
         }
         found
     };
-    if n_vocab == 0 {
-        eprintln!("Warning: could not determine vocabulary size from GGUF");
-    }
 
     // Try qwen2 prefix first, fall back to llama/generic
     let n_embd = get_i64(ctx, "qwen2.embedding_length")
@@ -358,7 +355,7 @@ pub fn load(
     model: &crate::gguf::GgufModel,
     ns: &str,
     offload: crate::graph::offload::OffloadRequest,
-) -> Option<super::Qwen2Model> {
+) -> Result<super::Qwen2Model, String> {
     #[cfg(feature = "cuda")]
     // Initialize CUDA BEFORE registering any weight: init() blocks while
     // another thread is mid-init, so the per-tensor `CudaState::get()` below
@@ -381,7 +378,11 @@ pub fn load(
     let cuda_registration =
         crate::cuda::CudaState::get().map(|cuda| cuda.begin_model(model.fingerprint));
     let ctx = &model.parts[0].ctx;
-    let mut hparams = hparams_from_gguf(ctx)?;
+    let mut hparams = hparams_from_gguf(ctx).ok_or_else(|| {
+        "GGUF metadata: cannot determine hparams (qwen2.*/llama.* embedding_length, \
+         attention.head_count, block_count, feed_forward_length)"
+            .to_string()
+    })?;
     let n_layer = hparams.n_layer as usize;
 
     // E5: how many blocks the device may hold, resolved **before the first weight is
@@ -396,10 +397,7 @@ pub fn load(
         offload::OffloadRequest::Default => {
             match offload::OffloadRequest::parse(env_request.as_deref()) {
                 Ok(r) => r,
-                Err(e) => {
-                    eprintln!("minfer: {e}");
-                    return None;
-                }
+                Err(e) => return Err(e),
             }
         }
         explicit => explicit,
@@ -420,10 +418,7 @@ pub fn load(
                 .or_else(|| std::env::var("MINFER_GPU_MEM").ok());
             let budget = match offload::weight_budget(&mem, cap.as_deref()) {
                 Ok(b) => b,
-                Err(e) => {
-                    eprintln!("minfer: {e}");
-                    return None;
-                }
+                Err(e) => return Err(e),
             };
             // A quarter of the weight budget is held back for the KV arenas and the activation
             // pool: those are sized per graph, not per load, so the fit cannot measure them —
@@ -450,10 +445,7 @@ pub fn load(
                 crate::models::device_available(),
             ) {
                 Ok(p) => p,
-                Err(e) => {
-                    eprintln!("minfer: {e}");
-                    return None;
-                }
+                Err(e) => return Err(e),
             };
             (plan, source)
         }
@@ -518,14 +510,12 @@ pub fn load(
         tn::rope_freqs,
     ) {
         Ok(table) => hparams.rope_freqs = table,
-        Err(e) => {
-            eprintln!("minfer: {e}");
-            return None;
-        }
+        Err(e) => return Err(e),
     }
 
     // Token embedding
-    let tok_embd = load_one(tn::TOKEN_EMBD)?;
+    let tok_embd = load_one(tn::TOKEN_EMBD)
+        .ok_or_else(|| format!("missing tensor `{}` (token embedding)", tn::TOKEN_EMBD))?;
 
     // Output norm
     let output_norm = load_one(tn::OUTPUT_NORM);
@@ -683,8 +673,6 @@ pub fn load(
         hparams.n_kv_embd = ti.ne[1];
     }
 
-    eprintln!("Loaded: {} layers", n_layer);
-
     // r59 rider: pre-warm the CUDA launch path OUTSIDE the measured prefill
     // window (kernel module load, MmqCache scratch planes, pinned readback).
     #[cfg(feature = "cuda")]
@@ -721,11 +709,15 @@ pub fn load(
     if !model.offload.plan.is_cpu_only()
         && super::graph::Qwen2Graph::device(&model) == crate::models::Device::Cpu
     {
-        eprintln!(
-"minfer: {} of {} blocks were asked onto the device ({}), but their weights are not usable there — running on CPU",
-            model.offload.plan.gpu_layers, model.offload.plan.n_layers, model.offload.source
-        );
+        let asked = model.offload.plan.gpu_layers;
+        let source = model.offload.source.clone();
         model.offload = crate::models::OffloadState::cpu_only(n_layer);
+        // A placement nobody can see is a placement nobody can debug: the CLI
+        // prints `offload_report()`, so the fallback travels in the report rather
+        // than on stderr from the library (#763 S3).
+        model.offload.source = format!(
+            "{source} — {asked} block(s) were asked onto the device, but their weights are not usable there; running on CPU"
+        );
     }
 
     // 8p: warm the persistent per-weight f16 dequant cache at load (one
@@ -774,7 +766,7 @@ pub fn load(
             }
         }
     }
-    Some(model)
+    Ok(model)
 }
 
 #[cfg(test)]

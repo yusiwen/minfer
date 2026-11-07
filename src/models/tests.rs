@@ -513,3 +513,89 @@ fn llama_scaled_long_context_matches_the_pinned_reference() {
         prompt_ids.len()
     );
 }
+
+// ── #763 S3: a load failure is a value with a reason ────────────────────────
+
+/// The toy fixture's bytes, for the two tests that need a *slightly* broken
+/// file. A same-length byte edit keeps the GGUF structurally valid, so the test
+/// exercises the intended refusal rather than a parse failure.
+fn toy_gguf_bytes() -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/toy/toy-qwen2-f32.gguf");
+    std::fs::read(&path).expect("the toy GGUF fixture")
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn write_patched(name: &str, edit: impl FnOnce(&mut Vec<u8>)) -> std::path::PathBuf {
+    let mut bytes = toy_gguf_bytes();
+    edit(&mut bytes);
+    let path = std::env::temp_dir().join(format!("minfer-763-{name}-{}.gguf", std::process::id()));
+    std::fs::write(&path, &bytes).expect("write the patched fixture");
+    path
+}
+
+/// `general.architecture`'s *value* (5 bytes), not the `qwen2.*` keys that also
+/// contain the word.
+fn patch_architecture(bytes: &mut [u8], new: &[u8; 5]) {
+    let key = b"general.architecture";
+    let k = find_bytes(bytes, key).expect("the fixture declares an architecture");
+    let mut p = k + key.len();
+    let ty = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+    assert_eq!(ty, 8, "GGUF string type");
+    p += 4;
+    let len = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
+    assert_eq!(len, 5, "the toy architecture is five bytes");
+    p += 8;
+    assert_eq!(&bytes[p..p + 5], b"qwen2");
+    bytes[p..p + 5].copy_from_slice(new);
+}
+
+#[test]
+fn an_unsupported_architecture_is_a_named_error() {
+    let path = write_patched("arch", |b| patch_architecture(b, b"bogus"));
+    let gguf = crate::gguf::load_gguf_model(&path).expect("the patched file still parses");
+    let err = load_model(&gguf).err().expect("a bogus arch must refuse");
+    assert_eq!(err.arch, "bogus");
+    assert!(
+        err.to_string().contains("unsupported architecture"),
+        "{err}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_missing_token_embedding_is_a_named_error() {
+    // 17 bytes in, 17 bytes out: the tensor-info name changes, the layout does not.
+    let path = write_patched("no-embd", |b| {
+        let at = find_bytes(b, b"token_embd.weight").expect("the fixture has token_embd");
+        b[at..at + 17].copy_from_slice(b"token_embd.weighX");
+    });
+    let gguf = crate::gguf::load_gguf_model(&path).expect("the patched file still parses");
+    let err = load_model(&gguf)
+        .err()
+        .expect("a missing tensor must refuse");
+    assert!(
+        err.reason.contains("missing tensor") && err.reason.contains("token_embd.weight"),
+        "{err}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_unsupported_kv_cache_type_is_a_named_error() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/toy/toy-qwen2-f32.gguf");
+    let gguf = crate::gguf::load_gguf_model(&path).expect("the toy GGUF loads");
+    let err = load_model_configured(
+        &gguf,
+        "",
+        crate::graph::offload::OffloadRequest::Layers(0),
+        Some("bogus"),
+    )
+    .err()
+    .expect("a bogus KV cache type must refuse");
+    assert!(err.reason.contains("bogus"), "{err}");
+}

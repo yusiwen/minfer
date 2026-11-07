@@ -241,12 +241,16 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
     };
     let ctx = &gguf_model.parts[0].ctx;
     let model = match crate::models::load_model(&gguf_model) {
-        Some(m) => m,
-        None => {
-            eprintln!("Error: failed to load model");
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: {e}");
             return 1;
         }
     };
+    eprintln!("Loaded: {} layers", model.n_layer());
+    if let Some(line) = model.offload_report() {
+        eprintln!("minfer: {line}");
+    }
     eprintln!("Model loaded.");
 
     // Backend label: ask the *model* which device its forwards run on. The old

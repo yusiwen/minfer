@@ -371,9 +371,34 @@ impl SpecialTokens {
     }
 }
 
+/// Why a model could not be loaded: which architecture, and the parser's or the
+/// loader's reason (#763 S3).
+///
+/// The response replaces `Option` plus a stderr print. A caller can render it
+/// (`Display`), match on it, or wrap it in its own error type; the CLI prints it
+/// once and exits non-zero.
+#[derive(Debug, Clone)]
+pub struct ModelLoadError {
+    /// `general.architecture` when the file declared one, empty otherwise.
+    pub arch: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for ModelLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.arch.is_empty() {
+            write!(f, "{}", self.reason)
+        } else {
+            write!(f, "{} model: {}", self.arch, self.reason)
+        }
+    }
+}
+
+impl std::error::Error for ModelLoadError {}
+
 /// Load a model from GGUF (single file or multi-part split), dispatching on
 /// `general.architecture` from part 0.
-pub fn load_model(model: &GgufModel) -> Option<Box<dyn ModelDef>> {
+pub fn load_model(model: &GgufModel) -> Result<Box<dyn ModelDef>, ModelLoadError> {
     load_model_ns(model, "")
 }
 
@@ -383,7 +408,7 @@ pub fn load_model(model: &GgufModel) -> Option<Box<dyn ModelDef>> {
 /// the registry is process-global and name-keyed, and without the prefix the
 /// second load collides with the first, fails its all-or-nothing CUDA check,
 /// and silently drops the primary model to CPU.
-pub fn load_model_ns(model: &GgufModel, ns: &str) -> Option<Box<dyn ModelDef>> {
+pub fn load_model_ns(model: &GgufModel, ns: &str) -> Result<Box<dyn ModelDef>, ModelLoadError> {
     load_model_with(model, ns, crate::graph::offload::OffloadRequest::Default)
 }
 
@@ -394,7 +419,7 @@ pub fn load_model_with(
     model: &GgufModel,
     ns: &str,
     offload: crate::graph::offload::OffloadRequest,
-) -> Option<Box<dyn ModelDef>> {
+) -> Result<Box<dyn ModelDef>, ModelLoadError> {
     // C4: `MINFER_CACHE_TYPE` is the interface the CLI and the server use. Resolved
     // once per load by `load_model_configured`, which is also the explicit-format
     // entry point a test uses instead of mutating the environment (issue #99).
@@ -413,24 +438,47 @@ pub fn load_model_configured(
     ns: &str,
     offload: crate::graph::offload::OffloadRequest,
     cache_type: Option<&str>,
-) -> Option<Box<dyn ModelDef>> {
+) -> Result<Box<dyn ModelDef>, ModelLoadError> {
     let ctx = &model.parts[0].ctx;
-    let arch = ctx.get_key_val_str("general.architecture")?;
-    let mut loaded: Box<dyn ModelDef> = match arch.as_str() {
-        "qwen2" => Box::new(qwen2::loader::load(model, ns, offload)?),
-        "qwen3" => Box::new(qwen3::loader::load(model, ns, offload)?),
-        // #723: Llama 3.1/3.2/3.3 dense. The loader and graph are the dense
-        // Qwen2 ones by construction: the loader reads `llama.*` metadata, ties
-        // `output.weight` to `token_embd` when the file has no lm_head, and
-        // tolerates a missing attention bias; the graph already runs the
-        // unfused chain when a bias is absent. What is Llama-specific is the
-        // stop set (`<|eot_id|>` / `<|eom_id|>`), resolved from the file.
-        "llama" => Box::new(qwen2::loader::load(model, ns, offload)?),
-        other => {
-            eprintln!("Unsupported architecture: '{}'", other);
-            return None;
-        }
-    };
+    let arch = ctx
+        .get_key_val_str("general.architecture")
+        .ok_or_else(|| ModelLoadError {
+            arch: String::new(),
+            reason: "GGUF metadata has no `general.architecture`".to_string(),
+        })?;
+    let mut loaded: Box<dyn ModelDef> =
+        match arch.as_str() {
+            "qwen2" => Box::new(qwen2::loader::load(model, ns, offload).map_err(|reason| {
+                ModelLoadError {
+                    arch: arch.clone(),
+                    reason,
+                }
+            })?),
+            "qwen3" => Box::new(qwen3::loader::load(model, ns, offload).map_err(|reason| {
+                ModelLoadError {
+                    arch: arch.clone(),
+                    reason,
+                }
+            })?),
+            // #723: Llama 3.1/3.2/3.3 dense. The loader and graph are the dense
+            // Qwen2 ones by construction: the loader reads `llama.*` metadata, ties
+            // `output.weight` to `token_embd` when the file has no lm_head, and
+            // tolerates a missing attention bias; the graph already runs the
+            // unfused chain when a bias is absent. What is Llama-specific is the
+            // stop set (`<|eot_id|>` / `<|eom_id|>`), resolved from the file.
+            "llama" => Box::new(qwen2::loader::load(model, ns, offload).map_err(|reason| {
+                ModelLoadError {
+                    arch: arch.clone(),
+                    reason,
+                }
+            })?),
+            other => {
+                return Err(ModelLoadError {
+                    arch: other.to_string(),
+                    reason: "unsupported architecture (supported: qwen2, qwen3, llama)".to_string(),
+                });
+            }
+        };
     // C4: the KV storage format is resolved once the device is known (weights are
     // registered by the arch loader, so `device()` is the same all-or-nothing answer
     // every forward will use), and then **stored on the engine**. This is the loud
@@ -448,18 +496,17 @@ pub fn load_model_configured(
         Ok(format) => {
             loaded.set_kv_format(format);
         }
-        Err(e) => {
-            eprintln!("minfer: {e}");
-            return None;
+        Err(reason) => {
+            return Err(ModelLoadError {
+                arch: arch.clone(),
+                reason,
+            })
         }
     }
     // E5's third acceptance: say which blocks landed where (and how much device memory they
-    // took) at startup — a placement nobody can see is a placement nobody can debug. Printed
-    // after the KV policy resolved, so a load that fails there prints nothing.
-    if let Some(line) = loaded.offload_report() {
-        eprintln!("minfer: {line}");
-    }
-    Some(loaded)
+    // took) at startup. The line is *returned* by `offload_report()`; the CLI prints it
+    // (#763 S3: no stderr from the library).
+    Ok(loaded)
 }
 
 #[cfg(test)]
