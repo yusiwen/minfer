@@ -468,7 +468,7 @@ fn oldest_droppable_turn_start(messages: &[(String, Option<String>)]) -> Option<
 /// C2's context shift is on by default (llama.cpp's server does the same);
 /// `MINFER_NO_CONTEXT_SHIFT=1` forces the exact drop-and-re-render overflow path.
 fn context_shift_enabled() -> bool {
-    !std::env::var("MINFER_NO_CONTEXT_SHIFT").map_or(false, |v| v == "1")
+    crate::config::get().context_shift
 }
 
 impl Conversation {

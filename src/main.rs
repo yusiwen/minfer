@@ -405,6 +405,10 @@ fn decode_token(tokenizer: &tokenizer::Tokenizer, id: u32) -> Vec<u8> {
 }
 
 fn main() {
+    // #763 S4: the engine reads `config::get()`, never the environment. The CLI is
+    // the one place that maps the documented `MINFER_*` interface into it, before
+    // any engine, device or graph exists.
+    minfer::config::install(minfer::config::EngineConfig::from_env());
     let raw_args: Vec<String> = std::env::args().collect();
     let prog = raw_args[0].clone();
 

@@ -2833,7 +2833,7 @@ pub struct KvDefragReport {
 /// disables the C3 compaction retry, so the same workload can be A/B'd with and
 /// without it (standing rule 3).
 pub fn kv_defrag_enabled() -> bool {
-    kv_defrag_enabled_from(std::env::var_os("MINFER_NO_KV_DEFRAG").as_deref())
+    kv_defrag_enabled_from((!crate::config::get().kv_defrag).then(|| std::ffi::OsStr::new("1")))
 }
 
 /// The pure half of [`kv_defrag_enabled`], so the gate's meaning is unit-tested

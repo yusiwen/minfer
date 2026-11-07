@@ -5,10 +5,7 @@ use std::arch::aarch64::*;
 
 pub(super) fn enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::arch::is_aarch64_feature_detected!("neon")
-            && !std::env::var("MINFER_NO_NEON").map_or(false, |v| v == "1")
-    })
+    *V.get_or_init(|| std::arch::is_aarch64_feature_detected!("neon") && crate::config::get().neon)
 }
 
 pub(super) unsafe fn vec_dot_f32(n: usize, x: &[f32], y: &[f32]) -> f32 {

@@ -235,11 +235,16 @@ fn fused_qkv_norm_matches_unfused_decode() {
             assert!(fused_in_cache, "the default decode graph must be fused");
         }
 
-        std::env::set_var("MINFER_NO_FUSE_QKV", "1");
-        let mut b = GraphCache::new();
-        let pb = Qwen3Graph::forward_cached(&q3, &ids, &positions, 1, n_ctx, &mut b);
-        let db = Qwen3Graph::forward_cached(&q3, &[next], &[nt], 1, n_ctx, &mut b);
-        std::env::remove_var("MINFER_NO_FUSE_QKV");
+        let no_fuse = crate::config::EngineConfig {
+            fuse_qkv: false,
+            ..crate::config::get().clone()
+        };
+        let (pb, db) = crate::config::with_config(no_fuse, || {
+            let mut b = GraphCache::new();
+            let pb = Qwen3Graph::forward_cached(&q3, &ids, &positions, 1, n_ctx, &mut b);
+            let db = Qwen3Graph::forward_cached(&q3, &[next], &[nt], 1, n_ctx, &mut b);
+            (pb, db)
+        });
 
         // prefill never fuses (nt>1) → both prefills must be bit-identical;
         // this isolates the decode-only divergence.

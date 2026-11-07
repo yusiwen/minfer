@@ -628,15 +628,15 @@ step, each a few µs of host time — so minfer's answer was not streams but
 **CUDA Graph capture/replay**: record the whole step's launches once, then
 replay the graph as a single launch. Capture is *per-stream* (only work
 enqueued on the capturing stream is recorded) and opens in thread-local mode,
-so each backend captures into its own stream; `stream_guard` (`src/graph/cuda_backend.rs:565`) is
+so each backend captures into its own stream; `stream_guard` (`src/graph/cuda_backend.rs:561`) is
 now a `None`-returning shim — [#188](https://github.com/yusiwen/minfer/issues/188) took the stream-work
 serialization away, and a caller must not rely on mutual exclusion there. The state machine lives in
-`graph_replay_step` (`src/graph/cuda_backend.rs:468`): executions 1–2 of
+`graph_replay_step` (`src/graph/cuda_backend.rs:464`): executions 1–2 of
 a split run as plain launches (warmup — llama.cpp's protocol), the 3rd opens
 the capture window, `synchronize()` closes it (instantiate + launch once +
-cache, `close_capture_or_sync` (`src/graph/cuda_backend.rs:582`)), and every later execution is a
-single `graph_launch_exec` (`src/graph/cuda_backend.rs:505`). The
-backend's `CudaBackend::synchronize` (`src/graph/cuda_backend.rs:2503`) is the
+cache, `close_capture_or_sync` (`src/graph/cuda_backend.rs:578`)), and every later execution is a
+single `graph_launch_exec` (`src/graph/cuda_backend.rs:501`). The
+backend's `CudaBackend::synchronize` (`src/graph/cuda_backend.rs:2499`) is the
 split-boundary drain point from §2.2: bind its own stream, clear the
 per-execution memos, then `close_capture_or_sync`. Replay is gated by
 `MINFER_NO_CUDA_GRAPH=1` (falls back to per-kernel launches — §5 makes the
@@ -745,7 +745,7 @@ CUDA node takes; the layered picture first (the one diagram of this chapter):
  scheduler.rs  : execute_node(node, backend)          (pure Rust, safe)
      │
      ▼
- `Op::Silu` (cuda_backend.rs:1039)   Op::Silu arm               (guards → Err or launch)
+ `Op::Silu` (cuda_backend.rs:1035)   Op::Silu arm               (guards → Err or launch)
      │   in_bufs[0].id != out_buf.id?  → copy_d2d (D2D stage)
      ▼
  `silu_f32` (src/cuda/methods/elementwise.rs:147)         CudaState::silu_f32        (thin unsafe wrapper)
@@ -787,7 +787,7 @@ under the alias rule (sole consumer + same backend); when the liveness
 allocator did *not* alias the two buffers (they are distinct pool slots), the
 backend stages a device-to-device copy first so the in-place kernel can never
 write a buffer some other node still needs. `copy_d2d`
-`copy_d2d` (`src/graph/cuda_backend.rs:1966`) resolves both pool slots to device
+`copy_d2d` (`src/graph/cuda_backend.rs:1962`) resolves both pool slots to device
 pointers, refuses on a byte-size mismatch (`Err` — the §2.2 contract), and
 enqueues `cudaMemcpyDeviceToDevice` on the backend's bound stream. Two GPU operations
 (copy + kernel) for the price of one node, both asynchronous, both ordered by

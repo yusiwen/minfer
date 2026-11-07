@@ -288,7 +288,7 @@ impl Qwen2Graph {
                 // `models::ffn_composition` for the rule and the loud refusal on a
                 // backend without offset views.
                 let ffn_composition = crate::models::ffn_composition(
-                    std::env::var("MINFER_FFN_COMPOSITION").ok().as_deref(),
+                    crate::config::get().ffn_composition.as_deref(),
                     Self::device(model),
                 );
                 let ffn_node = !ffn_composition;
@@ -588,10 +588,8 @@ impl Qwen2Graph {
                 fuse_qkv: nt == 1
                     && (metal_on || cuda_on)
                     && (cuda_on || !explicit_span)
-                    && !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1"),
-                fuse_ffn: nt == 1
-                    && (metal_on || cuda_on)
-                    && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1"),
+                    && crate::config::get().fuse_qkv,
+                fuse_ffn: nt == 1 && (metal_on || cuda_on) && crate::config::get().fuse_ffn,
                 // C4 per-engine (issue #99): this engine's resolved KV format. It
                 // sizes every KV node's cell and is part of the reuse identity, so a
                 // cached graph built for one format is never reused for another.
@@ -611,7 +609,7 @@ impl Qwen2Graph {
             .expect("re-map onto a cached graph")
         {
             let rebuild_t0 = std::time::Instant::now();
-            let trace_rb = std::env::var("MINFER_REBUILD_TRACE").map_or(false, |v| v == "1");
+            let trace_rb = crate::config::get().rebuild_trace;
             let mut graph = Self::build(model, &params);
             let sched = BackendScheduler::new();
             {
@@ -680,7 +678,7 @@ impl Qwen2Graph {
         {
             alloc.fill_input_i32(graph, "tail_ids", &out_rows).unwrap();
         }
-        if std::env::var("MINFER_GRAPH_DUMP").is_ok() {
+        if crate::config::get().graph_dump.is_some() {
             if let Some(idsbuf) = graph
                 .inputs
                 .iter()
@@ -697,7 +695,7 @@ impl Qwen2Graph {
 
         // debug dump: MINFER_GRAPH_DUMP=/tmp/x writes the logits and layer-0 KV
         // so GPU vs CPU graph runs can be compared (Phase 3 debugging)
-        if let Ok(dir) = std::env::var("MINFER_GRAPH_DUMP") {
+        if let Some(dir) = crate::config::get().graph_dump.clone() {
             static DUMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let dump_n = DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let logits = alloc.copy_to_cpu(graph.outputs[0]).expect("logits buffer");

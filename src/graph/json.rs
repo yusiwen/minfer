@@ -69,11 +69,11 @@ pub fn runtime_gparams(
 /// further (Qwen3's fused-QKV concat probe is macOS-only, Qwen2's concat probe
 /// is per-layer), so an extra `true` on a layer that cannot fuse is a no-op.
 pub fn preview_fuse_flags(nt: usize, metal_on: bool, cuda_on: bool) -> (bool, bool) {
-    let enabled = |var: &str| !std::env::var(var).map_or(false, |v| v == "1");
+    let cfg = crate::config::get();
     let gpu = metal_on || cuda_on;
     (
-        nt == 1 && gpu && enabled("MINFER_NO_FUSE_QKV"),
-        nt == 1 && gpu && enabled("MINFER_NO_FUSE_FFN"),
+        nt == 1 && gpu && cfg.fuse_qkv,
+        nt == 1 && gpu && cfg.fuse_ffn,
     )
 }
 

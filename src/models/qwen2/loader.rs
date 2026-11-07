@@ -391,7 +391,7 @@ pub fn load(
     // or `MINFER_GPU_LAYERS`; a spelling that is not a block count fails the load loudly
     // (`graph::offload::resolve`), because an ignored offload request is indistinguishable
     // from an offload that did not work.
-    let env_request = std::env::var("MINFER_GPU_LAYERS").ok();
+    let env_request = crate::config::get().gpu_layers.clone();
     // The CLI's explicit request wins; `Default` reads the environment (E5 S1).
     let request = match offload {
         offload::OffloadRequest::Default => {
@@ -415,7 +415,7 @@ pub fn load(
             let explicit_mib = request.budget_mib();
             let cap = explicit_mib
                 .map(|mib| mib.to_string())
-                .or_else(|| std::env::var("MINFER_GPU_MEM").ok());
+                .or_else(|| crate::config::get().gpu_mem.clone());
             let budget = match offload::weight_budget(&mem, cap.as_deref()) {
                 Ok(b) => b,
                 Err(e) => return Err(e),
@@ -577,7 +577,7 @@ pub fn load(
         if plan.on_device(i) {
             if let Some(cuda) = crate::cuda::CudaState::get() {
                 if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
-                    let fuse = !std::env::var("MINFER_NO_FUSE_QKV").map_or(false, |v| v == "1");
+                    let fuse = crate::config::get().fuse_qkv;
                     if fuse {
                         if let Some(data) = crate::cuda::concat_rows(&[wq, wk, wv]) {
                             let name = format!("{ns}blk.{i}.attn_qkv");
@@ -624,8 +624,7 @@ pub fn load(
         if plan.on_device(i) {
             if let Some(mps) = crate::metal::MpsState::get() {
                 if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
-                    let fuse = fg.shape[1] <= 16384
-                        && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+                    let fuse = fg.shape[1] <= 16384 && crate::config::get().fuse_ffn;
                     if fuse {
                         if let Some(data) = crate::metal::concat_rows(&[fg, fu]) {
                             mps.register_weight(&format!("{ns}blk.{i}.ffn_gu"), &data);
@@ -646,8 +645,7 @@ pub fn load(
             if let Some(cuda) = crate::cuda::CudaState::get() {
                 if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
                     let nf = fg.shape[1] as usize;
-                    let fuse_ffn = nf <= 16384
-                        && !std::env::var("MINFER_NO_FUSE_FFN").map_or(false, |v| v == "1");
+                    let fuse_ffn = nf <= 16384 && crate::config::get().fuse_ffn;
                     if fuse_ffn {
                         if let Some(data) = crate::cuda::concat_rows(&[fg, fu]) {
                             if fg.ttype == crate::tensor::TensorType::Q6_K {

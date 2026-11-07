@@ -121,7 +121,7 @@ family (the FFI surface, e.g. `launch_add_f32` (`src/cuda/methods/elementwise.rs
 and wraps each in a small safe method on `CudaState`. The graph backend never
 sees kernel names; it sees graph ops. The three call sites this chapter follows:
 
-- `Op::Add` → `CudaState::add_f32` — `src/graph/cuda_backend.rs:1016`
+- `Op::Add` → `CudaState::add_f32` — `src/graph/cuda_backend.rs:1012`
 - the MatMul bias epilogue → `CudaState::add_bias_f32` — `:1514`
 - `Op::GetRows` → `embed_rows_on_gpu` / `gather_rows_f32_on_gpu` — `:972` / `:986`
 
@@ -194,7 +194,7 @@ without global synchronization. #162 brackets each launch with
 The Rust call chain: the backend's `Op::Add` arm checks that both inputs have
 the same element count as the output and calls
 `CudaState::add_f32` (`src/cuda/methods/elementwise.rs`), which is a thin FFI shim.
-The dispatch site is `Op::Add` (`src/graph/cuda_backend.rs:1011`):
+The dispatch site is `Op::Add` (`src/graph/cuda_backend.rs:1007`):
 
 ```rust
 Op::Add => {
@@ -402,13 +402,13 @@ version, which is worth knowing because it explains *when* you will see these
 kernels in a profile:
 
 - The **persistent f16 weight cache** (Phase 8p) is warmed **at load time**
-  by the model loaders: `enable_w16_cache` (`src/models/qwen2/loader.rs:754`) + `warm_w16`
+  by the model loaders: `enable_w16_cache` (`src/models/qwen2/loader.rs:752`) + `warm_w16`
   (`:690`) per weight. `warm_w16` (`src/cuda/methods/prefill_f16.rs:89`) maps
   `TensorType` → the same type ids and calls
   `w16_get`, which launches the dequant). But only for models whose matmul
   weights total ≥ `W16_ENABLE_BYTES` (`src/cuda.rs:698`) = 2 GiB **and**
   when the int8 MMQ prefill path is not active
-  (`mmq_active` (`qwen2/loader.rs:752`)). A 0.5B Q4_0 model is far below that bar (its
+  (`mmq_active` (`qwen2/loader.rs:750`)). A 0.5B Q4_0 model is far below that bar (its
   largest tensor, `tok_embd`, is 76.6 MB in Q4_0 — §4.1) and therefore runs
   **no** dequant at load today.
 - Otherwise `launch_dequant_f16` runs **per call** into a scratch buffer,
@@ -519,7 +519,7 @@ matrix picks one row (doc 05's graph excerpt shows the node:
 `embed(3) GetRows — h = one token_embd row per id, [896, nt]`). The output is
 token-major f32 `[nt][896]` — the layout every later kernel assumes.
 
-**Dispatch.** The backend arm `Op::GetRows` (`src/graph/cuda_backend.rs:975`) matches
+**Dispatch.** The backend arm `Op::GetRows` (`src/graph/cuda_backend.rs:971`) matches
 `Op::GetRows` on metadata: with `NodeMeta::Embed` it calls
 `embed_rows_on_gpu` (`:972`), with plain metadata it calls the generic
 `gather_rows_f32_on_gpu` (`:986`) — the same `GetRows` node serves the
@@ -553,7 +553,7 @@ that carries the idea.
 | Kernel (file:line) | Purpose | The one interesting line |
 |---|---|---|
 | `convert_f32_f16_kernel` (`gemm_wmma.cu:203`) | f32 activations → f16, feeding the wmma prefill GEMM | `:208` — `base = (…blockIdx.x * blockDim.x + threadIdx.x) * 8`: the thread index is **multiplied by 8**; each thread `float4`-loads 8 f32 and stores 4 `__half2` (`:213`), 8× fewer transactions for the same traffic (the P1 comment at `:206`). Launcher `launch_convert_f16` `:833` sizes the grid over `n/8`. |
-| `f32_bits_to_i32` (`ops_elementwise.cu:249`) | positions/token ids arrive as I32-as-f32 bit patterns; rope/store/attention kernels want raw `int*` | `:256` — `dst[tid] = __float_as_int(src[tid]);` the whole kernel *is* that line: one device-side bit reinterpretation pass, so the per-layer path never syncs with the host (comment `:243`). Rust entry `bits_to_i32` `src/cuda/methods/kvstore.rs:185`, called from `positions_i32` (`cuda_backend.rs:1984`, launch `:2014`). |
+| `f32_bits_to_i32` (`ops_elementwise.cu:249`) | positions/token ids arrive as I32-as-f32 bit patterns; rope/store/attention kernels want raw `int*` | `:256` — `dst[tid] = __float_as_int(src[tid]);` the whole kernel *is* that line: one device-side bit reinterpretation pass, so the per-layer path never syncs with the host (comment `:243`). Rust entry `bits_to_i32` `src/cuda/methods/kvstore.rs:185`, called from `positions_i32` (`cuda_backend.rs:1980`, launch `:2014`). |
 | `gather_rows_f32` (`ops_misc.cu:145`) | the quant-free `GetRows`: `out[t*n+i] = x[ids[t]*n+i]` | `:157` — `out[idx] = src[(long long)id * n + i];` the classic gather: one flat index decoded into `(t, i)`, the id looked up per thread. Same `(1, 18)`-style dispatch you saw in §3.3 is what routes F32 embeddings and the tail-row selects here. |
 
 All three are one-thread-per-element kernels with the usual ceil-div launcher;

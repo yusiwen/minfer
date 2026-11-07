@@ -31,7 +31,6 @@
 //! [#58]: https://github.com/yusiwen/minfer/issues/58
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
 
 /// What the split boundary did in one execution, per allocator.
 ///
@@ -109,13 +108,10 @@ impl CrossCopyStats {
 /// (same graph, same input, both modes), and it is how the "before" numbers on
 /// the blocking-copy counters are reproduced on the F5 binary itself.
 ///
-/// Read once per process (like the other `MINFER_*` gates); `0` is the default
-/// (the async substrate).
-static ENV_SYNC: OnceLock<bool> = OnceLock::new();
-
 /// A test's programmatic override of [`sync_copies`], so a gate can flip the
 /// mode without touching the process environment (which is shared by every
-/// test in the binary). `0` = follow [`ENV_SYNC`], `1` = force async, `2` =
+/// test in the binary). `0` = follow [`crate::config::get().sync_copies`],
+/// `1` = force async, `2` =
 /// force synchronous.
 static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
@@ -124,7 +120,7 @@ pub fn sync_copies() -> bool {
     match OVERRIDE.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => *ENV_SYNC.get_or_init(|| std::env::var("MINFER_SYNC_COPIES").as_deref() == Ok("1")),
+        _ => crate::config::get().sync_copies,
     }
 }
 
