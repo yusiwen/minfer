@@ -630,7 +630,7 @@ pub fn accept_loop<R: Rng>(
         if i < d && t.token_id == proposals[i] {
             emitted.push(proposals[i]);
             push_capped(prev_tokens, proposals[i]);
-            crate::token_trace(base_pos + i + 1, proposals[i]);
+            crate::trace::token_trace(base_pos + i + 1, proposals[i]);
             accepted += 1;
         } else {
             // Mismatch (or the last row): this sample IS the next token.
@@ -644,7 +644,7 @@ pub fn accept_loop<R: Rng>(
             }
             emitted.push(t.token_id);
             push_capped(prev_tokens, t.token_id);
-            crate::token_trace(base_pos + i + 1, t.token_id);
+            crate::trace::token_trace(base_pos + i + 1, t.token_id);
             break;
         }
     }

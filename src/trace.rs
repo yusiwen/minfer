@@ -265,3 +265,22 @@ pub fn finish(path: &str, model: &str, prompt: &str, graph_prefill: Value, graph
         Err(e) => eprintln!("[trace] serialize failed: {e}"),
     }
 }
+
+/// doc 95 diagnostic: append `pos<TAB>token_id` per committed token when
+/// `MINFER_TOKEN_TRACE` is set — the position-wise identity battery alignment.
+///
+/// Lives here rather than in the CLI because `spec` (the engine's speculative
+/// round) records the same alignment: it was a `crate::` call into the binary's
+/// root before the library target existed (#763 S1).
+pub fn token_trace(pos: usize, tok: u32) {
+    use std::io::Write;
+    if let Ok(path) = std::env::var("MINFER_TOKEN_TRACE") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{pos}\t{tok}");
+        }
+    }
+}

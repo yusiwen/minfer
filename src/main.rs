@@ -8,44 +8,14 @@
 // than part of this gate.
 #![cfg_attr(not(test), deny(warnings))]
 
-mod bench;
-mod block;
-mod conversation;
-mod convert;
 #[cfg(feature = "cuda")]
-mod cuda;
-// #185: the checked "one thread at a time in the CUDA device path" contract.
-// Pure and feature-independent on purpose, so the CPU CI job runs its tests.
-// Consumers live in the CUDA backend; the offline unit tests still run
-// without the feature, so silence dead-code only in CPU-only builds.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-mod device_tier;
-mod download;
-mod dump;
-mod gguf;
-mod gguf_write;
-mod grammar;
-mod graph;
-mod kernel;
-mod live;
+use minfer::cuda;
 #[cfg(target_os = "macos")]
-mod metal;
-mod models;
-mod optiming;
-mod q4k_dsc;
-mod quantize;
-mod quants;
-mod sampler;
-mod server;
-mod spec;
-mod spec_verify;
-mod template;
-mod tensor;
-mod testfail;
-mod tokenizer;
-mod tooling;
-mod trace;
-mod vec_ops;
+use minfer::metal;
+use minfer::{
+    bench, conversation, download, gguf, grammar, graph, models, sampler, server, spec,
+    spec_verify, template, tokenizer, tooling, trace,
+};
 
 use rand::SeedableRng;
 use std::sync::Arc;
@@ -388,21 +358,6 @@ fn print_usage(prog: &str) {
     eprintln!("  -V, --version        print version and exit");
 }
 
-/// doc 95 diagnostic: append `pos<TAB>token_id` per committed token when
-/// MINFER_TOKEN_TRACE is set — the position-wise identity battery alignment.
-fn token_trace(pos: usize, tok: u32) {
-    use std::io::Write;
-    if let Ok(path) = std::env::var("MINFER_TOKEN_TRACE") {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(f, "{pos}\t{tok}");
-        }
-    }
-}
-
 /// F4: pull `--backend <name>` / `--backend=<name>` out of the argument list.
 ///
 /// Returns the remaining arguments (program name first) and the requested names
@@ -460,8 +415,8 @@ fn main() {
     // registry is built first — the names are resolved against it, and an
     // unknown name is a loud refusal here, before the model is even looked for.
     let (raw_args, backend_flag) = split_backend_flag(raw_args);
-    crate::graph::registry::init();
-    let backend_filter = match crate::graph::registry::request_filter(
+    minfer::graph::registry::init();
+    let backend_filter = match minfer::graph::registry::request_filter(
         &backend_flag,
         std::env::var("MINFER_BACKENDS").ok().as_deref(),
     ) {
@@ -471,7 +426,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    crate::graph::registry::install_filter(backend_filter);
+    minfer::graph::registry::install_filter(backend_filter);
 
     // `bench` subcommand: parsed separately (its -p/-n/-r/-o flags are
     // bench-local and must not collide with the global inference options,
@@ -537,7 +492,7 @@ fn main() {
     let mut gpu: Option<i32> = None;
     // E5: --gpu-layers N offloads the first N blocks to the device (0 = CPU only, unset =
     // MINFER_GPU_LAYERS, which is "every block the device can hold").
-    let mut gpu_layers_request = crate::graph::offload::OffloadRequest::Default;
+    let mut gpu_layers_request = minfer::graph::offload::OffloadRequest::Default;
     let mut gpu_layers_set = false;
     // D5-R speculative decoding (--spec-draft <model>, --spec-draft-n <d>).
     let mut spec_draft: Option<String> = None;
@@ -596,7 +551,7 @@ fn main() {
                         parse_err = Some(format!("invalid --threads '{v}'"));
                         0
                     });
-                    crate::kernel::set_cpu_threads(n);
+                    minfer::kernel::set_cpu_threads(n);
                 }
                 i += 2;
             }
@@ -630,7 +585,7 @@ fn main() {
             "--gpu-layers" => {
                 if let Some(v) = next_val(a) {
                     // E5 S2: a block count or `auto` (fit as many as the budget allows).
-                    match crate::graph::offload::OffloadRequest::parse(Some(v.as_str())) {
+                    match minfer::graph::offload::OffloadRequest::parse(Some(v.as_str())) {
                         Ok(r) => {
                             gpu_layers_request = r;
                             gpu_layers_set = true;
@@ -1158,7 +1113,8 @@ fn main() {
     // Stage 2: a named backend that this machine cannot use is refused now — a
     // message distinct from "unknown backend" and from "not compiled into this
     // build", and never a silent fall back to the CPU.
-    if let Err(e) = crate::graph::registry::check_available(crate::graph::registry::active_filter())
+    if let Err(e) =
+        minfer::graph::registry::check_available(minfer::graph::registry::active_filter())
     {
         eprintln!("Error: {e}");
         std::process::exit(1);
@@ -1564,7 +1520,7 @@ fn main() {
         }
     };
     #[cfg(feature = "debug_dump")]
-    crate::dump::maybe_dump_text("minfer_dump_prompt", &processed);
+    minfer::dump::maybe_dump_text("minfer_dump_prompt", &processed);
     let input_ids = match tokenizer.encode_checked(&processed) {
         Ok(ids) => ids,
         Err(e) => refuse(e),
@@ -1591,9 +1547,9 @@ fn main() {
     // P2 trace (MINFER_TRACE=<path>): the scheduler records per-node data; the
     // CLI marks phase boundaries and attaches tokens/logits for the page.
     // `trace_on` is hoisted out of the decode loop (one env read per run).
-    let trace_on = crate::trace::enabled();
+    let trace_on = minfer::trace::enabled();
     if trace_on {
-        crate::trace::begin_phase("prefill");
+        minfer::trace::begin_phase("prefill");
     }
     let logits = if spec_engine.is_some() {
         // Spec mode: drive the target through forward_graph_cached so its KV
@@ -1610,7 +1566,7 @@ fn main() {
     };
     let last_logits: Vec<f32> = logits;
     if trace_on {
-        crate::trace::attach_step(&last_logits);
+        minfer::trace::attach_step(&last_logits);
     }
 
     let prefill_time = infer_start.elapsed();
@@ -1626,26 +1582,26 @@ fn main() {
     // FusionPass), with real backend assignment (CPU/Metal colors) and the same
     // fusion env toggles as the live path.
     if dump_graph.is_some() || dump_graph_json.is_some() {
-        use crate::graph::json::{export_graph_json, runtime_gparams};
+        use minfer::graph::json::{export_graph_json, runtime_gparams};
         #[cfg(target_os = "macos")]
-        let metal_on = crate::graph::metal_backend::metal_available()
+        let metal_on = minfer::graph::metal_backend::metal_available()
             && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
         #[cfg(not(target_os = "macos"))]
         let metal_on = false;
         #[cfg(feature = "cuda")]
-        let cuda_on = crate::cuda::CudaState::get().is_some();
+        let cuda_on = minfer::cuda::CudaState::get().is_some();
         #[cfg(not(feature = "cuda"))]
         let cuda_on = false;
         // Shared gate (json::preview_fuse_flags) so the preview cannot drift
         // from the engine: Qwen2's runtime joins the decode QKV fusion on CUDA
         // too, and a Metal-only gate here used to drop its FusedQKV nodes.
         let (fuse_qkv, fuse_ffn) =
-            crate::graph::json::preview_fuse_flags(input_ids.len(), metal_on, cuda_on);
+            minfer::graph::json::preview_fuse_flags(input_ids.len(), metal_on, cuda_on);
         // #736: `gpu` means "a device participates" everywhere else (`CParams.gpu`,
         // `ModelDef::device`, the fusion gates). Passing `metal_on` alone left the
         // exporter's allocator without CUDA, so every exported node claimed CPU on a
         // CUDA-only box.
-        let device = crate::graph::json::export_placement(metal_on, cuda_on);
+        let device = minfer::graph::json::export_placement(metal_on, cuda_on);
         let model_name = std::path::Path::new(&model_path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1676,7 +1632,7 @@ fn main() {
                 fuse_ffn,
                 model.kv_format(),
             );
-            let g = crate::graph::json::build_runtime_graph(&*model, &gparams);
+            let g = minfer::graph::json::build_runtime_graph(&*model, &gparams);
             let mut f = std::fs::File::create(path).expect("create dot file");
             g.dump_dot(&mut f).expect("write dot");
             println!("Graph DOT exported to {path} ({} nodes)", g.n_nodes());
@@ -1695,7 +1651,7 @@ fn main() {
     // === Generate ===
     let mut logits = last_logits;
     if trace_on {
-        crate::trace::begin_phase("decode");
+        minfer::trace::begin_phase("decode");
     }
     let gen_start = Instant::now(); // pure-decode start (llama "Generation" caliber)
     let mut generated: Vec<u32> = Vec::new();
@@ -1788,7 +1744,7 @@ fn main() {
             if trace_on {
                 let text =
                     String::from_utf8_lossy(&decode_token(&tokenizer, next_token)).into_owned();
-                crate::trace::set_token(next_token, &text);
+                minfer::trace::set_token(next_token, &text);
             }
         }
         while !stop && generated.len() < params.n_predict {
@@ -1831,7 +1787,7 @@ fn main() {
                 }
                 if trace_on {
                     let text = String::from_utf8_lossy(&decode_token(&tokenizer, tok)).into_owned();
-                    crate::trace::set_token(tok, &text);
+                    minfer::trace::set_token(tok, &text);
                 }
                 consumed += 1;
             }
@@ -1891,7 +1847,7 @@ fn main() {
                 break;
             }
             generated.push(sampled.token_id);
-            token_trace(current_pos, sampled.token_id);
+            trace::token_trace(current_pos, sampled.token_id);
             prev_tokens.push(sampled.token_id);
             if prev_tokens.len() > REPEAT_LAST_N {
                 prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
@@ -1917,12 +1873,12 @@ fn main() {
             if trace_on {
                 let text = String::from_utf8_lossy(&decode_token(&tokenizer, sampled.token_id))
                     .into_owned();
-                crate::trace::set_token(sampled.token_id, &text);
+                minfer::trace::set_token(sampled.token_id, &text);
             }
             t1 = std::time::Instant::now();
             logits = model.forward(&[sampled.token_id], &[current_pos], 1, ctx);
             if trace_on {
-                crate::trace::attach_step(&logits);
+                minfer::trace::attach_step(&logits);
             }
             if timing {
                 t_fwd += t1.elapsed().as_secs_f64();
@@ -1947,27 +1903,27 @@ fn main() {
     // === P2 trace finish (MINFER_TRACE=<path>) ===
     // Attach the exported prefill/decode graphs (same params the runtime used,
     // mirrored by the dump block) and serialize the whole trace.
-    if let Some(tpath) = crate::trace::path() {
+    if let Some(tpath) = minfer::trace::path() {
         let model_name = std::path::Path::new(&model_path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| model_path.clone());
-        use crate::graph::json::export_graph_json;
+        use minfer::graph::json::export_graph_json;
         #[cfg(target_os = "macos")]
-        let metal_on = crate::graph::metal_backend::metal_available()
+        let metal_on = minfer::graph::metal_backend::metal_available()
             && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
         #[cfg(not(target_os = "macos"))]
         let metal_on = false;
         #[cfg(feature = "cuda")]
-        let cuda_on = crate::cuda::CudaState::get().is_some();
+        let cuda_on = minfer::cuda::CudaState::get().is_some();
         #[cfg(not(feature = "cuda"))]
         let cuda_on = false;
         // Decode-graph gates, shared with the dump block (and the engine).
-        let (fuse_qkv, fuse_ffn) = crate::graph::json::preview_fuse_flags(1, metal_on, cuda_on);
+        let (fuse_qkv, fuse_ffn) = minfer::graph::json::preview_fuse_flags(1, metal_on, cuda_on);
         // #736: the placement flag is "a device participates", exactly as in the
         // dump block and the engine; and the prefill preview takes the same fusion
         // gate as the engine (a hardcoded `false` shifted its node ids).
-        let device = crate::graph::json::export_placement(metal_on, cuda_on);
+        let device = minfer::graph::json::export_placement(metal_on, cuda_on);
         let prefill_graph = export_graph_json(
             &*model,
             &model_name,
@@ -1986,7 +1942,7 @@ fn main() {
             fuse_qkv,
             fuse_ffn,
         );
-        crate::trace::finish(&tpath, &model_name, &prompt, prefill_graph, decode_graph);
+        minfer::trace::finish(&tpath, &model_name, &prompt, prefill_graph, decode_graph);
     }
 
     println!();
@@ -2164,7 +2120,7 @@ fn run_conversation(
     first_prompt: Option<String>,
     mut spec_engine: Option<spec::SpecEngine>,
 ) -> i32 {
-    use crate::conversation::Engine as _;
+    use minfer::conversation::Engine as _;
     use std::io::Write; // reset_cache / forward trait methods
 
     // One resolver (#133 S1): a `--chat-template <FILE>` override beats the
@@ -2417,7 +2373,7 @@ fn resume_from_kv_companion(
     history: Option<&[(String, Option<String>)]>,
     kv_path: &str,
 ) -> bool {
-    use crate::conversation::Engine as _; // kv_load lives on the trait
+    use minfer::conversation::Engine as _; // kv_load lives on the trait
     if !std::path::Path::new(kv_path).exists() {
         return false;
     }

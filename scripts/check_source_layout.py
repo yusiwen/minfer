@@ -14,7 +14,9 @@ Two rules, both cheap to check and both easy to break silently:
 
 2. **Every `.rs` under `src/` is declared.** A file that no `mod` declaration
    names is never compiled — and when that file holds tests, they silently do
-   not run while `cargo test` and CI stay green. This is the dangerous half:
+   not run while `cargo test` and CI stay green. A file is declared when it is
+   reachable from a **crate root**: `src/main.rs`, and `src/lib.rs` once the
+   package has a library target (#763). This is the dangerous half:
    rule 1 makes it easy to create `foo/tests.rs` and forget the `mod tests;` in
    `foo.rs`.
 
@@ -38,9 +40,12 @@ import re
 import sys
 import tempfile
 
-#: Where the modules live, and the crate root the declaration walk starts from.
+#: Where the modules live, and the crate roots the declaration walk starts from.
 DEFAULT_ROOT = "src"
 CRATE_ROOT = "main.rs"
+#: The library root, when the package has one (#763): a module only the library
+#: declares is still compiled, so it must not be reported as orphaned.
+LIB_ROOT = "lib.rs"
 
 #: `mod name;` — a declaration that reaches a file. `pub` / `pub(crate)`
 #: prefixes count. Attributes are deliberately not matched: a `#[cfg(...)]`-gated
@@ -165,11 +170,15 @@ def check(root: str = DEFAULT_ROOT) -> list[str]:
             )
 
     crate_root = os.path.join(root, CRATE_ROOT)
-    if crate_root not in known:
+    roots = [crate_root]
+    lib_root = os.path.join(root, LIB_ROOT)
+    if lib_root in known:
+        roots.append(lib_root)
+    if not any(r in known for r in roots):
         return problems + [f"{crate_root}: crate root missing"]
 
     seen: set[str] = set()
-    stack = [crate_root]
+    stack = list(roots)
     while stack:
         f = stack.pop()
         if f in seen:
@@ -185,8 +194,8 @@ def check(root: str = DEFAULT_ROOT) -> list[str]:
     for f in files:
         if f not in seen:
             problems.append(
-                f"{f}: not reachable from {crate_root} — no `mod` declaration names it, "
-                f"so it is never compiled (tests in it would silently not run)"
+                f"{f}: not reachable from {' or '.join(roots)} — no `mod` declaration "
+                f"names it, so it is never compiled (tests in it would silently not run)"
             )
     return problems
 
@@ -329,6 +338,16 @@ def selftest() -> int:
             },
             1,
             ["a/helper.rs: not reachable from"],
+        ),
+        (
+            "a lib root reaches a module main.rs does not declare (#763)",
+            {
+                "lib.rs": "pub mod core_a;\n",
+                "core_a.rs": "pub fn f() {}\n",
+                "main.rs": "use minfer::core_a;\nfn main() {}\n",
+            },
+            0,
+            [],
         ),
         (
             "`#[path = ...]` is reported, and its file is then unsurprising-orphan",
