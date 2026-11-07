@@ -53,7 +53,7 @@ fn stage_forced() -> bool {
     if STAGE_FORCED.with(|c| c.get()) {
         return true;
     }
-    crate::config::get().packed_kv_stage
+    std::env::var("MINFER_PACKED_KV_STAGE").map_or(false, |v| v == "1")
 }
 
 /// #310: the per-thread `MINFER_PACKED_KV_STAGE` override [`stage_forced`]
@@ -83,7 +83,7 @@ static GPU_MS: std::sync::Mutex<(u64, f64)> = std::sync::Mutex::new((0, 0.0));
 
 fn op_profile_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| crate::config::get().op_profile)
+    *V.get_or_init(|| std::env::var("MINFER_OP_PROFILE").map_or(false, |v| v == "1"))
 }
 
 /// Records host-side encode time per op label on drop (works with early returns).
@@ -479,8 +479,10 @@ impl MetalBackend {
     /// MINFER_ATTN_CHUNKS override.
     fn attention_chunks(&self, positions: &crate::metal::MetalBuffer, count: usize) -> usize {
         let max_pos = Self::positions_max(positions, count);
-        crate::config::get()
-            .attn_chunks
+        std::env::var("MINFER_ATTN_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&c| c >= 1)
             .unwrap_or_else(|| ((max_pos + 1 + 31) / 32).clamp(1, 16))
     }
 
@@ -1550,7 +1552,9 @@ impl Backend for MetalBackend {
                             chunks,
                             self.kv_f16(),
                         );
-                    } else if (meta.hd == 64 || meta.hd == 128) && crate::config::get().split_attn {
+                    } else if (meta.hd == 64 || meta.hd == 128)
+                        && !std::env::var("MINFER_NO_SPLIT_ATTN").map_or(false, |v| v == "1")
+                    {
                         let chunks = self.attention_chunks(positions, nt);
                         cb.gqa_attn_split_f32(
                             q,
@@ -1703,7 +1707,7 @@ impl Backend for MetalBackend {
                     n,
                     n,
                 );
-                if crate::config::get().ffndebug {
+                if std::env::var("MINFER_FFNDEBUG").is_ok() {
                     self.submit_pending();
                     let nb = (self.pool[out_buf.id].length() as usize) / 4;
                     let ob = unsafe {
@@ -2118,7 +2122,7 @@ pub fn metal_available() -> bool {
 /// shifts every `metal_backend.rs:NNN` line anchor the docs carry.
 fn sync_ops_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| crate::config::get().metal_sync_ops)
+    *V.get_or_init(|| std::env::var("MINFER_METAL_SYNC_OPS").map_or(false, |v| v == "1"))
 }
 
 #[cfg(test)]

@@ -495,7 +495,7 @@ concatenated matmul output (`q = base`, `k = base + nqt`, `v = base + 2·nkt`;
 the Rust arm does this pointer arithmetic at (`cuda_backend.rs:`, the `Op::FusedQKV` section bases), and
 the **mixed-quant class** (e.g. a model where `attn_v` is Q6_K and cannot join
 the concat) points them at three separate matmul outputs
-(`Op::QkvBiasRopeStore`, arm at `cuda_backend.rs:1312`). One device kernel,
+(`Op::QkvBiasRopeStore`, arm at `cuda_backend.rs:1308`). One device kernel,
 two graph topologies, zero duplicated math.
 
 ### 3.3 KV in device memory — where the cache actually lives
@@ -584,7 +584,7 @@ allocation does not shrink, the bytes written per store and read per attention c
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
 copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1092`) maps the node to
 `pair[0]`; the CUDA arm comments "out_buf IS the region — no kernel" at
-(`cuda_backend.rs:955`, the `KvcacheLoad` arm comment). So the whole path — matmul, fused tail, cache,
+(`cuda_backend.rs:951`, the `KvcacheLoad` arm comment). So the whole path — matmul, fused tail, cache,
 attention, next layer — touches pool device memory and crosses no host
 boundary. The one structural guard on that layout: attention requires
 `hd == hd_kv` and `nkt == n_head_kv · hd` (the kernels stride KV rows by
@@ -699,7 +699,7 @@ allocator (`ptr_of` (`cuda_backend.rs:639`); `stream_guard` is a shim, not a loc
 and the per-step scratch share one arena; `alloc_fresh`
 (`alloc_fresh` (`cuda_backend.rs:2350`)) bypasses the free list when a buffer's *id* is
 still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
-(`cuda_backend.rs:872`, the `Drop` impl) frees the pool, the positions scratch, and every
+(`cuda_backend.rs:868`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
 "Backends own their buffer pools; the allocator is the single owner"
 (`AGENTS.md:120` ("Compute Graph — core rules", rule 8)) — the `GraphAllocator` decides *which* buffer a node gets and
@@ -794,7 +794,7 @@ differs is destroyed and re-captured `graph_replay_step` (`cuda_backend.rs:464`)
 `graph_replay_step` (`cuda_backend.rs:464`) return `false` — every step
 runs the plain per-node launch path. It is also the *recovery* switch: any
 capture/replay failure disables graphs for the rest of the session with a loud
-message saying exactly that (`cuda_backend.rs:508` and `:554`, the two "graphs disabled for this session" messages). TECH-PRIMER
+message saying exactly that (`cuda_backend.rs:504` and `:550`, the two "graphs disabled for this session" messages). TECH-PRIMER
 §8 calls it "the A/B control used by every graph-adjacent step doc"
 (`docs/CUDA-TECH-PRIMER.md:336-337` (§8 "CUDA Graphs — capture once, replay many (Phase 7")). A related hard rule: nothing inside a
 capture window may sync — a debug readback corrupts the capture, the 7e②

@@ -565,7 +565,7 @@ persistent KV regions. So the model wiring applies an **all-or-nothing
 gate** before the graph is even built:
 
 ```rust
-// src/models/qwen2/graph.rs:780 (`device`) (abridged)
+// src/models/qwen2/graph.rs:778 (`device`) (abridged)
 // CUDA participation (Phase 7): requires a usable device AND every
 // matmul weight registered on the CUDA registry in a kernel-supported
 // type (all-or-nothing; 7e③ moved the embedding gather on device, so
@@ -977,11 +977,11 @@ Every line answers a "what could go wrong":
   stream and capture runs in `cudaStreamCaptureModeThreadLocal`, so another
   backend's stream work (the CPU-side fills of a mixed split boundary, another
   model slot's launches) cannot be recorded into this graph. `stream_guard`
-  survives as a `None`-returning shim (`cuda_backend.rs:565`) so the historical
+  survives as a `None`-returning shim (`cuda_backend.rs:561`) so the historical
   call sites read as the no-ops they now are.
 
 Closing the window happens in `synchronize` → `close_capture_or_sync`
-(`cuda_backend.rs:569`): end capture, **instantiate**, launch once so the
+(`cuda_backend.rs:565`): end capture, **instantiate**, launch once so the
 step still produces output, and cache the exec. If instantiate/launch fails, the
 recorded launches never executed —
 this step's outputs are undefined, and the code says so out loud (graphs

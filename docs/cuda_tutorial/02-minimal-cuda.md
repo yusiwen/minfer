@@ -342,7 +342,7 @@ segfaults; all D2H (device-to-host) traffic goes through `cudaMemcpy`
 same-stream ordering is the correctness contract for async fills (`docs/GPU_SAFETY.md:232`, `:238`). Rule 1's Rust shape is on
 the elementwise dispatch arm: the backend checks the kernel's preconditions
 *before* launching and returns a formatted `Err` naming the node
-(`src/graph/cuda_backend.rs:1011`, the `Op::Add` arm) — `Op::Add` rejects input-size
+(`src/graph/cuda_backend.rs:1007`, the `Op::Add` arm) — `Op::Add` rejects input-size
 mismatches with `Err(format!("cuda: {}: add input size mismatch", node.name))`
 before calling `add_f32`). That is the boundary between the two error worlds:
 *host-visible* checks are ordinary Rust `Result`s raised before launch;
@@ -447,7 +447,7 @@ live captured CUDA Graph may still reference the old pointer
 is legitimate, because the alternative (freeing memory a captured graph still
 points at) is a use-after-free the GPU hits mid-replay. Scratch buffers, in
 contrast, are pooled: the backend frees every pool buffer in its `Drop`
-(`src/graph/cuda_backend.rs:872`, `impl Drop for CudaBackend`), and `CudaState` offers the raw pair
+(`src/graph/cuda_backend.rs:868`, `impl Drop for CudaBackend`), and `CudaState` offers the raw pair
 `cuda_malloc`/`cuda_free` (`src/cuda/methods/buffers.rs:21`) for pool use.
 
 **One complete ownership path, walked.** The simplest non-toy path in the
@@ -496,7 +496,7 @@ file: *register a weight → use it → (never) free it*.
    owns them until exit; the OS reclaims the context). For pool scratch:
    `CudaBackend::drop` frees every pool buffer with `cudaFree` (a
    context-wide call); the pre-#188 stream lock is gone, and the Drop now
-   first binds this backend's own stream with `self.bind()` (`src/graph/cuda_backend.rs:879`) for the teardown's host-side transfers. For the
+   first binds this backend's own stream with `self.bind()` (`src/graph/cuda_backend.rs:875`) for the teardown's host-side transfers. For the
    grow-on-demand scratch slots there is a middle pattern, `get_or_grow`
    (`src/cuda/methods.rs`): if the slot's allocation is too small, *free
    the old buffer then allocate the new one*, only under the slot's own
@@ -766,7 +766,7 @@ CUDA node takes; the layered picture first (the one diagram of this chapter):
 The scheduler calls `execute_node` on whichever backend was assigned at build
 time (assignment is decided *before* execution — the
 never-silently-fallback rule from `docs/GPU_SAFETY.md`). The CUDA backend's
-`Op::Silu` arm (`src/graph/cuda_backend.rs:1039`, the arm in `execute_node_inner`) is seven lines:
+`Op::Silu` arm (`src/graph/cuda_backend.rs:1035`, the arm in `execute_node_inner`) is seven lines:
 
 ```rust
 // `Op::Silu` (src/graph/cuda_backend.rs:)

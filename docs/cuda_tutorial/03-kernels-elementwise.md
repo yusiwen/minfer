@@ -353,7 +353,7 @@ grid has `od * nb` threads. Reading it line by line:
   row-major and each row is exactly `nb` blocks, the flat block index `g` is
   *also* the byte offset in units of 18. This only works because the row
   length `id` is a multiple of 32 — the backend gates it before dispatching:
-  the MatMul arm rejects `id % 32 != 0` (`src/graph/cuda_backend.rs:1652`, the quant-block gate) and the f16
+  the MatMul arm rejects `id % 32 != 0` (`src/graph/cuda_backend.rs:1648`, the quant-block gate) and the f16
   warm path requires `id % 256 == 0` (`warm_w16`, `src/cuda/methods/prefill_f16.rs:89`).
 - **`h2f(...)`** — the shared helper `h2f` (`src/cuda/kernels/common.cuh:101`): reinterpret the
   2 scale bytes as `__half` and convert to f32. The scale is stored f16, read
@@ -553,7 +553,7 @@ that carries the idea.
 | Kernel (file:line) | Purpose | The one interesting line |
 |---|---|---|
 | `convert_f32_f16_kernel` (`gemm_wmma.cu:203`) | f32 activations → f16, feeding the wmma prefill GEMM | `:208` — `base = (…blockIdx.x * blockDim.x + threadIdx.x) * 8`: the thread index is **multiplied by 8**; each thread `float4`-loads 8 f32 and stores 4 `__half2` (`:213`), 8× fewer transactions for the same traffic (the P1 comment at `:206`). Launcher `launch_convert_f16` `:833` sizes the grid over `n/8`. |
-| `f32_bits_to_i32` (`ops_elementwise.cu:249`) | positions/token ids arrive as I32-as-f32 bit patterns; rope/store/attention kernels want raw `int*` | `:256` — `dst[tid] = __float_as_int(src[tid]);` the whole kernel *is* that line: one device-side bit reinterpretation pass, so the per-layer path never syncs with the host (comment `:243`). Rust entry `bits_to_i32` `src/cuda/methods/kvstore.rs:185`, called from `positions_i32` (`cuda_backend.rs:1980`, launch `:2014`). |
+| `f32_bits_to_i32` (`ops_elementwise.cu:249`) | positions/token ids arrive as I32-as-f32 bit patterns; rope/store/attention kernels want raw `int*` | `:256` — `dst[tid] = __float_as_int(src[tid]);` the whole kernel *is* that line: one device-side bit reinterpretation pass, so the per-layer path never syncs with the host (comment `:243`). Rust entry `bits_to_i32` `src/cuda/methods/kvstore.rs:185`, called from `positions_i32` (`cuda_backend.rs:1980`, launch `:2010`). |
 | `gather_rows_f32` (`ops_misc.cu:145`) | the quant-free `GetRows`: `out[t*n+i] = x[ids[t]*n+i]` | `:157` — `out[idx] = src[(long long)id * n + i];` the classic gather: one flat index decoded into `(t, i)`, the id looked up per thread. Same `(1, 18)`-style dispatch you saw in §3.3 is what routes F32 embeddings and the tail-row selects here. |
 
 All three are one-thread-per-element kernels with the usual ceil-div launcher;

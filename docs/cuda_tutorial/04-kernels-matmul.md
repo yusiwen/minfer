@@ -375,7 +375,7 @@ gain class, same ceiling.
 
 Here is the section to bookmark: every MatMul-shaped node reaches the same
 match arm, and the arm hands everything to one function. The
-`Op::MatMul` arm (`src/graph/cuda_backend.rs:1625`), abridged to the calls that matter:
+`Op::MatMul` arm (`src/graph/cuda_backend.rs:1621`), abridged to the calls that matter:
 
 ```rust
 Op::MatMul { transpose_b } => {
