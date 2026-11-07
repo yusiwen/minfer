@@ -33,6 +33,13 @@ extern "C" {
 }
 
 // ─── Kernel Launch FFI (from cuda_kernels.cu) ───────────────────
+//
+// #763 S1: the package has a library target now, and an example then links
+// `minfer` instead of receiving the build script's `-l static=cuda_kernels`
+// directly (rustc deduplicates it against the rlib's recorded native libs).
+// Naming the archive here keeps this standalone example linkable; the `-L`
+// search path still comes from build.rs.
+#[link(name = "cuda_kernels", kind = "static")]
 extern "C" {
     fn launch_rms_norm_f32(
         x: *const f32,
