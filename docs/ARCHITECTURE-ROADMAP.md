@@ -675,7 +675,7 @@ parity-only stubs that no architecture emits (`Scale`, `Softmax`, `View`,
 `Reshape`, `Permute`, `AttnMode::Mha` — `COMPUTE-GRAPH-DESIGN.md §1.3`), and
 `View`/`Reshape`/`Permute` execute as copies. CUDA additionally refuses
 `transpose_b` matmul (`cuda_backend.rs:1621`), and Metal refuses
-`QkvBiasRopeStore` (`metal_backend.rs:698`) —
+`QkvBiasRopeStore` (`metal_backend.rs:700`) —
 so the two GPU backends do not implement the same op set, and a model's decode
 path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
 **Fixed in A8**: `SUPPORT-MATRIX.md` now carries an "Operator Coverage by
