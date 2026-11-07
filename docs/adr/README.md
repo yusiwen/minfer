@@ -198,6 +198,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0076](./0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md) | 2026-11-06 | A tensor's bytes are a mapping handle plus a range, never a `'static` view of a mapping | Accepted (supersedes ADR-0075) |
 | [0077](./0077-a-metal-registration-is-released-with-its-model.md) | 2026-11-06 | A Metal registration is released with its model, and the cache belongs to the engine | Accepted |
 | [0078](./0078-a-cuda-weight-is-released-with-its-model-and-a-capture-holds-a-lease.md) | 2026-11-07 | A CUDA weight is released with its model, and a live captured graph holds a lease | Accepted |
+| [0079](./0079-the-engine-is-a-crate-with-two-api-tiers.md) | 2026-11-07 | The engine is a crate with two API tiers, and the apps are its first consumers | Accepted |
 
 ## The template
 

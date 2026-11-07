@@ -15,6 +15,7 @@
 - [Architecture Roadmap](./ARCHITECTURE-ROADMAP.md)
 - [Architecture Execution Plan](./ARCHITECTURE-EXECUTION-PLAN.md)
 - [Source Layout Plan](./SOURCE-LAYOUT-PLAN.md)
+- [Crate API Design](./CRATE-API-DESIGN.md)
 
 # Decisions
 
@@ -97,6 +98,7 @@
     - [0076. A tensor's bytes are a mapping handle plus a range, never a `'static` view of a mapping](./adr/0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md)
     - [0077. A Metal registration is released with its model, and the cache belongs to the engine](./adr/0077-a-metal-registration-is-released-with-its-model.md)
     - [0078. A CUDA weight is released with its model, and a live captured graph holds a lease](./adr/0078-a-cuda-weight-is-released-with-its-model-and-a-capture-holds-a-lease.md)
+    - [0079. The engine is a crate with two API tiers, and the apps are its first consumers](./adr/0079-the-engine-is-a-crate-with-two-api-tiers.md)
 
 # Model Support
 
