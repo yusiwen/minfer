@@ -739,7 +739,7 @@ production path holds a hand-written chain — so on a Mac with both compiled in
 **Why a fresh allocation for cross-split staging (`alloc_fresh`) instead of reusing the free list?** The trait comment (§2.1) is the record of a real bug class: at execute time, free-list ids still back `node_to_buf` entries that later nodes in the *same* execute will read or write; recycling one for a staging copy would clobber in-flight data. The staging buffer is born outside the recycle economy and joins it only at graph-rebuild time, when liveness recycling is safe again (doc 07's allocator owns that transition).
 
 **Why is the f16 KV cache auto-selected by model size?** `kvformat::auto_device_format`
-(`src/graph/kvformat.rs:174`, reached through `resolve` at the end of a load — `src/models/mod.rs:447`)
+(`src/graph/kvformat.rs:174`, reached through `resolve` at the end of a load — `src/models/mod.rs:495`)
 turns f16 on when the device is not the CPU and `n_layers × n_kv_embd ≥ 8192` — the 7B class — and
 keeps f32 for the 0.5B class. The asymmetry is measured, not aesthetic: on the 7B, attention streams the whole KV per decode step, so halving those bytes is a direct win (−~1 ms/token at 2K ctx; #13 measured 1.60 → 0.95 s on a long-context case); on the 0.5B the decode is dispatch-latency-bound, the f16 conversion kernels cost more than the bandwidth saves, and f16 measured ~3 % *slower* (the comment cites the decided-not record). `MINFER_CACHE_TYPE=f16|f32|q8_0` overrides either way (`f16` on the CPU is mapped back to f32, which has
 no f16 KV kernel).
