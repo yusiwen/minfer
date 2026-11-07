@@ -315,10 +315,9 @@ impl SpecEngine {
                 format.name()
             ));
         }
-        let draft_path = crate::download::resolve(&cfg.draft_path)
-            .map_err(|e| format!("spec draft model: {e}"))?
-            .to_string_lossy()
-            .into_owned();
+        // #763 S2: the caller resolves the path (`download` is a CLI capability);
+        // the engine takes a path, so this module stays dependency-free.
+        let draft_path = cfg.draft_path.clone();
         let gguf = crate::gguf::load_gguf_model(std::path::Path::new(&draft_path))
             .map_err(|e| format!("spec draft: {e}"))?;
         // Namespaced load: the CUDA/Metal weight registries are process-global

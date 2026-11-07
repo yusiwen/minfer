@@ -61,15 +61,6 @@ impl TensorSpec {
 
 /// Number of dimensions the GGUF index stores: trailing 1s are dropped, but at
 /// least one dimension is always present (llama.cpp's `ggml_n_dims`).
-pub fn ggml_n_dims(ne: &[i64; 4]) -> u32 {
-    let mut n = 1u32;
-    for j in 1..4 {
-        if ne[j] != 1 {
-            n = j as u32 + 1;
-        }
-    }
-    n
-}
 
 // === KV encoding ===
 
@@ -169,7 +160,7 @@ impl GgufWriter {
 
         for (spec, off) in specs.iter().zip(offsets.iter()) {
             write_string(&mut header, &spec.name);
-            let n_dims = ggml_n_dims(&spec.ne);
+            let n_dims = crate::gguf::ggml_n_dims(&spec.ne);
             header.extend_from_slice(&n_dims.to_le_bytes());
             for j in 0..n_dims as usize {
                 header.extend_from_slice(&spec.ne[j].to_le_bytes());

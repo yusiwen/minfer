@@ -2068,3 +2068,16 @@ fn load_gguf_model_inner(path: &std::path::Path) -> Option<GgufModel> {
 
 #[cfg(test)]
 mod tests;
+/// Number of stored dimensions (llama.cpp's `ggml_n_dims`): trailing 1s dropped,
+/// at least one dimension always present. Lives here rather than in the writer
+/// so the model loaders (and a crate consumer) can size a tensor without
+/// pulling the GGUF writer in (#763 S2).
+pub fn ggml_n_dims(ne: &[i64; 4]) -> u32 {
+    let mut n = 1u32;
+    for j in 1..4 {
+        if ne[j] != 1 {
+            n = j as u32 + 1;
+        }
+    }
+    n
+}

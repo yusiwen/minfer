@@ -16,13 +16,13 @@ pub mod conversation;
 // the feature, so silence dead-code only in CPU-only builds.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub mod device_tier;
-pub mod download;
 pub mod dump;
 pub mod gguf;
 pub mod gguf_write;
 pub mod grammar;
 pub mod graph;
 pub mod kernel;
+#[cfg(feature = "observe")]
 pub mod live;
 pub mod models;
 pub mod optiming;
@@ -50,6 +50,8 @@ pub mod metal;
 pub mod bench;
 #[cfg(feature = "cli")]
 pub mod convert;
+#[cfg(feature = "cli")]
+pub mod download;
 #[cfg(feature = "cli")]
 pub mod server;
 #[cfg(feature = "cli")]

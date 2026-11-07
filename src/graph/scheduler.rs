@@ -191,7 +191,10 @@ impl BackendScheduler {
         //   (staging would be huge; captured in full on CPU). Inputs are
         //   host-filled by the allocator → read directly.
         let trace_on = crate::trace::enabled();
+        #[cfg(feature = "observe")]
         let live_on = crate::live::enabled();
+        #[cfg(not(feature = "observe"))]
+        let live_on = false;
         let capture = trace_on || live_on;
         // F8: the timing destination is resolved once per execute() — the
         // process flag (Global) is a cached relaxed load — so the per-node check
@@ -202,6 +205,7 @@ impl BackendScheduler {
         if trace_on {
             crate::trace::begin_step();
         }
+        #[cfg(feature = "observe")]
         if live_on {
             crate::live::begin_step();
         }
@@ -504,6 +508,7 @@ fn record_node_data(node: &CNode, data: &[f32], trace_on: bool, live_on: bool) {
     if trace_on {
         crate::trace::record_node(node.id, dn, stats, values.clone(), stride, n_total);
     }
+    #[cfg(feature = "observe")]
     if live_on {
         crate::live::record_node(
             node.id,
@@ -516,6 +521,8 @@ fn record_node_data(node: &CNode, data: &[f32], trace_on: bool, live_on: bool) {
             n_total,
         );
     }
+    #[cfg(not(feature = "observe"))]
+    let _ = live_on;
 }
 
 /// Read back staged Metal captures (valid after their split's command buffer

@@ -100,7 +100,7 @@ impl CudaState {
                 && std::env::var_os("MINFER_GRAPH_DUMP").is_none()
                 && std::env::var_os("MINFER_DUMP_DIR").is_none()
                 && !crate::trace::enabled()
-                && !crate::live::enabled() =>
+                && !live_enabled() =>
             {
                 2
             }
@@ -110,4 +110,16 @@ impl CudaState {
             _ => 0,
         }
     }
+}
+
+/// #763 S2: `live` is the `observe` feature; without it nothing is being
+/// observed, so the mode-2 decision is unchanged.
+#[cfg(feature = "observe")]
+fn live_enabled() -> bool {
+    crate::live::enabled()
+}
+
+#[cfg(not(feature = "observe"))]
+fn live_enabled() -> bool {
+    false
 }

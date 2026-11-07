@@ -1185,6 +1185,19 @@ fn main() {
     } else {
         None
     };
+    // #763 S2: the draft is resolved here, not inside the engine: `download` is a
+    // CLI capability, and `spec` now takes a path.
+    let spec_draft = match spec_draft {
+        Some(p) => match download::resolve(&p) {
+            Ok(path) => Some(path.to_string_lossy().into_owned()),
+            Err(e) => {
+                eprintln!("Error: spec draft: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     let prompt = if positional.len() > 1 {
         positional[1..].join(" ")
     } else if conv_mode || server_mode || viz_mode {
