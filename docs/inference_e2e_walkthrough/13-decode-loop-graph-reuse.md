@@ -327,7 +327,7 @@ the graph*; on the "survives" side, everything that *holds data*:
 | Survives the rebuild | Recomputed on rebuild |
 |---|---|
 | The `GraphAllocator` itself (it lives inside `GraphCache`, `cache.rs:`) | The node list (`Self::build`, `src/models/qwen2/graph.rs`) |
-| Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `src/models/qwen2/graph.rs:630`) |
+| Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `src/models/qwen2/graph.rs:632`) |
 | **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:`; `alloc_graph` explicitly frees only liveness buffers, `alloc_graph` (`alloc.rs:`)) | The fusion pass (`FusionPass::run`, `src/models/qwen2/graph.rs:`) |
 | Backend buffer *pools* (freed liveness buffers return to their pool; the memory is recycled, not released) | The node→buffer mapping (`alloc_graph` clears `node_to_buf`, `alloc.rs:519`) |
 | The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `replace_graph` (`cache.rs:`) + §3.4) | Cross-backend staging buffers (keyed by `(graph uid, node, backend)` and surviving a rebuild *and* a re-map — E4 S3; `alloc_graph` clears only the in-flight `cross_pending` set, `alloc_graph` (`alloc.rs:`)) |
