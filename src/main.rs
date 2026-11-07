@@ -2581,14 +2581,8 @@ fn dump_key_tensors(ctx: &gguf::GgufContext) {
 }
 
 fn get_chat_template(data: &[u8]) -> Option<String> {
-    if let Some(ctx) = gguf::GgufContext::init_from_data(data) {
-        for kv in &ctx.kv {
-            if kv.key == "tokenizer.chat_template" {
-                return Some(kv.get_val_str(0).to_string());
-            }
-        }
-    }
-    None
+    // #763 S6: one reader, shared with the engine facade.
+    minfer::template::from_gguf(data)
 }
 
 #[cfg(test)]

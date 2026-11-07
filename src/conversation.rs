@@ -392,6 +392,8 @@ impl std::fmt::Display for ConvError {
     }
 }
 
+impl std::error::Error for ConvError {}
+
 /// A multi-turn conversation session (logical state; inference state lives in `Engine`).
 pub struct Conversation {
     /// Recorded messages (role, content). Isomorphic with the server's ChatMessage.
