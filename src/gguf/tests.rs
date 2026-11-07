@@ -573,3 +573,175 @@ fn a_metal_reload_releases_the_first_mapping_and_runs_a_different_model() {
     let _ = std::fs::remove_file(&a_path);
     let _ = std::fs::remove_file(&b_path);
 }
+
+/// [#745] Acceptance #1, RSS half: after a real-model reload the host's resident
+/// set and the model file's descriptor count must return to the baseline.
+///
+/// The two models are different on purpose (A and B are independent cached
+/// GGUFs), and `Layers(0)` keeps every forward on the CPU, so this measures the
+/// host mapping lifetime rather than a device copy. The tolerance covers
+/// allocator caches the process may retain; 128 MiB is far below either model.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "real models: set MINFER_RSS_TEST_MODEL_A and MINFER_RSS_TEST_MODEL_B"]
+fn a_real_model_reload_returns_rss_and_fds_to_baseline() {
+    let a = match std::env::var("MINFER_RSS_TEST_MODEL_A") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            eprintln!("skipping: MINFER_RSS_TEST_MODEL_A unset");
+            return;
+        }
+    };
+    let b = match std::env::var("MINFER_RSS_TEST_MODEL_B") {
+        Ok(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
+        _ => {
+            eprintln!("skipping: MINFER_RSS_TEST_MODEL_B unset");
+            return;
+        }
+    };
+    assert_ne!(a, b, "the reload gate needs two different models");
+    const TOL_KIB: u64 = 128 * 1024;
+
+    let baseline = rss_kib();
+    assert_eq!(
+        open_fds_to(&a),
+        0,
+        "model A must not be open before the test"
+    );
+    assert_eq!(
+        open_fds_to(&b),
+        0,
+        "model B must not be open before the test"
+    );
+
+    let load = |p: &std::path::Path| {
+        let gguf = load_gguf_model(p).expect("the real GGUF loads");
+        let model = crate::models::load_model_with(
+            &gguf,
+            "",
+            crate::graph::offload::OffloadRequest::Layers(0),
+        )
+        .expect("the real model loads");
+        assert_eq!(
+            model.device(),
+            crate::models::Device::Cpu,
+            "the RSS gate keeps the forward on the CPU"
+        );
+        let mut cache = crate::graph::cache::GraphCache::new();
+        let logits = model.forward_graph_cached(&[1], &[0], 1, 32, &mut cache);
+        assert!(!logits.is_empty(), "the forward step must produce logits");
+        (gguf, model, cache)
+    };
+
+    let (gguf_a, model_a, cache_a) = load(&a);
+    let a_live = rss_kib();
+    assert!(
+        a_live > baseline,
+        "lifting model A must raise RSS (baseline {baseline} KiB, live {a_live} KiB)"
+    );
+    drop(cache_a);
+    drop(model_a);
+    drop(gguf_a);
+    trim_allocator();
+    let a_after = rss_kib();
+    assert_eq!(
+        open_fds_to(&a),
+        0,
+        "model A's file descriptor stayed open after model + cache drop"
+    );
+    assert!(
+        a_after <= baseline + TOL_KIB,
+        "model A's mapping stayed resident: baseline {baseline} KiB, after drop {a_after} KiB \
+         (tolerance {TOL_KIB} KiB)"
+    );
+
+    let (gguf_b, model_b, cache_b) = load(&b);
+    let b_live = rss_kib();
+    assert!(
+        b_live > baseline,
+        "lifting model B must raise RSS (baseline {baseline} KiB, live {b_live} KiB)"
+    );
+    drop(cache_b);
+    drop(model_b);
+    drop(gguf_b);
+    trim_allocator();
+    let b_after = rss_kib();
+    assert_eq!(
+        open_fds_to(&b),
+        0,
+        "model B's file descriptor stayed open after model + cache drop"
+    );
+    assert!(
+        b_after <= baseline + TOL_KIB,
+        "model B's mapping stayed resident: baseline {baseline} KiB, after drop {b_after} KiB \
+         (tolerance {TOL_KIB} KiB)"
+    );
+    eprintln!(
+        "rss_reload: baseline={baseline} KiB a_live={a_live} KiB a_after={a_after} KiB \
+         b_live={b_live} KiB b_after={b_after} KiB; fds A/B after drop = 0/0"
+    );
+}
+
+/// Resident set in KiB, on the host that owns the mapping.
+#[cfg(target_os = "linux")]
+fn rss_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .expect("/proc/self/status has VmRSS");
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .expect("VmRSS is a number of KiB")
+}
+
+#[cfg(target_os = "macos")]
+fn rss_kib() -> u64 {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("ps rss is a number of KiB")
+}
+
+/// Count the process's open descriptors whose target is `path`.
+#[cfg(target_os = "linux")]
+fn open_fds_to(path: &std::path::Path) -> usize {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    std::fs::read_dir("/proc/self/fd")
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| std::fs::read_link(e.path()).ok())
+                .filter(|p| p == &target)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn open_fds_to(path: &std::path::Path) -> usize {
+    macos_open_fds_to(path)
+}
+
+/// glibc retains freed arenas; ask it to return them so the RSS number is the
+/// mapping's lifetime, not the allocator's cache. No-op elsewhere.
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+fn trim_allocator() {
+    // SAFETY: glibc's `malloc_trim` only walks its own arenas; the argument is
+    // the padding to keep, and 0 asks for the maximum release.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trim_allocator() {}
