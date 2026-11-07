@@ -1375,3 +1375,13 @@ pub(crate) fn fallback_chatml_messages(
 
 #[cfg(test)]
 mod tests;
+
+/// The GGUF's `tokenizer.chat_template`, when the file carries one. Shared by the
+/// CLI and the engine facade (#763 S6): one reader, so the two cannot disagree.
+pub fn from_gguf(data: &[u8]) -> Option<String> {
+    let ctx = crate::gguf::GgufContext::init_from_data(data)?;
+    ctx.kv
+        .iter()
+        .find(|kv| kv.key == "tokenizer.chat_template")
+        .map(|kv| kv.get_val_str(0).to_string())
+}

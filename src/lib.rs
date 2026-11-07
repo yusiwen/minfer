@@ -18,6 +18,7 @@ pub mod conversation;
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub mod device_tier;
 pub mod dump;
+pub mod engine;
 pub mod gguf;
 pub mod gguf_write;
 pub mod grammar;

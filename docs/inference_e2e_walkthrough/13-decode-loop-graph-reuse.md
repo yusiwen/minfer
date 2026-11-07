@@ -5,7 +5,7 @@
 > rebuilt once and then reused for every step** → the same loop runs unchanged
 > on the GPU backends (docs 14–15, which swap out the kernels *inside* the
 > loop, never the loop itself).
-> **Code**: `src/main.rs` (decode loop (`main.rs:`, the `while generated.len() < params.n_predict` loop), the repeat window `REPEAT_LAST_N` (`conversation.rs:427`), loop setup
+> **Code**: `src/main.rs` (decode loop (`main.rs:`, the `while generated.len() < params.n_predict` loop), the repeat window `REPEAT_LAST_N` (`conversation.rs:429`), loop setup
 > `main.rs1955` (the decode-loop setup), `is_stop_token` `main.rs1955`), the cached forward
 > `src/models/qwen2/graph.rs::forward_cached` (`src/models/qwen2/graph.rs:`), the reuse
 > decision `src/graph/cache.rs::try_reuse` `try_reuse` (`cache.rs:`), the params
@@ -371,7 +371,7 @@ the token at position `p`), which makes the whole session strategy possible:
   bounds. Regeneration simply overwrites those slots as
   it appends. (A full `/clear` or a template mismatch falls back to
   `rehydrate_full` — reset the cache, re-render everything, re-prefill
-  once, `rehydrate_full` (`conversation.rs:519`).)
+  once, `rehydrate_full` (`conversation.rs:521`).)
 - **Seams kept consistent.** If a turn ended without an end-of-turn token,
   the next turn first inserts the EOT token into the KV at the cursor
   (`conversation.rs:`, the EOT insert) so the region keeps matching what the chat
