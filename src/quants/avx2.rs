@@ -96,7 +96,7 @@ pub(super) fn enabled() -> bool {
     *V.get_or_init(|| {
         is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("fma")
-            && !std::env::var("MINFER_NO_AVX2").map_or(false, |v| v == "1")
+            && crate::config::get().avx2
     })
 }
 

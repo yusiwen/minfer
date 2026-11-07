@@ -1184,7 +1184,7 @@ unsafe fn attn_heads(ctx: *const (), h0: usize, h1: usize) {
 /// rule 3 asks for: the two paths answer within a named class, not bitwise, because
 /// the fused one quantizes the query too.
 fn fused_q8_kv_enabled() -> bool {
-    std::env::var_os("MINFER_NO_FUSED_Q8_KV").is_none()
+    crate::config::get().fused_q8_kv
 }
 
 /// Attention over **packed Q8_0** K/V regions, reading the blocks directly.

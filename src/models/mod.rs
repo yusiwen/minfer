@@ -423,7 +423,7 @@ pub fn load_model_with(
     // C4: `MINFER_CACHE_TYPE` is the interface the CLI and the server use. Resolved
     // once per load by `load_model_configured`, which is also the explicit-format
     // entry point a test uses instead of mutating the environment (issue #99).
-    let cache_type = std::env::var("MINFER_CACHE_TYPE").ok();
+    let cache_type = crate::config::get().kv_cache_type.clone();
     load_model_configured(model, ns, offload, cache_type.as_deref())
 }
 

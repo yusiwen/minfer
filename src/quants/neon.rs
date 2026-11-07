@@ -18,7 +18,7 @@ pub(super) fn enabled() -> bool {
         // below would be an unnecessary third path for pre-2018 chips).
         std::arch::is_aarch64_feature_detected!("neon")
             && std::arch::is_aarch64_feature_detected!("dotprod")
-            && !std::env::var("MINFER_NO_NEON").map_or(false, |v| v == "1")
+            && crate::config::get().neon
     })
 }
 

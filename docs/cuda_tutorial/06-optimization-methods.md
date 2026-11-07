@@ -390,7 +390,7 @@ counted the difference.
   `attn_bias_rope_store_f32` (`src/cuda/kernels/kv_store.cu:134`) — one launch replaces the 7-launch decode tail;
   the graph ops `Op::FusedQKV` (concat matmul + fused epilogue) and
   `Op::FusedFFN` (gate|up concat matmul + in-place swiglu) are declared in
-  `Op::FusedQKV` (`src/graph/ops.rs:158`), `Op::FusedFFN` (`:177`), executed in `execute_node_inner` (`src/graph/cuda_backend.rs:929`; the `Op::FusedFFN` arm `:1249`, the `Op::FusedQKV` arm `:1379`),
+  `Op::FusedQKV` (`src/graph/ops.rs:158`), `Op::FusedFFN` (`:177`), executed in `execute_node_inner` (`src/graph/cuda_backend.rs:925`; the `Op::FusedFFN` arm `:1249`, the `Op::FusedQKV` arm `:1379`),
   and gated at build time in `fuse_qkv` (`src/models/qwen2/graph.rs:`). The decode
   A-quantize fusion (`swiglu_quant_pad40`, `rms_norm_quant_pad40`,
   `swiglu_quant_pad40` (`src/cuda/kernels/ops_elementwise.cu:215`), `rms_norm_quant_pad40` (`:90`) writes the quantized activation plane

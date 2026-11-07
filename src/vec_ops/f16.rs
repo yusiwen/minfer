@@ -68,7 +68,7 @@ thread_local! {
 /// `MINFER_NO_F16_ROWB=1` keeps F6's per-(row, token) loop shape (the A/B
 /// control for the row-blocked prefill; the two are bit-identical).
 fn no_f16_rowb() -> bool {
-    std::env::var("MINFER_NO_F16_ROWB").map_or(false, |v| v == "1")
+    !crate::config::get().f16_rowb
 }
 
 /// Scalar reference for the f16 dot — the correctness oracle the SIMD paths are

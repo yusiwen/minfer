@@ -9,6 +9,7 @@
 //! The decision behind the split is ADR-0079 (`docs/adr/0079-the-engine-is-a-crate-with-two-api-tiers.md`).
 
 pub mod block;
+pub mod config;
 pub mod conversation;
 // #185: the checked "one thread at a time in the CUDA device path" contract.
 // Pure and feature-independent on purpose, so the CPU CI job runs its tests.

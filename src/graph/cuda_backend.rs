@@ -215,21 +215,17 @@ impl CudaBackend {
         if stream.is_null() {
             return None;
         }
-        let graphs_mode = if std::env::var("MINFER_NO_CUDA_GRAPH").as_deref() == Ok("1") {
+        let graphs_mode = if !crate::config::get().cuda_graph {
             GraphMode::Disabled
         } else {
             GraphMode::Enabled
         };
-        let prefill_capture = std::env::var("MINFER_NO_PREFILL_CAPTURE").as_deref() != Ok("1");
+        let prefill_capture = crate::config::get().prefill_capture;
         // #218: the warmup count is 3 in every real build; the `MINFER_TEST_*`
         // seam exists only so a gate can force capture onto the first run (which
         // drives the >48 KiB smem opt-in into the window — the mutation arm).
         #[cfg(test)]
-        let capture_warmup = std::env::var("MINFER_TEST_CAPTURE_WARMUP")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(3);
+        let capture_warmup = crate::config::get().capture_warmup.unwrap_or(3);
         #[cfg(not(test))]
         let capture_warmup = 3u32;
         Some(Self {

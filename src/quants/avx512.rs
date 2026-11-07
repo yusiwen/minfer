@@ -23,8 +23,8 @@ pub(super) fn enabled() -> bool {
             && is_x86_feature_detected!("avx512dq")
             && is_x86_feature_detected!("avx512vl")
             && is_x86_feature_detected!("avx512vnni")
-            && !std::env::var("MINFER_NO_AVX512").map_or(false, |v| v == "1")
-            && !std::env::var("MINFER_NO_AVX2").map_or(false, |v| v == "1")
+            && crate::config::get().avx512
+            && crate::config::get().avx2
     })
 }
 

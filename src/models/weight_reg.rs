@@ -180,7 +180,7 @@ pub(crate) fn register_cuda_weight(
     let (id, od) = (shape[0] as usize, shape[1] as usize);
     let dsc_gates_on = crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_RAW_NB")
         && crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE")
-        && std::env::var("MINFER_MMQ_Q4K_DSC").as_deref() != Ok("0");
+        && crate::config::get().mmq_q4k_dsc;
     match cuda_weight_reg(ttype, rank, data.len(), od, id, dsc_gates_on) {
         CudaWeightReg::None => {}
         CudaWeightReg::Q6kPadded => {

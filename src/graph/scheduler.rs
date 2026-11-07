@@ -161,7 +161,7 @@ impl BackendScheduler {
         // #188 narrowed the guard to the unbound legacy `layer_gpu` path; #241
         // then deleted that path, and the guard module with it, so there is no
         // device-entry exclusion left anywhere in the engine.
-        if std::env::var("MINFER_GRAPH_TRACE").is_ok() {
+        if crate::config::get().graph_trace {
             for (si, s) in splits.iter().enumerate() {
                 eprintln!(
                     "[graph] split {si}: {:?} nodes {}-{}",
