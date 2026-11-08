@@ -5,6 +5,27 @@ edition = "2021"
 description = "A minimal local LLM inference engine built from scratch in Rust"
 license = "MIT"
 repository = "https://github.com/yusiwen/minfer"
+readme = "README.md"
+keywords = ["llm", "inference", "gguf", "quantized", "cpu"]
+categories = ["science", "algorithms", "hardware-support"]
+# The pinned toolchain is 1.97.1 (rust-toolchain.toml); say so for consumers
+# instead of letting them discover it.
+rust-version = "1.97"
+# Keep the published crate source-only: the book, the document tree and the
+# research experiments are repository material. `viz/` ships because the `viz`
+# feature reads its assets at runtime; the CUDA diagnostic example is the one
+# experiment a manifest entry names, so its single file travels.
+include = [
+    "/src/**",
+    "/tests/**",
+    "/examples/**",
+    "/viz/**",
+    "/experiments/cuda/cuda_graph_rust/cuda_graph_diag.rs",
+    "/build.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+]
 
 
 [[bin]]
@@ -52,6 +73,11 @@ futures-util = { version = "0.3", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util"] }
 sha2 = "0.10"
+
+[package.metadata.docs.rs]
+# The facade and the tiers, with the app-layer features a reader of the docs
+# needs to see the full surface. `metal` is not a feature yet (see #763 S9).
+features = ["server", "tooling", "viz", "observe"]
 
 [features]
 # Defaults keep `cargo build --release` producing today's binary. A consumer of

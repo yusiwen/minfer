@@ -299,6 +299,32 @@ jobs:
       - name: Newly dead code must fail the dead-code oracle (CPU)
         run: python3 scripts/check_dead_code_oracle.py --config cpu
 
+  # The crate is a library first (#763 S9): a consumer builds it with
+  # `default-features = false`, so every feature fence must compile on its own.
+  # This is the gate for "the sliver a consumer gets", and `cargo package`
+  # proves the published tarball (not the working tree) builds.
+  feature-matrix:
+    needs: changes
+    if: >-
+      (github.event_name != 'pull_request' || github.event.action != 'edited')
+      && needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04 # pinned, like the other jobs: `ubuntu-latest` migrates to Ubuntu 26
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: The core compiles with no default features
+        run: cargo check --release --no-default-features
+      - name: Each application feature compiles on its own
+        run: |
+          set -e
+          for f in server tooling observe viz; do
+            echo "== --features $f"
+            cargo check --release --no-default-features --features "$f"
+          done
+      - name: The published tarball builds (cargo package)
+        run: cargo package --allow-dirty
+
   # The container tag carries both the CUDA toolkit and the base image, and the
   # base is the compile-time glibc/gcc floor. Keep the toolkit at a version
   # build.rs is known to support (12.x and 13.x today) and keep the base at
