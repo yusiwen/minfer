@@ -638,6 +638,19 @@ Two layers of checks are deliberately *not* in `supports_op`:
 - **Bias** is applied by `add_bias_f32` after the GEMM; its last argument is the **row count** `nt`
   (the kernel maps one block row per token).
 
+**The MMQ gate family.** Six flags decide whether the promoted MMQ path is taken, each **on unless
+set to `0`**: `MINFER_MMQ` (the path itself), `MINFER_MMQ_RAW` (the raw-byte tensor-core kernels),
+`MINFER_MMQ_RAW_NB` (their NB-transposed variant), `MINFER_MMQ_A_TRANSPOSE` (the transposed-A
+quantize prepass), `MINFER_MMQ_Q6K_NB` (the Q6_K NB kernel) and `MINFER_Q6K_DPL` (the dual-plane Q6_K
+decode kernel). `MINFER_MMQ_A_FUSE` picks the producer-fused A quantize: `0` off, `1` fused, `2`
+(the default) fused *and* skipping the f32 output write, degrading to `1` while any window reader
+(`MINFER_GRAPH_DUMP`, `MINFER_DUMP_DIR`, `MINFER_TRACE`, live viz) is active. The r28–r60 measurements
+behind the defaults are in `CUDA_OPTIMIZATION.md`; since [#769](https://github.com/yusiwen/minfer/issues/769)
+the flags are `EngineConfig` fields (`src/config.rs`), not environment reads at the dispatch sites, so
+a library consumer can set them from code and the six are no longer invisible to
+`scripts/check_env_vars.py` — the dynamic `mmq_gate_on(name)` helper was the one place a `MINFER_*`
+read could hide from the ledger.
+
 ### 4.5 Allocator and scheduler integration
 
 - `GraphAllocator::supports` priority is **Metal → CUDA → CPU**; `enable_cuda()` mirrors

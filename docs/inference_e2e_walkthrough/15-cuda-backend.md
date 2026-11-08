@@ -767,7 +767,7 @@ fail — which is how the ladder degrades to the generic `launch_mmq_nt`
 fallback at the bottom:
 
 ```rust
-// src/cuda/methods/prefill_mmq.rs:133 (`prefill_mmq`) (generic tail)
+// src/cuda/methods/prefill_mmq.rs:132 (`prefill_mmq`) (generic tail)
 unsafe {
     let q8 = self.mmq_quantize_native(x as *const f32, id as i32, nt as i32, stream);
     if q8 == 0 {

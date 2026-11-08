@@ -29,7 +29,7 @@
 #
 # The line below states what the checker counts, and the checker compares it: refresh it in
 # the same change that adds a knob or moves one between the tables (#628).
-# Measured 2026-11-08: 91 production reads — 76 documented, 15 internal.
+# Measured 2026-11-08: 97 production reads — 82 documented, 15 internal.
 
 [documented]
 
@@ -56,10 +56,15 @@ MINFER_GRAPH_TRACE = "docs/COMPUTE-GRAPH-DESIGN.md"
 MINFER_METALLIB_FILE = "docs/METAL-BACKEND-DESIGN.md"
 MINFER_METAL_CAPTURE = "docs/METAL-BACKEND-DESIGN.md"
 MINFER_METAL_SYNC_OPS = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_MMQ = "docs/CUDA-BACKEND-DESIGN.md"
 MINFER_MMQ_A_FUSE = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_MMQ_A_TRANSPOSE = "docs/CUDA-BACKEND-DESIGN.md"
 MINFER_MMQ_Q4K_DSC = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
 MINFER_MMQ_Q6K_EXP = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
+MINFER_MMQ_Q6K_NB = "docs/CUDA-BACKEND-DESIGN.md"
+MINFER_MMQ_RAW = "docs/CUDA-BACKEND-DESIGN.md"
 MINFER_MMQ_RAW_KD = "docs/LLAMA-CPP-MMQ-ANALYSIS.md"
+MINFER_MMQ_RAW_NB = "docs/CUDA-BACKEND-DESIGN.md"
 MINFER_MMQ_RAW_NB_DEBUG = "docs/inference_e2e_walkthrough/15-cuda-backend.md"
 MINFER_MMQ_RAW_WIDE = "docs/LLAMA-CPP-MMQ-ANALYSIS.md"
 MINFER_MMVQ_V1 = "docs/cuda_tutorial/04-kernels-matmul.md"
@@ -95,6 +100,7 @@ MINFER_N_BATCH = "docs/USAGE.md"
 MINFER_OP_PROFILE = "docs/SUPPORT-MATRIX.md"
 MINFER_OP_TIMING = "docs/USAGE.md"
 MINFER_PACKED_KV_STAGE = "docs/METAL-BACKEND-DESIGN.md"
+MINFER_Q6K_DPL = "docs/CUDA-BACKEND-DESIGN.md"
 MINFER_Q6K_PF = "docs/CUDA-TECH-PRIMER.md"
 MINFER_QUEUE_MAX = "docs/USAGE.md"
 MINFER_REBUILD_TRACE = "docs/COMPUTE-GRAPH-DESIGN.md"

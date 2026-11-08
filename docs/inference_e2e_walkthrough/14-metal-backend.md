@@ -166,7 +166,7 @@ The command buffer is created lazily on the first op of a split:
 #### 3.2.2 Capability table: `supports_op` and `supports_fused`
 
 ```rust
-// src/graph/metal_backend.rs:675 (`supports_op`) (abridged to the shape; full match in tree)
+// src/graph/metal_backend.rs:673 (`supports_op`) (abridged to the shape; full match in tree)
     fn supports_op(&self, op: &Op, dtype: DType) -> bool {
         match op {
             Op::Input => true,
@@ -201,7 +201,7 @@ Two things to notice. The `dtype` checks are almost tautological — the graph's
 #### 3.2.3 The buffer pool: recycle vs fresh
 
 ```rust
-// src/graph/metal_backend.rs:919 (`alloc_fresh`)
+// src/graph/metal_backend.rs:917 (`alloc_fresh`)
     fn alloc_buffer(&mut self, size: usize) -> usize {
         if let Some(idx) = self
             .free
@@ -617,7 +617,7 @@ Walk it as three defenses. **(1) A completion handler on a semaphore**: `addComp
 #### 3.2.11 Host read/write: views, plus the readback that feeds the sampler
 
 ```rust
-// src/graph/metal_backend.rs:2036 (`read_host`)
+// src/graph/metal_backend.rs:2034 (`read_host`)
     fn read_host(&self, id: usize) -> Option<&[f32]> {
         let buf = self.pool.get(id)?;
         let len = (buf.length() as usize) / 4;
@@ -751,7 +751,7 @@ no f16 KV kernel).
 - **Never host-copy a GPU-pending buffer.** Shared memory makes every pool byte look readable at all times — but between `execute_node` and the split's submit, a buffer's *future* contents are still in flight. The Phase-3 KV-corruption bug (recorded in AGENTS.md core rule 5) came from exactly this: an in-place op's input was host-copied while the GPU had pending writes to it. The invariants that make the current code safe: inputs are host-written before their split encodes; outputs are read only after `synchronize`; and in-place GPU ops snapshot their input inside the backend when aliasing is not already guaranteed:
 
 ```rust
-// src/graph/metal_backend.rs:620 (`copy_in`)
+// src/graph/metal_backend.rs:618 (`copy_in`)
     fn copy_in(&self, dst: usize, src: usize) {
         // in-place-ish ops (silu/rope) may alias; snapshot to dst first
         let src_buf = self.buf(src);
