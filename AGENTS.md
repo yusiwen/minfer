@@ -16,21 +16,28 @@ For "where / how is X implemented", prefer [ccc](https://cocoindex.io/cocoindex-
 
 ## Layout
 
+`src/lib.rs` is the crate root (`minfer`). Engine modules are always compiled; the application layer (`main`, `server`, `tooling`, `convert`, `quantize`, `download`, `bench`, `spec_verify`) sits behind the `cli`/`server`/`tooling`/`viz` features (ADR-0079). Public tiers: `engine` (facade), `advanced` (L1, not semver-stable before 1.0) and `config` (the process configuration). `cargo build --release` still builds the binary; a consumer builds with `default-features = false`.
+
 ```
 src/
-├── main.rs          # CLI + inference loop (prefill → autoregressive decode)
+├── lib.rs           # crate root (minfer): engine modules + feature-gated app layer
+├── main.rs          # CLI (the facade's first consumer): parsing, presentation, modes
+├── advanced.rs      # L1 tier: ModelDef · GraphCache · Batch · Tokenizer · sampler · spec · L0
+├── config.rs        # EngineConfig: from_env() in the app, get() in the engine
+├── engine.rs        # L2 facade: Engine::load · Session::chat
+├── engine/generate.rs # the single-shot loop (prefill → decode → stop strings)
 ├── graph/           # ★ compute graph — the inference core (files below)
 ├── gguf.rs          # GGUF v3 parser
 ├── gguf_write.rs    # F6: GGUF v3 writer — header/metadata/tensor index, ggml_pad, split
-├── quantize.rs      # F6: weight encoders (byte-identical to llama.cpp) + loud refusal
-├── convert.rs       # F6: HF Qwen2 checkpoint → GGUF; strict-loader metadata; QuantizePlan
-├── tooling.rs       # F6: convert / quantize / split subcommands
+├── quantize.rs      # F6: weight encoders (llama-identical) + loud refusal
+├── convert.rs       # F6: HF checkpoint → GGUF; QuantizePlan
+├── tooling.rs       # F6 subcommands: convert / quantize / split
 ├── block.rs         # quantized block types (repr(C), ggml-common.h layout)
 ├── quants.rs        # AVX2 / NEON+SDOT dot kernels + Q8_0/Q8_K quantization — module decider
-├── quants/          # dot_q4_0 · dot_q4_1 · dot_q5 · dot_q8_0 · kquant · quantize_q8_0 · quantize_q8_k · avx2 · neon (split by #264)
+├── quants/          # dot kernels per type + quantize helpers (split by #264)
 ├── kernel.rs        # quantized matmul dispatch + scalar fallbacks; shared worker pool — module decider
 ├── kernel/          # dispatch · pool · embed (split by #264)
-├── vec_ops.rs       # RMSNorm, RoPE, Softmax, SiLU; vectorized f16 weight dot — module decider
+├── vec_ops.rs       # RMSNorm, RoPE, Softmax, SiLU, f16/bf16 dots — module decider
 ├── vec_ops/         # vec · rms_norm · rope · softmax · silu · f16 · bf16 · neon (split by #264)
 ├── tensor.rs        # 4D Tensor (shape/strides/data)
 ├── dump.rs          # debug dump module (--features debug_dump)
@@ -53,7 +60,7 @@ src/
 
 Each device backend is organised as L1 runtime, L2 launch/dispatch, L3 kernel sources and L4 graph executor, and **only L4 is polymorphic** — `graph/backend.rs` + `graph/registry.rs` are the single device seam. The full layering rationale, the shared-`common` rule and the completed splits: [`docs/SOURCE-LAYOUT-PLAN.md`](docs/SOURCE-LAYOUT-PLAN.md).
 
-`src/graph/`: `mod.rs` ComputeGraph/CNode · `ops.rs` Op + NodeMeta · `builder.rs` GraphBuilder · `scheduler.rs` assign → split → execute · `backend.rs` + `cpu_backend.rs`/`metal_backend.rs`/`cuda_backend.rs` executors · `registry.rs` backend registry (F4; F5's `copy_cross`/`await_cross`) · `alloc.rs` liveness allocator + persistent KV regions (E4) · `allocplan.rs` size-class ladder + pure plan + `DeviceMemory`/`budget_decision` · `offload.rs` layer offload plan (E5) · `kvcache.rs` cell store, removal/shift/compaction, span list, prefix sharing (C1–C3, C8b) · `kvformat.rs` KV format + `MINFER_CACHE_TYPE` gate (C4) · `kvsession.rs` versioned KV session container (C5) · `cache.rs`/`params.rs` params-only graph reuse · `fusion.rs` SwiGLU fusion · `copystats.rs` split-boundary counters · `batch.rs` batch composition · `dot.rs`/`json.rs` exporters.
+`src/graph/`: `ComputeGraph`/`CNode`, the op vocabulary, `GraphBuilder`, the scheduler, the backend seam (`backend.rs` + `registry.rs`), the liveness allocator and persistent KV regions, the offload plan and the KV session container. The file-by-file map and every invariant: [`docs/COMPUTE-GRAPH-DESIGN.md`](docs/COMPUTE-GRAPH-DESIGN.md).
 
 Unit tests live beside their module as `<module>/tests.rs`, declared `#[cfg(test)] mod tests;` (a long module splits into `<module>/tests/<topic>.rs`, each named by a `mod <topic>;`). Enforced by `scripts/check_source_layout.py`: an inline `#[cfg(…test…)] mod … {` is rejected, and so is a `src/**.rs` no `mod` declaration names. The rationale and the measured build-hygiene note: [`docs/SOURCE-LAYOUT-PLAN.md`](docs/SOURCE-LAYOUT-PLAN.md).
 
@@ -84,9 +91,8 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
 ./target/release/minfer split in.gguf <out-dir> --max-size 200M [--stem NAME]
 ```
 
-- CUDA test suite on a real GPU: `scripts/cuda_test.sh` (`cargo test --release --features cuda -- --test-threads=1`). CI has **no** GPU — its CUDA job only compiles the harness — so this is the only way to run the device-gated tests, and the device state is a process-wide singleton (`CudaState`), so **run it serially** ([#64](https://github.com/yusiwen/minfer/issues/64)). Local GPU runs must rebuild the CLI *with* the feature: a plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build, which silently measures the CPU. Per-instance streams and capture, the launch-return audit and the injection lever: [`docs/CUDA-BACKEND-DESIGN.md`](docs/CUDA-BACKEND-DESIGN.md) ("Running on a real device").
-- Real-model gates (the `#[ignore]`d set): `scripts/real_model_gates.sh` (`FEATURES=cuda` picks the device build; `PARALLEL=1`/`0` forces the form). The wrapper defaults to **serial on a device build** (the `CudaState` singleton) and to the **parallel** form on a CPU-only build. Run the set twice: the cached 0.5B (f32 KV) **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128 — the only combination reaching FA prefill and the half-width stride); `MINFER_LLAMA_TEST_MODEL=<Llama 3.x GGUF>` adds #725's pin. **The records are not kept here.** Every suite measurement — dated, box-labelled and machine-checked against `scripts/test-baselines.toml` — lives in [`docs/TEST-BASELINES.md`](docs/TEST-BASELINES.md); write a new record there and update `scripts/test-baselines.toml` in the same commit.
-  Read [`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) before writing or changing a gate: the five rules and the failure-injection seam (`MINFER_TEST_CALL_FAIL`, [#171](https://github.com/yusiwen/minfer/issues/171)). The PR-body shape (the two gate facts and the `Mac verification` record, [#335](https://github.com/yusiwen/minfer/issues/335)) is enforced by `scripts/check_pr_body.py` in the `check-pr-body` job ([#175](https://github.com/yusiwen/minfer/issues/175)): presence, not truth. Per-ticket history lives in the records, not here.
+- CUDA on a real GPU: `scripts/cuda_test.sh` (`cargo test --release --features cuda -- --test-threads=1`; the device state is a process-wide singleton, so serial). CI has no GPU and only compiles the CUDA harness. A plain `cargo test --release` overwrites `target/release/minfer` with a CPU-only build. Details: [`docs/CUDA-BACKEND-DESIGN.md`](docs/CUDA-BACKEND-DESIGN.md) ("Running on a real device").
+- Real-model gates: `scripts/real_model_gates.sh` (`FEATURES=cuda` for the device build; serial on a device, parallel on CPU). Run the set on the cached 0.5B **and** `MINFER_BATCH_TEST_MODEL=~/.cache/minfer/models/hf/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf` (f16 KV, hd 128: the only combination reaching FA prefill). Every suite measurement lives in [`docs/TEST-BASELINES.md`](docs/TEST-BASELINES.md), machine-checked against `scripts/test-baselines.toml`; update both in the same commit. Read [`docs/GATE-CONTRACT.md`](docs/GATE-CONTRACT.md) before writing or changing a gate (the five rules, the `MINFER_TEST_CALL_FAIL` seam, [#171](https://github.com/yusiwen/minfer/issues/171)); `check-pr-body.py` enforces the PR-body shape ([#335](https://github.com/yusiwen/minfer/issues/335), [#175](https://github.com/yusiwen/minfer/issues/175)) — presence, not truth.
 - Sandboxed agent shells: if `nvidia-smi` reports `Failed to initialize NVML: Unknown Error` and `cuInit` returns 304 while `/dev/nvidia*` exists, the *file sandbox* (Landlock) is denying `open()` with `EACCES` even on `crw-rw-rw-` nodes — that is **not** evidence of a broken driver. Check with a widened sandbox before recording "no device".
 - Batching default (E6): `chat::batch_mode(requested, model.device())` — pure and unit-tested, so CI covers the matrix. `ModelDef::device()` (`Device::{Cpu,Metal,Cuda}`) is the single authority for "the device participates", shared with the graph builder's `CParams.gpu`.
 - Full CLI + options: `docs/USAGE.md`. Build details (CUDA ccbin/arch/cudart) and the **devShell contents** (pinned `rust`, **mdBook 0.4.37**, `uv`, pre-commit; `.envrc` = `use flake`): `docs/BUILD.md` §"The devShell".
@@ -156,6 +162,7 @@ an agent reaches for first.
 | Reach for | Where |
 |---|---|
 | Architecture: module map, pipeline, adding an architecture | `docs/ARCHITECTURE.md` |
+| **Crate contract: tiers, features, consumer surface** | `docs/CRATE-API-DESIGN.md` |
 | End-to-end walkthrough (15 docs: CLI → GGUF → graph → kernels → backends) | `docs/inference_e2e_walkthrough/` |
 | Compute graph design | `docs/COMPUTE-GRAPH-DESIGN.md` |
 | KV cache: cells, the format gate, sessions | `docs/KV-CACHE-DESIGN.md` |
