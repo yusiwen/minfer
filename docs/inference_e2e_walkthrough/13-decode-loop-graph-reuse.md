@@ -5,17 +5,19 @@
 > rebuilt once and then reused for every step** → the same loop runs unchanged
 > on the GPU backends (docs 14–15, which swap out the kernels *inside* the
 > loop, never the loop itself).
-> **Code**: `src/main.rs` (decode loop (`main.rs:`, the `while generated.len() < params.n_predict` loop), the repeat window `REPEAT_LAST_N` (`conversation.rs:429`), loop setup
-> `main.rs1955` (the decode-loop setup), `is_stop_token` `main.rs1955`), the cached forward
-> `src/models/qwen2/graph.rs::forward_cached` (`src/models/qwen2/graph.rs:`), the reuse
-> decision `src/graph/cache.rs::try_reuse` `try_reuse` (`cache.rs:`), the params
-> `src/graph/params.rs` (`GraphParams` `params.rs:`), the allocator's
-> persistent KV regions `src/graph/alloc.rs` (`alloc_graph` `alloc.rs:513`,
-> `ensure_kv` `alloc.rs:995`), the per-step execution
-> `BackendScheduler::execute` (`scheduler.rs:`), and the
-> multi-turn session `src/conversation.rs` (`user_turn` `conversation.rs:`,
-> `generate_assistant_with_logits` `conversation.rs:`) — lines verified at
-> commit `15fa45c`.
+> **Code**: the decode loop in `src/engine/generate.rs` (`generate` L75, the
+> plain loop L284–351, the speculative round loop L166–283, the repeat window
+> `REPEAT_LAST_N` L142 — the session's own copy is `conversation.rs:429` — the
+> stop gates `special.is_stop` (`src/models/mod.rs:369`) and
+> `sampler::match_stop_suffix` (`src/sampler.rs:120`)); the cached forward
+> `src/models/qwen2/graph.rs::forward_cached` (L460); the reuse decision
+> `src/graph/cache.rs::try_reuse` (L69); the params `src/graph/params.rs`
+> (`GraphParams` L88); the allocator's persistent KV regions `src/graph/alloc.rs`
+> (`alloc_graph` L513, `ensure_kv` L995); the per-step execution
+> `BackendScheduler::execute`; and the multi-turn session `src/conversation.rs`
+> (`user_turn` L760, `generate_assistant_with_logits` L1274). The CLI's own half
+> is the call and the presentation: `src/main.rs` (L1547–1754). Lines verified at
+> commit `2204738`.
 
 ## 1. Background — where this stage sits
 
@@ -45,9 +47,16 @@ including the tokens the model itself just wrote. So the engine enters a loop:
 Step 2 is a full transformer forward — 24 layers, every weight matrix — but
 for **one** token instead of `nt`. That single-token forward is called a
 **decode step**, and the loop that repeats it is the **decode loop**. In
-`src/main.rs` it is a plain Rust `while` loop (`main.rs:`, the decode loop); everything
-dramatic about LLM inference — chatbots streaming words one at a time — is
-this loop running hundreds of times per second.
+`src/engine/generate.rs` it is a plain Rust `while` loop (`generate.rs:285`);
+everything dramatic about LLM inference — chatbots streaming words one at a
+time — is this loop running hundreds of times per second.
+
+Since #763 S6b that file *is* the loop: the decode control flow, the sampler
+calls and the stop gates live in `engine::generate`, and `src/main.rs` holds only
+the call — `GenerateParams`, the think-block highlighter's `emit` callback, the
+`on_prefill` hook and the stats lines. A reader looking for what stops a
+generation, or for the forward call, starts in `src/engine/generate.rs`; the
+CLI's file has no loop left.
 
 Two facts make this loop interesting enough for its own document.
 
@@ -88,11 +97,12 @@ by step. All the prompt's context is still there, and the very first decode
 step reads it.
 
 The loop also decides **when to stop**. Three gates live in (or beside) the
-loop: the sampled token is the end-of-text sentinel `is_stop_token` (`main.rs1955`),
+loop: the sampled token is an end-of-generation id (`special.is_stop`,
+`src/models/mod.rs:369`, decided in the loop at `src/engine/generate.rs:307`),
 the generated *byte stream* now ends with a user-supplied stop string
-`match_stop_suffix` (`main.rs1722`), or the `-n` token cap is reached (the `while` condition
-itself, the loop head (`main.rs:1866`). Doc 12 introduced these; here we see them as the
-loop's control flow.
+(`sampler::match_stop_suffix`, `src/sampler.rs:120`), or the `-n` token cap is
+reached (the `while` condition itself, `src/engine/generate.rs:285`). Doc 12
+introduced these; here we see them as the loop's control flow.
 
 Finally, there is a longer-timescale version of the same trick: a multi-turn
 chat session (`--cnv`, `src/conversation.rs`) keeps one token stream in the KV
@@ -161,7 +171,8 @@ Two structural things to notice before any code:
   *first*, from the logits the *previous* iteration's forward produced (or
   from prefill's logits on iteration one), and only then runs the forward
   that produces logits for the *next* iteration. The forward is the last
-  statement of the body — `ModelDef::forward` (`main.rs`), not the first.
+  statement of the body — `ModelDef::forward`
+  (`src/engine/generate.rs:342`), not the first.
 - **The rebuild happens inside the first `forward`, invisibly.** The loop
   calls `model.forward(...)` on every step; the cache check
   (`try_reuse`) is inside `forward_cached`. The loop never knows whether a
@@ -384,22 +395,24 @@ Three gates, three different owners, all on the sampler's output before or
 instead of the next forward (§3.2 walks the code):
 
 1. **End-of-generation token.** The sampled id equals the model's `eos` or
-   `<|im_end|>` (`is_stop_token`, `main.rs1955`; the ids come from
-   `special_tokens()` (`main.rs`). Decided in the loop
-   `is_stop_token` (`main.rs1955`); the token is *not* appended and *not* fed to the
-   graph — the run just ends. (Conversation mode deliberately does the
-   opposite: it writes the EOG token into the KV before breaking, to keep
-   the region matching the template's canonical next-turn render —
-   (`conversation.rs:`, the EOG write to the KV).)
+   one of its declared end roles — `special.is_stop(id)` (`SpecialTokens::is_stop`,
+   `src/models/mod.rs:369`; the ids come from `ModelDef::special_tokens()`,
+   `src/models/mod.rs:335`). Decided in the loop (`src/engine/generate.rs:307`);
+   the token is *not* appended and *not* fed to the graph — the run just ends.
+   (Conversation mode deliberately does the opposite: it writes the EOG token
+   into the KV before breaking, to keep the region matching the template's
+   canonical next-turn render — (`conversation.rs:`, the EOG write to the KV).)
 2. **Stop strings (`--stop`).** Byte-level suffix match over the *entire*
    generated byte stream, so a stop string split across token boundaries is
-   still caught by `match_stop_suffix` (`main.rs1722`;
-   doc 12 §3 owns the matcher). The matching bytes are truncated out of the
-   kept text; already-printed bytes stay in the terminal, llama.cpp-style.
-3. **The `-n` cap.** The `while` condition `generated.len() < params.n_predict`
-   the loop head (`main.rs:1866`), default 512 in `GenParams::default` (`main.rs:`). In conversation mode a
-   fourth gate joins: the write cursor reaching `n_ctx` stops cleanly
-   instead of overflowing the KV regions (`conversation.rs:`, the cursor guard).
+   still caught by `sampler::match_stop_suffix` (`src/sampler.rs:120`, called at
+   `src/engine/generate.rs:320`; doc 12 §3 owns the matcher). The matching bytes
+   are truncated out of the kept text; already-printed bytes stay in the
+   terminal, llama.cpp-style.
+3. **The `-n` cap.** The `while` condition `generated.len() < p.n_predict`
+   (`src/engine/generate.rs:285`), default 512 in `GenParams::default`
+   (`src/main.rs:89`). In conversation mode a fourth gate joins: the write
+   cursor reaching `n_ctx` stops cleanly instead of overflowing the KV regions
+   (`conversation.rs:`, the cursor guard).
 
 Note the asymmetry between the gates: EOS and stop strings `break` *before*
 the forward at the bottom of the body, so no forward is wasted on a token
@@ -418,11 +431,11 @@ and is only read:
 | Data | Type / shape | Where it comes from | Where it goes |
 |---|---|---|---|
 | `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`src/models/qwen2/graph.rs:659`) |
-| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`main.rs`) — starts at `input_ids.len()`, incremented once per step at `current_pos` (`main.rs`) | same, `src/models/qwen2/graph.rs:661`; the KV store uses it as the write slot, attention as the last readable slot |
+| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`src/engine/generate.rs:136`) — starts at `p.tokens.len()`, incremented once per step at `:350` | same, `src/models/qwen2/graph.rs:661`; the KV store uses it as the write slot, attention as the last readable slot |
 | K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
-| logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `src/models/qwen2/graph.rs:`) | moved into the loop's `logits` variable (`main.rs:1907-1921`, the `logits = model.forward(...)` assignment) for the next sample |
-| `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens — `recent_window` (`engine/generate.rs:142, 313-318`) | the sampler's repeat/frequency/presence penalties (doc 12) |
-| `generated` | `Vec<u32>` | pushed per step (`main.rs:1891`, the `generated.push(...)` call) | stop checks, final stats; decode_bytes streams it to stdout |
+| logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `src/models/qwen2/graph.rs:`) | moved into the loop's `logits` variable (`src/engine/generate.rs:342`, the `logits = model.forward(...)` assignment) for the next sample |
+| `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens — `recent_window` (`engine/generate.rs:143, 313-316`) | the sampler's repeat/frequency/presence penalties (doc 12) |
+| `generated` | `Vec<u32>` | pushed per step (`src/engine/generate.rs:311`, the `generated.push(...)` call) | stop checks, final stats; decode_bytes streams it to stdout |
 
 Two details of this table deserve unpacking.
 
@@ -440,15 +453,16 @@ arithmetic conversion, which is why a round trip through the buffer is
 lossless.
 
 **One forward call per step, five hidden phases.** The loop's single
-`model.forward(...)` — `ModelDef::forward` (`main.rs`) — expands inside `forward_cached` into:
-build params (six fields) → try_reuse (usually a hit) → fill 2–3 small
-inputs → one `scheduler.execute` walk → copy the output buffer back. On a
-rebuild step the same call additionally runs build → register → assign →
-fuse → alloc. The loop code has no idea any of that exists — which is the
-point of the `ModelDef::forward` facade `ModelDef::forward` (`models/mod.rs:224`).
+`model.forward(...)` — `ModelDef::forward` (`src/engine/generate.rs:342`) —
+expands inside `forward_cached` into: build params (six fields) → try_reuse
+(usually a hit) → fill 2–3 small inputs → one `scheduler.execute` walk → copy
+the output buffer back. On a rebuild step the same call additionally runs
+build → register → assign → fuse → alloc. The loop code has no idea any of that
+exists — which is the point of the `ModelDef::forward` facade
+(`models/mod.rs:224`).
 
 One name in the call needs a sentence for honesty: `forward`'s signature *used*
-to take a `&mut KVCache` (`main.rs` passed a `kv_cache` created at load). On the
+to take a `&mut KVCache` (the CLI passed a `kv_cache` it created at load). On the
 graph path that legacy type was always *ignored* — the callee bound it as `_kv`
 and `forward_cached` never took it — so [#252] deleted the parameter, the
 `KVCache` type and the construction rather than keep a dead API shape. The real
@@ -459,102 +473,107 @@ KV lives in the allocator's persistent regions (doc 07), and the call now reads
 
 ### 3.2 Key code
 
-#### The loop's setup (`src/main.rs:`, the decode-loop locals)
+#### The loop's setup (`src/engine/generate.rs:` L128–164, the decode-loop locals)
 
 Before the loop starts, a handful of locals are established — each one is a
 hand the loop plays with on every iteration:
 
 ```rust
+    // === Generate ===
     let mut logits = last_logits;
     if trace_on {
         crate::trace::begin_phase("decode");
     }
-    let gen_start = Instant::now(); // pure-decode start (llama "Generation" caliber)
+    let gen_start = std::time::Instant::now(); // pure-decode start (llama "Generation" caliber)
     let mut generated: Vec<u32> = Vec::new();
     let special = model.special_tokens();
-    let mut current_pos = input_ids.len();
+    let mut current_pos = p.tokens.len();
 
     // Seeded RNG for reproducible sampling; recent-token window for the
     // penalties (llama.cpp repeat_last_n default = 64), seeded with the prompt
     // tail so the first generated tokens are penalized too.
-    let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(p.seed);
     const REPEAT_LAST_N: usize = 64;
-    let mut prev_tokens = sampler::recent_window(&input_ids, REPEAT_LAST_N);
+    let mut prev_tokens = sampler::recent_window(&p.tokens, REPEAT_LAST_N);
 ```
 
 - `logits` starts as **prefill's last-token logits** — the loop's first
   iteration samples from them without running a forward first. This is the
   delayed-forward shape of §2.1 made concrete.
-- `current_pos = input_ids.len()`: the first generated token will be written
-  at KV slot `nt` — the slot *after* the prompt. The KV regions were sized
-  for `n_ctx` slots, and `ctx = params.n_ctx.max(input_ids.len())`
-  (`main.rs:1573-1587`, the `ctx` computation) guaranteed at prefill time that the prompt fits; from here
-  the cursor only ever increments.
-- `special` carries the model's stop-token ids (eos, and `<|im_end|>` when
-  the model defines one) — gate 1 of §2.7.
+- `current_pos = p.tokens.len()`: the first generated token will be written at
+  KV slot `nt` — the slot *after* the prompt. The KV regions were sized for
+  `n_ctx` slots, and `ctx = p.n_ctx.max(p.tokens.len())`
+  (`src/engine/generate.rs:99`, the prefill's own line) guaranteed at prefill
+  time that the prompt fits; from here the cursor only ever increments (`:350`).
+- `special` carries the model's stop-token ids: eos, plus `<|im_end|>` and the
+  declared EOT/EOM roles when the model has them — gate 1 of §2.7; the
+  predicate is `SpecialTokens::is_stop` (`src/models/mod.rs:369`).
 - `rng` is seeded once (`--seed`, default 42): the whole run's sampling is a
   deterministic function of the seed, which is what makes minfer's
   llama.cpp-comparison claims testable.
-- `prev_tokens` seeds the 64-token penalty window with the *prompt's tail*,
-  so even the first sampled token is subject to repeat penalties — doc 12's
-  `recent_window` helper.
+- `prev_tokens` seeds the 64-token penalty window with the *prompt's tail*, so
+  even the first sampled token is subject to repeat penalties — doc 12's
+  `recent_window` helper (`src/sampler.rs:108`).
 
-The stop-string machinery follows immediately — `stop_refs` (`engine/generate.rs:154`): user
-`--stop` strings are copied to byte vectors (`stop_bytes`/`stop_refs`), and
-two cursors track output — `full`, every generated byte ever, and `emitted`,
-how many of those bytes have already been flushed to stdout. The pair exists
-because a stop string may straddle token boundaries: earlier tokens were
+The stop-string machinery follows immediately (`src/engine/generate.rs:150-157`):
+user `--stop` strings are copied to byte vectors (`stop_bytes`/`stop_refs`), and
+two cursors track output — `full`, every generated byte ever, and `emitted`, how
+many of those bytes have already gone through the caller's `emit`. The pair
+exists because a stop string may straddle token boundaries: earlier tokens were
 already printed before anyone could know a stop string was forming.
 
-#### The decode loop, first half — sample and stop (`src/main.rs:`, through the stop-string check)
+#### The decode loop, first half — sample and stop (`src/engine/generate.rs:`
+L284–333, through the stop-string check)
 
 ```rust
-    while generated.len() < params.n_predict {
-        t0 = std::time::Instant::now();
-        let sampled = match sampler::sample_with_config_grammar(
-            &mut logits,
-            &sampler_cfg,
-            &prev_tokens,
-            &mut mirostat,
-            &mut grammar_state,
-            &mut rng,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                // The loud stop the grammar contract requires: the emitted text
-                // is a valid prefix, nothing illegal is appended.
-                eprintln!("\n[grammar] {e}");
+        while generated.len() < p.n_predict {
+            t0 = std::time::Instant::now();
+            let sampled = match sampler::sample_with_config_grammar(
+                &mut logits,
+                &sampler_cfg,
+                &prev_tokens,
+                &mut mirostat,
+                &mut grammar_state,
+                &mut rng,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    // The emitted text is a valid prefix; the caller renders the
+                    // refusal (the CLI prints it exactly as before).
+                    grammar_error = Some(e.to_string());
+                    break;
+                }
+            };
+            if timing {
+                t_samp += t0.elapsed().as_secs_f64();
+            }
+
+            if special.is_stop(sampled.token_id) {
+                stopped_by_eog = true;
                 break;
             }
-        };
-        if timing {
-            t_samp += t0.elapsed().as_secs_f64();
-        }
+            generated.push(sampled.token_id);
+            trace::token_trace(current_pos, sampled.token_id);
+            prev_tokens.push(sampled.token_id);
+            if prev_tokens.len() > REPEAT_LAST_N {
+                prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
+            }
 
-        if is_stop_token(sampled.token_id, &special) {
-            break;
-        }
-        generated.push(sampled.token_id);
-        token_trace(current_pos, sampled.token_id);
-        prev_tokens.push(sampled.token_id);
-        if prev_tokens.len() > REPEAT_LAST_N {
-            prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
-        }
-
-        // Stop-string detection on the FULL byte stream before emitting.
-        full.extend_from_slice(&tokenizer.decode_bytes(&[sampled.token_id]));
-        if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
-            full.truncate(cut);
-            if cut > emitted {
-                hi.feed(&full[emitted..]);
+            // Stop-string detection on the FULL byte stream before emitting.
+            full.extend_from_slice(&decode_bytes(tokenizer, sampled.token_id));
+            if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
+                full.truncate(cut);
+                if cut > emitted {
+                    emit(&full[emitted..]);
+                    emitted = full.len();
+                }
+                stopped_by_string = true;
+                break;
+            }
+            if emitted < full.len() {
+                emit(&full[emitted..]);
                 emitted = full.len();
             }
-            break;
-        }
-        if emitted < full.len() {
-            hi.feed(&full[emitted..]);
-            emitted = full.len();
-        }
 ```
 
 Reading it as a state machine, one iteration:
@@ -567,41 +586,47 @@ Reading it as a state machine, one iteration:
    Out comes one token id; the loop never inspects logits itself, and the
    607 KB of scores are noise to everyone but the sampler. A `SampleError`
    (no token the grammar allows) is the loud stop the excerpt handles: the
-   loop prints it and breaks, never emitting an arbitrary token.
-3. **Gate: EOS.** `is_stop_token` (`main.rs1955`) checks `eos`/`im_end`;
-   a hit breaks *before* the token is pushed — the sentinel is not text.
-4. **Append.** The token enters `generated` and the 64-entry sliding
-   penalty window, drained from the front.
+   loop records `grammar_error` and breaks — never emitting an arbitrary
+   token — and the CLI prints the refusal after the run
+   (`src/main.rs:1663-1665`).
+3. **Gate: EOS.** `special.is_stop` (`src/models/mod.rs:369`) checks `eos`,
+   `im_end` and the declared EOT/EOM roles; a hit breaks *before* the token is
+   pushed — the sentinel is not text, and `stopped_by_eog` is what the caller's
+   stats line reports.
+4. **Append.** The token enters `generated` and the 64-entry sliding penalty
+   window, drained from the front.
 5. **Gate: stop strings** — the tail of the excerpt: the token's bytes join
-   `full`, and `match_stop_suffix` (`main.rs1722`) tests whether it
-   now *ends* with a stop string; on a hit the text is truncated before the
-   match, else the new bytes are flushed to stdout (`main.rs:1896-1908`).
+   `full`, and `match_stop_suffix` (`src/sampler.rs:120`) tests whether it now
+   *ends* with a stop string; on a hit the text is truncated before the match,
+   else the new bytes go through `emit` — the CLI's highlighter
+   (`src/main.rs:1660`, the closure handed to `generate`).
 
 Only when all three gates pass does the iteration continue to the forward —
 the loop never runs the transformer for a token it has already decided to
 discard.
 
-#### The decode loop, second half — forward and advance (`src/main.rs:`, the forward call and cursor advance)
+#### The decode loop, second half — forward and advance (`src/engine/generate.rs:`
+L334–351, the forward call and cursor advance)
 
 ```rust
-        // forward() returns n_out*nv logits (n_out=1 for single-token decode,
-        // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
-        if trace_on {
-            let text = String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id]))
-                .into_owned();
-            crate::trace::set_token(sampled.token_id, &text);
+            // forward() returns n_out*nv logits (n_out=1 for single-token decode,
+            // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
+            if trace_on {
+                let text = String::from_utf8_lossy(&decode_bytes(tokenizer, sampled.token_id))
+                    .into_owned();
+                crate::trace::set_token(sampled.token_id, &text);
+            }
+            t1 = std::time::Instant::now();
+            logits = model.forward(&[sampled.token_id], &[current_pos], 1, ctx);
+            if trace_on {
+                crate::trace::attach_step(&logits);
+            }
+            if timing {
+                t_fwd += t1.elapsed().as_secs_f64();
+                n_tok += 1;
+            }
+            current_pos += 1;
         }
-        t1 = std::time::Instant::now();
-        logits = model.forward(&[sampled.token_id], &[current_pos], 1, ctx);
-        if trace_on {
-            crate::trace::attach_step(&logits);
-        }
-        if timing {
-            t_fwd += t1.elapsed().as_secs_f64();
-            n_tok += 1;
-        }
-        current_pos += 1;
-    }
 ```
 
 The heart of the whole document is one line:
@@ -623,26 +648,27 @@ sampling time and forward time — §4 uses this to show that the loop overhead
 is microseconds against the forward's milliseconds.
 
 The `trace_on` block records the token and the logits for the viz trace
-(§4); note it is hoisted out of the loop as a bool — `trace_on` (`main.rs1544`) so
-the steady-state loop does one env-var read fewer per step. And
+(§4); note it is hoisted out of the loop as a bool — `trace_on`
+(`src/engine/generate.rs:104`), one env read per run rather than per step. And
 `current_pos += 1` is the KV cursor's whole life: prefill filled slots
 `0..nt`, this line claims slot `nt`, `nt+1`, … one per step, until either a
 stop gate fires or (in conversation mode) a guard stops it before the
 regions overflow.
 
-`is_stop_token` itself is the smallest function in the pipeline
-`is_stop_token` (`main.rs1955`):
+The EOS predicate itself is the smallest function in the pipeline —
+`SpecialTokens::is_stop` (`src/models/mod.rs:369`):
 
 ```rust
-fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
-    id == special.eos || Some(id) == special.im_end
-}
+    pub fn is_stop(&self, id: u32) -> bool {
+        id == self.eos || Some(id) == self.im_end || Some(id) == self.eot || Some(id) == self.eom
+    }
 ```
 
-`im_end` is an `Option` because not every model defines `<|im_end|>` (Qwen2.5
-and Qwen3 chat models do). Two ids, one boolean — but this function is the
-model's only "voice": everything else about stopping is user policy (stop
-strings, `-n`), while this is the model saying "I'm done".
+`im_end`, `eot` and `eom` are `Option`s because not every model defines every
+role (Qwen's chat models define `<|im_end|>`; Llama 3.1 adds `<|eot_id|>` for
+turn ends and `<|eom_id|>` for tool calls). A handful of ids, one boolean — but
+this function is the model's only "voice": everything else about stopping is
+user policy (stop strings, `-n`), while this is the model saying "I'm done".
 
 #### Inside the forward: building the params — `GraphParams` (`src/models/qwen2/graph.rs:`)
 
@@ -1100,8 +1126,8 @@ must equal what the chat template would render for the *next* turn, and a
 canonical render contains the end marker after each assistant message. So
 the EOG token is pushed, decoded through the graph at the cursor (its K/V
 land in the regions), and only then does the turn end. Two stop policies,
-one principle each: the CLI stops the *text*; the session keeps the *KV
-mirror* canonical (`conversation.rs:` — the module's §5.4 note — documents the invariant this
+one principle each: the single-shot loop stops the *text*; the session keeps
+the *KV mirror* canonical (`conversation.rs:` — the module's §5.4 note — documents the invariant this
 preserves).
 
 ### 3.3 Design choices (why this shape and not another)
@@ -1173,15 +1199,16 @@ would mean periodic huge copies and, on GPU, buffer re-creation; sizing
 once at `n_ctx` means a step's KV write is a plain `copy_from_slice` into
 existing memory (`cpu_backend.rs:`, the KV `copy_from_slice`). The cost is bounded by
 `--n-ctx`, which the CLI deliberately decouples from the model's
-`max_seq_len` (`main.rs1537` cites the multi-GB over-allocation and
+`max_seq_len` (the `ctx` comment, `src/engine/generate.rs:88-98`, cites the
+multi-GB over-allocation and
 first-submit Metal tax this avoids — `docs/PERF-QWEN3-4B-VS-LLAMACPP.md`
 §2). The cursor-bounded window (§2.2) is what makes the slack harmless:
 unread region contents beyond it are never touched by attention.
 
 **Two stop policies for EOG, not one.** §3.2's conversation excerpt shows
-EOG being *written* to the KV before breaking, while the CLI's loop drops
-it. The difference is not inconsistency but the invariant each loop must
-keep. The CLI's obligation ends at the printed text; the session's
+EOG being *written* to the KV before breaking, while the single-shot loop
+drops it. The difference is not inconsistency but the invariant each loop must
+keep. The single-shot run's obligation ends at the printed text; the session's
 obligation extends to a KV mirror that the *next* turn will rely on — and
 the next turn's canonical template render contains the end-of-message
 marker. Breaking the mirror would surface later as subtly wrong context
@@ -1265,9 +1292,9 @@ by quota, and those are exactly the runs where the model would have kept
 going anyway.
 
 **8. `n_ctx` is computed once, before prefill, for both phases.**
-`ctx = params.n_ctx.max(input_ids.len())` (`main.rs:1573-1587`, the `ctx` computation) with the comment
-"Computed ONCE so prefill and decode size the same KV regions"
-(`main.rs:1587`, the "Computed ONCE" comment). If prefill and the first decode step disagreed on
+`ctx = p.n_ctx.max(p.tokens.len())` (`src/engine/generate.rs:99`, the `ctx`
+computation) with the comment "Computed ONCE so prefill and decode size the same
+KV regions" (`src/engine/generate.rs:98`). If prefill and the first decode step disagreed on
 `ctx`, they would disagree on `CParams`, the params comparison would fail,
 and — worse — `ensure_kv` would have sized regions from the prefill graph
 that the decode graph considers too small. One variable, computed early,
@@ -1290,13 +1317,15 @@ decision reads it.
 The decode loop and the reuse machinery are unusually observable — most of
 the evidence is on stderr of any plain run.
 
-- **The run header itself.** `Prefill: N tokens in …` vs
-  `Generated: M tokens in … (tok/s)` (`main.rs:1603-1614, 1854-1858`, the two rate headers) — two
-  deliberately different calibers (pure-decode rate vs blended rate,
-  `main.rs:1981-1994`, the pure-decode-vs-blended caliber comment). The gap between the two numbers *is* this
-  document's §2.2 argument, measured.
+- **The run header itself.** `Prefill: N tokens in …` (the CLI's `on_prefill`,
+  `src/main.rs:1565-1570`) vs `Generated: M tokens in … (tok/s)`
+  (`src/main.rs:1743-1748`) — two deliberately different calibers (pure-decode
+  rate vs blended rate, the comment at `src/main.rs:1740-1742`; the timer itself
+  is `gen_start`, `src/engine/generate.rs:133`). The gap between the two numbers
+  *is* this document's §2.2 argument, measured.
 - **`MINFER_TIMING=1`.** Splits the per-token wall clock into sampling vs
-  forward milliseconds — `t_samp`/`t_fwd` (`main.rs1675, 1800-1804`). Expect sampling in the
+  forward milliseconds — `t_samp` (`src/engine/generate.rs:303-305`) and
+  `t_fwd` (`:346-349`), printed by the CLI (`src/main.rs:1684-1688`). Expect sampling in the
   tens of microseconds and forward in the milliseconds — the loop's own
   overhead is the difference between the two.
 - **`MINFER_GRAPH_TRACE=1`.** The scheduler prints the split layout and a
@@ -1305,16 +1334,19 @@ the evidence is on stderr of any plain run.
   Metal run shows the decode graph's split boundary and the fused-op
   census. Watching it repeat N times for N tokens is the loop made
   visible.
-- **`MINFER_TRACE=<path>`.** Records a per-node data trace; the CLI marks
-  the prefill/decode phase boundary — `begin_phase` (`main.rs1547`, `:1626`), tags each decode
-  step with its sampled token (`set_token`, `main.rs1737`), and
-  attaches both the prefill graph and a *separate decode graph* JSON at the
-  end — `export_graph_json` (`main.rs:`). Opening the trace in `viz/` shows the two
+- **`MINFER_TRACE=<path>`.** Records a per-node data trace; the engine marks
+  the prefill/decode phase boundary — `begin_phase`
+  (`src/engine/generate.rs:106`, `:131`) — and tags each decode step with its
+  sampled token (`set_token`, called at `src/engine/generate.rs:339`), while the
+  CLI attaches both the prefill graph and a *separate decode graph* JSON at the
+  end — `export_graph_json` (`src/main.rs:1715`, `:1724`) and
+  `trace::finish` (`src/main.rs:1733`). Opening the trace in `viz/` shows the two
   topologies side by side — the G3 tail nodes present in one and absent in
   the other.
 - **`--dump-graph <dot>` / `--dump-graph-json <path>`.** Exits after
   exporting the graph the runtime *would* use — labeled `"decode"` when the
-  prompt is one token and `"prefill"` otherwise (`main.rs:1650-1661, 1545-1548`, the `kind` label).
+  prompt is one token and `"prefill"` otherwise (`src/main.rs:1610-1614`, the
+  `kind` label).
   Compare a prefill dump against a decode dump (feed a 1-token prompt) to
   see exactly which nodes the rebuild adds or removes.
 - **`MINFER_GRAPH_DUMP=<dir>`.** Writes `logits_decode.f32` plus every

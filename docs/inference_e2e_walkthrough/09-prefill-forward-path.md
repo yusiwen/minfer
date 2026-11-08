@@ -1,17 +1,18 @@
 # 09 · Prefill: the first forward
 
 > **Stage**: the graph machinery is ready — build, assign, fuse, allocate,
-> execute (docs 05–08) → **this stage: the CLI actually calls it, for the whole
-> prompt at once, and gets logits back** → the math inside the graph
+> execute (docs 05–08) → **this stage: the engine actually calls it, for the
+> whole prompt at once, and gets logits back** → the math inside the graph
 > ([10 — CPU matmul kernels](10-cpu-matmul-kernels.md),
 > [11 — Attention + vec ops + KV](11-attention-vecops-kv.md)) and the first
 > sample ([12 — Sampler](12-sampler.md)).
-> **Code**: `src/main.rs` prefill block (L1441–1485, timing prints L1480–1485 and
-> L1848–1865), the call chain `src/models/mod.rs::forward` (L222) →
-> `src/models/qwen2/mod.rs::forward` (L55) → `src/models/qwen2/graph.rs::forward`
-> (L438) → `forward_cached` (L456, a wrapper) → `forward_batch` (L480),
-> `src/graph/params.rs` (`GraphParams` L88), `src/trace.rs::begin_phase` (L70)
-> — lines verified at commit `15fa45c`.
+> **Code**: the prefill stage of `src/engine/generate.rs` (L75–126: `generate`
+> through `on_prefill`; the decode loop follows at L284–351), the call chain
+> `src/models/mod.rs::forward` (L224) → `src/models/qwen2/mod.rs::forward` (L68) →
+> `src/models/qwen2/graph.rs::forward` (L442) → `forward_cached` (L460, a wrapper)
+> → `forward_batch` (L484), `src/graph/params.rs` (`GraphParams` L88),
+> `src/trace.rs::begin_phase` (L70); the CLI's half is the call and the
+> presentation, `src/main.rs` (L1547–1754). Lines verified at commit `2204738`.
 
 ## 1. Background — where this stage sits
 
@@ -23,9 +24,18 @@ without computing anything. The machinery is a **compute graph**: a data
 structure that lists every math operation as a node, knows which backend
 (CPU, Metal, CUDA) runs each node, where each result lives in memory, and in
 what order the nodes execute. What it does *not* have yet is data to chew on
-and a caller. This document is that caller: the ~30 lines of `main.rs` that
-say "here are the prompt's token ids, please run the graph once over all of
-them, and give me the answer."
+and a caller. This document is that caller: the prefill stage of
+`engine::generate` (`src/engine/generate.rs`), the ~30 lines that say "here are
+the prompt's token ids, please run the graph once over all of them, and give me
+the answer."
+
+The facade boundary is worth naming once, because it is what #763 changed:
+prefill and the decode loop are the engine's (`engine::generate`, called both by
+the CLI and by `Engine::generate`), while `src/main.rs` keeps only the
+presentation — the chat template, the tokenizer, the think-block highlighter, the
+`on_prefill` hook that prints the `Prefill:` line, and the closing stats. A
+reader following this chapter's loop code lands in `src/engine/generate.rs`,
+never in `src/main.rs`.
 
 The answer has a name: **logits**. The last operation of the network — the
 `lm_head` matrix multiply — produces one floating-point score per entry of the
@@ -114,7 +124,7 @@ data:
 This indirection is what lets *one* graph topology serve prefill *and* decode:
 prefill fills `positions` with `0, 1, 2, …, nt-1`; the decode loop fills it
 with one running number (`current_pos`, starting at the prompt length,
-`main.rs:841`, incrementing per step, `main.rs:941`). If positions were
+`src/engine/generate.rs:136`, incrementing per step, `:350`). If positions were
 instead baked into the topology (say, attention shaped to read exactly
 `n_past + nt` cache rows), the graph would have to be rebuilt on *every*
 decode step, because `n_past` changes every step — and the params-only reuse
@@ -183,8 +193,8 @@ problem bounded.
 
 ### 2.4 Why only the last token's logits (`n_out = 1`)
 
-The prefill forward's fourth argument is `n_out`, and the CLI passes `1`
-(`main.rs:1595`). This is the tail-row optimization whose *topology* doc 05
+The prefill forward's fourth argument is `n_out`, and `engine::generate` passes
+`1` (`src/engine/generate.rs:118`). This is the tail-row optimization whose *topology* doc 05
 §2.8 built; here is the *why*.
 
 A transformer is **causal**: token `t`'s hidden state is computed only from
@@ -195,7 +205,8 @@ But during prefill we already *know* what token 18 is: it is sitting in the
 prompt (positions 18..nt-1 are the prompt itself). Training uses those
 predictions as the learning signal; **inference does not need them**. The
 only position whose continuation is genuinely unknown is the **last** one.
-So the CLI requests `n_out = 1`: one row of logits, for one token, the last.
+So the single-shot path requests `n_out = 1`: one row of logits, for one
+token, the last.
 
 What does `n_out = 1` change? Doc 05 §2.8 drew the line not at lm_head but
 one layer earlier: after the last layer's attention output projection, two
@@ -211,24 +222,25 @@ the widest matrix in the model (doc 05 §2.8 measured the whole-graph effect
 at ~+55% prefill throughput).
 
 Worth pausing on why `n_out = 1` is *safe* here and not a general-purpose
-setting: it is a property of the **single-sequence CLI**. The engine keeps
+setting: it is a property of **single-shot generation**. The engine keeps
 `n_out` as a `GraphParams` field precisely because other callers want more —
 a trainer computing loss over all positions would pass `n_out = nt` (and the
 graph would keep every row), and the graph's own fallback (`forward_batch`,
 `graph.rs:`) handles the `n_out == nt` case with the same code path.
-The CLI's choice is the degenerate, cheapest corner of a general mechanism.
+`engine::generate`'s choice is the degenerate, cheapest corner of a general
+mechanism; a caller of `advanced`'s `forward` can take another corner.
 
 ### 2.5 Sizing the context once for both phases
 
-Right before the forward call, `main.rs` computes:
+Right before the forward call, `src/engine/generate.rs` computes:
 
 ```rust
-let ctx = params.n_ctx.max(input_ids.len());
+let ctx = p.n_ctx.max(p.tokens.len());
 ```
 
 and passes that single number to *every* forward of the run — prefill at
-`main.rs:1595`, each decode step at `main.rs:1909`. The comment above it
-(`main.rs:1571-1575`) records the three facts that make this the right shape:
+`src/engine/generate.rs:118`, each decode step at `:342`. The comment above it
+(`:90-98`) records the three facts that make this the right shape:
 
 1. `n_ctx` **sizes the graph's KV regions** — the allocator carves each
    layer's K and V regions as `n_kv_embd × n_ctx` f32 elements, once (doc 07
@@ -238,7 +250,8 @@ and passes that single number to *every* forward of the run — prefill at
    tax).
 2. It **never shrinks below the prompt length** (`max`): the prompt itself
    needs `nt` KV slots, positions `0..nt`, and the decode loop continues at
-   `current_pos = input_ids.len()` (`main.rs:841`) — if `ctx < prompt len`,
+   `current_pos = p.tokens.len()` (`src/engine/generate.rs:136`) — if `ctx <
+   prompt len`,
    the very first decode position would overflow the regions.
 3. The model **clamps again** to `max_seq_len` (`n_ctx.min(max_seq_len)`,
    `graph.rs:392`): a prompt longer than the model was trained for is capped
@@ -315,17 +328,17 @@ G3-reduced path; the comment records its removal as R3-A2), and from there
 the value travels by **move**, Rust's zero-byte ownership transfer:
 
 ```rust
-let logits = model.forward(&input_ids, &positions, 1, ctx);  // owned Vec, main.rs:1595
-let last_logits: Vec<f32> = logits;      // move, main.rs:1597
+let logits = model.forward(&p.tokens, &positions, 1, ctx);  // owned Vec, generate.rs:118
+let last_logits: Vec<f32> = logits;      // move, generate.rs:120
 ...
-let mut logits = last_logits;            // move into the decode binding, main.rs:1682
+let mut logits = last_logits;            // move into the decode binding, generate.rs:129
 ...
 let sampled = sampler::sample_with_config(&mut logits, ...); // borrow, mutate in place
 ...
-logits = model.forward(&[sampled.token_id], &[current_pos], ...); // move again, main.rs:1909
+logits = model.forward(&[sampled.token_id], &[current_pos], 1, ctx); // move again, generate.rs:342
 ```
 
-The decode loop's comment (`main.rs:1901-1902`) states the stakes: *forward()
+The decode loop's comment (`src/engine/generate.rs:334-335`) states the stakes: *forward()
 returns n_out\*nv logits (n_out=1 for single-token decode, exactly n_vocab),
 so move the Vec in place instead of copying 607 KB/token.* At ~300 decode
 tokens/second, an extra 608 KB copy per token would be ~180 MB/s of pure
@@ -353,10 +366,10 @@ from the decode side.
 - `positions: Vec<usize>` — `0..nt` (§2.2); becomes the `positions` input
   node, same shape.
 - `n_out = 1` — the tail-row count (§2.4).
-- `ctx = max(params.n_ctx, nt)` — the KV region width for the whole run
-  (§2.5); `params.n_ctx` defaults to 4096 (`main.rs:43`).
+- `ctx = max(p.n_ctx, nt)` — the KV region width for the whole run
+  (§2.5); the CLI's `params.n_ctx` defaults to 4096 (`src/main.rs:114`).
 - `kv_cache` — **gone (#252)**. Until [#252] the call passed a legacy
-  `KVCache` created in `main.rs`; the graph path always **ignored** it (the
+  `KVCache` the CLI created at load; the graph path always **ignored** it (the
   callee bound it as `_kv`) and the graph owns KV in its persistent regions.
   [#252] deleted the argument, the type and that construction (doc 03).
 - The model itself: hparams and weight tensors, registered by name in the
@@ -377,62 +390,81 @@ from the decode side.
 
 ### 3.2 Key code
 
-#### The prefill block (`src/main.rs:`)
+#### The prefill stage (`src/engine/generate.rs:` L75–126)
+
+The CLI builds `GenerateParams`, hands in the tokenizer and two closures, and
+calls `engine::generate` (`src/main.rs:1644-1662`). Everything below is inside
+that call — the engine's, not the CLI's:
 
 ```rust
-    // === Prefill ===
-    let infer_start = Instant::now();
-    let positions: Vec<usize> = (0..input_ids.len()).collect();
-    // forward() computes logits for only the LAST n_out tokens (n_out=1 here:
-    // single sequence, only the final token is sampled). llama.cpp does the same
-    // via ggml_get_rows(inp_out_ids) at the last layer, shrinking the lm_head
-    // to n_outputs rows — saves the full-nt output GEMM + logits download.
-    // n_ctx (--n-ctx, default 4096) sizes the graph KV regions — NOT the
-    // model's max_seq_len, which would allocate 12 GB+ and pay a first-submit
-    // Metal tax (docs/PERF-QWEN3-4B-VS-LLAMACPP.md §2). It never shrinks below
-    // the prompt length, and the model's forward clamps it to max_seq_len.
+pub fn generate(
+    model: &dyn ModelDef,
+    tokenizer: &Tokenizer,
+    mut spec: Option<&mut SpecEngine>,
+    p: &GenerateParams<'_>,
+    emit: &mut dyn FnMut(&[u8]),
+    on_prefill: &mut dyn FnMut(&[f32], f64),
+) -> GenerateOutcome {
+    let mut target_cache = GraphCache::new();
+    /* … outcome flags, prefill stopwatch … */
+    let infer_start = std::time::Instant::now();
+    let positions: Vec<usize> = (0..p.tokens.len()).collect();
+    // forward() computes logits for only the LAST n_out tokens (n_out=1 here: ...)
+    // n_ctx (--n-ctx, default 4096) sizes the graph KV regions — NOT the model's
+    // max_seq_len … It never shrinks below the prompt length …
     // Computed ONCE so prefill and decode size the same KV regions.
-    let ctx = params.n_ctx.max(input_ids.len());
-    // P2 trace (MINFER_TRACE=<path>): the scheduler records per-node data; the
-    // CLI marks phase boundaries and attaches tokens/logits for the page.
+    let ctx = p.n_ctx.max(p.tokens.len());
     let trace_on = crate::trace::enabled();
     if trace_on {
         crate::trace::begin_phase("prefill");
     }
-    let logits = model.forward(&input_ids, &positions, 1, ctx);
+    let logits = if spec.is_some() {
+        /* forward_graph_cached + draft.prefill (spec mode) */
+    } else {
+        model.forward(&p.tokens, &positions, 1, ctx)
+    };
     let last_logits: Vec<f32> = logits;
     if trace_on {
         crate::trace::attach_step(&last_logits);
     }
 
     let prefill_time = infer_start.elapsed();
-    println!(
-        "Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
-        input_ids.len(),
-        prefill_time.as_secs_f64(),
-        input_ids.len() as f64 / prefill_time.as_secs_f64()
-    );
+    on_prefill(&last_logits, prefill_time.as_secs_f64());
+    /* … the decode loop follows (doc 13) … */
 ```
 
-Segment by segment: L738 starts the prefill stopwatch (after tokenization —
-tokenize cost is *not* in the prefill number); L739 builds the positions
-vector (§2.2); L740–748 is the comment that documents `n_out` (and its
-llama.cpp analogue `inp_out_ids`), the `n_ctx` sizing policy, and the
-compute-once rule; L749 the double-clamped context (§2.5); L753–756 opens
-the `prefill` trace phase (only when `MINFER_TRACE` is set — one env read
-per run, hoisted); **L757 is the stage itself** — one call, all prompt
-tokens, `n_out = 1`; L758–761 renames the result and (for the trace page)
-attaches the logits' top-5 to the prefill step; L763–769 prints the prefill
-caliber.
+Segment by segment, with the names the engine uses (`p.tokens` is the CLI's
+`input_ids` after tokenization):
+
+- the `infer_start` line starts the prefill stopwatch — after tokenization, so
+  the tokenize cost is *not* in the prefill number;
+- the `positions` line builds `0..nt` (§2.2);
+- the comment block (`:90-98`) documents `n_out` (and its llama.cpp analogue
+  `inp_out_ids`), the `n_ctx` sizing policy, and the compute-once rule; the
+  next line applies the double clamp (§2.5);
+- the `trace_on` block (`:100-106`) opens the `prefill` phase — `MINFER_TRACE`
+  only, one env read per run, hoisted;
+- **the `model.forward(...)` call is the stage itself** — one call, all prompt
+  tokens, `n_out = 1`; in speculative mode the branch at `:108-119` drives
+  `forward_graph_cached` instead, so the verify rounds reuse the target's cache;
+- `last_logits` renames the result and, under `trace_on`, attaches its top-5 to
+  the prefill step (`:120-122`);
+- `on_prefill` (`:125-126`) hands the logits and the elapsed time back to the
+  caller: the CLI prints `Prefill: …` there (`src/main.rs:1564-1570`) and, with
+  `--dump-graph`, exits after exporting the graph (`src/main.rs:1571-1640`).
+
+The `println!` that used to sit at the end of this block is now the caller's
+closure — which is the point of the split: the engine times the prefill, the
+caller decides what to print.
 
 #### The call chain — four hops, one delegation each
 
-`main.rs:1595` calls through the architecture-agnostic trait object
+`src/engine/generate.rs:118` calls through the architecture-agnostic trait object
 (`Box<dyn ModelDef>`), so the static type knows nothing about Qwen. Each hop
 adds exactly one concern:
 
 ```
-main.rs:1595  model.forward(&input_ids, &positions, 1, ctx)
+generate.rs:118  model.forward(&p.tokens, &positions, 1, ctx)
   │           trait method (models/mod.rs:224): the architecture-agnostic
   ▼           signature; callers must guarantee positions[i] < n_ctx
 qwen2/mod.rs:   impl ModelDef for Qwen2Model
@@ -548,8 +580,8 @@ is worth reading as five beats:
    the allocator-resolved cell, which Metal's single-host-`pos` store cannot
    do yet.
 3. **Reuse-or-build** (L600–655): `try_reuse` compares the params against the
-   cached graph (doc 05 §2.7); on mismatch — which for the CLI happens exactly
-   twice, at the prefill call and at the first decode call — `Self::build`
+   cached graph (doc 05 §2.7); on mismatch — which for a single-shot run happens
+   exactly twice, at the prefill call and at the first decode call — `Self::build`
    runs the full build → assign → fuse → allocate pipeline, and
    `replace_graph` swaps the graph in *keeping the allocator* (hence the KV
    regions).
@@ -588,7 +620,8 @@ ONLY inputs to graph reuse". The batch's composition — sequence count, cell
 rows, attention windows — is deliberately *not* here: it is data, refilled
 per forward (A7/E2).)
 
-#### The trace phase boundary (`src/trace.rs:`, CLI at `main.rs:734-741`)
+#### The trace phase boundary (`src/trace.rs:` L70; opened from
+`src/engine/generate.rs:106`, `:131`)
 
 ```rust
 /// CLI: mark the start of a phase (prefill / decode). Repeated calls within the
@@ -605,31 +638,33 @@ pub fn begin_phase(kind: &str) {
 `begin_phase("prefill")` opens a `Phase` record; the scheduler then appends
 one `Step` per `execute()` call (`begin_step`, called from the scheduler —
 prefill is *one* step, each decode forward one more), and
-`attach_step(&last_logits)` (L759–761, `trace.rs:`) staples the
+`attach_step(&last_logits)` (`src/engine/generate.rs:121-123`, `src/trace.rs:130`)
+staples the
 prefill logits' top-5 `(token_id, probability)` pairs onto that step. The
 JSON export (`trace.rs::finish`) embeds the prefill-phase graph, so the viz
-page can show the whole prefill execution node by node. Note the phase
-*naming* lives in the CLI, not the engine: the engine has `GraphType`, the
-trace has human-facing labels.
+page can show the whole prefill execution node by node. Note where the phase
+*naming* lives: `engine::generate` opens the two phases by name (`prefill`,
+then `decode`), the trace module owns the human-facing labels, and `GraphType`
+is the graph's own machine-facing class. Before #763 S6b the naming was the
+CLI's; the move put it beside the loop it describes.
 
-#### The timing calibers (`src/main.rs:751-757`, `837`, `1000-1017`)
+#### The timing calibers (`src/engine/generate.rs:88`, `:125`, `:133`; prints in
+`src/main.rs:1565-1570`, `:1736-1754`)
 
 Three stopwatches, three printed calibers — and the differences between them
 are the point:
 
 ```rust
-    let prefill_time = infer_start.elapsed();          // L763 (started L738)
-    println!("Prefill: {} tokens in {:.2}s ({:.1} tok/s)", ...);   // prompt / prefill wall
+    let prefill_time = infer_start.elapsed();       // generate.rs:125 (started :88)
+    on_prefill(&last_logits, prefill_time.as_secs_f64()); // → the caller's print
 
-    let gen_start = Instant::now();                    // L837, "pure-decode start"
+    let gen_start = Instant::now();                 // generate.rs:133, "pure-decode start"
     ...
-    let gen_time = gen_start.elapsed();                // L1000
-    let total_time = infer_start.elapsed();            // L1001
-    // Pure-decode rate (generated tokens / decode time) — matches llama.cpp's
-    // "Generation:" caliber. The "Total:" line below keeps the previous blended
-    // caliber (prompt+generated / prefill+decode) for comparison.
-    println!("Generated: {} tokens in {:.2}s ({:.1} tok/s)", ...); // L1006-1011
-    println!("Total:     {} tokens in {:.2}s ({:.1} tok/s)", ...); // L1012-1017
+    let decode_secs = gen_start.elapsed();          // generate.rs:359
+    // CLI (src/main.rs:1736-1754): Generated = generated / decode_secs,
+    // Total = (prompt + generated) / (prefill + decode) — the two calibers.
+    println!("Generated: {} tokens in {:.2}s ({:.1} tok/s)", ...); // src/main.rs:1743-1748
+    println!("Total:     {} tokens in {:.2}s ({:.1} tok/s)", ...); // src/main.rs:1749-1754
 ```
 
 - **Prefill** = prompt tokens ÷ wall time of the single prefill forward. It
@@ -637,9 +672,9 @@ are the point:
   allocation, and on Metal the first-submit setup (the 3× first-token tax of
   doc 07 §3.3). Long prompts amortize it; a 1-token prompt measures mostly
   setup.
-- **Generated** = generated tokens ÷ decode-only wall time (`gen_start` L837
-  → L1000). This is the llama.cpp/llama-bench **"Generation"** caliber:
-  steady-state speed, the number people mean by "tok/s". It includes the
+- **Generated** = generated tokens ÷ decode-only wall time (`gen_start`
+  `src/engine/generate.rs:133` → `:359`). This is the llama.cpp/llama-bench
+  **"Generation"** caliber: steady-state speed, the number people mean by "tok/s". It includes the
   sampler and streaming write per token — which is why `MINFER_TIMING`
   exists to split it further (§4).
 - **Total** = (prompt + generated) ÷ (prefill + decode) — the blended
@@ -694,9 +729,9 @@ is the same discipline applied where the win is 100×, not 10%.
 **Q2: Why only the last token's logits?** §2.4 gave the causality argument;
 the design-shaped summary: for an autoregressive *generator*, every prompt
 position except the last has a known continuation (it is in the prompt), so
-computing logits for them buys nothing the CLI can use. The `n_out` mechanism
-generalizes (any tail count; `n_out = nt` restores full logits and is the
-code's own fallback path, `graph.rs:`), so choosing `1` is a *caller
+computing logits for them buys nothing a single-shot run can use. The `n_out`
+mechanism generalizes (any tail count; `n_out = nt` restores full logits and
+is the code's own fallback path, `graph.rs:`), so choosing `1` is a *caller
 policy*, not an engine limitation — the engine still offers every row to
 callers who want them (trainers, scoring tools). The placement of the cut
 *after the last attention projection* (not at lm_head) is doc 05's §2.8
@@ -745,8 +780,8 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
 - **`n_ctx` is a run-level constant.** Passing a different `n_ctx` to decode
   than to prefill breaks the run (§2.5, Q3): either silently (regions sized
   on first use) or loudly (the preflight assert). This is why the comment
-  says "computed ONCE" — and why `main.rs:1909` passes the *same* `ctx`
-  binding, not a recomputation.
+  says "computed ONCE" — and why the decode call (`src/engine/generate.rs:342`)
+  closes over the *same* `ctx` binding, not a recomputation.
 - **The legacy `kv_cache` argument is gone (#252).** It was dead on this path
   from the start — nothing read it in `forward_batch` — and [#252] deleted it
   (with the `KVCache` type and the `main.rs` construction) once the storage
@@ -778,11 +813,11 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   in the thousands of tok/s and decode in the hundreds — the compute-bound vs
   memory-bound split of §2.3, visible in two numbers.
 - **`MINFER_TIMING=1`** — decomposes the decode side one level further
-  (`main.rs:1712-1717`): per token it times the sampler call (`t_samp`,
-  accumulated at `main.rs`) and the `forward` call (`t_fwd`, `main.rs`
-  on the speculative path and `main.rs:1914` on the plain one — "CPU encode + GPU
-  exec + logits download" per the comment), then prints one line
-  (`main.rs:1685-1687`), e.g. `[MINFER_TIMING] over 512 tokens:
+  (`src/engine/generate.rs:303-305` times the sampler call, `:346-349` the
+  `forward` call; the speculative round loop accumulates forward time at
+  `:228-231` — "CPU encode + GPU exec + logits download" per the comment). The
+  engine returns the totals in `GenerateOutcome::timing`, and the CLI prints one
+  line (`src/main.rs:1684-1688`), e.g. `[MINFER_TIMING] over 512 tokens:
   sample 0.02 ms/tok (1.2%), forward 3.30 ms/tok (98.8%)`. One
   paragraph is all it needs: it exists to answer "is my decode time
   *inference* or *sampling/streaming*?" — on every model in the support
@@ -847,6 +882,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
 - [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md) §3 (pipeline + "timing is
   dual-caliber"), §4.7 (prefill vs decode table) — the compressed version of
   this stage; [`docs/PERF-QWEN3-4B-VS-LLAMACPP.md`](../PERF-QWEN3-4B-VS-LLAMACPP.md)
-  §2 — the `n_ctx` over-allocation measurement behind the main.rs comment.
+  §2 — the `n_ctx` over-allocation measurement behind the `ctx` comment in
+  `src/engine/generate.rs`.
 
 ← [08 — The scheduler: splits, copies, execution](08-scheduler-execute.md) · [Index](./index.md) · [10 — CPU matmul: quantized weights × Q8_0 activations](10-cpu-matmul-kernels.md) →
