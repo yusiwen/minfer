@@ -394,7 +394,7 @@ minfer doesn't consult it; the ggml type tag per tensor is the operative fact.)
 **In:** a `&Path` — one `.gguf` file, which is either a whole model or part
 00001 of a split. Nothing else: no config, no sidecar files.
 
-**Out:** `Result<GgufModel, GgufLoadError>` — the `Err` carries the path and the parser's last reason; the CLI prints it once and exits (`main.rs`).
+**Out:** `Result<GgufModel, GgufLoadError>` — the `Err` carries the path and the parser's own reason, a value from the first stage that refused ([#767](https://github.com/yusiwen/minfer/issues/767)); the CLI prints it once and exits (`main.rs`).
 The two structs (`gguf.rs` lines 602–623, 1945–1954):
 
 ```rust
@@ -662,7 +662,7 @@ real-file walk shows it passing exactly: `output.weight` (Q8_0) is 151,936 ×
 221,218,816 = 144,643,072 + 76,575,744. No drift, no gaps: quantized
 arithmetic and padding compose perfectly.
 
-**(h) The mmap** (`gguf.rs` lines 1861–1890 and 1892–1927). No `memmap2`
+**(h) The mmap** (`gguf.rs`, `MmapFile` and `MmapFile::map`). No `memmap2`
 crate — raw libc, declared once:
 
 ```rust
@@ -674,8 +674,9 @@ crate — raw libc, declared once:
 pub struct MmapFile {
     ptr: *mut u8,
     len: usize,
-    #[allow(dead_code)]
     _file: std::fs::File, // keeps the fd alive for the mapping's lifetime
+    /// [#745] flipped by `Drop`, so a gate can assert the mapping really went away.
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // Generic POSIX mmap (Linux + macOS; the syscall ABI is identical on both).
@@ -695,23 +696,36 @@ extern "C" {
 and the map call:
 
 ```rust
-pub fn map(path: &std::path::Path) -> Option<Self> {
+pub fn map(path: &std::path::Path) -> ParseResult<Self> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
-        let file = std::fs::File::open(path).ok()?;
-        let len = file.metadata().ok()?.len() as usize;
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let len = file
+            .metadata()
+            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+            .len() as usize;
+        if len == 0 {
+            return Err(format!("cannot map {}: the file is empty", path.display()));
+        }
         let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ,
                                 MAP_PRIVATE, file.as_raw_fd(), 0) };
         // MAP_FAILED = (void*)-1
         if ptr as isize == -1 {
-            return None;
+            return Err(format!("cannot map {}: mmap failed: {}",
+                               path.display(), std::io::Error::last_os_error()));
         }
         // (The GPU-side warm-up read happens in src/metal/ register_part —
         // the first GPU access to file-backed pages costs ~44 ms of one-time
         // page/TLB setup per process, METAL_OPTIMIZATIONS #39. A CPU-side
         // madvise/touch does NOT fix it — the cost is the GPU's own access.)
-        Some(MmapFile { ptr: ptr as *mut u8, len, _file: file })
+        Ok(MmapFile {
+            ptr: ptr as *mut u8,
+            len,
+            _file: file,
+            alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
     }
 }
 ```
@@ -732,8 +746,13 @@ the drop that releases the descriptor is the same one that unmaps the pages.
 
 ```rust
 pub fn load_gguf_model(path: &std::path::Path) -> Result<GgufModel, GgufLoadError> {
-    // The body below is `load_gguf_model_inner`, the old `Option` chain; the
-    // outer call turns its last `gguf_note!` into the returned error.
+    load_gguf_model_inner(path).map_err(|reason| GgufLoadError {
+        path: path.to_path_buf(),
+        reason,
+    })
+}
+
+fn load_gguf_model_inner(path: &std::path::Path) -> Result<GgufModel, String> {
     let mmap0 = std::sync::Arc::new(MmapFile::map(path)?);
     let ctx0 = GgufContext::init_from_data(mmap0.as_slice())?;
     let split_count = ctx0
@@ -742,11 +761,12 @@ pub fn load_gguf_model(path: &std::path::Path) -> Result<GgufModel, GgufLoadErro
         .unwrap_or(1);
 
     if split_count <= 1 {
-        return Some(GgufModel {
+        return Ok(GgufModel {
             parts: vec![GgufPart {
                 ctx: ctx0,
                 mmap: mmap0,
             }],
+            fingerprint: model_fingerprint(&[path]),
         });
     }
 ```
@@ -755,10 +775,14 @@ pub fn load_gguf_model(path: &std::path::Path) -> Result<GgufModel, GgufLoadErro
 and the `Arc` keeps it alive as long as *anything* still holds a range of its
 pages — the model, a cloned weight tensor, a Metal zero-copy registration.
 Nothing is leaked, so the load path is also the drop path: when the last handle
-goes, `MmapFile::drop` runs `munmap` and closes the fd. Then either the fast path
-(no split: parse and return) or the split path — checks first (`split.no` must be
-0, lines 2016–2025; filename-derived part list must
-match `split.count`, lines 2027–2034), then parse each part in order:
+goes, `MmapFile::drop` runs `munmap` and closes the fd. Every refusal on the way
+out is a value too: a part that cannot be opened or parsed, or a `split.no`
+mismatch, returns its reason and the wrapper pairs it with the path — since
+[#767](https://github.com/yusiwen/minfer/issues/767) no stage records a note for
+the outermost call to pick up. Then either the fast path
+(no split: parse and return) or the split path — checks first (`split.no` must
+name the first part, and the filename-derived part list must match
+`split.count`), then parse each part in order:
 
 ```rust
 let mut parts = Vec::with_capacity(split_count);
@@ -770,12 +794,11 @@ for (i, p) in part_paths.iter().enumerate() {
         .map(|v| v as usize)
         .unwrap_or(0);
     if no != i {
-        eprintln!("GGUF: split {p:?} has split.no={no}, expected {i}");
-        return None;
+        return Err(format!("GGUF: split {p:?} has split.no={no}, expected {i}"));
     }
     parts.push(GgufPart { ctx, mmap });
 }
-Some(GgufModel { parts })
+Ok(GgufModel { parts, fingerprint })
 ```
 
 Note what is *not* here: no merging of KV maps, no re-allocation of tensor

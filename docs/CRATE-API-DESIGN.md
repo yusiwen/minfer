@@ -117,8 +117,7 @@ crate (load → chat → drop → reload, two sessions independent, and a single
 - **`metal` as a feature** ([#777](https://github.com/yusiwen/minfer/issues/777)); the device
   backends' own environment reads ([#769](https://github.com/yusiwen/minfer/issues/769)); the
   walkthrough prose that still frames the loop as CLI code
-  ([#773](https://github.com/yusiwen/minfer/issues/773)); the GGUF parser's internal error channel
-  ([#767](https://github.com/yusiwen/minfer/issues/767)).
+  ([#773](https://github.com/yusiwen/minfer/issues/773)).
 
 ## Phase 2 — the workspace split (deferred)
 
