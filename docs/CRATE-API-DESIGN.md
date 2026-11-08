@@ -36,10 +36,14 @@ tier (`src/server/**` reaches these types only through `crate::advanced`).
 `EngineConfig::from_env()` and installs it once, before any device or graph exists. The engine reads
 `config::get()`; a consumer that installs nothing gets the built-in defaults, never the host's
 environment. Since [#769](https://github.com/yusiwen/minfer/issues/769) that covers the device
-backends too: CUDA's and Metal's kernel-policy knobs (`mmq_*`, `flash_attn`, `gemm`, `mv_mma*`,
-`packed_kv_stage`, …) are `EngineConfig` fields, and no file under `src/` reads `MINFER_*` outside
-`from_env` and the `#[cfg(test)]` harnesses. On the test side, `config::with_config` and
-`registry::with_filter` scope a value to one thread so two engines can differ.
+backends and the model graph builders too: CUDA's and Metal's kernel-policy knobs (`mmq_*`,
+`flash_attn`, `gemm`, `mv_mma*`, `packed_kv_stage`, …) are `EngineConfig` fields, and no file under
+`src/cuda/`, `src/metal/`, `src/cuda.rs`, `src/metal.rs`, `src/graph/metal_backend.rs` or
+`src/models/*/graph.rs` reads `MINFER_*` outside `from_env`. The residual readers are the observation
+modules (`trace`, `dump`, `optiming`) and the speculative-decoding seam (`spec`, `spec_verify`), which
+still read their own variables — the honest edge of #769's scope. On the test side,
+`config::with_config` and `registry::with_filter` scope a value to one thread so two engines can
+differ.
 
 | field | meaning | environment spelling |
 | :--- | :--- | :--- |
