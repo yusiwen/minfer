@@ -25,5 +25,14 @@ pub use crate::sampler::{MirostatMode, SamplerConfig};
 pub use crate::spec::{SpecConfig, SpecEngine, SpecSampler};
 pub use crate::tokenizer::Tokenizer;
 
+// ── L0: observation ────────────────────────────────────────────────────
+// The visualizer and the metrics endpoint read these; the engine emits into
+// them from the scheduler. `live` needs tokio, so it is the `observe` feature.
+pub use crate::graph::json;
+#[cfg(feature = "observe")]
+pub use crate::live;
+pub use crate::optiming;
+pub use crate::trace;
+
 #[cfg(test)]
 mod tests;

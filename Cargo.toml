@@ -59,8 +59,9 @@ sha2 = "0.10"
 # Metal backend into a feature.
 default = ["cli"]
 # The application layer: the binary and the modules only it uses.
-cli = ["server", "tooling"]
-# The OpenAI-compatible HTTP server (axum + tokio), which includes `viz`.
+cli = ["server", "tooling", "viz"]
+# The OpenAI-compatible HTTP server (axum + tokio). The visualizer is separate
+# (`viz`), so a server-only host does not build it.
 server = [
     "dep:axum",
     "dep:tokio",
@@ -79,6 +80,8 @@ server = [
 # must not need tokio (S2).
 observe = ["dep:tokio", "tokio/sync"]
 tooling = []
+# The self-contained visualizer (`minfer viz`): its live capture rides `observe`.
+viz = ["server"]
 
 cuda = []
 # llama.cpp-style choice of how the CUDA runtime is linked: with `cuda_static`

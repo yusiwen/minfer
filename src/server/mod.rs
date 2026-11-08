@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod slot;
 pub mod toolcall;
 pub mod types;
+#[cfg(feature = "viz")]
 pub mod viz;
 pub mod worker;
 
