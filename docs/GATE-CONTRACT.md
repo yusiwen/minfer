@@ -608,13 +608,25 @@ The fix is mechanical, because mdBook 0.4.37 supports anchor includes: wrap the 
 `// ANCHOR: <name>` / `// ANCHOR_END: <name>` and write
 
     ```rust
-    {{#rustdoc_include ../../src/…:name}}
+    \{{#rustdoc_include ../../src/…:name}}
     ```
 
-in the page. `rustdoc_include`, not `include`, because `scripts/check_figures.py` claims every
-plain include for figures (it failed this repository's build with `E203` the first time). The
-included text is the file's own bytes, so a rename, a reorder or a rewrite appears in the book
-without anyone re-copying it — and a renamed anchor is a build failure, which is the loud half.
+in the page. The leading `\` is mdBook's escape: without it the preprocessor runs this *example*
+too and fails on a file that does not exist
+([#780](https://github.com/yusiwen/minfer/issues/780)). `rustdoc_include`, not `include`, because
+`scripts/check_figures.py` claims every plain include for figures (it failed this repository's build
+with `E203` the first time). The included text is the file's own bytes, so a rename, a reorder or a
+rewrite appears in the book without anyone re-copying it — and a renamed anchor is a build failure,
+which is the loud half.
+
+That half was quiet until [#780](https://github.com/yusiwen/minfer/issues/780): mdBook 0.4.37 reports
+an unresolvable include as an `[ERROR]` line on stderr, leaves the directive in the rendered page, and
+still exits **0**, so the exit code alone proved nothing. `scripts/build_book.sh` now captures the
+build's output, prints it, and exits non-zero when the log holds any `[ERROR]` line — and its message
+names the usual cause (an unresolvable include) and the escape that keeps an *example* from becoming
+one. The mutation that proves it: append `\{{#include ../../src/does-not-exist.rs}}` to any page;
+the script exits 1 and quotes mdBook's line, and removing the line makes the same command exit 0 with
+no `[ERROR]` in the log.
 
 `scripts/check_doc_code_copies.py` (#647) enforces the direction of travel: a claim in a document
 with no ledger entry fails, more claims than `scripts/doc-transcriptions.toml` records fails, and
