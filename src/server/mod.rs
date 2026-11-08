@@ -450,7 +450,9 @@ pub(crate) fn now_unix() -> i64 {
 
 /// Read `tokenizer.chat_template` from GGUF metadata (same lookup the CLI uses).
 pub(crate) fn chat_template_from_gguf(data: &[u8]) -> Option<String> {
-    let ctx = crate::gguf::GgufContext::init_from_data(data)?;
+    // A file that does not parse carries no template; the parse refusal itself
+    // is the loader's to report.
+    let ctx = crate::gguf::GgufContext::init_from_data(data).ok()?;
     ctx.kv
         .iter()
         .find(|kv| kv.key == "tokenizer.chat_template")
