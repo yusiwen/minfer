@@ -459,6 +459,10 @@ def check_pages(pages: list[Path], figures: list[Path], rep: Report) -> None:
         numbers: list[tuple[int, int, int]] = []
         for n, line in enumerate(lines, 1):
             hit = SVG_INCLUDE.search(line)
+            # `\{{#include ...}}` is mdBook's escape: it renders as text, so a page may
+            # document the directive without it becoming one (#780).
+            if hit and hit.start() > 0 and line[hit.start() - 1] == "\\":
+                hit = None
             if hit:
                 # mdBook allows `file:3`, `file:3:7` and `file:anchor`; the modifier is not a path.
                 target = hit.group(1).strip().partition(":")[0] or hit.group(1).strip()

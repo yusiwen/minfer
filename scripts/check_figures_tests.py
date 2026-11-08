@@ -254,6 +254,19 @@ class PageChecks(FigcheckTestCase):
         self.book.page("ch1.md", "# c\n\n{{#include figures/01-a.svg}}\n\n*Figure 1.1 - x*\n")
         self.assertCode("E201")
 
+    def test_escaped_include_is_example_text_not_an_include(self) -> None:
+        # #780: a page documents the directive, and `\{{#include ...}}` is mdBook's escape
+        # (it renders as text). It must not be judged as an include — no E201/E202/E203 — while
+        # the real include on the same page is still parsed normally.
+        self.book.figure("01-a.svg", CLEAN_FIGURE)
+        self.book.page("ch1.md",
+                       "# c\n\n<figure>{{#include figures/01-a.svg}}</figure>\n\n*Figure 1.1 - x*\n\n"
+                       "To show a directive without running it, escape it: "
+                       "`\\{{#include figures/99-nope.svg}}`.\n")
+        rep = self.book.report()
+        self.assertEqual(rep["errors"], [])
+        self.assertEqual(rep["warnings"], [])
+
     def test_e202_missing_include_target(self) -> None:
         self.book.figure("01-a.svg", CLEAN_FIGURE)
         self.book.page("ch1.md", "# c\n\n<figure>{{#include figures/99-nope.svg}}</figure>\n\n*Figure 1.1 - x*\n")
