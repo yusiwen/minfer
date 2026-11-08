@@ -13,11 +13,10 @@ use minfer::cuda;
 #[cfg(target_os = "macos")]
 use minfer::metal;
 use minfer::{
-    bench, conversation, download, gguf, grammar, graph, models, sampler, server, spec,
-    spec_verify, template, tokenizer, tooling, trace,
+    bench, conversation, download, gguf, grammar, models, sampler, server, spec, spec_verify,
+    template, tokenizer, tooling,
 };
 
-use rand::SeedableRng;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -387,21 +386,6 @@ fn split_backend_flag(args: Vec<String>) -> (Vec<String>, Vec<String>) {
         }
     }
     (rest, names)
-}
-
-/// Decode one token for display, through the **checked** entry point: a
-/// vocabulary-less model (`model = none`) cannot turn ids into text, and that is a
-/// named refusal rather than an empty string ([#586]).
-///
-/// [#586]: https://github.com/yusiwen/minfer/issues/586
-fn decode_token(tokenizer: &tokenizer::Tokenizer, id: u32) -> Vec<u8> {
-    match tokenizer.decode_checked(&[id]) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 fn main() {
@@ -1516,7 +1500,6 @@ fn main() {
         },
         None => None,
     };
-    let mut target_cache = graph::cache::GraphCache::new();
 
     // === Chat template (need tokenizer for bos_token text) ===
     // `template::render_single_turn` is the one place the single-turn path picks
@@ -1561,278 +1544,126 @@ fn main() {
     }
     println!("Prompt: {} tokens", input_ids.len());
 
-    // === Prefill ===
-    let infer_start = Instant::now();
-    let positions: Vec<usize> = (0..input_ids.len()).collect();
-    // forward() computes logits for only the LAST n_out tokens (n_out=1 here:
-    // single sequence, only the final token is sampled). llama.cpp does the same
-    // via ggml_get_rows(inp_out_ids) at the last layer, shrinking the lm_head
-    // to n_outputs rows — saves the full-nt output GEMM + logits download.
-    // n_ctx (--n-ctx, default 4096) sizes the graph KV regions — NOT the
-    // model's max_seq_len, which would allocate 12 GB+ and pay a first-submit
-    // Metal tax (docs/PERF-QWEN3-4B-VS-LLAMACPP.md §2). It never shrinks below
-    // the prompt length, and the model's forward clamps it to max_seq_len.
-    // Computed ONCE so prefill and decode size the same KV regions.
-    let ctx = params.n_ctx.max(input_ids.len());
-    // P2 trace (MINFER_TRACE=<path>): the scheduler records per-node data; the
-    // CLI marks phase boundaries and attaches tokens/logits for the page.
-    // `trace_on` is hoisted out of the decode loop (one env read per run).
-    let trace_on = minfer::trace::enabled();
-    if trace_on {
-        minfer::trace::begin_phase("prefill");
-    }
-    let logits = if spec_engine.is_some() {
-        // Spec mode: drive the target through forward_graph_cached so its KV
-        // lives in the cache the verify rounds reuse; the draft prefills the
-        // same tokens into its own cache.
-        let l = model.forward_graph_cached(&input_ids, &positions, 1, ctx, &mut target_cache);
-        spec_engine
-            .as_mut()
-            .expect("spec engine checked above")
-            .prefill(&input_ids, ctx);
-        l
-    } else {
-        model.forward(&input_ids, &positions, 1, ctx)
-    };
-    let last_logits: Vec<f32> = logits;
-    if trace_on {
-        minfer::trace::attach_step(&last_logits);
-    }
-
-    let prefill_time = infer_start.elapsed();
-    println!(
-        "Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
-        input_ids.len(),
-        prefill_time.as_secs_f64(),
-        input_ids.len() as f64 / prefill_time.as_secs_f64()
-    );
-
-    // === Graph export (--dump-graph <dot> / --dump-graph-json <json>) ===
-    // Rebuilds the graph the runtime just ran (shared helper: build → assign →
-    // FusionPass), with real backend assignment (CPU/Metal colors) and the same
-    // fusion env toggles as the live path.
-    if dump_graph.is_some() || dump_graph_json.is_some() {
-        use minfer::graph::json::{export_graph_json, runtime_gparams};
-        #[cfg(target_os = "macos")]
-        let metal_on = minfer::graph::metal_backend::metal_available()
-            && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
-        #[cfg(not(target_os = "macos"))]
-        let metal_on = false;
-        #[cfg(feature = "cuda")]
-        let cuda_on = minfer::cuda::CudaState::get().is_some();
-        #[cfg(not(feature = "cuda"))]
-        let cuda_on = false;
-        // Shared gate (json::preview_fuse_flags) so the preview cannot drift
-        // from the engine: Qwen2's runtime joins the decode QKV fusion on CUDA
-        // too, and a Metal-only gate here used to drop its FusedQKV nodes.
-        let (fuse_qkv, fuse_ffn) =
-            minfer::graph::json::preview_fuse_flags(input_ids.len(), metal_on, cuda_on);
-        // #736: `gpu` means "a device participates" everywhere else (`CParams.gpu`,
-        // `ModelDef::device`, the fusion gates). Passing `metal_on` alone left the
-        // exporter's allocator without CUDA, so every exported node claimed CPU on a
-        // CUDA-only box.
-        let device = minfer::graph::json::export_placement(metal_on, cuda_on);
-        let model_name = std::path::Path::new(&model_path)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| model_path.clone());
-
-        let doc = export_graph_json(
-            &*model,
-            &model_name,
-            input_ids.len(),
-            params.n_ctx,
-            device,
-            fuse_qkv,
-            fuse_ffn,
-        );
-        let kind = if input_ids.len() == 1 {
-            "decode"
-        } else {
-            "prefill"
-        };
-        if let Some(path) = &dump_graph {
-            // DOT export needs the graph itself (fused, assigned — same as the
-            // runtime), so rebuild it via the shared helper.
-            let gparams = runtime_gparams(
-                input_ids.len(),
-                params.n_ctx,
-                metal_on,
-                fuse_qkv,
-                fuse_ffn,
-                model.kv_format(),
-            );
-            let g = minfer::graph::json::build_runtime_graph(&*model, &gparams);
-            let mut f = std::fs::File::create(path).expect("create dot file");
-            g.dump_dot(&mut f).expect("write dot");
-            println!("Graph DOT exported to {path} ({} nodes)", g.n_nodes());
-        }
-        if let Some(path) = &dump_graph_json {
-            let s = serde_json::to_string_pretty(&doc).expect("serialize graph json");
-            std::fs::write(path, s).expect("write graph json");
-            println!(
-                "Graph JSON exported to {path} ({} nodes, {kind})",
-                doc["nodes"].as_array().map(|a| a.len()).unwrap_or(0)
-            );
-        }
-        std::process::exit(0);
-    }
-
-    // === Generate ===
-    let mut logits = last_logits;
-    if trace_on {
-        minfer::trace::begin_phase("decode");
-    }
-    let gen_start = Instant::now(); // pure-decode start (llama "Generation" caliber)
-    let mut generated: Vec<u32> = Vec::new();
-    let special = model.special_tokens();
-    let mut current_pos = input_ids.len();
-
-    // Seeded RNG for reproducible sampling; recent-token window for the
-    // penalties (llama.cpp repeat_last_n default = 64), seeded with the prompt
-    // tail so the first generated tokens are penalized too.
-    let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
-    const REPEAT_LAST_N: usize = 64;
-    let mut prev_tokens = sampler::recent_window(&input_ids, REPEAT_LAST_N);
-
-    // Stop strings (byte-level, llama.cpp antiprompt): `full` accumulates ALL
-    // generated bytes and `emitted` tracks what was already written, so a stop
-    // string split across tokens is caught even if its earlier tokens were
-    // already flushed (they stay in the terminal, like llama.cpp). Output is
-    // byte-wise (never lossy), so split multi-byte chars pass through intact.
-    let stop_bytes: Vec<Vec<u8>> = params
-        .stop_strings
-        .iter()
-        .map(|s| s.as_bytes().to_vec())
-        .collect();
-    let stop_refs: Vec<&[u8]> = stop_bytes.iter().map(|v| v.as_slice()).collect();
-    let mut full: Vec<u8> = Vec::new();
-    let mut emitted: usize = 0;
-
-    // MINFER_TIMING=1: decompose the per-token wall-clock into CPU sampling vs
-    // forward() (CPU encode + GPU exec + logits download). Debug tool only.
-    let timing = std::env::var("MINFER_TIMING").map_or(false, |v| v == "1");
-    let (mut t_samp, mut t_fwd, mut n_tok) = (0.0f64, 0.0f64, 0usize);
-    // t0/t1 are (re)assigned at the top of each loop iteration before use.
-    let (mut t0, mut t1);
-
-    // Gray-highlight the Qwen3 `<think>…</think>` reasoning block so it reads
-    // apart from the answer. Only when stdout is a terminal (no ANSI in pipes);
-    // MINFER_COLOR=1 forces it on (e.g. piping to less -R or a file).
+    // === Generate (the facade's single-shot path, #763 S6b) ===
+    // Prefill, sampling, stop strings and the speculative round loop live in
+    // `engine::generate`; the CLI keeps the presentation: the think-block
+    // highlighter, the dump-graph hook and the stats lines.
     let mut hi = ThinkHighlighter::new(
         std::io::IsTerminal::is_terminal(&std::io::stdout())
             || std::env::var("MINFER_COLOR").map_or(false, |v| v == "1"),
-        b"\x1b[0m", // exit think → back to the default answer color
+        b"\x1b[0m",
         |b| {
             let _ = std::io::Write::write_all(&mut std::io::stdout(), b);
             let _ = std::io::Write::flush(&mut std::io::stdout());
         },
     );
 
-    // === D5-R spec round loop ===
-    // Each round emits 1..=d+1 tokens (draft-accepted prefix + the target
-    // sampler's bonus); the per-token output machinery below is the same
-    // sequence the non-spec loop runs, applied per emitted token.
-    let sampler_cfg = params.sampler_config();
-    let mut mirostat = sampler::MirostatState::new(sampler_cfg.mirostat_tau);
-    // F2: one automaton state per run, exactly like mirostat's `mu`.
-    let mut grammar_state = sampler_cfg.grammar.as_ref().map(|g| g.state());
-    if let Some(engine) = spec_engine.as_mut() {
-        let sparams = spec::SpecSampler {
-            cfg: sampler_cfg.clone(),
-        };
-        // Seed token: the prefill's last-row logits, sampled exactly like the
-        // normal path — G1 token identity starts at token 0.
-        let mut seed_logits = std::mem::take(&mut logits);
-        let sampled = sampler::sample_with_config(
-            &mut seed_logits,
-            &sampler_cfg,
-            &prev_tokens,
-            &mut mirostat,
-            &mut rng,
+    // Called once, between the prefill and the first decode step: the prefill line
+    // and the `--dump-graph` early exit both happen at the same point they did
+    // inline.
+    let mut on_prefill = |_last_logits: &[f32], prefill_secs: f64| {
+        println!(
+            "Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
+            input_ids.len(),
+            prefill_secs,
+            input_ids.len() as f64 / prefill_secs
         );
-        let mut next_token = sampled.token_id;
-        let mut stop = false;
-        if is_stop_token(next_token, &special) {
-            stop = true;
-        } else {
-            generated.push(next_token);
-            prev_tokens.push(next_token);
-            full.extend_from_slice(&decode_token(&tokenizer, next_token));
-            if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
-                full.truncate(cut);
-                if cut > emitted {
-                    hi.feed(&full[emitted..]);
-                    emitted = full.len();
-                }
-                stop = true;
-            }
-            if !stop && emitted < full.len() {
-                hi.feed(&full[emitted..]);
-                emitted = full.len();
-            }
-            if trace_on {
-                let text =
-                    String::from_utf8_lossy(&decode_token(&tokenizer, next_token)).into_owned();
-                minfer::trace::set_token(next_token, &text);
-            }
-        }
-        while !stop && generated.len() < params.n_predict {
-            let t0r = std::time::Instant::now();
-            let round_toks = engine.round(
+        // === Graph export (--dump-graph <dot> / --dump-graph-json <json>) ===
+        // Rebuilds the graph the runtime just ran (shared helper: build → assign →
+        // FusionPass), with real backend assignment (CPU/Metal colors) and the same
+        // fusion env toggles as the live path.
+        if dump_graph.is_some() || dump_graph_json.is_some() {
+            use minfer::graph::json::{export_graph_json, runtime_gparams};
+            #[cfg(target_os = "macos")]
+            let metal_on = minfer::graph::metal_backend::metal_available()
+                && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
+            #[cfg(not(target_os = "macos"))]
+            let metal_on = false;
+            #[cfg(feature = "cuda")]
+            let cuda_on = minfer::cuda::CudaState::get().is_some();
+            #[cfg(not(feature = "cuda"))]
+            let cuda_on = false;
+            // Shared gate (json::preview_fuse_flags) so the preview cannot drift
+            // from the engine: Qwen2's runtime joins the decode QKV fusion on CUDA
+            // too, and a Metal-only gate here used to drop its FusedQKV nodes.
+            let (fuse_qkv, fuse_ffn) =
+                minfer::graph::json::preview_fuse_flags(input_ids.len(), metal_on, cuda_on);
+            // #736: `gpu` means "a device participates" everywhere else (`CParams.gpu`,
+            // `ModelDef::device`, the fusion gates). Passing `metal_on` alone left the
+            // exporter's allocator without CUDA, so every exported node claimed CPU on a
+            // CUDA-only box.
+            let device = minfer::graph::json::export_placement(metal_on, cuda_on);
+            let model_name = std::path::Path::new(&model_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| model_path.clone());
+
+            let doc = export_graph_json(
                 &*model,
-                &mut target_cache,
-                next_token,
-                current_pos,
-                ctx,
-                &sparams,
-                &mut prev_tokens,
-                &mut rng,
+                &model_name,
+                input_ids.len(),
+                params.n_ctx,
+                device,
+                fuse_qkv,
+                fuse_ffn,
             );
-            if timing {
-                t_fwd += t0r.elapsed().as_secs_f64();
-                n_tok += round_toks.len();
+            let kind = if input_ids.len() == 1 {
+                "decode"
+            } else {
+                "prefill"
+            };
+            if let Some(path) = &dump_graph {
+                // DOT export needs the graph itself (fused, assigned — same as the
+                // runtime), so rebuild it via the shared helper.
+                let gparams = runtime_gparams(
+                    input_ids.len(),
+                    params.n_ctx,
+                    metal_on,
+                    fuse_qkv,
+                    fuse_ffn,
+                    model.kv_format(),
+                );
+                let g = minfer::graph::json::build_runtime_graph(&*model, &gparams);
+                let mut f = std::fs::File::create(path).expect("create dot file");
+                g.dump_dot(&mut f).expect("write dot");
+                println!("Graph DOT exported to {path} ({} nodes)", g.n_nodes());
             }
-            let mut consumed = 0usize;
-            while consumed < round_toks.len() && generated.len() < params.n_predict {
-                let tok = round_toks[consumed];
-                if is_stop_token(tok, &special) {
-                    stop = true;
-                    break;
-                }
-                generated.push(tok);
-                full.extend_from_slice(&decode_token(&tokenizer, tok));
-                if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
-                    full.truncate(cut);
-                    if cut > emitted {
-                        hi.feed(&full[emitted..]);
-                        emitted = full.len();
-                    }
-                    stop = true;
-                    break;
-                }
-                if emitted < full.len() {
-                    hi.feed(&full[emitted..]);
-                    emitted = full.len();
-                }
-                if trace_on {
-                    let text = String::from_utf8_lossy(&decode_token(&tokenizer, tok)).into_owned();
-                    minfer::trace::set_token(tok, &text);
-                }
-                consumed += 1;
+            if let Some(path) = &dump_graph_json {
+                let s = serde_json::to_string_pretty(&doc).expect("serialize graph json");
+                std::fs::write(path, s).expect("write graph json");
+                println!(
+                    "Graph JSON exported to {path} ({} nodes, {kind})",
+                    doc["nodes"].as_array().map(|a| a.len()).unwrap_or(0)
+                );
             }
-            if stop {
-                break;
-            }
-            // The round already pushed every emitted token into prev_tokens
-            // (the accept loop's penalty windows depend on it). Bookkeeping
-            // follows what was actually emitted: an n_predict cut mid-round
-            // discards the tail (we exit right after, so the KV state that
-            // would have served those tokens is never read).
-            next_token = round_toks[consumed - 1];
-            current_pos += consumed;
+            std::process::exit(0);
         }
-        let st = &engine.stats;
+    };
+
+    let sampler_cfg = params.sampler_config();
+    let gparams = minfer::engine::GenerateParams {
+        tokens: &input_ids,
+        n_ctx: params.n_ctx,
+        n_predict: params.n_predict,
+        sampler: &sampler_cfg,
+        seed: params.seed,
+        stop_strings: &params.stop_strings,
+        timing: std::env::var("MINFER_TIMING").map_or(false, |v| v == "1"),
+        spec_adaptive: spec_draft_adaptive,
+        spec_d_max: spec_d_max,
+    };
+    let outcome = minfer::engine::generate(
+        &*model,
+        &tokenizer,
+        spec_engine.as_mut(),
+        &gparams,
+        &mut |delta| hi.feed(delta),
+        &mut on_prefill,
+    );
+    if let Some(e) = &outcome.grammar_error {
+        eprintln!("\n[grammar] {e}");
+    }
+    if let Some(st) = &outcome.spec {
         eprintln!(
             "\n[spec] rounds={} drafted={} accepted={} ({:.1}% of drafted) repairs={} tokens/round={:.2}",
             st.rounds,
@@ -1840,95 +1671,22 @@ fn main() {
             st.accepted,
             if st.drafted > 0 { st.accepted as f64 / st.drafted as f64 * 100.0 } else { 0.0 },
             st.repairs,
-            if st.rounds > 0 { generated.len() as f64 / st.rounds as f64 } else { 0.0 }
+            if st.rounds > 0 { st.generated as f64 / st.rounds as f64 } else { 0.0 }
         );
-        if spec_draft_adaptive && st.rounds > 0 {
+        if st.adaptive && st.rounds > 0 {
             eprintln!(
                 "[spec] adaptive dmean={:.2} (d_max={})",
                 st.d_sum as f64 / st.rounds as f64,
-                spec_d_max
+                st.d_max
             );
         }
     }
-    if spec_engine.is_none() {
-        while generated.len() < params.n_predict {
-            t0 = std::time::Instant::now();
-            let sampled = match sampler::sample_with_config_grammar(
-                &mut logits,
-                &sampler_cfg,
-                &prev_tokens,
-                &mut mirostat,
-                &mut grammar_state,
-                &mut rng,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    // The loud stop the grammar contract requires: the emitted text
-                    // is a valid prefix, nothing illegal is appended.
-                    eprintln!("\n[grammar] {e}");
-                    break;
-                }
-            };
-            if timing {
-                t_samp += t0.elapsed().as_secs_f64();
-            }
-
-            if is_stop_token(sampled.token_id, &special) {
-                break;
-            }
-            generated.push(sampled.token_id);
-            trace::token_trace(current_pos, sampled.token_id);
-            prev_tokens.push(sampled.token_id);
-            if prev_tokens.len() > REPEAT_LAST_N {
-                prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
-            }
-
-            // Stop-string detection on the FULL byte stream before emitting.
-            full.extend_from_slice(&decode_token(&tokenizer, sampled.token_id));
-            if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
-                full.truncate(cut);
-                if cut > emitted {
-                    hi.feed(&full[emitted..]);
-                    emitted = full.len();
-                }
-                break;
-            }
-            if emitted < full.len() {
-                hi.feed(&full[emitted..]);
-                emitted = full.len();
-            }
-
-            // forward() returns n_out*nv logits (n_out=1 for single-token decode,
-            // exactly n_vocab), so move the Vec in place instead of copying 607 KB/token.
-            if trace_on {
-                let text = String::from_utf8_lossy(&decode_token(&tokenizer, sampled.token_id))
-                    .into_owned();
-                minfer::trace::set_token(sampled.token_id, &text);
-            }
-            t1 = std::time::Instant::now();
-            logits = model.forward(&[sampled.token_id], &[current_pos], 1, ctx);
-            if trace_on {
-                minfer::trace::attach_step(&logits);
-            }
-            if timing {
-                t_fwd += t1.elapsed().as_secs_f64();
-                n_tok += 1;
-            }
-            current_pos += 1;
-        }
-    }
-    // Final flush of any bytes not yet written (incl. a dangling partial
-    // <think> marker, emitted raw).
-    if emitted < full.len() {
-        hi.feed(&full[emitted..]);
-    }
-    hi.finish();
-
-    if timing {
+    if let Some((t_samp, t_fwd, n_tok)) = outcome.timing {
         eprintln!("\n[MINFER_TIMING] over {n_tok} tokens: sample {:>6.2} ms/tok ({:>4.1}%), forward {:>6.2} ms/tok ({:>4.1}%)",
             t_samp / n_tok as f64 * 1e3, 100.0 * t_samp / (t_samp + t_fwd),
             t_fwd / n_tok as f64 * 1e3, 100.0 * t_fwd / (t_samp + t_fwd));
     }
+    hi.finish();
 
     // === P2 trace finish (MINFER_TRACE=<path>) ===
     // Attach the exported prefill/decode graphs (same params the runtime used,
@@ -1976,28 +1734,24 @@ fn main() {
     }
 
     println!();
-    let gen_time = gen_start.elapsed();
-    let total_time = infer_start.elapsed();
+    let gen_time = outcome.decode_secs;
+    let total_time = outcome.prefill_secs + outcome.decode_secs;
     println!("\n---");
     // Pure-decode rate (generated tokens / decode time) — matches llama.cpp's
     // "Generation:" caliber. The "Total:" line below keeps the previous blended
     // caliber (prompt+generated / prefill+decode) for comparison.
     println!(
         "Generated: {} tokens in {:.2}s ({:.1} tok/s)",
-        generated.len(),
-        gen_time.as_secs_f64(),
-        generated.len() as f64 / gen_time.as_secs_f64()
+        outcome.generated,
+        gen_time,
+        outcome.generated as f64 / gen_time
     );
     println!(
         "Total:     {} tokens in {:.2}s ({:.1} tok/s)",
-        input_ids.len() + generated.len(),
-        total_time.as_secs_f64(),
-        (input_ids.len() + generated.len()) as f64 / total_time.as_secs_f64()
+        input_ids.len() + outcome.generated,
+        total_time,
+        (input_ids.len() + outcome.generated) as f64 / total_time
     );
-}
-
-fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
-    special.is_stop(id)
 }
 
 /// Colors the Qwen3-style `<think>…</think>` block gray so the reasoning
