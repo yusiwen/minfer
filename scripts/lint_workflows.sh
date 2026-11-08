@@ -29,6 +29,13 @@
 #                          The sha256 pin below still applies, so a mirror must
 #                          serve identical bytes.
 #   MINFER_SHELLCHECK_URL  the same for the shellcheck tarball.
+#
+# Downloads retry across minutes, not seconds (#783): GitHub's release-download
+# endpoint intermittently answers 504 — or times out — for a whole window, and the
+# old `--retry 3 --retry-delay 2` spent every attempt inside one of them, then
+# failed with a bare `curl: (22)` and no indication that *nothing had been linted*.
+# The final message now names the URL, the last HTTP status and the curl exit, and
+# says the failure is transport, not a finding.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -71,6 +78,14 @@ ACTIONLINT_URL="${MINFER_ACTIONLINT_URL:-https://github.com/rhysd/actionlint/rel
 SHELLCHECK_TARBALL="shellcheck-v${SHELLCHECK_VERSION}.${SHELLCHECK_OS}.${SHELLCHECK_ARCH}.tar.xz"
 SHELLCHECK_URL="${MINFER_SHELLCHECK_URL:-https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${SHELLCHECK_TARBALL}}"
 
+# Retry schedule for the two downloads (#783). A first attempt plus
+# FETCH_RETRIES retries, each preceded by the next delay: 5 + 15 + 30 + 60 s of
+# waiting, which rides out the measured 504 windows without hanging the job.
+FETCH_RETRIES=4
+FETCH_DELAYS=(5 15 30 60)
+FETCH_CONNECT_TIMEOUT=15
+FETCH_MAX_TIME=60
+
 DL=""
 cleanup() {
   rm -rf ${DL:+"$DL"}
@@ -100,12 +115,33 @@ sha256_hex() {
   fi
 }
 
-# fetch_verified URL OUT WANT NAME — download, then refuse any byte the pin does not
-# expect. A mirror (the MINFER_*_URL overrides) must serve identical bytes.
+# fetch_verified URL OUT WANT NAME — download with a minutes-scale retry schedule
+# (#783), then refuse any byte the pin does not expect. A mirror (the MINFER_*_URL
+# overrides) must serve identical bytes; a digest mismatch is never retried, because
+# retrying it would turn "this mirror is serving the wrong bytes" into a wait.
 fetch_verified() {
   local url="$1" out="$2" want="$3" name="$4" actual
-  curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
-    --output "$out" "$url"
+  local attempt=0 rc=0 http_code="" delay=""
+  while :; do
+    attempt=$((attempt + 1))
+    if http_code=$(curl --fail --silent --show-error --location \
+      --connect-timeout "$FETCH_CONNECT_TIMEOUT" --max-time "$FETCH_MAX_TIME" \
+      --write-out '%{http_code}' --output "$out" "$url"); then
+      break
+    else
+      rc=$?
+    fi
+    if [ "$attempt" -gt "$FETCH_RETRIES" ]; then
+      echo "lint_workflows.sh: could not download ${name} from ${url}" >&2
+      echo "  ${attempt} attempts, retries ${FETCH_DELAYS[*]} s apart; last attempt: HTTP ${http_code:-000}, curl exit ${rc}." >&2
+      echo "  This is a network failure (HTTP 5xx/429 or a timeout), not a lint finding." >&2
+      echo "  Re-run the job, or point the MINFER_*_URL override at a mirror serving the pinned bytes." >&2
+      exit 1
+    fi
+    delay="${FETCH_DELAYS[$((attempt - 1))]}"
+    echo "lint_workflows.sh: ${name} attempt ${attempt} failed (HTTP ${http_code:-000}, curl exit ${rc}); retrying in ${delay}s" >&2
+    sleep "$delay"
+  done
   actual="$(sha256_hex "$out")"
   if [ "$actual" != "$want" ]; then
     echo "lint_workflows.sh: ${name} sha256 mismatch — refusing to lint with unverified bytes" >&2
@@ -119,6 +155,7 @@ DL="$(mktemp -d "${TMPDIR:-/tmp}/minfer-lint-workflows.XXXXXX")"
 
 echo "lint_workflows.sh: actionlint ${ACTIONLINT_VERSION} (${ACTIONLINT_OS}/${ACTIONLINT_ARCH}) from ${ACTIONLINT_URL}"
 echo "lint_workflows.sh: shellcheck ${SHELLCHECK_VERSION} (${SHELLCHECK_OS}/${SHELLCHECK_ARCH}) from ${SHELLCHECK_URL}"
+echo "lint_workflows.sh: downloads retry ${FETCH_RETRIES} times, ${FETCH_DELAYS[*]} s apart (#783)"
 fetch_verified "$ACTIONLINT_URL" "$DL/$ACTIONLINT_TARBALL" "$ACTIONLINT_SHA256" "actionlint ${ACTIONLINT_VERSION}"
 fetch_verified "$SHELLCHECK_URL" "$DL/$SHELLCHECK_TARBALL" "$SHELLCHECK_SHA256" "shellcheck ${SHELLCHECK_VERSION}"
 
