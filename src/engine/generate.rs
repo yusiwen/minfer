@@ -6,14 +6,12 @@
 //! the sampler pipeline (penalties, grammar, mirostat, the speculative round
 //! loop), stop strings, the trace marks and the KV writes.
 
-use std::time::Instant;
-
 use rand::SeedableRng;
 
 use crate::graph::cache::GraphCache;
 use crate::models::ModelDef;
 use crate::sampler::{self, SamplerConfig};
-use crate::spec::{SpecEngine, SpecSampler, SpecStats};
+use crate::spec::{SpecEngine, SpecSampler};
 use crate::tokenizer::Tokenizer;
 use crate::trace;
 
@@ -193,6 +191,7 @@ pub fn generate(
         let mut next_token = sampled.token_id;
         let mut stop = false;
         if special.is_stop(next_token) {
+            stopped_by_eog = true;
             stop = true;
         } else {
             generated.push(next_token);
@@ -237,6 +236,7 @@ pub fn generate(
             while consumed < round_toks.len() && generated.len() < p.n_predict {
                 let tok = round_toks[consumed];
                 if special.is_stop(tok) {
+                    stopped_by_eog = true;
                     stop = true;
                     break;
                 }
@@ -308,6 +308,7 @@ pub fn generate(
             }
 
             if special.is_stop(sampled.token_id) {
+                stopped_by_eog = true;
                 break;
             }
             generated.push(sampled.token_id);

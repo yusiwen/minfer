@@ -29,9 +29,9 @@ use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use crate::advanced::ModelDef;
+use crate::advanced::Tokenizer;
 use crate::gguf::GgufModel;
-use crate::models::ModelDef;
-use crate::tokenizer::Tokenizer;
 
 use super::chat::{Job, StreamEvent};
 use super::types::SamplingParams;

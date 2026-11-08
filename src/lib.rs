@@ -8,6 +8,7 @@
 //!
 //! The decision behind the split is ADR-0079 (`docs/adr/0079-the-engine-is-a-crate-with-two-api-tiers.md`).
 
+pub mod advanced;
 pub mod block;
 pub mod config;
 pub mod conversation;

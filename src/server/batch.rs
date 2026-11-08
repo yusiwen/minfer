@@ -23,11 +23,11 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tokio::sync::mpsc;
 
-use crate::graph::batch::Batch;
-use crate::graph::cache::GraphCache;
+use crate::advanced::Batch;
+use crate::advanced::GraphCache;
+use crate::advanced::Tokenizer;
 use crate::graph::kvcache::SeqId;
 use crate::models::{ModelDef, SpecialTokens};
-use crate::tokenizer::Tokenizer;
 
 use super::chat::{
     common_prefix_len, guarded_forward_batch, is_stop_token, prefill_span, Job, StreamEvent,
@@ -121,7 +121,7 @@ struct Run {
     params: SamplingParams,
     /// F3 (#48): the request's sampler configuration, resolved once (it owns the
     /// DRY breakers / logit bias) and reused for every decode step.
-    cfg: crate::sampler::SamplerConfig,
+    cfg: crate::advanced::SamplerConfig,
     /// F3: mirostat's running surprise budget, per request.
     mirostat: crate::sampler::MirostatState,
     /// F2 (#47): the request's grammar automaton, per slot/request.
@@ -469,7 +469,7 @@ impl BatchEngine {
     pub fn load_slots(
         &mut self,
         path: &std::path::Path,
-        model: &dyn crate::models::ModelDef,
+        model: &dyn crate::advanced::ModelDef,
     ) -> Result<(usize, u64), String> {
         let expect = crate::graph::kvsession::expect_for(model, self.n_ctx_total);
         let (host, report) = self.cache.alloc().kv_load_with_host(path, &expect)?;

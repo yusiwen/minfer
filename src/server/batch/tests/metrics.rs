@@ -38,7 +38,7 @@ fn serve_loop_publishes_the_queue_and_running_depth() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let metric_source = |path: &str| -> Vec<u32> { tok.encode(path) };
 
     // --- round 1: two jobs, two slots, observed while running ---------------
@@ -291,7 +291,7 @@ fn published_metrics_move_as_requests_are_served() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let n_slots = 2usize;
     let n_ctx = 128usize;
     let mut engine = BatchEngine::new(&*model, n_slots, n_ctx).expect("engine");

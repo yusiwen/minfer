@@ -8,11 +8,11 @@
 use rand::SeedableRng;
 use tokio::sync::mpsc;
 
-use crate::graph::cache::GraphCache;
+use crate::advanced::GraphCache;
+use crate::advanced::Tokenizer;
 use crate::models::{ModelDef, SpecialTokens};
 use crate::server::slot::{Slot, SlotState};
 use crate::server::types::{ApiError, SamplingParams};
-use crate::tokenizer::Tokenizer;
 
 /// Per-request event stream pushed by the worker to the HTTP handler.
 pub enum StreamEvent {
@@ -128,7 +128,7 @@ pub fn generate_spec(
     tx: &mpsc::Sender<StreamEvent>,
     id: &str,
     admitted: std::time::Instant,
-    spec: &mut crate::spec::SpecEngine,
+    spec: &mut crate::advanced::SpecEngine,
 ) -> Result<(), ApiError> {
     // F2 (#47): a verify round samples several rows from one automaton state, so
     // the combination is refused rather than silently generating unconstrained.
@@ -173,7 +173,7 @@ fn generate_seq(
     tx: &mpsc::Sender<StreamEvent>,
     id: &str,
     admitted: std::time::Instant,
-    mut spec: Option<&mut crate::spec::SpecEngine>,
+    mut spec: Option<&mut crate::advanced::SpecEngine>,
 ) -> Result<(), ApiError> {
     if input_ids.is_empty() {
         return Err(ApiError::invalid_request("prompt tokenizes to nothing"));
@@ -375,7 +375,7 @@ fn generate_seq(
                     id
                 }
             };
-            let sparams = crate::spec::SpecSampler { cfg: cfg.clone() };
+            let sparams = crate::advanced::SpecSampler { cfg: cfg.clone() };
             let toks = sp.round(
                 &*model,
                 cache,
@@ -589,7 +589,7 @@ fn generate_seq(
 /// bespoke failing-model mock.
 pub(crate) fn guarded_forward_batch(
     model: &dyn ModelDef,
-    batch: &crate::graph::batch::Batch,
+    batch: &crate::advanced::Batch,
     n_out: usize,
     n_ctx: usize,
     cache: &mut GraphCache,
@@ -707,7 +707,7 @@ pub fn worker_loop(
     tokenizer: Tokenizer,
     slots: Vec<Slot>,
     job_rx: mpsc::Receiver<Job>,
-    spec_cfg: Option<crate::spec::SpecConfig>,
+    spec_cfg: Option<crate::advanced::SpecConfig>,
     slots_file: Option<String>,
     metrics: std::sync::Arc<super::metrics::ServerMetrics>,
 ) -> super::worker::WorkerResources {
@@ -853,19 +853,22 @@ fn worker_loop_serial(
     tokenizer: Tokenizer,
     mut slots: Vec<Slot>,
     mut job_rx: mpsc::Receiver<Job>,
-    spec_cfg: Option<crate::spec::SpecConfig>,
+    spec_cfg: Option<crate::advanced::SpecConfig>,
     metrics: &super::metrics::ServerMetrics,
 ) -> super::worker::WorkerResources {
     // doc 97: one draft engine per slot (each slot's draft KV is isolated
     // exactly like its target KV). The draft model is small (0.5B-class) and
     // loaded once at worker startup.
-    let mut slot_specs: Vec<Option<crate::spec::SpecEngine>> = slots
+    let mut slot_specs: Vec<Option<crate::advanced::SpecEngine>> = slots
         .iter()
         .map(|_| match &spec_cfg {
-            Some(cfg) => {
-                crate::spec::SpecEngine::new(cfg, &tokenizer, model.n_vocab(), model.kv_format())
-                    .ok()
-            }
+            Some(cfg) => crate::advanced::SpecEngine::new(
+                cfg,
+                &tokenizer,
+                model.n_vocab(),
+                model.kv_format(),
+            )
+            .ok(),
             None => None,
         })
         .collect();

@@ -80,7 +80,7 @@ fn a_prefix_copied_from_another_slot_answers_identically() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let prompt = tok.encode("The capital of France is");
     let n_ctx = prompt.len() + 64;
 
@@ -145,7 +145,7 @@ fn a_store_inside_a_shared_prefix_takes_a_private_row() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     // Long enough that the share has rows worth copying.
     let prompt = tok.encode(
         "You are a helpful assistant. Answer in one short sentence. The capital of France is",
@@ -332,7 +332,7 @@ fn a_long_request_may_use_the_whole_arena() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let ids = tok.encode(&"buffalo ".repeat(300));
     let n_ctx = ids.len() + 64;
     assert!(

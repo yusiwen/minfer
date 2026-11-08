@@ -92,7 +92,7 @@ fn a_chunked_prefill_answers_like_an_unchunked_one() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let ids = tok.encode(&"buffalo ".repeat(96));
     let chunk = (ids.len() / 4).max(8);
     let n_ctx = ids.len() + 64;
@@ -254,7 +254,7 @@ fn a_repeated_chunked_prefill_stops_rebuilding() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let ids = tok.encode(&"buffalo ".repeat(96));
     let chunk = (ids.len() / 4).max(8);
     let n_ctx = ids.len() + 64;
@@ -315,7 +315,7 @@ fn a_long_prefill_keeps_another_slot_decoding() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     // Both prompts are repeats: neither is expected to EOG, which keeps the
     // scenario about scheduling rather than about the model's mood.
     let short = tok.encode(&"buffalo ".repeat(48));

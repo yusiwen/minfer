@@ -42,7 +42,7 @@ fn a_slot_snapshot_resumes_the_context_without_re_prefilling() {
     let model = crate::models::load_model(&gguf).expect("load model");
     #[cfg(feature = "cuda")]
     let _guard = crate::cuda::CudaState::model_load_guard();
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let n_ctx = 512usize;
     let n_slots = 2usize;
     let file = std::env::temp_dir().join(format!(
