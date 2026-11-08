@@ -204,6 +204,39 @@ compiler auto-detection (`MINFER_CUDA_CCBIN`), GPU-arch coverage (sm_70…sm_121
 CUDA 12.8 vs 13 notes), and cudart linking details — lives in
 **[`docs/BUILD.md`](docs/BUILD.md)**.
 
+## Use as a library
+
+The inference engine is a library (`minfer`); the binary, the HTTP server and the
+visualizer are its first consumers.
+
+```toml
+[dependencies]
+minfer = { version = "0.0.9", default-features = false }
+```
+
+```rust
+use minfer::conversation::TurnParams;
+use minfer::engine::{Engine, SessionConfig};
+use minfer::sampler::SamplerConfig;
+
+let engine = Engine::load(std::path::Path::new("model.gguf"))?;
+let mut session = engine.session(SessionConfig::default());
+let params = TurnParams {
+    n_predict: 64,
+    sampler: SamplerConfig::default(),
+    stop_strings: Vec::new(),
+};
+let mut out = Vec::new();
+session.chat("hello", &params, &mut |delta| out.extend_from_slice(delta))?;
+```
+
+`examples/embed.rs` is this program. The public tiers (`engine` facade,
+`advanced` primitives, `config`) and their stability promise are in
+[`docs/CRATE-API-DESIGN.md`](docs/CRATE-API-DESIGN.md); the decision behind them
+is [ADR-0079](docs/adr/0079-the-engine-is-a-crate-with-two-api-tiers.md).
+`default-features = false` builds the engine without the server, the tooling or
+the visualizer; `cargo build --release` still produces the full binary.
+
 ## Usage
 
 Examples use the built binary (`cargo build --release` first — see
