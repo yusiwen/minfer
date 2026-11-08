@@ -457,7 +457,7 @@ everything else — QKV projections, `wo`, gate, up, `lm_head` (id 896) —
 misses the gate and runs the **f32-activation kernel** `q4_0_f32_matmul`
 (`matmul_f32act.cu:103`). On Qwen2.5-7B (`id = 3584` everywhere), every decode matmul clears
 the gate and the whole step is MMVQ — plus the v2 variants, since
-`mmvq_v2(id)` (`src/cuda/methods/mmvq.rs:725`, the `mmvq_v2` gate) additionally requires `id % 256 == 0`
+`mmvq_v2(id)` (`src/cuda/methods/mmvq.rs:719`, the `mmvq_v2` gate) additionally requires `id % 256 == 0`
 (3584 = 256·14 ✓). The gate is not an oversight: the arms' comments record
 the measured crossovers (small-`id` MMVQ loses — the uncoalesced nibble
 loads dominate when rows are short; the Q5_K arm prices it at `src/cuda/methods/dispatch.rs:`). The reading habit
@@ -732,7 +732,7 @@ its pieces in a profile:
 - **Activation prepass**: `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`)
   quantizes f32 activations to int8 *and writes them pre-transposed and
   swizzled* into the exact layout the GEMM stages (`mmq_nb.cu:289`, fed by
-  `prefill_mmq.rs:133`); llama.cpp's `quantize_mmq_q8_1` design — "byte-identical … only
+  `prefill_mmq.rs:132`); llama.cpp's `quantize_mmq_q8_1` design — "byte-identical … only
   reordered" (`mmvq_aquant.cu:82-84`).
 - **The GEMM**: `mmq_raw_nb_bt_kernel` (`mmq_nb.cu:289`) — raw
   quantized weight bytes staged per tile, decoded in registers next to the
@@ -788,7 +788,7 @@ The derivation of the last row: FLOPs = 2·512·896·4864 ≈ 4.46 GFLOP; MMQ by
 512·152·40 B (activations) + 2.45 MB (weights) + 512·896·4 B (output) ≈ 7.4 MB;
 4.46e9 / 7.4e6 ≈ 600. Between the first and last row the intensity swings by
 three orders of magnitude — and that swing, not any kernel's cleverness, is what
-the dispatch gate `nt >= 9` (`src/cuda/methods/dispatch.rs:191`) reacts to (or
+the dispatch gate `nt >= 9` (`src/cuda/methods/dispatch.rs:190`) reacts to (or
 `nt >= 2` under the off-by-default `MINFER_SMALL_M_GEMM=1` experiment, doc 91).
 
 Two consequences worth internalizing:

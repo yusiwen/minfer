@@ -565,7 +565,7 @@ persistent KV regions. So the model wiring applies an **all-or-nothing
 gate** before the graph is even built:
 
 ```rust
-// src/models/qwen2/graph.rs:778 (`device`) (abridged)
+// src/models/qwen2/graph.rs:776 (`device`) (abridged)
 // CUDA participation (Phase 7): requires a usable device AND every
 // matmul weight registered on the CUDA registry in a kernel-supported
 // type (all-or-nothing; 7e③ moved the embedding gather on device, so
@@ -581,7 +581,7 @@ cparams: CParams {
 },
 ```
 
-`weights_on_cuda` (`qwen2/graph.rs:885`) walks every weight the graph reads
+`weights_on_cuda` (`qwen2/graph.rs:883`) walks every weight the graph reads
 — embedding, output head, every layer's norms/biases/matmul weights — and
 requires each to be (a) registered and (b) a type with a matching kernel.
 The type check is per *role*: matmul weights admit all eight quant types
@@ -668,7 +668,7 @@ GEMM). What falls through is the decode-side dispatch, and reading one arm
 teaches you the shape of all of them:
 
 ```rust
-// src/cuda/methods/dispatch.rs:323 (Q4_K arm; abridged comment)
+// src/cuda/methods/dispatch.rs:322 (Q4_K arm; abridged comment)
 TensorType::Q4_K => {
     // 8e-reversal: decode (nt == 1) runs the MMVQ structure
     // (dp4a over q8 activations, one row per 256-thread block) —

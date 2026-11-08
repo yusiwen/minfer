@@ -338,7 +338,7 @@ the graph*; on the "survives" side, everything that *holds data*:
 | Survives the rebuild | Recomputed on rebuild |
 |---|---|
 | The `GraphAllocator` itself (it lives inside `GraphCache`, `cache.rs:`) | The node list (`Self::build`, `src/models/qwen2/graph.rs`) |
-| Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `src/models/qwen2/graph.rs:632`) |
+| Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `src/models/qwen2/graph.rs:630`) |
 | **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:`; `alloc_graph` explicitly frees only liveness buffers, `alloc_graph` (`alloc.rs:`)) | The fusion pass (`FusionPass::run`, `src/models/qwen2/graph.rs:`) |
 | Backend buffer *pools* (freed liveness buffers return to their pool; the memory is recycled, not released) | The node→buffer mapping (`alloc_graph` clears `node_to_buf`, `alloc.rs:519`) |
 | The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `replace_graph` (`cache.rs:`) + §3.4) | Cross-backend staging buffers (keyed by `(graph uid, node, backend)` and surviving a rebuild *and* a re-map — E4 S3; `alloc_graph` clears only the in-flight `cross_pending` set, `alloc_graph` (`alloc.rs:`)) |
@@ -430,8 +430,8 @@ and is only read:
 
 | Data | Type / shape | Where it comes from | Where it goes |
 |---|---|---|---|
-| `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`src/models/qwen2/graph.rs:659`) |
-| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`src/engine/generate.rs:136`) — starts at `p.tokens.len()`, incremented once per step at `:350` | same, `src/models/qwen2/graph.rs:661`; the KV store uses it as the write slot, attention as the last readable slot |
+| `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`src/models/qwen2/graph.rs:657`) |
+| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`src/engine/generate.rs:136`) — starts at `p.tokens.len()`, incremented once per step at `:350` | same, `src/models/qwen2/graph.rs:659`; the KV store uses it as the write slot, attention as the last readable slot |
 | K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
 | logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `src/models/qwen2/graph.rs:`) | moved into the loop's `logits` variable (`src/engine/generate.rs:342`, the `logits = model.forward(...)` assignment) for the next sample |
 | `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens — `recent_window` (`engine/generate.rs:143, 313-316`) | the sampler's repeat/frequency/presence penalties (doc 12) |
@@ -733,7 +733,7 @@ and it probes GPU availability (`metal_on` / `cuda_on`), which feeds the
 #### The reuse decision itself `GraphCache` (`src/graph/cache.rs:`)
 
 With params in hand, the cache is asked one question
-(`src/models/qwen2/graph.rs:607`): `if !cache.try_reuse(&params).expect("re-map
+(`src/models/qwen2/graph.rs:605`): `if !cache.try_reuse(&params).expect("re-map
 onto a cached graph") { … }`. Here is the whole machinery:
 
 ```rust
@@ -878,7 +878,7 @@ the batch's `out_rows` (`src/models/qwen2/graph.rs`) — that input *only
 exists in prefill graphs* (`n_out < nt`), so its presence is data too.
 
 Finally `sched.execute(graph, alloc)` runs one scheduler walk
-(`src/models/qwen2/graph.rs:694`), and the output buffer is copied back as the returned
+(`src/models/qwen2/graph.rs:692`), and the output buffer is copied back as the returned
 logits (`src/models/qwen2/graph.rs:`). With G3 active the output buffer already holds
 exactly `n_out × n_vocab` values, so the return is either the buffer itself
 or a truncated copy — never a full-`nt` logits matrix (doc 09 covered the
@@ -1057,7 +1057,7 @@ Prefill computes attention and projections for all `nt` tokens (it must —
 every token's K/V goes into the cache), but only the *last* token's logits
 are wanted. So after the last layer's attention output projection, two
 `GetRows` nodes gather just the `n_out` tail rows (`tail_ids` is filled
-with `nt-1, …, nt-n_out` at `src/models/qwen2/graph.rs:679`), and the remaining FFN +
+with `nt-1, …, nt-n_out` at `src/models/qwen2/graph.rs:677`), and the remaining FFN +
 residual + lm_head run on `n_out` rows instead of `nt`. With `n_out = 1`
 and a 2000-token prompt, that saves a 2000-row lm_head GEMM — a 151,936
 column × 2000 row output — per run. In decode, `n_out == nt == 1`, the
@@ -1252,7 +1252,7 @@ as live for the whole step — `last_use` (`alloc.rs:`) — so that a liveness r
 can never clobber `token_ids` after it was filled but before its consumer
 ran. On a rebuild, `node_to_buf` is cleared and re-derived — the input
 *fill* in `forward_cached` happens *after* `alloc_graph` has produced the
-new mapping (`src/models/qwen2/graph.rs:643` before `src/models/qwen2/graph.rs:`), so fills always
+new mapping (`src/models/qwen2/graph.rs:641` before `src/models/qwen2/graph.rs:`), so fills always
 land in the buffers the scheduler will read.
 
 **4. Stale-but-unread KV after rollback.** `/regen` rewinds the cursor

@@ -840,7 +840,7 @@ time*, all-or-nothing: CUDA participation requires a device **and** every
 weight registered with a kernel-supported type
 (`Qwen2Graph::device` (`src/models/qwen2/graph.rs`),
 `cuda_on = … && Self::weights_on_cuda(model)`). `weights_on_cuda`
-`weights_on_cuda` (`src/models/qwen2/graph.rs:885`) walks every tensor — embedding,
+`weights_on_cuda` (`src/models/qwen2/graph.rs:883`) walks every tensor — embedding,
 per-layer wq/wk/wv/wo, gate/up/down, norms, biases — and on failure prints the
 exact loser: `"CUDA GATE: weight '{}' (type {:?}) has no CUDA kernel or is not registered"` —
 the gate is `Qwen2Graph::device` (`src/models/qwen2/graph.rs`). That either routes the
