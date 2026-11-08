@@ -12,6 +12,8 @@
 
 use std::path::Path;
 
+pub use generate::{generate, GenerateOutcome, GenerateParams, SpecStatsOut};
+
 use crate::conversation::{self, ConvError, Conversation, GraphEngine, TurnOutcome, TurnParams};
 use crate::gguf::{GgufLoadError, GgufModel};
 use crate::graph::offload::OffloadRequest;
@@ -127,6 +129,25 @@ impl Engine {
     pub fn special_tokens(&self) -> SpecialTokens {
         self.model.special_tokens()
     }
+    /// One single-shot generation on this engine (no session state): prefill
+    /// `params.tokens`, decode up to `params.n_predict`, stream deltas through
+    /// `emit`. The caller owns tokenization and prompt rendering.
+    pub fn generate(
+        &self,
+        params: &GenerateParams<'_>,
+        emit: &mut dyn FnMut(&[u8]),
+        on_prefill: &mut dyn FnMut(&[f32], f64),
+    ) -> GenerateOutcome {
+        generate(
+            self.model.as_ref(),
+            &self.tokenizer,
+            None,
+            params,
+            emit,
+            on_prefill,
+        )
+    }
+
     /// A new conversation on this engine. The session owns its KV cache and its
     /// message history; the engine is shared and never mutated by a turn.
     pub fn session(&self, cfg: SessionConfig) -> Session<'_> {
@@ -227,6 +248,8 @@ impl<'a> Session<'a> {
 pub fn mirostat_state(tau: f32) -> MirostatState {
     MirostatState::new(tau)
 }
+
+mod generate;
 
 #[cfg(test)]
 mod tests;

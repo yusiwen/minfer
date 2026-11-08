@@ -71,3 +71,31 @@ fn two_sessions_on_one_engine_do_not_share_history() {
         "the second session starts empty"
     );
 }
+
+#[test]
+fn the_external_generate_runs_the_whole_loop() {
+    let engine = Engine::load(&toy()).expect("load");
+    let ids = engine.tokenizer().encode("hi");
+    let sampler = SamplerConfig::default();
+    let params = minfer::engine::GenerateParams {
+        tokens: &ids,
+        n_ctx: 64,
+        n_predict: 2,
+        sampler: &sampler,
+        seed: 42,
+        stop_strings: &[],
+        timing: false,
+        spec_adaptive: false,
+        spec_d_max: 2,
+    };
+    let mut out = Vec::new();
+    let mut prefill = None;
+    let outcome = engine.generate(
+        &params,
+        &mut |delta| out.extend_from_slice(delta),
+        &mut |_logits, secs| prefill = Some(secs),
+    );
+    assert_eq!(outcome.prefill_tokens, ids.len());
+    assert!(outcome.generated <= 2, "n_predict caps the run");
+    assert!(prefill.is_some(), "the prefill hook fires once");
+}
