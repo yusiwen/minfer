@@ -170,7 +170,12 @@
 #                       `needs:` naming a missing job and a `run:` block shellcheck
 #                       rejects are all green there and caught here. Both tools
 #                       come from the script's own pins rather than from PATH, so
-#                       the verdict does not move with the runner image.
+#                       the verdict does not move with the runner image. The two
+#                       downloads retry across minutes (5/15/30/60 s, #783): the
+#                       release-download endpoint intermittently answers 504, and a
+#                       transport failure now ends with a line naming the URL, the
+#                       HTTP status and the curl exit — never a bare exit code that
+#                       reads like a lint finding.
 # 7. check-pr-body    : the PR-body gate (#175, enforcing the gate contract's
 #                       rules 3 and 5). `scripts/check_pr_body.py --selftest` runs
 #                       the checker's own pass/fail cases, then the checker reads
@@ -694,7 +699,9 @@ jobs:
   # 1.7.12 and shellcheck 0.10.0 by release tarball *and* per-architecture sha256,
   # and refuses to lint unverified bytes; actionlint's shell integration is on,
   # against the pinned shellcheck rather than the runner's. No toolchain, no
-  # cache: one checkout and one step.
+  # cache: one checkout and one step. The downloads retry across minutes (#783) and
+  # a transport failure is reported as one, so a 504 window cannot read as a lint
+  # finding on the next green tree.
   lint-workflows:
     if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-24.04 # pinned, like release.yml: `ubuntu-latest` migrates to Ubuntu 26 and emits a deprecation annotation
