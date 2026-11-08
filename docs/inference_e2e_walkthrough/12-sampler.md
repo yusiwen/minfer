@@ -25,7 +25,7 @@ depends on the model, the quantization, even the layer's final RMSNorm gain).
 For the Qwen family the vocabulary has **151,936** entries, so what this
 stage receives is a `Vec<f32>` with 151,936 elements — 151,936 × 4 bytes =
 607,744 bytes ≈ **0.6 MB** of scores (the `607 KB` the code comment at
-`src/main.rs:941-942` refers to).
+`src/main.rs:925-926` refers to).
 
 The sampler's whole job is to turn that list into one `u32` token id. That
 sounds trivially small next to the transformer's billions of multiplies, and
@@ -45,7 +45,7 @@ Three quiet facts shape the design:
    penalties need to know which tokens appeared recently. That means the
    decode loop keeps a sliding window of the last 64 token ids — seeded from
    the prompt's tail — and passes it in alongside the logits
-   (`src/main.rs:859-864`).
+   (`src/main.rs:843-848`).
 3. **"Stop generating" is a sampling-adjacent concern.** After a token is
    chosen, three gates decide whether generation ends: the token is the
    end-of-text sentinel (eos or `<|im_end|>`, doc 04), the generated *byte
@@ -362,7 +362,7 @@ finds every possible match exactly once, in O(len(stop)) time.
 | Value | Type / shape | From |
 |---|---|---|
 | `logits` | `&mut Vec<f32>`, exactly `n_vocab` entries (151,936 for Qwen ≈ 0.6 MB) | the last forward (docs 09–11); prefill for the first step, one-token decode for every later step |
-| `params.temp` | `f32`, default 0.8 (0 = greedy) | `GenParams` (`src/main.rs:43`) |
+| `params.temp` | `f32`, default 0.8 (0 = greedy) | `GenParams` (`src/main.rs:42`) |
 | `params.top_k` | `usize`, default 40 | :68 |
 | `params.top_p` | `f32`, default 0.95 | :69 |
 | `params.repeat_penalty` | `f32`, default 1.1 | :70 |
@@ -724,7 +724,7 @@ The gates run immediately after sampling, before anything is appended:
         }
 ```
 
-`is_stop_token` is the two-line sentinel (`src/main.rs:1037-1039`):
+`is_stop_token` is the two-line sentinel (`src/main.rs:1021-1023`):
 
 ```rust
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
@@ -754,7 +754,7 @@ pub fn match_stop_suffix(buf: &[u8], stops: &[&[u8]]) -> Option<usize> {
 "Earliest start wins" means the *longest* applicable stop string decides
 where to cut (a later start truncates less text). The bytes already flushed
 to the terminal before the match completed are not un-printed — that is the
-llama.cpp antiprompt behavior the comment at `src/main.rs:866-870` describes,
+llama.cpp antiprompt behavior the comment at `src/main.rs:850-854` describes,
 and it is why `full` (everything generated) and `emitted` (everything
 streamed) are tracked as separate cursors.
 
@@ -854,7 +854,7 @@ parity tests rather than trusting either alone.)
 obvious alternative — `let probs = sampler::sample(logits.clone(), …)` or
 returning a new `Vec` — buys a full-vocab copy per token for zero benefit.
 The arithmetic: 151,936 × 4 B = 607,744 B ≈ 0.6 MB per generated token,
-which is precisely the copy the call-site comment at `src/main.rs:941-942`
+which is precisely the copy the call-site comment at `src/main.rs:925-926`
 brags about not making ("move the Vec in place instead of copying 607
 KB/token") for the *forward* boundary — the sampler boundary gets the same
 treatment. The ownership dance that makes it work: `logits` starts as the
@@ -936,7 +936,7 @@ run even when the stochastic stages are skipped.
   selection, a ≤40-entry softmax, and one draw.
 - **`MINFER_TRACE=<path>`** — the decode loop attaches each sampled token's
   id and decoded text to the trace (`crate::trace::set_token`,
-  `src/main.rs:943-947`); the viz page shows the token stream the sampler
+  `src/main.rs:927-931`); the viz page shows the token stream the sampler
   produced.
 - **The reproducibility experiment** — run the same command twice, e.g.
   `./target/release/minfer qwen2.5-0.5b-instruct-q4_0 "Tell me a story" -n 24`:
