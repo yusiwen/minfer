@@ -90,7 +90,7 @@ pub fn run_viz(
     // worker thread (canonical prefill nt=16: topology matches any run, shapes
     // approximate for the live prefill view).
     let (live_tx, _) = tokio::sync::broadcast::channel::<String>(8192);
-    crate::live::init(live_tx.clone());
+    crate::advanced::live::init(live_tx.clone());
     // Mirror the engine's CParams construction (qwen2/qwen3 graph.rs): GPU
     // participation is Metal OR CUDA; QKV fusion stays Metal-only (the fused
     // bias+rope+store kernel has no CUDA counterpart — the engine's own gate
@@ -373,7 +373,7 @@ async fn viz_graph(State(state): State<Arc<VizState>>) -> impl IntoResponse {
 struct LiveGuard;
 impl Drop for LiveGuard {
     fn drop(&mut self) {
-        crate::live::detach_client();
+        crate::advanced::live::detach_client();
     }
 }
 struct Guarded<S>(S, LiveGuard);
@@ -385,8 +385,8 @@ impl<S: Stream + Unpin> Stream for Guarded<S> {
 }
 
 async fn viz_events(State(state): State<Arc<VizState>>) -> Response {
-    let rx = crate::live::subscribe(); // clients += 1: begin capture
-    let hello = Event::default().data(crate::live::hello(&state.app.model_name, 0));
+    let rx = crate::advanced::live::subscribe(); // clients += 1: begin capture
+    let hello = Event::default().data(crate::advanced::live::hello(&state.app.model_name, 0));
     let stream = Guarded(
         futures_util::stream::iter(vec![Ok::<_, Infallible>(hello)]).chain(
             tokio_stream::wrappers::BroadcastStream::new(rx).map(|r| match r {

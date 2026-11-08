@@ -15,7 +15,7 @@ exist and what was rejected.
 | :--- | :--- | :--- | :--- |
 | **L2 facade** | `Engine::load`, `Session`, `complete`, `chat`, the delta callback, cancellation | embedders, the CLI | documented; the only semver-relevant promise before 1.0 |
 | **L1 primitives** (`minfer::advanced`) | `ModelDef`, `GraphCache`, `graph::Batch`, KV sessions, `Tokenizer`, `SamplerConfig`, `Grammar` | the HTTP server, bench, tooling | public, **not** semver-stable before 1.0 |
-| **L0 observation** (`observe` feature) | `live`, `trace`, `graph::json`, `optiming` | `viz`, `/metrics` | feature-gated; off in the default consumer build |
+| **L0 observation** (`observe` feature) | `live`, `trace`, `graph::json`, `optiming` — re-exported from `minfer::advanced` (`live` only with `observe`) | `viz`, `/metrics` | feature-gated; off in the default consumer build |
 
 The rule that keeps the tiers honest: an embedder that needs L1 is telling us the facade is missing a
 capability; the server is the only consumer allowed to be on L1 by design.
@@ -68,7 +68,7 @@ conflict, never a silent second install.
 | `server` | the OpenAI-compatible server | on |
 | `tooling` | `convert` / `quantize` / `split` | on |
 | `download` | HuggingFace / Ollama resolution | on |
-| `viz` | the `viz` subcommand and its assets | on |
+| `viz` | the `viz` subcommand and its assets (implies `server`) | on |
 | `observe` | `live` / `trace` hooks | on for the binary; off for consumers |
 | `metal` | the Metal backend (macOS only) | on where it compiles |
 | `cuda`, `cuda_static`, `debug_dump` | unchanged | off |

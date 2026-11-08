@@ -23,3 +23,14 @@ fn the_advanced_tier_is_reachable_from_outside_the_crate() {
     let cfg = SamplerConfig::default();
     assert!(cfg.temp >= 0.0);
 }
+
+#[cfg(feature = "observe")]
+#[test]
+fn the_observation_surface_is_reachable() {
+    // Lazy arming: no viz client is attached, so capture is off.
+    assert!(
+        !minfer::advanced::live::enabled(),
+        "live capture must be off until a client subscribes"
+    );
+    let _ = minfer::advanced::trace::enabled();
+}
