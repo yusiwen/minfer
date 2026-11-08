@@ -114,7 +114,7 @@ data:
 This indirection is what lets *one* graph topology serve prefill *and* decode:
 prefill fills `positions` with `0, 1, 2, …, nt-1`; the decode loop fills it
 with one running number (`current_pos`, starting at the prompt length,
-`main.rs:857`, incrementing per step, `main.rs:957`). If positions were
+`main.rs:841`, incrementing per step, `main.rs:941`). If positions were
 instead baked into the topology (say, attention shaped to read exactly
 `n_past + nt` cache rows), the graph would have to be rebuilt on *every*
 decode step, because `n_past` changes every step — and the params-only reuse
@@ -238,7 +238,7 @@ and passes that single number to *every* forward of the run — prefill at
    tax).
 2. It **never shrinks below the prompt length** (`max`): the prompt itself
    needs `nt` KV slots, positions `0..nt`, and the decode loop continues at
-   `current_pos = input_ids.len()` (`main.rs:857`) — if `ctx < prompt len`,
+   `current_pos = input_ids.len()` (`main.rs:841`) — if `ctx < prompt len`,
    the very first decode position would overflow the regions.
 3. The model **clamps again** to `max_seq_len` (`n_ctx.min(max_seq_len)`,
    `graph.rs:392`): a prompt longer than the model was trained for is capped
@@ -354,7 +354,7 @@ from the decode side.
   node, same shape.
 - `n_out = 1` — the tail-row count (§2.4).
 - `ctx = max(params.n_ctx, nt)` — the KV region width for the whole run
-  (§2.5); `params.n_ctx` defaults to 4096 (`main.rs:44`).
+  (§2.5); `params.n_ctx` defaults to 4096 (`main.rs:43`).
 - `kv_cache` — **gone (#252)**. Until [#252] the call passed a legacy
   `KVCache` created in `main.rs`; the graph path always **ignored** it (the
   callee bound it as `_kv`) and the graph owns KV in its persistent regions.
@@ -588,7 +588,7 @@ ONLY inputs to graph reuse". The batch's composition — sequence count, cell
 rows, attention windows — is deliberately *not* here: it is data, refilled
 per forward (A7/E2).)
 
-#### The trace phase boundary (`src/trace.rs:`, CLI at `main.rs:750-757`)
+#### The trace phase boundary (`src/trace.rs:`, CLI at `main.rs:734-741`)
 
 ```rust
 /// CLI: mark the start of a phase (prefill / decode). Repeated calls within the
@@ -612,7 +612,7 @@ page can show the whole prefill execution node by node. Note the phase
 *naming* lives in the CLI, not the engine: the engine has `GraphType`, the
 trace has human-facing labels.
 
-#### The timing calibers (`src/main.rs:767-773`, `837`, `1000-1017`)
+#### The timing calibers (`src/main.rs:751-757`, `837`, `1000-1017`)
 
 Three stopwatches, three printed calibers — and the differences between them
 are the point:
@@ -782,7 +782,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   accumulated at `main.rs`) and the `forward` call (`t_fwd`, `main.rs`
   on the speculative path and `main.rs:1914` on the plain one — "CPU encode + GPU
   exec + logits download" per the comment), then prints one line
-  (`main.rs:1928-1930`), e.g. `[MINFER_TIMING] over 512 tokens:
+  (`main.rs:1685-1687`), e.g. `[MINFER_TIMING] over 512 tokens:
   sample 0.02 ms/tok (1.2%), forward 3.30 ms/tok (98.8%)`. One
   paragraph is all it needs: it exists to answer "is my decode time
   *inference* or *sampling/streaming*?" — on every model in the support
