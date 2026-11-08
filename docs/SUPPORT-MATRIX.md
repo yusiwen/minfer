@@ -119,7 +119,8 @@ continuation `[12095, 13, 1084, 374]`.
 have AVX2+FMA kernels (`src/quants/avx2.rs`) and AVX-512/VNNI variants
 (`src/quants/avx512.rs`), dispatched **AVX-512 → AVX2 → scalar** at runtime
 (`MINFER_NO_AVX512=1` drops to AVX2, `MINFER_NO_AVX2=1` to scalar — the x86
-counterparts of `MINFER_NO_NEON`) and gated **bitwise** against the scalar
+counterparts of `MINFER_NO_NEON`; `MINFER_NO_F16_ROWB=1` is the A/B control for
+the f16 row-block weight dot) and gated **bitwise** against the scalar
 reference (`quants::avx2_correctness`). The AVX2 column marks the hand-written x86
 kernel; NEON is folded into CPU as in every other row.
 
