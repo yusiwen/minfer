@@ -4,24 +4,20 @@ use std::fmt;
 use std::mem;
 use std::ptr;
 
-// [#745] S3: the parser's failure notes are both the reason a load fails and the
-// text a caller can put in an error. A thread-local, not a field: the parser is a
-// deep `Option` chain (~70 exits) whose signatures predate the named error.
-thread_local! {
-    static GGUF_LAST_ERROR: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Record the reason a parse step failed. The public loader takes the last note
-/// and returns it in [`GgufLoadError`]; the note is not printed here, so a caller
-/// decides (the CLI prints the error once, a test can assert on it).
-macro_rules! gguf_note {
-    ($($arg:tt)*) => {{
-        GGUF_LAST_ERROR.with(|slot| {
-            *slot.borrow_mut() = Some(format!($($arg)*));
-        });
-    }};
-}
+// === [#767] a parse refusal is a value ===
+//
+// [#745] S3 gave the model layer a named error; the parser it sits on still reported
+// out of band: the deep `Option` chain recorded a note in a thread-local, and only the
+// outermost call turned that note into a `GgufLoadError`. A helper's signature therefore
+// never said it could refuse, and a stage's specific reason could be overwritten by the
+// next stage's aggregate message before anyone read it.
+//
+// Now every stage returns its reason. `ParseResult`'s error is a complete `GGUF: ...`
+// sentence, which is exactly what `GgufLoadError::reason` carries, so there is no side
+// channel left to skip.
+//
+// [#767]: https://github.com/yusiwen/minfer/issues/767
+type ParseResult<T> = Result<T, String>;
 
 // === Constants (from gguf.h) ===
 
@@ -58,22 +54,24 @@ pub enum GgufType {
 }
 
 impl GgufType {
-    fn from_i32(v: i32) -> Self {
+    /// `None` for a value the format does not define: the reader turns that into a
+    /// refusal naming the byte, never a panic ([#767]).
+    fn from_i32(v: i32) -> Option<Self> {
         match v {
-            0 => GgufType::Uint8,
-            1 => GgufType::Int8,
-            2 => GgufType::Uint16,
-            3 => GgufType::Int16,
-            4 => GgufType::Uint32,
-            5 => GgufType::Int32,
-            6 => GgufType::Float32,
-            7 => GgufType::Bool,
-            8 => GgufType::String,
-            9 => GgufType::Array,
-            10 => GgufType::Uint64,
-            11 => GgufType::Int64,
-            12 => GgufType::Float64,
-            _ => panic!("invalid GGUF type: {}", v),
+            0 => Some(GgufType::Uint8),
+            1 => Some(GgufType::Int8),
+            2 => Some(GgufType::Uint16),
+            3 => Some(GgufType::Int16),
+            4 => Some(GgufType::Uint32),
+            5 => Some(GgufType::Int32),
+            6 => Some(GgufType::Float32),
+            7 => Some(GgufType::Bool),
+            8 => Some(GgufType::String),
+            9 => Some(GgufType::Array),
+            10 => Some(GgufType::Uint64),
+            11 => Some(GgufType::Int64),
+            12 => Some(GgufType::Float64),
+            _ => None,
         }
     }
 
@@ -152,43 +150,45 @@ pub enum GgmlType {
 pub const GGML_TYPE_COUNT: i32 = 42;
 
 impl GgmlType {
-    pub fn from_i32(v: i32) -> Self {
+    /// `None` for a value ggml does not define (4 and 5 were removed): the parser
+    /// turns it into a refusal naming the type byte, never a panic ([#767]).
+    pub fn from_i32(v: i32) -> Option<Self> {
         match v {
-            0 => GgmlType::F32,
-            1 => GgmlType::F16,
-            2 => GgmlType::Q4_0,
-            3 => GgmlType::Q4_1,
-            6 => GgmlType::Q5_0,
-            7 => GgmlType::Q5_1,
-            8 => GgmlType::Q8_0,
-            9 => GgmlType::Q8_1,
-            10 => GgmlType::Q2_K,
-            11 => GgmlType::Q3_K,
-            12 => GgmlType::Q4_K,
-            13 => GgmlType::Q5_K,
-            14 => GgmlType::Q6_K,
-            15 => GgmlType::Q8_K,
-            16 => GgmlType::IQ2_XXS,
-            17 => GgmlType::IQ2_XS,
-            18 => GgmlType::IQ3_XXS,
-            19 => GgmlType::IQ1_S,
-            20 => GgmlType::IQ4_NL,
-            21 => GgmlType::IQ3_S,
-            22 => GgmlType::IQ2_S,
-            23 => GgmlType::IQ4_XS,
-            24 => GgmlType::I8,
-            25 => GgmlType::I16,
-            26 => GgmlType::I32,
-            27 => GgmlType::I64,
-            28 => GgmlType::F64,
-            29 => GgmlType::IQ1_M,
-            30 => GgmlType::BF16,
-            34 => GgmlType::TQ1_0,
-            35 => GgmlType::TQ2_0,
-            39 => GgmlType::MXFP4,
-            40 => GgmlType::NVFP4,
-            41 => GgmlType::Q1_0,
-            _ => panic!("invalid GGML type: {}", v),
+            0 => Some(GgmlType::F32),
+            1 => Some(GgmlType::F16),
+            2 => Some(GgmlType::Q4_0),
+            3 => Some(GgmlType::Q4_1),
+            6 => Some(GgmlType::Q5_0),
+            7 => Some(GgmlType::Q5_1),
+            8 => Some(GgmlType::Q8_0),
+            9 => Some(GgmlType::Q8_1),
+            10 => Some(GgmlType::Q2_K),
+            11 => Some(GgmlType::Q3_K),
+            12 => Some(GgmlType::Q4_K),
+            13 => Some(GgmlType::Q5_K),
+            14 => Some(GgmlType::Q6_K),
+            15 => Some(GgmlType::Q8_K),
+            16 => Some(GgmlType::IQ2_XXS),
+            17 => Some(GgmlType::IQ2_XS),
+            18 => Some(GgmlType::IQ3_XXS),
+            19 => Some(GgmlType::IQ1_S),
+            20 => Some(GgmlType::IQ4_NL),
+            21 => Some(GgmlType::IQ3_S),
+            22 => Some(GgmlType::IQ2_S),
+            23 => Some(GgmlType::IQ4_XS),
+            24 => Some(GgmlType::I8),
+            25 => Some(GgmlType::I16),
+            26 => Some(GgmlType::I32),
+            27 => Some(GgmlType::I64),
+            28 => Some(GgmlType::F64),
+            29 => Some(GgmlType::IQ1_M),
+            30 => Some(GgmlType::BF16),
+            34 => Some(GgmlType::TQ1_0),
+            35 => Some(GgmlType::TQ2_0),
+            39 => Some(GgmlType::MXFP4),
+            40 => Some(GgmlType::NVFP4),
+            41 => Some(GgmlType::Q1_0),
+            _ => None,
         }
     }
 
@@ -804,111 +804,120 @@ impl<'a> GgufReader<'a> {
     }
 
     // read a single value of type T (gguf.cpp lines 266-273)
-    fn read_val<T: Copy>(&mut self) -> Option<T> {
+    fn read_val<T: Copy>(&mut self) -> ParseResult<T> {
         let size = mem::size_of::<T>();
         if size as u64 > self.nbytes_remain {
-            return None;
+            return Err(self.eof_reason(size as u64));
         }
         let mut dst = vec![0u8; size];
         let nread = self.read_raw(&mut dst, size);
         if nread != size {
-            return None;
+            return Err(self.eof_reason(size as u64));
         }
         // Interpret as little-endian T
         let val = unsafe { ptr::read_unaligned(dst.as_ptr() as *const T) };
-        Some(val)
+        Ok(val)
+    }
+
+    /// What a read needed, and where the part ran out. This is the detail the old
+    /// thread-local note held and a later stage message then overwrote ([#767]).
+    ///
+    /// [#767]: https://github.com/yusiwen/minfer/issues/767
+    fn eof_reason(&self, needed: u64) -> String {
+        format!(
+            "GGUF: unexpected end of file: needed {needed} bytes at offset {}, {} remain",
+            self.offset, self.nbytes_remain
+        )
     }
 
     // read bool as int8_t (gguf.cpp lines 313-320)
-    fn read_bool(&mut self) -> Option<bool> {
+    fn read_bool(&mut self) -> ParseResult<bool> {
         let tmp: i8 = self.read_val()?;
-        Some(tmp != 0)
+        Ok(tmp != 0)
     }
 
     // read ggml_type as int32_t (gguf.cpp lines 322-329)
-    fn read_ggml_type(&mut self) -> Option<GgmlType> {
+    fn read_ggml_type(&mut self) -> ParseResult<GgmlType> {
         let tmp: i32 = self.read_val()?;
-        Some(GgmlType::from_i32(tmp))
+        GgmlType::from_i32(tmp).ok_or_else(|| format!("GGUF: invalid GGML type: {tmp}"))
     }
 
     // read gguf_type as int32_t (gguf.cpp lines 331-338)
-    fn read_gguf_type(&mut self) -> Option<GgufType> {
+    fn read_gguf_type(&mut self) -> ParseResult<GgufType> {
         let tmp: i32 = self.read_val()?;
-        Some(GgufType::from_i32(tmp))
+        GgufType::from_i32(tmp).ok_or_else(|| format!("GGUF: invalid GGUF type: {tmp}"))
     }
 
     // read string: first uint64 length, then bytes (gguf.cpp lines 340-355)
-    fn read_string(&mut self) -> Option<String> {
+    fn read_string(&mut self) -> ParseResult<String> {
         let size: u64 = self.read_val()?;
         if size > GGUF_MAX_STRING_LENGTH {
-            gguf_note!(
-                "GGUF: string length {} exceeds maximum {}",
-                size,
-                GGUF_MAX_STRING_LENGTH
-            );
-            return None;
+            return Err(format!(
+                "GGUF: string length {size} exceeds maximum {GGUF_MAX_STRING_LENGTH}"
+            ));
         }
         if size > self.nbytes_remain {
-            gguf_note!(
-                "GGUF: string length {} exceeds remaining file size {} bytes",
-                size,
+            return Err(format!(
+                "GGUF: string length {size} exceeds remaining file size {} bytes",
                 self.nbytes_remain
-            );
-            return None;
+            ));
         }
         let mut buf = vec![0u8; size as usize];
         let nread = self.read_raw(&mut buf, size as usize);
         if nread != size as usize {
-            return None;
+            return Err(self.eof_reason(size));
         }
-        let s = String::from_utf8_lossy(&buf).to_string();
-        Some(s)
+        Ok(String::from_utf8_lossy(&buf).to_string())
     }
 
     // read a vector of values (gguf.cpp lines 275-311)
-    fn read_vec<T: Copy>(&mut self, n: u64) -> Option<Vec<T>> {
+    fn read_vec<T: Copy>(&mut self, n: u64) -> ParseResult<Vec<T>> {
         if n > GGUF_MAX_ARRAY_ELEMENTS {
-            return None;
+            return Err(format!(
+                "GGUF: array of {n} elements exceeds the maximum {GGUF_MAX_ARRAY_ELEMENTS}"
+            ));
         }
-        if n as u64 > self.nbytes_remain / mem::size_of::<T>() as u64 {
-            return None;
+        if n > self.nbytes_remain / mem::size_of::<T>() as u64 {
+            return Err(self.eof_reason(n * mem::size_of::<T>() as u64));
         }
         let mut dst = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            let val: T = self.read_val()?;
-            dst.push(val);
+            dst.push(self.read_val()?);
         }
-        Some(dst)
+        Ok(dst)
     }
 
     // read a vector of Strings (gguf.cpp lines 280-285 special case)
-    fn read_string_vec(&mut self, n: u64) -> Option<Vec<String>> {
+    fn read_string_vec(&mut self, n: u64) -> ParseResult<Vec<String>> {
         if n > GGUF_MAX_ARRAY_ELEMENTS {
-            return None;
+            return Err(format!(
+                "GGUF: string array of {n} elements exceeds the maximum {GGUF_MAX_ARRAY_ELEMENTS}"
+            ));
         }
-        if n as u64 * mem::size_of::<u64>() as u64 > self.nbytes_remain {
-            return None;
+        if n.saturating_mul(mem::size_of::<u64>() as u64) > self.nbytes_remain {
+            return Err(self.eof_reason(n.saturating_mul(mem::size_of::<u64>() as u64)));
         }
         let mut dst = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            let s = self.read_string()?;
-            dst.push(s);
+            dst.push(self.read_string()?);
         }
-        Some(dst)
+        Ok(dst)
     }
 
     fn tell(&self) -> u64 {
         self.offset
     }
 
-    fn seek(&mut self, absolute_offset: u64) -> bool {
+    fn seek(&mut self, absolute_offset: u64) -> ParseResult<()> {
         let end_offset = self.data.len() as u64;
         if absolute_offset > end_offset {
-            return false;
+            return Err(format!(
+                "GGUF: seek to offset {absolute_offset} is past the end of the {end_offset}-byte part"
+            ));
         }
         self.offset = absolute_offset;
         self.nbytes_remain = end_offset - absolute_offset;
-        true
+        Ok(())
     }
 }
 
@@ -948,708 +957,410 @@ fn data_section_size(info: &[GgufTensorInfo], limit: usize) -> Result<usize, Str
 impl GgufContext {
     /// Initialize from a byte slice (mmap'd file contents)
     /// Corresponds to gguf_init_from_buffer (gguf.cpp lines 966-977)
-    pub fn init_from_data(data: &[u8]) -> Option<GgufContext> {
+    ///
+    /// `Err` is the refusal's reason, a complete `GGUF: ...` sentence: the same text
+    /// [`load_gguf_model`] puts in [`GgufLoadError::reason`] ([#767]).
+    ///
+    /// [#767]: https://github.com/yusiwen/minfer/issues/767
+    pub fn init_from_data(data: &[u8]) -> ParseResult<GgufContext> {
         let mut reader = GgufReader::new(data);
-        GgufContext::init_from_reader(&mut reader)
+        parse_context(&mut reader)
+    }
+}
+
+/// One part, in file order: header, metadata, tensor index, data-section size.
+///
+/// Each stage returns its own refusal ([#767]); nothing is recorded on the side for a
+/// later stage to overwrite.
+fn parse_context(gr: &mut GgufReader<'_>) -> ParseResult<GgufContext> {
+    let (version, n_kv, n_tensors) = read_header(gr)?;
+    let mut ctx = GgufContext {
+        version,
+        kv: read_kv_pairs(gr, n_kv)?,
+        info: Vec::new(),
+        alignment: GGUF_DEFAULT_ALIGNMENT,
+        offset: 0,
+        size: 0,
+    };
+    // `general.alignment` is one of the pairs just read (gguf.cpp lines 609-616).
+    ctx.alignment = read_alignment(&ctx)?;
+    ctx.info = read_tensor_info(gr, n_tensors)?;
+
+    // Align to the data section (gguf.cpp lines 751-756). With no tensors there is no
+    // data section, so the offset stays where the index ended.
+    if n_tensors > 0 {
+        gr.seek(ggml_pad(gr.tell() as usize, ctx.alignment) as u64)?;
+    }
+    ctx.offset = gr.tell() as usize;
+
+    // Total data-section size: the end of the furthest tensor (gguf.cpp line 759,
+    // `size = max(offset + nbytes)`). The layout is **not** required to be contiguous
+    // in index order: each tensor carries its own offset, and writers insert padding
+    // between tensors (unsloth's UD quants do) or order the data differently from the
+    // index. Requiring `offset == accumulated` rejected legal files (#575); what
+    // matters is that every tensor's range fits in the part.
+    ctx.size = data_section_size(&ctx.info, gr.data.len().saturating_sub(ctx.offset))?;
+    Ok(ctx)
+}
+
+/// Magic, version and the two counts (gguf.cpp lines 457-541), with the version checks
+/// of gguf.cpp lines 481-541 on the way. Returns `(version, n_kv, n_tensors)`.
+fn read_header(gr: &mut GgufReader<'_>) -> ParseResult<(u32, i64, i64)> {
+    let magic: Vec<u8> = gr.read_vec::<u8>(4).map_err(|e| header_refusal(&e))?;
+    if magic != GGUF_MAGIC {
+        let shown: String = magic
+            .iter()
+            .map(|&b| if b.is_ascii_graphic() { b as char } else { '?' })
+            .collect();
+        return Err(format!(
+            "GGUF: invalid magic characters: '{shown}', expected 'GGUF'"
+        ));
     }
 
-    fn init_from_reader(gr: &mut GgufReader) -> Option<GgufContext> {
-        let mut ctx = GgufContext {
-            version: GGUF_VERSION,
-            kv: Vec::new(),
-            info: Vec::new(),
-            alignment: GGUF_DEFAULT_ALIGNMENT,
+    let version = gr.read_val::<u32>().map_err(|e| header_refusal(&e))?;
+    if version == 0 {
+        return Err(format!("GGUF: bad GGUF version: {version}"));
+    }
+    // A version whose low half is zero was written by a host with the opposite byte
+    // order (gguf.cpp lines 490-500).
+    if (version & 0x0000FFFF) == 0 {
+        return Err(format!(
+            "GGUF: failed to load model: this GGUF file version {version} is extremely large, is there a mismatch between the host and model endianness?"
+        ));
+    }
+    if version == 1 {
+        return Err(
+            "GGUF: GGUFv1 is no longer supported, please use a more up-to-date version".to_string(),
+        );
+    }
+    if version > GGUF_VERSION {
+        return Err(format!(
+            "GGUF: this GGUF file is version {version} but this software only supports up to version {GGUF_VERSION}"
+        ));
+    }
+
+    let n_tensors = gr.read_val::<i64>().map_err(|e| header_refusal(&e))?;
+    if n_tensors < 0 || n_tensors > (usize::MAX / mem::size_of::<GgufTensorInfo>()) as i64 {
+        return Err(format!(
+            "GGUF: number of tensors is {n_tensors} but must be in [0, {}]",
+            usize::MAX / mem::size_of::<GgufTensorInfo>()
+        ));
+    }
+    let n_kv = gr.read_val::<i64>().map_err(|e| header_refusal(&e))?;
+    if n_kv < 0 || n_kv > (usize::MAX / mem::size_of::<GgufKv>()) as i64 {
+        return Err(format!(
+            "GGUF: number of key value pairs is {n_kv} but must be in [0, {}]",
+            usize::MAX / mem::size_of::<GgufKv>()
+        ));
+    }
+    Ok((version, n_kv, n_tensors))
+}
+
+/// Keep the phrase a truncated header has always reported, and append what the reader
+/// actually hit. The phrase alone was all a caller got before [#767].
+///
+/// [#767]: https://github.com/yusiwen/minfer/issues/767
+fn header_refusal(detail: &str) -> String {
+    let detail = detail.strip_prefix("GGUF: ").unwrap_or(detail);
+    format!("GGUF: failed to read header: {detail}")
+}
+
+/// `general.alignment`, defaulted, shape-checked and validated (gguf.cpp lines 609-616).
+fn read_alignment(ctx: &GgufContext) -> ParseResult<usize> {
+    let idx = ctx.find_key(GGUF_KEY_GENERAL_ALIGNMENT);
+    let alignment = if idx == -1 {
+        GGUF_DEFAULT_ALIGNMENT
+    } else {
+        // Refuse a shape the accessor would assert on: a parse refusal is a value, not
+        // a panic (gguf.cpp's `gguf_get_val_u32` asserts the same thing).
+        let kv = &ctx.kv[idx as usize];
+        if kv.is_array || kv.type_ != GgufType::Uint32 {
+            let found = if kv.is_array {
+                "an array".to_string()
+            } else {
+                format!("a {:?}", kv.type_)
+            };
+            return Err(format!(
+                "GGUF: key '{GGUF_KEY_GENERAL_ALIGNMENT}' must be a single uint32, found {found}"
+            ));
+        }
+        ctx.get_val_u32(idx) as usize
+    };
+    if alignment == 0 || (alignment & (alignment - 1)) != 0 {
+        return Err(format!("GGUF: alignment {alignment} is not a power of 2"));
+    }
+    Ok(alignment)
+}
+
+/// The metadata block (gguf.cpp lines 544-617): one pair per iteration, in file order.
+fn read_kv_pairs(gr: &mut GgufReader<'_>, n_kv: i64) -> ParseResult<Vec<GgufKv>> {
+    // A capacity hint only, and capped: `n_kv` is file-controlled, so a corrupt count
+    // must not ask for a huge allocation before the first read fails.
+    let mut kv: Vec<GgufKv> = Vec::with_capacity(n_kv.clamp(0, 4096) as usize);
+    for i in 0..n_kv {
+        let key = gr.read_string()?;
+        for (j, seen) in kv.iter().enumerate() {
+            if seen.key == key {
+                return Err(format!(
+                    "GGUF: duplicate key '{key}' for tensors {j} and {i}"
+                ));
+            }
+        }
+
+        // A pair is `type: u32`, then, for an array, `elem_type: u32` and `n: u64`.
+        let mut type_ = gr.read_gguf_type()?;
+        let mut is_array = false;
+        let mut n: u64 = 1;
+        if type_ == GgufType::Array {
+            is_array = true;
+            type_ = gr.read_gguf_type()?;
+            n = gr.read_val::<u64>()?;
+        }
+
+        // Read the value(s) for the type (gguf.cpp lines 580-599). A numeric array is
+        // stored as little-endian bytes, a string array as strings.
+        let pair = match type_ {
+            GgufType::Uint8 => {
+                if is_array {
+                    GgufKv::new_array(key, GgufType::Uint8, gr.read_vec::<u8>(n)?)
+                } else {
+                    GgufKv::new_u8(key, gr.read_val()?)
+                }
+            }
+            GgufType::Int8 => {
+                if is_array {
+                    let raw: Vec<u8> = gr.read_vec::<i8>(n)?.iter().map(|&x| x as u8).collect();
+                    GgufKv::new_array(key, GgufType::Int8, raw)
+                } else {
+                    GgufKv::new_i8(key, gr.read_val()?)
+                }
+            }
+            GgufType::Uint16 => {
+                if is_array {
+                    let raw: Vec<u8> = gr
+                        .read_vec::<u16>(n)?
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect();
+                    GgufKv::new_array(key, GgufType::Uint16, raw)
+                } else {
+                    GgufKv::new_u16(key, gr.read_val()?)
+                }
+            }
+            GgufType::Int16 => {
+                if is_array {
+                    let raw: Vec<u8> = gr
+                        .read_vec::<i16>(n)?
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect();
+                    GgufKv::new_array(key, GgufType::Int16, raw)
+                } else {
+                    GgufKv::new_i16(key, gr.read_val()?)
+                }
+            }
+            GgufType::Uint32 => {
+                if is_array {
+                    let raw: Vec<u8> = gr
+                        .read_vec::<u32>(n)?
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect();
+                    GgufKv::new_array(key, GgufType::Uint32, raw)
+                } else {
+                    GgufKv::new_u32(key, gr.read_val()?)
+                }
+            }
+            GgufType::Int32 => {
+                if is_array {
+                    let raw: Vec<u8> = gr
+                        .read_vec::<i32>(n)?
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect();
+                    GgufKv::new_array(key, GgufType::Int32, raw)
+                } else {
+                    GgufKv::new_i32(key, gr.read_val()?)
+                }
+            }
+            GgufType::Float32 => {
+                if is_array {
+                    let raw: Vec<u8> = gr
+                        .read_vec::<f32>(n)?
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect();
+                    GgufKv::new_array(key, GgufType::Float32, raw)
+                } else {
+                    GgufKv::new_f32(key, gr.read_val()?)
+                }
+            }
+            GgufType::Bool => {
+                if is_array {
+                    let mut raw = Vec::with_capacity(n as usize);
+                    for _ in 0..n {
+                        raw.push(u8::from(gr.read_bool()?));
+                    }
+                    GgufKv::new_array(key, GgufType::Bool, raw)
+                } else {
+                    GgufKv::new_bool(key, gr.read_bool()?)
+                }
+            }
+            GgufType::String => {
+                if is_array {
+                    GgufKv::new_string_array(key, gr.read_string_vec(n)?)
+                } else {
+                    GgufKv::new_string(key, gr.read_string()?)
+                }
+            }
+            GgufType::Uint64 => {
+                if is_array {
+                    let raw: Vec<u8> = gr
+                        .read_vec::<u64>(n)?
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect();
+                    GgufKv::new_array(key, GgufType::Uint64, raw)
+                } else {
+                    GgufKv::new_u64(key, gr.read_val()?)
+                }
+            }
+            GgufType::Int64 => {
+                if is_array {
+                    let raw: Vec<u8> = gr
+                        .read_vec::<i64>(n)?
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect();
+                    GgufKv::new_array(key, GgufType::Int64, raw)
+                } else {
+                    GgufKv::new_i64(key, gr.read_val()?)
+                }
+            }
+            GgufType::Float64 => {
+                if is_array {
+                    let raw: Vec<u8> = gr
+                        .read_vec::<f64>(n)?
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect();
+                    GgufKv::new_array(key, GgufType::Float64, raw)
+                } else {
+                    GgufKv::new_f64(key, gr.read_val()?)
+                }
+            }
+            GgufType::Array => {
+                return Err(format!("GGUF: key '{key}' has invalid GGUF type Array"));
+            }
+        };
+        kv.push(pair);
+    }
+    Ok(kv)
+}
+
+/// The tensor index (gguf.cpp lines 619-749).
+fn read_tensor_info(gr: &mut GgufReader<'_>, n_tensors: i64) -> ParseResult<Vec<GgufTensorInfo>> {
+    let mut info: Vec<GgufTensorInfo> = Vec::with_capacity(n_tensors.clamp(0, 4096) as usize);
+    for i in 0..n_tensors {
+        let name = gr.read_string()?;
+        if name.len() >= GGML_MAX_NAME {
+            return Err(format!(
+                "GGUF: tensor name {i} is too long: {} >= {GGML_MAX_NAME}",
+                name.len()
+            ));
+        }
+        for (j, seen) in info.iter().enumerate() {
+            if seen.name == name {
+                return Err(format!(
+                    "GGUF: duplicate tensor name '{name}' for tensors {j} and {i}"
+                ));
+            }
+        }
+        let mut t = GgufTensorInfo {
+            name,
+            ne: [1i64; GGML_MAX_DIMS],
+            nb: [0usize; GGML_MAX_DIMS],
+            type_: GgmlType::F32,
             offset: 0,
-            size: 0,
         };
 
-        let mut ok = true;
+        // Shape (gguf.cpp lines 656-694).
+        let n_dims: u32 = gr.read_val()?;
+        if n_dims > GGML_MAX_DIMS as u32 {
+            return Err(format!(
+                "GGUF: tensor '{}' has invalid number of dimensions: {n_dims} > {GGML_MAX_DIMS}",
+                t.name
+            ));
+        }
+        for j in 0..GGML_MAX_DIMS {
+            if (j as u32) < n_dims {
+                t.ne[j] = gr.read_val::<i64>()?;
+                if t.ne[j] < 0 {
+                    return Err(format!(
+                        "GGUF: tensor '{}' dimension {j} has invalid number of elements: {} < 0",
+                        t.name, t.ne[j]
+                    ));
+                }
+            }
+        }
 
-        // === Read magic (gguf.cpp lines 457-478) ===
+        // The element count must be representable: `ggml_nelements` multiplies i64s. A
+        // zero dimension makes the count zero, and it also makes the division below
+        // impossible, so it skips the check instead of dividing by zero.
+        let (n0, n1, n2, n3) = (t.ne[0], t.ne[1], t.ne[2], t.ne[3]);
+        if n1 != 0
+            && n2 != 0
+            && n3 != 0
+            && ((i64::MAX / n1 <= n0)
+                || (i64::MAX / n2 <= n0 * n1)
+                || (i64::MAX / n3 <= n0 * n1 * n2))
         {
-            let magic: Vec<u8> = gr.read_vec::<u8>(4)?;
-            for i in 0..4 {
-                if magic[i] != GGUF_MAGIC[i] {
-                    let c0 = if magic[0].is_ascii_graphic() {
-                        magic[0] as char
-                    } else {
-                        '?'
-                    };
-                    let c1 = if magic[1].is_ascii_graphic() {
-                        magic[1] as char
-                    } else {
-                        '?'
-                    };
-                    let c2 = if magic[2].is_ascii_graphic() {
-                        magic[2] as char
-                    } else {
-                        '?'
-                    };
-                    let c3 = if magic[3].is_ascii_graphic() {
-                        magic[3] as char
-                    } else {
-                        '?'
-                    };
-                    gguf_note!(
-                        "GGUF: invalid magic characters: '{}{}{}{}', expected 'GGUF'",
-                        c0,
-                        c1,
-                        c2,
-                        c3
-                    );
-                    return None;
-                }
-            }
+            return Err(format!(
+                "GGUF: total number of elements in tensor '{}' with shape ({n0}, {n1}, {n2}, {n3}) is >= {}",
+                t.name,
+                i64::MAX
+            ));
         }
 
-        // === Read header (gguf.cpp lines 481-541) ===
-        let mut n_kv: i64 = 0;
-        let mut n_tensors: i64 = 0;
-
-        if ok {
-            if let Some(version) = gr.read_val::<u32>() {
-                ctx.version = version;
-                if ctx.version == 0 {
-                    gguf_note!("GGUF: bad GGUF version: {}", ctx.version);
-                    ok = false;
-                }
-                // endianness check (gguf.cpp lines 490-500)
-                if ok && (ctx.version & 0x0000FFFF) == 0x00000000 {
-                    gguf_note!("GGUF: failed to load model: this GGUF file version {} is extremely large, is there a mismatch between the host and model endianness?", ctx.version);
-                    ok = false;
-                }
-                if ok && ctx.version == 1 {
-                    gguf_note!(
-                        "GGUF: GGUFv1 is no longer supported, please use a more up-to-date version"
-                    );
-                    ok = false;
-                }
-                if ok && ctx.version > GGUF_VERSION {
-                    gguf_note!("GGUF: this GGUF file is version {} but this software only supports up to version {}", ctx.version, GGUF_VERSION);
-                    ok = false;
-                }
-            } else {
-                ok = false;
-            }
+        // Type (gguf.cpp lines 697-736). `from_i32` refuses an undefined byte, so no
+        // separate range check is needed here.
+        t.type_ = gr.read_ggml_type()?;
+        let type_size = t.type_.type_size();
+        let blck_size = t.type_.blck_size();
+        if blck_size == 0 || t.ne[0] % blck_size != 0 {
+            return Err(format!(
+                "GGUF: tensor '{}' of type {} ({}) has {} elements per row, not a multiple of block size ({blck_size})",
+                t.name,
+                t.type_ as i32,
+                t.type_.type_name(),
+                t.ne[0]
+            ));
+        }
+        let nelements = ggml_nelements(&t.ne);
+        if (nelements / blck_size) as u64 > (usize::MAX / type_size) as u64 {
+            return Err(format!(
+                "GGUF: tensor '{}' with shape ({}, {}, {}, {}) has a size in bytes > {}",
+                t.name,
+                t.ne[0],
+                t.ne[1],
+                t.ne[2],
+                t.ne[3],
+                usize::MAX
+            ));
         }
 
-        if ok {
-            if let Some(v) = gr.read_val::<i64>() {
-                n_tensors = v;
-                if n_tensors < 0
-                    || n_tensors > (usize::MAX / mem::size_of::<GgufTensorInfo>()) as i64
-                {
-                    gguf_note!(
-                        "GGUF: number of tensors is {} but must be in [0, {}]",
-                        n_tensors,
-                        usize::MAX / mem::size_of::<GgufTensorInfo>()
-                    );
-                    ok = false;
-                }
-            } else {
-                ok = false;
-            }
+        // Byte offsets (gguf.cpp lines 728-732).
+        t.nb[0] = type_size;
+        t.nb[1] = t.nb[0] * (t.ne[0] / blck_size) as usize;
+        for j in 2..GGML_MAX_DIMS {
+            t.nb[j] = t.nb[j - 1] * t.ne[j - 1] as usize;
         }
 
-        if ok {
-            if let Some(v) = gr.read_val::<i64>() {
-                n_kv = v;
-                if n_kv < 0 || n_kv > (usize::MAX / mem::size_of::<GgufKv>()) as i64 {
-                    gguf_note!(
-                        "GGUF: number of key value pairs is {} but must be in [0, {}]",
-                        n_kv,
-                        usize::MAX / mem::size_of::<GgufKv>()
-                    );
-                    ok = false;
-                }
-            } else {
-                ok = false;
-            }
-        }
-
-        if !ok {
-            gguf_note!("GGUF: failed to read header");
-            return None;
-        }
-
-        // === Read KV pairs (gguf.cpp lines 544-617) ===
-        {
-            for i in 0..n_kv {
-                let key: String;
-                match gr.read_string() {
-                    Some(s) => key = s,
-                    None => {
-                        gguf_note!("GGUF: encountered length_error while reading key {}", i);
-                        ok = false;
-                        break;
-                    }
-                }
-
-                // check for duplicate keys
-                for j in 0..ctx.kv.len() {
-                    if key == ctx.kv[j].key {
-                        gguf_note!("GGUF: duplicate key '{}' for tensors {} and {}", key, j, i);
-                        ok = false;
-                        break;
-                    }
-                }
-                if !ok {
-                    break;
-                }
-
-                let mut type_: GgufType;
-                let mut is_array: bool = false;
-                let mut n: u64 = 1;
-
-                match gr.read_gguf_type() {
-                    Some(t) => type_ = t,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-
-                if type_ == GgufType::Array {
-                    is_array = true;
-                    match gr.read_gguf_type() {
-                        Some(t) => type_ = t,
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    match gr.read_val::<u64>() {
-                        Some(v) => n = v,
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-
-                if !ok {
-                    break;
-                }
-
-                // Read value based on type (gguf.cpp lines 580-599)
-                match type_ {
-                    GgufType::Uint8 => {
-                        if is_array {
-                            let values: Vec<u8> = match gr.read_vec::<u8>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().map(|&x| x).collect::<Vec<_>>();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Uint8, raw));
-                        } else {
-                            let value: u8 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_u8(key, value));
-                        }
-                    }
-                    GgufType::Int8 => {
-                        if is_array {
-                            let values: Vec<i8> = match gr.read_vec::<i8>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().map(|&x| x as u8).collect::<Vec<_>>();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Int8, raw));
-                        } else {
-                            let value: i8 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_i8(key, value));
-                        }
-                    }
-                    GgufType::Uint16 => {
-                        if is_array {
-                            let values: Vec<u16> = match gr.read_vec::<u16>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().flat_map(|x| x.to_le_bytes()).collect();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Uint16, raw));
-                        } else {
-                            let value: u16 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_u16(key, value));
-                        }
-                    }
-                    GgufType::Int16 => {
-                        if is_array {
-                            let values: Vec<i16> = match gr.read_vec::<i16>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().flat_map(|x| x.to_le_bytes()).collect();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Int16, raw));
-                        } else {
-                            let value: i16 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_i16(key, value));
-                        }
-                    }
-                    GgufType::Uint32 => {
-                        if is_array {
-                            let values: Vec<u32> = match gr.read_vec::<u32>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().flat_map(|x| x.to_le_bytes()).collect();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Uint32, raw));
-                        } else {
-                            let value: u32 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_u32(key, value));
-                        }
-                    }
-                    GgufType::Int32 => {
-                        if is_array {
-                            let values: Vec<i32> = match gr.read_vec::<i32>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().flat_map(|x| x.to_le_bytes()).collect();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Int32, raw));
-                        } else {
-                            let value: i32 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_i32(key, value));
-                        }
-                    }
-                    GgufType::Float32 => {
-                        if is_array {
-                            let values: Vec<f32> = match gr.read_vec::<f32>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().flat_map(|x| x.to_le_bytes()).collect();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Float32, raw));
-                        } else {
-                            let value: f32 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_f32(key, value));
-                        }
-                    }
-                    GgufType::Bool => {
-                        if is_array {
-                            let mut raw = Vec::with_capacity(n as usize);
-                            for _ in 0..n {
-                                match gr.read_bool() {
-                                    Some(v) => raw.push(if v { 1 } else { 0 }),
-                                    None => {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !ok {
-                                break;
-                            }
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Bool, raw));
-                        } else {
-                            let value: bool = match gr.read_bool() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_bool(key, value));
-                        }
-                    }
-                    GgufType::String => {
-                        if is_array {
-                            let values: Vec<String> = match gr.read_string_vec(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_string_array(key, values));
-                        } else {
-                            let value: String = match gr.read_string() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_string(key, value));
-                        }
-                    }
-                    GgufType::Uint64 => {
-                        if is_array {
-                            let values: Vec<u64> = match gr.read_vec::<u64>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().flat_map(|x| x.to_le_bytes()).collect();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Uint64, raw));
-                        } else {
-                            let value: u64 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_u64(key, value));
-                        }
-                    }
-                    GgufType::Int64 => {
-                        if is_array {
-                            let values: Vec<i64> = match gr.read_vec::<i64>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().flat_map(|x| x.to_le_bytes()).collect();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Int64, raw));
-                        } else {
-                            let value: i64 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_i64(key, value));
-                        }
-                    }
-                    GgufType::Float64 => {
-                        if is_array {
-                            let values: Vec<f64> = match gr.read_vec::<f64>(n) {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            let raw = values.iter().flat_map(|x| x.to_le_bytes()).collect();
-                            ctx.kv.push(GgufKv::new_array(key, GgufType::Float64, raw));
-                        } else {
-                            let value: f64 = match gr.read_val() {
-                                Some(v) => v,
-                                None => {
-                                    ok = false;
-                                    break;
-                                }
-                            };
-                            ctx.kv.push(GgufKv::new_f64(key, value));
-                        }
-                    }
-                    GgufType::Array => {
-                        gguf_note!("GGUF: key '{}' has invalid GGUF type Array", key);
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-
-            if !ok {
-                gguf_note!("GGUF: failed to read key-value pairs");
-                return None;
-            }
-            assert!(ctx.kv.len() as i64 == n_kv);
-
-            // Read alignment from KV (gguf.cpp lines 609-616)
-            let alignment_idx = ctx.find_key(GGUF_KEY_GENERAL_ALIGNMENT);
-            ctx.alignment = if alignment_idx == -1 {
-                GGUF_DEFAULT_ALIGNMENT
-            } else {
-                ctx.get_val_u32(alignment_idx) as usize
-            };
-
-            if ctx.alignment == 0 || (ctx.alignment & (ctx.alignment - 1)) != 0 {
-                gguf_note!("GGUF: alignment {} is not a power of 2", ctx.alignment);
-                return None;
-            }
-        }
-
-        // === Read tensor info (gguf.cpp lines 619-749) ===
-        for i in 0..n_tensors {
-            let mut info = GgufTensorInfo {
-                name: String::new(),
-                ne: [1i64; GGML_MAX_DIMS],
-                nb: [0usize; GGML_MAX_DIMS],
-                type_: GgmlType::F32,
-                offset: 0,
-            };
-
-            // tensor name
-            {
-                let name: String;
-                match gr.read_string() {
-                    Some(s) => name = s,
-                    None => {
-                        gguf_note!(
-                            "GGUF: encountered length_error while reading tensor name {}",
-                            i
-                        );
-                        ok = false;
-                        break;
-                    }
-                }
-                if name.len() >= GGML_MAX_NAME {
-                    gguf_note!(
-                        "GGUF: tensor name {} is too long: {} >= {}",
-                        i,
-                        name.len(),
-                        GGML_MAX_NAME
-                    );
-                    ok = false;
-                    break;
-                }
-                info.name = name;
-
-                // check for duplicate tensor names
-                for j in 0..i {
-                    if info.name == ctx.info[j as usize].name {
-                        gguf_note!(
-                            "GGUF: duplicate tensor name '{}' for tensors {} and {}",
-                            info.name,
-                            j,
-                            i
-                        );
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if !ok {
-                break;
-            }
-
-            // tensor shape (gguf.cpp lines 656-694)
-            {
-                let n_dims: u32 = match gr.read_val() {
-                    Some(v) => v,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                };
-                if n_dims > GGML_MAX_DIMS as u32 {
-                    gguf_note!(
-                        "GGUF: tensor '{}' has invalid number of dimensions: {} > {}",
-                        info.name,
-                        n_dims,
-                        GGML_MAX_DIMS
-                    );
-                    ok = false;
-                    break;
-                }
-                for j in 0..GGML_MAX_DIMS {
-                    info.ne[j] = 1;
-                    if j < n_dims as usize {
-                        match gr.read_val::<i64>() {
-                            Some(v) => info.ne[j] = v,
-                            None => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if info.ne[j] < 0 {
-                            gguf_note!("GGUF: tensor '{}' dimension {} has invalid number of elements: {} < 0", info.name, j, info.ne[j]);
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if !ok {
-                    break;
-                }
-
-                // check total number of elements is representable
-                if ok {
-                    let n0 = info.ne[0];
-                    let n1 = info.ne[1];
-                    let n2 = info.ne[2];
-                    let n3 = info.ne[3];
-                    if (i64::MAX / n1 <= n0)
-                        || (i64::MAX / n2 <= n0 * n1)
-                        || (i64::MAX / n3 <= n0 * n1 * n2)
-                    {
-                        gguf_note!("GGUF: total number of elements in tensor '{}' with shape ({}, {}, {}, {}) is >= {}",
-                            info.name, n0, n1, n2, n3, i64::MAX);
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if !ok {
-                break;
-            }
-
-            // tensor type (gguf.cpp lines 697-736)
-            {
-                match gr.read_ggml_type() {
-                    Some(t) => info.type_ = t,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-                let type_val = info.type_ as i32;
-                if type_val < 0 || type_val >= GGML_TYPE_COUNT {
-                    gguf_note!(
-                        "GGUF: tensor '{}' has invalid ggml type {}. should be in [0, {})",
-                        info.name,
-                        type_val,
-                        GGML_TYPE_COUNT
-                    );
-                    ok = false;
-                    break;
-                }
-                let type_size = info.type_.type_size();
-                let blck_size = info.type_.blck_size();
-
-                // check that row size is divisible by block size
-                if blck_size == 0 || info.ne[0] % blck_size != 0 {
-                    gguf_note!("GGUF: tensor '{}' of type {} ({}) has {} elements per row, not a multiple of block size ({})",
-                        info.name, type_val, info.type_.type_name(), info.ne[0], blck_size);
-                    ok = false;
-                    break;
-                }
-
-                // check that size in bytes is representable
-                let nelements = ggml_nelements(&info.ne);
-                if ok && (nelements / blck_size) as u64 > (usize::MAX / type_size) as u64 {
-                    gguf_note!(
-                        "GGUF: tensor '{}' with shape ({}, {}, {}, {}) has a size in bytes > {}",
-                        info.name,
-                        info.ne[0],
-                        info.ne[1],
-                        info.ne[2],
-                        info.ne[3],
-                        usize::MAX
-                    );
-                    ok = false;
-                    break;
-                }
-
-                // calculate byte offsets (gguf.cpp lines 728-732)
-                info.nb[0] = type_size;
-                info.nb[1] = info.nb[0] * (info.ne[0] / blck_size) as usize;
-                for j in 2..GGML_MAX_DIMS {
-                    info.nb[j] = info.nb[j - 1] * info.ne[j - 1] as usize;
-                }
-            }
-            if !ok {
-                break;
-            }
-
-            // tensor data offset within buffer (gguf.cpp lines 738-739)
-            match gr.read_val::<u64>() {
-                Some(v) => info.offset = v,
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
-
-            ctx.info.push(info);
-        }
-
-        if !ok {
-            gguf_note!("GGUF: failed to read tensor info");
-            return None;
-        }
-        assert!(ctx.info.len() as i64 == n_tensors);
-
-        // align to data section (gguf.cpp lines 751-756)
-        if n_tensors > 0 {
-            let aligned_offset = ggml_pad(gr.tell() as usize, ctx.alignment);
-            if !gr.seek(aligned_offset as u64) {
-                gguf_note!("GGUF: failed to seek to beginning of data section");
-                return None;
-            }
-        }
-
-        // store data section offset (gguf.cpp line 759)
-        ctx.offset = gr.tell() as usize;
-
-        // Total data-section size: the end of the furthest tensor
-        // (`gguf.cpp`: `size = max(offset + nbytes)`).
-        //
-        // The layout is **not** required to be contiguous in index order — each
-        // tensor carries its own offset, and writers insert padding between
-        // tensors (unsloth's UD quants do) or order the data differently from the
-        // index. Requiring `offset == accumulated` rejected legal files (#575);
-        // what actually matters is that every tensor's range fits in the part.
-        match data_section_size(&ctx.info, gr.data.len().saturating_sub(ctx.offset)) {
-            Ok(size) => ctx.size = size,
-            Err(msg) => {
-                gguf_note!("{msg}");
-                return None;
-            }
-        }
-
-        Some(ctx)
+        // Offset within the part's data section (gguf.cpp lines 738-739).
+        t.offset = gr.read_val::<u64>()?;
+        info.push(t);
     }
+    Ok(info)
 }
 
 // === GgufContext extension methods (moved from old model.rs) ===
@@ -1764,29 +1475,30 @@ extern "C" {
 }
 
 impl MmapFile {
-    pub fn map(path: &std::path::Path) -> Option<Self> {
+    /// Map `path` read-only. The error is the reason a load failed: an unreadable or
+    /// empty file, or a failing `mmap`, as a value the caller renders ([#767]).
+    ///
+    /// [#767]: https://github.com/yusiwen/minfer/issues/767
+    pub fn map(path: &std::path::Path) -> ParseResult<Self> {
         #[cfg(not(unix))]
         {
             let _ = path;
-            return None;
+            return Err(
+                "GGUF: memory-mapping a file is not supported on this platform".to_string(),
+            );
         }
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let file = match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    gguf_note!("cannot open {}: {e}", path.display());
-                    return None;
-                }
-            };
-            let len = match file.metadata() {
-                Ok(m) => m.len() as usize,
-                Err(e) => {
-                    gguf_note!("cannot stat {}: {e}", path.display());
-                    return None;
-                }
-            };
+            let file = std::fs::File::open(path)
+                .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+            let len = file
+                .metadata()
+                .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+                .len() as usize;
+            if len == 0 {
+                return Err(format!("cannot map {}: the file is empty", path.display()));
+            }
             let ptr = unsafe {
                 mmap(
                     std::ptr::null_mut(),
@@ -1799,13 +1511,17 @@ impl MmapFile {
             };
             // MAP_FAILED = (void*)-1
             if ptr as isize == -1 {
-                return None;
+                return Err(format!(
+                    "cannot map {}: mmap failed: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                ));
             }
             // (The GPU-side warm-up read happens in metal.rs register_part —
             // the first GPU access to file-backed pages costs ~44 ms of one-time
             // page/TLB setup per process, METAL_OPTIMIZATIONS #39. A CPU-side
             // madvise/touch does NOT fix it — the cost is the GPU's own access.)
-            Some(MmapFile {
+            Ok(MmapFile {
                 ptr: ptr as *mut u8,
                 len,
                 _file: file,
@@ -1991,25 +1707,19 @@ pub fn resolve_splits(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>>
 /// weight tensor carries its own [`crate::tensor::TensorData::Mapped`] range plus
 /// the handle.
 ///
-/// A failure is a [`GgufLoadError`] (the path plus the parser's last reason); the
-/// parser's `Option` chain is wrapped, so callers no longer have to read a stderr
-/// print to learn why a load failed.
+/// A failure is a [`GgufLoadError`]: the path plus the parser's own reason. Since
+/// [#767] that reason is a value all the way from the reader — a stage cannot record
+/// it on the side, and the outermost call cannot lose it.
+///
+/// [#767]: https://github.com/yusiwen/minfer/issues/767
 pub fn load_gguf_model(path: &std::path::Path) -> Result<GgufModel, GgufLoadError> {
-    GGUF_LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
-    load_gguf_model_inner(path).ok_or_else(|| {
-        let reason = GGUF_LAST_ERROR
-            .with(|slot| slot.borrow_mut().take())
-            .unwrap_or_else(|| {
-                "GGUF: the file could not be parsed (truncated or malformed)".to_string()
-            });
-        GgufLoadError {
-            path: path.to_path_buf(),
-            reason,
-        }
+    load_gguf_model_inner(path).map_err(|reason| GgufLoadError {
+        path: path.to_path_buf(),
+        reason,
     })
 }
 
-fn load_gguf_model_inner(path: &std::path::Path) -> Option<GgufModel> {
+fn load_gguf_model_inner(path: &std::path::Path) -> ParseResult<GgufModel> {
     let mmap0 = std::sync::Arc::new(MmapFile::map(path)?);
     let ctx0 = GgufContext::init_from_data(mmap0.as_slice())?;
     let split_count = ctx0
@@ -2018,7 +1728,7 @@ fn load_gguf_model_inner(path: &std::path::Path) -> Option<GgufModel> {
         .unwrap_or(1);
 
     if split_count <= 1 {
-        return Some(GgufModel {
+        return Ok(GgufModel {
             parts: vec![GgufPart {
                 ctx: ctx0,
                 mmap: mmap0,
@@ -2032,21 +1742,24 @@ fn load_gguf_model_inner(path: &std::path::Path) -> Option<GgufModel> {
         .map(|v| v as usize)
         .unwrap_or(0);
     if split_no != 0 {
-        gguf_note!(
+        return Err(format!(
             "GGUF: split.no = {split_no} — must load the first split (00001-of-{split_count})"
-        );
-        return None;
+        ));
     }
 
-    let part_paths = resolve_splits(path)?;
+    let part_paths = resolve_splits(path).ok_or_else(|| {
+        format!(
+            "GGUF: cannot resolve the parts of '{}': expected the set's first part, <name>-00001-of-NNNNN.gguf",
+            path.display()
+        )
+    })?;
     let fingerprint =
         model_fingerprint(&part_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>());
     if part_paths.len() != split_count {
-        gguf_note!(
+        return Err(format!(
             "GGUF: split count mismatch: filename implies {} parts, split.count = {split_count}",
             part_paths.len()
-        );
-        return None;
+        ));
     }
 
     let mut parts = Vec::with_capacity(split_count);
@@ -2058,12 +1771,11 @@ fn load_gguf_model_inner(path: &std::path::Path) -> Option<GgufModel> {
             .map(|v| v as usize)
             .unwrap_or(0);
         if no != i {
-            gguf_note!("GGUF: split {p:?} has split.no={no}, expected {i}");
-            return None;
+            return Err(format!("GGUF: split {p:?} has split.no={no}, expected {i}"));
         }
         parts.push(GgufPart { ctx, mmap });
     }
-    Some(GgufModel { parts, fingerprint })
+    Ok(GgufModel { parts, fingerprint })
 }
 
 #[cfg(test)]

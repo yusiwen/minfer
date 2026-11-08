@@ -1379,7 +1379,9 @@ mod tests;
 /// The GGUF's `tokenizer.chat_template`, when the file carries one. Shared by the
 /// CLI and the engine facade (#763 S6): one reader, so the two cannot disagree.
 pub fn from_gguf(data: &[u8]) -> Option<String> {
-    let ctx = crate::gguf::GgufContext::init_from_data(data)?;
+    // A file that does not parse carries no template; the parse refusal itself
+    // is the loader's to report.
+    let ctx = crate::gguf::GgufContext::init_from_data(data).ok()?;
     ctx.kv
         .iter()
         .find(|kv| kv.key == "tokenizer.chat_template")

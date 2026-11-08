@@ -1058,3 +1058,150 @@ fn trim_allocator() {
 
 #[cfg(not(target_os = "linux"))]
 fn trim_allocator() {}
+
+// === #767: a parse refusal is a value ===
+
+/// A minimal GGUF header — magic, version, tensor count, KV count — and nothing else.
+fn gguf_header(version: u32, n_tensors: i64, n_kv: i64) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&GGUF_MAGIC);
+    b.extend_from_slice(&version.to_le_bytes());
+    b.extend_from_slice(&n_tensors.to_le_bytes());
+    b.extend_from_slice(&n_kv.to_le_bytes());
+    b
+}
+
+/// Append one scalar `uint8` metadata pair: key string, type, value.
+fn kv_u8(b: &mut Vec<u8>, key: &str, value: u8) {
+    b.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    b.extend_from_slice(key.as_bytes());
+    b.extend_from_slice(&(GgufType::Uint8 as i32).to_le_bytes());
+    b.push(value);
+}
+
+/// Append one `uint32` array metadata pair: key string, `Array`, element type, count, values.
+fn kv_array_u32(b: &mut Vec<u8>, key: &str, values: &[u32]) {
+    b.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    b.extend_from_slice(key.as_bytes());
+    b.extend_from_slice(&(GgufType::Array as i32).to_le_bytes());
+    b.extend_from_slice(&(GgufType::Uint32 as i32).to_le_bytes());
+    b.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    for v in values {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Append one tensor-index entry: name, dims, ggml type, data-section offset.
+fn tensor_entry(b: &mut Vec<u8>, name: &str, dims: &[i64], type_: i32, offset: u64) {
+    b.extend_from_slice(&(name.len() as u64).to_le_bytes());
+    b.extend_from_slice(name.as_bytes());
+    b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+    for d in dims {
+        b.extend_from_slice(&d.to_le_bytes());
+    }
+    b.extend_from_slice(&type_.to_le_bytes());
+    b.extend_from_slice(&offset.to_le_bytes());
+}
+
+#[test]
+fn every_truncation_of_a_gguf_header_is_a_named_refusal() {
+    // The header is 24 bytes. Every shorter prefix must be a refusal that says which
+    // stage it hit — no silent reason, no panic, no thread-local note ([#767]).
+    let full = gguf_header(GGUF_VERSION, 0, 0);
+    assert_eq!(full.len(), 24);
+    for len in 0..full.len() {
+        let err = GgufContext::init_from_data(&full[..len]).unwrap_err();
+        assert!(!err.is_empty(), "a {len}-byte prefix must carry a reason");
+        assert!(
+            err.starts_with("GGUF: failed to read header: "),
+            "a {len}-byte prefix must name the stage that refused: {err}"
+        );
+    }
+    GgufContext::init_from_data(&full).expect("the 24-byte header parses");
+}
+
+#[test]
+fn a_bad_magic_is_refused_with_the_magic_it_found() {
+    let err = GgufContext::init_from_data(b"this is not a GGUF file at all\n").unwrap_err();
+    assert_eq!(
+        err,
+        "GGUF: invalid magic characters: 'this', expected 'GGUF'"
+    );
+}
+
+#[test]
+fn an_unsupported_version_names_the_version() {
+    // Each of these used to be overwritten by a later aggregate note, so a caller could
+    // not tell a v1 file from a truncated one ([#767]).
+    let cases = [
+        (1u32, "GGUF: GGUFv1 is no longer supported"),
+        (GGUF_VERSION + 1, "this GGUF file is version 4"),
+        (
+            0x0001_0000,
+            "a mismatch between the host and model endianness",
+        ),
+    ];
+    for (version, expected) in cases {
+        let err = GgufContext::init_from_data(&gguf_header(version, 0, 0)).unwrap_err();
+        assert!(err.contains(expected), "version {version}: {err}");
+    }
+    // Version 0 takes its own branch even though its low half is zero too.
+    let err = GgufContext::init_from_data(&gguf_header(0, 0, 0)).unwrap_err();
+    assert_eq!(err, "GGUF: bad GGUF version: 0");
+}
+
+#[test]
+fn a_truncated_metadata_block_reports_what_it_needed() {
+    let err = GgufContext::init_from_data(&gguf_header(GGUF_VERSION, 0, 1)).unwrap_err();
+    assert_eq!(
+        err,
+        "GGUF: unexpected end of file: needed 8 bytes at offset 24, 0 remain"
+    );
+}
+
+#[test]
+fn a_duplicate_metadata_key_is_refused_by_name() {
+    let mut b = gguf_header(GGUF_VERSION, 0, 2);
+    kv_u8(&mut b, "general.name", 1);
+    kv_u8(&mut b, "general.name", 2);
+    let err = GgufContext::init_from_data(&b).unwrap_err();
+    assert_eq!(
+        err,
+        "GGUF: duplicate key 'general.name' for tensors 0 and 1"
+    );
+}
+
+#[test]
+fn an_array_shaped_alignment_is_refused_not_asserted() {
+    // `get_val_u32` asserts a scalar shape; the parser refuses instead of panicking.
+    let mut b = gguf_header(GGUF_VERSION, 0, 1);
+    kv_array_u32(&mut b, "general.alignment", &[32]);
+    let err = GgufContext::init_from_data(&b).unwrap_err();
+    assert!(err.contains("general.alignment"), "{err}");
+    assert!(err.contains("must be a single uint32"), "{err}");
+}
+
+#[test]
+fn a_tensor_with_an_unknown_type_is_refused_not_a_panic() {
+    let mut b = gguf_header(GGUF_VERSION, 1, 0);
+    tensor_entry(&mut b, "blk.0.attn_norm.weight", &[4], 99, 0);
+    let err = GgufContext::init_from_data(&b).unwrap_err();
+    assert_eq!(err, "GGUF: invalid GGML type: 99");
+}
+
+#[test]
+fn a_missing_file_is_a_load_error_that_names_the_path() {
+    let path = std::env::temp_dir().join("minfer-767-does-not-exist.gguf");
+    let _ = std::fs::remove_file(&path);
+    let err = match load_gguf_model(&path) {
+        Ok(_) => panic!("a missing file must not load"),
+        Err(e) => e,
+    };
+    assert!(err.reason.contains("cannot open"), "{}", err.reason);
+    assert!(
+        err.reason.contains("minfer-767-does-not-exist.gguf"),
+        "{}",
+        err.reason
+    );
+    assert_eq!(err.path, path);
+}
