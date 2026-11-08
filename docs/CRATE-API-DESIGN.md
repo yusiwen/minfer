@@ -35,8 +35,11 @@ tier (`src/server/**` reaches these types only through `crate::advanced`).
 `EngineConfig` (`src/config.rs`) is the process configuration: the CLI reads `MINFER_*` through
 `EngineConfig::from_env()` and installs it once, before any device or graph exists. The engine reads
 `config::get()`; a consumer that installs nothing gets the built-in defaults, never the host's
-environment. On the test side, `config::with_config` and `registry::with_filter` scope a value to one
-thread so two engines can differ.
+environment. Since [#769](https://github.com/yusiwen/minfer/issues/769) that covers the device
+backends too: CUDA's and Metal's kernel-policy knobs (`mmq_*`, `flash_attn`, `gemm`, `mv_mma*`,
+`packed_kv_stage`, …) are `EngineConfig` fields, and no file under `src/` reads `MINFER_*` outside
+`from_env` and the `#[cfg(test)]` harnesses. On the test side, `config::with_config` and
+`registry::with_filter` scope a value to one thread so two engines can differ.
 
 | field | meaning | environment spelling |
 | :--- | :--- | :--- |
@@ -114,10 +117,7 @@ crate (load → chat → drop → reload, two sessions independent, and a single
   move.
 - **Cancellation** — no token/cancel seam in the generation loop yet; the CLI has no Ctrl-C wiring.
 - **A bytes constructor** for `Engine::load`.
-- **`metal` as a feature** ([#777](https://github.com/yusiwen/minfer/issues/777)); the device
-  backends' own environment reads ([#769](https://github.com/yusiwen/minfer/issues/769)); the
-  walkthrough prose that still frames the loop as CLI code
-  ([#773](https://github.com/yusiwen/minfer/issues/773)).
+- **`metal` as a feature** ([#777](https://github.com/yusiwen/minfer/issues/777)).
 
 ## Phase 2 — the workspace split (deferred)
 

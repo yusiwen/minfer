@@ -405,7 +405,7 @@ tiers:
 **Tier 1 — prefill GEMM** (`src/cuda/methods/dispatch.rs:`, the prefill-GEMM gate): `nt >= 9` (or
 `nt >= 2` when the off-by-default `MINFER_SMALL_M_GEMM=1` experiment routes nt 2–8 here, doc 91) **and**
 `id % 32 == 0` **and** a supported quant type → a tiled GEMM — `prefill_mmq` (int8, default) or
-`prefill_gemm_f16` (the f16 escape, §3.5) depending on `mmq_active()` (`src/cuda/methods/policy.rs:39`:
+`prefill_gemm_f16` (the f16 escape, §3.5) depending on `mmq_active()` (`src/cuda/methods/policy.rs:30`:
 the resolved device tier's MMQ flag — a table flag, or `cc >= 800` — and `MINFER_MMQ` not `0`).
 
 **Tier 2 — decode/small-batch per-type kernels**: everything else falls
@@ -441,7 +441,7 @@ The one-line answer to "which kernel does decode's Matmul dispatch to?":
   after `decode_quantize_native` (`src/cuda/methods.rs:180`) has produced (or memoized,
   the MmqCache) the pad40 q8 activation plane via `quantize_q8_0_pad40`.
 - **prefill (`nt ≥ 9`)**: the same arm → `mmq_active()` →
-  `prefill_mmq` (`src/cuda/methods/prefill_mmq.rs:133`) → for Q4_K: transposed-A prepass
+  `prefill_mmq` (`src/cuda/methods/prefill_mmq.rs:132`) → for Q4_K: transposed-A prepass
   `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`) then
   `launch_mmq_raw_nb_bt_nt` (`mmq_nb.cu:601`) →
   **`mmq_raw_nb_bt_kernel`** (`mmq_nb.cu:289`); Q6_K has its own BT kernel
