@@ -103,7 +103,7 @@ impl CudaState {
     /// hatch): plain rms_norm/swiglu producers + unconditional standalone
     /// quantize per matmul.
     pub fn no_decode_a_fuse() -> bool {
-        std::env::var("MINFER_NO_DECODE_A_FUSE").map_or(false, |v| v == "1")
+        crate::config::get().no_decode_a_fuse
     }
 
     /// r51: record a PRODUCER-FUSED quantize result into the r49 MmqCache.

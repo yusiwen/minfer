@@ -122,9 +122,8 @@ impl CudaState {
         if nt > 64 || nbt_y == 0 || nktile <= 1 {
             return 1;
         }
-        let target: usize = std::env::var("MINFER_MMQ_KSPLIT_TARGET")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let target: usize = crate::config::get()
+            .mmq_ksplit_target
             .unwrap_or_else(|| (256usize).max(2 * self.sm_count as usize));
         let want = (target + nbt_y - 1) / nbt_y;
         want.clamp(2, nktile)
@@ -175,8 +174,8 @@ impl CudaState {
         // On any cap/mismatch the launcher returns 0 -> clean fall through
         // to the generic mmq_nt<7,2>.
         if type_id == 7
-            && Self::mmq_gate_on("MINFER_MMQ_Q6K_NB")
-            && Self::mmq_gate_on("MINFER_MMQ_RAW")
+            && crate::config::get().mmq_q6k_nb
+            && crate::config::get().mmq_raw
             && (id / 32) % 8 == 0
         {
             let nchunk = (id / 32) as i32;
@@ -246,7 +245,7 @@ impl CudaState {
                         ksplit as i32,
                     ) == 1
                 {
-                    if std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1") {
+                    if crate::config::get().mmq_raw_nb_debug {
                         // r54: name WHY the r41 in-kernel expand is running —
                         // "exp=off" is the intentional MINFER_MMQ_Q6K_EXP=0
                         // switch; "fallback!" means a W_exp build was expected
@@ -257,7 +256,7 @@ impl CudaState {
                             "W_exp-cp.async"
                         } else if !padded_q6k {
                             "in-kernel-expand"
-                        } else if std::env::var("MINFER_MMQ_Q6K_EXP").as_deref() == Ok("0") {
+                        } else if !crate::config::get().mmq_q6k_exp {
                             "in-kernel-expand(exp=off)"
                         } else {
                             "in-kernel-expand(fallback!)"
@@ -284,15 +283,12 @@ impl CudaState {
         // P6: raw-byte staging variant (q4_K, whole super-blocks only).
         // Same quantized activations; the GEMM stages RAW weight bytes via
         // cp.async and dequants in registers (docs/CUDA_OPTIMIZATION.md).
-        if type_id == 5 && Self::mmq_gate_on("MINFER_MMQ_RAW") && (id / 32) % 8 == 0 {
-            let kd: i32 = std::env::var("MINFER_MMQ_RAW_KD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8);
-            let wide = std::env::var("MINFER_MMQ_RAW_WIDE").as_deref() == Ok("1");
-            let nb = Self::mmq_gate_on("MINFER_MMQ_RAW_NB");
-            let nb_debug = std::env::var("MINFER_MMQ_RAW_NB_DEBUG").as_deref() == Ok("1");
-            let at = Self::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE");
+        if type_id == 5 && crate::config::get().mmq_raw && (id / 32) % 8 == 0 {
+            let kd: i32 = crate::config::get().mmq_raw_kd;
+            let wide = crate::config::get().mmq_raw_wide;
+            let nb = crate::config::get().mmq_raw_nb;
+            let nb_debug = crate::config::get().mmq_raw_nb_debug;
+            let at = crate::config::get().mmq_a_transpose;
             unsafe {
                 // P6 r34: relocate the A-side layout transform out of the mma
                 // kernel into a quantize-transpose prepass (llama.cpp's design).
@@ -367,7 +363,7 @@ impl CudaState {
                         // missed (alloc/upload failure or registration bug).
                         let d = if !w_dsc.is_null() {
                             "DSC=f32-plane"
-                        } else if std::env::var("MINFER_MMQ_Q4K_DSC").as_deref() == Ok("0") {
+                        } else if !crate::config::get().mmq_q4k_dsc {
                             "DSC=in-kernel(dsc=off)"
                         } else {
                             "DSC=in-kernel(fallback!)"

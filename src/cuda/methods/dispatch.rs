@@ -186,8 +186,7 @@ impl CudaState {
         // default — at nt<=64 the BT grid has only od/NBJ blocks (40 on the
         // 14B shapes) and runs ~1.7x over the multi-MMVQ path; the K-split
         // follow-up raises the block count before this can win.
-        let small_m_gemm =
-            std::env::var("MINFER_SMALL_M_GEMM").map_or(false, |v| v == "1") && nt >= 2;
+        let small_m_gemm = crate::config::get().small_m_gemm && nt >= 2;
         if (nt >= 9 || small_m_gemm)
             && id % 32 == 0
             && !Self::no_prefill_gemm()

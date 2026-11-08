@@ -54,7 +54,7 @@ impl CudaState {
 
     fn try_new(requested: Option<i32>) -> Option<Self> {
         Self::preload_driver();
-        if std::env::var("MINFER_DISABLE_CUDA").is_ok() {
+        if crate::config::get().disable_cuda {
             eprintln!("CUDA: disabled by MINFER_DISABLE_CUDA");
             return None;
         }
@@ -155,8 +155,9 @@ impl CudaState {
         // the forced-tier soak runs the whole suite under a foreign tier to
         // prove gates only ever choose among correct kernels.
         let cc_val = major * 100 + minor;
-        let tier_mmq = match std::env::var("MINFER_DEVICE_TIER")
-            .ok()
+        let tier_mmq = match crate::config::get()
+            .device_tier
+            .as_deref()
             .and_then(|v| v.parse::<i32>().ok())
         {
             Some(key) => {
@@ -258,7 +259,7 @@ impl CudaState {
                     }
                 }
             }
-            if crate::optiming::flag_from_env(std::env::var_os("MINFER_OP_TIMING").as_ref()) {
+            if crate::config::get().op_timing.is_some() {
                 eprintln!(
                     "CUDA: prefill-GEMM smem pre-warm ({} instantiation(s), {named} refused/skipped \
                      and named above) took {} µs",

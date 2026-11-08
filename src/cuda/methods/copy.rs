@@ -121,7 +121,7 @@ impl CudaState {
     pub fn copy_from_device_pinned(&self, src: *const std::ffi::c_void, dst: &mut [u8]) {
         static FALLBACK_WARNED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        if std::env::var("MINFER_NO_PINNED_READBACK").as_deref() == Ok("1") {
+        if crate::config::get().no_pinned_readback {
             self.copy_from_device(src, dst);
             return;
         }

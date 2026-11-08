@@ -477,7 +477,7 @@ impl CudaState {
         // (probe /tmp/d4/probe_l1_dpl.cu). Requires id % 256 == 0 (exact
         // nbe, like the W_exp plane); MINFER_Q6K_DPL=0 skips the build and
         // decode keeps the padded kernels.
-        if Self::mmq_gate_on("MINFER_Q6K_DPL") && id % 256 == 0 {
+        if crate::config::get().q6k_dpl && id % 256 == 0 {
             let nbe = id / 256;
             let dpl_row = (nbe * 210 + 15) & !15usize;
             let raw_row = nbe * 210;
@@ -523,10 +523,7 @@ impl CudaState {
         // in-kernel expand. ANDed with Q6K_NB: EXP only matters when the NB
         // kernel is live (r60: Q6K_NB is default-on — "0" opts out of the
         // kernel AND both planes).
-        if Self::mmq_gate_on("MINFER_MMQ_Q6K_NB")
-            && std::env::var("MINFER_MMQ_Q6K_EXP").as_deref() != Ok("0")
-            && id % 256 == 0
-        {
+        if crate::config::get().mmq_q6k_nb && crate::config::get().mmq_q6k_exp && id % 256 == 0 {
             self.register_weight_q6k_exp(name, &padded, od, id);
             // r56 (Session E item 2b): the dsc f32 plane rides the same gate
             // (+ od % 2 == 0: the kernel stages row PAIRS per 16-B cp.async
@@ -797,7 +794,7 @@ impl CudaState {
             }
         }
         // (3) MmqCache scratch pre-grow
-        if Self::mmq_gate_on("MINFER_MMQ") {
+        if crate::config::get().mmq {
             let max_nchunk = self.max_nchunk.load(std::sync::atomic::Ordering::Relaxed);
             if max_nchunk > 0 {
                 const NT_PREWARM: usize = 4096; // default n_ctx
@@ -975,12 +972,7 @@ impl CudaState {
     }
 
     pub fn register_weight_q80_p32(&self, name: &str, data: &[u8], od: usize, id: usize) {
-        if od == 0
-            || id == 0
-            || id % 32 != 0
-            || id < 2048
-            || std::env::var("MINFER_NO_Q80_P32").map_or(false, |v| v == "1")
-        {
+        if od == 0 || id == 0 || id % 32 != 0 || id < 2048 || crate::config::get().no_q80_p32 {
             return;
         }
         let nb = id / 32;

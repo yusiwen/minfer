@@ -255,13 +255,11 @@ impl CudaState {
         // costing more than the 56 ms convert pass it removes. Kept behind
         // MINFER_GEMM_A32=1 for the smem-mirror variant follow-up (cp.async
         // the f32 tile to smem, convert smem->smem — no global round trip).
-        let af32 = std::env::var("MINFER_GEMM_A32")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let af32 = crate::config::get().gemm_a32;
         if af32 {
             let launched = unsafe {
-                std::env::var("MINFER_A32_DEBUG")
-                    .is_ok()
+                crate::config::get()
+                    .a32_debug
                     .then(|| eprintln!("minfer/cuda: af32 gemm nt={nt} od={od} id={id}"));
                 launch_gemm_f32a(
                     x as *const f32,

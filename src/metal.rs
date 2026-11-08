@@ -345,7 +345,7 @@ impl MpsCommandBuffer<'_> {
     /// Metal command-buffer error / timeout.
     fn trace_op(&self, op: &str) {
         static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*TRACE.get_or_init(|| std::env::var("MINFER_TRACE").is_ok()) {
+        if !*TRACE.get_or_init(crate::trace::enabled) {
             return;
         }
         let mut t = self.state.dispatch_trace.lock().unwrap();
@@ -400,7 +400,7 @@ impl MpsCommandBuffer<'_> {
     /// forward reads as "Compute Command 0" (#673).
     pub fn label(&self, name: &str) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ON.get_or_init(|| std::env::var("MINFER_METAL_LABELS").map_or(false, |v| v == "1")) {
+        if *ON.get_or_init(|| crate::config::get().metal_labels) {
             self.enc.setLabel(Some(&NSString::from_str(name)));
         }
     }

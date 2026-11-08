@@ -6,15 +6,6 @@
 use super::*;
 
 impl CudaState {
-    /// r60: the promoted MMQ gate semantics — unset / any non-"0" value =
-    /// ON (the verified 1.080x path), explicit "0" = opt-out to the pre-r60
-    /// disabled/f16 behavior (the r54 `MINFER_MMQ_Q6K_EXP` pattern).
-    /// Single-sourced: every promoted MINFER_MMQ_* dispatch and
-    /// plane-registration read goes through this.
-    pub fn mmq_gate_on(name: &str) -> bool {
-        std::env::var(name).map_or(true, |v| v != "0")
-    }
-
     /// R1: `MINFER_MMQ` gates the prefill path INTO the int8 MMQ GEMM.
     /// r60 PROMOTION (2026-09-06): default ON — the full r34-r59 MMQ stack
     /// is parity-green and measures 3590.8 tok/s clean on 7B q4_K_m @3314
@@ -26,7 +17,7 @@ impl CudaState {
     /// escapes still work: `MINFER_NO_PREFILL_GEMM=1` (legacy per-type
     /// kernels).
     fn mmq_enabled() -> bool {
-        Self::mmq_gate_on("MINFER_MMQ")
+        crate::config::get().mmq
     }
 
     /// R1: the int8 MMQ prefill GEMM is active — sm_80+ (mma.m16n8k32 s8;
@@ -71,23 +62,20 @@ impl CudaState {
     /// miss REFUSES loudly) is enforced structurally — see MmqCache::dead_write
     /// and docs/CUDA_OPTIMIZATION.md P6 r52 for the full proof.
     pub fn mmq_a_fuse_mode(&self) -> u8 {
+        let cfg = crate::config::get();
         if !(self.mmq_active()
-            && Self::mmq_gate_on("MINFER_MMQ_RAW")
-            && Self::mmq_gate_on("MINFER_MMQ_RAW_NB")
-            && Self::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE")
-            && Self::mmq_gate_on("MINFER_MMQ_Q6K_NB"))
+            && cfg.mmq_raw
+            && cfg.mmq_raw_nb
+            && cfg.mmq_a_transpose
+            && cfg.mmq_q6k_nb)
         {
             return 0;
         }
         // r60 promotion: unset = mode 2 (the verified-best skip-write fused
         // producers); "1"/"2" keep the r51/r52 override semantics; "0" (and
-        // any other unrecognized value, as before r60) = off.
-        let requested = match std::env::var("MINFER_MMQ_A_FUSE").as_deref() {
-            Err(std::env::VarError::NotPresent) => 2,
-            Ok("1") => 1,
-            Ok("2") => 2,
-            _ => 0,
-        };
+        // any other unrecognized value, as before r60) = off. Resolved by
+        // `EngineConfig::from_env` (`mmq_a_fuse`).
+        let requested = crate::config::get().mmq_a_fuse;
         // r60: mode 2 additionally requires the NB-BT-only weight mix (see
         // `nb_bt_only`) — a mixed-quant model degrades to mode 1 regardless
         // of how mode 2 was requested (default or explicit "2").
@@ -97,8 +85,8 @@ impl CudaState {
         match requested {
             1 => 1,
             2 if mode2_possible
-                && std::env::var_os("MINFER_GRAPH_DUMP").is_none()
-                && std::env::var_os("MINFER_DUMP_DIR").is_none()
+                && crate::config::get().graph_dump.is_none()
+                && crate::config::get().dump_dir.is_none()
                 && !crate::trace::enabled()
                 && !live_enabled() =>
             {

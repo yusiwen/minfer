@@ -20,7 +20,7 @@ use crate::tensor::TensorType;
 
 pub fn rms_norm_256_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_NO_RMS_256").map_or(true, |v| v != "1"))
+    *V.get_or_init(|| crate::config::get().rms_256)
 }
 
 /// Use matmul-based prefill attention (P1 2026-08-11): broadcast+quantize the
@@ -29,7 +29,7 @@ pub fn rms_norm_256_enabled() -> bool {
 /// falls back to the classic kernel for A/B.
 pub fn matmul_attn_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_NO_MATMUL_ATTN").map_or(true, |v| v != "1"))
+    *V.get_or_init(|| crate::config::get().matmul_attn)
 }
 
 /// Use the llama flash-attention port (kernel_flash_attn_ext_f32/_f16 and the
@@ -39,8 +39,7 @@ pub fn matmul_attn_enabled() -> bool {
 /// path for A/B.
 pub fn flash_attn_enabled(hd: usize) -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_NO_FLASH").map_or(true, |v| v != "1"))
-        && (hd == 64 || hd == 128)
+    *V.get_or_init(|| crate::config::get().flash_attn) && (hd == 64 || hd == 128)
 }
 
 /// Use the llama kernel_flash_attn_ext_blk port (kernel_flash_attn_blk_f32/_f16,
@@ -50,8 +49,7 @@ pub fn flash_attn_enabled(hd: usize) -> bool {
 /// MINFER_NO_PREFILL_FLASH=1 reverts to the 3-pass path for A/B.
 pub fn prefill_flash_enabled(hd: usize) -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_NO_PREFILL_FLASH").map_or(true, |v| v != "1"))
-        && (hd == 64 || hd == 128)
+    *V.get_or_init(|| crate::config::get().prefill_flash) && (hd == 64 || hd == 128)
 }
 
 /// Use the windowed sibling of `kernel_flash_attn_blk_*`
@@ -62,8 +60,7 @@ pub fn prefill_flash_enabled(hd: usize) -> bool {
 /// `MINFER_NO_WINDOW_FLASH=1` reverts to the correctness kernel for A/B.
 pub fn prefill_window_flash_enabled(hd: usize) -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_NO_WINDOW_FLASH").map_or(true, |v| v != "1"))
-        && (hd == 64 || hd == 128)
+    *V.get_or_init(|| crate::config::get().window_flash) && (hd == 64 || hd == 128)
 }
 
 /// #310: which kernel family a packed `q8_0` KV region's `Op::Attn` takes. The
@@ -240,7 +237,7 @@ pub struct FewRowMma {
 /// it can be tested and reasoned about without the latch.
 pub fn few_row_mma_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_MV_MMA").map_or(false, |v| v == "1"))
+    *V.get_or_init(|| crate::config::get().mv_mma)
 }
 
 /// The tiling llama picks for this shape, or `None` when the shape is outside the arm.
@@ -278,8 +275,8 @@ pub fn few_row_mma(ttype: TensorType, nt: usize, od: usize, k: usize) -> Option<
     // Probe (#673): NSG=1 gives every threadgroup its own output rows, so the store
     // path needs no reduction and no threadgroup memory. `nt` drops to 1 to keep
     // enough threadgroups in the grid (od/8 against od/32 at NT=4).
-    if let Ok(v) = std::env::var("MINFER_MV_MMA_NSG") {
-        if v.parse::<usize>().ok() == Some(1) {
+    if let Some(v) = crate::config::get().mv_mma_nsg {
+        if v == 1 {
             // `nt=4` measured best: 17.88 tokens/s against 17.16 at nt=2 and 15.36 at
             // nt=1 (14B, nt=3, same afternoon). The eight MMAs inside a chunk all
             // accumulate into one `mc[rt][t]`, so the tile count *is* the number of
@@ -313,10 +310,7 @@ pub fn few_row_mma(ttype: TensorType, nt: usize, od: usize, k: usize) -> Option<
 /// rule above is llama's; this exists to ask whether *our* GPU wants a narrower tile
 /// than the rule picks, without a rebuild per answer.
 pub fn few_row_mma_nt_override() -> Option<usize> {
-    std::env::var("MINFER_MV_MMA_NT")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| matches!(n, 1 | 2 | 4))
+    crate::config::get().mv_mma_nt
 }
 
 /// Apply [`few_row_mma_nt_override`] to a tiling, keeping the reduction size consistent.
@@ -334,7 +328,7 @@ pub fn with_nt_override(mut t: FewRowMma) -> FewRowMma {
 /// matvec family at every `nt` (the A/B switch). ON by default.
 pub fn gemm_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("MINFER_GEMM").map_or(true, |v| v != "0"))
+    *V.get_or_init(|| crate::config::get().gemm)
 }
 
 #[cfg(test)]

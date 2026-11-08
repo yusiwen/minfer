@@ -57,13 +57,7 @@ fn s4_ab_map_reps(mode: i32) -> usize {
         return 1;
     }
     static REPS: OnceLock<usize> = OnceLock::new();
-    *REPS.get_or_init(|| {
-        std::env::var("MINFER_S4_AB_MAP_REPS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(1)
-    })
+    *REPS.get_or_init(|| crate::config::get().s4_ab_map_reps)
 }
 
 /// Wrapper to make `*mut c_void` Send+Sync for use in Mutex.
@@ -336,22 +330,7 @@ pub const CAPTURE_MODE_THREAD_LOCAL: i32 = 2;
 /// `docs/CUDA-BACKEND-DESIGN.md` §"Per-instance streams and capture".
 fn capture_mode() -> i32 {
     static MODE: OnceLock<i32> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        match std::env::var("MINFER_CUDA_CAPTURE_MODE")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-        {
-            Some(m @ (CAPTURE_MODE_RELAXED | CAPTURE_MODE_GLOBAL | CAPTURE_MODE_THREAD_LOCAL)) => m,
-            Some(other) => {
-                eprintln!(
-                    "CUDA: ignoring MINFER_CUDA_CAPTURE_MODE={other} (want 0 relaxed, 1 global, \
-                     2 thread-local); using thread-local"
-                );
-                CAPTURE_MODE_THREAD_LOCAL
-            }
-            None => CAPTURE_MODE_THREAD_LOCAL,
-        }
-    })
+    *MODE.get_or_init(|| crate::config::get().cuda_capture_mode)
 }
 
 /// Issue #188: the raw return code of the last `cudaStreamEndCapture` the graph
@@ -979,7 +958,7 @@ pub const KV_LAYOUT_Q8_0: i32 = 2;
 /// counter only when the arm it launched is the one under test.
 pub fn q8_kv_dp4a_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MINFER_NO_DP4A_Q8_KV").as_deref() != Ok("1"))
+    *ON.get_or_init(|| crate::config::get().dp4a_q8_kv)
 }
 
 /// #202: the packed Q8_0 **decode** K/V four-quant load's same-binary A/B control.
@@ -993,7 +972,7 @@ pub fn q8_kv_dp4a_enabled() -> bool {
 /// reason as [`q8_kv_dp4a_enabled`].
 pub fn q8_kv_wide_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MINFER_NO_Q8_KV_WIDE").as_deref() != Ok("1"))
+    *ON.get_or_init(|| crate::config::get().q8_kv_wide)
 }
 
 /// The `KV_LAYOUT_*` tag for a `KvFormat` — the one place the two names are tied
@@ -1039,7 +1018,7 @@ mod kv_dtype_tests;
 /// value other than `1` — is the production default: pre-warm. The lazy
 /// per-launch opt-in is unaffected either way; it is the universal fallback.
 fn gemm_prewarm_disabled() -> bool {
-    std::env::var("MINFER_NO_GEMM_PREWARM").as_deref() == Ok("1")
+    !crate::config::get().gemm_prewarm
 }
 
 #[cfg(test)]

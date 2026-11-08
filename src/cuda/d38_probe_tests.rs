@@ -390,11 +390,17 @@ fn cuda_q6k_dpl_bitwise() {
     // od*id >= 4M).
     for (od, id) in [(512usize, 8960usize), (4096usize, 1024usize)] {
         let raw = gen_q6_k_raw(od, id);
-        std::env::remove_var("MINFER_Q6K_DPL");
+        // A = the DPL-padded registration (the default), B = the plain padded
+        // one (`q6k_dpl: false`). The matmuls run with the default gate: only
+        // B's registration varies, which is the property under test.
         st.register_weight_q6k_padded("d44_dpl_a", &raw, od, id);
-        std::env::set_var("MINFER_Q6K_DPL", "0");
-        st.register_weight_q6k_padded("d44_dpl_b", &raw, od, id);
-        std::env::remove_var("MINFER_Q6K_DPL");
+        crate::config::with_config(
+            crate::config::EngineConfig {
+                q6k_dpl: false,
+                ..Default::default()
+            },
+            || st.register_weight_q6k_padded("d44_dpl_b", &raw, od, id),
+        );
         let wa = st.get_weight_ptr("d44_dpl_a").expect("a registered");
         let wb = st.get_weight_ptr("d44_dpl_b").expect("b registered");
         let x: Vec<f32> = (0..id).map(|i| ((i % 13) as f32 - 6.0) * 0.125).collect();
