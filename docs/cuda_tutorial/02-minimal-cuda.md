@@ -381,8 +381,8 @@ cost: pinned memory is a scarce OS resource (over-allocating it degrades the
 whole machine, not just your process). minfer keeps small, ring-shaped pinned
 pools only where asynchrony pays — the 8-slot × 2 MB staging ring for input
 fills (`write_input_async`, `src/cuda/methods/copy.rs:29`), a grow-on-demand D2H
-readback buffer for per-step logits (`PinnedBuf`, `src/cuda.rs:516`), and the
-capture staging pool (`CaptureStaging`, `src/cuda.rs:536`) — with a
+readback buffer for per-step logits (`PinnedBuf`, `src/cuda.rs:495`), and the
+capture staging pool (`CaptureStaging`, `src/cuda.rs:515`) — with a
 synchronous pageable fallback whenever pinned allocation fails.
 `docs/GPU_SAFETY.md:238` (CUDA rule 6) states the rule that makes this safe: *same-stream
 ordering* — the async fill is safe because every consumer kernel is enqueued
@@ -436,11 +436,11 @@ Initialization — the idiom where acquiring a resource in a constructor and
 releasing it in a destructor ties the resource's lifetime to an object's, so
 drops and panics cannot leak it) is how minfer keeps the *host-side* CUDA
 resources leak-proof: every pinned allocation has a `Drop` impl calling
-`cudaFreeHost` (`PinnedPool` `src/cuda.rs:498`, `PinnedBuf` `src/cuda.rs:`,
+`cudaFreeHost` (`PinnedPool` `src/cuda.rs:477`, `PinnedBuf` `src/cuda.rs:`,
 `CaptureStaging` `src/cuda.rs:`). Device memory is the interesting
 half-exception. A *weight* buffer is not RAII-managed at all: weights live
 for the whole process, keyed by name in the registry
-(`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `CudaState::weights` (`src/cuda.rs:715`)), and
+(`weights: Mutex<HashMap<String, (CudaPtr, usize)>>`, `CudaState::weights` (`src/cuda.rs:694`)), and
 the registry's replace rule deliberately leaks the stale buffer because a
 live captured CUDA Graph may still reference the old pointer
 `register_weight` (`src/cuda/methods/weights.rs:41`)) — leaking *by decision, with a bound and a comment*
@@ -477,7 +477,7 @@ file: *register a weight → use it → (never) free it*.
    (`:93-96`):
    `self.weights.lock().unwrap().insert(name.to_string(), (CudaPtr(ptr), data.len()))`.
    From here the *only* way to reach the buffer is
-   `get_weight_ptr` (`src/cuda/methods/weights.rs:870`) — the registry is the single owner, and dispatchers
+   `get_weight_ptr` (`src/cuda/methods/weights.rs:867`) — the registry is the single owner, and dispatchers
    resolve by name at execution time.
 4. **Use.** A decode step later, dispatch resolves the name to a device
    pointer and passes it to a launcher. The Rust side of `add_f32`

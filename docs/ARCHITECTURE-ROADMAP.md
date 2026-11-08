@@ -201,7 +201,7 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    exactly what breaks the first time an op is unsupported — e.g. `Softmax` on
    both device backends (`src/graph/op_matrix.rs`), or `QkvBiasRopeStore`, which
    only CUDA advertises (`cuda_backend.rs:2123`) while Metal refuses it
-   (`metal_backend.rs:698`).
+   (`metal_backend.rs:696`).
 2. **Synchronous, host-mediated cross-backend movement.** — **partly closed by
    F5** ([#58](https://github.com/yusiwen/minfer/issues/58), 2026-09-24): the
    boundary is now two registered phases. Phase A (`copy_across` →
