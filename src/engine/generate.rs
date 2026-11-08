@@ -97,8 +97,9 @@ pub fn generate(
     // the prompt length, and the model's forward clamps it to max_seq_len.
     // Computed ONCE so prefill and decode size the same KV regions.
     let ctx = p.n_ctx.max(p.tokens.len());
-    // P2 trace (MINFER_TRACE=<path>): the scheduler records per-node data; the
-    // CLI marks phase boundaries and attaches tokens/logits for the page.
+    // P2 trace (MINFER_TRACE=<path>): the scheduler records per-node data; this
+    // loop marks the phase boundaries and attaches tokens/logits for the page
+    // (the CLI adds the exported graph JSONs when it finishes).
     // `trace_on` is hoisted out of the decode loop (one env read per run).
     let trace_on = crate::trace::enabled();
     if trace_on {
@@ -161,10 +162,6 @@ pub fn generate(
     let (mut t_samp, mut t_fwd, mut n_tok) = (0.0f64, 0.0f64, 0usize);
     // t0/t1 are (re)assigned at the top of each loop iteration before use.
     let (mut t0, mut t1);
-
-    // Gray-highlight the Qwen3 `<think>…</think>` reasoning block so it reads
-    // apart from the answer. Only when stdout is a terminal (no ANSI in pipes);
-    // MINFER_COLOR=1 forces it on (e.g. piping to less -R or a file).
 
     // === D5-R spec round loop ===
     // Each round emits 1..=d+1 tokens (draft-accepted prefix + the target

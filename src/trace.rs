@@ -65,8 +65,9 @@ pub fn path() -> Option<String> {
     std::env::var("MINFER_TRACE").ok()
 }
 
-/// CLI: mark the start of a phase (prefill / decode). Repeated calls within the
-/// same phase are no-ops; a kind change starts a new phase.
+/// Mark the start of a phase (prefill / decode), from the generation loop
+/// (`engine::generate`). Repeated calls within the same phase are no-ops; a kind
+/// change starts a new phase.
 pub fn begin_phase(kind: &str) {
     let mut t = trace().lock().unwrap();
     match t.phases.last() {
