@@ -30,9 +30,9 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::advanced::ModelDef;
+use crate::advanced::Tokenizer;
 use crate::gguf::GgufModel;
-use crate::models::ModelDef;
-use crate::tokenizer::Tokenizer;
 
 use chat::{Job, StreamEvent};
 use metrics::ServerMetrics;
@@ -54,7 +54,7 @@ pub struct AppState {
     /// F2 (#47): the EOG ids a grammar needs, resolved once from the model (the
     /// handler compiles the per-request grammar before queueing the job, so it
     /// needs them here rather than only inside the worker).
-    pub special: crate::models::SpecialTokens,
+    pub special: crate::advanced::SpecialTokens,
     /// F2: whether the worker runs the speculative draft engine — a grammar and a
     /// verify round are mutually exclusive, and the handler must refuse the
     /// combination before queueing.
@@ -114,7 +114,7 @@ pub fn run(
     port: u16,
     n_ctx: usize,
     n_slots: usize,
-    spec_cfg: Option<crate::spec::SpecConfig>,
+    spec_cfg: Option<crate::advanced::SpecConfig>,
     slots_file: Option<String>,
     // S1 (#133) + #601: the `--chat-template <FILE>` override, already read and
     // validated by `template::load_template_file` before the model loaded; the

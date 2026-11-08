@@ -179,7 +179,7 @@ fn a_job_queued_behind_a_busy_slot_is_served_when_it_frees() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
     let mut engine = BatchEngine::new(&*model, 1, 512).expect("engine");
     let metrics = Arc::new(crate::server::metrics::ServerMetrics::new());
@@ -274,7 +274,7 @@ fn a_job_beyond_the_queue_bound_is_answered_with_503() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
     let mut engine = BatchEngine::new(&*model, 1, 512).expect("engine");
     let metrics = Arc::new(crate::server::metrics::ServerMetrics::new());
@@ -363,7 +363,7 @@ fn a_drain_answers_queued_jobs_with_503() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
     let mut engine = BatchEngine::new(&*model, 1, 512).expect("engine");
     let metrics = Arc::new(crate::server::metrics::ServerMetrics::new());

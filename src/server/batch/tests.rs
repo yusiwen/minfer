@@ -1,7 +1,7 @@
 //! `#[cfg(test)] mod tests` for `src/server/batch.rs` — extracted so a non-test
 //! build does not parse it. See the parent module for the docs.
 use super::*;
-use crate::models::ModelDef;
+use crate::advanced::ModelDef;
 use std::time::Instant;
 
 mod batching;

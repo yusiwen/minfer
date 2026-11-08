@@ -20,7 +20,7 @@ fn state() -> (Arc<VizState>, mpsc::Receiver<Job>) {
         n_ctx: 64,
         n_ctx_slot: 64,
         tokenizer: Arc::new(Tokenizer::empty()),
-        special: crate::models::SpecialTokens {
+        special: crate::advanced::SpecialTokens {
             eos: 0,
             im_end: None,
             eot: None,

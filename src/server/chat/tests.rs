@@ -225,7 +225,7 @@ fn real_model_json_schema_generation_parses() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let special = model.special_tokens();
 
     let schema = serde_json::json!({
@@ -373,7 +373,7 @@ fn real_model_empty_generation_is_clean() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let special = model.special_tokens();
 
     // (a) max_tokens = 0 with a schema: the loop never runs.
@@ -426,7 +426,7 @@ fn real_model_max_length_output_is_a_valid_prefix() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
     let special = model.special_tokens();
 
     let mut params = grammar_params(8);

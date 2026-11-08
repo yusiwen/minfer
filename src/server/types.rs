@@ -221,8 +221,8 @@ pub struct SamplingParams {
 impl SamplingParams {
     /// The sampler configuration these parameters describe — the single place
     /// the server maps its request fields onto the sampler's config.
-    pub fn sampler_config(&self) -> crate::sampler::SamplerConfig {
-        crate::sampler::SamplerConfig {
+    pub fn sampler_config(&self) -> crate::advanced::SamplerConfig {
+        crate::advanced::SamplerConfig {
             temp: self.temp,
             top_k: self.top_k,
             top_p: self.top_p,
@@ -258,7 +258,7 @@ impl SamplingParams {
     /// shapes never doubles a breaker.
     pub fn resolve_dry_breakers(
         &mut self,
-        tokenizer: &crate::tokenizer::Tokenizer,
+        tokenizer: &crate::advanced::Tokenizer,
     ) -> Result<(), ApiError> {
         if self.dry_breaker_strings.is_empty() {
             return Ok(());
@@ -279,8 +279,8 @@ impl SamplingParams {
     /// queued, so an unsupported construct is a `400` and never reaches a slot.
     pub fn compile_grammar(
         &mut self,
-        tokenizer: &crate::tokenizer::Tokenizer,
-        special: &crate::models::SpecialTokens,
+        tokenizer: &crate::advanced::Tokenizer,
+        special: &crate::advanced::SpecialTokens,
     ) -> Result<(), ApiError> {
         let Some(src) = self.grammar_source.clone() else {
             return Ok(());

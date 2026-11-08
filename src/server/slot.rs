@@ -2,7 +2,7 @@
 //! OPENAI-CHAT-API-PLAN.md §Slot Management — each slot owns its own graph +
 //! allocator + persistent KV regions; `n_ctx` is divided equally among slots.
 
-use crate::graph::cache::GraphCache;
+use crate::advanced::GraphCache;
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum SlotState {

@@ -68,7 +68,7 @@ const STOPPED_PANIC: u8 = 3;
 pub struct WorkerResources {
     /// Read by B: the stop event names the device the dead worker ran on, and the
     /// restart slice (A) respawns the loop with the same model.
-    pub model: Box<dyn crate::models::ModelDef>,
+    pub model: Box<dyn crate::advanced::ModelDef>,
     /// Read by B: the stop event reports how many slots the worker held.
     pub slots: Vec<Slot>,
     /// Read by B: the jobs still queued when the worker died are answered with the

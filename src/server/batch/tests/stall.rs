@@ -44,7 +44,7 @@ impl ModelDef for FailingForward {
 
     fn forward_batch(
         &self,
-        _batch: &crate::graph::batch::Batch,
+        _batch: &crate::advanced::Batch,
         _n_out: usize,
         _n_ctx: usize,
         _cache: &mut GraphCache,
@@ -414,7 +414,7 @@ fn the_seam_fails_the_batch_forward_without_a_bespoke_mock() {
     };
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
     // Arm the seam for exactly this scope — **this thread** (#619): the arm is a
     // thread-local, so a concurrent gate ticking an engine in the same process
@@ -502,7 +502,7 @@ fn a_spinning_run_is_answered_and_the_worker_keeps_serving() {
 
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");
-    let tok = crate::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
+    let tok = crate::advanced::Tokenizer::load(&gguf.parts[0].ctx).expect("tokenizer load");
 
     let mut engine = BatchEngine::new(&*model, 1, 512).expect("engine");
     let metrics = Arc::new(crate::server::metrics::ServerMetrics::new());

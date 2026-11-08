@@ -265,8 +265,8 @@ fn resolve_refuses_two_grammars_or_an_unknown_response_type() {
 
 #[test]
 fn compile_grammar_turns_an_unsupported_schema_into_a_400() {
-    let tok = crate::tokenizer::Tokenizer::empty();
-    let special = crate::models::SpecialTokens {
+    let tok = crate::advanced::Tokenizer::empty();
+    let special = crate::advanced::SpecialTokens {
         eos: 0,
         im_end: None,
         eot: None,
@@ -306,7 +306,7 @@ fn compile_grammar_turns_an_unsupported_schema_into_a_400() {
 
 #[test]
 fn dry_sequence_breakers_accepts_both_shapes_and_tells_them_apart() {
-    let tok = crate::tokenizer::Tokenizer::byte_level_for_tests();
+    let tok = crate::advanced::Tokenizer::byte_level_for_tests();
 
     // Token-id form: used as given, and the resolver is a no-op for it — it
     // never needs a vocabulary.
@@ -318,7 +318,7 @@ fn dry_sequence_breakers_accepts_both_shapes_and_tells_them_apart() {
     .unwrap();
     assert_eq!(ids.dry_breakers, vec![vec![1010u32]]);
     assert!(ids.dry_breaker_strings.is_empty());
-    ids.resolve_dry_breakers(&crate::tokenizer::Tokenizer::empty())
+    ids.resolve_dry_breakers(&crate::advanced::Tokenizer::empty())
         .expect("the token-id form needs no vocabulary");
     assert_eq!(ids.dry_breakers, vec![vec![1010u32]]);
 
@@ -369,7 +369,7 @@ fn a_breaker_string_that_matches_no_token_is_a_400() {
     .resolve(0)
     .unwrap();
     let err = p
-        .resolve_dry_breakers(&crate::tokenizer::Tokenizer::empty())
+        .resolve_dry_breakers(&crate::advanced::Tokenizer::empty())
         .unwrap_err();
     assert_eq!(err.status, 400);
     assert!(err.message.contains("overlaps no token"), "{}", err.message);
