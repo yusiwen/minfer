@@ -101,7 +101,7 @@ fn load_embedded_or_source(device: &MetalDevice, metallib: &[u8]) -> Option<Meta
 // than narrowed.
 impl MpsState {
     pub fn try_new() -> Option<Self> {
-        if std::env::var("MINFER_DISABLE_MPS").is_ok() {
+        if crate::config::get().disable_mps {
             eprintln!("MPS: disabled by MINFER_DISABLE_MPS");
             return None;
         }
@@ -122,7 +122,7 @@ impl MpsState {
             };
 
             // GPU trace capture: set MINFER_METAL_CAPTURE=1
-            if std::env::var("MINFER_METAL_CAPTURE").is_ok() {
+            if crate::config::get().metal_capture {
                 let capture = unsafe { MTLCaptureManager::sharedCaptureManager() };
                 let desc = MTLCaptureDescriptor::new();
                 desc.set_capture_device(&*device);
@@ -141,9 +141,7 @@ impl MpsState {
             // MINFER_METALLIB_FILE overrides the embedded library at runtime
             // (debug/tuning hook to A/B different -O levels without rebuilds).
             static METALLIB: &[u8] = include_bytes!(env!("MINFER_METALLIB_PATH"));
-            let override_file = std::env::var("MINFER_METALLIB_FILE")
-                .ok()
-                .filter(|p| !p.is_empty());
+            let override_file = crate::config::get().metallib_file.clone();
             let lib = if let Some(path) = override_file {
                 match std::fs::read(&path).ok().and_then(|b| {
                     device
@@ -672,7 +670,7 @@ impl MpsState {
                 return;
             }
             let ptr = data.as_ptr() as usize;
-            let force_copy = std::env::var("MINFER_WEIGHT_COPY").map_or(false, |v| v == "1");
+            let force_copy = crate::config::get().weight_copy;
             // Zero-copy path: the weight is a slice of a registered mmap'd part
             // → (part buffer, offset). The GPU reads the mapped file pages
             // directly (llama's shared mmap buffer, ggml-metal-device.m:1668) —

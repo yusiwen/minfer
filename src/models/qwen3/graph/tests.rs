@@ -220,8 +220,7 @@ fn fused_qkv_norm_matches_unfused_decode() {
             "decode graph with fuse_qkv=false must NOT contain FusedQkvNorm"
         );
 
-        // --- numeric: fused (default) vs unfused (MINFER_NO_FUSE_QKV=1) ---
-        let _ = std::env::remove_var("MINFER_NO_FUSE_QKV");
+        // --- numeric: fused (default) vs unfused (`fuse_qkv: false`) ---
         let mut a = GraphCache::new();
         let pa = Qwen3Graph::forward_cached(&q3, &ids, &positions, 1, n_ctx, &mut a);
         let next = argmax(&pa);
@@ -235,11 +234,19 @@ fn fused_qkv_norm_matches_unfused_decode() {
             assert!(fused_in_cache, "the default decode graph must be fused");
         }
 
-        std::env::set_var("MINFER_NO_FUSE_QKV", "1");
         let mut b = GraphCache::new();
-        let pb = Qwen3Graph::forward_cached(&q3, &ids, &positions, 1, n_ctx, &mut b);
-        let db = Qwen3Graph::forward_cached(&q3, &[next], &[nt], 1, n_ctx, &mut b);
-        std::env::remove_var("MINFER_NO_FUSE_QKV");
+        let (pb, db) = crate::config::with_config(
+            crate::config::EngineConfig {
+                fuse_qkv: false,
+                ..Default::default()
+            },
+            || {
+                let pb = Qwen3Graph::forward_cached(&q3, &ids, &positions, 1, n_ctx, &mut b);
+                let next = argmax(&pb);
+                let db = Qwen3Graph::forward_cached(&q3, &[next], &[nt], 1, n_ctx, &mut b);
+                (pb, db)
+            },
+        );
 
         // prefill never fuses (nt>1) → both prefills must be bit-identical;
         // this isolates the decode-only divergence.
@@ -260,7 +267,7 @@ fn fused_qkv_norm_matches_unfused_decode() {
                 .any(|n| matches!(n.op, Op::FusedQkvNorm { .. }));
             assert!(
                 !unfused_in_cache,
-                "the MINFER_NO_FUSE_QKV=1 decode graph must be unfused"
+                "the fuse_qkv=false decode graph must be unfused"
             );
         }
 

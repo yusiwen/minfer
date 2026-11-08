@@ -178,8 +178,8 @@ pub(crate) fn register_cuda_weight(
     // thread-local, so a registration may run while another engine captures on its
     // own stream. `register_cuda_weight`'s panic channel above is unchanged.
     let (id, od) = (shape[0] as usize, shape[1] as usize);
-    let dsc_gates_on = crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_RAW_NB")
-        && crate::cuda::CudaState::mmq_gate_on("MINFER_MMQ_A_TRANSPOSE")
+    let dsc_gates_on = crate::config::get().mmq_raw_nb
+        && crate::config::get().mmq_a_transpose
         && crate::config::get().mmq_q4k_dsc;
     match cuda_weight_reg(ttype, rank, data.len(), od, id, dsc_gates_on) {
         CudaWeightReg::None => {}

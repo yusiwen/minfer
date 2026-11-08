@@ -141,8 +141,16 @@ pub(crate) fn run_self(filter: &str, phase: &str, extra_env: &[(&str, &str)]) ->
 }
 
 /// `Some(phase)` when this process was spawned by [`run_self`] for `phase`.
+///
+/// The first call also installs the application's configuration: a fresh child
+/// speaks the application's protocol (`from_env` → `install`), which is what makes
+/// the gate's exported conditions (`MINFER_MMQ=0`, …) reach the engine now that
+/// the device paths read [`crate::config`] instead of the environment (#769). The
+/// test harness itself has no `main`, so nothing else would install it.
 pub(crate) fn child_phase() -> Option<String> {
-    std::env::var(PHASE_ENV).ok()
+    let phase = std::env::var(PHASE_ENV).ok()?;
+    crate::config::install(crate::config::EngineConfig::from_env());
+    Some(phase)
 }
 
 /// Child-side: this process has no CUDA device — tell the parent to skip.

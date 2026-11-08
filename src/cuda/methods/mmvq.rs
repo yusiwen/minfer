@@ -453,7 +453,7 @@ impl CudaState {
         // the plane is absent (MINFER_Q6K_DPL=0 / id not a multiple of
         // 256 / map miss). The pf-vs-loop shape gate mirrors the padded
         // dispatch below (same MINFER_Q6K_PF opt-out semantics).
-        if blk_stride_padded && Self::mmq_gate_on("MINFER_Q6K_DPL") {
+        if blk_stride_padded && crate::config::get().q6k_dpl {
             let dwp = self
                 .q6k_dpl
                 .lock()
@@ -463,10 +463,7 @@ impl CudaState {
             if let Some(dwp) = dwp {
                 unsafe {
                     let nbe = (id >> 8) as i32;
-                    if id > 8192
-                        && id <= 16384
-                        && !std::env::var("MINFER_Q6K_PF").map_or(false, |v| v == "0")
-                    {
+                    if id > 8192 && id <= 16384 && crate::config::get().q6k_prefetch {
                         launch_q6_k_q8_mmvq_v2_pf_dpl(
                             dwp as *const u8,
                             q8 as *const u8,
@@ -507,10 +504,7 @@ impl CudaState {
                 // npair ≤ 512 shape, which keep the pipelined kernel).
                 // D4-2 B1c: MINFER_Q6K_PF=0 A/Bs the pipelined form against
                 // the v2 loop at these shapes (both cover the full unit set).
-                if id > 8192
-                    && id <= 16384
-                    && !std::env::var("MINFER_Q6K_PF").map_or(false, |v| v == "0")
-                {
+                if id > 8192 && id <= 16384 && crate::config::get().q6k_prefetch {
                     // D3b-1b: tall rows (npair > 256, e.g. ffn_down id 13824)
                     // run the pipelined variant (bitwise-identical, loads for
                     // both serial units issue up front).
@@ -723,6 +717,6 @@ impl CudaState {
     /// super-blocks (chunk/pair indexing) — `MINFER_MMVQ_V1=1` forces the
     /// 8e kernels for A/B on shapes that would otherwise take v2.
     fn mmvq_v2(id: usize) -> bool {
-        id % 256 == 0 && !std::env::var("MINFER_MMVQ_V1").map_or(false, |v| v == "1")
+        id % 256 == 0 && !crate::config::get().mmvq_v1
     }
 }

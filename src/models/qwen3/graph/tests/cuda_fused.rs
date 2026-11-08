@@ -116,8 +116,7 @@ fn fused_qkv_norm_matches_unfused_decode_on_cuda() {
             "[{tag}] decode graph with fuse_qkv=false must NOT contain FusedQkvNorm"
         );
 
-        // --- numeric A/B: the default (fused) vs MINFER_NO_FUSE_QKV=1 ---
-        std::env::remove_var("MINFER_NO_FUSE_QKV");
+        // --- numeric A/B: the default (fused) vs `fuse_qkv: false` ---
         let mut a = GraphCache::new();
         let pa = Qwen3Graph::forward_cached(q3, &ids, &positions, 1, n_ctx, &mut a);
         let next = argmax(&pa);
@@ -132,18 +131,26 @@ fn fused_qkv_norm_matches_unfused_decode_on_cuda() {
             );
         }
 
-        std::env::set_var("MINFER_NO_FUSE_QKV", "1");
         let mut b = GraphCache::new();
-        let pb = Qwen3Graph::forward_cached(q3, &ids, &positions, 1, n_ctx, &mut b);
-        let db = Qwen3Graph::forward_cached(q3, &[next], &[nt], 1, n_ctx, &mut b);
-        std::env::remove_var("MINFER_NO_FUSE_QKV");
+        let (pb, db) = crate::config::with_config(
+            crate::config::EngineConfig {
+                fuse_qkv: false,
+                ..Default::default()
+            },
+            || {
+                let pb = Qwen3Graph::forward_cached(q3, &ids, &positions, 1, n_ctx, &mut b);
+                let next = argmax(&pb);
+                let db = Qwen3Graph::forward_cached(q3, &[next], &[nt], 1, n_ctx, &mut b);
+                (pb, db)
+            },
+        );
         {
             let (g, _) = b.current().unwrap();
             assert!(
                 !g.nodes
                     .iter()
                     .any(|n| matches!(n.op, Op::FusedQkvNorm { .. })),
-                "[{tag}] the MINFER_NO_FUSE_QKV=1 decode graph must be unfused"
+                "[{tag}] the fuse_qkv=false decode graph must be unfused"
             );
         }
 

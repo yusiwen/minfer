@@ -245,41 +245,41 @@ impl CudaState {
     /// 8e follow-up: `MINFER_NO_KQ_MMVQ=1` forces the K-quant decode matmuls
     /// back onto the f32 kernels (A/B escape hatch, MINFER_NO_FUSE_* style).
     fn no_kq_mmvq() -> bool {
-        std::env::var("MINFER_NO_KQ_MMVQ").map_or(false, |v| v == "1")
+        crate::config::get().no_kq_mmvq
     }
 
     // doc 103: per-type opt-outs for the new q4_0/q8_0 MMVQ decode paths
     // (A/B switches; the f32-activation kernels remain the fallback).
     fn no_q40_mmvq() -> bool {
-        std::env::var("MINFER_NO_Q40_MMVQ").map_or(false, |v| v == "1")
+        crate::config::get().no_q40_mmvq
     }
 
     fn no_q80_mmvq() -> bool {
-        std::env::var("MINFER_NO_Q80_MMVQ").map_or(false, |v| v == "1")
+        crate::config::get().no_q80_mmvq
     }
 
     fn no_q80_p32() -> bool {
-        std::env::var("MINFER_NO_Q80_P32").map_or(false, |v| v == "1")
+        crate::config::get().no_q80_p32
     }
 
     /// 8m: force the legacy per-type prefill kernels (A/B escape hatch).
     // 8p: opt-in dequant-in-GEMM (memory-lean alternative to the f16 cache).
     fn fused_b_on() -> bool {
-        std::env::var("MINFER_FUSED_B").map_or(false, |v| v == "1")
+        crate::config::get().fused_b
     }
 
     // 8p: disable the persistent per-weight f16 dequant cache.
     fn no_w16cache() -> bool {
-        std::env::var("MINFER_NO_W16CACHE").map_or(false, |v| v == "1")
+        crate::config::get().no_w16cache
     }
 
     fn no_prefill_gemm() -> bool {
-        std::env::var("MINFER_NO_PREFILL_GEMM").map_or(false, |v| v == "1")
+        crate::config::get().no_prefill_gemm
     }
 
     /// 8n: force the legacy per-token prefill attention kernel (A/B escape).
     fn no_fa_prefill() -> bool {
-        std::env::var("MINFER_NO_FA_PREFILL").map_or(false, |v| v == "1")
+        crate::config::get().no_fa_prefill
     }
 }
 
