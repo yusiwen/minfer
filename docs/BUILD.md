@@ -132,12 +132,21 @@ writer/encoders and their verification references are documented in
 
 ```bash
 cargo test --release                         # unit + integration, no model files needed
+cargo test --release --no-default-features --lib  # the engine-only configuration's unit tests
 cargo fmt --all --check                      # formatting, with the pinned toolchain's rustfmt
 scripts/real_model_gates.sh                  # the #[ignore]d real-model gate set (parallel on CPU)
 PARALLEL=0 scripts/real_model_gates.sh       # CPU-only serial form
 FEATURES=cuda scripts/real_model_gates.sh    # device gate set (serial, one GPU)
 scripts/cuda_test.sh                         # the whole CUDA suite on a real GPU, serial
 ```
+
+The `--no-default-features --lib` line is the configuration a **consumer** gets
+(`default-features = false`): it compiles the core without `cli`/`server`/Metal and runs its unit
+tests, so a test that reaches into an application module fails there instead of in a consumer's
+build ([#791](https://github.com/yusiwen/minfer/issues/791) is exactly that failure). The
+`feature-matrix` CI job `cargo check`s the same configuration — and each application feature alone —
+but does not run its tests, so this command is the local gate for it; `cargo test --release` uses the
+default features and cannot see the difference.
 
 The `#[ignore]`d set needs the cached real models (the 0.5B for the default
 configuration, `MINFER_BATCH_TEST_MODEL=…/Qwen3-0.6B-Q8_0.gguf` for the f16-KV one)

@@ -230,6 +230,21 @@ let mut out = Vec::new();
 session.chat("hello", &params, &mut |delta| out.extend_from_slice(delta))?;
 ```
 
+Beyond a chat turn, the facade also carries what a host needs to drive it:
+
+- `Session::complete(tokens, …)` — a **raw continuation**: it prefills only the tokens you pass (no
+  template render, no history entry) and reports them in `TurnOutcome::prefill_tokens`, which is what
+  makes a long prompt feedable in pieces.
+- `GenerateParams.cancel` (a `CancelToken`) — a caller-side stop, checked **between tokens** and
+  never inside a forward pass; the outcome reports `cancelled`.
+- `Engine::load_from_bytes(bytes)` — a model the host already holds, loaded without a temp file and
+  without copying the buffer (every weight stays a range of it).
+
+Their contracts — and their limits — are in
+[`docs/CRATE-API-DESIGN.md`](docs/CRATE-API-DESIGN.md): §Sessions, §Failures, and §Ownership and
+lifetime; the bytes loader's decision record is
+[ADR-0081](docs/adr/0081-a-tensor-s-bytes-are-a-backing-handle-plus-a-range.md).
+
 `examples/embed.rs` is this program. The public tiers (`engine` facade,
 `advanced` primitives, `config`) and their stability promise are in
 [`docs/CRATE-API-DESIGN.md`](docs/CRATE-API-DESIGN.md); the decision behind them
