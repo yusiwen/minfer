@@ -65,8 +65,12 @@ Objective-C. The `metal` crate is a Metal-framework binding built on top of
   back to compiling shaders from source at every process start.
   **Fix:** `build.rs` invokes `/usr/bin/xcrun` by absolute path and strips
   `DEVELOPER_DIR`/`SDKROOT` for those two child processes, so the real Xcode
-  (`xcode-select -p`) is always used. rustc linking in the same shell is
-  unaffected (it still uses the nix SDK/clang).
+  (`xcode-select -p`) is always used. rustc linking in the same shell still uses
+  the nix SDK/clang, which has no `Metal.framework`: the link is given the real
+  SDK's framework directory with `-F`, from the same `xcrun` route, and that
+  flag is package-scoped — printed by every package whose targets link
+  (`build.rs` for this package's tests, `crates/minfer-cli/build.rs` for the
+  binary, [#809](https://github.com/yusiwen/minfer/issues/809)).
 
 ---
 
@@ -116,7 +120,12 @@ same relationship.
   are all gone.
 - **Do not "fix" the nix/devShell SDK issue in `flake.nix`**: overriding
   `DEVELOPER_DIR`/`SDKROOT` there would also redirect rustc's linker
-  environment; the `build.rs` scoped fix is the correct place.
+  environment; the `build.rs` scoped fix is the correct place. Scoped means
+  **per package**: `cargo:rustc-link-arg` reaches only the emitting package's
+  own targets, so when the binary moved to `crates/minfer-cli` (#805) the flag
+  stopped reaching its link and the devShell build failed with
+  `ld: framework not found Metal` until that package printed its own copy
+  ([#809](https://github.com/yusiwen/minfer/issues/809), measured 2026-11-10).
 - **✅ DONE (2026-08-25)**: the Metal layer was migrated to the `objc2`
   ecosystem (`objc2-metal` + `block2` + `objc2-foundation`), dropping the
   `metal` crate, `block` crate, `vendor/block` and the `[patch.crates-io]`
