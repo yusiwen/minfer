@@ -178,3 +178,4 @@ pass, entered only when a named trigger fires (see the epic).
 - [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md) — A failure is an error, never a silent fallback
 - [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — The KV storage format is a per-engine gate, not a process-wide global
 - [ADR-0076](adr/0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md) — A tensor's bytes are a mapping handle plus a range
+- [ADR-0081](adr/0081-a-tensor-s-bytes-are-a-backing-handle-plus-a-range.md) — A tensor's bytes are a backing handle plus a range, and the backing may be an owned buffer
