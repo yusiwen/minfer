@@ -565,7 +565,7 @@ persistent KV regions. So the model wiring applies an **all-or-nothing
 gate** before the graph is even built:
 
 ```rust
-// src/models/qwen2/graph.rs:776 (`device`) (abridged)
+// src/models/qwen2/graph.rs:782 (`device`) (abridged)
 // CUDA participation (Phase 7): requires a usable device AND every
 // matmul weight registered on the CUDA registry in a kernel-supported
 // type (all-or-nothing; 7e③ moved the embedding gather on device, so
@@ -581,7 +581,7 @@ cparams: CParams {
 },
 ```
 
-`weights_on_cuda` (`qwen2/graph.rs:883`) walks every weight the graph reads
+`weights_on_cuda` (`qwen2/graph.rs:889`) walks every weight the graph reads
 — embedding, output head, every layer's norms/biases/matmul weights — and
 requires each to be (a) registered and (b) a type with a matching kernel.
 The type check is per *role*: matmul weights admit all eight quant types
@@ -970,7 +970,7 @@ Every line answers a "what could go wrong":
 - **The warmup protocol**: the first `capture_warmup` executions direct-launch
   (llama.cpp's warmup ×2, and that is the default), the next opens the window.
   `nt_hint` (the first MatMul node's token
-  count, `graph/mod.rs:127`) distinguishes decode-shaped from
+  count, `graph/mod.rs:130`) distinguishes decode-shaped from
   prefill-shaped graphs so the prefill capture gate applies only where it
   was validated.
 - **No stream lock (#188)**: the window is opened on the backend's *own*

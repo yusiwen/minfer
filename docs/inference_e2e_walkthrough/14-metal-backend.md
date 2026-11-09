@@ -86,7 +86,7 @@ When does Metal *not* win? The doc records the counterexamples as guardrails: th
 Three rules decide whether any node runs on Metal, all resolved **before the graph exists**:
 
 1. **Priority order Metal → CUDA → CPU.** `GraphAllocator::supports` (`alloc.rs:`) asks backends in that fixed order and returns the first yes. If Metal is enabled, it wins every op it supports; CUDA (when compiled in) gets the leftovers it can run; CPU mops up the rest. Doc 15's backend joins the same queue.
-2. **Metal is enabled only if the whole model made it to the GPU.** The gate (`models/qwen2/graph.rs:636`, §3.2.6) requires *every* weight the graph reads — embeddings, all 28+ layer weights and biases, norms, lm_head — to be registered in the Metal registry (`has_weight`). One missing tensor ⇒ `metal_on = false` ⇒ the entire graph runs on CPU. This is the **all-weights-registered gate**: all-or-nothing participation, never a partial run where some layers are on the GPU and some on the CPU (which would be correct-but-mysterious; a split boundary per layer would also hammer the sync path).
+2. **Metal is enabled only if the whole model made it to the GPU.** The gate (`models/qwen2/graph.rs:642`, §3.2.6) requires *every* weight the graph reads — embeddings, all 28+ layer weights and biases, norms, lm_head — to be registered in the Metal registry (`has_weight`). One missing tensor ⇒ `metal_on = false` ⇒ the entire graph runs on CPU. This is the **all-weights-registered gate**: all-or-nothing participation, never a partial run where some layers are on the GPU and some on the CPU (which would be correct-but-mysterious; a split boundary per layer would also hammer the sync path).
 3. **Participation is part of graph identity.** The gate's outcome is recorded in `CParams.gpu` (`graph/params.rs:27`), and `GraphParams` is the *only* thing graph reuse compares (doc 13). So "was the GPU on" is baked into the cached graph: a change (MPS unavailable, weights not registered) changes `CParams.gpu`, fails `try_reuse`, and forces a rebuild with the new assignment — rather than silently reusing a graph whose backend assignments no longer hold.
 
 And the failure posture, which the repo treats as a hard rule: **kernel-invariant violations return `Err` from `execute_node` — never a silent CPU fallback.** If a weight is somehow not registered when a matmul executes, the arm returns `Err("weight '...' not on GPU")` and the run aborts with that message; if an op reaches the Metal arm that `supports_op` rejected, the arm returns `Err` too (`metal_backend.rs:`). The reasoning (`GPU_SAFETY.md` §2.3): a silent fallback *masks* a broken invariant — the model would keep producing text while the user has no idea half the graph silently ran somewhere else, or that a shape assumption was violated. Loud failure at the offending node is debuggable; quiet degradation is not. (Frontier guards that sit *below* the graph layer — dispatch-time checks like `gpu_abort` for device-limit overruns — print the actual values and exit, for the same reason.)
@@ -478,10 +478,10 @@ The same loader file also pre-builds the **fusion weights**: when `wq/wk/wv` sha
 
 #### 3.2.8 The all-weights-registered gate and `CParams.gpu`
 
-At forward time, before the graph is built or reused, the model asks a yes/no question (`models/qwen2/graph.rs:776`, `device`):
+At forward time, before the graph is built or reused, the model asks a yes/no question (`models/qwen2/graph.rs:782`, `device`):
 
 ```rust
-// src/models/qwen2/graph.rs:776 (`device`)
+// src/models/qwen2/graph.rs:782 (`device`)
         // GPU availability is part of the reuse identity (backend assignment
         // lives in the built graph, not in the params' other fields). Uses
         // attributes rather than `cfg!()` so the `metal_backend` path is not
@@ -504,7 +504,7 @@ At forward time, before the graph is built or reused, the model asks a yes/no qu
 `metal_available()` (`metal_backend.rs:`) is just `MpsState::get().is_some()` — device present, not disabled. `weights_on_gpu` (`:721-777`) is the gate itself: it enumerates *every* tensor name the graph will read (embedding, output norm, lm_head, output bias, then per layer the norm, `wq/bq/wk/bk/wv/bv/wo`, the FFN norm, `ffn_gate/ffn_up/ffn_down`) and requires all of them in the Metal registry:
 
 ```rust
-// src/models/qwen2/graph.rs:815 (`weights_on_gpu`) (tail of weights_on_gpu)
+// src/models/qwen2/graph.rs:821 (`weights_on_gpu`) (tail of weights_on_gpu)
         #[cfg(target_os = "macos")]
         {
             let Some(mps) = crate::metal::MpsState::get() else {
@@ -519,7 +519,7 @@ One `false` ⇒ `metal_on = false` ⇒ the whole model on CPU. Why all-or-nothin
 The result flows into `CParams` (`:447-468`): `gpu: metal_on || cuda_on`, plus `fuse_qkv`/`fuse_ffn` gated on `nt == 1 && (metal_on || cuda_on)` — on the GPU the fusions are always shape-eligible at decode, on CPU they are not built (the CPU prefers the batched-quantization shape of doc 10). From there, if `try_reuse` fails, the rebuild path enables the backend and assigns:
 
 ```rust
-// src/models/qwen2/graph.rs:484 (`forward_batch`) (rebuild: register → enable → assign)
+// src/models/qwen2/graph.rs:490 (`forward_batch`) (rebuild: register → enable → assign)
         if !cache.try_reuse(&params) {
             let mut graph = Self::build(model, &params);
             let sched = BackendScheduler::new();
@@ -644,7 +644,7 @@ Walk it as three defenses. **(1) A completion handler on a semaphore**: `addComp
     }
 ```
 
-This is §2.2's promise made concrete: `read_host` reinterprets the Metal buffer's `contents()` pointer as a Rust `&[f32]` — no copy, no sync — and `write_host` is `memcpy` with a length check. The two call patterns that matter: **inputs** are written here *before* the split's nodes encode (the scheduler skips `Op::Input` nodes precisely because "data pre-filled by the allocator", `scheduler.rs:`), and **outputs** are read after the split's sync — the logits path ends with `alloc.copy_to_cpu(graph.outputs[0])` (`models/qwen2/graph.rs:624`), which lands here once the final submit's completion handler has fired. Reading a buffer whose producing kernels are still *encoded but not submitted* would be the classic race; the one-command-buffer-per-split discipline plus the bounded submit is what makes these plain views safe.
+This is §2.2's promise made concrete: `read_host` reinterprets the Metal buffer's `contents()` pointer as a Rust `&[f32]` — no copy, no sync — and `write_host` is `memcpy` with a length check. The two call patterns that matter: **inputs** are written here *before* the split's nodes encode (the scheduler skips `Op::Input` nodes precisely because "data pre-filled by the allocator", `scheduler.rs:`), and **outputs** are read after the split's sync — the logits path ends with `alloc.copy_to_cpu(graph.outputs[0])` (`models/qwen2/graph.rs:630`), which lands here once the final submit's completion handler has fired. Reading a buffer whose producing kernels are still *encoded but not submitted* would be the classic race; the one-command-buffer-per-split discipline plus the bounded submit is what makes these plain views safe.
 
 There is one more readback path, used only by the trace/viz tooling (`MINFER_TRACE`, the viz server): `capture_split` (`metal_backend.rs:`) encodes a *blit* pass — `encode_captures` (`src/metal/encode.rs`), a GPU→GPU copy into per-split staging buffers appended *after* all the split's kernels — so the capture reads this step's data without forcing a per-node flush. The scheduler queues `(node, staging)` pairs during the split (`scheduler.rs:`) and drains them in `flush_metal_captures` right after the boundary sync (`:394-417`). It is a nice illustration of the submit model: even debug tooling has to work *with* the async pipeline, by scheduling its reads into the same command buffer.
 
@@ -739,7 +739,7 @@ production path holds a hand-written chain — so on a Mac with both compiled in
 **Why a fresh allocation for cross-split staging (`alloc_fresh`) instead of reusing the free list?** The trait comment (§2.1) is the record of a real bug class: at execute time, free-list ids still back `node_to_buf` entries that later nodes in the *same* execute will read or write; recycling one for a staging copy would clobber in-flight data. The staging buffer is born outside the recycle economy and joins it only at graph-rebuild time, when liveness recycling is safe again (doc 07's allocator owns that transition).
 
 **Why is the f16 KV cache auto-selected by model size?** `kvformat::auto_device_format`
-(`src/graph/kvformat.rs:174`, reached through `resolve` at the end of a load — `src/models/mod.rs:495`)
+(`src/graph/kvformat.rs:174`, reached through `resolve` at the end of a load — `src/models/mod.rs:498`)
 turns f16 on when the device is not the CPU and `n_layers × n_kv_embd ≥ 8192` — the 7B class — and
 keeps f32 for the 0.5B class. The asymmetry is measured, not aesthetic: on the 7B, attention streams the whole KV per decode step, so halving those bytes is a direct win (−~1 ms/token at 2K ctx; #13 measured 1.60 → 0.95 s on a long-context case); on the 0.5B the decode is dispatch-latency-bound, the f16 conversion kernels cost more than the bandwidth saves, and f16 measured ~3 % *slower* (the comment cites the decided-not record). `MINFER_CACHE_TYPE=f16|f32|q8_0` overrides either way (`f16` on the CPU is mapped back to f32, which has
 no f16 KV kernel).
