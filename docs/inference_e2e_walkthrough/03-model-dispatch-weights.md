@@ -313,7 +313,7 @@ fewer bits, grouped into blocks that share a scale factor.
 
 ### 3.2 Key code
 
-Excerpt 1 — the startup order in `main.rs`: GPU init, dispatch, legacy KV
+Excerpt 1 — the startup order in `crates/minfer-cli/src/main.rs`: GPU init, dispatch, legacy KV
 cache. (`crates/minfer-cli/src/main.rs:`; the KV block below is **historical** — see the
 forward note under the annotations)
 
@@ -339,7 +339,7 @@ forward note under the annotations)
 > **Forward note (#252, 2026-10-02):** the `// === KV Cache ===` block above is gone. [#244] had
 > already deleted the `KVCacheLayer` storage; [#252] then deleted the empty marker `src/cache.rs`,
 > its `mod cache;` declaration and the vestigial `&mut KVCache` parameter of `ModelDef::forward` and
-> `forward_graph`, so `main.rs` loads the model and the tokenizer and nothing else. There is no
+> `forward_graph`, so `crates/minfer-cli/src/main.rs` loads the model and the tokenizer and nothing else. There is no
 > per-load KV allocation to narrate at all — the graph allocator's persistent regions are the only
 > KV store ([#244], [#252]).
 
@@ -424,7 +424,7 @@ not know which architecture it is talking to.
 | `n_layer` | loader-loop sizing here, the graph builder's per-layer loop (doc 05), the legacy KV cache above |
 | `n_head_kv`, `n_embd_head`, `n_kv_embd` | GQA (grouped-query attention: fewer K/V heads than query heads) head mapping and strides (doc 11), and the KV region width `n_kv_embd × n_ctx` (doc 07) |
 | `n_vocab` | logits width — the sampler's input size (doc 12) |
-| `special_tokens` | the sampler's stop condition: `main.rs` fetches `eos`/`im_end` ids once and checks every sampled token against them (`main.rs:840,900,1020`) |
+| `special_tokens` | the sampler's stop condition: `crates/minfer-cli/src/main.rs` fetches `eos`/`im_end` ids once and checks every sampled token against them (`crates/minfer-cli/src/main.rs:840,900,1020`) |
 | `rope_style` | doc 11: RoPE (rotary positional encoding) has two layout styles — Qwen's non-interleaved vs Llama's interleaved — and the vec-op must be told which |
 | `as_any` | lets graph code downcast to the concrete model when it needs specifics |
 | `Send + Sync` | the HTTP server shares the model across threads (`Arc<dyn ModelDef>`) |
@@ -849,7 +849,7 @@ in `docs/CUDA_OPTIMIZATION.md`.
 
 **The legacy `KVCache` is gone (#252).** [#244] deleted the type's storage (it was never read), and
 [#252] then deleted the empty marker `src/cache.rs`, its `mod cache;` declaration, the
-`ModelDef::forward`/`forward_graph` `&mut KVCache` parameter, the `KVCache::new` call in `main.rs` and
+`ModelDef::forward`/`forward_graph` `&mut KVCache` parameter, the `KVCache::new` call in `crates/minfer-cli/src/main.rs` and
 the tests that constructed one only to satisfy the signature. The graph path's real KV lives in the
 allocator's persistent per-layer regions (docs 07–08) and always did; the "vestigial 100 MB
 allocation" this paragraph used to call the cheaper mess stopped existing with [#244]'s storage

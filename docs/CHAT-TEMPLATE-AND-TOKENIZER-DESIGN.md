@@ -129,7 +129,7 @@ ChatML is kept for exactly one case, and it is not a silent one: a GGUF with
 model-specific format to lose, the startup path prints a one-line notice, and
 `docs/USAGE.md` documents it. Every other caller now sees the refusal:
 
-* CLI (`main.rs`): the template is resolved and validated at load → `Error: …` on
+* CLI (`crates/minfer-cli/src/main.rs`): the template is resolved and validated at load → `Error: …` on
   stderr, exit 1. A GGUF with **no** template renders the same ChatML the other paths
   render; the single-turn path used to print the notice and pass the raw prompt through
   ([#596](https://github.com/yusiwen/minfer/issues/596)).
@@ -276,7 +276,7 @@ output back into `choices[].message.tool_calls` remains the separate increment
 
 ### 2.9 A completion's tool call is extracted (#614/#699, ADR-0063/ADR-0066)
 
-`src/server/toolcall.rs` is the request carrier's mirror image. Both response paths run the
+`crates/minfer-cli/src/src/server/toolcall.rs` is the request carrier's mirror image. Both response paths run the
 completion through one parser, so the serial and batched engines share it:
 
 - **The parser is incremental.** `feed` holds back a suffix that could still become the
@@ -297,7 +297,7 @@ completion through one parser, so the serial and batched engines share it:
 - **`tool_choice: "required"` / a forced function are enforced**, not accepted-and-ignored: a
   GBNF built from the schema compiler's `j-object` rules wrapped in the model's own call syntax
   fixes or enumerates the name. The syntax is one **format-table row**
-  (`src/server/toolcall/format.rs`, ADR-0066): the parser and the grammar read the same row, so
+  (`crates/minfer-cli/src/src/server/toolcall/format.rs`, ADR-0066): the parser and the grammar read the same row, so
   the call the constraint produces is the call the parser extracts. Detection scans the template's
   source for the row's anchors (Jinja comments stripped); parsing falls back to the Qwen row when
   none matches, while `tool_choice` boundaries are named `400`s — a template the table does not

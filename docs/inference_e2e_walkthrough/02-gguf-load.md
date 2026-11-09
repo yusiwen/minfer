@@ -11,7 +11,7 @@
 
 Doc 01 ended with a plain string: a filesystem path to a `.gguf` file (resolved
 from a local path, a `hf:`/`ollama:` URI, or a cached model name). This doc is
-where that path stops being a name and starts being data. When `main.rs` runs
+where that path stops being a name and starts being data. When `crates/minfer-cli/src/main.rs` runs
 `gguf::load_gguf_model(...)` (line 579), the engine has exactly one asset: a
 file on disk, typically hundreds of megabytes to several gigabytes. When the
 call returns, the engine holds a `GgufModel` handle: the model's hyperparameters
@@ -394,7 +394,7 @@ minfer doesn't consult it; the ggml type tag per tensor is the operative fact.)
 **In:** a `&Path` — one `.gguf` file, which is either a whole model or part
 00001 of a split. Nothing else: no config, no sidecar files.
 
-**Out:** `Result<GgufModel, GgufLoadError>` — the `Err` carries the path and the parser's own reason, a value from the first stage that refused ([#767](https://github.com/yusiwen/minfer/issues/767)); the CLI prints it once and exits (`main.rs`).
+**Out:** `Result<GgufModel, GgufLoadError>` — the `Err` carries the path and the parser's own reason, a value from the first stage that refused ([#767](https://github.com/yusiwen/minfer/issues/767)); the CLI prints it once and exits (`crates/minfer-cli/src/main.rs`).
 The two structs (`gguf.rs` lines 602–623, 1945–1954):
 
 ```rust
@@ -836,7 +836,7 @@ pub fn split_file_info(name: &str) -> Option<(String, usize, usize)> {
 Both functions have unit tests right below (lines 2058–2096) covering the
 2-part, 3-part, non-split, and invalid-index cases.
 
-**(k) The call site's accounting** (`main.rs` lines 622–635). This is the
+**(k) The call site's accounting** (`crates/minfer-cli/src/main.rs` lines 622–635). This is the
 "File: … bytes … in N part(s)" line you see at startup, and the part-0
 convention made explicit:
 

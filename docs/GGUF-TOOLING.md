@@ -10,9 +10,9 @@ verify each claim. It is the design and the implementation record in one file.
 - Writer: `src/gguf_write.rs` — `GgufWriter`, `TensorSpec`, `encode_kv`,
   `write_single`, `write_split`, `split_assignment`.
 - Encoders: `src/quantize.rs` — `QuantTarget`, `quantize_row`, `decode_to_f32`.
-- Converter: `src/convert.rs` — safetensors + `config.json` + `tokenizer.json`
+- Converter: `crates/minfer-cli/src/src/convert.rs` — safetensors + `config.json` + `tokenizer.json`
   parsing, `Conversion`, `QuantizePlan`.
-- Subcommands: `src/tooling.rs` — `run_convert`, `run_quantize`, `run_split`.
+- Subcommands: `crates/minfer-cli/src/src/tooling.rs` — `run_convert`, `run_quantize`, `run_split`.
 
 ---
 

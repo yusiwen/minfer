@@ -784,7 +784,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   closes over the *same* `ctx` binding, not a recomputation.
 - **The legacy `kv_cache` argument is gone (#252).** It was dead on this path
   from the start — nothing read it in `forward_batch` — and [#252] deleted it
-  (with the `KVCache` type and the `main.rs` construction) once the storage
+  (with the `KVCache` type and the `crates/minfer-cli/src/main.rs` construction) once the storage
   had already gone in [#244]. `forward_batch`'s signature never took it; its
   `&mut GraphCache` argument is the graph *reuse* cache, not a KV binding.
 
@@ -794,7 +794,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   across runs of different prompt lengths (or across builds with different
   fusion env toggles) mixes steady-state prefill cost with build/first-submit
   cost. For steady-state numbers use `minfer bench` (warmup + reps,
-  `bench.rs:300`), not the CLI's single-shot print.
+  `crates/minfer-cli/src/bench.rs:300`), not the CLI's single-shot print.
 - **`n_out` is part of the reuse identity.** Changing it rebuilds the graph
   (it changes the tail topology). The CLI never does mid-run; the server
   could, and the params comparison handles it (`params_match`, doc 07

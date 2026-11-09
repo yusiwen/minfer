@@ -60,7 +60,7 @@ NVIDIA GPUs with int8 MMQ prefill and CUDA Graph replay
 
 | Stage | Doc | Entry code (each chapter names its commit) | What happens |
 |---|---|---|---|
-| CLI parse + model resolution | [01](01-cli-args-model-resolution.md) | `main.rs` (`main`, subcommand dispatch, `GenParams`), `download/mod.rs::resolve` | Flags → defaults; local path / `hf:` / `ollama:` / cached name → a GGUF path; mode branches (`--cnv`, `serve`, `viz`) |
+| CLI parse + model resolution | [01](01-cli-args-model-resolution.md) | `crates/minfer-cli/src/main.rs` (`main`, subcommand dispatch, `GenParams`), `download/mod.rs::resolve` | Flags → defaults; local path / `hf:` / `ollama:` / cached name → a GGUF path; mode branches (`--cnv`, `serve`, `viz`) |
 | GGUF load | [02](02-gguf-load.md) | `gguf.rs::load_gguf_model`, `MmapFile` | Parse GGUF v3 (header, metadata KV, tensor table), mmap the data blob zero-copy, merge multi-part splits |
 | Model dispatch + weights | [03](03-model-dispatch-weights.md) | `models/mod.rs::load_model`, `models/qwen2/loader.rs`, `MpsState::init` / `CudaState::init_with_gpu`, `GraphAllocator::register_weight` | `general.architecture` → `ModelDef`; hparams + weight tensors; GPU init; weights registered by name into allocator/backend registries |
 | Tokenizer + template | [04](04-tokenizer-template.md) | `tokenizer.rs::Tokenizer::load/encode`, `template.rs::render_template` | BPE from GGUF metadata; chat template via minijinja (ChatML fallback); text → token ids |
@@ -68,11 +68,11 @@ NVIDIA GPUs with int8 MMQ prefill and CUDA Graph replay
 | Assign + fusion | [06](06-assign-fusion.md) | `graph/scheduler.rs::assign_backends`, `graph/fusion.rs::run` | Every node → the best backend whose `supports_op` says yes (Metal → CUDA → CPU); the `Mul∘Silu→SwiGLU` rewrite |
 | Allocate | [07](07-allocator-liveness-kv.md) | `graph/alloc.rs`, `graph/cache.rs` | Liveness-based buffer sharing, in-place aliasing, `fill_input_i32`, two persistent KV regions per layer; `GraphCache` owns it all so KV survives rebuilds |
 | Execute | [08](08-scheduler-execute.md) | `graph/scheduler.rs::split_graph/execute` | Contiguous same-backend splits; cross-backend copies at boundaries; execution in build order; one Metal command buffer per split; CUDA replay hook |
-| Prefill forward | [09](09-prefill-forward-path.md) | `main.rs` (prefill block), `models/mod.rs::forward` → `forward_graph_cached` | All prompt tokens through the graph; positions drive KV writes and causal masking; last-token logits out; timing calibers |
+| Prefill forward | [09](09-prefill-forward-path.md) | `crates/minfer-cli/src/main.rs` (prefill block), `models/mod.rs::forward` → `forward_graph_cached` | All prompt tokens through the graph; positions drive KV writes and causal masking; last-token logits out; timing calibers |
 | CPU matmul kernels | [10](10-cpu-matmul-kernels.md) | `kernel.rs`, `quants.rs`, `block.rs` | Quantized weight × on-the-fly Q8_0 activations; AVX2 / NEON+SDOT dots; persistent thread pool; `repr(C)` block layouts |
 | Attention + vec ops + KV | [11](11-attention-vecops-kv.md) | `vec_ops.rs`, `graph/cpu_backend.rs` | RMSNorm, RoPE (two styles), softmax, SiLU; GQA attention; `kvcache_store/load` — positions are data, not structure |
 | Sampler | [12](12-sampler.md) | `sampler.rs::sample_with_config_grammar` | Penalties (repeat/frequency/presence, last-64 window) → top-k → top-p → temperature → seeded sample; stop-string byte matching |
-| Decode loop + reuse | [13](13-decode-loop-graph-reuse.md) | `main.rs` (decode loop), `graph/cache.rs::try_reuse`, `conversation.rs` | One token per step: only input *data* changes; first decode step rebuilds the graph, KV survives; multi-turn append-only prefill |
+| Decode loop + reuse | [13](13-decode-loop-graph-reuse.md) | `crates/minfer-cli/src/main.rs` (decode loop), `graph/cache.rs::try_reuse`, `conversation.rs` | One token per step: only input *data* changes; first decode step rebuilds the graph, KV survives; multi-turn append-only prefill |
 | Metal backend | [14](14-metal-backend.md) | `src/metal/` (`MpsState`), `graph/metal_backend.rs`, `src/metal/kernels/` | Same graph on Apple GPU: zero-copy weight buffers, per-op shaders, one command buffer per split, fused decode kernels, flash attention |
 | CUDA backend | [15](15-cuda-backend.md) | `graph/cuda_backend.rs`, `cuda.rs`, `cuda/kernels/*.cu` | Same graph on NVIDIA: resident weights, int8 MMQ prefill / MMVQ decode, split-KV attention, CUDA Graph capture/replay, pinned async staging |
 

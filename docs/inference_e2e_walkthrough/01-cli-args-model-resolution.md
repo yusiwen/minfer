@@ -6,7 +6,7 @@
 > (c) one concrete filesystem path to a GGUF model file — the only thing the
 > next stage needs.
 > **Code**: `crates/minfer-cli/src/main.rs` (`main`, `GenParams`, `print_usage`),
-> `src/download/mod.rs` (`resolve`, `resolve_cached_name`, `download_hf`,
+> `crates/minfer-cli/src/src/download/mod.rs` (`resolve`, `resolve_cached_name`, `download_hf`,
 > `download_ollama`, `list_local`).
 > **Sizes**: the line counts in this page are measured at `c252e24`.
 
@@ -171,7 +171,7 @@ arrives in two steps:
   reserves ≈ 1.2 GB while the model's maximum (40960 tokens) would reserve
   ≈ 11.8 GB — the "12 GB+" the code comment warns about
   (`crates/minfer-cli/src/main.rs:732-736`, citing `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` §2).
-- **And it is clamped twice, defensively.** In `main.rs` the effective
+- **And it is clamped twice, defensively.** In `crates/minfer-cli/src/main.rs` the effective
   context is `params.n_ctx.max(input_ids.len())` — a long prompt must never
   overflow the notepad — and the model's forward pass clamps again with
   `n_ctx.min(max_seq_len)` where `max_seq_len` comes from the GGUF metadata
@@ -589,7 +589,7 @@ those branches (`src/download/tests.rs:`).
     └── qwen2.5:0.5b → model.gguf (symlink into ~/.ollama/models/blobs)
 ```
 
-`list_local` (`src/download/mod.rs:524`) prints this tree with human
+`list_local` (`crates/minfer-cli/src/src/download/mod.rs:524`) prints this tree with human
 sizes ("412.3 MB"), grouped under `Hugging Face:` and `Ollama:` headers —
 and because resolution reads exactly these files, every name it prints is
 directly usable as the model argument. That is the whole point of source

@@ -977,7 +977,7 @@ from `src`, and double-circle markers for inputs and outputs.
 dot -Tpng /tmp/g.dot -o /tmp/g.png
 ```
 
-The export path does not reuse the runtime cache: `main.rs` rebuilds the graph via
+The export path does not reuse the runtime cache: `crates/minfer-cli/src/main.rs` rebuilds the graph via
 `json::build_runtime_graph` (`build_graph` → enable GPU → `assign_backends` → `FusionPass`), so the
 DOT and JSON exports contain the fusion and backend assignment the live run used. Both flags exit
 immediately after writing (before decode).
@@ -1229,9 +1229,9 @@ regions, prefills with `model.forward(&input_ids, ..., 1, ctx)`, then decodes on
 
 ### 11.3 Server and conversation
 
-- `server/slot.rs` gives every slot its own `GraphCache` and `n_ctx_total / n_slots` context; a slot's
+- `crates/minfer-cli/src/server/slot.rs` gives every slot its own `GraphCache` and `n_ctx_total / n_slots` context; a slot's
   cache is reset per request so a request cannot observe another request's KV.
-- `server/chat.rs` routes all inference through a `catch_unwind`-guarded
+- `crates/minfer-cli/src/server/chat.rs` routes all inference through a `catch_unwind`-guarded
   `forward_graph_cached` call, so a backend panic becomes a 500 instead of a dead worker.
 - `conversation.rs` owns a `GraphEngine { model, cache, n_ctx }` for multi-turn sessions; the append-
   only KV is exactly the persistent regions in that cache.

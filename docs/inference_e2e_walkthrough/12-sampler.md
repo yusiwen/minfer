@@ -489,7 +489,7 @@ test `test_freq_presence_then_repeat_penalty` pins with the comment
 #### The window, and how the loop keeps it sliding
 
 `src/sampler.rs:` is trivial — the interesting part is the call-site
-choreography in `main.rs`:
+choreography in `crates/minfer-cli/src/main.rs`:
 
 ```rust
 // src/sampler.rs:

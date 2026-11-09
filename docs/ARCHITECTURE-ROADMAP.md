@@ -408,7 +408,7 @@ server rejects any prompt longer than the slot context (`chat.rs:`);
 `new_slots` (`slot.rs:`) divides `n_ctx_total` equally per slot.
 `worker_loop` drains the queue **serially, one slot at a time** (`chat.rs:`),
 and every request starts from a fresh `GraphCache` (`chat.rs:84`). Default `--n-slots` is
-1 (`main.rs:473`), so the default server is strictly serial with a cold KV per
+1 (`crates/minfer-cli/src/main.rs:473`), so the default server is strictly serial with a cold KV per
 request.
 
 **Gap.** 🔴 This is the largest capability difference between what minfer does
@@ -440,7 +440,7 @@ Two smaller but immediate items sit in this layer:
   `forward_graph_cached`; the speculative path calls both models' forwards
   directly (`spec.rs`) and the tokenizer, sampler and stop-string paths were
   bare. A panic in any of them unwound `worker_loop`, dropping the bounded job
-  channel (capacity 64, `server/mod.rs:75`) — later requests got 503 — and the
+  channel (capacity 64, `crates/minfer-cli/src/server/mod.rs:75`) — later requests got 503 — and the
   queued jobs' `StreamEvent` senders, ending their SSE
   (Server-Sent Events) stream after an empty `[DONE]` rather than an error
   (`server/mod.rs:`). The whole per-job body now runs under
@@ -530,8 +530,8 @@ notable one still for reach is Q2_K/Q3_K (running large models on small machines
 its f16-weight gap closed by [#141](https://github.com/yusiwen/minfer/issues/141) (2026-09-25).**
 A GGUF v3 *writer* (`src/gguf_write.rs`), byte-verified weight encoders
 (`src/quantize.rs`), a HuggingFace Qwen2 converter that satisfies the strict
-loader (`src/convert.rs`), and the `convert` / `quantize` / `split` subcommands
-(`src/tooling.rs`, `docs/GGUF-TOOLING.md`). A converted f16 model runs **on the
+loader (`crates/minfer-cli/src/src/convert.rs`), and the `convert` / `quantize` / `split` subcommands
+(`crates/minfer-cli/src/src/tooling.rs`, `docs/GGUF-TOOLING.md`). A converted f16 model runs **on the
 CPU and on CUDA** — the CPU graph path gained f16 weight dispatch in F6 and #141
 vectorized that dot (AVX2 `F16C` / NEON `FCVTL`) and moved the multi-token row
 loop onto the shared CPU pool (3.2 → 207 tok/s prefill on the 0.5B), while CUDA
