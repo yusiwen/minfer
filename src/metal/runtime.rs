@@ -603,7 +603,7 @@ impl MpsState {
     ///
     /// `data` is a plain borrow: the buffer keeps the pointer and the owner keeps
     /// the pages mapped, so no `'static` slice is needed (or stored).
-    pub fn register_part(&self, data: &[u8], owner: std::sync::Arc<crate::gguf::MmapFile>) {
+    pub fn register_part(&self, data: &[u8], owner: crate::gguf::PartBytes) {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (data, owner);
@@ -613,20 +613,46 @@ impl MpsState {
             if data.is_empty() {
                 return;
             }
-            let page = 16384; // macOS page size on Apple Silicon
             let base = data.as_ptr() as usize;
-            debug_assert!(base % page == 0, "mmap'd GGUF part not page-aligned");
+            let mapped = owner.mapping().is_some();
+            // A mapped part's pages are page-aligned and immutable, so the GPU can
+            // alias them (#745). An owned part (#797) has neither property — a
+            // `Vec`'s allocation is arbitrarily aligned and its lifetime is the
+            // `Arc`'s — so it is copied once here and every weight of it becomes a
+            // (buffer, offset) range of that copy, exactly like the mmap case.
+            // (The per-weight copy in `register_weight` is the fallback for slices
+            // outside any registered part; this spends one allocation per part
+            // instead of one per tensor.)
             let buf = unsafe {
-                self.inner
-                    .device
-                    .newBufferWithBytesNoCopy_length_options_deallocator(
-                        NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut c_void)
-                            .unwrap(),
-                        (data.len() as u64) as usize,
-                        MTLResourceOptions::StorageModeShared,
-                        None,
-                    )
-                    .unwrap()
+                if mapped {
+                    let page = 16384; // macOS page size on Apple Silicon
+                    debug_assert!(base % page == 0, "mmap'd GGUF part not page-aligned");
+                    self.inner
+                        .device
+                        .newBufferWithBytesNoCopy_length_options_deallocator(
+                            NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut c_void)
+                                .unwrap(),
+                            (data.len() as u64) as usize,
+                            MTLResourceOptions::StorageModeShared,
+                            None,
+                        )
+                        .unwrap()
+                } else {
+                    let b = self
+                        .inner
+                        .device
+                        .newBufferWithLength_options(
+                            (data.len() as u64) as usize,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                        .unwrap();
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        b.contents().as_ptr() as *mut u8,
+                        data.len(),
+                    );
+                    b
+                }
             };
             self.inner.mmap_parts.lock().unwrap().push((
                 base,
@@ -642,22 +668,25 @@ impl MpsState {
             // Doing a dummy full-buffer read HERE (at model load, outside the
             // CLI's Total timing) moves that cost out of the first prefill —
             // llama-bench's numbers are equally warm. ~5 ms bandwidth + the
-            // setup, amortized into load.
-            let cb = self.cmd_buffer();
-            cb.trace_op("part_warmup");
-            cb.enc.setComputePipelineState(&*self.inner.pl_warmup);
-            unsafe {
-                cb.enc
-                    .setBuffer_offset_atIndex(Some(&*buf), (0) as usize, (0) as usize)
-            };
-            let tiny = self.inner.buf_positions.lock().unwrap().clone();
-            unsafe {
-                cb.enc
-                    .setBuffer_offset_atIndex(Some(&*tiny), (0) as usize, (1) as usize)
-            };
-            let n = (buf.length() / 4) as u64;
-            cb.dispatch_1d((n + 255) / 256, 256);
-            let _ = cb.submit();
+            // setup, amortized into load. An owned part is already resident host
+            // memory (just copied), so there is no fault to warm.
+            if mapped {
+                let cb = self.cmd_buffer();
+                cb.trace_op("part_warmup");
+                cb.enc.setComputePipelineState(&*self.inner.pl_warmup);
+                unsafe {
+                    cb.enc
+                        .setBuffer_offset_atIndex(Some(&*buf), (0) as usize, (0) as usize)
+                };
+                let tiny = self.inner.buf_positions.lock().unwrap().clone();
+                unsafe {
+                    cb.enc
+                        .setBuffer_offset_atIndex(Some(&*tiny), (0) as usize, (1) as usize)
+                };
+                let n = (buf.length() / 4) as u64;
+                cb.dispatch_1d((n + 255) / 256, 256);
+                let _ = cb.submit();
+            }
         }
     }
 

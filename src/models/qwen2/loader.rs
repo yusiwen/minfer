@@ -211,9 +211,9 @@ fn find_token_id(ctx: &GgufContext, target: &str) -> Option<u32> {
 
 fn load_tensor(
     ctx: &GgufContext,
-    // [#745] the part's mapping: the tensor carries the handle, so its bytes
+    // [#745] [#797] the part's backing: the tensor carries the handle, so its bytes
     // outlive the `GgufModel` it was read from. There is no `'static` slice.
-    owner: &std::sync::Arc<crate::gguf::MmapFile>,
+    owner: &crate::gguf::PartBytes,
     ti: &crate::gguf::GgufTensorInfo,
     ns: &str,
     plan: crate::graph::offload::OffloadPlan,
@@ -247,9 +247,9 @@ fn load_tensor(
         strides[j] = strides[j - 1] * shape[j - 1] as usize;
     }
 
-    // The tensor is a range of the part's mapping, not a borrowed `'static` slice:
-    // `TensorData::Mapped` owns the handle and validates the range once.
-    let mut tensor = Tensor::from_mapped(ttype, &shape, &strides, owner.clone(), off, nbytes);
+    // The tensor is a range of the part's bytes, not a borrowed `'static` slice:
+    // `TensorData` owns the handle and validates the range once.
+    let mut tensor = Tensor::from_part(ttype, &shape, &strides, owner.clone(), off, nbytes);
     tensor.set_name(&reg_name);
 
     // Register weight tensors with GPU backends — only when the E5 offload plan puts this
@@ -469,7 +469,7 @@ pub fn load(
     #[cfg(all(target_os = "macos", feature = "metal"))]
     if let Some(mps) = crate::metal::MpsState::get() {
         for part in &model.parts {
-            mps.register_part(part.data(), part.mmap.clone());
+            mps.register_part(part.data(), part.bytes.clone());
         }
     }
 
@@ -485,12 +485,12 @@ pub fn load(
     let load_one = |n: &str| -> Option<Tensor> {
         tensor_map.get(n).map(|(pi, ti)| {
             let part = &model.parts[*pi];
-            load_tensor(&part.ctx, &part.mmap, ti, ns, plan, &device_bytes)
+            load_tensor(&part.ctx, &part.bytes, ti, ns, plan, &device_bytes)
         })
     };
     let load_ti = |(pi, ti): &(usize, &crate::gguf::GgufTensorInfo)| -> Tensor {
         let part = &model.parts[*pi];
-        load_tensor(&part.ctx, &part.mmap, ti, ns, plan, &device_bytes)
+        load_tensor(&part.ctx, &part.bytes, ti, ns, plan, &device_bytes)
     };
 
     // #724: the `llama3` rope-scaling table, resolved before the first weight is

@@ -87,6 +87,31 @@ impl Engine {
         template_override: Option<&str>,
     ) -> Result<Self, EngineError> {
         let gguf = crate::gguf::load_gguf_model(path)?;
+        Self::from_gguf(gguf, offload, cache_type, template_override)
+    }
+
+    /// Load a model the host already holds in memory (#797) — received over the
+    /// network, embedded, or read from a volume the host decrypted itself.
+    ///
+    /// The buffer is not copied: every weight tensor is a range of it, the same
+    /// contract a path load has with its mapping. A split model is refused by
+    /// name (its siblings are resolved beside the file, and a bytes load has no
+    /// directory). The rest of the load is identical, so a continuation or a turn
+    /// behaves exactly as it does on a path load.
+    pub fn load_from_bytes(bytes: Vec<u8>) -> Result<Self, EngineError> {
+        let gguf = crate::gguf::load_gguf_model_from_bytes(bytes)?;
+        Self::from_gguf(gguf, OffloadRequest::Default, None, None)
+    }
+
+    /// The shared tail of both loaders: config resolution, the model, the
+    /// tokenizer and the validated template. Everything above this is a
+    /// difference in where the bytes came from.
+    fn from_gguf(
+        gguf: crate::gguf::GgufModel,
+        offload: OffloadRequest,
+        cache_type: Option<&str>,
+        template_override: Option<&str>,
+    ) -> Result<Self, EngineError> {
         let cache = cache_type
             .map(str::to_string)
             .or_else(|| crate::config::get().kv_cache_type.clone());

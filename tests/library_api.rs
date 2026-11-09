@@ -322,3 +322,37 @@ fn a_continuation_does_not_leak_into_a_later_chat() {
         "the control's turn advanced its own cursor"
     );
 }
+
+/// #797: a host that already holds the model answers exactly like a path load —
+/// same bytes, no temp file, byte-identical turn.
+#[test]
+fn a_model_loaded_from_bytes_answers_like_the_path_load() {
+    let path = toy();
+    let bytes = std::fs::read(&path).expect("read the fixture");
+    let from_bytes = Engine::load_from_bytes(bytes).expect("load from bytes");
+    let from_path = Engine::load(&path).expect("load from path");
+
+    let greedy = TurnParams {
+        n_predict: 4,
+        sampler: SamplerConfig {
+            temp: 0.0,
+            ..Default::default()
+        },
+        stop_strings: Vec::new(),
+    };
+    let answer = |engine: &Engine| {
+        let mut session = engine.session(SessionConfig {
+            n_ctx: 64,
+            ..Default::default()
+        });
+        let mut out = Vec::new();
+        session
+            .chat("hello", &greedy, &mut |d| out.extend_from_slice(d))
+            .expect("one turn");
+        out
+    };
+    let a = answer(&from_bytes);
+    let b = answer(&from_path);
+    assert!(!a.is_empty(), "the turn produced text");
+    assert_eq!(a, b, "a bytes load answers byte-identically to a path load");
+}
