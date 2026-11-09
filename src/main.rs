@@ -10,7 +10,7 @@
 
 #[cfg(feature = "cuda")]
 use minfer::cuda;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use minfer::metal;
 use minfer::{
     bench, conversation, download, gguf, grammar, models, sampler, server, spec, spec_verify,
@@ -1092,7 +1092,7 @@ fn main() {
     // so that stage 2 of the backend-name surface (a backend that is compiled in
     // but not usable on this machine) is a startup refusal and not something a
     // later, unrelated failure — a missing model file, a bad GGUF — can preempt.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     metal::MpsState::init();
     #[cfg(feature = "cuda")]
     cuda::CudaState::init_with_gpu(gpu);
@@ -1574,10 +1574,10 @@ fn main() {
         // fusion env toggles as the live path.
         if dump_graph.is_some() || dump_graph_json.is_some() {
             use minfer::graph::json::{export_graph_json, runtime_gparams};
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "metal"))]
             let metal_on = minfer::graph::metal_backend::metal_available()
                 && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(all(target_os = "macos", feature = "metal")))]
             let metal_on = false;
             #[cfg(feature = "cuda")]
             let cuda_on = minfer::cuda::CudaState::get().is_some();
@@ -1697,10 +1697,10 @@ fn main() {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| model_path.clone());
         use minfer::graph::json::export_graph_json;
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         let metal_on = minfer::graph::metal_backend::metal_available()
             && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let metal_on = false;
         #[cfg(feature = "cuda")]
         let cuda_on = minfer::cuda::CudaState::get().is_some();

@@ -206,7 +206,20 @@ fn main() {
         println!("cargo:rerun-if-changed={f}");
     }
     check_shader_file_list();
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+    // #777: `metal` is a cargo feature. Without it nothing compiles the backend,
+    // so the metallib and the `-F` SDK search path are unnecessary — and the
+    // build must not need the Metal toolchain. This branch is also the marker:
+    // the warning is the observable proof that xcrun was never spawned (cargo
+    // prints a build-script warning whenever the script runs).
+    let metal_feature = std::env::var_os("CARGO_FEATURE_METAL").is_some();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") && !metal_feature {
+        println!(
+            "cargo:warning=Metal: the `metal` feature is off — no metallib, no \
+             -framework Metal, and /usr/bin/xcrun is not spawned (a metal-less \
+             macOS build needs no Apple toolchain)"
+        );
+    }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") && metal_feature {
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let air = format!("{out_dir}/minfer.air");
         let metallib = format!("{out_dir}/minfer.metallib");

@@ -117,13 +117,13 @@ fn the_cache_type_gate_is_strict_and_device_aware() {
     // the CPU; only a build that compiles no CUDA — or a non-macOS build with no
     // Metal backend — refuses it there. The answer comes from the registry, not
     // from a list here.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     assert_eq!(
         resolve(Device::Metal, Some("q8_0"), 24, 512).unwrap(),
         KvFormat::Q8_0,
         "#310 gave Metal a packed read"
     );
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         let err = resolve(Device::Metal, Some("q8_0"), 24, 512).unwrap_err();
         assert!(err.contains("q8_0"), "{err}");

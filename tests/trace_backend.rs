@@ -100,7 +100,7 @@ fn the_trace_names_the_backend_each_node_ran_on() {
     eprintln!(
         "trace backends: {counts:?} (device={device:?}, cuda_build={}, metal_build={})",
         cfg!(feature = "cuda"),
-        cfg!(target_os = "macos")
+        cfg!(all(target_os = "macos", feature = "metal"))
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

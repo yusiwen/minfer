@@ -65,9 +65,9 @@ fn compare(tag: &str, a: &[f32], b: &[f32]) {
 /// run would exercise the Metal path instead — covered by the Metal tests).
 #[test]
 fn graph_cpu_self_consistency_real_model() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _g = crate::metal::metal_test_lock();
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if crate::metal::MpsState::get().is_some() {
         eprintln!("MPS initialized by an earlier test; skipping CPU-only test");
         return;
@@ -99,9 +99,9 @@ fn graph_cpu_self_consistency_real_model() {
 /// not change prefill logits while positions fit. CPU-only (see above).
 #[test]
 fn forward_cached_isolates_kv_between_caches() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _g = crate::metal::metal_test_lock();
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if crate::metal::MpsState::get().is_some() {
         eprintln!("MPS initialized by an earlier test; skipping CPU-only test");
         return;
@@ -150,14 +150,14 @@ fn forward_cached_isolates_kv_between_caches() {
 /// and rms_norm_256 / attn_rope_store vs QkNorm / rope_f32 / store_kv).
 #[test]
 fn fused_qkv_norm_matches_unfused_decode() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _g = crate::metal::metal_test_lock();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         eprintln!("not macOS; skipping");
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         use crate::graph::ops::Op;
         use crate::graph::params::{CParams, GraphParams, GraphType};
@@ -308,14 +308,14 @@ fn fused_qkv_norm_matches_unfused_decode() {
 /// two independent caches must produce the identical sequence.
 #[test]
 fn graph_metal_matches_llama_reference() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _g = crate::metal::metal_test_lock();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         eprintln!("not macOS; skipping");
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         crate::metal::MpsState::init();
         let Some((_, q3, ids, positions)) = load_qwen3() else {
@@ -360,14 +360,14 @@ fn graph_metal_matches_llama_reference() {
 /// independent executions element by element.
 #[test]
 fn metal_prefill_determinism() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _g = crate::metal::metal_test_lock();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         eprintln!("not macOS; skipping");
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         crate::metal::MpsState::init();
         let Some((_, q3, ids, positions)) = load_qwen3() else {

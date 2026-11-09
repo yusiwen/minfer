@@ -76,16 +76,35 @@ sha2 = "0.10"
 
 [package.metadata.docs.rs]
 # The facade and the tiers, with the app-layer features a reader of the docs
-# needs to see the full surface. `metal` is not a feature yet (see #763 S9).
+# needs to see the full surface. `metal` is deliberately absent: it needs a macOS
+# target, and docs.rs builds on Linux (the cfg sites are all `target_os = "macos"`,
+# so the feature is inert there anyway).
 features = ["server", "tooling", "viz", "observe"]
 
 [features]
 # Defaults keep `cargo build --release` producing today's binary. A consumer of
-# the engine uses `default-features = false` (ADR-0079); S9 turns the macOS
-# Metal backend into a feature.
-default = ["cli"]
+# the engine uses `default-features = false` (ADR-0079). `metal` is listed here,
+# not implied by `cli`, so `--no-default-features --features cli` still builds a
+# binary WITHOUT the Metal backend — the configuration that must refuse
+# `--backend metal` by name (#777) — while a plain `cargo build --release` keeps
+# Metal on macOS.
+default = ["cli", "metal"]
 # The application layer: the binary and the modules only it uses.
 cli = ["server", "tooling", "viz"]
+# The macOS Metal backend (#777). Compiled only on macOS, and only with this
+# feature: every site that reaches the backend is
+# `cfg(all(target_os = "macos", feature = "metal"))`, and build.rs compiles the
+# metallib only when the feature is on. Off macOS the feature is inert (its
+# dependencies are target-filtered), so `default` can list it unconditionally.
+# A consumer that wants an engine without the Metal toolchain builds with
+# `default-features = false`.
+metal = [
+    "dep:objc2",
+    "dep:objc2-metal",
+    "dep:objc2-foundation",
+    "dep:block2",
+    "dep:dispatch2",
+]
 # The OpenAI-compatible HTTP server (axum + tokio). The visualizer is separate
 # (`viz`), so a server-only host does not build it.
 server = [
@@ -125,9 +144,11 @@ name = "cuda_graph_diag"
 path = "experiments/cuda/cuda_graph_rust/cuda_graph_diag.rs"
 required-features = ["cuda"]
 
+# Optional behind `metal` (#777): a metal-less macOS build resolves and compiles
+# none of these, so it needs no Apple SDK at all.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-metal = "0.3"
-block2 = "0.6"
-objc2-foundation = "0.3"
-objc2 = "0.6"
-dispatch2 = "0.3"
+objc2-metal = { version = "0.3", optional = true }
+block2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+objc2 = { version = "0.6", optional = true }
+dispatch2 = { version = "0.3", optional = true }

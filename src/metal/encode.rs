@@ -8,7 +8,7 @@ use block2::RcBlock;
 use objc2_metal::{MTLBlitCommandEncoder, MTLCommandBufferStatus, MTLCommandEncoder, MTLEvent};
 use std::ffi::c_void;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 extern "C" {
     fn dispatch_semaphore_create(value: isize) -> *mut std::ffi::c_void;
     fn dispatch_semaphore_signal(sem: *mut std::ffi::c_void) -> isize;
@@ -17,7 +17,7 @@ extern "C" {
     fn dispatch_release(obj: *mut std::ffi::c_void);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 impl MpsCommandBuffer<'_> {
     /// End the compute pass. Call before encoding blits from the same command
     /// buffer (Metal allows only one active encoder at a time); `submit` then

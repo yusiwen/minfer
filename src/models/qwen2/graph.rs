@@ -343,7 +343,7 @@ impl Qwen2Graph {
         let (Some(wq), Some(wk), Some(wv)) = (wq, wk, wv) else {
             return false;
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             crate::metal::concat_rows(&[wq, wk, wv]).is_some()
         }
@@ -351,11 +351,14 @@ impl Qwen2Graph {
         // concat_rows' preconditions exactly; the loader performs the real
         // concatenation once at model load and registers blk.{i}.attn_qkv,
         // so both sides agree with the Metal pattern).
-        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        #[cfg(all(feature = "cuda", not(all(target_os = "macos", feature = "metal"))))]
         {
             crate::cuda::concat_rows_feasible(&[wq, wk, wv])
         }
-        #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
+        #[cfg(not(any(
+            all(target_os = "macos", feature = "metal"),
+            all(feature = "cuda", not(all(target_os = "macos", feature = "metal")))
+        )))]
         {
             let _ = (wq, wk, wv);
             false
@@ -371,22 +374,25 @@ impl Qwen2Graph {
         let (Some(fg), Some(fu)) = (fg, fu) else {
             return false;
         };
-        #[cfg(all(target_os = "macos", not(feature = "cuda")))]
+        #[cfg(all(target_os = "macos", feature = "metal", not(feature = "cuda")))]
         {
             crate::metal::concat_rows(&[fg, fu]).is_some()
         }
-        #[cfg(all(target_os = "macos", feature = "cuda"))]
+        #[cfg(all(target_os = "macos", feature = "metal", feature = "cuda"))]
         {
             crate::metal::concat_rows(&[fg, fu]).is_some()
                 || crate::cuda::concat_rows(&[fg, fu]).is_some()
         }
-        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        #[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "cuda"))]
         {
             // metadata-only probe — the concat bytes are built once by the
             // loader; rebuilding them here cost ~920 ms per decode graph build
             crate::cuda::concat_rows_feasible(&[fg, fu])
         }
-        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+        #[cfg(all(
+            not(all(target_os = "macos", feature = "metal")),
+            not(feature = "cuda")
+        ))]
         {
             let _ = (fg, fu);
             false
@@ -615,7 +621,7 @@ impl Qwen2Graph {
             {
                 let alloc = cache.alloc();
                 Self::register_graph_weights(model, alloc);
-                #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", feature = "metal"))]
                 if metal_on {
                     alloc.enable_metal();
                 }
@@ -776,14 +782,14 @@ impl Qwen2Graph {
     /// `metal_backend` path is not resolved on non-macOS builds (the module does
     /// not exist there).
     pub fn device(model: &Qwen2Model) -> crate::models::Device {
-        #[cfg(any(target_os = "macos", feature = "cuda"))]
+        #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "cuda"))]
         {
             // F4: a backend the run fenced off (`--backend` / `MINFER_BACKENDS`)
             // does not participate, so the builder never emits a device-only
             // fused node the CPU cannot execute. The fence is the same one
             // `GraphAllocator::supports_for` reads, so the two cannot disagree.
             let filter = crate::graph::registry::active_filter();
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "metal"))]
             if filter.allows(crate::graph::Backend::METAL)
                 && crate::graph::metal_backend::metal_available()
                 && Self::weights_on_gpu(model)
@@ -802,7 +808,7 @@ impl Qwen2Graph {
                 return crate::models::Device::Cuda;
             }
         }
-        #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+        #[cfg(not(any(all(target_os = "macos", feature = "metal"), feature = "cuda")))]
         let _ = model;
         crate::models::Device::Cpu
     }
@@ -811,7 +817,7 @@ impl Qwen2Graph {
     ///
     /// E5: "the graph reads" means the **offloaded** blocks, and the unblocked tensors only
     /// under a full plan — the loader did not register anything else for a partial plan.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     fn weights_on_gpu(model: &Qwen2Model) -> bool {
         let plan = model.offload.plan;
         if plan.is_cpu_only() {
@@ -856,14 +862,14 @@ impl Qwen2Graph {
             }
             v
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let Some(mps) = crate::metal::MpsState::get() else {
                 return false;
             };
             names.iter().all(|n| mps.has_weight(n))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = names;
             false

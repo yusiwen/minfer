@@ -2,7 +2,7 @@
 //! build does not parse it. See the parent module for the docs.
 use super::*;
 use objc2_foundation::NSString;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2_metal::{MTLCreateSystemDefaultDevice, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
 use std::ptr::NonNull;

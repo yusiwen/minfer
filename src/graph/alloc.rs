@@ -86,7 +86,7 @@ fn unaccounted_budget_note(note: &str) {
 /// The CUDA **and Metal** weight registries are its production callers (`cuda.rs`,
 /// `metal/runtime.rs`); the CPU tests pin the poisoned-lock path, so the item must
 /// also exist under `test`.
-#[cfg(any(feature = "cuda", target_os = "macos", test))]
+#[cfg(any(feature = "cuda", all(target_os = "macos", feature = "metal"), test))]
 pub fn weights_from_lock<T, F>(lock: std::sync::LockResult<T>, what: &str, sum: F) -> usize
 where
     F: FnOnce(&T) -> usize,
@@ -106,7 +106,7 @@ where
 /// Per-backend liveness allocator.
 pub struct GraphAllocator {
     cpu: CpuBackend,
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     metal: Option<super::metal_backend::MetalBackend>,
     #[cfg(feature = "cuda")]
     cuda: Option<super::cuda_backend::CudaBackend>,
@@ -192,7 +192,7 @@ impl Default for GraphAllocator {
     fn default() -> Self {
         Self {
             cpu: CpuBackend::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "metal"))]
             metal: None,
             #[cfg(feature = "cuda")]
             cuda: None,
@@ -256,7 +256,7 @@ impl GraphAllocator {
 
     /// Enable the Metal backend (called when MPS is initialized and the model
     /// weights are GPU-registered).
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn enable_metal(&mut self) -> bool {
         if self.metal.is_none() {
             self.metal = super::metal_backend::MetalBackend::new();
@@ -299,7 +299,7 @@ impl GraphAllocator {
     /// described under the width its region really uses.
     pub fn set_kv_format(&mut self, format: KvFormat) {
         self.cpu.set_kv_format(format);
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some(m) = self.metal.as_mut() {
             m.set_kv_format(format);
         }
@@ -320,13 +320,13 @@ impl GraphAllocator {
     }
 
     /// Mutable Metal backend (None until enabled / MPS unavailable).
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn metal_mut(&mut self) -> Option<&mut super::metal_backend::MetalBackend> {
         self.metal.as_mut()
     }
 
     /// Immutable Metal backend.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn metal(&self) -> Option<&super::metal_backend::MetalBackend> {
         self.metal.as_ref()
     }
@@ -2638,7 +2638,7 @@ impl GraphAllocator {
     /// The CUDA hooks and, since #137, the Metal hooks mutate them; a build with
     /// neither device has no hook to mutate them, so the accessor compiles out
     /// there.
-    #[cfg(any(feature = "cuda", target_os = "macos"))]
+    #[cfg(any(feature = "cuda", all(target_os = "macos", feature = "metal")))]
     pub fn cross_stats_mut(&mut self) -> &mut CrossCopyStats {
         &mut self.cross_stats
     }
@@ -2732,7 +2732,7 @@ impl GraphAllocator {
     ///
     /// The CUDA and (since #137) Metal staging hooks are its production readers;
     /// the CPU tests read it.
-    #[cfg(any(feature = "cuda", target_os = "macos", test))]
+    #[cfg(any(feature = "cuda", all(target_os = "macos", feature = "metal"), test))]
     pub fn cross_buffer(&self, uid: u64, node_id: NodeId, backend: Backend) -> Option<BufRef> {
         self.cross.get(&(uid, node_id, backend)).copied()
     }

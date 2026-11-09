@@ -32,7 +32,7 @@ pub fn cpu_threads() -> usize {
     }
     static AUTO: OnceLock<usize> = OnceLock::new();
     *AUTO.get_or_init(|| {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             // hw.perflevel0.logicalcpu = performance-core count (10 on M4 Pro).
             if let Ok(out) = std::process::Command::new("sysctl")

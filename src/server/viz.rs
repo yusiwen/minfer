@@ -97,10 +97,10 @@ pub fn run_viz(
     // is `fuse_qkv = nt==1 && metal_on`); FFN gate+up fusion runs on both
     // (7e⑤). The preview builds through the same graph builder, so the live
     // per-node events (matched by node id) only line up when these flags do.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let metal_on = crate::graph::metal_backend::metal_available()
         && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     let metal_on = false;
     #[cfg(feature = "cuda")]
     let cuda_on = crate::cuda::CudaState::get().is_some();

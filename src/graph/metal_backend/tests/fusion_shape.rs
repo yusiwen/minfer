@@ -13,7 +13,7 @@
 //! `src/graph/metal_backend/tests.rs` (issue #267 pattern); the fixtures live in
 //! the parent module and are reached through `use super::*;`.
 //!
-//! `#![cfg(target_os = "macos")]` is deliberately **not** used: these tests
+//! `#![cfg(all(target_os = "macos", feature = "metal"))]` is deliberately **not** used: these tests
 //! compile on every platform and skip at runtime when MPS is unavailable, exactly
 //! like the rest of the module. CI's `build-macos` therefore only type-checks
 //! them; the assertions run on a Mac (record in the PR).

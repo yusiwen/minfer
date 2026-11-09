@@ -102,7 +102,7 @@ fn an_unknown_backend_name_exits_loudly_from_the_environment() {
 /// is `cuda`.
 #[test]
 fn a_compiled_out_backend_name_is_a_different_refusal() {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         let (_, err, code) = run_cli(&["--backend", "metal", NO_MODEL], &[]);
         assert_ne!(code, 0);

@@ -245,9 +245,9 @@ fn load_tensor(
 
     // E5: register only when the offload plan puts this tensor's block on the device (see
     // qwen2's loader twin for the rule and the reason).
-    #[cfg(any(target_os = "macos", feature = "cuda"))]
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "cuda"))]
     let on_device = plan.allows_weight(&reg_name);
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if on_device {
         if let Some(mps) = crate::metal::MpsState::get() {
             if matches!(
@@ -301,7 +301,7 @@ fn load_tensor(
 
     // A CPU-only build compiles both registration blocks out; the parameters stay part of
     // the signature (the filter is the contract) and the plan still reaches the model.
-    #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+    #[cfg(not(any(all(target_os = "macos", feature = "metal"), feature = "cuda")))]
     let _ = (plan, device_bytes);
 
     tensor
@@ -471,9 +471,9 @@ pub fn load(
     // Zero-copy weight registration: tell the Metal backend about each mmap'd
     // part (page-aligned base) BEFORE any weight is registered, so weights are
     // wrapped as (buffer, offset) into the part buffer instead of being copied.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let metal_registration = crate::metal::MpsState::get().map(|mps| mps.begin_registration());
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if let Some(mps) = crate::metal::MpsState::get() {
         for part in &model.parts {
             mps.register_part(part.data(), part.mmap.clone());
@@ -530,7 +530,7 @@ pub fn load(
         // weights share a matmul (same quant type + same input dim); decode
         // falls back to three separate matmuls otherwise. Requires the per-head
         // Q/K norm weights to be present (Qwen3 always has them).
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         if plan.on_device(i) {
             if let Some(mps) = crate::metal::MpsState::get() {
                 if let (Some(wq), Some(wk), Some(wv)) = (&layer.wq, &layer.wk, &layer.wv) {
@@ -600,7 +600,7 @@ pub fn load(
         // Gated like the build-side fusion decision (nf ≤ 16384): the 7B's
         // nf = 18944 concat would otherwise hold ~2.0 GiB of weights no node
         // ever reads (Phase 8 review). Memory-footprint-only change.
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         if plan.on_device(i) {
             if let Some(mps) = crate::metal::MpsState::get() {
                 if let (Some(fg), Some(fu)) = (&layer.ffn_gate, &layer.ffn_up) {
@@ -664,7 +664,7 @@ pub fn load(
         kv_format: crate::graph::kvformat::KvFormat::F32,
         #[cfg(feature = "cuda")]
         cuda: cuda_registration,
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         metal: metal_registration,
     };
 

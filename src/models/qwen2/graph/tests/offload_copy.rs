@@ -517,7 +517,7 @@ fn async_cross_copies_never_block_and_stay_bitwise_identical() {
 ///
 /// [#137]: https://github.com/yusiwen/minfer/issues/137
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 #[ignore = "requires the cached 0.5B model and a Metal device"]
 fn async_cross_copies_never_block_and_stay_bitwise_identical_on_metal() {
     use crate::graph::cache::GraphCache;

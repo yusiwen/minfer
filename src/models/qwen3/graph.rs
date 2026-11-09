@@ -300,7 +300,7 @@ impl Qwen3Graph {
         let (Some(wq), Some(wk), Some(wv)) = (wq, wk, wv) else {
             return false;
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             crate::metal::concat_rows(&[wq, wk, wv]).is_some()
         }
@@ -310,11 +310,14 @@ impl Qwen3Graph {
         // `register_weight`/`register_weight_q6k_padded` there), so building the
         // graph does not rebuild the concat bytes: doing that here measured a
         // ~920 ms stall per decode graph build on the 14B.
-        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
+        #[cfg(all(feature = "cuda", not(all(target_os = "macos", feature = "metal"))))]
         {
             crate::cuda::concat_rows_feasible(&[wq, wk, wv])
         }
-        #[cfg(not(any(target_os = "macos", all(feature = "cuda", not(target_os = "macos")))))]
+        #[cfg(not(any(
+            all(target_os = "macos", feature = "metal"),
+            all(feature = "cuda", not(all(target_os = "macos", feature = "metal")))
+        )))]
         {
             let _ = (wq, wk, wv);
             false
@@ -330,20 +333,23 @@ impl Qwen3Graph {
         let (Some(fg), Some(fu)) = (fg, fu) else {
             return false;
         };
-        #[cfg(all(target_os = "macos", not(feature = "cuda")))]
+        #[cfg(all(target_os = "macos", feature = "metal", not(feature = "cuda")))]
         {
             crate::metal::concat_rows(&[fg, fu]).is_some()
         }
-        #[cfg(all(target_os = "macos", feature = "cuda"))]
+        #[cfg(all(target_os = "macos", feature = "metal", feature = "cuda"))]
         {
             crate::metal::concat_rows(&[fg, fu]).is_some()
                 || crate::cuda::concat_rows(&[fg, fu]).is_some()
         }
-        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        #[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "cuda"))]
         {
             crate::cuda::concat_rows(&[fg, fu]).is_some()
         }
-        #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+        #[cfg(all(
+            not(all(target_os = "macos", feature = "metal")),
+            not(feature = "cuda")
+        ))]
         {
             let _ = (fg, fu);
             false
@@ -548,7 +554,7 @@ impl Qwen3Graph {
             {
                 let alloc = cache.alloc();
                 Self::register_graph_weights(model, alloc);
-                #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", feature = "metal"))]
                 if metal_on {
                     alloc.enable_metal();
                 }
@@ -682,11 +688,11 @@ impl Qwen3Graph {
     /// `metal_backend` path is not resolved on non-macOS builds (the module does
     /// not exist there).
     pub fn device(model: &Qwen3Model) -> crate::models::Device {
-        #[cfg(any(target_os = "macos", feature = "cuda"))]
+        #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "cuda"))]
         {
             // F4: a fenced backend does not participate (see qwen2's twin).
             let filter = crate::graph::registry::active_filter();
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "metal"))]
             if filter.allows(crate::graph::Backend::METAL)
                 && crate::graph::metal_backend::metal_available()
                 && Self::weights_on_gpu(model)
@@ -705,13 +711,13 @@ impl Qwen3Graph {
                 return crate::models::Device::Cuda;
             }
         }
-        #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+        #[cfg(not(any(all(target_os = "macos", feature = "metal"), feature = "cuda")))]
         let _ = model;
         crate::models::Device::Cpu
     }
 
     /// Every weight the graph reads must be GPU-registered for the Metal path.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     fn weights_on_gpu(model: &Qwen3Model) -> bool {
         // E5: only the offloaded blocks (and the unblocked tensors under a full plan) have to
         // be registered — see qwen2's twin.
@@ -757,14 +763,14 @@ impl Qwen3Graph {
             }
             v
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let Some(mps) = crate::metal::MpsState::get() else {
                 return false;
             };
             names.iter().all(|n| mps.has_weight(n))
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = names;
             false

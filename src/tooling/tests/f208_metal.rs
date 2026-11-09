@@ -63,7 +63,7 @@ fn f208_metal_greedy(
 /// `/tmp/f6-work/f208/`. The
 /// helper skips loudly (naming the path) when neither exists, the same shape as
 /// `env_path` in the parent module.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn f208_metal_fixture() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MINFER_F208_BF16_GGUF") {
         let p = std::path::PathBuf::from(p);
@@ -123,9 +123,9 @@ fn f208_metal_fixture() -> Option<std::path::PathBuf> {
 #[test]
 #[ignore = "requires a converted bf16 GGUF and a Metal device (#208)"]
 fn f208_bf16_weights_run_on_the_metal_device() {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     eprintln!("not a macOS build; #208's Metal gate is a no-op here");
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         use crate::graph::offload::OffloadRequest;
         use crate::graph::params::{CParams, GraphParams, GraphType};

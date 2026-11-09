@@ -854,7 +854,7 @@ fn forward_cached_isolates_kv_between_caches() {
 ///   a_windowed_prefill_is_not_materially_slower --nocapture`.
 ///
 /// [issue #44]: https://github.com/yusiwen/minfer/issues/44
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 #[ignore = "requires the cached 0.5B model and a Metal device"]
 fn a_windowed_prefill_is_not_materially_slower_than_the_causal_one() {

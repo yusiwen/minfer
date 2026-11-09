@@ -120,7 +120,7 @@ fn a_dropped_model_releases_its_mapping_and_fd() {
     // registration legitimately owns the pages (that is what makes the GPU read
     // them after the model is gone). Assert the CPU case; say so when it is not
     // the case rather than passing silently.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if crate::metal::MpsState::get().is_some() {
         eprintln!(
             "745: skipped — MPS is live in this process and its part registration \
@@ -169,7 +169,7 @@ fn a_dropped_model_releases_its_mapping_and_fd() {
 /// free to drop the `GgufModel` first.
 #[test]
 fn a_loaded_model_keeps_its_mapping_until_it_is_dropped() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if crate::metal::MpsState::get().is_some() {
         eprintln!("745: skipped — MPS's part registration holds the mapping on purpose");
         return;
@@ -223,7 +223,7 @@ fn a_loaded_model_keeps_its_mapping_until_it_is_dropped() {
 /// device registry can silently break.
 #[test]
 fn a_reload_after_a_forward_releases_the_mapping_and_loads_a_different_model() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if crate::metal::MpsState::get().is_some() {
         eprintln!("745: skipped — MPS's part registration holds each mapping on purpose");
         return;
@@ -356,7 +356,7 @@ fn a_reload_after_a_forward_releases_the_mapping_and_loads_a_different_model() {
 /// the first model's weights. The model fingerprint in [`GgufModel`] is what lets
 /// `register_weight` tell "reload of the same file" (reuse is correct) from "a
 /// different model" (copy).
-#[cfg(any(feature = "cuda", target_os = "macos"))]
+#[cfg(any(feature = "cuda", all(target_os = "macos", feature = "metal")))]
 fn toy_with_changed_weight(label: &str) -> std::path::PathBuf {
     let path = toy_gguf();
     let temp = std::env::temp_dir().join(format!("minfer-745-{label}-{}.gguf", std::process::id()));
@@ -757,7 +757,7 @@ fn a_cuda_release_is_retained_while_a_capture_is_live() {
 /// model + cache, not the model alone. This gate is the two-model shape #752 asks
 /// for: the first model's mapping and fd must be gone before the second model
 /// runs, and the second model must not reuse the first model's registration.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn macos_open_fds_to(path: &std::path::Path) -> usize {
     let pid = std::process::id().to_string();
     // `-d '^mem'` excludes lsof's memory-mapped-file rows: the mapping is not an
@@ -775,7 +775,7 @@ fn macos_open_fds_to(path: &std::path::Path) -> usize {
         .count()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn a_metal_reload_releases_the_first_mapping_and_runs_a_different_model() {
     crate::metal::MpsState::init();
@@ -894,7 +894,7 @@ fn a_metal_reload_releases_the_first_mapping_and_runs_a_different_model() {
 /// GGUFs), and `Layers(0)` keeps every forward on the CPU, so this measures the
 /// host mapping lifetime rather than a device copy. The tolerance covers
 /// allocator caches the process may retain; 128 MiB is far below either model.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "metal")))]
 #[test]
 #[ignore = "real models: set MINFER_RSS_TEST_MODEL_A and MINFER_RSS_TEST_MODEL_B"]
 fn a_real_model_reload_returns_rss_and_fds_to_baseline() {
@@ -1009,7 +1009,7 @@ fn rss_kib() -> u64 {
         .expect("VmRSS is a number of KiB")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn rss_kib() -> u64 {
     let out = std::process::Command::new("/bin/ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
@@ -1035,7 +1035,7 @@ fn open_fds_to(path: &std::path::Path) -> usize {
         .unwrap_or(0)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn open_fds_to(path: &std::path::Path) -> usize {
     macos_open_fds_to(path)
 }

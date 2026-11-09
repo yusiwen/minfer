@@ -8,7 +8,7 @@
 
 use super::*;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 /// #724: the `RopeFreqs` value to hand a kernel. "No scaling" is spelled as a
 /// zero table (`n == 0`) rather than an omitted argument, so the kernel's own
 /// branch — the same one the CPU reference takes — selects the unscaled formula.
