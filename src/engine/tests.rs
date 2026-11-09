@@ -27,3 +27,19 @@ fn a_missing_model_is_a_named_error() {
         .expect("a missing file must refuse");
     assert!(matches!(err, EngineError::Gguf(_)), "{err}");
 }
+
+/// #796: a clone shares the flag a generator checks, which is the only
+/// cross-thread invariant the type carries. The loop's behaviour is asserted
+/// from outside the crate (`tests/library_api.rs`): a generation here would
+/// size the process-global Qwen2 graph cache at the toy's `n_ctx`, poisoning
+/// the real-model gates in this same test binary (the reason `forward()`'s
+/// global cache is a known limitation, not a test detail).
+#[test]
+fn a_cancel_token_shares_its_flag_with_its_clones() {
+    let token = CancelToken::new();
+    let clone = token.clone();
+    assert!(!clone.is_cancelled(), "a fresh token is not cancelled");
+    token.cancel();
+    assert!(clone.is_cancelled(), "clones share one flag");
+    assert!(format!("{token:?}").contains("cancelled: true"));
+}

@@ -145,6 +145,13 @@ Three flags describe the run instead of changing how it decodes:
   prints `Graph JSON exported to <PATH> (<n> nodes, <kind>)`, where `<kind>` names the phase the
   graph was built for, and also exits before decoding.
 
+`Ctrl-C` during a run cancels it at the next token boundary: what was generated is already on
+stdout, the run prints `[cancelled] SIGINT — N of M requested tokens` and exits **130**. The check
+is between tokens, never inside a forward pass, so a signal that arrives during one is honoured at
+the next token. An embedding host gets the same seam as `GenerateParams.cancel` (a
+`minfer::engine::CancelToken`), and `GenerateOutcome.cancelled` says the run stopped that way
+([#796](https://github.com/yusiwen/minfer/issues/796)).
+
 ## Chat templates and tokenizer
 
 Chat rendering uses the model's own `tokenizer.chat_template` from the GGUF. The
