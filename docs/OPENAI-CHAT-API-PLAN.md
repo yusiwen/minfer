@@ -48,7 +48,7 @@
 > - `sampler::recent_window(tokens, 64)` — penalty-window helper (prompt-tail seeding).
 > - `sampler::match_stop_suffix(buf, stops) -> Option<usize>` — byte-wise suffix match, longest stop
 >   wins, empty stops ignored, multi-byte stops split across tokens handled (tested).
-> - CLI (`src/main.rs`): `--frequency-penalty`, `--presence-penalty`, repeatable `--stop <STR>`;
+> - CLI (`crates/minfer-cli/src/main.rs`): `--frequency-penalty`, `--presence-penalty`, repeatable `--stop <STR>`;
 >   generation output is byte-level (`decode_bytes`), so split multi-byte chars no longer produce
 >   U+FFFD (smoke-tested with Chinese text); stop strings truncate the emitted text (smoke-tested:
 >   `--stop " is"` stops and removes the stop string).
@@ -57,7 +57,7 @@
 > complete and smoke-tested end-to-end against the cached Qwen2.5-0.5B model:
 > - Dependencies: `axum` 0.7, `tokio` (rt-multi-thread/macros/sync/net), `tokio-stream`, `tower-http`
 >   (CORS), `uuid` (v4), `futures-util`; `ModelDef` is now `Send + Sync` (model moves into the worker).
-> - `src/server/`: `types.rs` (request/response types, llama.cpp-matching defaults, role/content
+> - `crates/minfer-cli/src/server/`: `types.rs` (request/response types, llama.cpp-matching defaults, role/content
 >   validation, `ApiError` with numeric `code`), `slot.rs` (per-slot `GraphCache` + `n_ctx_slot`
 >   division), `chat.rs` (serial worker loop: prefill → decode with penalties/stop/UTF-8-safe emit,
 >   `StreamEvent` backpressure over per-request channels), `mod.rs` (axum router + handlers).
@@ -170,7 +170,7 @@ Add an OpenAI-compatible HTTP server to minfer, enabling integration with existi
 | Sampler | `src/sampler.rs` | `apply_penalties`, `sample_with_penalties`, `recent_window`, `match_stop_suffix` — done (rev 4) |
 | Tokenizer | `src/tokenizer.rs` | `decode_bytes` + `complete_utf8_prefix_len` + `bos_text` |
 | KV Cache | Graph allocator persistent regions; per-slot via `forward_cached` | Ready |
-| **HTTP server** | `src/server/` (types/slot/chat/mod) | **done (rev 5)** — axum + tokio worker |
+| **HTTP server** | `crates/minfer-cli/src/server/` (types/slot/chat/mod) | **done (rev 5)** — axum + tokio worker |
 | **Request parser** | `src/server/types.rs` | **done (rev 5)** |
 | **Response formatter** | `src/server/types.rs` | **done (rev 5)** |
 | **Session manager** | `src/server/slot.rs` + `chat::worker_loop` | **done (rev 5)** |
@@ -354,7 +354,7 @@ be constrained; the remaining work is not another format row.
 ### Stop Strings
 
 `stop` is **not** implemented anywhere in minfer today (the CLI only stops on EOS / `<|im_end|>`,
-`src/main.rs:is_stop_token`). llama.cpp converts `stop` into `antiprompt` entries checked at the
+`crates/minfer-cli/src/main.rs:is_stop_token`). llama.cpp converts `stop` into `antiprompt` entries checked at the
 **text level** after each token (`tools/server/server-task.cpp`), truncating the emitted text at the
 stop string and reporting `stopping_word` in the response. Our generation loop must add:
 
@@ -858,7 +858,7 @@ Each slot contains (see the `Slot` struct in [Data Structures](#data-structures)
 - generated_tokens: list of generated token IDs
 - rng: independent StdRng, seeded from the request's `seed` (random when omitted)
 - prev_tokens: repetition-penalty window, **seeded with the last 64 prompt tokens at prefill** (the CLI
-  does this in `src/main.rs`; without it the first 64 generated tokens escape the penalty)
+  does this in `crates/minfer-cli/src/main.rs`; without it the first 64 generated tokens escape the penalty)
 - n_predict_max: max tokens to generate (-1 = no limit)
 - stop_strings / pending_bytes / incomplete_utf8: stop matching + UTF-8 buffering state
   (see [Streaming (SSE)](#streaming-sse))
@@ -1035,7 +1035,7 @@ cached Qwen2.5-0.5B model (stop truncation, penalties, Chinese output without U+
 1. Merge frequency/presence into the penalty pass: extend `apply_repetition_penalty` →
    `apply_penalties(logits, prev_tokens, repeat, freq, presence)` per the formula in
    [Sampling Parameters](#sampling-parameters); keep behavior identical when freq/presence are 0.
-2. `prev_tokens` seeding: extract the CLI's prompt-tail seeding (`src/main.rs`) into a helper the
+2. `prev_tokens` seeding: extract the CLI's prompt-tail seeding (`crates/minfer-cli/src/main.rs`) into a helper the
    server's slot prefill also calls.
 3. Stop-string matcher: implement byte-wise suffix matching over `pending_bytes`; unit-test with
    multi-byte stop strings split across tokens.

@@ -47,7 +47,7 @@
 |---|---|---|---|---|
 | P0 | Backend & scheduler init | Create Metal backend, MTLCommandQueue, kernel library, scheduler; pre-reserve compute buffers | `ggml-metal.cpp:689` `ggml-metal-context.m:84` `llama-context.cpp:581` `ggml-backend.cpp:1792` | `src/metal/ops.rs` (MpsState::try_new) |
 | P1 | Model loading / weight registration | Allocate Metal buffers per tensor and upload quantized weights | `llama-model.cpp:1401` `llama-model-loader.cpp:1426` `ggml-metal-device.m:1631` | `src/models/qwen2/loader.rs` + `src/metal/ops.rs` (register_weight) |
-| P2 | Batch preparation & microbatching | Split the API batch into micro-batches, reserve host output buffers | `llama-context.cpp:1635` `llama-batch.cpp:25` | `src/main.rs` (single batch, no split) "N/A" |
+| P2 | Batch preparation & microbatching | Split the API batch into micro-batches, reserve host output buffers | `llama-context.cpp:1635` `llama-batch.cpp:25` | `crates/minfer-cli/src/main.rs` (single batch, no split) "N/A" |
 | P3 | Compute graph build (Qwen2) | Build the ggml compute graph (DFS topological order) | `src/models/qwen2.cpp:53` `llama-graph.cpp` `ggml.c:7188` | `src/models/qwen2/graph.rs:448` (declarative graph build) |
 | P4 | Scheduler split & allocation | Assign nodes to backends, split into runs, gallocr allocation | `ggml-backend.cpp:1936`→`:1055` | "N/A" (single MPS backend, static buffers) |
 | P5 | Scheduler compute | Per-split: copy inputs, call backend graph_compute | `ggml-backend.cpp:1594` `ggml-metal.cpp:535` | `forward.rs:` (single CB, all layers) |

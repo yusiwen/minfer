@@ -98,7 +98,7 @@ Out of scope, and refused rather than approximated: `Q4_K_S`/`Q5_K_S`, imatrix, 
 
 - [`docs/GGUF-TOOLING.md`](../GGUF-TOOLING.md) §2.2 (the targets and the demotion rule) and
   §4.2.1 (the reference procedure and the measured histograms); §6 lists what is still absent.
-- [`src/quantize/mix.rs`](../../src/quantize/mix.rs) — the policy; [`src/convert.rs`](../../src/convert.rs)
+- [`src/quantize/mix.rs`](../../src/quantize/mix.rs) — the policy; [`src/convert.rs`](../../crates/minfer-cli/src/convert.rs)
   `QuantizePlan::plan` — the order; `src/tooling/tests/quantize_bounds.rs` — the two gates.
 - llama.cpp's quantizer: `llama_tensor_get_type_impl`, `tensor_get_category`, `use_more_bits` and
   `tensor_type_fallback` in its own src/llama-quant.cpp (read at `458681e1d`, the build the recorded

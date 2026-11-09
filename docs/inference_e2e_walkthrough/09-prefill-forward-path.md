@@ -12,7 +12,7 @@
 > `src/models/qwen2/graph.rs::forward` (L442) → `forward_cached` (L460, a wrapper)
 > → `forward_batch` (L484), `src/graph/params.rs` (`GraphParams` L88),
 > `src/trace.rs::begin_phase` (L70); the CLI's half is the call and the
-> presentation, `src/main.rs` (L1547–1754). Lines verified at commit `2204738`.
+> presentation, `crates/minfer-cli/src/main.rs` (L1547–1754). Lines verified at commit `2204738`.
 
 ## 1. Background — where this stage sits
 
@@ -31,11 +31,11 @@ the answer."
 
 The facade boundary is worth naming once, because it is what #763 changed:
 prefill and the decode loop are the engine's (`engine::generate`, called both by
-the CLI and by `Engine::generate`), while `src/main.rs` keeps only the
+the CLI and by `Engine::generate`), while `crates/minfer-cli/src/main.rs` keeps only the
 presentation — the chat template, the tokenizer, the think-block highlighter, the
 `on_prefill` hook that prints the `Prefill:` line, and the closing stats. A
 reader following this chapter's loop code lands in `src/engine/generate.rs`,
-never in `src/main.rs`.
+never in `crates/minfer-cli/src/main.rs`.
 
 The answer has a name: **logits**. The last operation of the network — the
 `lm_head` matrix multiply — produces one floating-point score per entry of the
@@ -367,7 +367,7 @@ from the decode side.
   node, same shape.
 - `n_out = 1` — the tail-row count (§2.4).
 - `ctx = max(p.n_ctx, nt)` — the KV region width for the whole run
-  (§2.5); the CLI's `params.n_ctx` defaults to 4096 (`src/main.rs:114`).
+  (§2.5); the CLI's `params.n_ctx` defaults to 4096 (`crates/minfer-cli/src/main.rs:114`).
 - `kv_cache` — **gone (#252)**. Until [#252] the call passed a legacy
   `KVCache` the CLI created at load; the graph path always **ignored** it (the
   callee bound it as `_kv`) and the graph owns KV in its persistent regions.
@@ -393,7 +393,7 @@ from the decode side.
 #### The prefill stage (`src/engine/generate.rs:` L75–126)
 
 The CLI builds `GenerateParams`, hands in the tokenizer and two closures, and
-calls `engine::generate` (`src/main.rs:1650-1669`). Everything below is inside
+calls `engine::generate` (`crates/minfer-cli/src/main.rs:1650-1669`). Everything below is inside
 that call — the engine's, not the CLI's:
 
 ```rust
@@ -450,8 +450,8 @@ Segment by segment, with the names the engine uses (`p.tokens` is the CLI's
 - `last_logits` renames the result and, under `trace_on`, attaches its top-5 to
   the prefill step (`:120-122`);
 - `on_prefill` (`:125-126`) hands the logits and the elapsed time back to the
-  caller: the CLI prints `Prefill: …` there (`src/main.rs:1570-1576`) and, with
-  `--dump-graph`, exits after exporting the graph (`src/main.rs:1577-1646`).
+  caller: the CLI prints `Prefill: …` there (`crates/minfer-cli/src/main.rs:1570-1576`) and, with
+  `--dump-graph`, exits after exporting the graph (`crates/minfer-cli/src/main.rs:1577-1646`).
 
 The `println!` that used to sit at the end of this block is now the caller's
 closure — which is the point of the split: the engine times the prefill, the
@@ -649,7 +649,7 @@ is the graph's own machine-facing class. Before #763 S6b the naming was the
 CLI's; the move put it beside the loop it describes.
 
 #### The timing calibers (`src/engine/generate.rs:136`, `:173`, `:195`; prints in
-`src/main.rs:1571-1576`, `:1743-1761`)
+`crates/minfer-cli/src/main.rs:1571-1576`, `:1743-1761`)
 
 Three stopwatches, three printed calibers — and the differences between them
 are the point:
@@ -817,7 +817,7 @@ slice?** §2.6 gave the mechanics; the ownership-shaped summary:
   `forward` call; the speculative round loop accumulates forward time at
   `:228-231` — "CPU encode + GPU exec + logits download" per the comment). The
   engine returns the totals in `GenerateOutcome::timing`, and the CLI prints one
-  line (`src/main.rs:1691-1695`), e.g. `[MINFER_TIMING] over 512 tokens:
+  line (`crates/minfer-cli/src/main.rs:1691-1695`), e.g. `[MINFER_TIMING] over 512 tokens:
   sample 0.02 ms/tok (1.2%), forward 3.30 ms/tok (98.8%)`. One
   paragraph is all it needs: it exists to answer "is my decode time
   *inference* or *sampling/streaming*?" — on every model in the support

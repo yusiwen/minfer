@@ -174,8 +174,12 @@ def check(root: str = DEFAULT_ROOT) -> list[str]:
     lib_root = os.path.join(root, LIB_ROOT)
     if lib_root in known:
         roots.append(lib_root)
+    # A package may be library-only: since Phase 2 (#805) the engine's root has
+    # `lib.rs` and no `main.rs` (the binary lives in `crates/minfer-cli`), so a
+    # missing `main.rs` is not an error when the library root exists.
     if not any(r in known for r in roots):
-        return problems + [f"{crate_root}: crate root missing"]
+        return problems + [f"{root}: neither {CRATE_ROOT} nor {LIB_ROOT} exists"]
+    roots = [r for r in roots if r in known]
 
     seen: set[str] = set()
     stack = list(roots)

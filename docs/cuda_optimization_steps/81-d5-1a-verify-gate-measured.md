@@ -64,7 +64,7 @@ the graph-level dispatch never does.
 
 ### 3.1 The instrument — `minfer specverify`
 
-New subcommand (`src/spec_verify.rs`), the only code D5-1a lands. It drives
+New subcommand (`crates/minfer-cli/src/spec_verify.rs`), the only code D5-1a lands. It drives
 the existing generic primitive `forward_graph_cached(tokens, positions,
 n_out)` — at `nt > 1` the CUDA backend already dispatches the batched path
 (MMQ GEMM + full attention; the decode-only MMVQ / FusedQKV / FusedFFN /

@@ -71,4 +71,4 @@ converts. Both stale comments in cuda.rs corrected.
 ## Files
 
 - `src/device_tier.rs` (new), `src/cuda.rs` (fields, init, gate, comments),
-  `src/main.rs` (module decl).
+  `crates/minfer-cli/src/main.rs` (module decl).

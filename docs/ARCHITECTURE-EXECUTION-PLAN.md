@@ -6616,7 +6616,7 @@ an assertion; every deletion is a no-caller item", and the evidence form is the 
 the one bucket-A item that lives only behind `target_os = "macos"`, and it was kept for that reason —
 `build-macos` compiles the library, not the macOS-gated tests, so nothing in CI would have caught a
 deletion of it. (2) `--features debug_dump` was not built; every bucket-A name was grepped against
-its gated code (`src/dump.rs`, `src/quants.rs`, `src/main.rs`) and none appears there. (3) The
+its gated code (`src/dump.rs`, `src/quants.rs`, `crates/minfer-cli/src/main.rs`) and none appears there. (3) The
 counted census is a `cargo check`: a "caller" is a compile-time reference, not a verified runtime
 exercise; the suites above are the independent runtime check. (4) The real-model gate sets were not
 re-run (no test in that set was touched); their rows remain dated 2026-09-27.
@@ -6655,7 +6655,7 @@ their dead items are outside bucket D by construction.
 | disposition | items |
 |---|---|
 | tightened to `#[cfg_attr(not(feature = "cuda"), allow(dead_code))]` | `GraphAllocator::kv_format` (`src/graph/alloc.rs`) — the only bucket-D item still bare |
-| already precise, module-level form, no edit | `DeviceKey`, `Provenance`, `TIERS`, `GENERIC`, `llama_key`, `Selected`, `select`, `select_forced`, `family_row`, `select_by_key` — `#[cfg_attr(not(feature = "cuda"), allow(dead_code))] mod device_tier;` (`src/main.rs`); `OffloadPlan::allows_weight` — `#[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))] pub mod offload;` (`src/graph/mod.rs`); `CudaWeightReg` + `cuda_weight_reg` — `#![cfg_attr(not(feature = "cuda"), allow(dead_code))]` (`src/models/weight_reg.rs`); `q4k_dsc_payload_bytes` + `q4k_dsc_payload_ok` + `q4k_dsc_plane_admitted` — the same inner form (`src/q4k_dsc.rs`) |
+| already precise, module-level form, no edit | `DeviceKey`, `Provenance`, `TIERS`, `GENERIC`, `llama_key`, `Selected`, `select`, `select_forced`, `family_row`, `select_by_key` — `#[cfg_attr(not(feature = "cuda"), allow(dead_code))] mod device_tier;` (`crates/minfer-cli/src/main.rs`); `OffloadPlan::allows_weight` — `#[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))] pub mod offload;` (`src/graph/mod.rs`); `CudaWeightReg` + `cuda_weight_reg` — `#![cfg_attr(not(feature = "cuda"), allow(dead_code))]` (`src/models/weight_reg.rs`); `q4k_dsc_payload_bytes` + `q4k_dsc_payload_ok` + `q4k_dsc_plane_admitted` — the same inner form (`src/q4k_dsc.rs`) |
 | already precise, item-level form, no edit | `DeviceMemory::{Reported.free, QueryFailed.code}` — `#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]` (`src/graph/allocplan.rs`) |
 | explicitly kept, naming [#244](https://github.com/yusiwen/minfer/issues/244) | `Vendor`, `QClass`, `DeviceTier` (`src/device_tier.rs`) — their bare item-level `#[allow(dead_code)]` is load-bearing for [#244](https://github.com/yusiwen/minfer/issues/244)'s never-constructed members in the **cuda** build (`Vendor::{Amd,Mthreads,Apple}`, `QClass::Other`, `DeviceTier::{source,mmvq_batch_default,mmvq_batch_by_type}`). Tightening the containing item to `not(feature = "cuda")` would expose exactly those members and break the warning-free cuda build; giving each its own note is [#244](https://github.com/yusiwen/minfer/issues/244)'s decision, so this ticket does not pre-empt it and a comment records the coupling on that issue. |
 
@@ -7397,14 +7397,14 @@ branch point (`bef4bd9`), not trusted from the ticket: `git grep -n 'KVCache' sr
 | what | site before | change |
 |---|---|---|
 | the marker type | `src/cache.rs` (31 lines: `pub struct KVCache;`, `KVCache::new`) | **file deleted** |
-| its declaration | `src/main.rs:13` `mod cache;` | deleted (with the file, so `check_source_layout.py` stays consistent) |
+| its declaration | `crates/minfer-cli/src/main.rs:13` `mod cache;` | deleted (with the file, so `check_source_layout.py` stays consistent) |
 | the trait declaration | `src/models/mod.rs:207` (`kv` at `:211`) | `kv: &mut KVCache` removed; doc comment updated |
 | the default `forward_graph` | `src/models/mod.rs:264` (`kv` at `:268`) | `kv` removed from the signature and the delegation |
 | Qwen2 impls | `src/models/qwen2/mod.rs:56`/`:97` (`kv` at `:60`/`:101`) | both removed; `use crate::cache::KVCache;` gone |
 | Qwen3 impls | `src/models/qwen3/mod.rs:48`/`:89` (`kv` at `:52`/`:93`) | both removed; `use crate::cache::KVCache;` gone |
 | graph entry points | `src/models/qwen2/graph.rs:435`, `src/models/qwen3/graph.rs:380` | `_kv: &mut KVCache` removed from `forward`; imports gone |
-| CLI construction | `src/main.rs:1298` (`KVCache::new`) | deleted, with the then-unused `n_kv_embd`/`n_layer` locals |
-| CLI forwards | `src/main.rs:1567`, `:1788` | argument dropped |
+| CLI construction | `crates/minfer-cli/src/main.rs:1298` (`KVCache::new`) | deleted, with the then-unused `n_kv_embd`/`n_layer` locals |
+| CLI forwards | `crates/minfer-cli/src/main.rs:1567`, `:1788` | argument dropped |
 | test construction | `src/models/qwen2/graph/tests.rs:2978/3019/3023` | `KVCache::new` calls and arguments dropped |
 | test mock | `src/server/batch/tests.rs:1794` (`FailingForward::forward`) | `_kv` parameter dropped |
 
@@ -11622,7 +11622,7 @@ Every path that exists is preserved.
 `not reachable from src/main.rs — no `mod` declaration names it, so it is never compiled (tests in it would silently not run)`.
 Deleting `pub use pool::{cpu_threads, par_for, set_cpu_threads};` → `cargo check --release` exits 101
 with `error[E0425]: cannot find function `set_cpu_threads` in module `crate::kernel`` at
-`src/bench.rs:138:36` and the note `function `crate::kernel::pool::set_cpu_threads` exists but is
+`crates/minfer-cli/src/bench.rs:138:36` and the note `function `crate::kernel::pool::set_cpu_threads` exists but is
 inaccessible`. Both reverted, exit 0.
 
 **#264 is complete.** `src/quants.rs` 1,340 → 61 + 9 parts (+ the extracted `neon_correctness.rs` 138),
@@ -11768,7 +11768,7 @@ figures were corrected by Step 0 and re-corrected here where #262/#267 invalidat
 **Deliberately out of scope (the Mac round).** [#265](https://github.com/yusiwen/minfer/issues/265)
 (Step 4: `src/metal.rs`/`src/metal.metal` → `src/metal/{runtime,encode,ops,policy}.rs` +
 `src/metal/kernels/*.metal`) and [#53](https://github.com/yusiwen/minfer/issues/53)'s Metal
-`DeviceMemory` answer — the second implementation the `common` rule waits on. `src/main.rs` gates the
+`DeviceMemory` answer — the second implementation the `common` rule waits on. `crates/minfer-cli/src/main.rs` gates the
 whole Metal module on `target_os`, so no Linux build or CI job can compile it. The `common` decision
 is therefore **not taken**: plan §1.3 records the pre-analysis (the type and the policy are already in
 the device-agnostic `allocplan`/`offload`; the device answer has one implementation,
@@ -11879,7 +11879,7 @@ job's `cargo test --release --features cuda --no-run`.
 **The ticket.** [#265](https://github.com/yusiwen/minfer/issues/265) is Step 4 of the source-layout
 campaign: split `src/metal.rs` (2 472 lines at `a7fc07e`) into `src/metal/{runtime,encode,ops,policy}.rs`
 and `src/metal.metal` (5 151 lines) into `src/metal/kernels/*.metal` + `*.h`. It is a Mac-local task —
-`src/main.rs` gates the module on `target_os` — and the ticket's Addendum 2 (2026-10-05) required three
+`crates/minfer-cli/src/main.rs` gates the module on `target_os` — and the ticket's Addendum 2 (2026-10-05) required three
 increments, each verified on the Mac, rather than one step. Box
 `macbook (macOS 27.0.1, Apple M4 Pro)`, toolchain pinned at `1.97.1` (`RUSTUP_TOOLCHAIN` unset),
 worktree `.worktrees/265` branched from the landed [#255](https://github.com/yusiwen/minfer/issues/255).

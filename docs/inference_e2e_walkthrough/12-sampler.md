@@ -8,7 +8,7 @@
 > **Code**: `src/sampler.rs` (`apply_penalties` :71, `recent_window` :108,
 > `match_stop_suffix` :120, `apply_top_k` :141, `apply_top_p` :165,
 > `sample_temperature` :242, `sample_with_config` :1181) and its call site,
-> the decode loop in `src/main.rs` :1553–1791 (`GenParams` defaults :73–140,
+> the decode loop in `crates/minfer-cli/src/main.rs` :1553–1791 (`GenParams` defaults :73–140,
 > seeded RNG :1566, sampling call :1729–1744, stop gates :1749–1768,
 > `is_stop_token` :1868) — lines verified at commit `15fa45c`.
 
@@ -25,7 +25,7 @@ depends on the model, the quantization, even the layer's final RMSNorm gain).
 For the Qwen family the vocabulary has **151,936** entries, so what this
 stage receives is a `Vec<f32>` with 151,936 elements — 151,936 × 4 bytes =
 607,744 bytes ≈ **0.6 MB** of scores (the `607 KB` the code comment at
-`src/main.rs:925-926` refers to).
+`crates/minfer-cli/src/main.rs:925-926` refers to).
 
 The sampler's whole job is to turn that list into one `u32` token id. That
 sounds trivially small next to the transformer's billions of multiplies, and
@@ -45,7 +45,7 @@ Three quiet facts shape the design:
    penalties need to know which tokens appeared recently. That means the
    decode loop keeps a sliding window of the last 64 token ids — seeded from
    the prompt's tail — and passes it in alongside the logits
-   (`src/main.rs:843-848`).
+   (`crates/minfer-cli/src/main.rs:843-848`).
 3. **"Stop generating" is a sampling-adjacent concern.** After a token is
    chosen, three gates decide whether generation ends: the token is the
    end-of-text sentinel (eos or `<|im_end|>`, doc 04), the generated *byte
@@ -138,7 +138,7 @@ is: **always take the highest-probability token**. That is called **greedy
 decoding** (or *argmax sampling* — "argmax" means "the index of the
 maximum"). It is fully deterministic and it is the right default for
 benchmarking and correctness gates — minfer's own `bench` uses it
-(`src/bench.rs:24,384`), and the CUDA optimization campaign's second gate is
+(`crates/minfer-cli/src/bench.rs:24,384`), and the CUDA optimization campaign's second gate is
 "greedy byte-for-byte identity" before/after a kernel change
 (`docs/cuda_optimization_steps/77-verification-methodology.md` §2.2).
 
@@ -154,7 +154,7 @@ sometimes wins, which is exactly the escape hatch that breaks loops and
 gives the model its range of phrasing. The trade is coherence for diversity;
 **temperature** (§2.6) is the dial between the two, and the dial's zero stop
 is greedy itself — `--greedy` in the CLI is literally `--temp 0`
-(`src/main.rs:`), and `sample_temperature` returns the argmax when
+(`crates/minfer-cli/src/main.rs:`), and `sample_temperature` returns the argmax when
 `temp < 1e-6` (`src/sampler.rs:`). Greedy is not a different
 algorithm here; it is a degenerate temperature.
 
@@ -320,7 +320,7 @@ picks one. Three sub-steps, all in `sample_temperature`
    (`src/sampler.rs:`). The dart comes from `rng.gen()` — one
    uniform `f32` in [0, 1) per generated token — from a **seeded** random
    number generator: `StdRng::seed_from_u64(params.seed)`, default seed 42
-   (`src/main.rs:1701`). A *seed* is the starting state of a pseudo-random
+   (`crates/minfer-cli/src/main.rs:1701`). A *seed* is the starting state of a pseudo-random
    generator: same seed in, same sequence of "random" numbers out — which
    is why the same command produces the same text even while sampling
    (§3.3's fourth design question covers why minfer wants that).
@@ -328,7 +328,7 @@ picks one. Three sub-steps, all in `sample_temperature`
 ### 2.7 Stopping: when does generation end?
 
 The sampler produces a token; the loop decides whether to keep going. Three
-gates, checked in this order each step (`src/main.rs:`):
+gates, checked in this order each step (`crates/minfer-cli/src/main.rs:`):
 
 1. **Stop tokens.** `is_stop_token(id, &special)` — true when the sampled id
    equals the model's **eos** (end of sequence) token or `<|im_end|>` (doc
@@ -362,7 +362,7 @@ finds every possible match exactly once, in O(len(stop)) time.
 | Value | Type / shape | From |
 |---|---|---|
 | `logits` | `&mut Vec<f32>`, exactly `n_vocab` entries (151,936 for Qwen ≈ 0.6 MB) | the last forward (docs 09–11); prefill for the first step, one-token decode for every later step |
-| `params.temp` | `f32`, default 0.8 (0 = greedy) | `GenParams` (`src/main.rs:42`) |
+| `params.temp` | `f32`, default 0.8 (0 = greedy) | `GenParams` (`crates/minfer-cli/src/main.rs:49`) |
 | `params.top_k` | `usize`, default 40 | :68 |
 | `params.top_p` | `f32`, default 0.95 | :69 |
 | `params.repeat_penalty` | `f32`, default 1.1 | :70 |
@@ -381,7 +381,7 @@ struct — no full-vocab copy crosses the sampler boundary, and no second
 buffer needs to stay alive per token. Why that shape matters is design
 question 5 in §3.3.
 
-**After the call** (still inside one loop iteration, `src/main.rs:`):
+**After the call** (still inside one loop iteration, `crates/minfer-cli/src/main.rs:`):
 stop-token gate → `generated.push(id)` + window update → decode to bytes
 into `full` → stop-string gate → stream newly finished bytes → next forward.
 
@@ -394,7 +394,7 @@ the stage order, elided only where a stage is long; the order *is* the design:
 
 ```rust
 // src/sampler.rs:1067 — the pipeline; `sample_with_config` (:1181) is the
-// unconstrained wrapper the CLI calls (`src/main.rs:1754`)
+// unconstrained wrapper the CLI calls (`crates/minfer-cli/src/main.rs:1754`)
 pub fn sample_with_config_grammar<R: Rng>(
     logits: &mut [f32], cfg: &SamplerConfig, prev_tokens: &[u32],
     mirostat: &mut MirostatState, grammar: &mut Option<GrammarState>,
@@ -724,7 +724,7 @@ The gates run immediately after sampling, before anything is appended:
         }
 ```
 
-`is_stop_token` is the two-line sentinel (`src/main.rs:1021-1023`):
+`is_stop_token` is the two-line sentinel (`crates/minfer-cli/src/main.rs:1021-1023`):
 
 ```rust
 fn is_stop_token(id: u32, special: &models::SpecialTokens) -> bool {
@@ -754,7 +754,7 @@ pub fn match_stop_suffix(buf: &[u8], stops: &[&[u8]]) -> Option<usize> {
 "Earliest start wins" means the *longest* applicable stop string decides
 where to cut (a later start truncates less text). The bytes already flushed
 to the terminal before the match completed are not un-printed — that is the
-llama.cpp antiprompt behavior the comment at `src/main.rs:850-854` describes,
+llama.cpp antiprompt behavior the comment at `crates/minfer-cli/src/main.rs:850-854` describes,
 and it is why `full` (everything generated) and `emitted` (everything
 streamed) are tracked as separate cursors.
 
@@ -768,7 +768,7 @@ self-reinforcing basin where the most likely token after a repetition is
 the same repetition. Multinomial sampling injects exactly enough noise to
 escape those basins while staying biased toward good tokens (a 0.73-likely
 token still wins 73% of the time); temperature is the coherence-vs-diversity
-dial and greedy its zero point (`--greedy`, `src/main.rs:`). The
+dial and greedy its zero point (`--greedy`, `crates/minfer-cli/src/main.rs:`). The
 composition minfer chose matters as much as the mechanism: penalties apply
 in *both* modes (a repeated token can lose the argmax), so even greedy
 output is loop-resistant — the default 1.1 penalty does real work in every
@@ -854,7 +854,7 @@ parity tests rather than trusting either alone.)
 obvious alternative — `let probs = sampler::sample(logits.clone(), …)` or
 returning a new `Vec` — buys a full-vocab copy per token for zero benefit.
 The arithmetic: 151,936 × 4 B = 607,744 B ≈ 0.6 MB per generated token,
-which is precisely the copy the call-site comment at `src/main.rs:925-926`
+which is precisely the copy the call-site comment at `crates/minfer-cli/src/main.rs:925-926`
 brags about not making ("move the Vec in place instead of copying 607
 KB/token") for the *forward* boundary — the sampler boundary gets the same
 treatment. The ownership dance that makes it work: `logits` starts as the
@@ -925,7 +925,7 @@ run even when the stochastic stages are skipped.
 - **The sampler destroys its input buffer** (it holds probabilities after
   `sample_temperature`). The caller-side invariant that makes this safe:
   `logits` is reassigned from the next forward before it is ever read
-  again (`src/main.rs:1950`). Reading `logits` between sample and reassign
+  again (`crates/minfer-cli/src/main.rs:1950`). Reading `logits` between sample and reassign
   would read probabilities and call them logits.
 
 ## 4. Observe & verify
@@ -936,7 +936,7 @@ run even when the stochastic stages are skipped.
   selection, a ≤40-entry softmax, and one draw.
 - **`MINFER_TRACE=<path>`** — the decode loop attaches each sampled token's
   id and decoded text to the trace (`crate::trace::set_token`,
-  `src/main.rs:927-931`); the viz page shows the token stream the sampler
+  `crates/minfer-cli/src/main.rs:927-931`); the viz page shows the token stream the sampler
   produced.
 - **The reproducibility experiment** — run the same command twice, e.g.
   `./target/release/minfer qwen2.5-0.5b-instruct-q4_0 "Tell me a story" -n 24`:
@@ -945,7 +945,7 @@ run even when the stochastic stages are skipped.
   observations is the seeded-sampler contract, live.
 - **Greedy mode** — `--greedy` (or `--temp 0`) runs the penalty pass +
   argmax; `bench` subcommand output is produced this way
-  (`src/bench.rs:24`) so throughput numbers measure the engine, not the
+  (`crates/minfer-cli/src/bench.rs:24`) so throughput numbers measure the engine, not the
   lottery.
 - **Stop strings** — `--stop` with a string that straddles tokens, e.g.
   `--stop "the mat"` against a prompt that will produce it; the output ends

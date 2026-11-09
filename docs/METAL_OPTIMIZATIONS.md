@@ -189,7 +189,7 @@ MINFER_CACHE_TYPE=f16 ./target/release/minfer bench -p 430 -n 128 -r 3 <Q8_0 mod
 llama.cpp (the 2026-08-17 pair used `minfer --greedy` vs `llama-bench -b 512 -t 8`;
 kept here — `minfer bench` is the current harness: `pp` times the prefill alone, and
 `tg` runs `P` prefill tokens and then times **only** the `n_gen` decode steps (the
-prefill happens before the timer in `src/bench.rs`'s `decode_once`), which is
+prefill happens before the timer in `crates/minfer-cli/src/bench.rs`'s `decode_once`), which is
 `llama-bench`'s `tg` caliber — the direct analogue of the old `Generated:`
 pure-decode number, not a prefill-inclusive average; both harnesses do a warmup pass
 before the measured reps and report a mean over `-r 3`):
@@ -1585,7 +1585,7 @@ it.
 download all operate on `n_out` rows (n_out=1 for the minfer CLI). Host:
 `src/models/qwen2/forward.rs` (GPU `output_norm_gpu(…, n_out, …)`, CUDA path,
 CPU fallback slices `hidden[(nt-n_out)*ne..]`), `src/metal/runtime.rs` +
-`rms_norm(.., off)` byte-offset, `src/main.rs` passes `n_out=1`.
+`rms_norm(.., off)` byte-offset, `crates/minfer-cli/src/main.rs` passes `n_out=1`.
 
 **Measured** (7B Q4_K_M pp495, interleaved A/B same window):
 - GPU submit-wait: pre ~1354 (noisy 1354-2754) → post **1253-1271 ms** (stable)

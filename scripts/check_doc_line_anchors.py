@@ -665,7 +665,7 @@ class Checker:
         if self._src_text is None:
             chunks = []
             for rel in self.paths:
-                if rel.startswith("src/"):
+                if rel.startswith(("src/", "crates/")):
                     chunks.append(
                         (self.root / rel).read_text(encoding="utf-8", errors="replace")
                     )
@@ -683,7 +683,7 @@ class Checker:
         if self._test_defs is None:
             chunks = []
             for rel in self.paths:
-                if rel.startswith(("src/", "tests/")):
+                if rel.startswith(("src/", "tests/", "crates/")):
                     chunks.append(
                         (self.root / rel).read_text(encoding="utf-8", errors="replace")
                     )

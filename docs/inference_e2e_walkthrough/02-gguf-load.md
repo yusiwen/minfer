@@ -5,7 +5,7 @@
 > model dispatch + weight registration ([03](03-model-dispatch-weights.md)).
 > **Code**: `src/gguf.rs` — `load_gguf_model` (line 1998), `GgufContext::init_from_reader`
 > (line 1021), `MmapFile` (line 1866), `ggml_pad` (line 328); call site
-> `src/main.rs` line 579. Block layouts: `src/block.rs`.
+> `crates/minfer-cli/src/main.rs` line 579. Block layouts: `src/block.rs`.
 
 ## 1. Background — where this stage sits
 
@@ -1069,11 +1069,11 @@ redundancy is an assertion.
 
 ## 4. Observe & verify
 
-- **`minfer info <model>`** (`src/main.rs:1028`) runs this exact stage and
+- **`minfer info <model>`** (`crates/minfer-cli/src/main.rs:1028`) runs this exact stage and
   dumps its output instead of continuing: you get the full metadata KV dump
-  (`dump_gguf_metadata`, `src/main.rs:2279` — every key with its type and
+  (`dump_gguf_metadata`, `crates/minfer-cli/src/main.rs:2286` — every key with its type and
   value, arrays itemized) followed by `dump_key_tensors`' name/type/shape
-  table (`src/main.rs:2334`). On the 0.5B Q4_0 file: `n_kv=26`, `n_tensors=291`,
+  table (`crates/minfer-cli/src/main.rs:2334`). On the 0.5B Q4_0 file: `n_kv=26`, `n_tensors=291`,
   `general.architecture = "qwen2"`, `qwen2.block_count = 24`,
   `output.weight` q8_0 `[896,151936]`, `token_embd.weight` q4_0 `[896,151936]`.
 - **The normal startup lines** are this stage's stdout: `Loading model: …`,
@@ -1081,9 +1081,9 @@ redundancy is an assertion.
   `GGUF: 26 KV, 291 tensors` (line 634), then `Model loaded.` after doc 03.
   On a split you'll see `in 2 part(s)`; the number printed is the sum of the
   parts.
-- **`--meta` takes the same printer on a normal run** (`src/main.rs:1257`);
+- **`--meta` takes the same printer on a normal run** (`crates/minfer-cli/src/main.rs:1257`);
   without it the run prints the one-line `GGUF: N KV, M tensors`
-  (`src/main.rs:1259`) the transcript above shows.
+  (`crates/minfer-cli/src/main.rs:1259`) the transcript above shows.
 - **Unit tests**: `cargo test gguf` runs the split-pattern tests
   (`split_file_info_parses_pattern` at line 2059,
   `resolve_splits_builds_all_parts` at line 2078) — the filename grammar and
