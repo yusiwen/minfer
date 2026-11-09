@@ -57,7 +57,7 @@ pub const SUPPORTED_TARGETS: &str =
 /// itself rather than over one hand-picked name: #616 was a gate that pinned
 /// `q4_K` as unencodable and silently became a false assumption once the
 /// K-quant encoders landed (#140), in a gate CI never runs.
-pub(crate) const KNOWN_UNSUPPORTED: &[&str] = &[
+pub const KNOWN_UNSUPPORTED: &[&str] = &[
     "q2_K", "q3_K", "q8_K", "q8_1", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl", "iq3_s",
     "iq2_s", "iq4_xs", "iq1_m", "tq1_0", "tq2_0", "mxfp4", "nvfp4", "q1_0", "bf16", "f64", "i8",
     "i16", "i32", "i64",
@@ -370,18 +370,19 @@ pub enum FmaContract {
     /// and vectorization choices (§4.2.1). Only the F6 parity gate's provenance
     /// probe constructs it (`src/tooling/tests/quantize_bounds.rs`), so it is
     /// scoped to the test build rather than annotated with an `allow`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     Off,
 }
 
 /// `a*b + c` under an explicit [`FmaContract`]. The `Fast` arm is the
-/// production arithmetic (`f32::mul_add`); the `Off` arm exists only in the
-/// test build, so a non-test build has exactly one arm and no choice to make.
+/// production arithmetic (`f32::mul_add`); the `Off` arm exists only under
+/// `cfg(test)` or the `test-hooks` feature (#805), so a production build has
+/// exactly one arm and no choice to make.
 #[inline]
 fn fma(contract: FmaContract, a: f32, b: f32, c: f32) -> f32 {
     match contract {
         FmaContract::Fast => a.mul_add(b, c),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         FmaContract::Off => a * b + c,
     }
 }

@@ -852,9 +852,9 @@ impl CudaState {
     /// `(name, bytes)`. The plane's only consumer is the NB-BT q4_K kernel, so this is
     /// the exact set of device buffers a load that is *not* q4_K must leave empty — the
     /// registry query the #165 gate and its before/after accounting read by name.
-    /// Test-only (#238): driven by `graph::cuda_backend::tests::weights::cuda_q4dsc_plane_is_q4k_only and tooling::tests::f167_qwen3_q4k_registers_the_dsc_plane_exactly`; `#[cfg(test)]` keeps it out of production builds.
-    #[cfg(test)]
-    pub(crate) fn q4dsc_planes(&self) -> Vec<(String, usize)> {
+    /// Test-only (#238): driven by `graph::cuda_backend::tests::weights::cuda_q4dsc_plane_is_q4k_only and tooling::tests::f167_qwen3_q4k_registers_the_dsc_plane_exactly`; gated by `cfg(test)` or the `test-hooks` feature (#805), so it stays out of production builds.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn q4dsc_planes(&self) -> Vec<(String, usize)> {
         self.weights
             .lock()
             .unwrap()
@@ -892,9 +892,9 @@ impl CudaState {
     /// decode), so this performs exactly that lookup rather than looking the sibling name
     /// up in the registry — which is the part a name-only assertion cannot see. `None`
     /// when the weight is not registered at all.
-    /// Test-only (#238): driven by `tooling::tests::f167_qwen3_q4k_registers_the_dsc_plane_exactly`; `#[cfg(test)]` keeps it out of production builds.
-    #[cfg(test)]
-    pub(crate) fn q4dsc_plane_for(&self, name: &str) -> Option<*mut std::ffi::c_void> {
+    /// Test-only (#238): driven by `tooling::tests::f167_qwen3_q4k_registers_the_dsc_plane_exactly`; gated by `cfg(test)` or the `test-hooks` feature (#805), so it stays out of production builds.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn q4dsc_plane_for(&self, name: &str) -> Option<*mut std::ffi::c_void> {
         let wp = self.get_weight_ptr(name)?;
         if wp.is_null() {
             return None;

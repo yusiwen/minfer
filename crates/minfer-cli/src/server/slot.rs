@@ -1,0 +1,48 @@
+//! Slot management: per-slot `GraphCache` (KV regions) + context budget.
+//! OPENAI-CHAT-API-PLAN.md §Slot Management — each slot owns its own graph +
+//! allocator + persistent KV regions; `n_ctx` is divided equally among slots.
+
+use minfer::advanced::GraphCache;
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum SlotState {
+    Idle,
+    Processing,
+}
+
+/// One inference slot. Only ever touched by the serial worker thread, so no
+/// locking is needed; the queue provides concurrency between requests.
+// The `id: usize` field was deleted in [#244]: the worker addresses slots
+// positionally, no diagnostic ever printed it, and "future routing" is the
+// future-consumer justification the plan's A7 note rejects.
+//
+// [#244]: https://github.com/yusiwen/minfer/issues/244
+pub struct Slot {
+    pub state: SlotState,
+    pub cache: GraphCache,
+    /// B2: the token sequence the slot's KV rows currently hold — row `i` holds
+    /// `cached_tokens[i]`. Kept in lockstep with the KV writes (the prefill and
+    /// every committed decode token) so the next request can reuse the cache
+    /// when its prompt starts with exactly this sequence, and prefills from
+    /// position 0 otherwise. Cleared on any error, because a failed request may
+    /// have written part of a row.
+    pub cached_tokens: Vec<u32>,
+    pub n_ctx_slot: usize,
+}
+
+/// Build `n_slots` slots dividing `n_ctx_total` equally
+/// (n_ctx_slot = n_ctx_total / n_slots; llama.cpp `--parallel` semantics).
+pub fn new_slots(n_slots: usize, n_ctx_total: usize) -> Vec<Slot> {
+    let per = n_ctx_total / n_slots.max(1);
+    (0..n_slots)
+        .map(|_| Slot {
+            state: SlotState::Idle,
+            cache: GraphCache::new(),
+            cached_tokens: Vec::new(),
+            n_ctx_slot: per,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,1033 @@
+//! Chat generation loop (worker side) + streaming events.
+//! OPENAI-CHAT-API-PLAN.md §Streaming, §Slot Management, Implementation Plan
+//! Phase 3/4: serial execution on a dedicated worker thread; per-request
+//! `tokio::sync::mpsc` channels give natural backpressure; UTF-8-safe
+//! incremental decoding and stop-string truncation happen here, before any
+//! chunk is emitted.
+
+use rand::SeedableRng;
+use tokio::sync::mpsc;
+
+use crate::server::slot::{Slot, SlotState};
+use crate::server::types::{ApiError, SamplingParams};
+use minfer::advanced::GraphCache;
+use minfer::advanced::Tokenizer;
+use minfer::models::{ModelDef, SpecialTokens};
+
+/// Per-request event stream pushed by the worker to the HTTP handler.
+pub enum StreamEvent {
+    /// A UTF-8-safe text chunk (never ends mid-character).
+    Text(String),
+    /// Generation finished: reason is "stop" or "length"; `tokens` is the
+    /// exact completion-token count (for `usage`).
+    Finish { reason: String, tokens: usize },
+    /// Terminal error (ApiError carries status/type for the HTTP response).
+    Err(ApiError),
+}
+
+/// One queued inference task. `input_ids` is the rendered+tokenized prompt
+/// (the handler tokenizes so context-overflow checks happen before queuing).
+#[derive(Clone)]
+pub struct Job {
+    /// #726: the request id the client sees (`chatcmpl-…`), carried into the
+    /// worker so `request.admitted` and `request.finished` name the same
+    /// request. Tests that do not read the log leave it empty.
+    pub id: String,
+    /// #726: when the handler queued the request — the finished line's `ms`
+    /// measures from here, so it includes the wait and the prefill.
+    pub admitted: std::time::Instant,
+    pub input_ids: Vec<u32>,
+    pub params: SamplingParams,
+    pub tx: mpsc::Sender<StreamEvent>,
+}
+
+pub(crate) fn is_stop_token(id: u32, special: &SpecialTokens) -> bool {
+    special.is_stop(id)
+}
+
+/// B2: length of the common token prefix of the slot's recorded sequence and
+/// the incoming prompt.
+///
+/// Prefix reuse is safe *because of this comparison*: the slot reuses rows
+/// `0..reuse`, and every one of them holds the same token the new prompt has at
+/// that position — the contents were verified, not assumed. A mismatch (or an
+/// empty record) yields 0, which means a full prefill from position 0.
+pub(crate) fn common_prefix_len(cached: &[u32], prompt: &[u32]) -> usize {
+    cached
+        .iter()
+        .zip(prompt.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+/// B2: which slice of the prompt this request must feed, given how many tokens
+/// the slot's KV already holds. Returns `(feed_from, feed_len)`.
+///
+/// Always at least the last token: its logits are what the sampler consumes, so
+/// a fully-cached prompt still costs one row (a decode step rather than a
+/// prefill).
+pub(crate) fn prefill_span(nt: usize, reuse: usize) -> (usize, usize) {
+    let feed_from = reuse.min(nt.saturating_sub(1));
+    (feed_from, nt - feed_from)
+}
+
+/// Run one job on `slot` to completion, pushing events into `job.tx`.
+///
+/// Termination: EOS / im_end -> "stop"; stop string -> "stop" (truncated);
+/// `max_tokens` or slot context full -> "length". The slot's `GraphCache` is
+/// passed by the caller and is only ever touched here (serial worker), so KV
+/// isolation is structural. The generated text/usage travels over the event
+/// channel; this function only reports errors.
+pub fn generate(
+    model: &dyn ModelDef,
+    tokenizer: &Tokenizer,
+    cache: &mut GraphCache,
+    cached_tokens: &mut Vec<u32>,
+    n_ctx_slot: usize,
+    input_ids: &[u32],
+    params: &SamplingParams,
+    tx: &mpsc::Sender<StreamEvent>,
+    id: &str,
+    admitted: std::time::Instant,
+) -> Result<(), ApiError> {
+    if input_ids.is_empty() {
+        return Err(ApiError::invalid_request("prompt tokenizes to nothing"));
+    }
+    generate_seq(
+        model,
+        tokenizer,
+        cache,
+        cached_tokens,
+        n_ctx_slot,
+        input_ids,
+        params,
+        tx,
+        id,
+        admitted,
+        None,
+    )
+}
+
+/// doc 97: speculative variant — `spec` carries the slot's draft engine.
+/// Mirrors `generate_seq` token-for-token (the identity contract) while a
+/// round commits 1..=d+1 pre-sampled tokens: the round writes the seed's KV
+/// row plus every batch row except the last (the next seed); `current_pos`
+/// advances by the committed count per break kind. The per-token machinery
+/// (EOG / stop strings / UTF-8 holdback / Text events) is byte-identical to
+/// the sequential loop. Stop-string tokens are never committed; their
+/// spec-written rows are stale and overwritten before they are read.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_spec(
+    model: &dyn ModelDef,
+    tokenizer: &Tokenizer,
+    cache: &mut GraphCache,
+    cached_tokens: &mut Vec<u32>,
+    n_ctx_slot: usize,
+    input_ids: &[u32],
+    params: &SamplingParams,
+    tx: &mpsc::Sender<StreamEvent>,
+    id: &str,
+    admitted: std::time::Instant,
+    spec: &mut minfer::advanced::SpecEngine,
+) -> Result<(), ApiError> {
+    // F2 (#47): a verify round samples several rows from one automaton state, so
+    // the combination is refused rather than silently generating unconstrained.
+    if params.grammar.is_some() {
+        return Err(ApiError::invalid_request(
+            "a grammar/JSON schema cannot be combined with speculative decoding".to_string(),
+        ));
+    }
+    if input_ids.is_empty() {
+        return Err(ApiError::invalid_request("prompt tokenizes to nothing"));
+    }
+    // Each request starts its draft context from scratch: the draft's KV
+    // regions keep the previous request's rows and the draft never re-prefills
+    // the new prompt (it drafts from the seed), so stale rows would sit below
+    // every round's attention window. Resetting is cheap (~1 ms rebuild) and
+    // keeps requests independent.
+    spec.reset_draft();
+    generate_seq(
+        model,
+        tokenizer,
+        cache,
+        cached_tokens,
+        n_ctx_slot,
+        input_ids,
+        params,
+        tx,
+        id,
+        admitted,
+        Some(spec),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_seq(
+    model: &dyn ModelDef,
+    tokenizer: &Tokenizer,
+    cache: &mut GraphCache,
+    cached_tokens: &mut Vec<u32>,
+    n_ctx_slot: usize,
+    input_ids: &[u32],
+    params: &SamplingParams,
+    tx: &mpsc::Sender<StreamEvent>,
+    id: &str,
+    admitted: std::time::Instant,
+    mut spec: Option<&mut minfer::advanced::SpecEngine>,
+) -> Result<(), ApiError> {
+    if input_ids.is_empty() {
+        return Err(ApiError::invalid_request("prompt tokenizes to nothing"));
+    }
+    if input_ids.len() > n_ctx_slot {
+        return Err(ApiError::exceed_context(format!(
+            "prompt of {} tokens exceeds slot context of {}",
+            input_ids.len(),
+            n_ctx_slot
+        )));
+    }
+
+    let nt = input_ids.len();
+    let special = model.special_tokens();
+
+    // B2: how much of this prompt the slot's KV rows already hold.
+    //
+    // `cached_tokens` names the tokens those rows were written for, and reuse
+    // is gated on an exact prefix match — so every row attention will read has
+    // been verified to hold the same token. That is what makes reuse safe
+    // regardless of the historical staleness question (see the B1 note in
+    // `worker_loop`), and it is now bitwise too: the CPU attention is
+    // nt-invariant (roadmap §4 item 14), so feeding a suffix at its own
+    // positions reproduces a single-shot prefill exactly
+    // (`prefix_reuse_matches_a_full_prefill`).
+    //
+    // The speculative path neither reuses nor records: a verify round writes
+    // rows past the committed tokens, so the "row i holds cached_tokens[i]"
+    // invariant is not one this path maintains for free.
+    // `MINFER_NO_PREFIX_REUSE=1` disables reuse entirely (the pre-B2 behaviour);
+    // it is an A/B switch for the measurement, not a topology change, so it is
+    // not part of any graph identity.
+    let track =
+        spec.is_none() && !std::env::var("MINFER_NO_PREFIX_REUSE").map_or(false, |v| v == "1");
+    let reuse = if track {
+        common_prefix_len(cached_tokens, input_ids)
+    } else {
+        0
+    };
+    // Always feed at least the last token: its logits are what the sampler
+    // consumes, so a fully-cached prompt still costs one row.
+    let (feed_from, _feed_len) = prefill_span(nt, reuse);
+    let positions: Vec<usize> = (feed_from..nt).collect();
+
+    // P3 live (server): phase/token/logits events for the web visualizer.
+    let live_on = minfer::live::enabled();
+
+    // Prefill (n_out=1: only the LAST token's logits are returned and used for
+    // the first sample — passing nt here would hand the sampler all nt rows and
+    // corrupt the first sampled token).
+    if live_on {
+        minfer::live::begin_phase("prefill");
+    }
+    let last_logits = guarded_forward(
+        model,
+        &input_ids[feed_from..],
+        &positions,
+        1,
+        n_ctx_slot,
+        cache,
+    )?;
+    if live_on {
+        minfer::live::attach_step(&last_logits);
+    }
+    let mut logits = last_logits;
+    let mut current_pos = nt;
+    // One line per request: makes the reuse (or its absence) observable in
+    // production, and it is what B3's measurement reads.
+    crate::server::log::info(format_args!(
+        "[server] prefill fed {}/{} prompt tokens ({} reused from the slot's KV)",
+        nt - feed_from,
+        nt,
+        feed_from
+    ));
+    // Rows 0..nt now hold `input_ids` (the reused prefix because it matched,
+    // the fed suffix because it was just written).
+    cached_tokens.clear();
+    if track {
+        cached_tokens.extend_from_slice(input_ids);
+    }
+    debug_assert!(cached_tokens.is_empty() || cached_tokens.len() == current_pos);
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(params.seed);
+    const REPEAT_LAST_N: usize = 64;
+    let mut prev_tokens = sampler_recent_window(input_ids, REPEAT_LAST_N);
+    // F3 (#48): the request's sampler configuration, built once, plus mirostat's
+    // per-request state (`mu`); both are inert unless a new knob is set.
+    let cfg = params.sampler_config();
+    let mut mirostat = minfer::sampler::MirostatState::new(cfg.mirostat_tau);
+    // F2 (#47): the request's grammar automaton, one per request like mirostat's mu.
+    let mut grammar_state = cfg.grammar.as_ref().map(|g| g.state());
+
+    let stop_bytes: Vec<Vec<u8>> = params
+        .stop_strings
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    let stop_refs: Vec<&[u8]> = stop_bytes.iter().map(|v| v.as_slice()).collect();
+
+    // doc 97: the speculative seed carried across rounds (the previous
+    // batch's last token); None after any turn-ending break.
+    let mut spec_seed: Option<u32> = None;
+
+    // `full` accumulates ALL generated bytes; `emitted` tracks how many of them
+    // were already sent as Text events. Stop detection runs on `full` (llama.cpp
+    // checks the whole generated text, so a stop string split across tokens is
+    // caught even though its earlier tokens were already emitted — they are
+    // simply left in the client's buffer, exactly like llama.cpp).
+    let mut full: Vec<u8> = Vec::new();
+    let mut emitted: usize = 0;
+    let mut completion_tokens = 0usize;
+    let mut finish_reason = "stop";
+    let mut stopped_by_string = false;
+
+    if live_on {
+        minfer::live::begin_phase("decode");
+    }
+
+    // Emit `full[emitted..end]` as one Text event (complete UTF-8 by caller).
+    let emit = |full: &[u8],
+                emitted: usize,
+                end: usize,
+                tx: &mpsc::Sender<StreamEvent>|
+     -> Result<(), ApiError> {
+        if end > emitted {
+            let chunk = String::from_utf8_lossy(&full[emitted..end]).into_owned();
+            if tx.blocking_send(StreamEvent::Text(chunk)).is_err() {
+                return Err(ApiError::server("client disconnected"));
+            }
+        }
+        Ok(())
+    };
+
+    loop {
+        // max_tokens limit
+        if params.max_tokens >= 0 && completion_tokens as i64 >= params.max_tokens {
+            finish_reason = "length";
+            break;
+        }
+        // slot context full (KV write positions must stay < n_ctx_slot)
+        if current_pos >= n_ctx_slot {
+            finish_reason = "length";
+            break;
+        }
+
+        // === doc 97: speculative iteration (a sibling of the plain body
+        // below, mirroring it token-for-token — the identity contract). ===
+        if let Some(sp) = spec.as_deref_mut() {
+            // Seed: sampled from the last-row logits ONCE (first iteration);
+            // afterwards the previous batch's last token is the seed — it was
+            // already committed by the batch machinery below. (The logits var
+            // is never refreshed in spec mode, so re-sampling here would
+            // re-emit the first seed every round.)
+            let seed_id = match spec_seed.take() {
+                Some(id) => id,
+                None => {
+                    let sampled = minfer::sampler::sample_with_config_grammar(
+                        &mut logits,
+                        &cfg,
+                        &prev_tokens,
+                        &mut mirostat,
+                        &mut grammar_state,
+                        &mut rng,
+                    )
+                    .map_err(|e| ApiError::invalid_request(e.to_string()))?;
+                    let id = sampled.token_id;
+                    if is_stop_token(id, &special) {
+                        // The turn ends here; the slot's KV has no
+                        // cross-request continuity (rows 0.. are rewritten
+                        // before they are read), so no EOG KV write is needed.
+                        finish_reason = "stop";
+                        break;
+                    }
+                    completion_tokens += 1;
+                    full.extend_from_slice(&tokenizer.decode_bytes(&[id]));
+                    if let Some(cut) = minfer::sampler::match_stop_suffix(&full, &stop_refs) {
+                        stopped_by_string = true;
+                        if cut > emitted {
+                            emit(&full, emitted, cut, tx)?;
+                            emitted = cut;
+                        }
+                        break;
+                    }
+                    prev_tokens.push(id);
+                    if prev_tokens.len() > REPEAT_LAST_N {
+                        prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
+                    }
+                    let complete =
+                        emitted + minfer::tokenizer::complete_utf8_prefix_len(&full[emitted..]);
+                    if complete > emitted {
+                        emit(&full, emitted, complete, tx)?;
+                        emitted = complete;
+                    }
+                    if live_on {
+                        let text =
+                            String::from_utf8_lossy(&tokenizer.decode_bytes(&[id])).into_owned();
+                        minfer::live::set_token(id, &text);
+                    }
+                    id
+                }
+            };
+            let sparams = minfer::advanced::SpecSampler { cfg: cfg.clone() };
+            let toks = sp.round(
+                &*model,
+                cache,
+                seed_id,
+                current_pos,
+                n_ctx_slot,
+                &sparams,
+                &mut prev_tokens,
+                &mut rng,
+            );
+            let mut batch_break = false;
+            for (i, &tok) in toks.iter().enumerate() {
+                if params.max_tokens >= 0 && completion_tokens as i64 >= params.max_tokens {
+                    // Cap hit mid-batch: toks[0..i] were committed and their
+                    // KV rows written; the tail is discarded (its rows, if
+                    // any, are stale and rewritten before they are read).
+                    finish_reason = "length";
+                    current_pos += 1 + i;
+                    batch_break = true;
+                    break;
+                }
+                if is_stop_token(tok, &special) {
+                    // The turn ends here (no cross-request KV continuity —
+                    // see the seed-EOG note above).
+                    finish_reason = "stop";
+                    current_pos += 1 + i;
+                    batch_break = true;
+                    break;
+                }
+                completion_tokens += 1;
+                full.extend_from_slice(&tokenizer.decode_bytes(&[tok]));
+                if let Some(cut) = minfer::sampler::match_stop_suffix(&full, &stop_refs) {
+                    stopped_by_string = true;
+                    if cut > emitted {
+                        emit(&full, emitted, cut, tx)?;
+                        emitted = cut;
+                    }
+                    // toks[i] is NOT committed (stop strings are not part of
+                    // the canonical text); committed slots = seed + toks[0..i].
+                    current_pos += 1 + i;
+                    batch_break = true;
+                    break;
+                }
+                // prev_tokens: the round's accept loop already pushed every
+                // emitted token (pushing again would duplicate entries and
+                // skew the repeat penalty — same as the conversation loop).
+                let complete =
+                    emitted + minfer::tokenizer::complete_utf8_prefix_len(&full[emitted..]);
+                if complete > emitted {
+                    emit(&full, emitted, complete, tx)?;
+                    emitted = complete;
+                }
+                if live_on {
+                    let text =
+                        String::from_utf8_lossy(&tokenizer.decode_bytes(&[tok])).into_owned();
+                    minfer::live::set_token(tok, &text);
+                }
+            }
+            if batch_break {
+                // A mid-batch break (length cap / EOG / stop string) ended the
+                // TURN — leave the outer loop. (The plain path's equivalents
+                // break out directly; without this the loop would run another
+                // round after the turn was already finished, re-sampling a
+                // seed from the stale prefill logits.)
+                break;
+            }
+            // Full batch committed: toks[len-1] is the next seed (committed by
+            // the batch machinery, its row written by the next round).
+            current_pos += toks.len();
+            spec_seed = toks.last().copied();
+            continue;
+        }
+
+        let sampled = match minfer::sampler::sample_with_config_grammar(
+            &mut logits,
+            &cfg,
+            &prev_tokens,
+            &mut mirostat,
+            &mut grammar_state,
+            &mut rng,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // The grammar allows nothing more: stop the turn with the reason
+                // on stderr. The text emitted so far is a valid prefix.
+                crate::server::log::warn(format_args!("[grammar] {e}"));
+                finish_reason = "stop";
+                break;
+            }
+        };
+        if is_stop_token(sampled.token_id, &special) {
+            finish_reason = "stop";
+            break;
+        }
+        completion_tokens += 1;
+        prev_tokens.push(sampled.token_id);
+        if prev_tokens.len() > REPEAT_LAST_N {
+            prev_tokens.drain(0..prev_tokens.len() - REPEAT_LAST_N);
+        }
+
+        // Stop-string detection on the FULL byte stream before emitting.
+        full.extend_from_slice(&tokenizer.decode_bytes(&[sampled.token_id]));
+        if let Some(cut) = minfer::sampler::match_stop_suffix(&full, &stop_refs) {
+            stopped_by_string = true;
+            // Truncate at the stop string. If the stop's start lies before the
+            // already-emitted bytes, the emitted prefix stays (unavoidable);
+            // otherwise emit the untruncated tail up to `cut`.
+            if cut > emitted {
+                emit(&full, emitted, cut, tx)?;
+                emitted = cut;
+            }
+            break;
+        }
+
+        // Emit only the complete-UTF-8 prefix; hold back a split multi-byte char.
+        let complete = emitted + minfer::tokenizer::complete_utf8_prefix_len(&full[emitted..]);
+        if complete > emitted {
+            emit(&full, emitted, complete, tx)?;
+            emitted = complete;
+        }
+
+        // Decode step.
+        if live_on {
+            let text =
+                String::from_utf8_lossy(&tokenizer.decode_bytes(&[sampled.token_id])).into_owned();
+            minfer::live::set_token(sampled.token_id, &text);
+        }
+        logits = guarded_forward(
+            model,
+            &[sampled.token_id],
+            &[current_pos],
+            1,
+            n_ctx_slot,
+            cache,
+        )?;
+        if live_on {
+            minfer::live::attach_step(&logits);
+        }
+        current_pos += 1;
+        if track {
+            // Row `current_pos - 1` now holds this token.
+            cached_tokens.push(sampled.token_id);
+            debug_assert_eq!(cached_tokens.len(), current_pos);
+        }
+    }
+
+    // Final flush: everything after `emitted` — but if we stopped on a stop
+    // string, nothing beyond `cut` (== full.len() after truncation below) may
+    // leak; truncating `full` to `cut` makes the flush safe in both cases.
+    if stopped_by_string {
+        // `full` still holds bytes past the stop; drop them.
+        if emitted < full.len() {
+            // cut was captured above; recompute it the same way.
+            if let Some(cut) = minfer::sampler::match_stop_suffix(&full, &stop_refs) {
+                full.truncate(cut);
+            }
+            if emitted < full.len() {
+                emit(&full, emitted, full.len(), tx)?;
+            }
+        }
+    } else if emitted < full.len() {
+        // Never end a response body mid-character: a still-pending partial
+        // sequence can never complete now, so it is dropped rather than decoded
+        // to U+FFFD (the text stays a valid prefix of the grammar's language).
+        let complete = emitted + minfer::tokenizer::complete_utf8_prefix_len(&full[emitted..]);
+        if complete > emitted {
+            emit(&full, emitted, complete, tx)?;
+        }
+        if complete < full.len() {
+            crate::server::log::warn(format_args!(
+                "[server] dropped {} trailing byte(s) of an incomplete UTF-8 character",
+                full.len() - complete
+            ));
+        }
+    }
+    crate::server::log::event(
+        crate::server::log::Level::Info,
+        "request.finished",
+        &[
+            ("id", id),
+            ("slot", "0"),
+            ("reason", finish_reason),
+            ("tokens", &completion_tokens.to_string()),
+            ("ms", &admitted.elapsed().as_millis().to_string()),
+        ],
+    );
+    let _ = tx.blocking_send(StreamEvent::Finish {
+        reason: finish_reason.to_string(),
+        tokens: completion_tokens,
+    });
+    if live_on {
+        minfer::live::finish(
+            finish_reason,
+            completion_tokens,
+            &String::from_utf8_lossy(&full),
+        );
+    }
+
+    Ok(())
+}
+
+/// `forward_batch` wrapped like [`guarded_forward`]: a panic becomes an `Err`
+/// instead of unwinding the worker. A panic inside a *batched* forward is worse
+/// than a per-request one — the shared arena may be half-written — so `tick`
+/// fails the whole batch and the caller re-seeds the engine's caches.
+///
+/// #171: this is the `forward_batch` failure-injection chokepoint
+/// (`MINFER_TEST_CALL_FAIL=forward_batch` panics inside the guard, so the real
+/// guard and the real 500 path run) and an observable site
+/// (`testfail::checked("forward_batch")`), which is what lets a gate drop a
+/// bespoke failing-model mock.
+pub(crate) fn guarded_forward_batch(
+    model: &dyn ModelDef,
+    batch: &minfer::advanced::Batch,
+    n_out: usize,
+    n_ctx: usize,
+    cache: &mut GraphCache,
+) -> Result<Vec<f32>, ApiError> {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        minfer::testfail::note_checked("forward_batch");
+        minfer::testfail::guard_panic("forward_batch");
+        model.forward_batch(batch, n_out, n_ctx, cache)
+    }));
+    match r {
+        Ok(v) => Ok(v),
+        Err(payload) => Err(ApiError::server(format!(
+            "inference panicked: {}",
+            panic_message(&*payload)
+        ))),
+    }
+}
+
+/// `forward_graph_cached` wrapped so an unexpected panic (e.g. an internal
+/// invariant) becomes a 500 instead of killing the worker thread.
+fn guarded_forward(
+    model: &dyn ModelDef,
+    tokens: &[u32],
+    positions: &[usize],
+    n_out: usize,
+    n_ctx: usize,
+    cache: &mut GraphCache,
+) -> Result<Vec<f32>, ApiError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model.forward_graph_cached(tokens, positions, n_out, n_ctx, cache)
+    }))
+    .map_err(|_| ApiError::server("inference panicked"))
+}
+
+/// Run one job with panic isolation. Returns `true` when the job completed —
+/// including a normal `Err`, which is forwarded to `tx` — and `false` when it
+/// panicked, which is reported to `tx` as a 500 instead of unwinding the worker
+/// thread (see the call site in `worker_loop`).
+fn run_job_isolated<F>(tx: &mpsc::Sender<StreamEvent>, f: F) -> bool
+where
+    F: FnOnce() -> Result<(), ApiError>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            let _ = tx.blocking_send(StreamEvent::Err(e));
+            true
+        }
+        Err(payload) => {
+            // `&*payload`, not `&payload`: `Box<dyn Any + Send>` is itself an
+            // `Any`, so passing the Box by reference would downcast against the
+            // Box type and always report a non-string payload.
+            let msg = panic_message(&*payload);
+            crate::server::log::error(format_args!(
+                "[server] job panicked: {msg} — the worker thread survives and the slot is released"
+            ));
+            let _ = tx.blocking_send(StreamEvent::Err(ApiError::server(format!(
+                "internal error: {msg}"
+            ))));
+            false
+        }
+    }
+}
+
+/// Human-readable panic payload. `panic!` with a literal or a formatted string
+/// yields `&'static str` / `String`; anything else gets a generic label.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// How the worker composes work (E6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchMode {
+    Serial,
+    Batched,
+}
+
+/// Decide the batching mode from `MINFER_BATCH` and the device the model's
+/// forwards actually run on.
+///
+/// Pure on purpose: CI has no GPU, so the matrix (unset / "1" / "0" / invalid x
+/// cpu / metal / cuda) is unit-tested here instead of being discovered in
+/// production. **Metal joined CUDA** in #44 part (b) once the write/move side of
+/// G5 landed (`copy_cells`, `copy_kv_to_cpu`): a batched slot's run can be
+/// compacted or shifted mid-session, and the Metal arms now serve that, so the
+/// default follows the device. The read side (`supports_attn_span()`) was part
+/// (a); the batching gates (`a_two_sequence_batch_…`,
+/// `batch_order_does_not_change_a_sequences_logits`,
+/// `offset_sensitivity_is_narrowed_to_multi_query_attention`) and the server's
+/// `a_long_prefill_keeps_another_slot_decoding` are green on the Mac, which is
+/// the D8 condition the approval comment set.
+pub(crate) fn batch_mode(requested: Option<&str>, device: minfer::models::Device) -> BatchMode {
+    match requested {
+        Some("1") => BatchMode::Batched,
+        Some("0") => BatchMode::Serial,
+        // Unset, or a value the caller already warned about: follow the device —
+        // batching is the measured win on the device (CUDA, and now Metal).
+        _ => match device {
+            minfer::models::Device::Cuda | minfer::models::Device::Metal => BatchMode::Batched,
+            _ => BatchMode::Serial,
+        },
+    }
+}
+
+/// Worker thread: drains the job queue serially, one slot at a time.
+/// Busy slots defer naturally — the queue is unbounded (llama.cpp semantics).
+pub fn worker_loop(
+    model: Box<dyn ModelDef>,
+    tokenizer: Tokenizer,
+    slots: Vec<Slot>,
+    job_rx: mpsc::Receiver<Job>,
+    spec_cfg: Option<minfer::advanced::SpecConfig>,
+    slots_file: Option<String>,
+    metrics: std::sync::Arc<super::metrics::ServerMetrics>,
+) -> super::worker::WorkerResources {
+    // E2/E6: the plain path *can* batch every ready slot into one forward per
+    // step, and **whether that is a win is a property of the device** — measured
+    // end to end at `--n-slots 4`: 0.88x on Qwen2.5-0.5B Q4_0 and 0.49x on 7B
+    // Q4_K_M on CPU (the plan's E2 record has the table and the diagnosis: the
+    // CPU `nt > 1` decode path is not cheaper per token, and concurrency forfeits
+    // B2's cross-request prefix reuse), versus **1.9x on the GB10**, where decode
+    // is weight-bandwidth bound. So the default follows the device (E6):
+    //
+    //   MINFER_BATCH unset -> batched iff the model's forwards run on a device
+    //                         (CUDA, or Metal since #44 part (b))
+    //   MINFER_BATCH=1     -> batched (forced; also the way to batch on CPU)
+    //   MINFER_BATCH=0     -> serial (forced)
+    //
+    // Metal joined CUDA when the write/move half of G5 landed (#44 part (b)):
+    // a batched slot's run can be compacted or shifted mid-session, and the
+    // Metal `copy_cells` / `copy_kv_to_cpu` arms now serve that instead of
+    // failing on the first move. The read half (`supports_attn_span()`) was
+    // part (a).
+    //
+    // A session with a speculative draft keeps the per-slot caches and the
+    // run-to-completion loop below too, because doc 94/97's identity contract is
+    // per request.
+    let requested = std::env::var("MINFER_BATCH").ok();
+    if let Some(v) = requested.as_deref() {
+        if v != "0" && v != "1" {
+            crate::server::log::warn(format_args!(
+                "[server] MINFER_BATCH={v:?} is neither \"0\" nor \"1\"; using the default for this device"
+            ));
+        }
+    }
+    let device = model.device();
+    let mode = batch_mode(requested.as_deref(), device);
+    crate::server::log::info(format_args!(
+        "[server] batching: {} (device {}; MINFER_BATCH=1 forces it on, =0 forces it off)",
+        match mode {
+            BatchMode::Batched => "on",
+            BatchMode::Serial => "off",
+        },
+        device.name()
+    ));
+    if spec_cfg.is_none() && mode == BatchMode::Batched {
+        let n_ctx_total: usize = slots.iter().map(|s| s.n_ctx_slot).sum();
+        match super::batch::BatchEngine::new(&*model, slots.len(), n_ctx_total) {
+            Ok(mut engine) => {
+                // E3: the prefill chunk (`n_batch` made real). Printed for the same
+                // reason the batching mode is: the default is a decision, and a
+                // decision nobody can see is one nobody can debug.
+                let n_batch = super::batch::prefill_chunk_size(
+                    std::env::var("MINFER_N_BATCH").ok().as_deref(),
+                );
+                engine.set_prefill_chunk(n_batch);
+                crate::server::log::info(format_args!(
+                    "[server] prefill chunks: {} ({}; MINFER_N_BATCH=0 disables chunking)",
+                    if n_batch == 0 {
+                        "off".to_string()
+                    } else {
+                        format!("{n_batch} tokens")
+                    },
+                    if std::env::var("MINFER_N_BATCH").is_ok() {
+                        "MINFER_N_BATCH"
+                    } else {
+                        "default"
+                    }
+                ));
+                crate::server::log::info(format_args!(
+                    "[server] continuous batching: {} slot(s), {n_ctx_total} KV rows shared",
+                    engine.n_slots()
+                ));
+                // C5 S2: resume the slot contexts, and rewrite the snapshot whenever a
+                // request completes. Printed at startup for the same reason the batching
+                // mode is: the cost of the snapshot is a decision, and a decision nobody
+                // can see is one nobody can debug.
+                if let Some(path) = &slots_file {
+                    let p = std::path::Path::new(path);
+                    match engine.load_slots(p, &*model) {
+                        Ok((slots, bytes)) => crate::server::log::info(format_args!(
+                            "[server] resumed {slots} slot(s), {bytes} byte(s) of KV from {path} \
+                             — a request whose prompt matches a slot's tokens prefills only its delta"
+                        )),
+                        Err(e) => crate::server::log::warn(format_args!("[server] {e}; starting with empty slots")),
+                    }
+                    crate::server::log::info(format_args!(
+                        "[server] slot snapshot: {} (about {} MiB per completed request)",
+                        path,
+                        engine.snapshot_bytes() / (1024 * 1024)
+                    ));
+                    engine.set_slots_file(Some(p.to_path_buf()));
+                }
+                // #150: the queue bound, printed for the same reason as the mode:
+                // a request that waits (or is refused) is a policy decision.
+                let queue_max = super::batch::queue_max_from_env();
+                crate::server::log::info(format_args!(
+                    "[server] queue: up to {queue_max} request(s) wait for a slot \
+                     (MINFER_QUEUE_MAX); beyond that the newest is answered 503"
+                ));
+                let (job_rx, exit) = super::batch::serve_loop(
+                    &*model,
+                    &tokenizer,
+                    job_rx,
+                    &mut engine,
+                    &metrics,
+                    queue_max,
+                );
+                // #731: the loop hands its queue back (and why it ended) so the
+                // supervisor can restart it (slice A) instead of reloading.
+                return super::worker::WorkerResources {
+                    model,
+                    slots,
+                    job_rx,
+                    exit,
+                };
+            }
+            Err(e) => {
+                crate::server::log::warn(format_args!(
+                    "[server] continuous batching unavailable ({e}); serving serially"
+                ));
+                return worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics);
+            }
+        }
+    }
+    if let Some(path) = &slots_file {
+        crate::server::log::info(format_args!(
+            "[server] note: the slot snapshot ({path}) covers the shared-arena (batched) \
+             engine; this server serves serially, so nothing will be resumed or saved"
+        ));
+    }
+    worker_loop_serial(model, tokenizer, slots, job_rx, spec_cfg, &metrics)
+}
+
+/// The pre-E2 loop: one request at a time, each on its own slot cache. Kept for
+/// speculative sessions (the identity contract is per request) and as the loud
+/// fallback when the shared arena cannot be built.
+///
+/// F8: there is no shared arena here — one `GraphCache` per slot — so `/metrics`
+/// reports the arena of the slot that served the last request rather than a sum
+/// (the batched path has one arena and reports it in full). The queue depth on
+/// this path is the HTTP backlog only; the loop holds at most one job.
+fn worker_loop_serial(
+    model: Box<dyn ModelDef>,
+    tokenizer: Tokenizer,
+    mut slots: Vec<Slot>,
+    mut job_rx: mpsc::Receiver<Job>,
+    spec_cfg: Option<minfer::advanced::SpecConfig>,
+    metrics: &super::metrics::ServerMetrics,
+) -> super::worker::WorkerResources {
+    // doc 97: one draft engine per slot (each slot's draft KV is isolated
+    // exactly like its target KV). The draft model is small (0.5B-class) and
+    // loaded once at worker startup.
+    let mut slot_specs: Vec<Option<minfer::advanced::SpecEngine>> = slots
+        .iter()
+        .map(|_| match &spec_cfg {
+            Some(cfg) => minfer::advanced::SpecEngine::new(
+                cfg,
+                &tokenizer,
+                model.n_vocab(),
+                model.kv_format(),
+            )
+            .ok(),
+            None => None,
+        })
+        .collect();
+    loop {
+        let Some(job) = job_rx.blocking_recv() else {
+            // All senders dropped: publish an idle reading, then leave.
+            metrics
+                .worker_pending
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .running
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            break;
+        };
+        // F8: this loop holds at most one job (the channel backlog is the only
+        // queue), so `pending` is always 0 and `running` follows the slot.
+        metrics
+            .jobs_admitted_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .worker_pending
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        metrics
+            .running
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let Some(slot_idx) = slots.iter().position(|s| s.state == SlotState::Idle) else {
+            crate::server::log::event(
+                crate::server::log::Level::Error,
+                "request.rejected",
+                &[
+                    ("id", &job.id),
+                    ("queued", &job_rx.len().to_string()),
+                    ("reason", "no idle slot"),
+                ],
+            );
+            let _ = job
+                .tx
+                .blocking_send(StreamEvent::Err(ApiError::unavailable("no idle slot")));
+            metrics
+                .jobs_dropped_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        };
+        let slot = &mut slots[slot_idx];
+        let slot_spec = slot_specs[slot_idx].as_mut();
+        // F3 (#48): mirostat's per-step state has no home in a verify round;
+        // refuse the combination loudly instead of sampling without it.
+        if slot_spec.is_some() && job.params.mirostat != minfer::sampler::MirostatMode::Off {
+            let _ = job
+                .tx
+                .blocking_send(StreamEvent::Err(ApiError::invalid_request(
+                    "mirostat cannot be combined with speculative decoding (--spec-draft)"
+                        .to_string(),
+                )));
+            metrics
+                .jobs_dropped_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        // #726: the queue depth the request waited behind, and the slot it landed
+        // on — the pair the `request.admitted` line names.
+        crate::server::log::event(
+            crate::server::log::Level::Info,
+            "request.admitted",
+            &[
+                ("id", &job.id),
+                ("slot", &slot_idx.to_string()),
+                ("queued", &job_rx.len().to_string()),
+            ],
+        );
+        slot.state = SlotState::Processing;
+        metrics
+            .running
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        // B2: the slot KEEPS its cache and its `cached_tokens` record across
+        // requests; `generate_seq` reuses the KV only when the new prompt
+        // starts with exactly the recorded sequence, and prefills from position
+        // 0 otherwise. The per-request reset this replaces came from commit
+        // 39eceaa (doc 97), whose message described the cross-request bug as
+        // "stale rows inside the new attention window". B1 tested that
+        // mechanism directly (`reused_cache_across_prompts_matches_a_fresh_cache`
+        // in `models/qwen2/graph.rs`: A→B, B→A, prefill+decode→B, each compared
+        // bitwise against a virgin cache — all agree), so the reset was guarding
+        // against something that does not happen on the plain path; the original
+        // bug is consistent with the process-global cache the OpenAI plan's
+        // revision notes record, which per-slot caches already fixed.
+        //
+        // `cached_tokens` is cleared on every error below: a failed request may
+        // have written part of a row, and claiming otherwise is the one way this
+        // could silently go wrong. The fused GPU stores (FusedQKV /
+        // FusedQkvNorm / QkvBiasRopeStore) write K/V in-kernel and are
+        // unverified on dgxspark (A0: CUDA compile-only, Metal not built), so
+        // the reuse gate stays conservative.
+        //
+        // Panic isolation for the WHOLE job, not just the forward call.
+        // `guarded_forward` already contains a panic inside
+        // `forward_graph_cached`, but the speculative path calls both models'
+        // forwards directly (`spec.rs`), and the tokenizer, sampler, stop-string
+        // and streaming paths are unguarded. Without this net one panic unwinds
+        // this thread: `job_rx` is dropped, every later request is rejected, and
+        // the requests already queued lose their event sender (an empty 200
+        // instead of an error).
+        let completed = run_job_isolated(&job.tx, || match slot_spec {
+            Some(spec) => generate_spec(
+                &*model,
+                &tokenizer,
+                &mut slot.cache,
+                &mut slot.cached_tokens,
+                slot.n_ctx_slot,
+                &job.input_ids,
+                &job.params,
+                &job.tx,
+                &job.id,
+                job.admitted,
+                spec,
+            ),
+            None => generate(
+                &*model,
+                &tokenizer,
+                &mut slot.cache,
+                &mut slot.cached_tokens,
+                slot.n_ctx_slot,
+                &job.input_ids,
+                &job.params,
+                &job.tx,
+                &job.id,
+                job.admitted,
+            ),
+        });
+        // A panic may have written part of a KV row, so the record is no longer
+        // trustworthy: drop it and make the next request prefill from position 0.
+        // A *completed* job needs no such care — `generate_seq` only records a
+        // token after its row was written, and returns early (before touching the
+        // KV) for a rejected request, leaving the previous record valid.
+        if !completed {
+            slot.cached_tokens.clear();
+        }
+        slot.state = SlotState::Idle;
+        // F8: publish the slot's arena after every request — on this path each
+        // slot owns its own `GraphCache`, so this is a live reading of the arena
+        // that just served, not a startup snapshot.
+        metrics
+            .running
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let backend = minfer::graph::kvsession::backend_of(model.device());
+        let snapshot = super::metrics::kv_snapshot_from(slot.cache.alloc(), backend);
+        metrics.publish_kv(&snapshot);
+    }
+    super::worker::WorkerResources {
+        model,
+        slots,
+        job_rx,
+        exit: super::worker::WorkerExit::Shutdown,
+    }
+}
+
+pub(crate) fn sampler_recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
+    minfer::sampler::recent_window(tokens, last_n)
+}
+
+#[cfg(test)]
+mod tests;

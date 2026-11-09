@@ -1094,8 +1094,8 @@ impl Tokenizer {
     /// paths they assert — the drain check runs before tokenization, and
     /// `/health`, `/v1/models` and `/metrics` never touch the vocabulary — so an
     /// empty one is honest rather than a stub that could hide a real call.
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn empty() -> Self {
         Self {
             id_to_token: Vec::new(),
             id_to_score: Vec::new(),
@@ -1130,8 +1130,8 @@ impl Tokenizer {
     /// the server's request tests need one to resolve a breaker string without a
     /// GGUF on disk. Ids below 1000 are empty tokens, exactly like the pad /
     /// unused slots a real vocabulary has.
-    #[cfg(test)]
-    pub(crate) fn byte_level_for_tests() -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn byte_level_for_tests() -> Self {
         const BASE: u32 = 1000;
         let byte_to_unicode = build_byte_to_unicode();
         let unicode_to_byte = byte_to_unicode.iter().map(|(&b, &c)| (c, b)).collect();

@@ -99,8 +99,8 @@ pub struct GrammarState {
     accepting: bool,
     cache: HashMap<StateKey, Arc<[u64]>>,
     /// Pieces the last mask computation walked. Test-only instrumentation
-    /// (#126): `#[cfg(test)]` keeps the counter out of production builds.
-    #[cfg(test)]
+    /// (#126): gated by `test-hooks` so another package's tests can read it (#805).
+    #[cfg(any(test, feature = "test-hooks"))]
     walked: usize,
 }
 
@@ -113,9 +113,9 @@ impl GrammarState {
     }
 
     /// Number of states whose mask is cached (bounded by `MAX_MASK_CACHE`).
-    /// Test-only (#238): driven by `grammar::tests::mask_is_cached_per_state and server::chat::tests::real_model_json_schema_generation_parses`; `#[cfg(test)]` keeps it out of production builds.
-    #[cfg(test)]
-    pub(crate) fn cached_states(&self) -> usize {
+    /// Test-only (#238): driven by `grammar::tests::mask_is_cached_per_state and server::chat::tests::real_model_json_schema_generation_parses`; gated by `cfg(test)` or the `test-hooks` feature (#805), so it stays out of production builds.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn cached_states(&self) -> usize {
         self.cache.len()
     }
 
@@ -123,12 +123,12 @@ impl GrammarState {
     /// no-op: the count exists so a gate can bound the mask by work instead of
     /// by a clock (GATE-CONTRACT §4), and `#[cfg(test)]` is what keeps the
     /// counter out of the shipping struct.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn set_walked(&mut self, walked: usize) {
         self.walked = walked;
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-hooks")))]
     fn set_walked(&mut self, _walked: usize) {}
 
     /// Token pieces the last [`Grammar::mask`] call walked — the work the mask
@@ -136,9 +136,9 @@ impl GrammarState {
     /// (#126): driven by
     /// `grammar::tests::the_index_walks_only_the_accepted_buckets` and
     /// `server::chat::tests::real_model_json_schema_generation_parses`;
-    /// `#[cfg(test)]` keeps it out of production builds.
-    #[cfg(test)]
-    pub(crate) fn pieces_walked(&self) -> usize {
+    /// gated by `cfg(test)` or the `test-hooks` feature (#805), so it stays out of production builds.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn pieces_walked(&self) -> usize {
         self.walked
     }
 }
@@ -340,7 +340,7 @@ impl Grammar {
             inner,
             accepting,
             cache: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             walked: 0,
         }
     }
@@ -416,16 +416,16 @@ impl Grammar {
     /// the automaton never entered a dead state on it. This is the honest
     /// assertion for a generation truncated by the length limit: the whole text
     /// need not be a complete instance, but every byte emitted was legal.
-    /// Test-only (#238): driven by `grammar::tests::accept_reports_the_longest_accepted_prefix and server::chat::tests::real_model_max_length_output_is_a_valid_prefix`; `#[cfg(test)]` keeps it out of production builds.
-    #[cfg(test)]
-    pub(crate) fn accepts_prefix(&self, bytes: &[u8]) -> bool {
+    /// Test-only (#238): driven by `grammar::tests::accept_reports_the_longest_accepted_prefix and server::chat::tests::real_model_max_length_output_is_a_valid_prefix`; gated by `cfg(test)` or the `test-hooks` feature (#805), so it stays out of production builds.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn accepts_prefix(&self, bytes: &[u8]) -> bool {
         self.consume(&self.initial_key(), bytes).is_ok()
     }
 
     /// True when the byte string is a complete sentence of the grammar.
-    /// Test-only (#238): driven by `grammar::tests::gbnf_literals_classes_and_dot`; `#[cfg(test)]` keeps it out of production builds.
-    #[cfg(test)]
-    pub(crate) fn accepts(&self, bytes: &[u8]) -> bool {
+    /// Test-only (#238): driven by `grammar::tests::gbnf_literals_classes_and_dot`; gated by `cfg(test)` or the `test-hooks` feature (#805), so it stays out of production builds.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn accepts(&self, bytes: &[u8]) -> bool {
         match self.consume(&self.initial_key(), bytes) {
             Ok(next) => self.state_key_accepting(&next),
             Err(_) => false,
@@ -433,7 +433,7 @@ impl Grammar {
     }
 
     /// Test-only (#238): driven by `grammar::tests::gbnf_literals_classes_and_dot (through accepts/accepts_prefix)`; `#[cfg(test)]` keeps it out of production builds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn initial_key(&self) -> StateKey {
         StateKey {
             stacks: self
@@ -641,8 +641,8 @@ impl Grammar {
     /// compares it against the indexed mask bit for bit over the real
     /// 151,936-token vocabulary; `#[cfg(test)]` keeps it out of production
     /// builds.
-    #[cfg(test)]
-    pub(crate) fn mask_whole_for_tests(&self, st: &GrammarState) -> Arc<[u64]> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn mask_whole_for_tests(&self, st: &GrammarState) -> Arc<[u64]> {
         self.mask_whole(&st.inner, st.accepting).expect("mask").0
     }
 
@@ -1769,7 +1769,7 @@ fn emit_node(node: &Node, ids: &HashMap<&str, u32>, prog: &mut Vec<Inst>) -> Res
 /// `pub(crate)` for the tool-call grammar (`src/server/toolcall.rs`), which wraps
 /// `j-object` in the model's `<tool_call>` syntax (#614) — one JSON grammar, not
 /// a second copy that can drift from the schema compiler's.
-pub(crate) const GENERIC_RULES: &[(&str, &str)] = &[
+pub const GENERIC_RULES: &[(&str, &str)] = &[
     ("j-ws", r#"[ \t\n\r]*"#),
     ("j-char", r#"[^"\\\u0000-\u001f] | "\\" j-esc"#),
     (
@@ -3712,7 +3712,7 @@ fn is_annotation(key: &str) -> bool {
     )
 }
 
-pub(crate) fn json_type_name(v: &Value) -> &'static str {
+pub fn json_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "a boolean",

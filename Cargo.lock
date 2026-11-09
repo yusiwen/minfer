@@ -444,10 +444,8 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 name = "minfer"
 version = "0.0.9"
 dependencies = [
- "axum",
  "block2",
  "dispatch2",
- "futures-util",
  "half",
  "minijinja",
  "objc2",
@@ -459,14 +457,26 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
- "tokio-stream",
- "tower-http",
- "uuid",
 ]
 
 [[package]]
 name = "minfer-cli"
 version = "0.0.9"
+dependencies = [
+ "axum",
+ "futures-util",
+ "half",
+ "minfer",
+ "rand",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "tower-http",
+ "uuid",
+]
 
 [[package]]
 name = "minijinja"

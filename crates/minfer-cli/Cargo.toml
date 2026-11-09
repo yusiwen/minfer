@@ -7,6 +7,41 @@ license = "MIT"
 # Phase 2 (#805): the CLI ships as a release artifact, not as a crates.io package.
 publish = false
 
+[[bin]]
+name = "minfer"
+path = "src/main.rs"
+
 [dependencies]
-# W1 keeps this empty on purpose: the skeleton proves the workspace mechanics
-# (default-members, feature scope, package/`-p` behaviour) before anything moves.
+# `observe` is unconditional on purpose: the binary always carries the visualizer
+# and the trace export, and both ride the engine's `live` broadcast. A consumer of
+# the engine does not need it (that is the point of the boundary), so it stays a
+# feature there and a dependency here.
+minfer = { path = "../..", version = "0.0.9", default-features = false, features = ["observe"] }
+axum = "0.7"
+futures-util = "0.3"
+half = "2"
+rand = "0.8"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "net", "time", "signal"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-util"] }
+# The application's tests observe the engine through its test-only hooks; the
+# binary's own build does not (the feature is off outside a test build of this
+# package), and a consumer of the engine never sees them.
+minfer = { path = "../..", features = ["test-hooks"] }
+
+[features]
+# Everything the engine exposes is forwarded one line each; there is no second
+# switch here, because the package IS the switch (ADR-0082 decision 2).
+default = ["metal"]
+metal = ["minfer/metal"]
+cuda = ["minfer/cuda"]
+cuda_static = ["minfer/cuda_static"]
+debug_dump = ["minfer/debug_dump"]
