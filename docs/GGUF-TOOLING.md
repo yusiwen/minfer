@@ -480,7 +480,7 @@ reference's own code rather than assumed:
   `BF16` encoder is `(n + (0x7fff + ((n >> 16) & 1))) >> 16` with the comment
   *"same as ggml_compute_fp32_to_bf16 in ggml-impl.h"*, and the C function is
   that expression plus a NaN→quiet branch (`ggml-impl.h:611-623`). minfer's
-  `convert::f32_to_bf16_bits` (`src/convert.rs:105`, whose comment reads
+  `block::f32_to_bf16_bits` (`src/block.rs:43`, whose comment reads
   *"exactly `ggml_compute_fp32_to_bf16` (ggml-impl.h)"*) is that function by name
   and by bit pattern. So the cast and the converter share one rule; what the direct
   run adds is an independent **implementation** of it (numpy against Rust) and

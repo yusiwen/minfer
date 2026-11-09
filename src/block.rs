@@ -25,6 +25,30 @@ pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+// === f32 → bf16 (issue #142) ===
+//
+// The encoder lives here, with the word format it inverts, so that the engine's
+// own tests can build bf16 bytes without the `cli` feature (#791); `convert`
+// re-exports it for the writer and for ADR-0021's citation.
+
+/// f32 → bf16 bits, exactly `ggml_compute_fp32_to_bf16` (ggml-impl.h):
+/// round-to-nearest-even on the top 16 bits, with a NaN forced quiet.
+///
+/// The rounding is the integer form of RNE: `bits + 0x7fff + lsb` then shift,
+/// where `lsb` is bit 16 — a tie (the discarded 16 bits are exactly `0x8000`)
+/// adds 1 only when the surviving mantissa bit is odd, i.e. it rounds to even.
+/// The exponent carries for free (a mantissa overflow increments it). Every
+/// finite value fits: the largest magnitude reaching the add is `0x7f7fffff`,
+/// so the sum cannot wrap `u32`.
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    let u = x.to_bits();
+    if (u & 0x7fff_ffff) > 0x7f80_0000 {
+        // NaN: keep the sign and the top mantissa bits, set the quiet bit.
+        return ((u >> 16) as u16) | 64;
+    }
+    (u.wrapping_add(0x7fff + ((u >> 16) & 1)) >> 16) as u16
+}
+
 // === Block byte-size constants (ggml-common.h) ===
 
 pub const Q4B: usize = 18; // sizeof(block_q4_0)

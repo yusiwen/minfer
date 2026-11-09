@@ -221,7 +221,7 @@ fn f16_dot_uses_the_vectorized_path() {
 fn bf16_bytes(vals: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vals.len() * 2);
     for &v in vals {
-        out.extend_from_slice(&crate::convert::f32_to_bf16_bits(v).to_le_bytes());
+        out.extend_from_slice(&crate::block::f32_to_bf16_bits(v).to_le_bytes());
     }
     out
 }
@@ -331,7 +331,7 @@ fn bf16_and_f16_matmul_agree_bitwise_when_the_values_are_equal() {
     let mut wf: Vec<f32> = Vec::with_capacity(m * k);
     while wf.len() < m * k {
         let v = lcg(&mut seed) * 8.0;
-        let b = crate::block::bf16_to_f32(crate::convert::f32_to_bf16_bits(v));
+        let b = crate::block::bf16_to_f32(crate::block::f32_to_bf16_bits(v));
         if half::f16::from_f32(b).to_f32().to_bits() == b.to_bits() {
             wf.push(b);
         }
