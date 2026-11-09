@@ -54,6 +54,17 @@ extern "C" {
     fn launch_quantize_q8_0(x: *const f32, y: *mut u8, dim: i32, nt: i32, stream: *mut c_void);
 }
 
+// The C++ runtime the kernel archive's host objects need (`__cxa_guard_*`).
+//
+// #787: this example links neither `minfer` nor its rlib — it references no item
+// of the crate — so rustc drops the rlib, and with it every native library
+// recorded there, including build.rs's `-l stdc++`. The kernel objects still need
+// libstdc++ (`undefined reference to __cxa_guard_acquire`), so name it here.
+// Order matters: it must come *after* `cuda_kernels`, because the linker resolves
+// a static archive's undefined symbols against the libraries that follow it.
+#[link(name = "stdc++")]
+extern "C" {}
+
 // ─── Helpers ────────────────────────────────────────────────────
 
 fn check(msg: &str) {
