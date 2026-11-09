@@ -380,6 +380,12 @@ jobs:
         run: cargo build --release --features cuda
       - name: Compile the test harness (no device on a hosted runner)
         run: cargo test --release --features cuda --no-run
+      # #787: scripts/cuda_test.sh selects `--lib --bins --tests`, so the example
+      # is not built by the device run any more; this is its link gate. The
+      # example does not use the crate, so it must name the kernel archive and
+      # the C++ runtime on its own link line.
+      - name: Build the CUDA example
+        run: cargo build --release --features cuda --examples
       # #254 Layer 2, the maximal configuration. Deliberately the last step: the
       # scratch copy shares this job's warm target/, so only the crate is
       # rechecked, and nothing below would want the stripped tree.

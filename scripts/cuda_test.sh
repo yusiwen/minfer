@@ -10,9 +10,15 @@
 # Serial execution removes that interleaving. It is also what the real-model CPU
 # tests in docs/KNOWN-CPU-ISSUES-2026-08-29.md already do, for the same reason.
 #
+# The suite targets are selected explicitly (--lib --bins --tests): a bare
+# `cargo test` also *builds* every `[[example]]`, and an example whose link line
+# is broken then fails the run without executing a single test (#787). The CUDA
+# example keeps its own gate — `cargo build --release --features cuda --examples`
+# in the `build-linux-cuda` CI job — so this wrapper stays about the tests.
+#
 # Usage: scripts/cuda_test.sh [extra cargo test args...]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="/usr/local/cuda-13.0/bin:$PATH"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
-cargo test --release --features cuda -- --test-threads=1 "$@"
+cargo test --release --features cuda --lib --bins --tests -- --test-threads=1 "$@"
