@@ -81,12 +81,16 @@ offload plan — is per engine, and the fence can be scoped (`registry::with_fil
 | `tooling` | `convert` / `quantize` / `split` | via `cli` |
 | `viz` | the `viz` subcommand and its assets (implies `server`) | via `cli` |
 | `observe` | the `live`/`trace` hooks (tokio `sync`) | via `server` |
+| `metal` | the macOS Metal backend, and its `objc2` dependencies | on (inert off macOS) |
 | `cuda`, `cuda_static`, `debug_dump` | unchanged | off |
 
 The binary declares `required-features = ["cli"]`, so `cargo build --release` produces it while
 `--no-default-features` builds the core alone. The `feature-matrix` CI job builds the core, each
-application feature alone, and the `cargo package` tarball. **`metal` is not a feature yet** — a
-macOS consumer still compiles the Metal backend and needs the toolchain; that is #777.
+application feature alone, and the `cargo package` tarball. `metal` is a feature since
+[#777](https://github.com/yusiwen/minfer/issues/777): compiled only with
+`cfg(all(target_os = "macos", feature = "metal"))`, default-on, and inert off macOS. Without it a
+macOS build resolves no `objc2` crate and calls no `xcrun`; `--no-default-features --features cli`
+still produces the binary, which then refuses `--backend metal` by name (ADR-0080).
 
 ## The consumer's view
 

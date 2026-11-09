@@ -447,3 +447,8 @@ symbol = "CaptureLease"
 adr = "0078"
 what = "`weights_bytes()` sums the ledger, retired bytes included, so the E4 weights term and cudaMemGetInfo describe the same memory"
 path = "src/cuda/methods/accounting.rs"
+
+[[governs]]
+adr = "0080"
+what = "the Metal backend is the `metal` cargo feature (macOS only), and a build without it refuses the name by naming the feature"
+symbol = "not_compiled_why"

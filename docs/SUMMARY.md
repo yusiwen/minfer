@@ -99,6 +99,7 @@
     - [0077. A Metal registration is released with its model, and the cache belongs to the engine](./adr/0077-a-metal-registration-is-released-with-its-model.md)
     - [0078. A CUDA weight is released with its model, and a live captured graph holds a lease](./adr/0078-a-cuda-weight-is-released-with-its-model-and-a-capture-holds-a-lease.md)
     - [0079. The engine is a crate with two API tiers, and the apps are its first consumers](./adr/0079-the-engine-is-a-crate-with-two-api-tiers.md)
+    - [0080. The Metal backend is a cargo feature, and a metal-less build refuses the name](./adr/0080-the-metal-backend-is-a-cargo-feature-and-a-metal-less-build-refuses-the-name.md)
 
 # Model Support
 

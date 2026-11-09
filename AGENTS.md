@@ -67,7 +67,9 @@ Unit tests live beside their module as `<module>/tests.rs`, declared `#[cfg(test
 ## Build & Run
 
 ```bash
-cargo build --release                             # CPU + Metal; never touches nvcc
+cargo build --release                             # CPU + Metal (macOS: the default `metal` feature)
+cargo build --release --no-default-features       # engine only: no Metal backend, no Apple toolchain
+cargo build --release --no-default-features --features cli  # binary without Metal (refuses --backend metal)
 cargo build --release --features cuda             # + CUDA backend (needs nvcc)
 cargo build --release --features cuda,cuda_static # + static cudart (no libcudart.so dep)
 cargo build --release --features debug_dump       # + MINFER_DUMP_DIR per-layer dumps
