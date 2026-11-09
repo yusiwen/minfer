@@ -87,6 +87,13 @@ never a silent mid-run fallback.
 The split follows CUDA: `src/metal/` is the only place that touches Objective-C/Metal APIs, and
 `metal_backend.rs` is the only place that knows about graph nodes.
 
+**Build configuration.** The backend is the `metal` cargo feature
+([ADR-0080](adr/0080-the-metal-backend-is-a-cargo-feature-and-a-metal-less-build-refuses-the-name.md)):
+every site that reaches it is `cfg(all(target_os = "macos", feature = "metal"))`, `default` enables
+it, and a build without it compiles no metallib (so it never spawns `xcrun`) and refuses
+`--backend metal` by name instead of falling back to the CPU. The three layers above exist only in
+that configuration.
+
 ### 2.2 The `MetalBackend` surface
 
 ```rust
@@ -1068,3 +1075,4 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0032](adr/0032-the-packed-kv-staging-window-is-f32.md) — The packed-KV staging window is f32, not f16
 - [ADR-0036](adr/0036-bf16-gets-its-own-device-kernels.md) — bf16 weights get their own device kernels, not a dtype flag on the f16 ones
 - [ADR-0037](adr/0037-a-metal-weight-dtype-a-kernel-cannot-consume-is-refused.md) — A Metal weight dtype a kernel cannot consume is refused, never run as a wrong kernel
+- [ADR-0080](adr/0080-the-metal-backend-is-a-cargo-feature-and-a-metal-less-build-refuses-the-name.md) — The Metal backend is a cargo feature, and a metal-less build refuses the name

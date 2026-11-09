@@ -26,7 +26,7 @@ Loaded directly from GGUF metadata — no external dependency on tiktoken. `toke
 
 All 8 quantized dot products as SIMD kernels on NEON+SDOT (inline asm, Apple Silicon); on x86 AVX2 covers **Q4_0, Q8_0 and the three K-quants** — Q4_1, Q5_0 and Q5_1 fall to the scalar reference there. Plus a persistent row-parallel thread pool (`-t/--threads`). Qwen3-4B CPU decode runs ~52–58 tok/s on M4 Pro (vs 1.1 before the pool).
 
-### GPU — Metal (Apple Silicon)
+### GPU — Metal (Apple Silicon, feature-gated `metal`, on by default)
 
 Flash attention (single fused kernel for decode + prefill), simdgroup GEMM prefill for every quant type, SIMD-parallel RMSNorm, float4-vectorized kernels, a build-time precompiled `.metallib` (no per-run shader compile), and auto-selected f16 KV cache for 7B-class models. Tracked in [METAL_OPTIMIZATIONS.md](./METAL_OPTIMIZATIONS.md).
 

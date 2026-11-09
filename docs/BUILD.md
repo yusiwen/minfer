@@ -104,6 +104,11 @@ by the devShell's `shellHook` (see "Git hooks" below), so a commit made outside
 cargo build --release
 ./target/release/minfer <model.gguf> "hello"
 
+# engine only — no Metal backend, no Apple toolchain
+cargo build --release --no-default-features
+# the binary without Metal: it refuses `--backend metal` by name
+cargo build --release --no-default-features --features cli
+
 # CUDA (NVIDIA GPU) — opt-in feature, requires the CUDA toolkit (nvcc)
 cargo build --release --features cuda
 # statically-linked cudart (no libcudart.so runtime dep)
@@ -217,10 +222,19 @@ The formatting gate is provided by [git-hooks.nix](https://github.com/cachix/git
 
 ## macOS / Metal notes
 
-On macOS the Metal backend is built in automatically: `build.rs` compiles
-`src/metal/kernels/` → a precompiled `.metallib` via `/usr/bin/xcrun` at build
-time (no per-run shader compile). If Xcode tools are unavailable the build
-still succeeds and the shader is compiled from source at first run.
+On macOS the Metal backend is the `metal` cargo feature, on by default
+(`default = ["cli", "metal"]`): `build.rs` compiles `src/metal/kernels/` → a
+precompiled `.metallib` via `/usr/bin/xcrun` at build time (no per-run shader
+compile). If Xcode tools are unavailable the build still succeeds and the shader
+is compiled from source at first run.
+
+With `--no-default-features` the feature is off and the build touches no Apple
+toolchain at all: no metallib, no `-F <SDK>` framework search path, no `xcrun`
+(the build script prints one warning as the marker), and none of the `objc2`
+dependencies is resolved. `--no-default-features --features cli` gives the
+binary without the backend; `--backend metal` then refuses by name — "the Metal
+backend is compiled only with --features metal" — rather than falling back to
+the CPU ([ADR-0080](adr/0080-the-metal-backend-is-a-cargo-feature-and-a-metal-less-build-refuses-the-name.md)).
 
 ## CUDA build details
 
