@@ -85,7 +85,10 @@ offload plan — is per engine, and the fence can be scoped (`registry::with_fil
 | `cuda`, `cuda_static`, `debug_dump` | unchanged | off |
 
 The binary declares `required-features = ["cli"]`, so `cargo build --release` produces it while
-`--no-default-features` builds the core alone. The `feature-matrix` CI job builds the core, each
+`--no-default-features` builds the core alone. The engine-only configuration is **testable** too: `cargo test
+--no-default-features --lib` compiles and runs it — the bf16 encoder lives in `block` with the word
+format it inverts, so no engine test reaches into a `cli` module
+([#791](https://github.com/yusiwen/minfer/issues/791)). The `feature-matrix` CI job builds the core, each
 application feature alone, and the `cargo package` tarball. `metal` is a feature since
 [#777](https://github.com/yusiwen/minfer/issues/777): compiled only with
 `cfg(all(target_os = "macos", feature = "metal"))`, default-on, and inert off macOS. Without it a

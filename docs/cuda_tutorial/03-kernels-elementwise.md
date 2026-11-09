@@ -274,7 +274,7 @@ threads (§4 does that arithmetic).
 
 #### The data layout first
 
-Everything in this section depends on 18 bytes. `BlockQ4_0` (`src/block.rs:65`):
+Everything in this section depends on 18 bytes. `BlockQ4_0` (`src/block.rs:89`):
 
 ```rust
 // Q4_0 — 4-bit quantization, 32 elements per block (line 184-189)
@@ -288,7 +288,7 @@ pub struct BlockQ4_0 {
 }
 ```
 
-with `pub const Q4B: usize = 18` at `Q4B` (`block.rs:30`) and a compile-time
+with `pub const Q4B: usize = 18` at `Q4B` (`block.rs:54`) and a compile-time
 `assert!(core::mem::size_of::<BlockQ4_0>() == 2 + 16)` at `:203`. So the
 byte layout is exactly:
 
