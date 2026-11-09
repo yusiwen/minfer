@@ -364,6 +364,11 @@ pub enum ConvError {
     /// construct, a syntax error). The turn is refused loudly — the engine never
     /// substitutes a generic ChatML prompt.
     Template(String),
+    /// #795: a raw continuation was asked of a session carrying a speculative
+    /// draft. The draft keeps its own KV indexed by the same positions, so a
+    /// continuation that bypasses the turn machinery would desynchronise the
+    /// pair; the session refuses instead of half-driving it.
+    CompleteWithSpec,
 }
 
 impl From<template::TemplateError> for ConvError {
@@ -388,6 +393,11 @@ impl std::fmt::Display for ConvError {
             ),
             ConvError::Grammar(msg) => write!(f, "{msg}"),
             ConvError::Template(msg) => write!(f, "{msg}"),
+            ConvError::CompleteWithSpec => write!(
+                f,
+                "a raw continuation cannot run on a session with a speculative draft (the draft's \
+                 KV is indexed by the same positions and would desynchronise)"
+            ),
         }
     }
 }
@@ -424,6 +434,11 @@ pub struct Conversation {
     /// assistant turn, so each turn produces a fresh instance of the schema
     /// (a persistent state would be stuck at "accepting" after turn 1).
     pub grammar_state: Option<crate::grammar::GrammarState>,
+    /// #795: a raw continuation (`complete_tokens`) put tokens into the KV that
+    /// no render of `messages` reproduces, so the next `user_turn` rebuilds the
+    /// stream from the history instead of appending a delta after them. Set by
+    /// `complete_tokens`, consumed (and cleared) by the next `user_turn`.
+    pub force_full_render: bool,
 }
 
 const REPEAT_LAST_N: usize = 64;
@@ -495,6 +510,7 @@ impl Conversation {
             n_ctx: spec.n_ctx,
             mirostat: sampler::MirostatState::new(spec.mirostat_tau),
             grammar_state: None,
+            force_full_render: false,
         }
     }
 
@@ -557,7 +573,8 @@ impl Conversation {
         }
         let logits = self.rehydrate_full(engine, &toks);
         self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
-        let mut out = self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+        let mut out =
+            self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits, true)?;
         out.prefill_tokens = toks.len();
         Ok(Some(out))
     }
@@ -792,8 +809,10 @@ impl Conversation {
             return Err(ConvError::EmptyInput);
         }
 
-        // 3. Prefix mismatch (non-deterministic template) → full re-render fallback (§5.4).
-        if !delta.prefix_matched {
+        // 3. Prefix mismatch (non-deterministic template), or a raw continuation left
+        //    rows no render reproduces (#795) → full re-render fallback (§5.4).
+        let forced = std::mem::take(&mut self.force_full_render);
+        if !delta.prefix_matched || forced {
             self.messages
                 .push(("user".to_string(), Some(input.to_string())));
             let full = self.render_full(true)?;
@@ -804,7 +823,7 @@ impl Conversation {
             let logits = self.rehydrate_full(engine, &toks);
             self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
             let mut out =
-                self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+                self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits, true)?;
             out.prefill_tokens = toks.len();
             return Ok(out);
         }
@@ -918,7 +937,7 @@ impl Conversation {
             };
             self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
             let mut out =
-                self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+                self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits, true)?;
             out.prefill_tokens = if used_shift {
                 delta_toks.len()
             } else {
@@ -945,7 +964,7 @@ impl Conversation {
             let logits = self.rehydrate_full(engine, &toks);
             self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
             let mut out =
-                self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+                self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits, true)?;
             out.prefill_tokens = toks.len();
             return Ok(out);
         }
@@ -958,7 +977,8 @@ impl Conversation {
         // The penalty window is reseeded **after** the delta is appended (llama.cpp feeds prompt tokens into the sampler window).
         self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
 
-        let mut out = self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+        let mut out =
+            self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits, true)?;
         out.prefill_tokens = delta_toks.len();
         Ok(out)
     }
@@ -1016,8 +1036,67 @@ impl Conversation {
         // The penalty window is reseeded **after** the delta is appended (same as user_turn).
         self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
 
-        let mut out = self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits)?;
+        let mut out =
+            self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits, true)?;
         out.prefill_tokens = toks.len();
+        Ok(out)
+    }
+
+    /// #795: one **raw continuation** on the session's KV.
+    ///
+    /// The tokens are prefilled at the current cursor — no template render, no
+    /// message recorded — and the run decodes exactly like a turn. That is what
+    /// makes a long prompt splittable across calls: the second call prefills
+    /// only its own tokens, and `TurnOutcome::prefill_tokens` says so.
+    ///
+    /// The continuation is **not** part of the history: `messages` is the
+    /// authority (the KV mirror invariant of §5.4 says the stream is a prefix of
+    /// the render), so the next [`user_turn`](Self::user_turn) rebuilds the KV
+    /// from the history through the full-re-render path. Consecutive
+    /// `complete_tokens` calls reuse each other's rows; a continuation never
+    /// leaks into a later chat turn.
+    pub fn complete_tokens(
+        &mut self,
+        tokens: &[u32],
+        decoder: &dyn TokenCodec,
+        cfg: &TurnParams,
+        engine: &mut dyn Engine,
+        emit: &mut dyn FnMut(&[u8]),
+    ) -> Result<TurnOutcome, ConvError> {
+        if tokens.is_empty() {
+            return Err(ConvError::EmptyInput);
+        }
+        if engine.has_spec() {
+            // The draft carries its own KV at the same positions; half-driving
+            // the pair would desynchronise it. Refuse by name instead.
+            return Err(ConvError::CompleteWithSpec);
+        }
+        // A turn that stopped without EOG still owes its EOT; write it first so
+        // the continuation starts after a closed turn (the same rule as a turn).
+        if self.need_insert_eot && self.current_pos < self.n_ctx {
+            let _ = engine.forward(&[self.eot], &[self.current_pos], 1);
+            self.stream_tokens.push(self.eot);
+            self.current_pos += 1;
+            self.need_insert_eot = false;
+        }
+        let needed = self.current_pos + tokens.len();
+        if needed > self.n_ctx {
+            return Err(ConvError::ContextFull {
+                needed,
+                available: self.n_ctx,
+            });
+        }
+        let positions: Vec<usize> = (self.current_pos..needed).collect();
+        let logits = engine.forward(tokens, &positions, 1);
+        self.stream_tokens.extend_from_slice(tokens);
+        self.current_pos = needed;
+        self.prev_tokens = sampler::recent_window(&self.stream_tokens, REPEAT_LAST_N);
+        // The rows just written (and the ones the decode below writes) are not
+        // part of any render of `messages`, so the next turn must rebuild.
+        self.force_full_render = true;
+        let mut out =
+            self.generate_assistant_with_logits(decoder, cfg, engine, emit, logits, false)?;
+        out.prefill_tokens = tokens.len();
         Ok(out)
     }
 
@@ -1278,6 +1357,7 @@ impl Conversation {
         engine: &mut dyn Engine,
         emit: &mut dyn FnMut(&[u8]),
         mut logits: Vec<f32>,
+        record: bool,
     ) -> Result<TurnOutcome, ConvError> {
         // doc 97: speculative rounds when the engine carries a draft. The
         // spec loop is a sibling of the plain loop (not a branch inside it)
@@ -1375,10 +1455,12 @@ impl Conversation {
 
         let text = String::from_utf8(full.clone())
             .unwrap_or_else(|_| String::from_utf8_lossy(&full).into_owned());
-        self.messages
-            .push(("assistant".to_string(), Some(text.clone())));
-        // Did not reach EOG → insert EOT before the next turn's input (§5.4).
-        self.need_insert_eot = !stopped_by_eog;
+        if record {
+            self.messages
+                .push(("assistant".to_string(), Some(text.clone())));
+            // Did not reach EOG → insert EOT before the next turn's input (§5.4).
+            self.need_insert_eot = !stopped_by_eog;
+        }
 
         Ok(TurnOutcome {
             text,

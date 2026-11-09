@@ -185,3 +185,103 @@ fn first_user_turn_prefills_the_system_prompt() {
         "the system prompt must reach the KV"
     );
 }
+
+/// #795: a raw continuation prefills at the cursor, only the new tokens, and
+/// never drops the cache — the two properties that make a split prompt cheap.
+#[test]
+fn a_continuation_prefills_at_the_cursor_and_keeps_the_cache() {
+    let mut c = conv(512);
+    let mut eng = MockEngine::new(vec![]);
+    let mut p = cfg();
+    p.n_predict = 0; // prefill only: one forward per call, no decode
+    let head = vec![11u32, 12, 13];
+    let tail = vec![21u32, 22];
+
+    c.complete_tokens(&head, &FakeCodec, &p, &mut eng, &mut noop_emit())
+        .unwrap();
+    c.complete_tokens(&tail, &FakeCodec, &p, &mut eng, &mut noop_emit())
+        .unwrap();
+
+    assert_eq!(eng.resets, 0, "a continuation never drops the cache");
+    assert_eq!(eng.calls.len(), 2, "one prefill per call");
+    assert_eq!(
+        eng.calls[0].0, head,
+        "the first call prefills its own tokens"
+    );
+    assert_eq!(eng.calls[0].1, vec![0, 1, 2], "from position 0");
+    assert_eq!(
+        eng.calls[1].0, tail,
+        "the second prefills only the new tokens"
+    );
+    assert_eq!(
+        eng.calls[1].1,
+        vec![3, 4],
+        "at the cursor the first call left"
+    );
+    assert_eq!(c.current_pos, 5);
+    assert_eq!(c.stream_tokens, [head, tail].concat());
+    assert!(
+        c.force_full_render,
+        "the next turn must rebuild from history"
+    );
+    assert!(c.messages.is_empty(), "the continuation records no message");
+}
+
+/// #795: the turn after a continuation rebuilds the stream from the messages
+/// (reset + full render), instead of appending a delta after the raw rows.
+#[test]
+fn the_turn_after_a_continuation_rebuilds_instead_of_appending() {
+    let mut c = conv(512);
+    let mut eng = MockEngine::new(vec![IM_END, EOS]);
+    c.start(Some("hi"), &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+        .unwrap();
+    let before = c.current_pos;
+
+    c.complete_tokens(&[11, 12], &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+        .unwrap();
+    let resets_before = eng.resets;
+    let calls_before = eng.calls.len();
+
+    c.user_turn("Q", &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+        .unwrap();
+
+    assert_eq!(
+        eng.resets,
+        resets_before + 1,
+        "the forced full re-render resets the cache"
+    );
+    let first_after = &eng.calls[calls_before];
+    let full = fallback_full(&[
+        ("user".into(), Some("hi".into())),
+        ("assistant".into(), Some(String::new())),
+        ("user".into(), Some("Q".into())),
+    ]);
+    assert_eq!(
+        first_after.1.first(),
+        Some(&0),
+        "the rebuild starts at position 0, not after the raw rows"
+    );
+    assert_eq!(
+        first_after.0.len(),
+        full.len(),
+        "and prefills the whole render"
+    );
+    assert!(
+        c.current_pos > before,
+        "the turn advanced past the continuation's rows"
+    );
+}
+
+/// #795: a session carrying a speculative draft refuses a raw continuation by
+/// name (the draft's KV shares the positions and would desynchronise).
+#[test]
+fn a_continuation_refuses_a_speculative_session() {
+    let mut c = conv(512);
+    let mut eng = MockEngine::new(vec![]);
+    eng.spec_batches.push_back(vec![IM_END]);
+    let err = c
+        .complete_tokens(&[11, 12], &FakeCodec, &cfg(), &mut eng, &mut noop_emit())
+        .unwrap_err();
+    assert!(matches!(err, ConvError::CompleteWithSpec), "{err}");
+    assert_eq!(c.current_pos, 0, "a refused continuation writes nothing");
+}
