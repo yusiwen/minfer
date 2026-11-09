@@ -28,6 +28,19 @@ include = [
 ]
 
 
+# Phase 2 (#805): the application layer lives in its own package. The engine stays
+# at the repository root, because every documentation anchor into `src/...` would
+# otherwise have to move (1,190 anchors, measured 2026-11-09).
+#
+# `default-members` is the one line that keeps `cargo build --release` producing
+# `target/release/minfer`: a non-virtual workspace defaults to the root package
+# alone, so the CLI member must be named explicitly for a plain build to include
+# it (W2 adds it; W1 proves the root-only form still works).
+[workspace]
+members = ["crates/minfer-cli"]
+default-members = ["."]
+resolver = "2"
+
 [[bin]]
 name = "minfer"
 path = "src/main.rs"

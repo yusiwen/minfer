@@ -1,0 +1,12 @@
+[package]
+name = "minfer-cli"
+version = "0.0.9"
+edition = "2021"
+description = "The minfer command-line application: the facade's first consumer"
+license = "MIT"
+# Phase 2 (#805): the CLI ships as a release artifact, not as a crates.io package.
+publish = false
+
+[dependencies]
+# W1 keeps this empty on purpose: the skeleton proves the workspace mechanics
+# (default-members, feature scope, package/`-p` behaviour) before anything moves.
