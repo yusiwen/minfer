@@ -267,7 +267,8 @@ fn main() {
         //     vars, so stripping them only works together with the /usr/bin
         //     path. The system xcrun falls back to `xcode-select -p`.
         // Unsetting the vars only affects these two child processes — rustc
-        // linking in the same shell still uses the nix SDK/clang.
+        // linking in the same shell still uses the nix SDK/clang, and finds
+        // Metal through the `-F` SDK path printed further down.
         // #788: the runtime-source fallback is an explicit opt-in, and a failed
         // compile is a hard error. It used to be a warning plus an empty
         // metallib, which (a) is a silent fallback — ADR-0009 — and (b) was
@@ -396,6 +397,13 @@ fn main() {
         // again just picks the same framework. `-F` is a link-search flag the
         // linker understands natively (no -L semantics), so it never shadows
         // an nix-provided dylib.
+        //
+        // `cargo:rustc-link-arg` is PACKAGE-SCOPED: it reaches the binaries,
+        // tests, examples and benches of the package whose build script printed
+        // it, never a dependent's final link. This copy therefore covers this
+        // package's own test binaries only; the `minfer` binary and the CLI
+        // package's tests print the same flag from crates/minfer-cli/build.rs
+        // (#809 — the Phase 2 split is what made the difference visible).
         if let Ok(out) = Command::new(&xcrun)
             .env_remove("DEVELOPER_DIR")
             .env_remove("SDKROOT")
