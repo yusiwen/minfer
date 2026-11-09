@@ -42,6 +42,17 @@ arguments, so `develop -c scripts/build_book.sh /path/to/minfer` hands the path 
 `build_book.sh` (`mdbook` then exits 2 with its usage line, because it was given a
 directory as a subcommand).
 
+**On macOS the devShell links the binary through the Xcode SDK.** `nix develop`
+puts nixpkgs' clang first on `PATH`, and its framework search path covers
+nixpkgs' `apple-sdk` packages — not `Metal.framework`, which ships with Xcode.
+`crates/minfer-cli/build.rs` therefore adds the real SDK's framework directory
+with `-F`, resolved through `/usr/bin/xcrun` with `DEVELOPER_DIR`/`SDKROOT`
+stripped: the same route the Metal shader precompile uses
+([#809](https://github.com/yusiwen/minfer/issues/809)). Without it the link of
+the binary — and of this package's integration tests — dies with
+`ld: framework not found Metal`. The flag is printed by every package that
+links, because `cargo:rustc-link-arg` never reaches a dependent's final link.
+
 `.envrc` is `use flake`, so with `direnv` on `PATH` and allowed the shell sets
 itself up on entry. **When it does not:** if `nix` is not on `PATH`, `direnv`
 fails with `nix: command not found` and the devShell's tools simply vanish from
