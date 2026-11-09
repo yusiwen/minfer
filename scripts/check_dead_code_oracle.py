@@ -10,9 +10,11 @@ than with a name census. This script productises that oracle:
 1. Copy the tree to a scratch directory (the checked-out tree is never modified)
    and replace **every** `allow(dead_code)` — bare, `cfg_attr`, combined lists and
    the inner `#![...]` form — with a line-preserving marker comment, so line
-   numbers and spans stay comparable. A spelling this script cannot strip (a
-   multi-line attribute, a `clippy::dead_code` path) is an error, never a silent
-   skip; if zero annotations are stripped that is an error too.
+   numbers and spans stay comparable. An attribute rustfmt wrapped past the width
+   budget is collapsed onto its first line first (its continuation lines become
+   empty), because the strip itself is line-based. A spelling it still cannot
+   parse (`clippy::dead_code`) is an error, never a silent skip; if zero
+   annotations are stripped that is an error too.
 2. Run ``cargo check --release [--features cuda] --message-format=json`` over the
    copy with ``RUSTFLAGS=--cap-lints=warn``. The cap matters: the crate's
    ``#![cfg_attr(not(test), deny(warnings))]`` would turn the lint into an error
@@ -152,6 +154,46 @@ ATTRIBUTE = re.compile(r"^[ \t]*#!?\[")
 DEAD_CODE = re.compile(r"\bdead_code\b")
 MARKER = "// minfer-dead-code-oracle: stripped"
 
+#: The head of an attribute that may carry an allow list. It finds a span rustfmt
+#: wrapped past the width budget; the strip below is line-based, so such a span is
+#: collapsed onto its first line before it is judged.
+ATTRIBUTE_HEAD = re.compile(r"^[ \t]*#!?\[(?:cfg_attr|allow)\(")
+
+
+def join_wrapped_attributes(text: str) -> str:
+    """Collapse a wrapped `#[cfg_attr(...)]` / `#[allow(...)]` onto one line.
+
+    rustfmt wraps an attribute longer than the width budget. The continuation
+    lines become empty rather than disappearing, so every item keeps its line
+    number and the spans the compiler reports still address it.
+    """
+    lines = text.splitlines(keepends=True)
+    if not any(ATTRIBUTE_HEAD.match(line) for line in lines):
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if ATTRIBUTE_HEAD.match(lines[i]) is None or lines[i].count("(") <= lines[i].count(")"):
+            out.append(lines[i])
+            i += 1
+            continue
+        depth = 0
+        end = None
+        for j in range(i, len(lines)):
+            depth += lines[j].count("(") - lines[j].count(")")
+            if depth <= 0:
+                end = j
+                break
+        if end is None or end == i:
+            out.append(lines[i])
+            i += 1
+            continue
+        body = " ".join(line.strip() for line in lines[i : end + 1])
+        out.append(re.sub(r"\s+", " ", body).strip() + "\n")
+        out.extend("\n" for _ in range(end - i))
+        i = end + 1
+    return "".join(out)
+
 #: Message verb -> kind, in first-match order.
 KIND_BY_VERB = (
     (re.compile(r"\bfields?\b"), "field"),
@@ -188,6 +230,7 @@ def strip_source(text: str, where: str) -> tuple[str, list[int]]:
     `dead_code` mention in a comment is prose and is left alone; one in an
     attribute this function does not understand is an error.
     """
+    text = join_wrapped_attributes(text)
     out: list[str] = []
     stripped: list[int] = []
     for i, raw in enumerate(text.splitlines(keepends=True), 1):
@@ -208,8 +251,8 @@ def strip_source(text: str, where: str) -> tuple[str, list[int]]:
             if DEAD_CODE.search(line) and ATTRIBUTE.match(line):
                 raise OracleError(
                     f"{where}:{i}: unrecognised `allow(dead_code)` spelling — this oracle strips "
-                    f"only single-line `#[allow(...)]` / `#[cfg_attr(<cfg>, allow(...))]` "
-                    f"attributes; rewrite it or teach strip_source() the shape"
+                    f"`#[allow(...)]` / `#[cfg_attr(<cfg>, allow(...))]` attributes; "
+                    f"rewrite it or teach strip_source() the shape"
                 )
             out.append(raw)
     text_out = "".join(out)
@@ -560,15 +603,23 @@ def selftest() -> int:
     for name, body, want_text, want_count in strip_cases:
         got_text, got_lines = strip_source(body, "fixture.rs")
         expect(f"strip: {name}", (got_text, len(got_lines)), (want_text, want_count))
-    for name, body in [
-        ("multi-line allow", "#[allow(\n    dead_code\n)]\n"),
-        ("clippy path", "#[allow(clippy::dead_code)]\n"),
-    ]:
-        try:
-            strip_source(body, "fixture.rs")
-            expect(f"strip must refuse: {name}", "no error", "OracleError")
-        except OracleError:
-            pass
+    wrapped_cfg_attr = (
+        '#[cfg_attr(\n    not(any(\n        all(target_os = "macos", feature = "metal"),\n'
+        '        feature = "cuda"\n    )),\n    allow(dead_code)\n)]\nfn f() {}\n'
+    )
+    got_text, got_lines = strip_source(wrapped_cfg_attr, "fixture.rs")
+    expect(
+        "strip: rustfmt-wrapped cfg_attr",
+        (got_text, got_lines),
+        (MARKER + "\n" + "\n" * 6 + "fn f() {}\n", [1]),
+    )
+    got_text, got_lines = strip_source("#[allow(\n    dead_code\n)]\n", "fixture.rs")
+    expect("strip: wrapped allow", (got_text, got_lines), (MARKER + "\n\n\n", [1]))
+    try:
+        strip_source("#[allow(clippy::dead_code)]\n", "fixture.rs")
+        expect("strip must refuse: clippy path", "no error", "OracleError")
+    except OracleError:
+        pass
 
     expect(
         "fields are two items",
