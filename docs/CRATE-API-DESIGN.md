@@ -1,9 +1,9 @@
 # Crate API design
 
-**Status: current contract (Phase 1 landed).** The decision behind it is
-[ADR-0079](adr/0079-the-engine-is-a-crate-with-two-api-tiers.md); this page is what a host can
-actually call today. The slices that built it are #763's S0–S9 (the epic's comments carry each
-landing), and the gaps that remain are named at the end rather than implied.
+**Status: current contract (Phase 1 landed, and every gap it named has since closed).** The decision
+behind it is [ADR-0079](adr/0079-the-engine-is-a-crate-with-two-api-tiers.md); this page is what a host
+can actually call today. The slices that built it are #763's S0–S10 (the epic's comments carry each
+landing), and the end of the page names each gap that was left, with the ticket that closed it.
 
 ## The tiers
 
@@ -27,8 +27,13 @@ tier (`src/server/**` reaches these types only through `crate::advanced`).
 - The model owns the mapping it reads (ADR-0076). Dropping an `Engine` releases the mapping, the
   device registrations (ADR-0077/0078) and the KV arena; a process may then load another model. The
   reload gate is `src/gguf/tests.rs`.
-- Loading is **path-only** today. A bytes constructor (a model received over the network) is a
-  follow-up, not an omission: it needs the same owned-mapping contract.
+- Loading takes a **path or bytes**. `Engine::load_from_bytes(Vec<u8>)` (#797) serves a host that
+  already holds the model — received over the network, embedded, or read from a volume it decrypted
+  itself — under the same contract: the buffer is **not** copied (every weight is a range of it, as a
+  path load's weights are ranges of the mapping), and a split model is refused by name because its
+  siblings are resolved beside the file and a bytes load has no directory. On macOS an owned part is
+  copied once into its `MTLBuffer` (`newBufferWithBytesNoCopy` needs page-aligned pages whose lifetime
+  the engine can guarantee), which is the same one-buffer-per-part shape the mapped path uses.
 
 ## Configuration
 
@@ -142,13 +147,16 @@ crate (load → chat → drop → reload, two sessions independent, and a single
 
 ## What Phase 1 did not do
 
-These are gaps with their own tickets, not omissions. Three items this list used to name have since
-landed: `metal` as a feature ([#777](https://github.com/yusiwen/minfer/issues/777), §Features),
-cancellation ([#796](https://github.com/yusiwen/minfer/issues/796), §Failures) and the raw
-continuation `Session::complete` ([#795](https://github.com/yusiwen/minfer/issues/795), §Sessions).
+Every gap this list named has landed, each with the ticket that closed it:
 
-- **A bytes constructor** for `Engine::load` — the owned-mapping contract is
-  [#797](https://github.com/yusiwen/minfer/issues/797).
+- `metal` as a feature ([#777](https://github.com/yusiwen/minfer/issues/777)) — §Features.
+- cancellation ([#796](https://github.com/yusiwen/minfer/issues/796)) — §Failures.
+- the raw continuation `Session::complete` ([#795](https://github.com/yusiwen/minfer/issues/795)) —
+  §Sessions.
+- the bytes constructor `Engine::load_from_bytes` ([#797](https://github.com/yusiwen/minfer/issues/797))
+  — §Ownership and lifetime.
+
+The only deferred work left is Phase 2 below, behind the epic's three named triggers.
 
 ## Phase 2 — the workspace split (deferred)
 

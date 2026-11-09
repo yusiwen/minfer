@@ -134,9 +134,10 @@ enum TensorDataInner {
     /// GGUF part; `Tensor::new`/`Tensor::from_data` build the scratch case.
     #[cfg(test)]
     Owned(Vec<u8>),
-    /// A range of a read-only file mapping, with the handle that keeps it alive.
-    Mapped {
-        map: std::sync::Arc<crate::gguf::MmapFile>,
+    /// A range of a GGUF part's bytes, with the handle that keeps them alive —
+    /// a file mapping for a path load, an owned buffer for a bytes load (#797).
+    Borrowed {
+        bytes: crate::gguf::PartBytes,
         off: usize,
         len: usize,
     },
@@ -150,24 +151,20 @@ impl TensorData {
         }
     }
 
-    /// A range of `map`. The range is checked here, once, so `deref` needs no
-    /// `unsafe` and a malformed range fails at construction instead of inside a
-    /// kernel read.
-    pub(crate) fn mapped(
-        map: std::sync::Arc<crate::gguf::MmapFile>,
-        off: usize,
-        len: usize,
-    ) -> Self {
+    /// A range of `bytes` (a mapped part or an owned one). The range is checked
+    /// here, once, so `deref` needs no `unsafe` and a malformed range fails at
+    /// construction instead of inside a kernel read.
+    pub(crate) fn borrowed(bytes: crate::gguf::PartBytes, off: usize, len: usize) -> Self {
         let end = off
             .checked_add(len)
             .unwrap_or_else(|| panic!("tensor range {off}+{len} overflows usize"));
         assert!(
-            end <= map.as_slice().len(),
-            "tensor range {off}..{end} is past the mapping's {} bytes",
-            map.as_slice().len()
+            end <= bytes.len(),
+            "tensor range {off}..{end} is past the part's {} bytes",
+            bytes.len()
         );
         Self {
-            inner: TensorDataInner::Mapped { map, off, len },
+            inner: TensorDataInner::Borrowed { bytes, off, len },
         }
     }
 }
@@ -179,7 +176,7 @@ impl std::ops::Deref for TensorData {
         match &self.inner {
             #[cfg(test)]
             TensorDataInner::Owned(bytes) => bytes,
-            TensorDataInner::Mapped { map, off, len } => &map.as_slice()[*off..*off + *len],
+            TensorDataInner::Borrowed { bytes, off, len } => &bytes.as_slice()[*off..*off + *len],
         }
     }
 }
@@ -195,8 +192,13 @@ impl std::fmt::Debug for TensorData {
         match &self.inner {
             #[cfg(test)]
             TensorDataInner::Owned(bytes) => write!(f, "TensorData::Owned({} bytes)", bytes.len()),
-            TensorDataInner::Mapped { off, len, .. } => {
-                write!(f, "TensorData::Mapped({off}..{})", off + len)
+            TensorDataInner::Borrowed { bytes, off, len } => {
+                let kind = if bytes.mapping().is_some() {
+                    "Mapped"
+                } else {
+                    "Borrowed"
+                };
+                write!(f, "TensorData::{kind}({off}..{})", off + len)
             }
         }
     }
@@ -280,18 +282,19 @@ impl Tensor {
         tensor
     }
 
-    /// Create a weight tensor as a range of an mmap'd GGUF part (zero-copy load —
-    /// the file pages are shared with the CPU/GPU instead of being copied per
+    /// Create a weight tensor as a range of a GGUF part's bytes (zero-copy load —
+    /// the pages/buffer are shared with the CPU/GPU instead of being copied per
     /// tensor).
     ///
-    /// [#745] `map` is the part's mapping and `(off, len)` is the tensor's payload
-    /// inside it. The tensor carries the handle, so it keeps its own bytes alive
-    /// even after the `GgufModel` is dropped; the range is validated here.
-    pub fn from_mapped(
+    /// [#745] [#797] `bytes` is the part's backing (a mapping or an owned buffer)
+    /// and `(off, len)` is the tensor's payload inside it. The tensor carries the
+    /// handle, so it keeps its own bytes alive even after the `GgufModel` is
+    /// dropped; the range is validated here.
+    pub fn from_part(
         ttype: TensorType,
         shape: &[i64; 4],
         strides: &[usize; 4],
-        map: std::sync::Arc<crate::gguf::MmapFile>,
+        bytes: crate::gguf::PartBytes,
         off: usize,
         len: usize,
     ) -> Self {
@@ -299,7 +302,7 @@ impl Tensor {
             ttype,
             shape: *shape,
             strides: *strides,
-            data: TensorData::mapped(map, off, len),
+            data: TensorData::borrowed(bytes, off, len),
             name: String::new(),
         }
     }

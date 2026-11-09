@@ -1560,24 +1560,76 @@ impl Drop for MmapFile {
     }
 }
 
-/// One GGUF part: its parsed context + the mapping that holds its bytes.
+/// The bytes a GGUF part is backed by (#797).
 ///
-/// [#745] the part **owns** its mapping. Unlike the leaked version, there is no
-/// `'static` view of the pages: [`GgufPart::data`] borrows them from `mmap`, so a
-/// slice cannot outlive the part. A weight tensor gets a range plus a clone of the
-/// `Arc` ([`crate::tensor::TensorData::Mapped`]) and therefore keeps its own bytes
-/// alive after the `GgufModel` is dropped.
+/// A path load **maps** the file; a host that already holds the model in memory
+/// (`Engine::load_from_bytes`) hands over an **owned** buffer. Both are shared
+/// through an `Arc`, so a weight tensor's range keeps its backing alive after the
+/// `GgufModel` is dropped — the same contract #745 gave the mapping handle.
+#[derive(Clone)]
+pub enum PartBytes {
+    /// A read-only file mapping, shared with every tensor range in this part.
+    Mapped(std::sync::Arc<MmapFile>),
+    /// A buffer the host owns and handed over; there is no file and no `munmap`.
+    Owned(std::sync::Arc<Vec<u8>>),
+}
+
+impl PartBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            PartBytes::Mapped(map) => map.as_slice(),
+            PartBytes::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    /// The mapping handle, when this part is file-backed. Metal's zero-copy
+    /// registration needs it; an owned part is copied once instead
+    /// (`newBufferWithBytesNoCopy` requires page-aligned pages whose lifetime the
+    /// engine can guarantee, and a `Vec`'s allocation is neither).
+    pub fn mapping(&self) -> Option<&std::sync::Arc<MmapFile>> {
+        match self {
+            PartBytes::Mapped(map) => Some(map),
+            PartBytes::Owned(_) => None,
+        }
+    }
+
+    /// The "still live" flag the #745 gates hold. A mapping flips it on `munmap`;
+    /// an owned buffer has no unmap (it is freed by the last `Arc`), so it hands
+    /// back a flag that stays `true` — there is nothing for a test to observe.
+    pub fn alive(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        match self {
+            PartBytes::Mapped(map) => map.alive(),
+            PartBytes::Owned(_) => std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+}
+
+/// One GGUF part: its parsed context + the bytes that hold it.
+///
+/// [#745] the part **owns** its bytes. Unlike the leaked version, there is no
+/// `'static` view of them: [`GgufPart::data`] borrows from `bytes`, so a slice
+/// cannot outlive the part. A weight tensor gets a range plus a clone of the
+/// handle ([`crate::tensor::TensorData`]) and therefore keeps its own bytes alive
+/// after the `GgufModel` is dropped.
 pub struct GgufPart {
     pub ctx: GgufContext,
-    /// The mapping that owns this part's bytes.
-    pub mmap: std::sync::Arc<MmapFile>,
+    /// The backing that owns this part's bytes (a mapping or an owned buffer).
+    pub bytes: PartBytes,
 }
 
 impl GgufPart {
     /// This part's bytes. The borrow is tied to the part (and therefore to the
-    /// mapping's handle); it is never a `'static` view.
+    /// backing's handle); it is never a `'static` view.
     pub fn data(&self) -> &[u8] {
-        self.mmap.as_slice()
+        self.bytes.as_slice()
     }
 }
 
@@ -1719,6 +1771,65 @@ pub fn load_gguf_model(path: &std::path::Path) -> Result<GgufModel, GgufLoadErro
     })
 }
 
+/// Load a model from bytes the host already holds (#797) — a model received over
+/// the network, an embedded asset, a volume the host decrypted itself.
+///
+/// The buffer is **not** copied: the part owns the `Arc<Vec<u8>>` and every weight
+/// tensor is a range of it, exactly as a path load's tensors are ranges of the
+/// mapping. A split model is refused by name: the path loader resolves its
+/// siblings next to the file, and a bytes load has no directory to look in.
+///
+/// The refusal carries `<memory>` where a path load carries the file, so a host
+/// can tell the two apart in the rendered error.
+pub fn load_gguf_model_from_bytes(bytes: Vec<u8>) -> Result<GgufModel, GgufLoadError> {
+    const VIRTUAL: &str = "<memory>";
+    let bytes = std::sync::Arc::new(bytes);
+    let ctx = GgufContext::init_from_data(&bytes).map_err(|reason| GgufLoadError {
+        path: std::path::PathBuf::from(VIRTUAL),
+        reason,
+    })?;
+    let split_count = ctx
+        .get_key_val_i64("split.count")
+        .map(|v| v as usize)
+        .unwrap_or(1);
+    if split_count > 1 {
+        return Err(GgufLoadError {
+            path: std::path::PathBuf::from(VIRTUAL),
+            reason: format!(
+                "GGUF: a split model ({split_count} parts) cannot be loaded from memory — the \
+                 path loader resolves the parts beside the file, and a bytes load has no \
+                 directory"
+            ),
+        });
+    }
+    let fingerprint = bytes_fingerprint(&bytes);
+    Ok(GgufModel {
+        parts: vec![GgufPart {
+            ctx,
+            bytes: PartBytes::Owned(bytes),
+        }],
+        fingerprint,
+    })
+}
+
+/// A process-local identity for a model held in memory (#797), the counterpart of
+/// [`model_fingerprint`]'s path+inode+length+mtime.
+///
+/// Deliberately not a content hash: hashing several GB at load costs more than the
+/// CUDA registry's reuse saves, so this hashes the length plus the first and last
+/// 4 KiB — enough to tell a reloaded buffer from a different model, and it is a
+/// pure function of the bytes (no path, no filesystem).
+pub(crate) fn bytes_fingerprint(data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.len().hash(&mut h);
+    let head = &data[..data.len().min(4096)];
+    head.hash(&mut h);
+    let tail_start = data.len().saturating_sub(4096);
+    data[tail_start..].hash(&mut h);
+    h.finish()
+}
+
 fn load_gguf_model_inner(path: &std::path::Path) -> ParseResult<GgufModel> {
     let mmap0 = std::sync::Arc::new(MmapFile::map(path)?);
     let ctx0 = GgufContext::init_from_data(mmap0.as_slice())?;
@@ -1731,7 +1842,7 @@ fn load_gguf_model_inner(path: &std::path::Path) -> ParseResult<GgufModel> {
         return Ok(GgufModel {
             parts: vec![GgufPart {
                 ctx: ctx0,
-                mmap: mmap0,
+                bytes: PartBytes::Mapped(mmap0),
             }],
             fingerprint: model_fingerprint(&[path]),
         });
@@ -1773,7 +1884,10 @@ fn load_gguf_model_inner(path: &std::path::Path) -> ParseResult<GgufModel> {
         if no != i {
             return Err(format!("GGUF: split {p:?} has split.no={no}, expected {i}"));
         }
-        parts.push(GgufPart { ctx, mmap });
+        parts.push(GgufPart {
+            ctx,
+            bytes: PartBytes::Mapped(mmap),
+        });
     }
     Ok(GgufModel { parts, fingerprint })
 }

@@ -131,7 +131,11 @@ fn a_dropped_model_releases_its_mapping_and_fd() {
     let (alive, fd) = {
         let model = load_gguf_model(&path).expect("the toy GGUF loads");
         assert_eq!(model.parts.len(), 1, "the toy fixture is a single part");
-        let mmap = model.parts[0].mmap.clone();
+        let mmap = model.parts[0]
+            .bytes
+            .mapping()
+            .expect("a path load maps")
+            .clone();
         let alive = mmap.alive();
         let fd = mmap.raw_fd();
         assert!(
@@ -177,7 +181,7 @@ fn a_loaded_model_keeps_its_mapping_until_it_is_dropped() {
     let path = toy_gguf();
     let (model, alive) = {
         let gguf = load_gguf_model(&path).expect("the toy GGUF loads");
-        let alive = gguf.parts[0].mmap.alive();
+        let alive = gguf.parts[0].bytes.alive();
         let model = crate::models::load_model(&gguf).expect("the toy model loads");
         // The gguf is dropped here; the model's weight tensors must hold the pages.
         (model, alive)
@@ -230,7 +234,11 @@ fn a_reload_after_a_forward_releases_the_mapping_and_loads_a_different_model() {
     }
     let path = toy_gguf();
     let gguf_a = load_gguf_model(&path).expect("the toy GGUF loads");
-    let mmap_a = gguf_a.parts[0].mmap.clone();
+    let mmap_a = gguf_a.parts[0]
+        .bytes
+        .mapping()
+        .expect("a path load maps")
+        .clone();
     let alive_a = mmap_a.alive();
     let fd = mmap_a.raw_fd();
     // A weight's byte offset in the *file* (the toy is a single part).
@@ -324,7 +332,7 @@ fn a_reload_after_a_forward_releases_the_mapping_and_loads_a_different_model() {
             .expect("change the weight byte");
     }
     let gguf_b = load_gguf_model(&temp).expect("the modified toy GGUF loads");
-    let alive_b = gguf_b.parts[0].mmap.alive();
+    let alive_b = gguf_b.parts[0].bytes.alive();
     let model_b = crate::models::load_model_with(
         &gguf_b,
         "",
@@ -791,7 +799,7 @@ fn a_metal_reload_releases_the_first_mapping_and_runs_a_different_model() {
 
     let load = |p: &std::path::Path| {
         let gguf = load_gguf_model(p).expect("the toy GGUF loads");
-        let alive = gguf.parts[0].mmap.alive();
+        let alive = gguf.parts[0].bytes.alive();
         let model = crate::models::load_model_with(
             &gguf,
             "",
@@ -815,7 +823,11 @@ fn a_metal_reload_releases_the_first_mapping_and_runs_a_different_model() {
     let logits_a = model_a.forward_graph_cached(&[1], &[0], 1, 16, &mut cache_a);
     assert!(!logits_a.is_empty(), "the forward step must produce logits");
     // Zero-copy: every weight is a range of the part mapping, not a copy.
-    let mmap = gguf_a.parts[0].mmap.clone();
+    let mmap = gguf_a.parts[0]
+        .bytes
+        .mapping()
+        .expect("a path load maps")
+        .clone();
     let base = mmap.as_slice().as_ptr() as usize;
     let end = base + mmap.as_slice().len();
     let qwen = model_a
@@ -1204,4 +1216,58 @@ fn a_missing_file_is_a_load_error_that_names_the_path() {
         err.reason
     );
     assert_eq!(err.path, path);
+}
+
+/// #797: a bytes load **borrows** the buffer it was handed — the part and every
+/// weight it parses are ranges of it, never per-tensor copies (the same contract
+/// #745 gives a mapping).
+#[test]
+fn a_bytes_load_borrows_the_supplied_buffer() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/toy/toy-qwen2-f32.gguf");
+    let bytes = std::fs::read(&path).expect("read the toy fixture");
+    let base = bytes.as_ptr() as usize;
+    let len = bytes.len();
+    let gguf = crate::gguf::load_gguf_model_from_bytes(bytes).expect("parse from bytes");
+    assert!(
+        gguf.parts[0].bytes.mapping().is_none(),
+        "an owned load has no mapping"
+    );
+    let data = gguf.parts[0].data();
+    assert_eq!(
+        data.as_ptr() as usize,
+        base,
+        "the part is the supplied buffer, not a copy"
+    );
+    assert_eq!(data.len(), len);
+
+    let model = crate::models::load_model(&gguf).expect("the toy model loads from bytes");
+    let q2 = model
+        .as_any()
+        .downcast_ref::<crate::models::qwen2::Qwen2Model>()
+        .expect("a qwen2 model");
+    let w = q2
+        .tok_embd
+        .as_ref()
+        .expect("the toy has an embedding")
+        .data();
+    let (wptr, wlen) = (w.as_ptr() as usize, w.len());
+    assert!(
+        wptr >= base && wptr + wlen <= base + len,
+        "the weight's {} bytes at {wptr:#x} are a range of the {len}-byte buffer at {base:#x}",
+        wlen
+    );
+}
+
+/// #797: a bytes refusal names the virtual path, so a host can tell a memory load
+/// from a file load in the rendered error.
+#[test]
+fn a_bytes_refusal_names_the_virtual_path() {
+    let err = crate::gguf::load_gguf_model_from_bytes(vec![0u8; 16])
+        .err()
+        .expect("16 zero bytes are not a GGUF");
+    assert!(
+        err.to_string().contains("<memory>"),
+        "the refusal names its source: {err}"
+    );
 }
