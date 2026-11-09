@@ -1,0 +1,206 @@
+//! `#[cfg(test)] mod tests` for `src/tooling.rs` — extracted so a non-test
+//! build does not parse it. See the parent module for the docs.
+use super::*;
+use minfer::gguf::GgmlType;
+
+mod bf16;
+mod f141_device;
+mod f164_metal;
+mod f167_qwen3;
+mod f16_encode;
+mod f208_device;
+mod f208_metal;
+mod f6_fixtures;
+mod f6_roundtrip;
+mod parse;
+mod quantize_bounds;
+mod quantize_legacy_row_parity;
+mod quantize_row_fallback;
+// === F6 real-model gates (#[ignore]: CI has no checkpoint/model) ===
+
+/// The prompt every F6 logit gate uses. Short enough to prefill quickly on
+/// the 0.5B, long enough that a position/weight error moves a logit.
+const PROMPT: &str = "The capital of France is";
+/// Resolve one `#[ignore]`d gate's fixture path: the environment override, else
+/// the default.
+///
+/// A path that is **present** is verified against the F6 fixture manifest before
+/// it is handed back (`f6_fixtures::check`, issue #205): a cached reference the
+/// record does not describe refuses the run by name and digest instead of being
+/// compared against. A path that is absent still skips the gate with a printed
+/// line, and a path outside the fixture cache (a `/tmp` scratch file, a cached
+/// model, a directory) is not a manifest fixture and is left alone.
+fn env_path(key: &str, default: &str) -> Option<PathBuf> {
+    let p = std::env::var_os(key)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default.replace('~', &std::env::var("HOME").unwrap())));
+    if p.exists() {
+        f6_fixtures::check(&p);
+        Some(p)
+    } else {
+        eprintln!("{key} not found at {}; skipping this F6 gate", p.display());
+        None
+    }
+}
+fn work_dir(name: &str) -> PathBuf {
+    let d = PathBuf::from("/tmp/f6-work").join(name);
+    std::fs::create_dir_all(&d).expect("create work dir");
+    d
+}
+fn cached_qwen05() -> PathBuf {
+    let home = std::env::var("HOME").unwrap();
+    PathBuf::from(home).join(
+        ".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/\
+         qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    )
+}
+/// Greedy continuation `steps` tokens past `prompt`, returning the
+/// final-step logits (whole vocabulary) and the sampled token ids.
+///
+/// Forced onto the CPU plan (`OffloadRequest::Layers(0)`) so the bitwise
+/// comparisons are device-independent and no device registration is done —
+/// CI has no GPU, and the logit claims here are about *weights*, not backends.
+fn logits_greedy(path: &Path, prompt: &str, steps: usize, n_ctx: usize) -> (Vec<f32>, Vec<u32>) {
+    let gguf = minfer::gguf::load_gguf_model(path).expect("parse GGUF");
+    let tok =
+        minfer::tokenizer::Tokenizer::load(&gguf.parts[0].ctx).expect("strict tokenizer load");
+    let model = minfer::models::load_model_with(
+        &gguf,
+        "",
+        minfer::graph::offload::OffloadRequest::Layers(0),
+    )
+    .expect("load model");
+    let q = model
+        .as_any()
+        .downcast_ref::<minfer::models::qwen2::Qwen2Model>()
+        .expect("Qwen2 model");
+    logits_greedy_on(q, &tok.encode(prompt), steps, n_ctx)
+}
+/// The run itself, on an already-loaded model. Shared by the CPU gates
+/// (which load with `Layers(0)`) and #141's device arm (which loads with a
+/// full device plan): the numeric comparison must be the same forward code
+/// on both sides, differing only in the backend the scheduler assigns.
+fn logits_greedy_on(
+    q: &minfer::models::qwen2::Qwen2Model,
+    ids: &[u32],
+    steps: usize,
+    n_ctx: usize,
+) -> (Vec<f32>, Vec<u32>) {
+    let nt = ids.len();
+    let mut cache = minfer::graph::cache::GraphCache::new();
+    let mut positions: Vec<usize> = (0..nt).collect();
+    let mut logits = minfer::models::qwen2::graph::Qwen2Graph::forward_cached(
+        q, ids, &positions, 1, n_ctx, &mut cache,
+    );
+    let mut toks = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let next = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0 as u32;
+        toks.push(next);
+        positions = vec![nt + step];
+        logits = minfer::models::qwen2::graph::Qwen2Graph::forward_cached(
+            q,
+            &[next],
+            &positions,
+            1,
+            n_ctx,
+            &mut cache,
+        );
+    }
+    let _ = positions;
+    (logits, toks)
+}
+/// Compare every tensor payload of two GGUFs by name (offset-independent).
+/// `Ok(n)` is the number of tensors compared; `Err` names the first difference
+/// and counts the differing bytes of that tensor (`Ok`/`Err` rather than an
+/// assertion because the F6 parity gate asks the same question of a *second*,
+/// deliberately differently-encoded file before it reports a failure — see
+/// `tests/quantize_bounds.rs`).
+fn tensor_payloads_equal(a_path: &Path, b_path: &Path) -> Result<usize, String> {
+    let ma = minfer::gguf::load_gguf_model(a_path).map_err(|e| e.to_string())?;
+    let mb = minfer::gguf::load_gguf_model(b_path).map_err(|e| e.to_string())?;
+    let mut index = std::collections::HashMap::new();
+    for (pi, part) in ma.parts.iter().enumerate() {
+        for ti in &part.ctx.info {
+            let off = part.ctx.offset + ti.offset as usize;
+            index.insert(ti.name.clone(), (pi, off, ti.nbytes()));
+        }
+    }
+    let mut n = 0;
+    for (pi, part) in mb.parts.iter().enumerate() {
+        for ti in &part.ctx.info {
+            let off = part.ctx.offset + ti.offset as usize;
+            let (pa, oa, na) = index
+                .get(&ti.name)
+                .ok_or_else(|| format!("tensor '{}' only in the second file", ti.name))?;
+            if *na != ti.nbytes() {
+                return Err(format!("tensor {} size {} != {}", ti.name, na, ti.nbytes()));
+            }
+            let (xa, xb) = (
+                &ma.parts[*pa].data()[*oa..*oa + *na],
+                &mb.parts[pi].data()[off..off + ti.nbytes()],
+            );
+            if xa != xb {
+                let diff = xa.iter().zip(xb).filter(|(p, q)| p != q).count();
+                return Err(format!(
+                    "tensor {} payload differs ({diff} of {} bytes)",
+                    ti.name,
+                    xa.len()
+                ));
+            }
+            n += 1;
+        }
+    }
+    if n != index.len() {
+        return Err("tensor set differs".to_string());
+    }
+    assert!(n > 0);
+    Ok(n)
+}
+
+/// [`tensor_payloads_equal`] as an assertion, for the gates that have nothing
+/// else to ask. Returns the number of tensors compared.
+fn assert_tensor_payloads_equal(a_path: &Path, b_path: &Path) -> usize {
+    tensor_payloads_equal(a_path, b_path).unwrap_or_else(|e| panic!("{e}"))
+}
+/// The Qwen3 twin of [`logits_greedy_on`] (that one is pinned to `Qwen2Model`).
+/// Same forward code on both arms, so the only difference is the backend the
+/// scheduler assigns.
+fn logits_greedy_on_qwen3(
+    q: &minfer::models::qwen3::Qwen3Model,
+    ids: &[u32],
+    steps: usize,
+    n_ctx: usize,
+) -> (Vec<f32>, Vec<u32>) {
+    let nt = ids.len();
+    let mut cache = minfer::graph::cache::GraphCache::new();
+    let mut positions: Vec<usize> = (0..nt).collect();
+    let mut logits = minfer::models::qwen3::graph::Qwen3Graph::forward_cached(
+        q, ids, &positions, 1, n_ctx, &mut cache,
+    );
+    let mut toks = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let next = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0 as u32;
+        toks.push(next);
+        positions = vec![nt + step];
+        logits = minfer::models::qwen3::graph::Qwen3Graph::forward_cached(
+            q,
+            &[next],
+            &positions,
+            1,
+            n_ctx,
+            &mut cache,
+        );
+    }
+    let _ = positions;
+    (logits, toks)
+}

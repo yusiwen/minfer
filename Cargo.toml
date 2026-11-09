@@ -19,7 +19,6 @@ include = [
     "/src/**",
     "/tests/**",
     "/examples/**",
-    "/viz/**",
     "/experiments/cuda/cuda_graph_rust/cuda_graph_diag.rs",
     "/build.rs",
     "/Cargo.toml",
@@ -38,13 +37,8 @@ include = [
 # it (W2 adds it; W1 proves the root-only form still works).
 [workspace]
 members = ["crates/minfer-cli"]
-default-members = ["."]
+default-members = [".", "crates/minfer-cli"]
 resolver = "2"
-
-[[bin]]
-name = "minfer"
-path = "src/main.rs"
-required-features = ["cli"]
 
 [dependencies]
 rand = "0.8"
@@ -61,16 +55,10 @@ serde_json = { version = "1", features = ["raw_value"] }
 # on that order — a render-only concern must not move the grammar.)
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "preserve_order"] }
 
-# OpenAI-compatible HTTP server (OPENAI-CHAT-API-PLAN.md, Phase 2+)
-axum = { version = "0.7", optional = true }
 # `time` + `signal` are F8's (#51): the bounded graceful drain needs
 # `tokio::time::timeout` and the SIGINT/SIGTERM handlers. Both are platform-neutral
 # (no new crate, no new dependency), so the macOS and CUDA builds are unaffected.
 tokio = { version = "1", optional = true, features = ["sync"] }
-tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
-tower-http = { version = "0.6", optional = true, features = ["cors"] }
-uuid = { version = "1", optional = true, features = ["v4"] }
-futures-util = { version = "0.3", optional = true }
 
 # Test-only. `AsyncReadExt`/`AsyncWriteExt` are what F8's `/metrics` test drives a
 # real HTTP/1.1 request with; the production `tokio` dependency stays without
@@ -92,18 +80,16 @@ sha2 = "0.10"
 # needs to see the full surface. `metal` is deliberately absent: it needs a macOS
 # target, and docs.rs builds on Linux (the cfg sites are all `target_os = "macos"`,
 # so the feature is inert there anyway).
-features = ["server", "tooling", "viz", "observe"]
+features = ["observe"]
 
 [features]
-# Defaults keep `cargo build --release` producing today's binary. A consumer of
-# the engine uses `default-features = false` (ADR-0079). `metal` is listed here,
-# not implied by `cli`, so `--no-default-features --features cli` still builds a
-# binary WITHOUT the Metal backend — the configuration that must refuse
-# `--backend metal` by name (#777) — while a plain `cargo build --release` keeps
-# Metal on macOS.
-default = ["cli", "metal"]
-# The application layer: the binary and the modules only it uses.
-cli = ["server", "tooling", "viz"]
+# Phase 2 (#805) turned the feature fences into a package boundary, so the four
+# names that only selected which modules of THIS package were compiled — `cli`,
+# `server`, `tooling`, `viz` — are gone (ADR-0082). The binary is
+# `crates/minfer-cli`, and a consumer builds the engine with
+# `default-features = false` (ADR-0079), whose dependency graph is now the
+# published contract.
+default = ["metal"]
 # The macOS Metal backend (#777). Compiled only on macOS, and only with this
 # feature: every site that reaches the backend is
 # `cfg(all(target_os = "macos", feature = "metal"))`, and build.rs compiles the
@@ -118,28 +104,17 @@ metal = [
     "dep:block2",
     "dep:dispatch2",
 ]
-# The OpenAI-compatible HTTP server (axum + tokio). The visualizer is separate
-# (`viz`), so a server-only host does not build it.
-server = [
-    "dep:axum",
-    "dep:tokio",
-    "dep:tokio-stream",
-    "dep:tower-http",
-    "dep:uuid",
-    "dep:futures-util",
-    "tokio/rt-multi-thread",
-    "tokio/macros",
-    "tokio/net",
-    "tokio/time",
-    "tokio/signal",
-    "observe",
-]
-# `live`/`viz` observation hooks. Off in a consumer build, where the engine core
-# must not need tokio (S2).
+# `live`/`trace` observation hooks. Off in a consumer build, where the engine
+# core must not need tokio (S2). A host that wants the visualizer or the trace
+# export turns it on; the CLI turns it on for every build.
 observe = ["dep:tokio", "tokio/sync"]
-tooling = []
-# The self-contained visualizer (`minfer viz`): its live capture rides `observe`.
-viz = ["server"]
+
+# Phase 2 (#805): the test-only observers (`testfail::checked` and friends, the
+# grammar's state counters, `FmaContract::Off`) are `cfg(test)` in this package
+# and invisible to a dependent package's tests. This feature is the one switch
+# that turns them on for such a build; nothing in production enables it, and the
+# CLI's `[dev-dependencies]` is its only user.
+test-hooks = []
 
 cuda = []
 # llama.cpp-style choice of how the CUDA runtime is linked: with `cuda_static`

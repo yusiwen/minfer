@@ -12,7 +12,7 @@
 //! A mixture is a *selection policy*, not an encoder, so it lives here instead of
 //! as another spelling in [`QuantTarget`]: every concrete target keeps exactly
 //! one encoder and [`crate::quantize::quantize_row`] stays total, while
-//! [`crate::convert::QuantizePlan`] resolves each tensor to a concrete target
+//! The converter's `QuantizePlan` resolves each tensor to a concrete target
 //! before any weight is encoded.
 //!
 //! Two properties this module must not get wrong, both pinned in `tests.rs`:

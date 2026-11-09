@@ -199,9 +199,10 @@ pub fn note_checked(site: &'static str) {
 ///
 /// Gate-facing API: read by `#[cfg(test)]` gates and by the `#[ignore]`d
 /// real-model set, so a non-test build sees it unused.
-/// Test-only (#238): driven by `graph::scheduler::tests::the_execute_chokepoint_is_observable`; `#[cfg(test)]` keeps it out of production builds.
-#[cfg(test)]
-pub(crate) fn checked(site: &str) -> u64 {
+/// Test-only (#238): driven by `graph::scheduler::tests::the_execute_chokepoint_is_observable`;
+/// gated out of production builds, and on for another package's tests through `test-hooks` (#805).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn checked(site: &str) -> u64 {
     CHECKED.with(|c| {
         c.borrow()
             .iter()
@@ -212,9 +213,10 @@ pub(crate) fn checked(site: &str) -> u64 {
 
 /// Clear every counter on this thread (a gate calls this before the run it
 /// wants to observe, so a previous test on the same thread cannot fake it).
-/// Test-only (#238): driven by `graph::scheduler::tests::the_execute_chokepoint_is_observable`; `#[cfg(test)]` keeps it out of production builds.
-#[cfg(test)]
-pub(crate) fn reset_checked() {
+/// Test-only (#238): driven by `graph::scheduler::tests::the_execute_chokepoint_is_observable`;
+/// gated out of production builds, and on for another package's tests through `test-hooks` (#805).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn reset_checked() {
     CHECKED.with(|c| c.borrow_mut().clear());
 }
 
@@ -226,24 +228,24 @@ pub(crate) fn reset_checked() {
 /// parallel harness runs the gates in one process. The CUDA `launch:*` / `attr:*`
 /// sites see it too — their helper forwards to [`requested`]
 /// — so a device gate arms and launches on its own thread and stays inside it.
-#[cfg(test)]
-pub(crate) struct InjectionGuard {
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct InjectionGuard {
     /// How long [`ARMED`] was before this arm: dropping truncates back to it, so
     /// nested arms unarm innermost-first.
     depth: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl InjectionGuard {
     /// Arm `site` on this thread until the returned guard drops.
-    pub(crate) fn arm(site: &str) -> Self {
+    pub fn arm(site: &str) -> Self {
         Self::arm_all(&[site])
     }
 
     /// Arm several sites as **one** scope: a device dispatch that reaches more
     /// than one site in a single call arms them together, and one drop disarms
     /// the set.
-    pub(crate) fn arm_all(sites: &[&str]) -> Self {
+    pub fn arm_all(sites: &[&str]) -> Self {
         let depth = ARMED.with(|a| {
             let mut v = a.borrow_mut();
             let depth = v.len();
@@ -254,7 +256,7 @@ impl InjectionGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for InjectionGuard {
     fn drop(&mut self) {
         ARMED.with(|a| a.borrow_mut().truncate(self.depth));

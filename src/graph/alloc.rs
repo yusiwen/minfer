@@ -1848,8 +1848,8 @@ impl GraphAllocator {
     /// `a_store_inside_a_shared_prefix_takes_a_private_row` (the C8b S3 copy-on-write
     /// gate): it must read the rows exactly where the sequence's span list says they
     /// live.
-    #[cfg(test)]
-    pub(crate) fn kv_cell_of(&self, seq: super::kvcache::SeqId, pos: usize) -> Option<usize> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn kv_cell_of(&self, seq: super::kvcache::SeqId, pos: usize) -> Option<usize> {
         self.kv.cell_of(seq, pos)
     }
 

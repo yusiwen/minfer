@@ -1,10 +1,2403 @@
-//! The `minfer` binary (moved here in Phase 2, #805).
-//!
-//! W1 (#805) parks a placeholder here so the workspace skeleton is a real package
-//! with a real compiler invocation; W2 moves `src/main.rs` and everything it owns
-//! into this directory.
+// End-to-End Inference Engine
+//
+// The non-test build is the one that ships, and it stays warning-free: this is
+// the gate that keeps the dead-code backlog PR #216 cleared from growing back
+// (the `#[allow]`s that remain are deliberate and item-scoped). Scoped to
+// `not(test)` on purpose — the test build has its own warnings (unused locals
+// and imports inside test code), which are a separate, tracked cleanup rather
+// than part of this gate.
+#![cfg_attr(not(test), deny(warnings))]
+
+#[cfg(feature = "cuda")]
+use minfer::cuda;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use minfer::metal;
+use minfer::{conversation, gguf, grammar, models, sampler, spec, template, tokenizer};
+
+// The application layer: these modules lived in the library until #805, where the
+// feature fence became a package boundary. They stay `crate::`-relative, so the
+// application code did not change — only the crate it is compiled into did.
+mod bench;
+mod convert;
+mod download;
+mod server;
+mod spec_verify;
+mod tooling;
+
+use std::sync::Arc;
+use std::time::Instant;
+
+/// Conversation-mode color behavior (CLI-CONVERSATION-PLAN.md §5.6).
+#[derive(Clone, Copy, PartialEq)]
+enum ColorMode {
+    On,
+    Off,
+    Auto,
+}
+
+impl ColorMode {
+    fn enabled(self) -> bool {
+        use std::io::IsTerminal;
+        match self {
+            ColorMode::On => true,
+            ColorMode::Off => false,
+            ColorMode::Auto => std::io::stdout().is_terminal() && std::io::stderr().is_terminal(),
+        }
+    }
+}
+
+struct GenParams {
+    n_predict: usize,
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+    repeat_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
+    // === F3 sampler set (#48); every default below is a no-op ===
+    min_p: f32,
+    typical_p: f32,
+    xtc_probability: f32,
+    xtc_threshold: f32,
+    dry_multiplier: f32,
+    dry_base: f32,
+    dry_allowed_length: usize,
+    dry_penalty_last_n: usize,
+    /// Restart sequences as token-id sequences (`--dry-sequence-breakers`).
+    dry_breakers: Vec<Vec<u32>>,
+    /// Restart sequences as breaker **strings** (`--dry-sequence-breaker`,
+    /// llama.cpp's spelling: singular and repeatable, `none` clears).
+    ///
+    /// Kept unresolved until the tokenizer exists — a breaker string can only
+    /// be matched through the vocabulary's own tokenization — and then folded
+    /// into [`Self::dry_breakers`]. One flag, one interpretation: this never
+    /// reinterprets a numeric string as a token id.
+    dry_breaker_strings: Vec<String>,
+    mirostat: sampler::MirostatMode,
+    mirostat_tau: f32,
+    mirostat_eta: f32,
+    mirostat_m: usize,
+    /// `(token_id, bias)` pairs (`--logit-bias`).
+    logit_bias: Vec<(u32, f32)>,
+    /// F2 (#47): the raw grammar/schema request (`--grammar`, `--json-schema`).
+    /// Compiled once the vocabulary is known; an unsupported construct is a
+    /// startup refusal, never a silent guess.
+    grammar_source: Option<grammar::GrammarSource>,
+    /// F2: the compiled grammar (per request), shared with `SamplerConfig`.
+    grammar: Option<Arc<grammar::Grammar>>,
+    seed: u64,
+    n_ctx: usize,
+    stop_strings: Vec<String>,
+}
+
+impl Default for GenParams {
+    fn default() -> Self {
+        Self {
+            n_predict: 512,
+            temp: 0.8, // llama.cpp default (sampling, not greedy)
+            top_k: 40,
+            top_p: 0.95,            // llama.cpp default
+            repeat_penalty: 1.1,    // 1.0 = disabled; mild penalty reduces repetition
+            frequency_penalty: 0.0, // llama.cpp default (0.0 = disabled)
+            presence_penalty: 0.0,  // llama.cpp default (0.0 = disabled)
+            min_p: 0.0,             // F3: disabled
+            typical_p: 1.0,         // F3: disabled
+            xtc_probability: 0.0,   // F3: disabled
+            xtc_threshold: 0.5,     // F3: llama.cpp default
+            dry_multiplier: 0.0,    // F3: disabled
+            dry_base: 1.75,         // F3: llama.cpp default
+            dry_allowed_length: 2,  // F3: llama.cpp default
+            dry_penalty_last_n: 64, // F3: llama.cpp default
+            dry_breakers: Vec::new(),
+            dry_breaker_strings: Vec::new(),
+            mirostat: sampler::MirostatMode::Off,
+            mirostat_tau: 5.0, // F3: llama.cpp default
+            mirostat_eta: 0.1, // F3: llama.cpp default
+            mirostat_m: 100,   // F3: llama.cpp default
+            logit_bias: Vec::new(),
+            grammar_source: None,
+            grammar: None,
+            seed: 42,
+            n_ctx: 4096,
+            stop_strings: Vec::new(),
+        }
+    }
+}
+
+impl GenParams {
+    /// The F3 sampler configuration. `MirostatMode` is parsed strictly at the
+    /// flag, so this conversion cannot invent a value.
+    fn sampler_config(&self) -> sampler::SamplerConfig {
+        sampler::SamplerConfig {
+            temp: self.temp,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            repeat_penalty: self.repeat_penalty,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            min_p: self.min_p,
+            typical_p: self.typical_p,
+            dry_multiplier: self.dry_multiplier,
+            dry_base: self.dry_base,
+            dry_allowed_length: self.dry_allowed_length,
+            dry_penalty_last_n: self.dry_penalty_last_n,
+            dry_breakers: self.dry_breakers.clone(),
+            xtc_probability: self.xtc_probability,
+            xtc_threshold: self.xtc_threshold,
+            mirostat: self.mirostat,
+            mirostat_tau: self.mirostat_tau,
+            mirostat_eta: self.mirostat_eta,
+            mirostat_m: self.mirostat_m,
+            logit_bias: self.logit_bias.clone(),
+            grammar: self.grammar.clone(),
+        }
+    }
+}
+
+/// Parse `--dry-sequence-breakers`: `;`-separated restart sequences, each a
+/// `,`-separated token-id list (`198;13,2`). Every entry must be a valid token
+/// id — a non-numeric spelling is a loud parse error, never silently dropped.
+///
+/// This is the **token-id** spelling only. Breaker *strings* go through the
+/// singular `--dry-sequence-breaker`, which resolves them against the
+/// vocabulary after the tokenizer loads (#118); the two are never guessed from
+/// each other's characters.
+fn parse_dry_breakers(spec: &str) -> Result<Vec<Vec<u32>>, String> {
+    let mut out = Vec::new();
+    for breaker in spec.split(';').filter(|b| !b.trim().is_empty()) {
+        let mut ids = Vec::new();
+        for id in breaker.split(',') {
+            let id = id.trim();
+            match id.parse::<u32>() {
+                Ok(v) => ids.push(v),
+                Err(_) => {
+                    return Err(format!(
+                        "invalid --dry-sequence-breakers entry '{id}' (this flag takes token ids \
+                         only; for a breaker *string* use --dry-sequence-breaker, see #118)"
+                    ))
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err(format!(
+                "empty --dry-sequence-breakers sequence '{breaker}'"
+            ));
+        }
+        out.push(ids);
+    }
+    Ok(out)
+}
+
+/// Parse one `--logit-bias` list: `ID:BIAS` pairs separated by `,`
+/// (`15043:-2.0,198:1.5`). Repeatable — later flags append. A malformed pair is
+/// a loud parse error.
+fn parse_logit_bias(spec: &str) -> Result<Vec<(u32, f32)>, String> {
+    let mut out = Vec::new();
+    for pair in spec.split(',').filter(|p| !p.trim().is_empty()) {
+        let Some((id, bias)) = pair.split_once(':') else {
+            return Err(format!(
+                "invalid --logit-bias entry '{pair}' (expected ID:BIAS)"
+            ));
+        };
+        let id = id
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("invalid --logit-bias token id '{}'", id.trim()))?;
+        let bias = bias
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("invalid --logit-bias value '{}'", bias.trim()))?;
+        out.push((id, bias));
+    }
+    Ok(out)
+}
+
+/// F2: record a grammar request, refusing a second spelling (the four flags are
+/// mutually exclusive — one grammar per request, never a silent precedence rule).
+fn set_grammar_source(
+    slot: &mut Option<grammar::GrammarSource>,
+    src: grammar::GrammarSource,
+    flag: &str,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!(
+            "{flag} given but a grammar/schema flag was already set; --grammar, --grammar-str, \
+             --json-schema and --json-schema-str are mutually exclusive"
+        ));
+    }
+    *slot = Some(src);
+    Ok(())
+}
+
+fn print_usage(prog: &str) {
+    eprintln!("minfer — a minimal local LLM inference engine");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  {prog} <model> [prompt] [OPTIONS]");
+    eprintln!("  {prog} serve [--port N] [--n-ctx N] [--n-slots N] <model>");
+    eprintln!("  {prog} info <model>");
+    eprintln!("  {prog} download hf <repo> [quant]");
+    eprintln!("  {prog} download ollama <model>[:tag]");
+    eprintln!("  {prog} download <hf|ollama>:<name>[:variant]");
+    eprintln!("  {prog} list");
+    eprintln!("  {prog} viz [--port N] <model>   # self-contained viz server (default port 8081)");
+    eprintln!("  {prog} bench [-p N] [-n N] [-r N] [-o md|csv|json] <model>");
+    eprintln!(
+        "  {prog} specverify [-p N] [-r N] [-o json|md] <model>   # D5-1a C_T(nt) gate bench"
+    );
+    eprintln!(
+        "  {prog} convert <hf-model-dir> <out.gguf> [--outtype f16|bf16|f32] [--split-max-size BYTES]"
+    );
+    eprintln!("  {prog} quantize <in.gguf> <out.gguf> --type <target> [--split-max-size BYTES]");
+    eprintln!("  {prog} split <in.gguf> <out-dir> --max-size BYTES [--stem NAME]");
+    eprintln!("    (F6 tooling; see `{prog} convert --help`, `quantize --help`, `split --help`)");
+    eprintln!();
+    eprintln!("MODEL — <model> may be any of:");
+    eprintln!("  · a local file path     /abs/model.gguf   ./model.gguf   ~/model.gguf");
+    eprintln!("  · a Hugging Face repo   hf:<repo>[:<quant>]              (auto-download)");
+    eprintln!("                         <quant> e.g. Q4_0, q4_k_m (case-insensitive;");
+    eprintln!("                         single file or split auto-detected)");
+    eprintln!("  · an Ollama model       ollama:<model>[:tag]            (pull)");
+    eprintln!("  · a cached model name   <filename>   resolved from ~/.cache/minfer/models");
+    eprintln!("                         (see `{prog} list`)");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  --meta               print GGUF metadata and key tensors");
+    eprintln!("  --no-template        use the raw prompt without the chat template");
+    eprintln!(
+        "  --chat-template <FILE>    render a template file instead of the GGUF's\n\
+         \x20                           tokenizer.chat_template (mutually exclusive with\n\
+         \x20                           --no-template; an unrenderable file refuses at startup)"
+    );
+    eprintln!("  --cnv, --conversation   multi-turn conversation mode (interactive REPL)");
+    eprintln!("  -st, --single-turn   conversation: run one turn, then exit");
+    eprintln!("  --system <STR>       conversation: system prompt");
+    eprintln!("  -mli, --multiline-input   conversation: submit input on an empty line");
+    eprintln!("  --color [on|off|auto]     conversation: color output (default auto = tty)");
+    eprintln!(
+        "  --session <FILE>          conversation: save/load history (JSON) + KV (<FILE>.kv); a\n\
+         \x20                           matching KV companion resumes with no prefill"
+    );
+    eprintln!("  --temp <T>           sampling temperature (default 0.8; 0 = greedy)");
+    eprintln!("  --greedy             greedy decoding (--temp 0)");
+    eprintln!("  --top-k <K>          top-K sampling (default 40)");
+    eprintln!("  --top-p <P>          top-P nucleus sampling (default 0.95)");
+    eprintln!("  --repeat-penalty <N> penalize repeated tokens (default 1.1; 1.0 = off)");
+    eprintln!("  --frequency-penalty <N> penalize by token count in the window (default 0.0)");
+    eprintln!("  --presence-penalty <N>  penalize any token present in the window (default 0.0)");
+    eprintln!("  --- F3 sampler set (#48); every default leaves the chain unchanged ---");
+    eprintln!(
+        "  --min-p <P>          min-p sampling: drop tokens below P * max probability (0 = off)"
+    );
+    eprintln!("  --typical <P>        locally typical sampling (default 1.0 = off)");
+    eprintln!(
+        "  --xtc-probability <P>  XTC: chance to exclude the top choices (default 0.0 = off)"
+    );
+    eprintln!("  --xtc-threshold <T>  XTC probability threshold, 0..0.5 (default 0.5)");
+    eprintln!("  --dry-multiplier <N> DRY penalty multiplier (default 0.0 = off)");
+    eprintln!("  --dry-base <N>       DRY penalty growth base (default 1.75)");
+    eprintln!("  --dry-allowed-length <N>  shortest repeated suffix DRY reacts to (default 2)");
+    eprintln!("  --dry-penalty-last-n <N>  DRY penalty window (default 64)");
+    eprintln!("  --dry-sequence-breakers <L>  DRY restart sequences as token ids, e.g. '198;13,2'");
+    eprintln!("  --dry-sequence-breaker <S>   DRY restart sequence as a string, repeatable ('none' clears), e.g. ':'");
+    eprintln!("  --mirostat <0|1|2>   mirostat off / v1 / v2 (default 0)");
+    eprintln!("  --mirostat-tau <N>   mirostat target surprise in bits (default 5.0)");
+    eprintln!("  --mirostat-eta <N>   mirostat learning rate (default 0.1)");
+    eprintln!("  --mirostat-m <N>     mirostat v1 estimator window (default 100)");
+    eprintln!(
+        "  --logit-bias <L>     add to raw logits: 'ID:BIAS[,ID:BIAS...]', e.g. '15043:-2.0'"
+    );
+    eprintln!(
+        "  --grammar <FILE>     F2: constrain sampling to a GBNF grammar (docs/GRAMMAR-DESIGN.md)"
+    );
+    eprintln!("  --grammar-str <GBNF> F2: same, grammar text inline");
+    eprintln!("  --json-schema <FILE> F2: constrain sampling to a JSON Schema (compiled to GBNF)");
+    eprintln!("  --json-schema-str <JSON>  F2: same, schema text inline");
+    eprintln!("  --stop <STR>         stop generation at this string (repeatable)");
+    eprintln!("  -n, --n-predict <N>  max tokens to generate (default 512)");
+    eprintln!("  --seed <N>           RNG seed for sampling (default 42)");
+    eprintln!("  --gpu <N>            CUDA device index (default: auto-select highest compute; ignored on CPU/Metal)");
+    eprintln!(
+        "  --backend <name>     F4: restrict the backends this run may use (repeatable, or\n\
+         \x20                      comma-separated). Accepted: cpu, metal, cuda. Unset =\n\
+         \x20                      every backend this build has. `cpu` always participates\n\
+         \x20                      (it is the fallback), so `--backend cpu` forces the CPU.\n\
+         \x20                      Same surface as MINFER_BACKENDS; the flag wins. An unknown\n\
+         \x20                      name, a name this build does not contain, and a name this\n\
+         \x20                      machine cannot use are three distinct startup refusals."
+    );
+    eprintln!(
+        "  --gpu-layers <N|auto>  E5: put the first N transformer blocks on the device and run"
+    );
+    eprintln!("                       the rest on the CPU (0 = CPU only; `auto` = as many as the");
+    eprintln!(
+        "                       device budget allows, see MINFER_GPU_MEM; unset = MINFER_GPU_LAYERS,"
+    );
+    eprintln!("                       i.e. every block the device can hold). Printed at load.");
+    eprintln!("  --spec-draft <model> speculative decoding: draft model (D5-R)");
+    eprintln!(
+        "  --spec-draft-n <N>   drafted tokens per round (default 2; verify batch = N+1 rows)",
+    );
+    eprintln!(
+        "  --spec-draft-adaptive  pick d per round from per-depth acceptance x cost (d_max 8)"
+    );
+    eprintln!("  --port <N>           server port (default 8080; used by `serve`)");
+    eprintln!(
+        "  --n-ctx <N>          context size (default 4096; server: the total, an elastic share per slot)"
+    );
+    eprintln!(
+        "                       single-shot / --cnv: sizes the KV cache, clamped to the model's"
+    );
+    eprintln!("                       max context (e.g. Qwen3-4B 40960); server: total context");
+    eprintln!(
+        "  -t, --threads <N>    CPU worker threads (default: performance cores, e.g. 10 on M4 Pro;"
+    );
+    eprintln!("                       1 = single-threaded; affects the CPU-only path)");
+    eprintln!("  --n-slots <N>        server slot count (default 1)");
+    eprintln!(
+        "  --slots-file <PATH>  server: resume the slot contexts from PATH and rewrite it\n\
+         \x20                      after every completed request (C5 S2; batched engine only)"
+    );
+    eprintln!("  --dump-graph <PATH>       export the compute graph as Graphviz DOT and exit");
+    eprintln!("  --dump-graph-json <PATH>  export the compute graph as JSON (web visualizer, viz/) and exit");
+    eprintln!("  -h, --help           show this help");
+    eprintln!("  -V, --version        print version and exit");
+}
+
+/// F4: pull `--backend <name>` / `--backend=<name>` out of the argument list.
+///
+/// Returns the remaining arguments (program name first) and the requested names
+/// in order. Handled here rather than in the flag loop so every subcommand —
+/// including the ones with their own parsers (`bench`, `specverify`) — honours
+/// it, and so the name gate runs before anything else in the process.
+fn split_backend_flag(args: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    let mut names: Vec<String> = Vec::new();
+    let mut it = args.into_iter();
+    if let Some(prog) = it.next() {
+        rest.push(prog);
+    }
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--backend=") {
+            names.push(v.to_string());
+        } else if a == "--backend" {
+            match it.next() {
+                Some(v) => names.push(v),
+                None => {
+                    eprintln!("Error: missing value for --backend");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            rest.push(a);
+        }
+    }
+    (rest, names)
+}
 
 fn main() {
-    eprintln!("minfer-cli: the binary moves here in W2 (#805)");
-    std::process::exit(2);
+    let raw_args: Vec<String> = std::env::args().collect();
+    let prog = raw_args[0].clone();
+
+    // F4: the backend name surface. `--backend <name>` (repeatable, and
+    // comma-separated values are accepted) is extracted **before** any
+    // subcommand dispatch, so `serve`, `viz`, `run`, `bench` and `specverify`
+    // all honour it and no per-subcommand parser has to learn the flag. The
+    // registry is built first — the names are resolved against it, and an
+    // unknown name is a loud refusal here, before the model is even looked for.
+    let (raw_args, backend_flag) = split_backend_flag(raw_args);
+    minfer::graph::registry::init();
+    let backend_filter = match minfer::graph::registry::request_filter(
+        &backend_flag,
+        std::env::var("MINFER_BACKENDS").ok().as_deref(),
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    // #763 S4/S5: the engine reads `config::get()`, never the environment, and
+    // the fence is the config's `backends` field. Install once, here, before any
+    // device, graph or allocator exists; a second install would be ignored.
+    let mut engine_config = minfer::config::EngineConfig::from_env();
+    engine_config.backends = backend_filter;
+    minfer::config::install(engine_config);
+
+    // `bench` subcommand: parsed separately (its -p/-n/-r/-o flags are
+    // bench-local and must not collide with the global inference options,
+    // which reject unknown flags below).
+    if raw_args.get(1).map_or(false, |s| s == "bench") {
+        let code = bench::run(&prog, &raw_args[2..]);
+        std::process::exit(code);
+    }
+
+    // `specverify` subcommand: D5-1a verify-step cost micro-bench (its -p/-r/-o
+    // flags are bench-local too, so it parses separately like `bench`).
+    if raw_args.get(1).map_or(false, |s| s == "specverify") {
+        let code = spec_verify::run(&prog, &raw_args[2..]);
+        std::process::exit(code);
+    }
+
+    // F6 (#49): the GGUF tooling subcommands. Like `bench`/`specverify` they
+    // parse their own flags (--outtype/--type/--split-max-size/--max-size), so
+    // they must be dispatched before the global option parser, which rejects
+    // unknown flags. They also run without touching a device: conversion and
+    // quantization are host-side file work.
+    if let Some(sub) = raw_args.get(1).map(|s| s.as_str()) {
+        if matches!(sub, "convert" | "quantize" | "split") {
+            let code = match sub {
+                "convert" => tooling::run_convert(&prog, &raw_args[2..]),
+                "quantize" => tooling::run_quantize(&prog, &raw_args[2..]),
+                _ => tooling::run_split(&prog, &raw_args[2..]),
+            };
+            std::process::exit(code);
+        }
+    }
+
+    // Parse flags + positional args. Sampling flags map to GenParams.
+    let mut params = GenParams::default();
+    let mut meta_flag = false;
+    let mut no_template = false;
+    // S1 (#133): a template file that replaces the GGUF's `tokenizer.chat_template`.
+    let mut chat_template_file: Option<String> = None;
+    // Multi-turn conversation mode (CLI-CONVERSATION-PLAN.md, Phase 2).
+    let mut conv_mode = false;
+    let mut single_turn = false;
+    let mut system_prompt: Option<String> = None;
+    let mut multiline_input = false;
+    let mut color_mode = ColorMode::Auto;
+    let mut session_file: Option<String> = None;
+    // `--graph` is accepted for compatibility; the graph path is now the
+    // default forward (Phase 6).
+    let _graph_mode = false;
+    let mut dump_graph: Option<String> = None;
+    let mut dump_graph_json: Option<String> = None;
+    // OpenAI-compatible HTTP server mode (OPENAI-CHAT-API-PLAN.md).
+    let mut server_mode = false;
+    let mut server_port: u16 = 8080;
+    let mut server_n_ctx: usize = params.n_ctx;
+    let mut server_n_slots: usize = 1;
+    // C5 S2: the slot snapshot the server resumes from and rewrites on completion.
+    let mut server_slots_file: Option<String> = None;
+    // Self-contained viz server: `minfer viz [--port N] <model>`.
+    let mut viz_mode = false;
+    let mut viz_port: u16 = 8081;
+    let mut port_provided = false;
+    // CUDA-only: --gpu N selects a device index; no-op on CPU/Metal builds.
+    let mut gpu: Option<i32> = None;
+    // E5: --gpu-layers N offloads the first N blocks to the device (0 = CPU only, unset =
+    // MINFER_GPU_LAYERS, which is "every block the device can hold").
+    let mut gpu_layers_request = minfer::graph::offload::OffloadRequest::Default;
+    let mut gpu_layers_set = false;
+    // D5-R speculative decoding (--spec-draft <model>, --spec-draft-n <d>).
+    let mut spec_draft: Option<String> = None;
+    let mut spec_draft_n: usize = 2;
+    let mut spec_draft_adaptive = false;
+    let mut spec_draft_n_set = false;
+    // resolved before engine construction: the adaptive depth cap
+    let mut spec_d_max = 2usize;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 1;
+    let mut parse_err: Option<String> = None;
+    while i < raw_args.len() {
+        let a = raw_args[i].as_str();
+        let mut next_val = |name: &str| -> Option<String> {
+            if i + 1 < raw_args.len() {
+                Some(raw_args[i + 1].clone())
+            } else {
+                parse_err = Some(format!("missing value for {name}"));
+                None
+            }
+        };
+        match a {
+            "-h" | "--help" => {
+                print_usage(&prog);
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                // Value injected at build time (build.rs): "v<tag>(<short sha>)"
+                // for release builds, "v<Cargo pkg version>" otherwise.
+                println!("minfer {}", env!("MINFER_VERSION"));
+                std::process::exit(0);
+            }
+            "--port" => {
+                if let Some(v) = next_val(a) {
+                    server_port = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --port '{v}'"));
+                        8080
+                    });
+                    port_provided = true;
+                }
+                i += 2;
+            }
+            "--n-ctx" => {
+                if let Some(v) = next_val(a) {
+                    server_n_ctx = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --n-ctx '{v}'"));
+                        4096
+                    });
+                    params.n_ctx = server_n_ctx;
+                }
+                i += 2;
+            }
+            "-t" | "--threads" => {
+                if let Some(v) = next_val(a) {
+                    let n = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --threads '{v}'"));
+                        0
+                    });
+                    minfer::kernel::set_cpu_threads(n);
+                }
+                i += 2;
+            }
+            "--slots-file" => {
+                if let Some(v) = next_val(a) {
+                    server_slots_file = Some(v);
+                }
+                i += 2;
+            }
+            "--n-slots" => {
+                if let Some(v) = next_val(a) {
+                    server_n_slots = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --n-slots '{v}'"));
+                        1
+                    });
+                }
+                i += 2;
+            }
+            "--gpu" => {
+                if let Some(v) = next_val(a) {
+                    gpu = match v.parse::<i32>() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            parse_err = Some(format!("invalid --gpu '{v}'"));
+                            None
+                        }
+                    };
+                }
+                i += 2;
+            }
+            "--gpu-layers" => {
+                if let Some(v) = next_val(a) {
+                    // E5 S2: a block count or `auto` (fit as many as the budget allows).
+                    match minfer::graph::offload::OffloadRequest::parse(Some(v.as_str())) {
+                        Ok(r) => {
+                            gpu_layers_request = r;
+                            gpu_layers_set = true;
+                        }
+                        Err(_) => parse_err = Some(format!("invalid --gpu-layers '{v}'")),
+                    }
+                }
+                i += 2;
+            }
+            "--spec-draft" => {
+                if let Some(v) = next_val(a) {
+                    spec_draft = Some(v);
+                }
+                i += 2;
+            }
+            "--spec-draft-n" => {
+                if let Some(v) = next_val(a) {
+                    spec_draft_n = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --spec-draft-n '{v}'"));
+                        2
+                    });
+                    spec_draft_n_set = true;
+                }
+                i += 2;
+            }
+            // doc 95: adaptive draft depth — the controller picks d per round
+            // from per-depth acceptance and cost EWMA (d_max = 8 unless
+            // --spec-draft-n explicitly sets the cap).
+            "--spec-draft-adaptive" => {
+                spec_draft_adaptive = true;
+                i += 1;
+            }
+            "--meta" => {
+                meta_flag = true;
+                i += 1;
+            }
+            "--no-template" => {
+                no_template = true;
+                i += 1;
+            }
+            // S1 (#133): a file whose contents replace the GGUF's own template.
+            "--chat-template" => {
+                if let Some(v) = next_val(a) {
+                    chat_template_file = Some(v);
+                }
+                i += 2;
+            }
+            "--cnv" | "--conversation" => {
+                conv_mode = true;
+                i += 1;
+            }
+            "-st" | "--single-turn" => {
+                single_turn = true;
+                i += 1;
+            }
+            "--system" => {
+                if let Some(v) = next_val(a) {
+                    system_prompt = Some(v);
+                }
+                i += 2;
+            }
+            "-mli" | "--multiline-input" => {
+                multiline_input = true;
+                i += 1;
+            }
+            "--session" => {
+                if let Some(v) = next_val(a) {
+                    session_file = Some(v);
+                }
+                i += 2;
+            }
+            "--color" => {
+                if let Some(v) = next_val(a) {
+                    color_mode = match v.as_str() {
+                        "on" => ColorMode::On,
+                        "off" => ColorMode::Off,
+                        "auto" => ColorMode::Auto,
+                        _ => {
+                            parse_err = Some(format!("invalid --color '{v}' (on|off|auto)"));
+                            ColorMode::Auto
+                        }
+                    };
+                }
+                i += 2;
+            }
+            "--greedy" => {
+                params.temp = 0.0;
+                i += 1;
+            }
+            "--temp" => {
+                if let Some(v) = next_val(a) {
+                    params.temp = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --temp '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            "--top-k" => {
+                if let Some(v) = next_val(a) {
+                    params.top_k = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --top-k '{v}'"));
+                        0
+                    });
+                }
+                i += 2;
+            }
+            "--top-p" => {
+                if let Some(v) = next_val(a) {
+                    params.top_p = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --top-p '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            "--repeat-penalty" => {
+                if let Some(v) = next_val(a) {
+                    params.repeat_penalty = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --repeat-penalty '{v}'"));
+                        1.0
+                    });
+                }
+                i += 2;
+            }
+            "--frequency-penalty" => {
+                if let Some(v) = next_val(a) {
+                    params.frequency_penalty = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --frequency-penalty '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            "--presence-penalty" => {
+                if let Some(v) = next_val(a) {
+                    params.presence_penalty = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --presence-penalty '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            // === F3 sampler set (#48) ===
+            "--min-p" => {
+                if let Some(v) = next_val(a) {
+                    params.min_p = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --min-p '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            "--typical" => {
+                if let Some(v) = next_val(a) {
+                    params.typical_p = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --typical '{v}'"));
+                        1.0
+                    });
+                }
+                i += 2;
+            }
+            "--xtc-probability" => {
+                if let Some(v) = next_val(a) {
+                    params.xtc_probability = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --xtc-probability '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            "--xtc-threshold" => {
+                if let Some(v) = next_val(a) {
+                    params.xtc_threshold = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --xtc-threshold '{v}'"));
+                        0.5
+                    });
+                }
+                i += 2;
+            }
+            "--dry-multiplier" => {
+                if let Some(v) = next_val(a) {
+                    params.dry_multiplier = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --dry-multiplier '{v}'"));
+                        0.0
+                    });
+                }
+                i += 2;
+            }
+            "--dry-base" => {
+                if let Some(v) = next_val(a) {
+                    params.dry_base = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --dry-base '{v}'"));
+                        1.75
+                    });
+                }
+                i += 2;
+            }
+            "--dry-allowed-length" => {
+                if let Some(v) = next_val(a) {
+                    params.dry_allowed_length = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --dry-allowed-length '{v}'"));
+                        2
+                    });
+                }
+                i += 2;
+            }
+            "--dry-penalty-last-n" => {
+                if let Some(v) = next_val(a) {
+                    params.dry_penalty_last_n = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --dry-penalty-last-n '{v}'"));
+                        64
+                    });
+                }
+                i += 2;
+            }
+            "--dry-sequence-breakers" => {
+                if let Some(v) = next_val(a) {
+                    match parse_dry_breakers(&v) {
+                        Ok(b) => params.dry_breakers = b,
+                        Err(e) => parse_err = Some(e),
+                    }
+                }
+                i += 2;
+            }
+            // #118: llama.cpp's spelling — singular and repeatable, one breaker
+            // per flag, `none` clearing the list. The string stays unresolved
+            // until the tokenizer is loaded.
+            "--dry-sequence-breaker" => {
+                if let Some(v) = next_val(a) {
+                    if v == "none" {
+                        params.dry_breaker_strings.clear();
+                    } else {
+                        params.dry_breaker_strings.push(v);
+                    }
+                }
+                i += 2;
+            }
+            "--mirostat" => {
+                if let Some(v) = next_val(a) {
+                    match v
+                        .parse::<i64>()
+                        .map_err(|_| format!("invalid --mirostat '{v}'"))
+                        .and_then(sampler::MirostatMode::parse)
+                    {
+                        Ok(m) => params.mirostat = m,
+                        Err(e) => parse_err = Some(e),
+                    }
+                }
+                i += 2;
+            }
+            "--mirostat-tau" => {
+                if let Some(v) = next_val(a) {
+                    params.mirostat_tau = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --mirostat-tau '{v}'"));
+                        5.0
+                    });
+                }
+                i += 2;
+            }
+            "--mirostat-eta" => {
+                if let Some(v) = next_val(a) {
+                    params.mirostat_eta = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --mirostat-eta '{v}'"));
+                        0.1
+                    });
+                }
+                i += 2;
+            }
+            "--mirostat-m" => {
+                if let Some(v) = next_val(a) {
+                    params.mirostat_m = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --mirostat-m '{v}'"));
+                        100
+                    });
+                }
+                i += 2;
+            }
+            "--logit-bias" => {
+                if let Some(v) = next_val(a) {
+                    match parse_logit_bias(&v) {
+                        Ok(mut b) => params.logit_bias.append(&mut b),
+                        Err(e) => parse_err = Some(e),
+                    }
+                }
+                i += 2;
+            }
+            // === F2 (#47) constrained decoding ===
+            "--grammar" | "--json-schema" => {
+                if let Some(v) = next_val(a) {
+                    let read = std::fs::read_to_string(&v)
+                        .map_err(|e| format!("cannot read {a} file '{v}': {e}"));
+                    match read {
+                        Err(e) => parse_err = Some(e),
+                        Ok(text) => {
+                            let src = if a == "--grammar" {
+                                grammar::GrammarSource::Gbnf(text)
+                            } else {
+                                match serde_json::from_str::<serde_json::Value>(&text) {
+                                    Ok(v) => grammar::GrammarSource::Json(v),
+                                    Err(e) => {
+                                        parse_err =
+                                            Some(format!("invalid JSON in {a} file '{v}': {e}"));
+                                        i += 2;
+                                        continue;
+                                    }
+                                }
+                            };
+                            match set_grammar_source(&mut params.grammar_source, src, a) {
+                                Ok(()) => {}
+                                Err(e) => parse_err = Some(e),
+                            }
+                        }
+                    }
+                }
+                i += 2;
+            }
+            "--grammar-str" | "--json-schema-str" => {
+                if let Some(v) = next_val(a) {
+                    let src = if a == "--grammar-str" {
+                        grammar::GrammarSource::Gbnf(v)
+                    } else {
+                        match serde_json::from_str::<serde_json::Value>(&v) {
+                            Ok(v) => grammar::GrammarSource::Json(v),
+                            Err(e) => {
+                                parse_err = Some(format!("invalid JSON for {a}: {e}"));
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    };
+                    match set_grammar_source(&mut params.grammar_source, src, a) {
+                        Ok(()) => {}
+                        Err(e) => parse_err = Some(e),
+                    }
+                }
+                i += 2;
+            }
+            "--stop" => {
+                if let Some(v) = next_val(a) {
+                    params.stop_strings.push(v);
+                }
+                i += 2;
+            }
+            "-n" | "--n-predict" => {
+                if let Some(v) = next_val(a) {
+                    params.n_predict = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid -n '{v}'"));
+                        0
+                    });
+                }
+                i += 2;
+            }
+            "--graph" => {
+                i += 1; // accepted for compat; graph path is the default
+            }
+            "--dump-graph" => {
+                if let Some(v) = next_val("--dump-graph") {
+                    dump_graph = Some(v);
+                }
+                i += 2;
+            }
+            "--dump-graph-json" => {
+                if let Some(v) = next_val("--dump-graph-json") {
+                    dump_graph_json = Some(v);
+                }
+                i += 2;
+            }
+            "--seed" => {
+                if let Some(v) = next_val(a) {
+                    params.seed = v.parse().unwrap_or_else(|_| {
+                        parse_err = Some(format!("invalid --seed '{v}'"));
+                        0
+                    });
+                }
+                i += 2;
+            }
+            _ => {
+                if a.starts_with('-') && a.len() > 1 {
+                    // Unknown option — reject instead of treating as model path.
+                    print_usage(&prog);
+                    eprintln!("Error: unknown option '{a}'");
+                    std::process::exit(1);
+                }
+                positional.push(raw_args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if let Some(e) = parse_err {
+        eprintln!("Error: {e}");
+        print_usage(&prog);
+        std::process::exit(1);
+    }
+
+    // F3: refuse a nonsensical sampler configuration at the boundary. The logit
+    // bias token ids are checked against the vocabulary below, once it is known.
+    if let Err(e) = params.sampler_config().validate() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+
+    if positional.is_empty() {
+        print_usage(&prog);
+        std::process::exit(1);
+    }
+
+    // === Subcommands ===
+    match positional[0].as_str() {
+        "download" => {
+            if positional.len() < 2 {
+                eprintln!("Usage: {prog} download hf <repo> [quant] | ollama <model>[:tag]");
+                eprintln!("       {prog} download hf:<repo>[:quant] | ollama:<model>[:tag]");
+                std::process::exit(1);
+            }
+            let arg = &positional[1];
+            let uri = if arg == "hf" || arg == "ollama" {
+                // space form: download hf <repo> [quant]  /  download ollama <model>[:tag]
+                if positional.len() < 3 {
+                    eprintln!("Usage: {prog} download {} <repo-or-model> [variant]", arg);
+                    std::process::exit(1);
+                }
+                format!("{}:{}", arg, positional[2..].join(":"))
+            } else if arg.starts_with("hf:") || arg.starts_with("ollama:") {
+                // URI form: download hf:<repo>[:quant]  /  download ollama:<model>[:tag]
+                if positional.len() != 2 {
+                    eprintln!("Usage: {prog} download <hf|ollama>:<name>[:variant]");
+                    std::process::exit(1);
+                }
+                arg.clone()
+            } else {
+                eprintln!("Unknown download source '{}'. Use 'hf' or 'ollama'.", arg);
+                std::process::exit(1);
+            };
+            match download::resolve(&uri) {
+                Ok(p) => println!("Model downloaded: {}", p.display()),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        "list" => {
+            match download::list_local() {
+                Ok(()) => {}
+                Err(e) => eprintln!("Error: {}", e),
+            }
+            return;
+        }
+        "info" => {
+            if positional.len() < 2 {
+                eprintln!("Usage: {prog} info <model>");
+                std::process::exit(1);
+            }
+            // Resolve paths, hf:/ollama: URIs, and cached model names.
+            let model_path = match download::resolve(&positional[1]) {
+                Ok(p) => {
+                    eprintln!("Model ready: {}", p.display());
+                    p.to_string_lossy().to_string()
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            // A parse failure is a *refusal*, not a panic: the loader has already
+            // printed the specific reason (magic, type, shape, bounds, …) to
+            // stderr, and this names the file and exits non-zero ([#580]).
+            //
+            // [#580]: https://github.com/yusiwen/minfer/issues/580
+            let gguf_model = match gguf::load_gguf_model(std::path::Path::new(&model_path)) {
+                Ok(model) => model,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let ctx = &gguf_model.parts[0].ctx;
+            dump_gguf_metadata(ctx);
+            dump_key_tensors(ctx);
+            return;
+        }
+        "viz" => {
+            // `minfer viz [--port N] <model>` — model still specified at
+            // startup, so the rest of main runs the normal load + run_viz path.
+            if positional.len() < 2 {
+                eprintln!("Usage: {prog} viz [--port N] <model>");
+                std::process::exit(1);
+            }
+            viz_mode = true;
+            positional.remove(0); // drop the subcommand token; positional[0] = model
+            if port_provided {
+                viz_port = server_port;
+            }
+        }
+        "serve" => {
+            // `minfer serve [--port N] [--n-ctx N] [--n-slots N] <model>` —
+            // model still specified at startup; the rest of main runs the
+            // normal load + server::run path (--port/--n-ctx/--n-slots already
+            // parsed into the server_* vars).
+            if positional.len() < 2 {
+                eprintln!("Usage: {prog} serve [--port N] [--n-ctx N] [--n-slots N] <model>");
+                std::process::exit(1);
+            }
+            server_mode = true;
+            positional.remove(0); // drop "serve"; positional[0] = model
+        }
+        _ => {} // fall through to model inference
+    }
+
+    // === GPU backends ===
+    //
+    // F4: the device layer comes up **here**, before the model path is resolved,
+    // so that stage 2 of the backend-name surface (a backend that is compiled in
+    // but not usable on this machine) is a startup refusal and not something a
+    // later, unrelated failure — a missing model file, a bad GGUF — can preempt.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    metal::MpsState::init();
+    #[cfg(feature = "cuda")]
+    cuda::CudaState::init_with_gpu(gpu);
+    // On CPU/Metal builds `--gpu` is a no-op: it is parsed but unused.
+    #[cfg(not(feature = "cuda"))]
+    let _ = gpu;
+    // Stage 2: a named backend that this machine cannot use is refused now — a
+    // message distinct from "unknown backend" and from "not compiled into this
+    // build", and never a silent fall back to the CPU.
+    if let Err(e) =
+        minfer::graph::registry::check_available(&minfer::graph::registry::active_filter())
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+
+    let model_path = &positional[0];
+
+    // Conversation mode needs the chat template (ChatML fallback included);
+    // --no-template would leave the history unformatted.
+    if conv_mode && no_template {
+        eprintln!(
+            "Error: --cnv conflicts with --no-template (conversation needs the chat template)"
+        );
+        print_usage(&prog);
+        std::process::exit(1);
+    }
+
+    // S1 (#133): a file override and the bypass are mutually exclusive. The run
+    // would carry two contradictory instructions about the prompt, and silently
+    // ignoring one is the class of bug this ticket exists to remove.
+    if no_template {
+        if let Some(file) = &chat_template_file {
+            eprintln!(
+                "Error: --chat-template {file} conflicts with --no-template (one names the \
+                 template to use, the other says use none)"
+            );
+            print_usage(&prog);
+            std::process::exit(1);
+        }
+    }
+
+    // #601: the file half of the override is decided **before the model loads** —
+    // it needs no GGUF, so a missing or unrenderable template costs a file read
+    // instead of a 0.6B-weight load, and the refusal is the process's exit status.
+    let chat_template_override: Option<String> = match chat_template_file.as_deref() {
+        Some(path) => match template::load_template_file(std::path::Path::new(path)) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!("Error: {}", e.message());
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    // Resolve paths, hf:/ollama: URIs, and cached model names.
+    let is_uri = model_path.starts_with("hf:")
+        || model_path.starts_with("ollama:")
+        || (!model_path.starts_with('/')
+            && !model_path.starts_with('.')
+            && !model_path.starts_with('~'));
+    let model_path = match download::resolve(model_path) {
+        Ok(p) => {
+            if is_uri {
+                eprintln!("Model ready: {}", p.display());
+            }
+            p.to_string_lossy().to_string()
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    // Conversation mode: the positional prompt is the FIRST user turn; stdin
+    // is read interactively by the loop (never consume it here).
+    let first_prompt = if conv_mode && positional.len() > 1 {
+        Some(positional[1..].join(" "))
+    } else {
+        None
+    };
+    // #763 S2: the draft is resolved here, not inside the engine: `download` is a
+    // CLI capability, and `spec` now takes a path.
+    let spec_draft = match spec_draft {
+        Some(p) => match download::resolve(&p) {
+            Ok(path) => Some(path.to_string_lossy().into_owned()),
+            Err(e) => {
+                eprintln!("Error: spec draft: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    let prompt = if positional.len() > 1 {
+        positional[1..].join(" ")
+    } else if conv_mode || server_mode || viz_mode {
+        // serve / viz / --cnv take no positional prompt and never consume
+        // stdin for it. (Bare `minfer viz model` would otherwise hang on
+        // read_line until you press Enter — the model+grep host already shows
+        // startup, so don't block on a prompt these modes don't use.)
+        String::new()
+    } else {
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap_or(0);
+        input.trim().to_string()
+    };
+
+    // === Load GGUF (single file or multi-part split) ===
+    println!("Loading model: {} ...", model_path);
+    let gguf_model = match gguf::load_gguf_model(std::path::Path::new(&model_path)) {
+        Ok(m) => m,
+        Err(e) => {
+            let p = std::path::Path::new(&model_path);
+            if p.is_dir() {
+                // A directory is almost always a cache dir with several .gguf
+                // candidates — list them instead of a bare "parse GGUF" panic.
+                let mut found: Vec<String> = std::fs::read_dir(p)
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter_map(|e| {
+                                let n = e.file_name().to_string_lossy().into_owned();
+                                n.ends_with(".gguf").then_some(n)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                found.sort();
+                eprintln!("Error: {model_path} is a directory — minfer needs a .gguf file path");
+                if found.is_empty() {
+                    eprintln!("       no .gguf files found in that directory");
+                } else {
+                    eprintln!("       candidates:");
+                    for f in &found {
+                        eprintln!(
+                            "         minfer viz {}/{}",
+                            model_path.trim_end_matches('/'),
+                            f
+                        );
+                    }
+                    eprintln!("       or run `minfer list` for cached models");
+                }
+            } else if !p.exists() {
+                eprintln!("Error: file not found: {model_path}");
+                eprintln!("       run `minfer list` to see cached models");
+            } else {
+                eprintln!("Error: {e}");
+            }
+            std::process::exit(1);
+        }
+    };
+    let n_parts = gguf_model.parts.len();
+    let total_bytes: usize = gguf_model.parts.iter().map(|p| p.data().len()).sum();
+    println!(
+        "File: {} bytes ({:.1} MB) in {n_parts} part(s)",
+        total_bytes,
+        total_bytes as f64 / 1_048_576.0
+    );
+
+    let ctx = &gguf_model.parts[0].ctx;
+    if meta_flag {
+        dump_gguf_metadata(ctx);
+    } else {
+        println!("GGUF: {} KV, {} tensors", ctx.kv.len(), ctx.info.len());
+    }
+
+    // === Load model (dispatches on general.architecture) ===
+    if gpu_layers_set {
+        // The request is already in `gpu_layers_request`; the load prints where the blocks
+        // landed (E5). Nothing else to do here.
+    }
+    let model = match models::load_model_with(&gguf_model, "", gpu_layers_request) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    // #763 S3: the loader no longer prints these; the CLI renders the engine's
+    // answer. The sequence (`Loaded: N layers`, `Model loaded.`) is documented.
+    eprintln!("Loaded: {} layers", model.n_layer());
+    if let Some(line) = model.offload_report() {
+        eprintln!("minfer: {line}");
+    }
+    if meta_flag {
+        dump_key_tensors(ctx);
+    } else {
+        println!("Model loaded.");
+    }
+
+    // === Tokenizer ===
+    // F7 (#50): an unsupported or incomplete tokenizer is a refused load, never
+    // a wrong split. The reason names the metadata value.
+    let tokenizer = match tokenizer::Tokenizer::load(&ctx) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("Vocabulary: {} tokens", tokenizer.vocab_size());
+
+    // F3 boundary checks. The logit bias ids need the vocabulary, which is known
+    // only now; the speculative path cannot carry mirostat's per-token state, so
+    // asking for both is refused rather than silently sampling without it.
+    if let Err(e) = params
+        .sampler_config()
+        .validate_logit_bias(tokenizer.vocab_size())
+    {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+    // F3 (#118): resolve the `--dry-sequence-breaker` *strings* against the
+    // vocabulary, which only exists now. A breaker that matches no token, one
+    // over llama.cpp's length limit, or a tail over its token limit is refused
+    // here — llama.cpp truncates or skips, minfer does not. The numeric
+    // `--dry-sequence-breakers` form is already resolved at parse time and is
+    // merged in, so the two spellings share one deduplicated sequence list.
+    if !params.dry_breaker_strings.is_empty() {
+        match tokenizer.resolve_sequence_breakers(&params.dry_breaker_strings) {
+            Ok(seqs) => {
+                let resolved = seqs.len();
+                for seq in seqs {
+                    if !params.dry_breakers.contains(&seq) {
+                        params.dry_breakers.push(seq);
+                    }
+                }
+                eprintln!(
+                    "[dry] {} breaker string(s) resolved to {resolved} overlapping token \
+                     sequence(s) ({} sequence(s) configured in total)",
+                    params.dry_breaker_strings.len(),
+                    params.dry_breakers.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // F2: compile the requested grammar/schema once, now that the vocabulary (and
+    // with it every token piece and the EOG ids) is known. An unsupported
+    // construct is refused here, before any generation.
+    if let Some(src) = params.grammar_source.clone() {
+        match grammar::compile_source(&src, &tokenizer, &model.special_tokens()) {
+            Ok(g) => {
+                eprintln!(
+                    "[grammar] compiled {} rule(s) over {} tokens ({} grammar bytes)",
+                    g.source().lines().filter(|l| l.contains("::=")).count(),
+                    g.n_vocab(),
+                    g.source().len()
+                );
+                params.grammar = Some(Arc::new(g));
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // A speculative verify round samples several rows from one state, and the
+    // draft model would need the same mask: refused rather than silently
+    // generating without the constraint.
+    if spec_draft.is_some() && params.grammar.is_some() {
+        eprintln!(
+            "Error: --spec-draft does not support a grammar or JSON schema (a verify round \
+             samples several rows from one automaton state); disable one of the two"
+        );
+        std::process::exit(1);
+    }
+    if spec_draft.is_some() && params.mirostat != sampler::MirostatMode::Off {
+        eprintln!(
+            "Error: --spec-draft does not support mirostat (its per-step state belongs to the \
+             serial decode loop); disable one of the two"
+        );
+        std::process::exit(1);
+    }
+
+    // === OpenAI-compatible HTTP server mode ===
+    // Resolve the engine depth cap: adaptive uses 8 unless the user set
+    // --spec-draft-n; static runs use --spec-draft-n as-is (default 2).
+    // (Bugfix: this used to be gated on the adaptive flag, silently turning
+    // every static --spec-draft-n 3..7 run into a d=8 run.)
+    if spec_draft_n_set {
+        spec_d_max = spec_draft_n;
+    } else if spec_draft_adaptive {
+        spec_d_max = 8;
+    }
+    // mirror the engine's identity cap (verify nt <= 8; see spec.rs)
+    if spec_draft_adaptive {
+        spec_d_max = spec_d_max.min(7);
+    }
+
+    // === Multi-turn conversation mode (--cnv) ===
+    if server_mode {
+        if server_n_slots == 0 {
+            eprintln!("Error: --n-slots must be >= 1");
+            std::process::exit(1);
+        }
+        if server_n_ctx == 0 {
+            eprintln!("Error: --n-ctx must be >= 1");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "Starting OpenAI-compatible server (model={}, n_ctx={}, n_slots={})",
+            model_path, server_n_ctx, server_n_slots
+        );
+        let server_spec = spec_draft.as_ref().map(|p| spec::SpecConfig {
+            draft_path: p.clone(),
+            draft_n: spec_d_max,
+            adaptive: spec_draft_adaptive,
+        });
+        server::run(
+            model,
+            tokenizer,
+            &gguf_model,
+            server_port,
+            server_n_ctx,
+            server_n_slots,
+            server_spec,
+            server_slots_file,
+            chat_template_override.as_deref(),
+        );
+        return;
+    }
+
+    // === Self-contained viz server (viz subcommand) ===
+    if viz_mode {
+        eprintln!(
+            "Starting viz server (model={}, n_ctx={}, slots={})",
+            model_path, params.n_ctx, 1
+        );
+        server::viz::run_viz(
+            model,
+            tokenizer,
+            &gguf_model,
+            viz_port,
+            params.n_ctx,
+            1,
+            chat_template_override.as_deref(),
+        );
+        return;
+    }
+
+    // === Multi-turn conversation mode (--cnv) ===
+    if conv_mode {
+        // doc 97: the draft loads here (before the target's KV goes to the
+        // gen-loop path) so the conversation can wrap its engine.
+        let conv_spec_engine = match &spec_draft {
+            Some(p) => match spec::SpecEngine::new(
+                &spec::SpecConfig {
+                    draft_path: p.clone(),
+                    draft_n: spec_d_max,
+                    adaptive: spec_draft_adaptive,
+                },
+                &tokenizer,
+                model.n_vocab(),
+                model.kv_format(),
+            ) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    eprintln!("Error: failed to load draft model: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        };
+        let code = run_conversation(
+            model,
+            &tokenizer,
+            &gguf_model.parts[0].data(),
+            chat_template_override.as_deref(),
+            &params,
+            system_prompt,
+            single_turn,
+            multiline_input,
+            color_mode,
+            session_file,
+            first_prompt,
+            conv_spec_engine,
+        );
+        std::process::exit(code);
+    }
+
+    // === D5-R speculative decoding: load the draft model + its graph cache ===
+    // The target's KV moves to a GraphCache too: verify rounds drive
+    // forward_graph_cached at nt=d+1 (the primitive the specverify instrument
+    // validated end-to-end), so both models live in the same plumbing.
+    let mut spec_engine = match &spec_draft {
+        Some(p) => match spec::SpecEngine::new(
+            &spec::SpecConfig {
+                draft_path: p.clone(),
+                draft_n: spec_d_max,
+                adaptive: spec_draft_adaptive,
+            },
+            &tokenizer,
+            model.n_vocab(),
+            model.kv_format(),
+        ) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    // === Chat template (need tokenizer for bos_token text) ===
+    // `template::render_single_turn` is the one place the single-turn path picks
+    // the template: a `--chat-template <FILE>` override, else the GGUF's copy,
+    // else the announced ChatML fallback (#596 — the notice and the prompt come
+    // back together, so they cannot disagree).
+    let bos_text = tokenizer
+        .id_to_token
+        .get(tokenizer.bos_token as usize)
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let processed = if no_template {
+        prompt.clone()
+    } else {
+        match template::render_single_turn(
+            get_chat_template(gguf_model.parts[0].data()).as_deref(),
+            chat_template_override.as_deref(),
+            &prompt,
+            bos_text,
+        ) {
+            Ok(r) => {
+                if r.chatml_notice {
+                    eprintln!("{}", template::CHATML_NOTICE);
+                }
+                r.text
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e.message());
+                std::process::exit(1);
+            }
+        }
+    };
+    #[cfg(feature = "debug_dump")]
+    minfer::dump::maybe_dump_text("minfer_dump_prompt", &processed);
+    let input_ids = match tokenizer.encode_checked(&processed) {
+        Ok(ids) => ids,
+        Err(e) => refuse(e),
+    };
+    if input_ids.is_empty() {
+        eprintln!("tokenize failed");
+        std::process::exit(1);
+    }
+    println!("Prompt: {} tokens", input_ids.len());
+
+    // === Generate (the facade's single-shot path, #763 S6b) ===
+    // Prefill, sampling, stop strings and the speculative round loop live in
+    // `engine::generate`; the CLI keeps the presentation: the think-block
+    // highlighter, the dump-graph hook and the stats lines.
+    let mut hi = ThinkHighlighter::new(
+        std::io::IsTerminal::is_terminal(&std::io::stdout())
+            || std::env::var("MINFER_COLOR").map_or(false, |v| v == "1"),
+        b"\x1b[0m",
+        |b| {
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), b);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        },
+    );
+
+    // Ctrl-C cancels the run at the next token boundary and exits 130 (#796):
+    // what has been generated is already on stdout, and the loop stops where the
+    // model did instead of being killed mid-pass.
+    let cancel = minfer::engine::CancelToken::new();
+    install_ctrl_c_cancel(cancel.clone());
+
+    // Called once, between the prefill and the first decode step: the prefill line
+    // and the `--dump-graph` early exit both happen at the same point they did
+    // inline.
+    let mut on_prefill = |_last_logits: &[f32], prefill_secs: f64| {
+        println!(
+            "Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
+            input_ids.len(),
+            prefill_secs,
+            input_ids.len() as f64 / prefill_secs
+        );
+        // === Graph export (--dump-graph <dot> / --dump-graph-json <json>) ===
+        // Rebuilds the graph the runtime just ran (shared helper: build → assign →
+        // FusionPass), with real backend assignment (CPU/Metal colors) and the same
+        // fusion env toggles as the live path.
+        if dump_graph.is_some() || dump_graph_json.is_some() {
+            use minfer::graph::json::{export_graph_json, runtime_gparams};
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            let metal_on = minfer::graph::metal_backend::metal_available()
+                && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
+            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            let metal_on = false;
+            #[cfg(feature = "cuda")]
+            let cuda_on = minfer::cuda::CudaState::get().is_some();
+            #[cfg(not(feature = "cuda"))]
+            let cuda_on = false;
+            // Shared gate (json::preview_fuse_flags) so the preview cannot drift
+            // from the engine: Qwen2's runtime joins the decode QKV fusion on CUDA
+            // too, and a Metal-only gate here used to drop its FusedQKV nodes.
+            let (fuse_qkv, fuse_ffn) =
+                minfer::graph::json::preview_fuse_flags(input_ids.len(), metal_on, cuda_on);
+            // #736: `gpu` means "a device participates" everywhere else (`CParams.gpu`,
+            // `ModelDef::device`, the fusion gates). Passing `metal_on` alone left the
+            // exporter's allocator without CUDA, so every exported node claimed CPU on a
+            // CUDA-only box.
+            let device = minfer::graph::json::export_placement(metal_on, cuda_on);
+            let model_name = std::path::Path::new(&model_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| model_path.clone());
+
+            let doc = export_graph_json(
+                &*model,
+                &model_name,
+                input_ids.len(),
+                params.n_ctx,
+                device,
+                fuse_qkv,
+                fuse_ffn,
+            );
+            let kind = if input_ids.len() == 1 {
+                "decode"
+            } else {
+                "prefill"
+            };
+            if let Some(path) = &dump_graph {
+                // DOT export needs the graph itself (fused, assigned — same as the
+                // runtime), so rebuild it via the shared helper.
+                let gparams = runtime_gparams(
+                    input_ids.len(),
+                    params.n_ctx,
+                    metal_on,
+                    fuse_qkv,
+                    fuse_ffn,
+                    model.kv_format(),
+                );
+                let g = minfer::graph::json::build_runtime_graph(&*model, &gparams);
+                let mut f = std::fs::File::create(path).expect("create dot file");
+                g.dump_dot(&mut f).expect("write dot");
+                println!("Graph DOT exported to {path} ({} nodes)", g.n_nodes());
+            }
+            if let Some(path) = &dump_graph_json {
+                let s = serde_json::to_string_pretty(&doc).expect("serialize graph json");
+                std::fs::write(path, s).expect("write graph json");
+                println!(
+                    "Graph JSON exported to {path} ({} nodes, {kind})",
+                    doc["nodes"].as_array().map(|a| a.len()).unwrap_or(0)
+                );
+            }
+            std::process::exit(0);
+        }
+    };
+
+    let sampler_cfg = params.sampler_config();
+    let gparams = minfer::engine::GenerateParams {
+        tokens: &input_ids,
+        n_ctx: params.n_ctx,
+        n_predict: params.n_predict,
+        sampler: &sampler_cfg,
+        seed: params.seed,
+        stop_strings: &params.stop_strings,
+        timing: std::env::var("MINFER_TIMING").map_or(false, |v| v == "1"),
+        spec_adaptive: spec_draft_adaptive,
+        spec_d_max: spec_d_max,
+        cancel: Some(&cancel),
+    };
+    let outcome = minfer::engine::generate(
+        &*model,
+        &tokenizer,
+        spec_engine.as_mut(),
+        &gparams,
+        &mut |delta| hi.feed(delta),
+        &mut on_prefill,
+    );
+    if let Some(e) = &outcome.grammar_error {
+        eprintln!("\n[grammar] {e}");
+    }
+    if let Some(st) = &outcome.spec {
+        eprintln!(
+            "\n[spec] rounds={} drafted={} accepted={} ({:.1}% of drafted) repairs={} tokens/round={:.2}",
+            st.rounds,
+            st.drafted,
+            st.accepted,
+            if st.drafted > 0 { st.accepted as f64 / st.drafted as f64 * 100.0 } else { 0.0 },
+            st.repairs,
+            if st.rounds > 0 { st.generated as f64 / st.rounds as f64 } else { 0.0 }
+        );
+        if st.adaptive && st.rounds > 0 {
+            eprintln!(
+                "[spec] adaptive dmean={:.2} (d_max={})",
+                st.d_sum as f64 / st.rounds as f64,
+                st.d_max
+            );
+        }
+    }
+    if let Some((t_samp, t_fwd, n_tok)) = outcome.timing {
+        eprintln!("\n[MINFER_TIMING] over {n_tok} tokens: sample {:>6.2} ms/tok ({:>4.1}%), forward {:>6.2} ms/tok ({:>4.1}%)",
+            t_samp / n_tok as f64 * 1e3, 100.0 * t_samp / (t_samp + t_fwd),
+            t_fwd / n_tok as f64 * 1e3, 100.0 * t_fwd / (t_samp + t_fwd));
+    }
+    hi.finish();
+
+    // === P2 trace finish (MINFER_TRACE=<path>) ===
+    // Attach the exported prefill/decode graphs (same params the runtime used,
+    // mirrored by the dump block) and serialize the whole trace.
+    if let Some(tpath) = minfer::trace::path() {
+        let model_name = std::path::Path::new(&model_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| model_path.clone());
+        use minfer::graph::json::export_graph_json;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let metal_on = minfer::graph::metal_backend::metal_available()
+            && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1");
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let metal_on = false;
+        #[cfg(feature = "cuda")]
+        let cuda_on = minfer::cuda::CudaState::get().is_some();
+        #[cfg(not(feature = "cuda"))]
+        let cuda_on = false;
+        // Decode-graph gates, shared with the dump block (and the engine).
+        let (fuse_qkv, fuse_ffn) = minfer::graph::json::preview_fuse_flags(1, metal_on, cuda_on);
+        // #736: the placement flag is "a device participates", exactly as in the
+        // dump block and the engine; and the prefill preview takes the same fusion
+        // gate as the engine (a hardcoded `false` shifted its node ids).
+        let device = minfer::graph::json::export_placement(metal_on, cuda_on);
+        let prefill_graph = export_graph_json(
+            &*model,
+            &model_name,
+            input_ids.len(),
+            params.n_ctx,
+            device,
+            fuse_qkv,
+            fuse_ffn,
+        );
+        let decode_graph = export_graph_json(
+            &*model,
+            &model_name,
+            1,
+            params.n_ctx,
+            device,
+            fuse_qkv,
+            fuse_ffn,
+        );
+        minfer::trace::finish(&tpath, &model_name, &prompt, prefill_graph, decode_graph);
+    }
+
+    println!();
+    let gen_time = outcome.decode_secs;
+    let total_time = outcome.prefill_secs + outcome.decode_secs;
+    println!("\n---");
+    // Pure-decode rate (generated tokens / decode time) — matches llama.cpp's
+    // "Generation:" caliber. The "Total:" line below keeps the previous blended
+    // caliber (prompt+generated / prefill+decode) for comparison.
+    println!(
+        "Generated: {} tokens in {:.2}s ({:.1} tok/s)",
+        outcome.generated,
+        gen_time,
+        outcome.generated as f64 / gen_time
+    );
+    println!(
+        "Total:     {} tokens in {:.2}s ({:.1} tok/s)",
+        input_ids.len() + outcome.generated,
+        total_time,
+        (input_ids.len() + outcome.generated) as f64 / total_time
+    );
+
+    if outcome.cancelled {
+        // 128 + SIGINT, the shell's own convention: a cancelled run is not a
+        // failed one, but it must not look like a completed generation either.
+        eprintln!(
+            "\n[cancelled] SIGINT — {} of {} requested tokens",
+            outcome.generated, params.n_predict
+        );
+        std::process::exit(130);
+    }
+}
+
+/// Cancel the running generation when SIGINT arrives (#796).
+///
+/// The CLI's generation loop is synchronous, so the signal handler cannot live
+/// in it: a tiny current-thread runtime on a side thread awaits
+/// [`tokio::signal::ctrl_c`] and flips the token. `generate` checks the token
+/// between tokens, which is the only place a run can be stopped without
+/// abandoning a forward pass mid-flight. `tokio::signal` installs the
+/// process-wide handler once, so this is called once per run.
+fn install_ctrl_c_cancel(token: minfer::engine::CancelToken) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                token.cancel();
+            }
+        });
+    });
+}
+
+/// Colors the Qwen3-style `<think>…</think>` block gray so the reasoning
+/// stands apart from the normal answer. Streaming-safe: the markers may be
+/// split across arbitrary token/chunk boundaries. `exit_code` restores the
+/// color that follows the think block (conversation mode: the green answer
+/// wrap `\x1b[32m`; plain mode: reset `\x1b[0m`). With color disabled the
+/// sink sees the raw bytes unchanged.
+struct ThinkHighlighter<F: FnMut(&[u8])> {
+    sink: F,
+    color: bool,
+    exit_code: &'static [u8],
+    pending: Vec<u8>,
+    in_think: bool,
+}
+
+impl<F: FnMut(&[u8])> ThinkHighlighter<F> {
+    const OPEN: &'static [u8] = b"<think>";
+    const CLOSE: &'static [u8] = b"</think>";
+    const GRAY: &'static [u8] = b"\x1b[90m";
+
+    fn new(color: bool, exit_code: &'static [u8], sink: F) -> Self {
+        Self {
+            sink,
+            color,
+            exit_code,
+            pending: Vec::new(),
+            in_think: false,
+        }
+    }
+
+    fn feed(&mut self, data: &[u8]) {
+        self.pending.extend_from_slice(data);
+        self.drain_pending();
+    }
+
+    /// Flush any remaining bytes (call once at the end of a turn). Also
+    /// restores the exit color if the stream ended inside a `<think>` block
+    /// (e.g. n_predict cut the reasoning mid-way) so no color state leaks.
+    fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            let bytes = std::mem::take(&mut self.pending);
+            self.emit(&bytes);
+        }
+        if self.color && self.in_think {
+            self.emit(self.exit_code);
+            self.in_think = false;
+        }
+    }
+
+    fn drain_pending(&mut self) {
+        loop {
+            let marker = if self.in_think {
+                Self::CLOSE
+            } else {
+                Self::OPEN
+            };
+            let Some(pos) = find_subslice(&self.pending, marker) else {
+                // No marker yet: emit everything except the tail that could be
+                // a marker prefix (e.g. "<thin"), keep that for the next chunk.
+                let keep = marker.len().saturating_sub(1);
+                let cut = self.pending.len().saturating_sub(keep);
+                if cut > 0 {
+                    let body = self.pending[..cut].to_vec();
+                    self.pending.drain(..cut);
+                    self.emit(&body);
+                }
+                return;
+            };
+            if pos > 0 {
+                let body = self.pending[..pos].to_vec();
+                self.emit(&body);
+            }
+            // The think block (both tags + reasoning) is gray; the answer color
+            // takes over only AFTER the closing tag — otherwise `</think>` turns
+            // the answer color (e.g. green) and looks like part of the reasoning.
+            if self.color {
+                if self.in_think {
+                    // closing </think>: keep it gray, then switch to the answer color
+                    self.emit(Self::GRAY);
+                    self.emit(marker);
+                    self.emit(self.exit_code);
+                } else {
+                    // opening <think>: switch to gray for the reasoning
+                    self.emit(Self::GRAY);
+                    self.emit(marker);
+                }
+            } else {
+                self.emit(marker);
+            }
+            self.pending.drain(..pos + marker.len());
+            self.in_think = !self.in_think;
+        }
+    }
+
+    fn emit(&mut self, bytes: &[u8]) {
+        (self.sink)(bytes);
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+// === Multi-turn conversation mode (CLI-CONVERSATION-PLAN.md Phase 2) ===
+
+/// Read one line of user input. In multiline mode (-mli), accumulate until an
+/// empty line submits; on EOF, submit buffered input or return None.
+fn read_user_input(multiline: bool) -> Option<String> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    loop {
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).ok()? == 0 {
+            // EOF (Ctrl+D)
+            return if buf.is_empty() { None } else { Some(buf) };
+        }
+        let line = line.trim_end_matches(['\n', '\r']).to_string();
+        if !multiline {
+            return Some(line);
+        }
+        if line.is_empty() {
+            return Some(buf); // empty line submits
+        }
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str(&line);
+    }
+}
+
+/// Interactive multi-turn conversation loop (--cnv).
+/// Append-only KV + incremental template rendering: a `Conversation` state
+/// machine driving a `GraphEngine` inference engine.
+fn run_conversation(
+    model: Box<dyn models::ModelDef>,
+    tokenizer: &tokenizer::Tokenizer,
+    gguf_data: &[u8],
+    template_override: Option<&str>,
+    params: &GenParams,
+    system_prompt: Option<String>,
+    single_turn: bool,
+    multiline: bool,
+    color_mode: ColorMode,
+    session_file: Option<String>,
+    first_prompt: Option<String>,
+    mut spec_engine: Option<spec::SpecEngine>,
+) -> i32 {
+    use minfer::conversation::Engine as _;
+    use std::io::Write; // reset_cache / forward trait methods
+
+    // One resolver (#133 S1): a `--chat-template <FILE>` override beats the
+    // GGUF's copy, and whichever wins is validated before the first turn.
+    let startup = match template::startup_template(
+        get_chat_template(gguf_data).as_deref(),
+        template_override,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {}", e.message());
+            return 1;
+        }
+    };
+    if startup.announce_chatml {
+        eprintln!("{}", template::CHATML_NOTICE);
+    }
+    let template = startup.text;
+    let special = model.special_tokens();
+    let bos_text = tokenizer
+        .id_to_token
+        .get(tokenizer.bos_token as usize)
+        .cloned()
+        .unwrap_or_default();
+    let eog = {
+        let mut v = vec![special.eos];
+        if let Some(im) = special.im_end {
+            v.push(im);
+        }
+        v
+    };
+    let eot = special.im_end.unwrap_or(special.eos);
+
+    let spec = conversation::ConversationSpec {
+        template,
+        bos_text,
+        eog,
+        eot,
+        seed: params.seed,
+        n_ctx: params.n_ctx,
+        mirostat_tau: params.mirostat_tau,
+        system_prompt,
+    };
+    let mut conv = conversation::Conversation::new(spec);
+    let graph_engine = conversation::GraphEngine::new(&*model, params.n_ctx);
+    let sparams = spec::SpecSampler {
+        cfg: params.sampler_config(),
+    };
+    let mut engine = conversation::SpecAwareEngine::new(graph_engine, spec_engine.take(), sparams);
+
+    // --session: the history JSON is the host's own record; its `.kv` companion (C5 S2)
+    // is the KV those rows belong to. A matching companion resumes with **no** prefill;
+    // anything else falls back to re-rendering the history, and says why.
+    let history = session_file.as_ref().and_then(|path| {
+        std::fs::read_to_string(path).ok().and_then(|text| {
+            let msgs = conversation::Conversation::messages_from_json(&text);
+            if msgs.is_none() {
+                eprintln!("[session] ignoring unreadable session file {path}");
+            }
+            msgs
+        })
+    });
+    let resumed = match &session_file {
+        Some(path) => {
+            let kv = format!("{path}.kv");
+            resume_from_kv_companion(&mut conv, &mut engine, history.as_deref(), &kv)
+        }
+        None => false,
+    };
+    if !resumed {
+        if let (Some(msgs), Some(path)) = (history, &session_file) {
+            if let Err(e) = conv.load_history(msgs, &*tokenizer, &mut engine) {
+                eprintln!("Error: {e}");
+                return 1;
+            }
+            eprintln!(
+                "[session] loaded {} message(s) from {path}",
+                conv.messages.len()
+            );
+        }
+    }
+
+    // --session save (on exit): the history, then the KV that belongs to it.
+    let save_session = |conv: &conversation::Conversation,
+                        engine: &mut conversation::SpecAwareEngine| {
+        if let Some(path) = &session_file {
+            let json = conv.messages_to_json();
+            if std::fs::write(path, json).is_ok() {
+                eprintln!(
+                    "[session] saved {} message(s) to {path}",
+                    conv.messages.len()
+                );
+            } else {
+                eprintln!("[session] failed to save session to {path}");
+            }
+            let kv = format!("{path}.kv");
+            match engine.kv_save(
+                std::path::Path::new(&kv),
+                conv.snapshot_to_json().as_bytes(),
+            ) {
+                Ok(bytes) => eprintln!("[session] saved {bytes} byte(s) of KV to {kv}"),
+                Err(e) => eprintln!("[session] KV not saved to {kv}: {e}"),
+            }
+        }
+    };
+    let tp = conversation::TurnParams {
+        n_predict: params.n_predict,
+        sampler: params.sampler_config(),
+        stop_strings: params.stop_strings.clone(),
+    };
+    let color_on = color_mode.enabled();
+    let mut turn = 0usize;
+
+    let mut pending = first_prompt;
+    loop {
+        if pending.is_none() {
+            // Prompt + flush (precondition for piped tests, see docs §8.3).
+            if color_on {
+                print!("\x1b[1;36m");
+            }
+            print!("> ");
+            if color_on {
+                print!("\x1b[0m");
+            }
+            std::io::stdout().flush().unwrap_or(());
+            let Some(input) = read_user_input(multiline) else {
+                break;
+            };
+            let input = input.trim().to_string();
+            if input.is_empty() {
+                continue;
+            }
+            pending = Some(input);
+        }
+        let input = pending.take().unwrap();
+
+        // Slash commands.
+        if input.starts_with('/') {
+            let cmd = input.split_whitespace().next().unwrap_or("");
+            match cmd {
+                "/exit" | "/quit" => break,
+                "/help" => {
+                    println!("\ncommands:");
+                    println!("  /exit, /quit   exit (Ctrl+D / EOF also exits)");
+                    println!("  /clear         clear the chat history");
+                    println!("  /regen         regenerate the last assistant reply");
+                    println!("  /help          this help");
+                    continue;
+                }
+                "/clear" => {
+                    conv.clear();
+                    engine.reset_cache();
+                    println!("\n[history cleared]");
+                    continue;
+                }
+                "/regen" => {
+                    if color_on {
+                        print!("\x1b[32m");
+                        std::io::stdout().flush().unwrap_or(());
+                    }
+                    let t0 = Instant::now();
+                    let mut hi = ThinkHighlighter::new(color_on, b"\x1b[32m", |b| {
+                        let _ = std::io::stdout().write_all(b);
+                        let _ = std::io::stdout().flush();
+                    });
+                    let r = conv.regen_turn(&*tokenizer, &tp, &mut engine, &mut |b| hi.feed(b));
+                    hi.finish();
+                    if color_on {
+                        print!("\x1b[0m");
+                        std::io::stdout().flush().unwrap_or(());
+                    }
+                    match r {
+                        Ok(out) => {
+                            turn += 1;
+                            println!();
+                            eprintln!("[turn {turn}] regen: prefill {} tokens, generated {} tokens in {:.2}s",
+                                out.prefill_tokens, out.tokens_generated, t0.elapsed().as_secs_f64());
+                        }
+                        Err(e) => eprintln!("\n[regen failed: {e}]"),
+                    }
+                    if single_turn {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {
+                    eprintln!("unknown command '{cmd}' — try /help");
+                    continue;
+                }
+            }
+        }
+
+        // Ordinary user turn.
+        if color_on {
+            print!("\x1b[32m");
+            std::io::stdout().flush().unwrap_or(());
+        }
+        let t0 = Instant::now();
+        let mut hi = ThinkHighlighter::new(color_on, b"\x1b[32m", |b| {
+            let _ = std::io::stdout().write_all(b);
+            let _ = std::io::stdout().flush();
+        });
+        let result = conv.user_turn(&input, &*tokenizer, &tp, &mut engine, &mut |b| hi.feed(b));
+        hi.finish();
+        if color_on {
+            print!("\x1b[0m");
+            std::io::stdout().flush().unwrap_or(());
+        }
+        match result {
+            Ok(out) => {
+                turn += 1;
+                println!();
+                eprintln!(
+                    "[turn {turn}] prefill {} tokens, generated {} tokens in {:.2}s",
+                    out.prefill_tokens,
+                    out.tokens_generated,
+                    t0.elapsed().as_secs_f64()
+                );
+                if out.hit_n_predict {
+                    eprintln!("[turn {turn}] stopped by n_predict / context limit");
+                }
+                if out.dropped_turns > 0 {
+                    eprintln!(
+                        "[turn {turn}] <<context full: dropped oldest {n} turn(s)>>",
+                        n = out.dropped_turns
+                    );
+                }
+            }
+            Err(e) => eprintln!("\n[error] {e}"),
+        }
+        if single_turn {
+            break;
+        }
+    }
+    save_session(&conv, &mut engine);
+    eprintln!("\n---\nconversation ended after {turn} turn(s)");
+    0
+}
+
+/// C5 S2: resume `--session FILE` from its KV companion, when the companion describes
+/// this run and the host state it carries agrees with the history file.
+///
+/// Returns `true` only when the conversation was actually restored — every other outcome
+/// (no companion, a file this run cannot use, a host state this build cannot read, a
+/// history the user edited) prints the reason and returns `false`, and the caller
+/// re-seeds from the history, which is always correct if slower.
+fn resume_from_kv_companion(
+    conv: &mut conversation::Conversation,
+    engine: &mut conversation::SpecAwareEngine,
+    history: Option<&[(String, Option<String>)]>,
+    kv_path: &str,
+) -> bool {
+    use minfer::conversation::Engine as _; // kv_load lives on the trait
+    if !std::path::Path::new(kv_path).exists() {
+        return false;
+    }
+    let loaded = match engine.kv_load(std::path::Path::new(kv_path)) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("[session] {e}; re-seeding the history instead");
+            return false;
+        }
+    };
+    let host = String::from_utf8_lossy(&loaded.host);
+    let Some(snap) = conversation::Conversation::snapshot_from_json(&host) else {
+        eprintln!(
+            "[session] {kv_path} carries no host state this build understands; re-seeding \
+             the history instead"
+        );
+        return false;
+    };
+    // The KV rows belong to the snapshot's history. A history file the user edited must
+    // not be silently ignored, so a disagreement is a refusal, not a merge.
+    if let Some(msgs) = history {
+        if msgs != snap.messages.as_slice() {
+            eprintln!(
+                "[session] {kv_path} and the history file describe different conversations \
+                 ({} vs {} messages); re-seeding the history instead",
+                snap.messages.len(),
+                msgs.len()
+            );
+            return false;
+        }
+    }
+    if snap.current_pos != loaded.written {
+        eprintln!(
+            "[session] {kv_path} holds {} written row(s) but its host state says {}; \
+             re-seeding the history instead",
+            loaded.written, snap.current_pos
+        );
+        return false;
+    }
+    if let Err(e) = conv.restore_snapshot(&snap) {
+        eprintln!("[session] {e}; re-seeding the history instead");
+        return false;
+    }
+    eprintln!(
+        "[session] resumed {} message(s) and {} KV row(s) from {kv_path} ({} bytes) — 0 tokens \
+         prefilled",
+        conv.messages.len(),
+        loaded.written,
+        loaded.bytes
+    );
+    true
+}
+
+fn dump_array<T: std::fmt::Debug>(key: &str, label: &str, items: &[T]) {
+    const SHOW_PREFIX: usize = 5;
+    const SHOW_SUFFIX: usize = 3;
+    if items.len() <= SHOW_PREFIX + SHOW_SUFFIX {
+        eprintln!("  {} (arr:{}) = {:?}", key, label, items);
+    } else {
+        eprint!("  {} (arr:{}) = [", key, label);
+        for i in 0..SHOW_PREFIX {
+            if i > 0 {
+                eprint!(", ");
+            }
+            eprint!("{:?}", items[i]);
+        }
+        eprint!(", ..., ");
+        for i in items.len() - SHOW_SUFFIX..items.len() {
+            if i > items.len() - SHOW_SUFFIX {
+                eprint!(", ");
+            }
+            eprint!("{:?}", items[i]);
+        }
+        eprintln!("]");
+    }
+}
+
+fn dump_gguf_metadata(ctx: &gguf::GgufContext) {
+    use gguf::GgufType;
+    eprintln!("\n=== GGUF Metadata ===");
+    for kv in &ctx.kv {
+        let key = kv.get_key();
+        if kv.is_array {
+            let ne = kv.get_ne();
+            match kv.get_type() {
+                GgufType::String => {
+                    let items: Vec<&str> = (0..ne).map(|i| kv.get_val_str(i)).collect();
+                    dump_array(key, "str", &items);
+                }
+                GgufType::Int32 => {
+                    let items: Vec<i32> = (0..ne).map(|i| kv.get_val_i32(i)).collect();
+                    dump_array(key, "i32", &items);
+                }
+                GgufType::Uint32 => {
+                    let items: Vec<u32> = (0..ne).map(|i| kv.get_val_u32(i)).collect();
+                    dump_array(key, "u32", &items);
+                }
+                GgufType::Float32 => {
+                    let items: Vec<f32> = (0..ne).map(|i| kv.get_val_f32(i)).collect();
+                    dump_array(key, "f32", &items);
+                }
+                GgufType::Int64 => {
+                    let items: Vec<i64> = (0..ne).map(|i| kv.get_val_i64(i)).collect();
+                    dump_array(key, "i64", &items);
+                }
+                GgufType::Uint64 => {
+                    let items: Vec<u64> = (0..ne).map(|i| kv.get_val_u64(i)).collect();
+                    dump_array(key, "u64", &items);
+                }
+                GgufType::Float64 => {
+                    let items: Vec<f64> = (0..ne).map(|i| kv.get_val_f64(i)).collect();
+                    dump_array(key, "f64", &items);
+                }
+                t => eprintln!("  {} (arr:{:?}) = <{} elements>", key, t, ne),
+            }
+        } else {
+            match kv.get_type() {
+                GgufType::String => eprintln!("  {} = \"{}\"", key, kv.get_val_str(0)),
+                GgufType::Bool => eprintln!("  {} = {}", key, kv.get_val_bool(0)),
+                GgufType::Int32 => eprintln!("  {} = {}", key, kv.get_val_i32(0)),
+                GgufType::Uint32 => eprintln!("  {} = {}", key, kv.get_val_u32(0)),
+                GgufType::Int64 => eprintln!("  {} = {}", key, kv.get_val_i64(0)),
+                GgufType::Uint64 => eprintln!("  {} = {}", key, kv.get_val_u64(0)),
+                GgufType::Float32 => eprintln!("  {} = {}", key, kv.get_val_f32(0)),
+                GgufType::Float64 => eprintln!("  {} = {}", key, kv.get_val_f64(0)),
+                t => eprintln!("  {} ({:?})", key, t),
+            }
+        }
+    }
+    eprintln!("=== Metadata End ===");
+}
+
+fn dump_key_tensors(ctx: &gguf::GgufContext) {
+    let key_names = [
+        "token_embd.weight",
+        "output_norm.weight",
+        "output.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_q.bias",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_k.bias",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_v.bias",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_down.weight",
+        "blk.0.ffn_up.weight",
+        "blk.0.ffn_norm.weight",
+    ];
+    eprintln!("--- Key Tensors ---");
+    for name in &key_names {
+        if let Some(ti) = ctx.info.iter().find(|t| t.name == *name) {
+            let dims: Vec<String> = {
+                let mut d: Vec<String> = ti
+                    .ne
+                    .iter()
+                    .filter(|&&v| v > 0)
+                    .map(|v| v.to_string())
+                    .collect();
+                if d.is_empty() {
+                    d.push("1".into());
+                }
+                d
+            };
+            eprintln!(
+                "  {:<50} {}  [{}]",
+                ti.name,
+                ti.type_.type_name(),
+                dims.join(",")
+            );
+        }
+    }
+    eprintln!("--------");
+}
+
+fn get_chat_template(data: &[u8]) -> Option<String> {
+    // #763 S6: one reader, shared with the engine facade.
+    minfer::template::from_gguf(data)
+}
+
+#[cfg(test)]
+mod arg_parse_tests;
+#[cfg(test)]
+mod think_highlighter_tests;
+
+/// A refusal that cannot be ignored: the loader's message on stderr, a non-zero exit
+/// and no panic ([#580]). At the end of the file on purpose — the doc anchors above
+/// cite `main.rs` line numbers, so a helper inserted in the middle would move them.
+///
+/// [#580]: https://github.com/yusiwen/minfer/issues/580
+fn refuse(message: String) -> ! {
+    eprintln!("Error: {message}");
+    std::process::exit(1)
 }

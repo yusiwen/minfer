@@ -45,19 +45,3 @@ pub mod vec_ops;
 pub mod cuda;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod metal;
-
-// The application layer: only the binary uses these. Phase 1 gates them behind
-// `cli`; S2 makes their dependencies optional and S7 moves the server onto the
-// `advanced` tier.
-#[cfg(feature = "cli")]
-pub mod bench;
-#[cfg(feature = "cli")]
-pub mod convert;
-#[cfg(feature = "cli")]
-pub mod download;
-#[cfg(feature = "cli")]
-pub mod server;
-#[cfg(feature = "cli")]
-pub mod spec_verify;
-#[cfg(feature = "cli")]
-pub mod tooling;

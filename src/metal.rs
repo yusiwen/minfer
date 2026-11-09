@@ -56,9 +56,12 @@ pub type MetalLibrary = Retained<ProtocolObject<dyn MTLLibrary>>;
 /// the heavy `prefill_gemm_throughput_profile` test (50-kernel batches, up to
 /// ~700 MB of buffers per case) is running concurrently. Product code is
 /// single-worker serial and never submits concurrently, so this is a
-/// test-only guard: every test that touches MPS takes the lock.
-#[cfg(test)]
-pub(crate) fn metal_test_lock() -> std::sync::MutexGuard<'static, ()> {
+/// test-only guard: every test that touches MPS takes the lock. Gated by
+/// `cfg(test)` or the `test-hooks` feature, because the application package's
+/// macOS device gates call it and a dependent package cannot see `cfg(test)`
+/// items (#805).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn metal_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     // Tolerate poisoning: the guard only serializes GPU access (no shared data),
     // and a panicking test (e.g. the pre-existing q4 overflow) would otherwise
