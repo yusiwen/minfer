@@ -1558,6 +1558,12 @@ fn main() {
         },
     );
 
+    // Ctrl-C cancels the run at the next token boundary and exits 130 (#796):
+    // what has been generated is already on stdout, and the loop stops where the
+    // model did instead of being killed mid-pass.
+    let cancel = minfer::engine::CancelToken::new();
+    install_ctrl_c_cancel(cancel.clone());
+
     // Called once, between the prefill and the first decode step: the prefill line
     // and the `--dump-graph` early exit both happen at the same point they did
     // inline.
@@ -1651,6 +1657,7 @@ fn main() {
         timing: std::env::var("MINFER_TIMING").map_or(false, |v| v == "1"),
         spec_adaptive: spec_draft_adaptive,
         spec_d_max: spec_d_max,
+        cancel: Some(&cancel),
     };
     let outcome = minfer::engine::generate(
         &*model,
@@ -1752,6 +1759,40 @@ fn main() {
         total_time,
         (input_ids.len() + outcome.generated) as f64 / total_time
     );
+
+    if outcome.cancelled {
+        // 128 + SIGINT, the shell's own convention: a cancelled run is not a
+        // failed one, but it must not look like a completed generation either.
+        eprintln!(
+            "\n[cancelled] SIGINT — {} of {} requested tokens",
+            outcome.generated, params.n_predict
+        );
+        std::process::exit(130);
+    }
+}
+
+/// Cancel the running generation when SIGINT arrives (#796).
+///
+/// The CLI's generation loop is synchronous, so the signal handler cannot live
+/// in it: a tiny current-thread runtime on a side thread awaits
+/// [`tokio::signal::ctrl_c`] and flips the token. `generate` checks the token
+/// between tokens, which is the only place a run can be stopped without
+/// abandoning a forward pass mid-flight. `tokio::signal` installs the
+/// process-wide handler once, so this is called once per run.
+fn install_ctrl_c_cancel(token: minfer::engine::CancelToken) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                token.cancel();
+            }
+        });
+    });
 }
 
 /// Colors the Qwen3-style `<think>…</think>` block gray so the reasoning

@@ -6,6 +6,9 @@
 //! the sampler pipeline (penalties, grammar, mirostat, the speculative round
 //! loop), stop strings, the trace marks and the KV writes.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use rand::SeedableRng;
 
 use crate::graph::cache::GraphCache;
@@ -14,6 +17,45 @@ use crate::sampler::{self, SamplerConfig};
 use crate::spec::{SpecEngine, SpecSampler};
 use crate::tokenizer::Tokenizer;
 use crate::trace;
+
+/// A cancellation handle a host holds across threads (#796).
+///
+/// The loop checks it once per decoded token — and once per speculative round,
+/// so a draft round cannot outrun it — and stops at that token boundary. It
+/// cannot interrupt a forward pass, which is a single call into the model; a
+/// cancel that arrives mid-pass is honoured at the next token.
+///
+/// Cheap to clone: every clone shares one flag, so a signal handler or a UI
+/// thread can hold its own. There is no reset: a cancelled token stays
+/// cancelled, so a host that wants to run again makes a new one.
+#[derive(Clone, Default)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the running generation to stop. Idempotent.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`cancel`](Self::cancel) has been called, by any clone.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
+impl std::fmt::Debug for CancelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
 
 /// What one single-shot generation needs.
 pub struct GenerateParams<'a> {
@@ -30,6 +72,9 @@ pub struct GenerateParams<'a> {
     /// Speculative decoding's adaptive-depth line, for the caller's report.
     pub spec_adaptive: bool,
     pub spec_d_max: usize,
+    /// Stop between tokens when this is cancelled (#796); `None` runs to a stop
+    /// condition, as it always did.
+    pub cancel: Option<&'a CancelToken>,
 }
 
 /// What the run produced, for the caller's report.
@@ -42,6 +87,9 @@ pub struct GenerateOutcome {
     pub stopped_by_eog: bool,
     pub stopped_by_string: bool,
     pub hit_n_predict: bool,
+    /// A caller's [`CancelToken`] fired: the run stopped at a token boundary
+    /// before `n_predict`, and `hit_n_predict` is false by construction.
+    pub cancelled: bool,
     /// A grammar refusal (the emitted text is a valid prefix).
     pub grammar_error: Option<String>,
     /// `(sample_secs, forward_secs, counted_tokens)` when `timing` was on.
@@ -125,8 +173,22 @@ pub fn generate(
     let prefill_time = infer_start.elapsed();
     on_prefill(&last_logits, prefill_time.as_secs_f64());
 
+    // A token cancelled before the first decode step stops here. The prefill
+    // already ran — a forward pass cannot be interrupted — and `on_prefill`
+    // fired, so the host's report ("N prefill tokens, 0 generated") is
+    // consistent with what actually happened (#796).
+    if p.cancel.map_or(false, |c| c.is_cancelled()) {
+        return GenerateOutcome {
+            prefill_tokens: p.tokens.len(),
+            prefill_secs: prefill_time.as_secs_f64(),
+            cancelled: true,
+            ..GenerateOutcome::default()
+        };
+    }
+
     // === Generate ===
     let mut logits = last_logits;
+    let mut cancelled = false;
     if trace_on {
         crate::trace::begin_phase("decode");
     }
@@ -214,6 +276,12 @@ pub fn generate(
             }
         }
         while !stop && generated.len() < p.n_predict {
+            // One check per round: the round's forward decides d+1 tokens at
+            // once, so a cancel arriving between rounds stops before that work.
+            if p.cancel.map_or(false, |c| c.is_cancelled()) {
+                cancelled = true;
+                break;
+            }
             let t0r = std::time::Instant::now();
             let round_toks = engine.round(
                 &*model,
@@ -257,6 +325,12 @@ pub fn generate(
                     crate::trace::set_token(tok, &text);
                 }
                 consumed += 1;
+                // A d+1 round is one forward but several emitted tokens: stop at
+                // the first one after the cancel instead of finishing the round.
+                if p.cancel.map_or(false, |c| c.is_cancelled()) {
+                    cancelled = true;
+                    break;
+                }
             }
             if stop {
                 break;
@@ -283,6 +357,10 @@ pub fn generate(
     }
     if spec.is_none() {
         while generated.len() < p.n_predict {
+            if p.cancel.map_or(false, |c| c.is_cancelled()) {
+                cancelled = true;
+                break;
+            }
             t0 = std::time::Instant::now();
             let sampled = match sampler::sample_with_config_grammar(
                 &mut logits,
@@ -364,7 +442,11 @@ pub fn generate(
         decode_secs,
         stopped_by_eog,
         stopped_by_string,
-        hit_n_predict: generated.len() >= p.n_predict && !stopped_by_eog && !stopped_by_string,
+        cancelled,
+        hit_n_predict: !cancelled
+            && generated.len() >= p.n_predict
+            && !stopped_by_eog
+            && !stopped_by_string,
         grammar_error,
         timing: timing.then_some((t_samp, t_fwd, n_tok)),
         spec: spec_stats,

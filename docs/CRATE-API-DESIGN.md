@@ -71,6 +71,11 @@ offload plan — is per engine, and the fence can be scoped (`registry::with_fil
   write to the host's stderr; the CLI renders what the engine returns.
 - A generation that hits a limit (tokens, EOG, stop string, grammar refusal) returns a
   `GenerateOutcome` that says so; it is not an `Err` unless the request itself was refused.
+- A caller can stop a run between tokens: `GenerateParams.cancel` carries a `CancelToken`, checked
+  once per decoded token and once per speculative round, and the outcome then reports `cancelled`
+  (never `hit_n_predict`). The check **cannot** interrupt a forward pass — a single call into the
+  model — so a cancel that arrives mid-pass is honoured at the next token. The CLI wires Ctrl-C to
+  this seam and exits 130 (#796).
 
 ## Features
 
@@ -123,15 +128,13 @@ crate (load → chat → drop → reload, two sessions independent, and a single
 
 ## What Phase 1 did not do
 
-These are gaps with their own tickets, not omissions. The list's former fourth item — `metal` as a
-feature — has since landed ([#777](https://github.com/yusiwen/minfer/issues/777)), and §Features above
-is its current statement.
+These are gaps with their own tickets, not omissions. Two items this list used to name have since
+landed: `metal` as a feature ([#777](https://github.com/yusiwen/minfer/issues/777), §Features) and
+cancellation ([#796](https://github.com/yusiwen/minfer/issues/796), §Failures).
 
 - **`Session::complete`** (incremental KV reuse across single-shot calls) — `Session::chat` keeps a
   conversation, `Engine::generate` is a fresh single shot. Merging the two is an API decision, not a
   move ([#795](https://github.com/yusiwen/minfer/issues/795)).
-- **Cancellation** — no token/cancel seam in the generation loop yet; the CLI has no Ctrl-C wiring
-  ([#796](https://github.com/yusiwen/minfer/issues/796)).
 - **A bytes constructor** for `Engine::load` — the owned-mapping contract is
   [#797](https://github.com/yusiwen/minfer/issues/797).
 

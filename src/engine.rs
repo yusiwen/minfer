@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-pub use generate::{generate, GenerateOutcome, GenerateParams, SpecStatsOut};
+pub use generate::{generate, CancelToken, GenerateOutcome, GenerateParams, SpecStatsOut};
 
 use crate::conversation::{self, ConvError, Conversation, GraphEngine, TurnOutcome, TurnParams};
 use crate::gguf::{GgufLoadError, GgufModel};

@@ -59,7 +59,7 @@ fn two_sessions_on_one_engine_do_not_share_history() {
         n_ctx: 64,
         ..Default::default()
     });
-    let mut b = engine.session(SessionConfig {
+    let b = engine.session(SessionConfig {
         n_ctx: 64,
         ..Default::default()
     });
@@ -87,6 +87,7 @@ fn the_external_generate_runs_the_whole_loop() {
         timing: false,
         spec_adaptive: false,
         spec_d_max: 2,
+        cancel: None,
     };
     let mut out = Vec::new();
     let mut prefill = None;
@@ -98,4 +99,83 @@ fn the_external_generate_runs_the_whole_loop() {
     assert_eq!(outcome.prefill_tokens, ids.len());
     assert!(outcome.generated <= 2, "n_predict caps the run");
     assert!(prefill.is_some(), "the prefill hook fires once");
+}
+
+/// #796: a host cancels from inside its own delta callback — the shape a UI or a
+/// deadline uses. The loop stops at the next token boundary and says so; it does
+/// not run to `n_predict`, and it does not abandon a forward pass mid-flight.
+#[test]
+fn a_cancelled_generate_stops_at_the_next_token() {
+    let engine = Engine::load(&toy()).expect("load");
+    let ids = engine.tokenizer().encode("hi");
+    let sampler = SamplerConfig::default();
+    let cancel = minfer::engine::CancelToken::new();
+    let params = minfer::engine::GenerateParams {
+        tokens: &ids,
+        n_ctx: 64,
+        n_predict: 32,
+        sampler: &sampler,
+        seed: 42,
+        stop_strings: &[],
+        timing: false,
+        spec_adaptive: false,
+        spec_d_max: 2,
+        cancel: Some(&cancel),
+    };
+    let mut deltas = 0usize;
+    let mut out = Vec::new();
+    let outcome = engine.generate(
+        &params,
+        &mut |delta| {
+            deltas += 1;
+            out.extend_from_slice(delta);
+            if deltas == 1 {
+                cancel.cancel();
+            }
+        },
+        &mut |_logits, _secs| {},
+    );
+    assert!(outcome.cancelled, "the outcome names the cancellation");
+    assert!(
+        outcome.generated >= 1 && outcome.generated < 32,
+        "the run stopped between tokens, not at n_predict: {}",
+        outcome.generated
+    );
+    assert!(!outcome.hit_n_predict, "a cancel is not an n_predict hit");
+    assert!(!out.is_empty(), "the partial answer was emitted");
+}
+
+/// #796: a pre-cancelled token decodes nothing, but the prefill still happens
+/// and is reported — a host that cancels between a load and a run gets an
+/// honest "0 of N tokens", not a silent no-op.
+#[test]
+fn a_pre_cancelled_generate_decodes_nothing() {
+    let engine = Engine::load(&toy()).expect("load");
+    let ids = engine.tokenizer().encode("hi");
+    let sampler = SamplerConfig::default();
+    let cancel = minfer::engine::CancelToken::new();
+    cancel.cancel();
+    let params = minfer::engine::GenerateParams {
+        tokens: &ids,
+        n_ctx: 64,
+        n_predict: 8,
+        sampler: &sampler,
+        seed: 42,
+        stop_strings: &[],
+        timing: false,
+        spec_adaptive: false,
+        spec_d_max: 2,
+        cancel: Some(&cancel),
+    };
+    let mut out = Vec::new();
+    let outcome = engine.generate(
+        &params,
+        &mut |delta| out.extend_from_slice(delta),
+        &mut |_logits, _secs| {},
+    );
+    assert!(outcome.cancelled, "the outcome names the cancellation");
+    assert_eq!(outcome.generated, 0, "nothing is decoded");
+    assert_eq!(outcome.prefill_tokens, ids.len(), "the prefill is reported");
+    assert!(!outcome.hit_n_predict, "a cancel is not an n_predict hit");
+    assert!(out.is_empty(), "nothing is emitted");
 }
