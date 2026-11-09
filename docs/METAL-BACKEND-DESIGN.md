@@ -82,7 +82,7 @@ never a silent mid-run fallback.
 | Graph executor | `src/graph/metal_backend.rs` | Implements `Backend`: shared-memory buffer pool, name→buffer-offset weight resolution, per-op dispatch, split-scoped `MpsCommandBuffer`, capture staging, error contract |
 | Device/kernel layer | `src/metal/` | `MpsState` singleton: device/queue/library init, zero-copy weight registry, `MpsCommandBuffer` (encoder, barriers, submit), and one Rust method per op/kernel |
 | Shaders | `src/metal/kernels/` | The Metal Shading Language kernels (norms, matmul tiers, attention variants, elementwise, KV store, get_rows, fused epilogues) |
-| Build chain | `build.rs` | Runtime shader compilation (default) or a precompiled metallib (`MINFER_METALLIB_FILE`/`_PATH`); the objc2 framework links |
+| Build chain | `build.rs` | A precompiled metallib, compiled with `xcrun metal` at build time; a shader that does not compile **fails** the build, and the runtime source compile is the `MINFER_METAL_FORCE_SHADER_SOURCE=1` opt-in ([#788](https://github.com/yusiwen/minfer/issues/788)). `MINFER_METALLIB_FILE`/`_PATH` override the library at runtime; the objc2 framework links |
 
 The split follows CUDA: `src/metal/` is the only place that touches Objective-C/Metal APIs, and
 `metal_backend.rs` is the only place that knows about graph nodes.

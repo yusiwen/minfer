@@ -169,6 +169,30 @@ fn kernel_translation_units() -> Vec<String> {
     KERNEL_SOURCES.iter().map(|s| s.to_string()).collect()
 }
 
+/// The path of the `metal` compiler `xcrun` resolves, or `None` when it cannot
+/// (no Xcode, or the Metal Toolchain component is not installed).
+///
+/// #788: the path is what the build script watches. Installing the component
+/// mounts a new cryptex under `/var/run/com.apple.security.cryptexd/mnt`, so the
+/// resolved path changes and cargo re-runs the script — no `touch build.rs`.
+fn resolve_metal_tool(xcrun: &str) -> Option<String> {
+    let out = Command::new(xcrun)
+        .env_remove("DEVELOPER_DIR")
+        .env_remove("SDKROOT")
+        .args(["-sdk", "macosx", "-f", "metal"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
 fn main() {
     // ─── Build version (minfer --version) ─────────────────────────────
     // The release workflow passes MINFER_VERSION as "vX.Y.Z(shortsha)",
@@ -244,38 +268,65 @@ fn main() {
         //     path. The system xcrun falls back to `xcode-select -p`.
         // Unsetting the vars only affects these two child processes — rustc
         // linking in the same shell still uses the nix SDK/clang.
+        // #788: the runtime-source fallback is an explicit opt-in, and a failed
+        // compile is a hard error. It used to be a warning plus an empty
+        // metallib, which (a) is a silent fallback — ADR-0009 — and (b) was
+        // CACHED: a machine that installed the Metal Toolchain afterwards kept
+        // replaying the warning and running the runtime path until someone
+        // touched this file, because nothing the script watches had changed. A
+        // failed build script is never cached, so the failure now clears itself
+        // on the next build.
+        let force_source = std::env::var_os("MINFER_METAL_FORCE_SHADER_SOURCE").is_some();
+        // Diagnostic override (#788): the failure path cannot be exercised on a
+        // box that already has the component, so point the compiler somewhere
+        // else (`MINFER_METAL_XCRUN=/bin/false`) and the same panic runs.
+        let xcrun = std::env::var("MINFER_METAL_XCRUN").unwrap_or_else(|_| "/usr/bin/xcrun".into());
+        // Toggling either knob must re-run this script.
+        println!("cargo:rerun-if-env-changed=MINFER_METAL_FORCE_SHADER_SOURCE");
+        println!("cargo:rerun-if-env-changed=MINFER_METAL_XCRUN");
+        // The tool the component installs is watched, so installing (or
+        // removing) the Metal Toolchain re-runs this script by itself — the
+        // `touch build.rs` workaround #788 measured.
+        if let Some(tool) = resolve_metal_tool(&xcrun) {
+            println!("cargo:rerun-if-changed={tool}");
+        }
+
         let mut metal_err = String::new();
-        let metal_ok = match Command::new("/usr/bin/xcrun")
-            .env_remove("DEVELOPER_DIR")
-            .env_remove("SDKROOT")
-            .args([
-                "-sdk",
-                "macosx",
-                "metal",
-                "-O3",
-                // clang module cache goes to a writable dir (note: metal
-                // only accepts the `=` form of -fmodules-cache-path)
-                &format!("-fmodules-cache-path={out_dir}"),
-                "-c",
-                shader_src.as_str(),
-                "-o",
-            ])
-            .arg(&air)
-            .output()
-        {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                metal_err.push_str(&String::from_utf8_lossy(&o.stderr));
-                false
-            }
-            Err(e) => {
-                metal_err.push_str(&format!("failed to spawn /usr/bin/xcrun: {e}"));
-                false
+        let metal_ok = if force_source {
+            false
+        } else {
+            match Command::new(&xcrun)
+                .env_remove("DEVELOPER_DIR")
+                .env_remove("SDKROOT")
+                .args([
+                    "-sdk",
+                    "macosx",
+                    "metal",
+                    "-O3",
+                    // clang module cache goes to a writable dir (note: metal
+                    // only accepts the `=` form of -fmodules-cache-path)
+                    &format!("-fmodules-cache-path={out_dir}"),
+                    "-c",
+                    shader_src.as_str(),
+                    "-o",
+                ])
+                .arg(&air)
+                .output()
+            {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    metal_err.push_str(&String::from_utf8_lossy(&o.stderr));
+                    false
+                }
+                Err(e) => {
+                    metal_err.push_str(&format!("failed to spawn {xcrun}: {e}"));
+                    false
+                }
             }
         };
 
         let lib_ok = if metal_ok {
-            match Command::new("/usr/bin/xcrun")
+            match Command::new(&xcrun)
                 .env_remove("DEVELOPER_DIR")
                 .env_remove("SDKROOT")
                 .args(["-sdk", "macosx", "metallib"])
@@ -289,7 +340,7 @@ fn main() {
                     false
                 }
                 Err(e) => {
-                    metal_err.push_str(&format!("failed to spawn /usr/bin/xcrun: {e}"));
+                    metal_err.push_str(&format!("failed to spawn {xcrun}: {e}"));
                     false
                 }
             }
@@ -297,15 +348,27 @@ fn main() {
             false
         };
 
-        if !lib_ok {
-            // Fallback marker: empty metallib → runtime source compile.
+        if force_source {
+            // The requested behaviour: an empty marker, and src/metal.rs
+            // compiles the same concatenated source at first run.
             let _ = std::fs::write(&metallib, b"");
+            println!(
+                "cargo:warning=Metal: MINFER_METAL_FORCE_SHADER_SOURCE is set — the shaders \
+                 compile from source at runtime (no metallib is built)"
+            );
+        } else if !lib_ok {
+            let _ = std::fs::remove_file(&air);
             let err = metal_err.trim();
-            if err.is_empty() {
-                println!("cargo:warning=Metal metallib compile failed (no compiler output) — will compile shaders from source at runtime");
-            } else {
-                println!("cargo:warning=Metal metallib compile failed — will compile shaders from source at runtime. Compiler output:\n{err}");
-            }
+            panic!(
+                "Metal: the shader library did not compile. A macOS build with the `metal` \
+                 feature must not silently fall back to a runtime source compile (#788: that \
+                 path fails the real-model suite).\n\n\
+                 Install the Metal Toolchain and rebuild:\n\n    \
+                 xcodebuild -downloadComponent MetalToolchain\n\n\
+                 Or opt into the runtime fallback deliberately:\n\n    \
+                 MINFER_METAL_FORCE_SHADER_SOURCE=1 cargo build --release\n\n\
+                 Compiler output ({xcrun} -sdk macosx metal):\n{err}"
+            );
         }
         let _ = std::fs::remove_file(&air);
         // Content hash in the env fingerprint: cargo does not track OUT_DIR
@@ -333,7 +396,9 @@ fn main() {
         // again just picks the same framework. `-F` is a link-search flag the
         // linker understands natively (no -L semantics), so it never shadows
         // an nix-provided dylib.
-        if let Ok(out) = Command::new("/usr/bin/xcrun")
+        if let Ok(out) = Command::new(&xcrun)
+            .env_remove("DEVELOPER_DIR")
+            .env_remove("SDKROOT")
             .args(["--sdk", "macosx", "--show-sdk-path"])
             .output()
         {

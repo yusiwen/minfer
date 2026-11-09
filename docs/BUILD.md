@@ -225,8 +225,20 @@ The formatting gate is provided by [git-hooks.nix](https://github.com/cachix/git
 On macOS the Metal backend is the `metal` cargo feature, on by default
 (`default = ["cli", "metal"]`): `build.rs` compiles `src/metal/kernels/` → a
 precompiled `.metallib` via `/usr/bin/xcrun` at build time (no per-run shader
-compile). If Xcode tools are unavailable the build still succeeds and the shader
-is compiled from source at first run.
+compile). A build whose shaders do not compile **fails**, naming the remedy
+(`xcodebuild -downloadComponent MetalToolchain`) and the opt-in below — a silent
+fallback to runtime shader compilation is exactly the state that made the suite
+fail on a machine that looked fixed
+([#788](https://github.com/yusiwen/minfer/issues/788), [ADR-0009](adr/0009-a-failure-is-an-error-never-a-silent-fallback.md)).
+
+- `MINFER_METAL_FORCE_SHADER_SOURCE=1` compiles the shaders from source at first
+  run instead of building the metallib — the deliberate fallback (`#788`).
+- `MINFER_METAL_XCRUN` overrides the compiler the build script asks for (default
+  `/usr/bin/xcrun`); it is a diagnostic knob, and how the failure path is
+  exercised on a box that already has the component.
+- A **cross-check** of the macOS target from another host
+  (`cargo check --target aarch64-apple-darwin`) has no Apple toolchain by
+  definition: pass `MINFER_METAL_FORCE_SHADER_SOURCE=1`.
 
 With `--no-default-features` the feature is off and the build touches no Apple
 toolchain at all: no metallib, no `-F <SDK>` framework search path, no `xcrun`
