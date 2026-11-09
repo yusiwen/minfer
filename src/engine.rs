@@ -6,9 +6,9 @@
 //! the message history). A host creates one `Engine` and as many sessions as it
 //! has conversations.
 //!
-//! **Status:** S6a covers loading and `chat`. The raw `complete` entry point and
-//! the CLI's single-shot path move here in S6b; the CLI's conversation mode is
-//! this facade's first consumer once wired (next increment).
+//! **Status:** loading, `chat` and the raw `complete` continuation are here; the
+//! CLI's single-shot path uses `Engine::generate` and its conversation mode
+//! still drives `conversation::Conversation` directly (#800).
 
 use std::path::Path;
 
@@ -227,6 +227,34 @@ impl<'a> Session<'a> {
             graph,
         } = self;
         conversation.user_turn(input, &engine.tokenizer, params, graph, emit)
+    }
+
+    /// One **raw continuation** on this session's KV (#795): `tokens` are
+    /// prefilled at the cursor — no template render, no history entry — and the
+    /// run decodes like a turn, streaming through `emit`.
+    ///
+    /// Only the new tokens are prefilled, so a long prompt can be fed in
+    /// pieces; `TurnOutcome::prefill_tokens` counts them. The continuation is
+    /// not part of the history: the next [`chat`](Self::chat) rebuilds the KV
+    /// from the messages, so a continuation never leaks into a later turn.
+    pub fn complete(
+        &mut self,
+        tokens: &[u32],
+        params: &TurnParams,
+        emit: &mut dyn FnMut(&[u8]),
+    ) -> Result<TurnOutcome, ConvError> {
+        let Session {
+            engine,
+            conversation,
+            graph,
+        } = self;
+        conversation.complete_tokens(tokens, &engine.tokenizer, params, graph, emit)
+    }
+
+    /// Tokens written to this session's KV (prompt, generated tokens and the
+    /// EOT that closes a turn): the position the next prefill starts at.
+    pub fn n_past(&self) -> usize {
+        self.conversation.current_pos
     }
 
     pub fn conversation(&self) -> &Conversation {

@@ -7,7 +7,7 @@
 > loop, never the loop itself).
 > **Code**: the decode loop in `src/engine/generate.rs` (`generate` L75, the
 > plain loop L284–351, the speculative round loop L166–283, the repeat window
-> `REPEAT_LAST_N` L142 — the session's own copy is `conversation.rs:429` — the
+> `REPEAT_LAST_N` L142 — the session's own copy is `conversation.rs:444` — the
 > stop gates `special.is_stop` (`src/models/mod.rs:372`) and
 > `sampler::match_stop_suffix` (`src/sampler.rs:120`)); the cached forward
 > `src/models/qwen2/graph.rs::forward_cached` (L460); the reuse decision
@@ -382,7 +382,7 @@ the token at position `p`), which makes the whole session strategy possible:
   bounds. Regeneration simply overwrites those slots as
   it appends. (A full `/clear` or a template mismatch falls back to
   `rehydrate_full` — reset the cache, re-render everything, re-prefill
-  once, `rehydrate_full` (`conversation.rs:521`).)
+  once, `rehydrate_full` (`conversation.rs:537`).)
 - **Seams kept consistent.** If a turn ended without an end-of-turn token,
   the next turn first inserts the EOT token into the KV at the cursor
   (`conversation.rs:`, the EOT insert) so the region keeps matching what the chat

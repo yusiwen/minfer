@@ -123,18 +123,30 @@ let mut out = Vec::new();
 session.chat("hello", &params, &mut |delta| out.extend_from_slice(delta))?;
 ```
 
+## Sessions
+
+`Session::chat` runs a **turn**: the input is rendered through the model's template, the delta is
+prefilled after the rows the session already holds, and the reply is recorded in the history.
+`Session::n_past()` reports the KV cursor, so a host can log or bound what a session holds.
+
+`Session::complete` runs a **raw continuation**: the tokens are prefilled at that cursor (no template,
+no message recorded) and decoded like a turn, so a long prompt can be fed in pieces — the second call
+charges only its own tokens, and `TurnOutcome::prefill_tokens` says how many. The continuation is not
+history: `messages` stays the authority, and the next `chat` rebuilds the KV from it through the full
+re-render path, so a continuation never leaks into a later turn. A session carrying a speculative
+draft refuses a continuation by name (`ConvError::CompleteWithSpec`): the draft's KV is indexed by the
+same positions and half-driving the pair would desynchronise it.
+
 `examples/embed.rs` is this program; `tests/library_api.rs` runs the same surface from outside the
 crate (load → chat → drop → reload, two sessions independent, and a single-shot `Engine::generate`).
 
 ## What Phase 1 did not do
 
-These are gaps with their own tickets, not omissions. Two items this list used to name have since
-landed: `metal` as a feature ([#777](https://github.com/yusiwen/minfer/issues/777), §Features) and
-cancellation ([#796](https://github.com/yusiwen/minfer/issues/796), §Failures).
+These are gaps with their own tickets, not omissions. Three items this list used to name have since
+landed: `metal` as a feature ([#777](https://github.com/yusiwen/minfer/issues/777), §Features),
+cancellation ([#796](https://github.com/yusiwen/minfer/issues/796), §Failures) and the raw
+continuation `Session::complete` ([#795](https://github.com/yusiwen/minfer/issues/795), §Sessions).
 
-- **`Session::complete`** (incremental KV reuse across single-shot calls) — `Session::chat` keeps a
-  conversation, `Engine::generate` is a fresh single shot. Merging the two is an API decision, not a
-  move ([#795](https://github.com/yusiwen/minfer/issues/795)).
 - **A bytes constructor** for `Engine::load` — the owned-mapping contract is
   [#797](https://github.com/yusiwen/minfer/issues/797).
 

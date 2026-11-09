@@ -179,3 +179,146 @@ fn a_pre_cancelled_generate_decodes_nothing() {
     assert!(!outcome.hit_n_predict, "a cancel is not an n_predict hit");
     assert!(out.is_empty(), "nothing is emitted");
 }
+
+/// #795: a raw continuation prefills only its own tokens, and the session's KV
+/// cursor says so.
+#[test]
+fn complete_prefills_only_the_new_tokens() {
+    let engine = Engine::load(&toy()).expect("load");
+    let mut session = engine.session(SessionConfig {
+        n_ctx: 64,
+        ..Default::default()
+    });
+    let mut sink = |_d: &[u8]| {};
+    session.chat("hello", &turn(2), &mut sink).expect("chat");
+    let before = session.n_past();
+    assert!(before > 0, "the chat turn wrote rows");
+
+    let ids = engine.tokenizer().encode(" world");
+    assert!(!ids.is_empty(), "the fixture tokenizes the continuation");
+    let out = session
+        .complete(&ids, &turn(2), &mut sink)
+        .expect("one continuation");
+    assert_eq!(
+        out.prefill_tokens,
+        ids.len(),
+        "only the continuation is prefilled; the chat's rows are reused"
+    );
+    assert!(
+        session.n_past() >= before + ids.len(),
+        "the cursor advanced by the continuation and its decode ({} -> {})",
+        before,
+        session.n_past()
+    );
+}
+
+/// #795: splitting the same token stream across two calls is equivalent to one
+/// call — the second prefill starts where the first stopped, and the KV rows make
+/// the logits identical (both sessions start fresh, so the sampler seeds match).
+#[test]
+fn a_split_continuation_matches_a_single_one() {
+    let engine = Engine::load(&toy()).expect("load");
+    let ids = engine.tokenizer().encode("The capital of France is");
+    assert!(ids.len() > 2, "split the prompt into two non-empty halves");
+    let (head, tail) = ids.split_at(ids.len() / 2);
+
+    let run = |chunks: &[&[u32]]| -> (String, usize) {
+        let mut session = engine.session(SessionConfig {
+            n_ctx: 64,
+            ..Default::default()
+        });
+        let mut out = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            // The intermediate call only prefills; the last one decodes.
+            let n = if i + 1 == chunks.len() { 4 } else { 0 };
+            session
+                .complete(chunk, &turn(n), &mut |d| out.extend_from_slice(d))
+                .expect("continuation");
+        }
+        (String::from_utf8_lossy(&out).into_owned(), session.n_past())
+    };
+
+    let split = (head, tail);
+    let (a_text, a_pos) = run(&[split.0, split.1]);
+    let (b_text, b_pos) = run(&[&ids]);
+    assert_eq!(a_text, b_text, "the split run decodes the same text");
+    assert_eq!(
+        a_pos, b_pos,
+        "and writes the same number of KV rows ({} vs {})",
+        a_pos, b_pos
+    );
+}
+
+/// #795: a continuation is not history. However many raw tokens it wrote, the
+/// next chat turn rebuilds the stream from the messages, so the session's cursor
+/// afterwards depends on the history alone — run the same turn after
+/// continuations of different lengths and the cursor must not move.
+#[test]
+fn a_continuation_does_not_leak_into_a_later_chat() {
+    let engine = Engine::load(&toy()).expect("load");
+    let mut sink = |_d: &[u8]| {};
+    // Greedy: the assertion is about the KV the turn reads, not about which RNG
+    // draws the continuation consumed.
+    let greedy = |n: usize| TurnParams {
+        n_predict: n,
+        sampler: SamplerConfig {
+            temp: 0.0,
+            ..Default::default()
+        },
+        stop_strings: Vec::new(),
+    };
+
+    let run = |continuation: Option<usize>| -> (usize, usize, usize) {
+        let mut session = engine.session(SessionConfig {
+            n_ctx: 64,
+            ..Default::default()
+        });
+        let mut sink = |_d: &[u8]| {};
+        session.chat("hello", &greedy(2), &mut sink).expect("chat");
+        if let Some(n) = continuation {
+            let ids = engine.tokenizer().encode(" world, again and again");
+            assert!(ids.len() >= n, "the fixture encodes {n} tokens");
+            session
+                .complete(&ids[..n], &greedy(2), &mut sink)
+                .expect("continuation");
+        }
+        let before = session.n_past();
+        session
+            .chat("again", &greedy(2), &mut sink)
+            .expect("chat after");
+        (
+            before,
+            session.n_past(),
+            session.conversation().messages.len(),
+        )
+    };
+
+    let (control_before, control_after, control_msgs) = run(None);
+    assert_eq!(control_msgs, 4, "chat, reply, chat, reply");
+
+    // The control takes the delta path; a continued session is forced through the
+    // full re-render, and the two tokenize the message boundary slightly
+    // differently — so the comparable property is that the rebuilt cursor does not
+    // depend on how many raw tokens the continuation wrote.
+    let mut rebuilt = None;
+    for n in [1usize, 2, 5] {
+        let (before, after, msgs) = run(Some(n));
+        assert!(
+            before > control_before,
+            "the continuation did write rows ({n} tokens, cursor {before} vs {control_before})"
+        );
+        assert_eq!(msgs, 4, "the continuation recorded no message ({n} tokens)");
+        match rebuilt {
+            None => rebuilt = Some(after),
+            Some(first) => assert_eq!(
+                after, first,
+                "the rebuilt cursor must not depend on the continuation's length ({n} tokens)"
+            ),
+        }
+    }
+    assert!(rebuilt.is_some(), "at least one continuation ran");
+    assert!(
+        control_after > control_before,
+        "the control's turn advanced its own cursor"
+    );
+}
