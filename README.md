@@ -123,7 +123,8 @@ loader), `kernel.rs`/`quants.rs` (quantized matmul), `src/metal/`+`src/metal/ker
 `cuda.rs`+`cuda/kernels/*.cu` (GPU kernels) with `device_tier.rs` (cc-keyed
 per-device dispatch tiers), `sampler.rs`/`tokenizer.rs`/
 `template.rs` (sampling + tokenization + chat templates), `conversation.rs`
-(multi-turn sessions), `server/` (HTTP). Supported quants:
+(multi-turn sessions), and `crates/minfer-cli/` for the binary, the HTTP server
+and the visualizer. Supported quants:
 Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K (CPU, CUDA and Metal), 2-D
 f16/bf16 weights, and F32/F16 norms & biases.
 

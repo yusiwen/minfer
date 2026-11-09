@@ -460,6 +460,10 @@ jobs:
       # green. A source audit needs no build and no GPU.
       - name: Every test module is a file, and every source file is declared
         run: python3 scripts/check_source_layout.py
+      # Phase 2 (#805) added a second package: the engine is library-only, so the
+      # checker is run once per crate root rather than once on `src/`.
+      - name: The same rules for the application package
+        run: python3 scripts/check_source_layout.py --root crates/minfer-cli/src
       - name: The source-layout checker's own pass/fail cases
         run: python3 scripts/check_source_layout.py --selftest
       # The always-loaded index has a byte cap (#434). `AGENTS.md` is loaded into

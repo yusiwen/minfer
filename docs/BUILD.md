@@ -104,10 +104,11 @@ by the devShell's `shellHook` (see "Git hooks" below), so a commit made outside
 cargo build --release
 ./target/release/minfer <model.gguf> "hello"
 
-# engine only — no Metal backend, no Apple toolchain
-cargo build --release --no-default-features
+# engine only — no Metal backend, no Apple toolchain (`-p` is required: a bare
+# `--no-default-features` at the workspace root applies to every member)
+cargo build --release --no-default-features -p minfer
 # the binary without Metal: it refuses `--backend metal` by name
-cargo build --release --no-default-features --features cli
+cargo build --release -p minfer-cli --no-default-features
 
 # CUDA (NVIDIA GPU) — opt-in feature, requires the CUDA toolkit (nvcc)
 cargo build --release --features cuda

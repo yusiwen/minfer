@@ -16,12 +16,11 @@ For "where / how is X implemented", prefer [ccc](https://cocoindex.io/cocoindex-
 
 ## Layout
 
-`src/lib.rs` is the crate root (`minfer`). Engine modules are always compiled; the application layer (`main`, `server`, `tooling`, `convert`, `quantize`, `download`, `bench`, `spec_verify`) sits behind the `cli`/`server`/`tooling`/`viz` features (ADR-0079). Public tiers: `engine` (facade), `advanced` (L1, not semver-stable before 1.0) and `config` (the process configuration). `cargo build --release` still builds the binary; a consumer builds with `default-features = false`.
+`src/lib.rs` is the engine's crate root (`minfer`); the application layer — the binary, the HTTP server, the tooling and the visualizer — is the separate package `crates/minfer-cli`, which depends on this one (ADR-0082). Public tiers: `engine` (facade), `advanced` (L1, not semver-stable before 1.0) and `config` (the process configuration). `cargo build --release` still builds the binary (both packages are workspace default members); a consumer builds with `default-features = false`, and `cargo check -p minfer --no-default-features` is the sliver.
 
 ```
 src/
-├── lib.rs           # crate root (minfer): engine modules + feature-gated app layer
-├── main.rs          # CLI (the facade's first consumer): parsing, presentation, modes
+├── lib.rs           # crate root (minfer): the engine modules; the app is crates/minfer-cli
 ├── advanced.rs      # L1 tier: ModelDef · GraphCache · Batch · Tokenizer · sampler · spec · L0
 ├── config.rs        # EngineConfig: from_env() in the app, get() in the engine
 ├── engine.rs        # L2 facade: Engine::load · Session::chat
@@ -30,8 +29,6 @@ src/
 ├── gguf.rs          # GGUF v3 parser
 ├── gguf_write.rs    # F6: GGUF v3 writer — header/metadata/tensor index, ggml_pad, split
 ├── quantize.rs      # F6: weight encoders (llama-identical) + loud refusal
-├── convert.rs       # F6: HF checkpoint → GGUF; QuantizePlan
-├── tooling.rs       # F6 subcommands: convert / quantize / split
 ├── block.rs         # quantized block types (repr(C), ggml-common.h layout)
 ├── quants.rs        # AVX2 / NEON+SDOT dot kernels + Q8_0/Q8_K quantization — module decider
 ├── quants/          # dot kernels per type + quantize helpers (split by #264)
@@ -46,8 +43,6 @@ src/
 ├── grammar.rs       # F2: GBNF + JSON-schema → pushdown automaton → per-state token mask
 ├── template.rs      # chat templates (minijinja + Python-str hook); loud refusal; ChatML only for a template-less GGUF; `--chat-template FILE`
 ├── conversation.rs  # multi-turn session (append-only KV; C2 overflow drops oldest + re-ropes)
-├── server/          # OpenAI-compatible axum server; batch.rs = continuous batching, metrics.rs = /metrics
-├── download/mod.rs  # HuggingFace + Ollama auto-download
 ├── metal.rs         # MPS module root: type defs + private dispatch primitives (split by #265)
 ├── metal/           # L1/L2: runtime.rs · encode.rs · ops.rs · policy.rs (split by #265)
 │   └── kernels/     # L3 kernel sources: common.h · dequantize.h + 14 family .metal (split by #265)
@@ -56,6 +51,12 @@ src/
 ├── cuda/kernels/    # L3 kernel sources: common.cuh + 17 .cu translation units, one per kernel family (split by #263)
 ├── device_tier.rs   # cc-keyed CUDA device-tier table + selector
 └── models/          # ModelDef trait + per-arch mod/graph/loader (qwen2/, qwen3/)
+
+crates/minfer-cli/   # the app package: bin `minfer`, publish = false
+├── src/main.rs      # CLI: parsing, presentation, modes
+├── src/server/      # axum server; batch.rs = continuous batching, metrics.rs = /metrics
+├── src/{tooling,convert}.rs · src/download/   # F6 tooling + model download
+└── src/{bench,spec_verify}.rs · tests/        # bench, verify gates, binary-driven e2e
 ```
 
 Each device backend is organised as L1 runtime, L2 launch/dispatch, L3 kernel sources and L4 graph executor, and **only L4 is polymorphic** — `graph/backend.rs` + `graph/registry.rs` are the single device seam. The full layering rationale, the shared-`common` rule and the completed splits: [`docs/SOURCE-LAYOUT-PLAN.md`](docs/SOURCE-LAYOUT-PLAN.md).
@@ -68,8 +69,8 @@ Unit tests live beside their module as `<module>/tests.rs`, declared `#[cfg(test
 
 ```bash
 cargo build --release                             # CPU + Metal (macOS: the default `metal` feature)
-cargo build --release --no-default-features       # engine only: no Metal backend, no Apple toolchain
-cargo build --release --no-default-features --features cli  # binary without Metal (refuses --backend metal)
+cargo build --release --no-default-features -p minfer        # engine only: no Metal backend, no Apple toolchain
+cargo build --release -p minfer-cli --no-default-features   # binary without Metal (refuses --backend metal)
 cargo build --release --features cuda             # + CUDA backend (needs nvcc)
 cargo build --release --features cuda,cuda_static # + static cudart (no libcudart.so dep)
 cargo build --release --features debug_dump       # + MINFER_DUMP_DIR per-layer dumps
@@ -153,7 +154,7 @@ Inference = build `ComputeGraph` → assign backends → fuse → allocate → e
 
 ## Dependencies
 
-Core: `rand`, `regex`, `half`, `serde`+`serde_json`, `minijinja`. Server: `axum`/`tokio`/`tower-http`/`uuid`/… macOS: `objc2-*` family (2026-08-25 objc2 migration). Dev-only: `tokio`'s `io-util` (F8's `/metrics` test) and `sha2` (#205's fixture-manifest content check — a real hash is not something to hand-write in a test, and it is not in the production graph).
+Engine: `rand`, `regex`, `half`, `serde`+`serde_json`, `minijinja`; on macOS the `objc2-*` family (2026-08-25 objc2 migration). The application package (`crates/minfer-cli`, #805): `axum`/`tokio`/`tokio-stream`/`tower-http`/`uuid`/`futures-util`, plus the engine's `observe` feature. Dev-only, in the CLI package: `tokio`'s `io-util` (F8's `/metrics` test) and `sha2` (#205's fixture-manifest content check — a real hash is not something to hand-write in a test, and it is not in the production graph).
 
 ## Docs Index
 

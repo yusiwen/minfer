@@ -283,7 +283,7 @@ feeds `ctx` — a template that bloats the prompt bloats the KV allocation.
 
 #### 3.2.1 Template selection and rendering (CLI path)
 
-The whole template stage in `main.rs` is deliberately small — read the template
+The whole template stage in `crates/minfer-cli/src/main.rs` is deliberately small — read the template
 out of metadata, render, encode:
 
 ```rust
@@ -579,8 +579,8 @@ determines its length (1 for ASCII, 2–4 for multi-byte, judged by the
 `0xC0`/`0xE0`/`0xF0` masks on the top bits), so the function scans forward
 until the next character would run past the end of the buffer, and returns the
 offset where the complete prefix ends — everything from there onward waits for
-the next token. The callers wire it into per-step emission: `server/chat.rs:179`
-appends newly decoded bytes to a full accumulator and `server/chat.rs:193`
+the next token. The callers wire it into per-step emission: `crates/minfer-cli/src/server/chat.rs:179`
+appends newly decoded bytes to a full accumulator and `crates/minfer-cli/src/server/chat.rs:193`
 flushes up to `emitted + complete_utf8_prefix_len(&full[emitted..])`;
 `conversation.rs:654` (the speculative batch) and `:1444` (the plain loop) do the same for the REPL. (The CLI decode loop
 instead writes raw bytes straight to stdout and lets the terminal assemble the
@@ -722,7 +722,7 @@ otherwise. Invariant: a new special-token source must join
 maps an unknown piece to one token per byte, and `Tokenizer::load` refuses a
 vocabulary that lacks any of the 256 byte tokens (F7/#50). Before that, a
 vocab/merges inconsistency silently yielded the vocabulary's first entry and one
-word of output was consistently garbage. The empty-encode guard in `main.rs`
+word of output was consistently garbage. The empty-encode guard in `crates/minfer-cli/src/main.rs`
 still catches the louder "nothing encoded at all" failure.
 
 **Byte-decode invariant: no lossy conversion in the streaming path.** The

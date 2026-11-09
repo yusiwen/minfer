@@ -5,7 +5,7 @@
 
 ## 1. Background — where this stage sits
 
-Doc 09 followed the prefill call from `main.rs` into the graph machinery. Doc 08 ended at the moment the scheduler walks a split and calls `execute_node` for every node. For a `MatMul` node on the CPU backend, that call bottoms out in the code this document walks: the quantized matrix multiplication that produces essentially every number a transformer computes.
+Doc 09 followed the prefill call from `crates/minfer-cli/src/main.rs` into the graph machinery. Doc 08 ended at the moment the scheduler walks a split and calls `execute_node` for every node. For a `MatMul` node on the CPU backend, that call bottoms out in the code this document walks: the quantized matrix multiplication that produces essentially every number a transformer computes.
 
 First, the vocabulary, because the rest of the series assumes it:
 

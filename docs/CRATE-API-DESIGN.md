@@ -84,26 +84,28 @@ offload plan — is per engine, and the fence can be scoped (`registry::with_fil
 
 ## Features
 
-| feature | brings | default |
-| :--- | :--- | :--- |
-| `cli` | the `minfer` binary; implies `server`, `tooling`, `viz` | on |
-| `server` | the OpenAI-compatible server (axum + tokio) | via `cli` |
-| `tooling` | `convert` / `quantize` / `split` | via `cli` |
-| `viz` | the `viz` subcommand and its assets (implies `server`) | via `cli` |
-| `observe` | the `live`/`trace` hooks (tokio `sync`) | via `server` |
-| `metal` | the macOS Metal backend, and its `objc2` dependencies | on (inert off macOS) |
-| `cuda`, `cuda_static`, `debug_dump` | unchanged | off |
+| package | feature | brings | default |
+| :--- | :--- | :--- | :--- |
+| `minfer` | `metal` | the macOS Metal backend, and its `objc2` dependencies | on (inert off macOS) |
+| `minfer` | `observe` | the `live`/`trace` hooks (tokio `sync`) | off |
+| `minfer` | `cuda`, `cuda_static`, `debug_dump` | unchanged | off |
+| `minfer` | `test-hooks` | the test-only observers another package's tests read | off |
+| `minfer-cli` | `metal`, `cuda`, `cuda_static`, `debug_dump` | one line each, forwarded to `minfer` | `metal` |
 
-The binary declares `required-features = ["cli"]`, so `cargo build --release` produces it while
-`--no-default-features` builds the core alone. The engine-only configuration is **testable** too: `cargo test
---no-default-features --lib` compiles and runs it — the bf16 encoder lives in `block` with the word
-format it inverts, so no engine test reaches into a `cli` module
-([#791](https://github.com/yusiwen/minfer/issues/791)). The `feature-matrix` CI job builds the core, each
-application feature alone, and the `cargo package` tarball. `metal` is a feature since
-[#777](https://github.com/yusiwen/minfer/issues/777): compiled only with
-`cfg(all(target_os = "macos", feature = "metal"))`, default-on, and inert off macOS. Without it a
-macOS build resolves no `objc2` crate and calls no `xcrun`; `--no-default-features --features cli`
-still produces the binary, which then refuses `--backend metal` by name (ADR-0080).
+Phase 2 ([#805](https://github.com/yusiwen/minfer/issues/805), ADR-0082) turned the fences into a package
+boundary, so the four names that only selected which modules of the *same* package were compiled —
+`cli`, `server`, `tooling`, `viz` — are gone; the package is the switch, and `crates/minfer-cli` always
+contains the binary, the server, the tooling and the visualizer. What the feature matrix proves is now
+per package: `cargo check -p minfer --no-default-features` (the core alone), `-p minfer --features
+observe`, `-p minfer-cli --no-default-features` (the app's own sliver), and `cargo package -p minfer`.
+
+The engine-only configuration is **testable**: `cargo test -p minfer --no-default-features --lib` compiles
+and runs it — the bf16 encoder lives in `block` with the word format it inverts, so no engine test reaches
+into an application module ([#791](https://github.com/yusiwen/minfer/issues/791)). `metal` is a feature
+since [#777](https://github.com/yusiwen/minfer/issues/777): compiled only with
+`cfg(all(target_os = "macos", feature = "metal"))`, default-on, and inert off macOS. Without it a macOS
+build resolves no `objc2` crate and calls no `xcrun`; `-p minfer-cli --no-default-features` still produces
+the binary, which then refuses `--backend metal` by name (ADR-0080).
 
 ## The consumer's view
 
@@ -156,19 +158,31 @@ Every gap this list named has landed, each with the ticket that closed it:
 - the bytes constructor `Engine::load_from_bytes` ([#797](https://github.com/yusiwen/minfer/issues/797))
   — §Ownership and lifetime.
 
-The only deferred work left is Phase 2 below, behind the epic's three named triggers.
+The one piece Phase 1 deliberately deferred was the package boundary; it is the record below.
 
-## Phase 2 — the workspace split (deferred)
+## Phase 2 — the split, as it landed
 
-Phase 1 keeps every path. Phase 2 moves the app layer (`main`, `server`, `tooling`, `convert`,
-`quantize`, `download`, `bench`) into `crates/minfer-app`, keeps the engine package at the repository
-root, and version-publishes `minfer` and `minfer-cli` separately. It is a move plus a scripted anchor
-pass, entered only when a named trigger fires (see the epic).
+Phase 2 ([#805](https://github.com/yusiwen/minfer/issues/805), ADR-0082) moved the application layer
+(`main`, `server`, `tooling`, `convert`, `download`, `bench`, `spec_verify`) into `crates/minfer-cli`,
+kept the engine package at the repository root, and turned the four module-selecting features into a
+package boundary. Two points changed from the original sketch, both because the measurement said so:
+`quantize` stayed in the engine ([`src/lib.rs`](../src/lib.rs) exports it unconditionally — it is the
+encoder, not a subcommand), and the package is `minfer-cli`, not `minfer-app`. Only the engine is
+published; the CLI ships as a release artifact.
+
+The mechanics, for the next reader: 564 cross-package `crate::` references rewritten to `minfer::`; nine
+`pub(crate)` observers and five `cfg(test)`-only surfaces exposed through one `test-hooks` feature that
+only the CLI's dev-dependencies enable; 51 ADR citations pinned, because ADRs are frozen; 75 anchors
+re-pointed and seven corrected to the symbol's new line. The suite ledger stayed a single merged row
+(ADR-0082 decision 4) and **did not move**: 708 / 0 / 48 unit and 44 / 0 / 6 integration, before and
+after the move.
 
 ## Non-goals
 
 - No inference-semantics change; the identity gates are the guard.
-- No whole-module `pub`; only the tiers are exported.
+- No whole-module `pub`; only the tiers are exported. The one deliberate exception is the
+  `test-hooks` feature, which exposes test-only observers to a dependent package's tests
+  (ADR-0082) and is off in every build but that package's test build.
 - The server is not rewritten onto the facade.
 - `deny(warnings)` does not move into the library.
 

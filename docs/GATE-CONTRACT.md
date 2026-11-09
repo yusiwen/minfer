@@ -840,6 +840,13 @@ where the prose carries the number and the code holds the source of truth — wi
 failure too, so the comparison cannot be dropped by deleting a comment. It needed that: between #531
 and [#628](https://github.com/yusiwen/minfer/issues/628) the line trailed the code by one knob
 (`MINFER_QUEUE_MAX`), because it was the only place the counts lived and nothing recomputed them.
+Since Phase 2 ([#805](https://github.com/yusiwen/minfer/issues/805)) the source-facing checks read
+**both packages**: `check_env_vars.py` scans `src/` and every `crates/*/src/`, `check_source_layout.py`
+runs once per crate root, `check_doc_line_anchors.py` indexes symbols under `crates/` as well as `src/`,
+`check_adr.py` finds a governed symbol in either tree, and `check_dead_code_annotations.py` walks both.
+Each of them was silently blind to the new package the moment it existed, and each failed loudly in the
+same PR that moved the code — which is the property to keep: a gate may not go quiet because a path moved.
+
 And the job also runs three audits that are pure and offline like the rest:
 `scripts/check_agents_size.py` (the cap on `AGENTS.md`), `scripts/check_source_layout.py` (the test-file
 and module-declaration rules) and `scripts/check_cuda_launch_returns.py` (every CUDA launch reads its

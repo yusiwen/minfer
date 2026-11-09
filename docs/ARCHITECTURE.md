@@ -39,7 +39,7 @@
 
 | Module | Responsibility |
 |---|---|
-| `main.rs` | CLI, GGUF load, chat template, **prefill → autoregressive generation loop**, timing |
+| `crates/minfer-cli/src/main.rs` | CLI, GGUF load, chat template, **prefill → autoregressive generation loop**, timing |
 | `graph/` | **Compute graph core** — IR, builder, scheduler, backends, reuse cache (see §4 table) |
 | `gguf.rs` | GGUF v3 parser (metadata KV + tensor table + data blob), multi-part (split) support, `ggml_pad` alignment |
 | `block.rs` | 20+ quantized block types as `repr(C)` structs + fp16 conversions, matching `ggml-common.h` |
@@ -60,7 +60,7 @@
 | `device_tier.rs` | cc-keyed device tier table + selector (measured GB10 row, llama.cpp-adopted consumer rows, GENERIC fallback); resolved once at init, feeds the MMQ gate, smem feasibility and plane-VRAM budget checks (docs 105–106) |
 | `download/` | Hugging Face Hub + Ollama download, cached-name resolution, resume support |
 | `dump.rs` | Per-layer hidden-state debug dump (gated by `--features debug_dump`) |
-| `bench.rs` / `live.rs` / `trace.rs` / `spec_verify.rs` | llama-bench-style bench, live viz inference host, per-node trace export (`MINFER_TRACE`), D5 verify-step gate bench |
+| `crates/minfer-cli/src/bench.rs` / `live.rs` / `trace.rs` / `crates/minfer-cli/src/spec_verify.rs` | llama-bench-style bench, live viz inference host, per-node trace export (`MINFER_TRACE`), D5 verify-step gate bench |
 
 ### The backend layers — runtime, launch, kernels, executors
 
@@ -117,7 +117,7 @@ layer:
 
 ## 3. Inference Pipeline
 
-The top-level flow lives in `main.rs`. The whole engine is a **single-pass
+The top-level flow lives in `crates/minfer-cli/src/main.rs`. The whole engine is a **single-pass
 prefill** followed by an **autoregressive decode loop**; both call
 `ModelDef::forward`, which routes through the compute graph. Every forward is
 **build → assign → fuse → alloc → execute** (the subgraph below), but the
@@ -420,7 +420,7 @@ loader change plus backend kernels — see `docs/MODEL-SUPPORT-ROADMAP.md`,
 
 ## 9. Model Download
 
-`download/mod.rs` resolves `hf:<repo>[:<quant>]` and `ollama:<model>[:<tag>]`
+`crates/minfer-cli/src/download/mod.rs` resolves `hf:<repo>[:<quant>]` and `ollama:<model>[:<tag>]`
 URIs, downloads via curl with size-checked resume, quant-matches single or
 split files case-insensitively, and stores them under
 `~/.cache/minfer/models`. Cached filenames can be used directly as the model

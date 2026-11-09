@@ -226,7 +226,7 @@ re-runs the node on the CPU. The reason is numerical, not aesthetic:
   `sched.execute(graph, alloc).unwrap();` (`src/models/qwen2/graph.rs`
   L549–550) turns an `Err` into a panic, and the server wraps the forward so
   an unexpected abort becomes a 500 instead of killing the worker thread
-  (`src/server/chat.rs` L234–247).
+  (`crates/minfer-cli/src/src/server/chat.rs` L234–247).
 
 ## 3. Implementation
 
