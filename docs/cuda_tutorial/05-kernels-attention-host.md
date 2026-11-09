@@ -22,7 +22,7 @@ Two things make attention special compared to the matmuls you have already read:
   number of keys accumulated so far — and that is *data on the GPU*, not a host
   integer. Both kernels in this chapter read the `positions` array on the device
   to find their work. This is minfer's graph rule 1 — "KV positions are data, not
-  structure" (`AGENTS.md:119` ("Compute Graph — core rules", rule 1)) — doing real work inside a kernel.
+  structure" (`AGENTS.md:121` ("Compute Graph — core rules", rule 1)) — doing real work inside a kernel.
 - **It has a serial dependency the matmuls do not have.** Softmax (the
   exponentiate-and-normalize that turns scores into weights) needs the *largest
   score of the whole row* before any output can be finalized. The online softmax
@@ -484,7 +484,7 @@ and they compound:
 
 The graph-level counterpart of this kernel is `Op::FusedQKV` — AGENTS rule 7:
 "Decode fusions: `Op::FusedQKV` (concat matmul + bias/rope/store)…"
-(`AGENTS.md:125` ("Compute Graph — core rules", rule 7)), with the mechanics in TECH-PRIMER §6.4
+(`AGENTS.md:127` ("Compute Graph — core rules", rule 7)), with the mechanics in TECH-PRIMER §6.4
 (`docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels") ). Section 3.4 shows the Rust arm that
 launches it.
 
@@ -526,7 +526,7 @@ and the registry's `reads_packed_kv`, and an existing region must match `n_ctx`,
 backend and packing — else `Err`. `alloc_persistent` (`alloc.rs:1081`) routes
 through the same pool allocator as everything else — on CUDA a `cudaMalloc` held
 in the backend's buffer pool (§3.4) — and registers it as *never freed*. Because the
-allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:120` ("Compute Graph — core rules", rule 2)), the regions survive
+allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:122` ("Compute Graph — core rules", rule 2)), the regions survive
 rebuilds and hold their contents across decode steps: two device buffers per layer nobody may recycle.
 
 **Size and layout.** The size comes from the graph builder:
@@ -545,7 +545,7 @@ now receives the allocator-resolved **cell** row (C6: `positions` ropes, `cells`
 stores; they coincide only while a run starts at cell 0). `n_past` never
 appears in the layout — it is only ever *how many leading rows are valid*, and
 that count lives in the on-device boundary array. That is precisely
-AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:119` ("Compute Graph — core rules", rule 1)): the
+AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:121` ("Compute Graph — core rules", rule 1)): the
 graph topology is identical at position 0 and position 2000, and the kernels
 discover the valid range from the data — `attention_prefill.cu:206-208` records
 the exclusive per-row limit, and `fa_prefill_kv` computes `kv_end = bound[last_t] + 1`
@@ -571,7 +571,7 @@ needs a host round trip to learn where the history ends.
 **f16 KV: half the bytes, same addresses.** The per-engine `kv_layout` tag
 (`cuda_backend.rs:46`, the `KV_LAYOUT_*` code) is fixed when the backend is built from the
 engine's resolved `KvFormat` (`src/graph/kvformat.rs` is the single authority): `load_model_configured`
-(`src/models/mod.rs:436`) resolves it from `MINFER_CACHE_TYPE` and stamps it through
+(`src/models/mod.rs:439`) resolves it from `MINFER_CACHE_TYPE` and stamps it through
 `GraphAllocator::set_kv_format`. When the tag is f16, every store converts to `__half` and
 every attention read converts back; §3.2's kernel shows both sides of that. The
 `store_kv_f16` header comment states the trade (`kv_store.cu:23-30`): "halves attention
@@ -702,7 +702,7 @@ still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
 (`cuda_backend.rs:868`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
 "Backends own their buffer pools; the allocator is the single owner"
-(`AGENTS.md:126` ("Compute Graph — core rules", rule 8)) — the `GraphAllocator` decides *which* buffer a node gets and
+(`AGENTS.md:128` ("Compute Graph — core rules", rule 8)) — the `GraphAllocator` decides *which* buffer a node gets and
 when it dies; the backend only manages device memory behind those decisions.
 
 **`read_host` / `write_host` — and the copy rule.** The asymmetry is the
@@ -722,7 +722,7 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
 (`write_host` (`cuda_backend.rs:2467`)) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
 The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — is
-AGENTS rule 5 (`AGENTS.md:123` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
+AGENTS rule 5 (`AGENTS.md:125` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
 sentences: a per-node host readback inside a split whose command buffer was
 still open read *stale* (not-yet-written) data, which surfaced as an all-zero
 KV region and garbled output (`docs/COMPUTE-GRAPH-DESIGN.md:952-954` (§7 "In-place execution and the aliasing rule") , the §7.3
@@ -840,7 +840,7 @@ time*, all-or-nothing: CUDA participation requires a device **and** every
 weight registered with a kernel-supported type
 (`Qwen2Graph::device` (`src/models/qwen2/graph.rs`),
 `cuda_on = … && Self::weights_on_cuda(model)`). `weights_on_cuda`
-`weights_on_cuda` (`src/models/qwen2/graph.rs:883`) walks every tensor — embedding,
+`weights_on_cuda` (`src/models/qwen2/graph.rs:889`) walks every tensor — embedding,
 per-layer wq/wk/wv/wo, gate/up/down, norms, biases — and on failure prints the
 exact loser: `"CUDA GATE: weight '{}' (type {:?}) has no CUDA kernel or is not registered"` —
 the gate is `Qwen2Graph::device` (`src/models/qwen2/graph.rs`). That either routes the
@@ -853,7 +853,7 @@ weight lookup still fails inside `execute_node`, it is
 actual values `execute_node_inner` (`cuda_backend.rs:925`). AGENTS states the contract once:
 "kernel-invariant violations return `Err` from `execute_node` — never a
 silent CPU fallback; backend assignment is decided at build time"
-(`AGENTS.md:113` ("GPU Safety", the Err-never-fallback contract)); TECH-PRIMER §7 repeats it
+(`AGENTS.md:115` ("GPU Safety", the Err-never-fallback contract)); TECH-PRIMER §7 repeats it
 (`docs/CUDA-TECH-PRIMER.md:312-314` (§7 "Synchronization discipline (GPU Safety, `docs/GP")); the design record states
 the rule (`docs/COMPUTE-GRAPH-DESIGN.md:1080-1082` (§9.2 "Eligibility") ); the assignment walkthrough gives the
 reason — a quiet fallback would mask the bug the guard exists to catch

@@ -680,11 +680,11 @@ nvcc from your shell; `build.rs` (the Cargo build script that runs before
 compilation) does the whole pipeline:
 
 1. **Opt-in, and required once opted in.** The CUDA section returns early
-   unless `CARGO_FEATURE_CUDA` is set (`build.rs:363`, the opt-in early return) — plain builds
+   unless `CARGO_FEATURE_CUDA` is set (`build.rs:376`, the opt-in early return) — plain builds
    never touch nvcc. But once the feature is requested, CUDA is *required*:
    `src/cuda.rs` declares the `launch_*` symbols that only the kernels
    archive provides, so every failure below `panic!`s with an actionable
-   message (`build.rs:369`, the panic path).
+   message (`build.rs:382`, the panic path).
 2. **Find nvcc and the toolkit root.** `find_nvcc()` (`build.rs:`)
    probes `CUDA_HOME`/`CUDA_PATH`, then `which nvcc`, resolving to an
    absolute path either way; `find_cuda_home()` (`build.rs:`) derives
@@ -694,17 +694,17 @@ compilation) does the whole pipeline:
    toolkit supports (CUDA 13 rejects GCC 15 — the error surfaces confusingly
    inside `<cmath>`). `detect_host_compiler()` (`build.rs:`) probes
    nvcc's default first, then `g++-15 … g++-11, g++, clang++`; the winner is
-   passed as `-ccbin` (`build.rs:386`, `:477`), and
+   passed as `-ccbin` (`build.rs:399`, `:490`), and
    `MINFER_CUDA_CCBIN` overrides the probe.
 4. **Probe the architectures.** `detect_archs()` (`build.rs:`)
    compiles a one-line dummy kernel for every candidate from `sm_70` to
-   sm_121 `detect_archs` (`build.rs:733`)) and keeps the ones this nvcc accepts —
+   sm_121 `detect_archs` (`build.rs:746`)) and keeps the ones this nvcc accepts —
    candidates newer than the toolkit simply fail their probe and are skipped,
    so one list works on every CUDA version. (The floor is sm_70, not Pascal:
    the prefill GEMM uses WMMA tensor-core intrinsics that require Volta+,
-   `build.rs:726`, the sm_70 floor rationale).
+   `build.rs:739`, the sm_70 floor rationale).
 5. **Compile once, embed many targets.** The single `nvcc` invocation
-   (`build.rs:477`, the one nvcc invocation) carries `-O3 -fPIC` plus one
+   (`build.rs:490`, the one nvcc invocation) carries `-O3 -fPIC` plus one
    `-gencode arch=compute_NN,code=sm_NN` per detected arch — SASS for every
    GPU class — *plus* two kinds of PTX (`build.rs:`, the PTX pushes): a backward
    `compute_70/72` (so an older card like a V100 can JIT forward) and a
@@ -720,12 +720,12 @@ compilation) does the whole pipeline:
    `extern "C"` block of §2.3 declares are resolved against this archive —
    the whole seam between the two languages.
 7. **cudart: static or shared.** The CUDA runtime is linked according to the
-   `cuda_static` feature (`build.rs:416`, the cudart choice): `cuda_static` links
+   `cuda_static` feature (`build.rs:429`, the cudart choice): `cuda_static` links
    `libcudart_static.a` (plus `dl`/`pthread`) so the binary needs only the
    NVIDIA driver at run time; the default links `libcudart.so` and bakes an
    rpath — *only* when the toolkit dir is not a system dir, to avoid
-   shadowing a nix-provided glibc (`build.rs:542`, the rpath guard). The lib directory is
-   probed rather than assumed (`build.rs:634`, `find_cuda_lib_dir`), because distro packages
+   shadowing a nix-provided glibc (`build.rs:555`, the rpath guard). The lib directory is
+   probed rather than assumed (`build.rs:647`, `find_cuda_lib_dir`), because distro packages
    install cudart into the multiarch dir. What is *never* linked is the
    driver library `libcuda.so.1` — it is dlopen'd lazily at run time
    (`preload_driver`, `src/cuda/methods/init.rs:34`), the same lazy-loading trick as the

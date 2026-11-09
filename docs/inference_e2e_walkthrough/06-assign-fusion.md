@@ -324,7 +324,7 @@ would be *wrong as a reference*.
 
 **In:** the freshly built `ComputeGraph` (doc 05) — every node carries `op` (with full payloads),
 `src` (input node ids), `out_shape`/`out_dtype`, and `backend: Option<Backend>` where `None`
-means "undecided" (`Backend` is a re-export of the registry handle — `src/graph/mod.rs:105`). Plus
+means "undecided" (`Backend` is a re-export of the registry handle — `src/graph/mod.rs:108`). Plus
 the **registry** (`src/graph/registry.rs`): which backends this build contains, their names,
 capability records and priority order — and, per allocator, which of them are *enabled* (Metal on
 macOS when available and all weights registered; CUDA when the feature is on and a device exists).
@@ -879,7 +879,7 @@ decisions ⇒ identical topology ⇒ reuse is sound *and* toggles are observable
   Keep that boundary: pattern pass = local substitution, builder = structural change.
 - **GPU feasibility is a precondition, not a per-node property.** `supports_op(Metal)` says
   nothing about whether the *weights* are resident; that is the model-level all-or-nothing gate
-  (`weights_on_gpu`, qwen2/graph.rs:815) feeding `metal_on`, feeding `enable_metal()`. A
+  (`weights_on_gpu`, qwen2/graph.rs:821) feeding `metal_on`, feeding `enable_metal()`. A
   backend enabled without its weights would abort at the first matmul with "weight not
   registered" — loud, but avoidable.
 - **In-place aliasing interacts with fusion only indirectly** (full story in docs 07/08): the

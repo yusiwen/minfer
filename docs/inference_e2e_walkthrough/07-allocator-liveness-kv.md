@@ -917,7 +917,7 @@ logits off by **21.79** (`COMPUTE-GRAPH-DESIGN.md` deviation 22). The fix is
 excerpt 2: call `topo_order()?` purely to reject cycles, then compute
 liveness over `0..n_nodes` — the order the scheduler actually runs. (Small
 forensics note: the doc comment on `topo_order` still says "used by the
-allocator" (`graph/mod.rs:237`) — a stale leftover; `GraphAllocator` (`alloc.rs:107`) is
+allocator" (`graph/mod.rs:240`) — a stale leftover; `GraphAllocator` (`alloc.rs:107`) is
 authoritative.)
 
 **Bug 2b — input buffers are never freed.** Same fix series, complementary
@@ -941,7 +941,7 @@ longer matters.
   at rebuild (§2.7).
 - KV positions are data: the region is sized `n_kv_embd × n_ctx`, and a
   position ≥ `n_ctx` is a loud error, not an overflow (`cpu_backend.rs:358`),
-  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:397`).
+  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:403`).
 - Dead nodes get no buffer and the scheduler skips them — so adding an op the
   fusion pass orphans cannot corrupt memory, it just does nothing — skipped
   where `node_buffer` (`scheduler.rs:`, the bufferless-node skip) reads `None`.
