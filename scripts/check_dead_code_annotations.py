@@ -147,7 +147,7 @@ REASON_MARKERS = (
 #: `src/metal/tests.rs`) and the `impl MpsState` blanket was deleted (the macOS
 #: non-test oracle reports no dead member).
 GRANDFATHERED_BARE = {
-    "src/convert.rs:order",
+    "crates/minfer-cli/src/convert.rs:order",
     "src/cuda/ffi_runtime.rs:cudaStreamWaitEvent",
     "src/cuda/methods/events.rs:stream_wait_event",
     "src/device_tier.rs:Amd",
@@ -287,8 +287,20 @@ def check(
     if grandfather is None:
         grandfather = GRANDFATHERED_BARE
     files: list[str] = []
-    for r, _dirs, fs in os.walk(root):
-        files += [os.path.join(r, f) for f in fs if f.endswith(".rs")]
+    # Every crate source tree: Phase 2 (#805) moved the application layer into
+    # `crates/minfer-cli`, and a scan that stopped at `src/` would report the
+    # grandfathered sites there as deleted.
+    roots = [root]
+    crates = os.path.join(os.path.dirname(root.rstrip("/")) or ".", "crates")
+    if os.path.isdir(crates):
+        roots += sorted(
+            os.path.join(crates, name, "src")
+            for name in os.listdir(crates)
+            if os.path.isdir(os.path.join(crates, name, "src"))
+        )
+    for tree in roots:
+        for r, _dirs, fs in os.walk(tree):
+            files += [os.path.join(r, f) for f in fs if f.endswith(".rs")]
     files.sort()
     if not files:
         return [f"{root}: no .rs files"]

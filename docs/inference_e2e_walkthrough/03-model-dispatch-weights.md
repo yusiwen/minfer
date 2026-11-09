@@ -314,7 +314,7 @@ fewer bits, grouped into blocks that share a scale factor.
 ### 3.2 Key code
 
 Excerpt 1 — the startup order in `main.rs`: GPU init, dispatch, legacy KV
-cache. (`src/main.rs:`; the KV block below is **historical** — see the
+cache. (`crates/minfer-cli/src/main.rs:`; the KV block below is **historical** — see the
 forward note under the annotations)
 
 ```rust

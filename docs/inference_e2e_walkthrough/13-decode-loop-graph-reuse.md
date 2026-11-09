@@ -16,7 +16,7 @@
 > (`alloc_graph` L513, `ensure_kv` L995); the per-step execution
 > `BackendScheduler::execute`; and the multi-turn session `src/conversation.rs`
 > (`user_turn` L760, `generate_assistant_with_logits` L1274). The CLI's own half
-> is the call and the presentation: `src/main.rs` (L1547–1754). Lines verified at
+> is the call and the presentation: `crates/minfer-cli/src/main.rs` (L1547–1754). Lines verified at
 > commit `2204738`.
 
 ## 1. Background — where this stage sits
@@ -52,7 +52,7 @@ everything dramatic about LLM inference — chatbots streaming words one at a
 time — is this loop running hundreds of times per second.
 
 Since #763 S6b that file *is* the loop: the decode control flow, the sampler
-calls and the stop gates live in `engine::generate`, and `src/main.rs` holds only
+calls and the stop gates live in `engine::generate`, and `crates/minfer-cli/src/main.rs` holds only
 the call — `GenerateParams`, the think-block highlighter's `emit` callback, the
 `on_prefill` hook and the stats lines. A reader looking for what stops a
 generation, or for the forward call, starts in `src/engine/generate.rs`; the
@@ -410,7 +410,7 @@ instead of the next forward (§3.2 walks the code):
    terminal, llama.cpp-style.
 3. **The `-n` cap.** The `while` condition `generated.len() < p.n_predict`
    (`src/engine/generate.rs:359`), default 512 in `GenParams::default`
-   (`src/main.rs:89`). In conversation mode a fourth gate joins: the write
+   (`crates/minfer-cli/src/main.rs:89`). In conversation mode a fourth gate joins: the write
    cursor reaching `n_ctx` stops cleanly instead of overflowing the KV regions
    (`conversation.rs:`, the cursor guard).
 
@@ -588,7 +588,7 @@ Reading it as a state machine, one iteration:
    (no token the grammar allows) is the loud stop the excerpt handles: the
    loop records `grammar_error` and breaks — never emitting an arbitrary
    token — and the CLI prints the refusal after the run
-   (`src/main.rs:1670-1672`).
+   (`crates/minfer-cli/src/main.rs:1670-1672`).
 3. **Gate: EOS.** `special.is_stop` (`src/models/mod.rs:372`) checks `eos`,
    `im_end` and the declared EOT/EOM roles; a hit breaks *before* the token is
    pushed — the sentinel is not text, and `stopped_by_eog` is what the caller's
@@ -599,7 +599,7 @@ Reading it as a state machine, one iteration:
    `full`, and `match_stop_suffix` (`src/sampler.rs:120`) tests whether it now
    *ends* with a stop string; on a hit the text is truncated before the match,
    else the new bytes go through `emit` — the CLI's highlighter
-   (`src/main.rs:1667`, the closure handed to `generate`).
+   (`crates/minfer-cli/src/main.rs:1667`, the closure handed to `generate`).
 
 Only when all three gates pass does the iteration continue to the forward —
 the loop never runs the transformer for a token it has already decided to
@@ -1318,14 +1318,14 @@ The decode loop and the reuse machinery are unusually observable — most of
 the evidence is on stderr of any plain run.
 
 - **The run header itself.** `Prefill: N tokens in …` (the CLI's `on_prefill`,
-  `src/main.rs:1571-1576`) vs `Generated: M tokens in … (tok/s)`
-  (`src/main.rs:1750-1755`) — two deliberately different calibers (pure-decode
-  rate vs blended rate, the comment at `src/main.rs:1747-1749`; the timer itself
+  `crates/minfer-cli/src/main.rs:1571-1576`) vs `Generated: M tokens in … (tok/s)`
+  (`crates/minfer-cli/src/main.rs:1750-1755`) — two deliberately different calibers (pure-decode
+  rate vs blended rate, the comment at `crates/minfer-cli/src/main.rs:1747-1749`; the timer itself
   is `gen_start`, `src/engine/generate.rs:195`). The gap between the two numbers
   *is* this document's §2.2 argument, measured.
 - **`MINFER_TIMING=1`.** Splits the per-token wall clock into sampling vs
   forward milliseconds — `t_samp` (`src/engine/generate.rs:381-383`) and
-  `t_fwd` (`:346-349`), printed by the CLI (`src/main.rs:1691-1695`). Expect sampling in the
+  `t_fwd` (`:346-349`), printed by the CLI (`crates/minfer-cli/src/main.rs:1691-1695`). Expect sampling in the
   tens of microseconds and forward in the milliseconds — the loop's own
   overhead is the difference between the two.
 - **`MINFER_GRAPH_TRACE=1`.** The scheduler prints the split layout and a
@@ -1339,13 +1339,13 @@ the evidence is on stderr of any plain run.
   (`src/engine/generate.rs:154`, `:193`) — and tags each decode step with its
   sampled token (`set_token`, called at `src/engine/generate.rs:417`), while the
   CLI attaches both the prefill graph and a *separate decode graph* JSON at the
-  end — `export_graph_json` (`src/main.rs:1722`, `:1731`) and
-  `trace::finish` (`src/main.rs:1740`). Opening the trace in `viz/` shows the two
+  end — `export_graph_json` (`crates/minfer-cli/src/main.rs:1729`, `:1738`) and
+  `trace::finish` (`crates/minfer-cli/src/main.rs:1842`). Opening the trace in `viz/` shows the two
   topologies side by side — the G3 tail nodes present in one and absent in
   the other.
 - **`--dump-graph <dot>` / `--dump-graph-json <path>`.** Exits after
   exporting the graph the runtime *would* use — labeled `"decode"` when the
-  prompt is one token and `"prefill"` otherwise (`src/main.rs:1616-1620`, the
+  prompt is one token and `"prefill"` otherwise (`crates/minfer-cli/src/main.rs:1616-1620`, the
   `kind` label).
   Compare a prefill dump against a decode dump (feed a 1-token prompt) to
   see exactly which nodes the rebuild adds or removes.

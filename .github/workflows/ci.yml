@@ -318,17 +318,18 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
-      - name: The core compiles with no default features
-        run: cargo check --release --no-default-features
-      - name: Each application feature compiles on its own
-        run: |
-          set -e
-          for f in server tooling observe viz; do
-            echo "== --features $f"
-            cargo check --release --no-default-features --features "$f"
-          done
+      # Phase 2 (#805): the application layer is its own package, so "the core
+      # compiles with no default features" must name it — a plain
+      # `--no-default-features` at the workspace root applies to every selected
+      # member and would still build the binary.
+      - name: The core compiles with no default features (-p minfer)
+        run: cargo check --release -p minfer --no-default-features
+      - name: The observation feature compiles alone
+        run: cargo check --release -p minfer --no-default-features --features observe
+      - name: The application package compiles without its defaults
+        run: cargo check --release -p minfer-cli --no-default-features
       - name: The published tarball builds (cargo package)
-        run: cargo package --allow-dirty
+        run: cargo package -p minfer --allow-dirty
 
   # The container tag carries both the CUDA toolkit and the base image, and the
   # base is the compile-time glibc/gcc floor. Keep the toolkit at a version

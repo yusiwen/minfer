@@ -206,9 +206,14 @@ def load_governs(root: Path) -> tuple[list[dict[str, str]], list[str]]:
                 problems.append(f"{where}: `path = \"{target}\"` does not exist")
         else:
             pattern = re.compile(DEFINES.pattern.format(symbol=re.escape(str(symbol))), re.M)
+            # Both packages: Phase 2 (#805) moved the application layer into
+            # `crates/minfer-cli`, and a binding that only looked at `src/` would
+            # report every moved definition as missing.
+            roots = [root / "src"] + sorted((root / "crates").glob("*/src"))
             holders = sorted(
                 p.relative_to(root).as_posix()
-                for p in (root / "src").rglob("*.rs")
+                for base in roots
+                for p in base.rglob("*.rs")
                 if pattern.search(p.read_text(encoding="utf-8", errors="replace"))
             )
             if not holders:

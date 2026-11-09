@@ -6,7 +6,7 @@
 > operates on — the raw material of the whole rest of the series.
 > **Code**: `src/tokenizer.rs` (`Tokenizer::load` :353, `encode` :619,
 > `decode_bytes` :661), `src/template.rs` (`render_template` :603,
-> `render_messages` :494), `src/main.rs` (template block :1404-1439,
+> `render_messages` :494), `crates/minfer-cli/src/main.rs` (template block :1404-1439,
 > `get_chat_template` :2449, decode loop :1749-1768) — lines verified at commit
 > `15fa45c`.
 
@@ -111,7 +111,7 @@ question text, or a stray `<|im_end|>`. It will not answer.
 
 So the template is not a display nicety; it selects *which distribution* the
 model samples from. minfer always passes `add_generation_prompt=true` on the
-CLI path (`src/main.rs`), because a one-shot prompt is by definition a
+CLI path (`crates/minfer-cli/src/main.rs`), because a one-shot prompt is by definition a
 "generate the assistant's next turn" request.
 
 One more piece: **bos** and **eos**. *bos* (beginning of sequence) is a token
@@ -241,7 +241,7 @@ They get special treatment at both ends of the pipeline:
 - **Decode/generate**: the ids of eos and `<|im_end|>` are handed to the
   generation loop as *stop sentinels* — when the sampler produces one, the
   engine stops instead of appending it. They are also fed into the sampler's
-  penalty window (`src/main.rs`, doc 12). The ids come from
+  penalty window (`crates/minfer-cli/src/main.rs`, doc 12). The ids come from
   `ModelDef::special_tokens()` (doc 03), sourced from GGUF metadata:
   `tokenizer.ggml.eos_token_id`, plus a lookup of `<|im_end|>` that falls back
   to the eos id (`src/models/qwen2/loader.rs:`). One vocabulary, two
@@ -272,7 +272,7 @@ is baked into the weight shape), so the conversion tool writes the matching
 token table alongside it.
 
 The flow is: `&str` prompt + metadata → rendered `String` → `Vec<u32>` →
-`ctx = max(--n-ctx, ids.len())` (`src/main.rs`), which sizes the persistent
+`ctx = max(--n-ctx, ids.len())` (`crates/minfer-cli/src/main.rs`), which sizes the persistent
 KV regions once for the whole run → `forward(&ids, positions 0..n)` (doc 05+).
 During generation the direction reverses: one sampled id per step →
 `decode_bytes` → raw bytes → stdout/SSE. The template's token cost is real
@@ -323,7 +323,7 @@ Three branches, in priority order: `--no-template` bypasses everything and
 tokenizes the raw prompt (useful for base models and for comparing token
 counts); otherwise `get_chat_template` pulls `tokenizer.chat_template` from
 the GGUF metadata bytes (a tiny re-parse of metadata only —
-`src/main.rs`); with no template key at all, the raw prompt is used
+`crates/minfer-cli/src/main.rs`); with no template key at all, the raw prompt is used
 as-is. The literal `true` argument to `render_template` is
 `add_generation_prompt` — §2.2 explained why it must always be on for a
 one-shot prompt. If the tokenizer produces zero ids, the run aborts: an empty
@@ -611,8 +611,8 @@ if let Some(cut) = sampler::match_stop_suffix(&full, &stop_refs) {
 }
 ```
 
-`special` came from `model.special_tokens()` (`src/main.rs`), and
-`is_stop_token` (`src/main.rs`) is the two-line sentinel check
+`special` came from `model.special_tokens()` (`crates/minfer-cli/src/main.rs`), and
+`is_stop_token` (`crates/minfer-cli/src/main.rs`) is the two-line sentinel check
 `id == special.eos || Some(id) == special.im_end` — the `SpecialTokens` struct
 itself is two fields (`eos`, `im_end: Option<u32>`, `src/models/mod.rs`).
 Note the byte-accumulation pattern: decoded bytes go into `full` *before*
@@ -621,7 +621,7 @@ a stop string (`--stop "Let me think"`) that straddles two tokens is caught in
 the accumulated stream — the same byte-first philosophy as §2.4. The tokens
 handed to `prev_tokens` also feed the sampler's repeat-penalty window (doc
 12), so prompt *and* generated token ids influence penalties from the very
-first step (`src/main.rs`).
+first step (`crates/minfer-cli/src/main.rs`).
 
 ### 3.3 Design choices (why this shape and not another)
 
@@ -668,7 +668,7 @@ KV row per layer, multiplied by every layer.
 The rendered prompt must end with the empty assistant-turn opener
 (`<|im_start|>assistant\n`), or the model's next-token distribution is
 "continue whatever turn is open" — usually a continuation of the user's own
-text (§2.2). It is hard-coded `true` on the CLI path (`src/main.rs`)
+text (§2.2). It is hard-coded `true` on the CLI path (`crates/minfer-cli/src/main.rs`)
 because a one-shot CLI prompt is definitionally a "start the assistant's turn"
 request. The multi-turn paths pass it explicitly too — and *only* on the final
 render: `format_single` (`src/template.rs`), the incremental renderer
@@ -732,25 +732,25 @@ comment says so explicitly. Streaming paths must pair `decode_bytes` with
 permanent U+FFFD in the transcript.
 
 **Template and conversation modes are coupled.** `--cnv` refuses
-`--no-template` (`src/main.rs`) because the conversation session's
+`--no-template` (`crates/minfer-cli/src/main.rs`) because the conversation session's
 append-only KV scheme *requires* template rendering to compute what the next
 turn appends.
 
 **Template output feeds KV sizing.** `ctx = max(n_ctx, prompt_len)`
-(`src/main.rs`): the rendered prompt's token count participates in sizing
+(`crates/minfer-cli/src/main.rs`): the rendered prompt's token count participates in sizing
 the persistent KV regions (doc 07). A runaway template (e.g. one that
 duplicates history) does not just slow prefill — it changes the allocation.
 
 ## 4. Observe & verify
 
 - **The two printed counts.** Every CLI run prints `Vocabulary: 151936 tokens`
-  (`src/main.rs` — the number for Qwen-family models) and then
+  (`crates/minfer-cli/src/main.rs` — the number for Qwen-family models) and then
   `Prompt: {} tokens` (printed right after tokenization). Run the same prompt
   with and without `--no-template`: the difference is exactly the boilerplate
   the template added (system turn, role markers, the assistant opener).
 - **See the rendered prompt.** Build with `--features debug_dump` and set
   `MINFER_DUMP_DIR`: `crate::dump::maybe_dump_text("minfer_dump_prompt", …)`
-  (`src/main.rs`) writes the post-template, pre-tokenization string —
+  (`crates/minfer-cli/src/main.rs`) writes the post-template, pre-tokenization string —
   the literal `<|im_start|>…<|im_end|>…<|im_start|>assistant` text of §2.2.
   Format reference: `docs/debug-dump.md`.
 - **Unit tests are the fastest oracle — and the llama.cpp cross-check.**
@@ -767,7 +767,7 @@ duplicates history) does not just slow prefill — it changes the allocation.
   template shape, `src/template.rs`).
 - **Per-token text in traces and the loud refusal.** With
   `MINFER_TRACE=<path>`, the decode loop attaches each sampled token's decoded
-  text to the trace (`crate::trace::set_token`, `src/main.rs`) — handy for
+  text to the trace (`crate::trace::set_token`, `crates/minfer-cli/src/main.rs`) — handy for
   spotting byte-fallback pieces from §3.4. A template failure prints
   `Error: chat template error — …` on stderr and stops before inference: the
   model's own template is not renderable and the engine refused to substitute a

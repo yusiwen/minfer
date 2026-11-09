@@ -86,15 +86,27 @@ def is_test_file(path: Path) -> bool:
     return any(segment.endswith(("_tests", "_test")) for segment in parts[:-1])
 
 
+def source_trees(root: Path) -> list[Path]:
+    """Every crate source tree: the root package plus each `crates/*` member.
+
+    Phase 2 (#805) moved the application layer into `crates/minfer-cli`, so a scan
+    limited to `<root>/src` would report every variable the CLI reads as unread.
+    """
+    trees = [root / "src"]
+    trees.extend(sorted(p for p in (root / "crates").glob("*/src") if p.is_dir()))
+    return trees
+
+
 def production_reads(root: Path) -> dict[str, list[str]]:
     """`{name: [file, …]}` for every `MINFER_*` read outside the test files."""
     found: dict[str, list[str]] = {}
-    for path in sorted((root / "src").rglob("*.rs")):
-        if is_test_file(path.relative_to(root)):
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for match in READ.finditer(text):
-            found.setdefault(match.group(1), []).append(path.relative_to(root).as_posix())
+    for tree in source_trees(root):
+        for path in sorted(tree.rglob("*.rs")):
+            if is_test_file(path.relative_to(root)):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for match in READ.finditer(text):
+                found.setdefault(match.group(1), []).append(path.relative_to(root).as_posix())
     return found
 
 

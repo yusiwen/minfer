@@ -179,3 +179,4 @@ pass, entered only when a named trigger fires (see the epic).
 - [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — The KV storage format is a per-engine gate, not a process-wide global
 - [ADR-0076](adr/0076-a-tensor-s-bytes-are-a-mapping-handle-plus-a-range.md) — A tensor's bytes are a mapping handle plus a range
 - [ADR-0081](adr/0081-a-tensor-s-bytes-are-a-backing-handle-plus-a-range.md) — A tensor's bytes are a backing handle plus a range, and the backing may be an owned buffer
+- [ADR-0082](adr/0082-the-application-layer-is-its-own-package.md) — The application layer is its own package, and the engine's four application features retire

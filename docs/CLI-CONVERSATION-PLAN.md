@@ -23,7 +23,7 @@
 > 4. **惩罚窗口在 delta 追加后重灌**（llama.cpp 把 prompt token 喂进采样器窗口，等价语义）。
 > 5. `Engine` 增加 `reset_cache()`（全量重灌/`/clear` 用）。
 >
-> **Revision 3 (2026-08-22) — Phase 2 implemented.** CLI 接线（`src/main.rs`）：`--cnv`/`-st`/
+> **Revision 3 (2026-08-22) — Phase 2 implemented.** CLI 接线（`crates/minfer-cli/src/main.rs`）：`--cnv`/`-st`/
 > `--system`/`-mli`/`--color [on|off|auto]`；`--cnv` 与 `--no-template` 互斥报错（模型加载前）；
 > slash 命令 `/exit` `/quit` `/clear` `/regen` `/help`；`> ` 提示符 + flush 纪律；每回合
 > stderr 报告 `[turn N] prefill X tokens, generated Y tokens`（增量性断言用）。README 增补
@@ -68,8 +68,8 @@
 
 ## 1. 概述
 
-minfer 的 CLI（`src/main.rs`）目前是**单发**模式：一个 prompt → 渲染单条 user 消息 → prefill → 解码 → 退出。
-Server 路径（`src/server/`）已经支持多消息渲染与完整解码循环，但 CLI 无法连续对话。
+minfer 的 CLI（`crates/minfer-cli/src/main.rs`）目前是**单发**模式：一个 prompt → 渲染单条 user 消息 → prefill → 解码 → 退出。
+Server 路径（`crates/minfer-cli/src/server/`）已经支持多消息渲染与完整解码循环，但 CLI 无法连续对话。
 
 本文档参考 llama.cpp 的两代 CLI 设计，为 minfer CLI 设计多轮对话（conversation mode）改造方案。
 核心策略是**追加式 KV + 增量模板渲染**（llama.cpp legacy 路线）：整个对话累积在 KV 缓存中，
@@ -180,7 +180,7 @@ if add_ass && fmt_past 以 '\n' 结尾: delta = "\n" + delta   // 尾部换行�
 
 ## 4. minfer 现状与可复用件
 
-### 4.1 现状（`src/main.rs`）
+### 4.1 现状（`crates/minfer-cli/src/main.rs`）
 
 ```
 读 prompt（参数或 stdin 一行） → get_chat_template(GGUF) → render_template(单 user 消息)
@@ -199,7 +199,7 @@ if add_ass && fmt_past 以 '\n' 结尾: delta = "\n" + delta   // 尾部换行�
 | `GraphCache::new()` | `src/graph/cache.rs` | 每会话独立 cache（server `slot.rs` 同款用法） |
 | `sampler::{sample_with_penalties, recent_window, match_stop_suffix}` | `src/sampler.rs` | 采样链 / 惩罚窗口 / stop 串后缀匹配 |
 | `Tokenizer::{encode, decode_bytes, complete_utf8_prefix_len}` | `src/tokenizer.rs` | 字节级解码，UTF-8 安全输出 |
-| `is_stop_token`（eos / im_end） | `src/main.rs:511` | EOG 检测 |
+| `is_stop_token`（eos / im_end） | `crates/minfer-cli/src/main.rs:511` | EOG 检测 |
 | server 解码循环模式 | `src/server/chat.rs` | penalties/stop/UTF-8 处理的参考实现（rev-5 修正：stop 匹配跑**全量**字节流） |
 
 ### 4.3 缺口
@@ -479,7 +479,7 @@ add_generation_prompt, bos_token) -> FormattedDelta{text, prefix_matched}`；`te
   - 一致性单测：构造 token 流模拟，验证 §5.4 不变量（special-token 感知的 FakeCodec）；
   - 真实模型集成冒烟：`#[ignore]`，Qwen2.5-0.5B 2 回合（无 U+FFFD、增量性、位置不越界）。
 
-### Phase 2：CLI 接线与 UX（`src/main.rs`）
+### Phase 2：CLI 接线与 UX（`crates/minfer-cli/src/main.rs`）
 
 **Status: implemented (rev 3).** 参数/命令/提示符/flush 全部落地（见 Revision 3）；
 进程级测试 `tests/conversation_cli.rs`（3 快 + 4 忽略真实模型）。Ctrl+C 打断按决策点 3

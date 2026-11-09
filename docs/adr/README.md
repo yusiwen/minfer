@@ -201,6 +201,7 @@ decision — see the numbering rule above. Within one date, the order is by numb
 | [0079](./0079-the-engine-is-a-crate-with-two-api-tiers.md) | 2026-11-07 | The engine is a crate with two API tiers, and the apps are its first consumers | Accepted |
 | [0080](./0080-the-metal-backend-is-a-cargo-feature-and-a-metal-less-build-refuses-the-name.md) | 2026-11-09 | The Metal backend is a cargo feature, and a metal-less build refuses the name | Accepted |
 | [0081](./0081-a-tensor-s-bytes-are-a-backing-handle-plus-a-range.md) | 2026-11-09 | A tensor's bytes are a backing handle plus a range, and the backing may be an owned buffer | Accepted |
+| [0082](./0082-the-application-layer-is-its-own-package.md) | 2026-11-09 | The application layer is its own package, and the engine's four application features retire | Accepted |
 
 ## The template
 

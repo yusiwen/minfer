@@ -4,7 +4,7 @@
 # and tests it against the tree. An ADR is immutable, so a path cited at decision
 # time can legitimately stop existing — a file moves, a layout is split, a rejected
 # option was never created. This file is that set, so the checker can tell **history**
-# from **staleness**: without it, the 13 entries below would be 22 spurious failures
+# from **staleness**: without it, the 62 entries below would be 79 spurious failures
 # (ADR-0027, Alternatives considered).
 #
 # The checker enforces three things about this file:
@@ -106,3 +106,297 @@ adr = "0026"
 path = "docs/dead-code-baseline.toml"
 kind = "named-in-the-move"
 reason = "quotes the old exception rule it corrects, which named the baseline's pre-#464 path"
+
+[[citation]]
+adr = "0017"
+path = "src/main.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0021"
+path = "src/convert.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0024"
+path = "src/tooling/tests/f6_fixtures.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0041"
+path = "src/tooling/tests/quantize_row_fallback.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0041"
+path = "src/convert.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0041"
+path = "src/tooling.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0052"
+path = "src/main.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0057"
+path = "src/main.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0057"
+path = "src/server/mod.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0057"
+path = "src/server/viz.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0058"
+path = "src/server/types.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0058"
+path = "src/server/mod.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0059"
+path = "src/server/batch.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0059"
+path = "src/server/metrics.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0059"
+path = "src/server/mod.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0059"
+path = "src/server/chat.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0060"
+path = "src/convert.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0060"
+path = "src/tooling/tests/quantize_bounds.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0062"
+path = "src/server/types.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0062"
+path = "src/server/mod.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0063"
+path = "src/server/mod.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0063"
+path = "src/server/toolcall.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0063"
+path = "src/server/types.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0066"
+path = "src/server/toolcall.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0066"
+path = "src/server/toolcall/format.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0066"
+path = "src/server/mod.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0067"
+path = "src/server/toolcall/format.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0067"
+path = "src/server/toolcall.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0068"
+path = "src/server/toolcall/format.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0068"
+path = "src/server/toolcall.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0069"
+path = "src/server/toolcall/format.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0069"
+path = "src/server/toolcall.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0070"
+path = "src/server/toolcall.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0070"
+path = "src/server/mod.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0070"
+path = "src/server/toolcall/tests.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0071"
+path = "src/server/toolcall/format.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0071"
+path = "src/server/toolcall.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0071"
+path = "src/server/toolcall/tests.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0073"
+path = "src/server/toolcall/format.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0073"
+path = "src/server/toolcall.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0073"
+path = "src/server/toolcall/tests.rs"
+kind = "corrected-elsewhere"
+reason = "the application layer moved to `crates/minfer-cli/src/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0079"
+path = "src/main.rs"
+kind = "named-in-the-move"
+reason = "ADR-0079 is the record that planned this move; #805 executed it and ADR-0082 states the new location"
+
+[[citation]]
+adr = "0066"
+path = "tests/template_e2e.rs"
+kind = "corrected-elsewhere"
+reason = "the binary-driven integration tests moved to `crates/minfer-cli/tests/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0067"
+path = "tests/template_e2e.rs"
+kind = "corrected-elsewhere"
+reason = "the binary-driven integration tests moved to `crates/minfer-cli/tests/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0068"
+path = "tests/template_e2e.rs"
+kind = "corrected-elsewhere"
+reason = "the binary-driven integration tests moved to `crates/minfer-cli/tests/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0069"
+path = "tests/template_e2e.rs"
+kind = "corrected-elsewhere"
+reason = "the binary-driven integration tests moved to `crates/minfer-cli/tests/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0070"
+path = "tests/template_e2e.rs"
+kind = "corrected-elsewhere"
+reason = "the binary-driven integration tests moved to `crates/minfer-cli/tests/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0071"
+path = "tests/template_e2e.rs"
+kind = "corrected-elsewhere"
+reason = "the binary-driven integration tests moved to `crates/minfer-cli/tests/` in #805, and ADR-0082 records the move"
+
+[[citation]]
+adr = "0073"
+path = "tests/template_e2e.rs"
+kind = "corrected-elsewhere"
+reason = "the binary-driven integration tests moved to `crates/minfer-cli/tests/` in #805, and ADR-0082 records the move"

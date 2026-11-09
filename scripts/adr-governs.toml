@@ -155,7 +155,7 @@ path = "src/gguf_write.rs"
 [[governs]]
 adr = "0021"
 what = "bf16 is a round-to-nearest-even cast, and 1-D tensors stay f32"
-path = "src/convert.rs"
+path = "crates/minfer-cli/src/convert.rs"
 
 [[governs]]
 adr = "0021"
