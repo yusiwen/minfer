@@ -123,12 +123,17 @@ crate (load → chat → drop → reload, two sessions independent, and a single
 
 ## What Phase 1 did not do
 
+These are gaps with their own tickets, not omissions. The list's former fourth item — `metal` as a
+feature — has since landed ([#777](https://github.com/yusiwen/minfer/issues/777)), and §Features above
+is its current statement.
+
 - **`Session::complete`** (incremental KV reuse across single-shot calls) — `Session::chat` keeps a
   conversation, `Engine::generate` is a fresh single shot. Merging the two is an API decision, not a
-  move.
-- **Cancellation** — no token/cancel seam in the generation loop yet; the CLI has no Ctrl-C wiring.
-- **A bytes constructor** for `Engine::load`.
-- **`metal` as a feature** ([#777](https://github.com/yusiwen/minfer/issues/777)).
+  move ([#795](https://github.com/yusiwen/minfer/issues/795)).
+- **Cancellation** — no token/cancel seam in the generation loop yet; the CLI has no Ctrl-C wiring
+  ([#796](https://github.com/yusiwen/minfer/issues/796)).
+- **A bytes constructor** for `Engine::load` — the owned-mapping contract is
+  [#797](https://github.com/yusiwen/minfer/issues/797).
 
 ## Phase 2 — the workspace split (deferred)
 
