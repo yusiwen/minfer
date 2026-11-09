@@ -190,12 +190,12 @@ fn llama_greedy_tokens_match_the_pinned_llama_cpp_reference() {
     // (`main.rs`), and the loaders register weights against the live state, so the order
     // matters: init, then load. `MINFER_DISABLE_MPS=1` keeps the CPU arm reachable, which
     // is what that variable means everywhere else.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     crate::metal::MpsState::init();
     // [#752] run the pinned arm *after* a Metal reload: load, forward, drop, so
     // the zero-copy registration-release path has run in this process before the
     // Llama model is loaded and the 32 pinned ids are checked.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         let toy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/toy/toy-qwen2-f32.gguf");
@@ -466,7 +466,7 @@ fn llama_scaled_long_context_matches_the_pinned_reference() {
         path.display()
     );
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     crate::metal::MpsState::init();
     let gguf = crate::gguf::load_gguf_model(&path).expect("parse GGUF");
     let model = crate::models::load_model(&gguf).expect("load model");

@@ -131,7 +131,7 @@ fn backend_claims(tag: Backend, op: &Op) -> Result<bool, String> {
         return Ok(super::backend_takes(&b, op, DType::F32));
     }
     if tag == Backend::METAL {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             // Mirror the CUDA arm below: `MpsState::get()` stays `None` until
             // something initializes the process-wide state, so without this the
@@ -145,7 +145,7 @@ fn backend_claims(tag: Backend, op: &Op) -> Result<bool, String> {
                 None => Err("no Metal device".into()),
             };
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = op;
             return Err("not compiled in (macOS-only module)".into());
@@ -222,7 +222,7 @@ fn run_on(tag: Backend, case: &Case) -> Result<Vec<f32>, String> {
         // norm/matmul cell has no device weight without this, and since #40 the
         // norm arms refuse that loudly instead of running weightless — so the
         // harness must register here to exercise the real kernel.
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         if tag == Backend::METAL {
             if let Some(state) = crate::metal::MpsState::get() {
                 state.register_weight(&w.name, w.data());
@@ -822,7 +822,7 @@ fn matrix_cases_match_their_reference() {
     // init regresses, every Metal cell reports "no Metal device" and the suite
     // looks green without touching the device at all — this catches that, while
     // still tolerating a deliberate `MINFER_DISABLE_MPS` run.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         // Initialize here too: if the `backend_claims` init regressed, the column
         // above already reported SKIP (the device did not exist yet) and *this*

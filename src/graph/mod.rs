@@ -41,14 +41,17 @@ pub mod kvcache;
 pub mod kvformat;
 /// KV session save/restore container (C5).
 pub mod kvsession;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod metal_backend;
 /// Layer offload plan: how many blocks run on the device (E5).
 ///
 /// The plan is resolved on every build — a box with no device resolves an unset request to
 /// CPU-only — but a couple of its helpers have no caller without a device (the loader's
 /// registration filter compiles out), hence the allowance on those builds.
-#[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code))]
+#[cfg_attr(
+    not(any(all(target_os = "macos", feature = "metal"), feature = "cuda")),
+    allow(dead_code)
+)]
 pub mod offload;
 pub mod ops;
 pub mod params;

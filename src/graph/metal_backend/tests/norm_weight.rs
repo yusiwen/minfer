@@ -13,7 +13,7 @@
 //! a Metal build. The unregistered-name case is deliberately built by leaving
 //! `MpsState` without the registration, which is exactly the
 //! assignment/offload mistake the guard must catch; the weightless case is built
-//! through the builder's `None` weight. `#![cfg(target_os = "macos")]` is
+//! through the builder's `None` weight. `#![cfg(all(target_os = "macos", feature = "metal"))]` is
 //! deliberately **not** used, so CI's `build-macos` type-checks them and a Mac
 //! runs them (record in the PR).
 

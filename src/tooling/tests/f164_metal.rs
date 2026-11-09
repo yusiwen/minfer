@@ -66,12 +66,12 @@ fn f164_run(env_key: &str, default: &str, ns: &str, n_ctx: usize, steps: usize) 
     use crate::graph::Backend;
     use crate::models::Device;
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         let _ = (env_key, default, ns, n_ctx, steps);
         eprintln!("not a macOS build; the #164 Metal gate is a no-op here");
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         let _g = crate::metal::metal_test_lock();
         // The Metal device must be up **before** the load, or the loader decides

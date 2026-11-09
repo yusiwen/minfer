@@ -51,7 +51,7 @@ fn cross_shape_tolerance() -> f32 {
     if crate::cuda::CudaState::get().is_some() {
         return 1.0;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if crate::metal::MpsState::get().is_some() {
         // Metal is a device too, so its cross-shape comparison uses a named
         // class for the same reason CUDA does: a batched forward runs the

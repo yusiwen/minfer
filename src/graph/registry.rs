@@ -67,8 +67,8 @@ const DEBUG_NAMES: [&str; N_BACKENDS] = ["CPU", "Metal", "Cuda"];
 ///
 /// Each device constant is gated on the cfg whose backend module uses it, so a
 /// build without that backend does not carry it (`metal_backend.rs` is
-/// `target_os = "macos"`, `cuda_backend.rs` is `feature = "cuda"`).
-#[cfg(target_os = "macos")]
+/// `all(target_os = "macos", feature = "metal")`, `cuda_backend.rs` is `feature = "cuda"`).
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub const PRIORITY_METAL: u16 = 300;
 #[cfg(feature = "cuda")]
 pub const PRIORITY_CUDA: u16 = 200;
@@ -269,7 +269,7 @@ impl Registry {
             priority: Vec::new(),
         };
         super::cpu_backend::register(&mut r);
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         super::metal_backend::register(&mut r);
         #[cfg(feature = "cuda")]
         super::cuda_backend::register(&mut r);
@@ -353,7 +353,15 @@ pub fn init() {
 
 fn not_compiled_why(backend: Backend) -> &'static str {
     match backend {
-        Backend::METAL => "the Metal backend is compiled only on macOS (target_os = \"macos\")",
+        // #777: the backend is a cargo feature now, so a macOS build can be
+        // metal-less; name the lever the reader can act on for their target.
+        Backend::METAL => {
+            if cfg!(target_os = "macos") {
+                "the Metal backend is compiled only with --features metal"
+            } else {
+                "the Metal backend is compiled only on macOS with --features metal"
+            }
+        }
         Backend::CUDA => "the CUDA backend is compiled only with --features cuda",
         _ => "the backend is not compiled into this build",
     }

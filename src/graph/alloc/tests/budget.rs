@@ -416,7 +416,7 @@ fn a_rebuild_does_not_touch_the_device_pool() {
 /// macOS-only: enabling the Metal pool needs a live MPS device, and CI has none.
 ///
 /// [#53]: https://github.com/yusiwen/minfer/issues/53
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_memory_report_carries_the_device_budget() {
     // The process-wide Metal lock keeps the injection half of the Metal gate
@@ -484,7 +484,7 @@ fn metal_memory_report_carries_the_device_budget() {
 /// getter.
 ///
 /// macOS-only: enabling the Metal pool needs a live MPS device, and CI has none.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 fn metal_registered_weights_are_charged_in_the_budget_gate() {
     let _g = crate::metal::metal_test_lock();

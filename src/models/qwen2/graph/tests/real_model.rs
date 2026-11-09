@@ -32,7 +32,7 @@ fn graph_logits_match_forward_real_model() {
     // global), which would send forward() to layer_gpu with a different
     // activation path; skip in that case (correctness is covered by the
     // hermetic layer-0 isolation and the CLI).
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if crate::metal::MpsState::get().is_some() {
         eprintln!("MPS initialized by an earlier test; skipping CPU-parity test");
         return;
@@ -204,14 +204,14 @@ fn graph_metal_matches_cpu_logits() {
     /// Q4_0 on "The capital of France is".
     const PINNED_GREEDY: [u32; 4] = [12095, 11, 323, 432];
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _g = crate::metal::metal_test_lock();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         eprintln!("not macOS; skipping");
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         use crate::graph::cache::GraphCache;
         use crate::graph::offload::OffloadRequest;
@@ -340,14 +340,14 @@ fn graph_metal_matches_cpu_logits() {
 /// Phase 3: full layer-0 path on Metal vs CPU (embed/rms/matmul/rope/kv/attn).
 #[test]
 fn graph_metal_layer0_isolation() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _g = crate::metal::metal_test_lock();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         eprintln!("not macOS; skipping");
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         let Some(path) = cached_model_path() else {
             eprintln!("not cached; skipping");
@@ -500,14 +500,14 @@ fn graph_metal_layer0_isolation() {
 /// Real model layer-0 K matmul: Metal vs CPU (isolates weight offset/data).
 #[test]
 fn graph_metal_real_wk_matmul() {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let _g = crate::metal::metal_test_lock();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         eprintln!("not macOS; skipping");
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         let Some(path) = cached_model_path() else {
             eprintln!("not cached; skipping");

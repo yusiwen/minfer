@@ -212,7 +212,7 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
     //
     // F4: the device layer comes up before the model is resolved, so stage 2 of
     // the backend-name surface is a startup refusal (see bench's twin).
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     crate::metal::MpsState::init();
     #[cfg(feature = "cuda")]
     crate::cuda::CudaState::init();

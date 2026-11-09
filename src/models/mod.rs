@@ -84,7 +84,7 @@ pub fn device_name(device: Device) -> &'static str {
 ///
 /// [#53]: https://github.com/yusiwen/minfer/issues/53
 pub fn device_memory() -> crate::graph::allocplan::DeviceMemory {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if let Some(metal) = crate::metal::MpsState::get() {
         return metal.device_memory();
     }
@@ -99,7 +99,7 @@ pub fn device_memory() -> crate::graph::allocplan::DeviceMemory {
 /// offload plan is resolved at the start of a load, so "unset request" can mean "every block
 /// the device can hold" without waiting for the registration checks that follow.
 pub fn device_available() -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if crate::graph::metal_backend::metal_available() {
         return true;
     }
@@ -210,7 +210,7 @@ pub fn ffn_composition(requested: Option<&str>, device: Device) -> bool {
 /// Two members are dead in a non-test Linux build, and each names its own
 /// configuration ([#244], replacing the trait-level blanket #243 left):
 /// `as_any` is test-reached, `forward_graph`'s one caller sits in a
-/// `#[cfg(target_os = "macos")]` test block. A third, `offload`, was deleted in
+/// `#[cfg(all(target_os = "macos", feature = "metal"))]` test block. A third, `offload`, was deleted in
 /// [#244] — the graph builders read the concrete `model.offload.plan` field, so
 /// the method had no production reader. `format_chat` had no caller in any build
 /// and was deleted in [#242]; template.rs is the chat-rendering path.
@@ -263,14 +263,17 @@ pub trait ModelDef: Send + Sync {
 
     /// Graph-based forward (Phase 6); defaults to the imperative path.
     ///
-    /// Reachable from a `#[cfg(target_os = "macos")]` **test** block only
+    /// Reachable from a `#[cfg(all(target_os = "macos", feature = "metal"))]` **test** block only
     /// (`models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits`), so the
     /// allowance names both halves of the configuration in which it is unused —
     /// a non-test build or a non-macOS host ([#244]; [#243]'s rule).
     ///
     /// [#243]: https://github.com/yusiwen/minfer/issues/243
     /// [#244]: https://github.com/yusiwen/minfer/issues/244
-    #[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(
+        any(not(test), not(all(target_os = "macos", feature = "metal"))),
+        allow(dead_code)
+    )]
     fn forward_graph(
         &self,
         tokens: &[u32],

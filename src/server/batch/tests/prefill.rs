@@ -204,11 +204,11 @@ fn a_chunked_prefill_answers_like_an_unchunked_one() {
         }
     };
     let on_metal = {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             crate::metal::MpsState::get().is_some()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             false
         }

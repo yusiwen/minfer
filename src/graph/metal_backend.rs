@@ -16,7 +16,7 @@
 //! constraints are checked up front (nkt == nk*hd for attention).
 
 use crate::metal::MpsState;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLSharedEvent};
 
 use super::backend::Backend;

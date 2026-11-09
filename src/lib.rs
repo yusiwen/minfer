@@ -43,7 +43,7 @@ pub mod vec_ops;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod metal;
 
 // The application layer: only the binary uses these. Phase 1 gates them behind

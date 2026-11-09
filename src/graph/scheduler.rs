@@ -211,7 +211,7 @@ impl BackendScheduler {
         }
         // (node_id, src_buf_id) for the current Metal split, then (node_id,
         // staging_id) awaiting readback after that split's sync.
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         let mut metal_srcs: Vec<(usize, usize)> = Vec::new();
         let mut staged: Vec<(usize, usize)> = Vec::new();
         // CUDA capture: node ids whose outputs were queued into the pinned
@@ -418,7 +418,7 @@ impl BackendScheduler {
                                     record_node_data(node, d, trace_on, live_on);
                                 }
                             }
-                            #[cfg(target_os = "macos")]
+                            #[cfg(all(target_os = "macos", feature = "metal"))]
                             BackendTag::METAL => {
                                 metal_srcs.push((id, br.id));
                             }
@@ -448,7 +448,7 @@ impl BackendScheduler {
             }
             // encode this split's Metal captures as one blit pass (after all of
             // its kernels, so the staging holds this step's output)
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", feature = "metal"))]
             if !metal_srcs.is_empty() {
                 let src_ids: Vec<usize> = metal_srcs.iter().map(|&(_, b)| b).collect();
                 let dsts = alloc
@@ -537,7 +537,7 @@ fn flush_metal_captures(
 ) {
     // `staged` is only ever populated by Metal splits (above), so on non-macOS
     // it is always empty; the whole read-back body lives on macOS only.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         for (id, st) in staged.drain(..) {
             let node = graph.node(id);
@@ -552,7 +552,7 @@ fn flush_metal_captures(
             m.release_staging_all();
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     let _ = (graph, alloc, staged, trace_on, live_on);
 }
 

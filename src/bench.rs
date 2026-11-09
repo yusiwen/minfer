@@ -190,7 +190,7 @@ pub fn run(prog: &str, args: &[String]) -> i32 {
     // F4: the device layer comes up before the model is resolved, so stage 2 of
     // the backend-name surface (a backend compiled in but not usable here) is a
     // startup refusal rather than something a missing model can preempt.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     crate::metal::MpsState::init();
     #[cfg(feature = "cuda")]
     crate::cuda::CudaState::init();
@@ -586,7 +586,7 @@ fn detect_backend() -> &'static str {
     if crate::cuda::CudaState::get().is_some() {
         return "CUDA";
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if crate::graph::metal_backend::metal_available()
         && !std::env::var("MINFER_DISABLE_MPS").map_or(false, |v| v == "1")
     {

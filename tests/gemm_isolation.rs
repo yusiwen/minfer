@@ -1,36 +1,36 @@
 // Isolation test for kernel_q4_0_mm_f32: run the GEMM on the same input twice
 // and verify determinism + correctness vs a scalar CPU reference.
 // macOS only (Metal). Ignored otherwise.
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", feature = "metal"))]
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2::rc::Retained;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2::runtime::ProtocolObject;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2_foundation::NSString;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2_metal::{
     MTLBarrierScope, MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
     MTLResourceOptions, MTLSize,
 };
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use std::ffi::c_void;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use std::ptr::NonNull;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 type MetalDevice = Retained<ProtocolObject<dyn MTLDevice>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 type MetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 type MetalCommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 type MetalComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 type MetalLibrary = Retained<ProtocolObject<dyn MTLLibrary>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 type MetalComputeCommandEncoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 
 const Q4B: usize = 18;

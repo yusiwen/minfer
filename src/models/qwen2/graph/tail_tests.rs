@@ -322,12 +322,12 @@ fn tail_reduction_matches_full_nt() {
 /// in-place swiglu; both execute the same Metal math, so logits must match.
 #[test]
 fn fused_qkv_matches_unfused_decode() {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         eprintln!("not macOS; skipping");
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         use crate::graph::alloc::GraphAllocator;
         use crate::graph::builder::GraphBuilder;

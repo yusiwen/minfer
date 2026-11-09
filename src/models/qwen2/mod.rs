@@ -50,7 +50,7 @@ pub struct Qwen2Model {
     /// first part/weight registration; dropping the last clone releases the
     /// device buffers and then the mapping handles. `None` off macOS or when MPS
     /// is unavailable.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub metal: Option<std::sync::Arc<crate::metal::ModelRegistration>>,
 }
 
@@ -93,7 +93,7 @@ impl ModelDef for Qwen2Model {
         }
         // [#745] a live MPS model owns a registration; without one it cannot
         // be the Metal path (the registration is what keeps the pages mapped).
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         if crate::metal::MpsState::get().is_some() && self.metal.is_none() {
             return crate::models::Device::Cpu;
         }

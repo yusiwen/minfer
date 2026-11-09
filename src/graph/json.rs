@@ -91,9 +91,12 @@ pub fn export_placement(metal_on: bool, cuda_on: bool) -> bool {
 /// live server.
 pub fn build_runtime_graph(model: &dyn ModelDef, gparams: &GraphParams) -> ComputeGraph {
     let mut g = model.build_graph(gparams);
-    #[cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(unused_mut))]
+    #[cfg_attr(
+        not(any(all(target_os = "macos", feature = "metal"), feature = "cuda")),
+        allow(unused_mut)
+    )]
     let mut alloc = GraphAllocator::new();
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     if gparams.cparams.gpu {
         alloc.enable_metal();
     }

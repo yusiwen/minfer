@@ -64,7 +64,7 @@ pub fn unavailable_detail() -> &'static str {
     UNAVAILABLE.get().map(|s| s.as_str()).unwrap_or("")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn compile_metal_source(device: &MetalDevice) -> Option<MetalLibrary> {
     let src = include_str!(concat!(env!("OUT_DIR"), "/minfer.metal"));
     match device.newLibraryWithSource_options_error(&*NSString::from_str(src), None) {
@@ -80,7 +80,7 @@ fn compile_metal_source(device: &MetalDevice) -> Option<MetalLibrary> {
 
 /// Load the embedded precompiled metallib, falling back to a runtime source
 /// compile when it is empty or fails to load.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn load_embedded_or_source(device: &MetalDevice, metallib: &[u8]) -> Option<MetalLibrary> {
     if !metallib.is_empty() {
         match device.newLibraryWithData_error(&*DispatchData::from_bytes(metallib)) {
@@ -106,10 +106,10 @@ impl MpsState {
             return None;
         }
         // dummy for non-macOS — never called due to cfg
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         return None;
 
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let device = match MTLCreateSystemDefaultDevice() {
                 Some(d) => d,
@@ -470,7 +470,7 @@ impl MpsState {
     /// until this model is dropped are tagged with a fresh id. The loader calls
     /// this before `register_part`/`register_weight`, and the model holds the
     /// returned handle; its drop removes the buffers before the mapping handles.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn begin_registration(&self) -> std::sync::Arc<crate::metal::ModelRegistration> {
         let id = self
             .inner
@@ -486,7 +486,7 @@ impl MpsState {
     /// [#745] Remove one model's registrations. Weight buffers go first so no
     /// `MTLBuffer` outlives the mapping it aliases; the `mmap_parts` retain then
     /// drops the part buffers and, last, the `Arc<MmapFile>` handles.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn release_registration(&self, id: u64) {
         {
             let mut weights = self.inner.weights.lock().unwrap();
@@ -499,11 +499,11 @@ impl MpsState {
     }
 
     pub fn has_weight(&self, name: &str) -> bool {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             false
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             self.inner.weights.lock().unwrap().contains_key(name)
         }
@@ -512,12 +512,12 @@ impl MpsState {
     /// Look up a registered weight's (buffer, byte offset) — used by the graph
     /// Metal backend to dispatch per-op kernels without holding the Tensor.
     pub fn weight_buf(&self, name: &str) -> Option<(MetalBuffer, u64)> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = name;
             None
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             self.inner
                 .weights
@@ -538,11 +538,11 @@ impl MpsState {
     /// as `CudaState::weights_bytes`: reporting 0 would silently under-charge the
     /// budget by every resident weight (issue #122's fail-open twin).
     pub fn weights_bytes(&self) -> usize {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             0
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             crate::graph::alloc::weights_from_lock(
                 self.inner.weights.lock(),
@@ -555,11 +555,11 @@ impl MpsState {
     /// Allocate a shared-memory f32 buffer (visible to both CPU and GPU) for
     /// the graph backend's buffer pool.
     pub fn new_f32_buffer(&self, n_elements: usize) -> MetalBuffer {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             unreachable!()
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let bytes = (n_elements * 4) as u64;
             self.inner
@@ -579,12 +579,12 @@ impl MpsState {
     /// the device refused to create one — a loud error at the call site, never a
     /// silent fallback to the synchronous path.
     pub fn new_shared_event(&self) -> Option<MetalSharedEvent> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = self;
             None
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             self.inner.device.newSharedEvent()
         }
@@ -604,11 +604,11 @@ impl MpsState {
     /// `data` is a plain borrow: the buffer keeps the pointer and the owner keeps
     /// the pages mapped, so no `'static` slice is needed (or stored).
     pub fn register_part(&self, data: &[u8], owner: std::sync::Arc<crate::gguf::MmapFile>) {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (data, owner);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             if data.is_empty() {
                 return;
@@ -662,9 +662,9 @@ impl MpsState {
     }
 
     pub fn register_weight(&self, name: &str, data: &[u8]) {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {}
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             if data.is_empty() {
                 return;
@@ -722,11 +722,11 @@ impl MpsState {
 
     /// Create a command buffer for batching operations.
     pub fn cmd_buffer(&self) -> MpsCommandBuffer<'_> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             unreachable!()
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let cmd_buf_ref = self.inner.queue.commandBuffer().unwrap();
             let enc_ref = cmd_buf_ref.computeCommandEncoder().unwrap();
@@ -767,12 +767,12 @@ impl MpsState {
                 name: reason,
             };
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = self;
             DeviceMemory::NoDevice
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let recommended = self.inner.device.recommendedMaxWorkingSetSize();
             if recommended == 0 {

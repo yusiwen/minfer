@@ -9,13 +9,16 @@ use crate::graph::DType;
 
 /// The registered set, per configuration. Pinned so a backend that stops
 /// registering (or gains an entry it should not have) fails here.
-#[cfg(all(target_os = "macos", feature = "cuda"))]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "cuda"))]
 const EXPECTED_REGISTERED: &[&str] = &["cpu", "metal", "cuda"];
-#[cfg(all(target_os = "macos", not(feature = "cuda")))]
+#[cfg(all(target_os = "macos", feature = "metal", not(feature = "cuda")))]
 const EXPECTED_REGISTERED: &[&str] = &["cpu", "metal"];
-#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+#[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "cuda"))]
 const EXPECTED_REGISTERED: &[&str] = &["cpu", "cuda"];
-#[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+#[cfg(all(
+    not(all(target_os = "macos", feature = "metal")),
+    not(feature = "cuda")
+))]
 const EXPECTED_REGISTERED: &[&str] = &["cpu"];
 
 /// The assignment order, per configuration — the pre-F4 behaviour
@@ -24,13 +27,16 @@ const EXPECTED_REGISTERED: &[&str] = &["cpu"];
 /// Literals on purpose: deriving them from `PRIORITY_*` would make the value
 /// half of this gate vacuous (only a reordering would fail, not a silent
 /// re-numbering), and the numbers are what the assignment order *is*.
-#[cfg(all(target_os = "macos", feature = "cuda"))]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "cuda"))]
 const EXPECTED_PRIORITY: &[(&str, u16)] = &[("metal", 300), ("cuda", 200), ("cpu", 100)];
-#[cfg(all(target_os = "macos", not(feature = "cuda")))]
+#[cfg(all(target_os = "macos", feature = "metal", not(feature = "cuda")))]
 const EXPECTED_PRIORITY: &[(&str, u16)] = &[("metal", 300), ("cpu", 100)];
-#[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+#[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "cuda"))]
 const EXPECTED_PRIORITY: &[(&str, u16)] = &[("cuda", 200), ("cpu", 100)];
-#[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+#[cfg(all(
+    not(all(target_os = "macos", feature = "metal")),
+    not(feature = "cuda")
+))]
 const EXPECTED_PRIORITY: &[(&str, u16)] = &[("cpu", 100)];
 
 /// F4 gate 2: the **registered set**, the **priority order** and the priority
@@ -127,7 +133,7 @@ fn names_resolve_and_unknown_names_are_refused() {
     );
 
     // "that backend exists but is not compiled in" — a different message.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         let e = resolve_name("metal").unwrap_err();
         assert!(
@@ -138,6 +144,13 @@ fn names_resolve_and_unknown_names_are_refused() {
             e.message()
                 .contains("backend 'metal' is known but not compiled into this build"),
             "{}",
+            e.message()
+        );
+        // #777: the backend is a cargo *feature* now, so the refusal names the
+        // lever — on every non-metal configuration, macOS included.
+        assert!(
+            e.message().contains("--features metal"),
+            "a feature-gated backend must name the feature: {}",
             e.message()
         );
     }
@@ -151,14 +164,17 @@ fn names_resolve_and_unknown_names_are_refused() {
         assert!(e.message().contains("--features cuda"), "{}", e.message());
     }
     // …and the compiled-in names resolve on this configuration.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     assert_eq!(resolve_name("metal"), Ok(Backend::METAL));
     #[cfg(feature = "cuda")]
     assert_eq!(resolve_name("cuda"), Ok(Backend::CUDA));
     assert_eq!(resolve_name("cpu"), Ok(Backend::CPU));
 
     // An unregistered handle claims nothing rather than guessing.
-    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+    #[cfg(all(
+        not(all(target_os = "macos", feature = "metal")),
+        not(feature = "cuda")
+    ))]
     {
         assert!(!Backend::METAL.is_registered());
         assert!(!Backend::METAL.caps().reads_packed_kv);
@@ -193,11 +209,11 @@ fn the_name_surface_fences_devices_and_keeps_cpu() {
     // device names this build has is configuration-dependent, so this picks
     // one it does have (the "neither" configuration's case is the
     // NotCompiled assertion at the end).
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let device = Backend::METAL;
-    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    #[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "cuda"))]
     let device = Backend::CUDA;
-    #[cfg(any(target_os = "macos", feature = "cuda"))]
+    #[cfg(any(all(target_os = "macos", feature = "metal"), feature = "cuda"))]
     {
         let device_only =
             BackendFilter::from_names([device.name()]).expect("a compiled-in device resolves");
@@ -266,12 +282,12 @@ fn the_name_surface_fences_devices_and_keeps_cpu() {
 fn the_packed_kv_capability_is_the_registrys_answer() {
     assert!(Backend::CPU.caps().reads_packed_kv);
     // Metal reads packed since #310 (mechanism A/B plus the classic fallback).
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         assert!(Backend::METAL.caps().reads_packed_kv);
         assert!(reads_packed_kv(Backend::METAL));
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
     assert!(!Backend::METAL.caps().reads_packed_kv);
     assert!(reads_packed_kv(Backend::CPU));
     #[cfg(feature = "cuda")]

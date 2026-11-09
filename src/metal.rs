@@ -11,7 +11,7 @@
 
 use crate::tensor::{Tensor, TensorType};
 use objc2::{rc::Retained, runtime::ProtocolObject};
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -24,28 +24,28 @@ use std::sync::OnceLock;
 
 static MPS: OnceLock<Option<MpsState>> = OnceLock::new();
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub type MetalDevice = Retained<ProtocolObject<dyn MTLDevice>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub type MetalCommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub type MetalCommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 /// F5 (#137): the synchronization primitive of the cross-backend staging copy.
 /// `MTLSharedEvent` is chosen over a completion handler because it is the only
 /// Metal event that supports a **device-side** wait (`encodeWaitForEvent`), and
 /// it also supports a bounded **host** wait (`waitUntilSignaledValue`). See
 /// `docs/BACKEND-REGISTRY-DESIGN.md` §11.2.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub type MetalSharedEvent = Retained<ProtocolObject<dyn MTLSharedEvent>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub type MetalComputeCommandEncoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub type MetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub type MetalComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub type MetalLibrary = Retained<ProtocolObject<dyn MTLLibrary>>;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 
 /// Serialize Metal-touching tests.
 ///
@@ -141,7 +141,7 @@ pub fn concat_rows(tensors: &[&Tensor]) -> Option<Vec<u8>> {
 }
 
 pub struct MpsState {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     inner: MpsStateInner,
 }
 // Metal objects (objc2) are not auto Send/Sync, but minfer touches MpsState only
@@ -150,7 +150,7 @@ pub struct MpsState {
 unsafe impl Send for MpsState {}
 unsafe impl Sync for MpsState {}
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 struct MpsStateInner {
     device: MetalDevice,
     // Cached device capabilities (queried once at init, aligned with llama.cpp's
@@ -322,7 +322,7 @@ struct MpsStateInner {
 
 // ─── MpsCommandBuffer: batch multiple ops in one GPU submission ──────
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub struct MpsCommandBuffer<'a> {
     state: &'a MpsStateInner,
     // The metal crate returns AUTORELEASED objects from `commandBuffer` /
@@ -338,7 +338,7 @@ pub struct MpsCommandBuffer<'a> {
     enc_open: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 impl MpsCommandBuffer<'_> {
     /// Record the current dispatch op label (only when MINFER_TRACE=1, so normal
     /// encode speed is unaffected). Used to print the faulting kernel on a
@@ -590,19 +590,19 @@ mod mmap_align_test;
 ///
 /// The engine contract: a `GraphCache`/backend may reference these buffers by
 /// name; drop the cache before (or with) the model, never use it afterwards.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub struct ModelRegistration {
     id: u64,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 impl ModelRegistration {
     pub(crate) fn new(id: u64) -> Self {
         Self { id }
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 impl Drop for ModelRegistration {
     fn drop(&mut self) {
         if let Some(mps) = MpsState::get() {
