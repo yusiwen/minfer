@@ -474,7 +474,7 @@ fused SwiGLU kernel, and the last layer computed only the tail `n_out` rows
 optimization **was subsequently carried into the graph path** as the G3 work:
 the builder inserts `GetRows(wo, tail_ids)` (and the same for the residual)
 before the last layer's FFN, so the last FFN, the final norm and `lm_head` all
-run on `n_out` rows only (`models/qwen2/graph.rs:64`, `:232-235`;
+run on `n_out` rows only (`models/qwen2/graph.rs:62`, `:230-233`;
 `GraphParams.n_out` is part of the reuse identity).
 
 ## A.3 Old backend layering & fallback
