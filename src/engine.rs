@@ -15,7 +15,8 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-pub use generate::{generate, CancelToken, GenerateOutcome, GenerateParams, SpecStatsOut};
+pub use crate::cancel::CancelToken;
+pub use generate::{generate, GenerateOutcome, GenerateParams, SpecStatsOut};
 
 use crate::conversation::{self, ConvError, Conversation, GraphEngine, TurnOutcome, TurnParams};
 use crate::gguf::{GgufLoadError, GgufModel};

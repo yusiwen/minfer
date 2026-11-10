@@ -582,7 +582,7 @@ offset where the complete prefix ends — everything from there onward waits for
 the next token. The callers wire it into per-step emission: `crates/minfer-cli/src/server/chat.rs:179`
 appends newly decoded bytes to a full accumulator and `crates/minfer-cli/src/server/chat.rs:193`
 flushes up to `emitted + complete_utf8_prefix_len(&full[emitted..])`;
-`conversation.rs:654` (the speculative batch) and `:1444` (the plain loop) do the same for the REPL. (The CLI decode loop
+`conversation.rs:669` (the speculative batch) and `:1479` (the plain loop) do the same for the REPL. (The CLI decode loop
 instead writes raw bytes straight to stdout and lets the terminal assemble the
 glyph; `complete_utf8_prefix_len_holds_incomplete_trailing` at `:474` pins the
 grammar.)

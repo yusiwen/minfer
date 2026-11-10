@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_predict: 64,
         sampler: SamplerConfig::default(),
         stop_strings: Vec::new(),
+        cancel: None,
     };
     let mut out = Vec::new();
     session.chat(&prompt, &params, &mut |delta| out.extend_from_slice(delta))?;

@@ -10,6 +10,7 @@
 //! they may change when the server needs a different shape. A host that only
 //! wants to load a model and answer a prompt uses [`crate::engine`], not this.
 
+pub use crate::cancel::CancelToken;
 pub use crate::conversation::{
     Conversation, ConversationSpec, Engine as ConversationEngine, TurnOutcome, TurnParams,
 };

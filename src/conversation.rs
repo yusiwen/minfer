@@ -302,6 +302,15 @@ pub struct TurnParams {
     /// min-p / typical / XTC / DRY / mirostat / logit bias.
     pub sampler: sampler::SamplerConfig,
     pub stop_strings: Vec<String>,
+    /// Stop the turn between tokens when this is cancelled (#800).
+    ///
+    /// The same seam the single-shot loop takes as `GenerateParams.cancel`, and
+    /// the same rule: checked once per decoded token and once per speculative
+    /// round, honoured at a token boundary (a forward pass cannot be
+    /// interrupted), and reported as [`TurnOutcome::cancelled`] — never as
+    /// `hit_n_predict`. A cancelled token stays cancelled, so a host that runs
+    /// again makes a new one.
+    pub cancel: Option<crate::cancel::CancelToken>,
 }
 
 /// doc 97: how a speculative batch ended (drives the position bookkeeping).
@@ -344,6 +353,11 @@ pub struct TurnOutcome {
     pub tokens_generated: usize,
     /// Old turns dropped on context overflow (0 = not truncated, §5.7).
     pub dropped_turns: usize,
+    /// A [`TurnParams::cancel`] token fired: the turn stopped at a token
+    /// boundary before `n_predict`, and `hit_n_predict` is false by
+    /// construction. The partial reply is recorded and the next turn still runs
+    /// (it writes the pending EOT first, §5.4).
+    pub cancelled: bool,
 }
 
 #[derive(Debug)]
@@ -611,6 +625,7 @@ impl Conversation {
         let mut stopped_by_eog = false;
         let mut stopped_by_string = false;
         let mut hit_n_predict = false;
+        let mut cancelled = false;
         // The seed: sampled from the entry logits exactly like the plain
         // path's first iteration (G1 token identity starts at token 0).
         self.grammar_state = cfg.sampler.grammar.as_ref().map(|g| g.state());
@@ -675,6 +690,16 @@ impl Conversation {
                 break;
             }
             if stopped_by_eog || stopped_by_string {
+                break;
+            }
+            // #800: once per speculative round, like the single-shot loop. The
+            // seed is committed and its row is still unwritten, so flush it
+            // before the break — the loop-top exits above do the same, and a
+            // skipped row would leave the KV one row short of the stream.
+            if cfg.cancel.as_ref().map_or(false, |c| c.is_cancelled()) {
+                cancelled = true;
+                let _ = engine.forward(&[seed], &[self.current_pos], 1);
+                self.current_pos += 1;
                 break;
             }
             let toks = engine
@@ -770,6 +795,7 @@ impl Conversation {
             prefill_tokens: 0, // filled in by the caller
             tokens_generated: n_gen,
             dropped_turns: 0,
+            cancelled,
         })
     }
 
@@ -1386,10 +1412,19 @@ impl Conversation {
         let mut stopped_by_eog = false;
         let mut stopped_by_string = false;
         let mut hit_n_predict = false;
+        let mut cancelled = false;
         // F2: a fresh automaton position for this turn (see the field's note).
         self.grammar_state = cfg.sampler.grammar.as_ref().map(|g| g.state());
 
         loop {
+            // #800: the same boundary the single-shot loop uses — between
+            // tokens, so the last written row is the last emitted token. The
+            // cap checks come first: a turn that also reached `n_predict` is a
+            // cap stop, not a cancellation.
+            if cfg.cancel.as_ref().map_or(false, |c| c.is_cancelled()) {
+                cancelled = true;
+                break;
+            }
             if n_gen >= cfg.n_predict {
                 hit_n_predict = true;
                 break;
@@ -1470,6 +1505,7 @@ impl Conversation {
             prefill_tokens: 0, // filled in by the caller
             tokens_generated: n_gen,
             dropped_turns: 0,
+            cancelled,
         })
     }
 }

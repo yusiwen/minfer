@@ -10,6 +10,7 @@
 
 pub mod advanced;
 pub mod block;
+pub mod cancel;
 pub mod config;
 pub mod conversation;
 // #185: the checked "one thread at a time in the CUDA device path" contract.

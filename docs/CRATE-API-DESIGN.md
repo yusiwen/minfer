@@ -87,7 +87,10 @@ forward entry (`forward_graph_cached`) takes it.
   once per decoded token and once per speculative round, and the outcome then reports `cancelled`
   (never `hit_n_predict`). The check **cannot** interrupt a forward pass — a single call into the
   model — so a cancel that arrives mid-pass is honoured at the next token. The CLI wires Ctrl-C to
-  this seam and exits 130 (#796).
+  this seam and exits 130 (#796). The conversation turn loop takes the same token as
+  `TurnParams.cancel` and reports it as `TurnOutcome.cancelled`
+  ([#800](https://github.com/yusiwen/minfer/issues/800)); there the CLI interrupts one turn and keeps
+  the session.
 
 ## Features
 

@@ -6,56 +6,15 @@
 //! the sampler pipeline (penalties, grammar, mirostat, the speculative round
 //! loop), stop strings, the trace marks and the KV writes.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-
 use rand::SeedableRng;
 
+use crate::cancel::CancelToken;
 use crate::graph::cache::GraphCache;
 use crate::models::ModelDef;
 use crate::sampler::{self, SamplerConfig};
 use crate::spec::{SpecEngine, SpecSampler};
 use crate::tokenizer::Tokenizer;
 use crate::trace;
-
-/// A cancellation handle a host holds across threads (#796).
-///
-/// The loop checks it once per decoded token — and once per speculative round,
-/// so a draft round cannot outrun it — and stops at that token boundary. It
-/// cannot interrupt a forward pass, which is a single call into the model; a
-/// cancel that arrives mid-pass is honoured at the next token.
-///
-/// Cheap to clone: every clone shares one flag, so a signal handler or a UI
-/// thread can hold its own. There is no reset: a cancelled token stays
-/// cancelled, so a host that wants to run again makes a new one.
-#[derive(Clone, Default)]
-pub struct CancelToken {
-    flag: Arc<AtomicBool>,
-}
-
-impl CancelToken {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Ask the running generation to stop. Idempotent.
-    pub fn cancel(&self) {
-        self.flag.store(true, Ordering::Relaxed);
-    }
-
-    /// Whether [`cancel`](Self::cancel) has been called, by any clone.
-    pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::Relaxed)
-    }
-}
-
-impl std::fmt::Debug for CancelToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CancelToken")
-            .field("cancelled", &self.is_cancelled())
-            .finish()
-    }
-}
 
 /// What one single-shot generation needs.
 pub struct GenerateParams<'a> {

@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 const EOS: u32 = 2;
 const IM_END: u32 = 7;
 
+mod cancel;
 mod overflow;
 mod real_model;
 mod regen;
@@ -137,6 +138,7 @@ fn cfg() -> TurnParams {
             ..sampler::SamplerConfig::default()
         },
         stop_strings: Vec::new(),
+        cancel: None,
     }
 }
 fn spec(n_ctx: usize) -> ConversationSpec {

@@ -59,6 +59,7 @@ fn conversation_real_model_smoke() {
             ..sampler::SamplerConfig::default()
         },
         stop_strings: Vec::new(),
+        cancel: None,
     };
     let mut emitted: Vec<u8> = Vec::new();
     let t1 = conv
@@ -180,6 +181,7 @@ fn context_shift_real_model_measurement() {
             ..sampler::SamplerConfig::default()
         },
         stop_strings: Vec::new(),
+        cancel: None,
     };
     let prompts = [
         "The capital of France is",

@@ -17,6 +17,7 @@ fn turn(n_predict: usize) -> TurnParams {
         n_predict,
         sampler: SamplerConfig::default(),
         stop_strings: Vec::new(),
+        cancel: None,
     }
 }
 
@@ -266,6 +267,7 @@ fn a_continuation_does_not_leak_into_a_later_chat() {
             ..Default::default()
         },
         stop_strings: Vec::new(),
+        cancel: None,
     };
 
     let run = |continuation: Option<usize>| -> (usize, usize, usize) {
@@ -339,6 +341,7 @@ fn a_model_loaded_from_bytes_answers_like_the_path_load() {
             ..Default::default()
         },
         stop_strings: Vec::new(),
+        cancel: None,
     };
     let answer = |engine: &Engine| {
         let mut session = engine.session(SessionConfig {
