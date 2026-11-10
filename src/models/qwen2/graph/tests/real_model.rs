@@ -157,9 +157,11 @@ fn graph_logits_match_forward_real_model() {
     // NOTE: both runs share one GraphAllocator so the KV persists across
     // the prefill -> decode transition (like the real loop).
     let n_ctx = q2.hparams.max_seq_len as usize;
-    let lf = model.forward(&ids, &positions, 1, n_ctx);
+    // A cache local to this gate, never the process global (#799).
+    let mut cache = GraphCache::new();
+    let lf = model.forward_graph_cached(&ids, &positions, 1, n_ctx, &mut cache);
     let next = argmax(&lf);
-    let lf2 = model.forward(&[next], &[ids.len()], 1, n_ctx);
+    let lf2 = model.forward_graph_cached(&[next], &[ids.len()], 1, n_ctx, &mut cache);
     let (lg, lg2) = run_prefill_decode(q2, &ids, next, n_ctx);
     compare("prefill", &lf, &lg);
     compare("decode", &lf2, &lg2);

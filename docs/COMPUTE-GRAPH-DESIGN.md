@@ -1147,12 +1147,9 @@ drain them with a single sync at the split boundary.
 
 ```rust
 pub trait ModelDef: Send + Sync {
-    fn forward(&self, tokens: &[u32], positions: &[usize],
-               n_out: usize, n_ctx: usize) -> Vec<f32>;
     fn as_any(&self) -> &dyn std::any::Any;
 
     fn build_graph(&self, params: &GraphParams) -> ComputeGraph;            // default: unimplemented!
-    fn forward_graph(&self, tokens, positions, n_out, n_ctx) -> Vec<f32>;   // default: forward()
     fn forward_graph_cached(&self, tokens, positions, n_out, n_ctx,
                             cache: &mut GraphCache) -> Vec<f32>;            // default: unimplemented!
 
@@ -1162,20 +1159,27 @@ pub trait ModelDef: Send + Sync {
     fn n_embd_head(&self) -> usize;
     fn n_kv_embd(&self) -> usize;
     fn n_vocab(&self) -> usize;
+    /// The model's positional limit; a convenience caller clamps `n_ctx` here.
+    fn max_seq_len(&self) -> usize;
     fn rope_style(&self) -> RopeStyle;
 }
 ```
 
-- `forward` is retained as the single-shot convenience entry and both models route it to the graph
-  path: `QwenXGraph::forward` clamps `n_ctx` to `max_seq_len`, locks the process-global
-  `graph_cache()`, and calls `forward_cached`. Its pre-[#252](https://github.com/yusiwen/minfer/issues/252)
-  legacy `kv: &mut KVCache` argument was ignored (the KV lives in the graph allocator) and was
-  deleted with the type.
+- **There is one forward entry, and it takes its cache.** `ModelDef::forward` and
+  `ModelDef::forward_graph` were deleted with [#799](https://github.com/yusiwen/minfer/issues/799):
+  the first locked a **process-global** `graph_cache()`, so a second `n_ctx` — or a second model, or
+  a second KV format — in one process panicked in the allocator, which correctly refuses to resize
+  live regions. Its pre-[#252](https://github.com/yusiwen/minfer/issues/252) legacy `kv: &mut KVCache`
+  argument had already been deleted (the KV lives in the graph allocator).
 - `build_graph` is the immutable-topology constructor; each architecture implements it in
   `models/<arch>/graph.rs`.
 - `forward_graph_cached` is the real primitive used by the CLI, the server, the conversation engine
-  and `bench`. Callers that need an isolated KV (a server slot, a draft model) must own their
-  `GraphCache`; the process-global one exists only for the single-shot CLI path.
+  and `bench`. **Every caller owns its `GraphCache`**: `Engine::generate` one per engine (rebuilt when
+  `n_ctx` changes), a `Session` one, a server slot one, a draft model one. There is no process-wide
+  cache to borrow.
+- `max_seq_len` exists because the clamp that used to live in `QwenXGraph::forward` moved out with
+  it: a convenience caller (`engine::generate`) sizes its regions at `min(n_ctx, max_seq_len)`,
+  llama.cpp's own rule.
 - There is no `weights_version()` method: the value is the `GraphParams.weights_version` field, set to
   a constant `1` today.
 

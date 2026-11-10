@@ -1666,11 +1666,16 @@ fn main() {
         spec_d_max: spec_d_max,
         cancel: Some(&cancel),
     };
+    // The run's KV cache: one per process here (the CLI generates once), and
+    // never a static — two models or two `n_ctx` values must not share one
+    // (#799).
+    let mut gen_cache = minfer::graph::cache::GraphCache::new();
     let outcome = minfer::engine::generate(
         &*model,
         &tokenizer,
         spec_engine.as_mut(),
         &gparams,
+        &mut gen_cache,
         &mut |delta| hi.feed(delta),
         &mut on_prefill,
     );

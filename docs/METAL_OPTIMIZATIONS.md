@@ -109,9 +109,9 @@ is against the old path, not against the pre-round figure):
 > (**532 / 0 / 43** unit, **21 / 0 / 6** integration; the +1 is #329's dispatch-refusal gate). **The Metal-vs-CPU
 > *logits* row cannot be taken from `graph_metal_matches_cpu_logits`**: in the
 > graph era both `ModelDef::forward` and `forward_graph` route through
-> `Qwen2Graph::forward` (`src/models/qwen2/mod.rs:69`/`:122`), so its
+> `Qwen2Graph::forward`, so its
 > `max |Δ| = 0` compares the Metal graph with itself — the test's "CPU reference"
-> comment is stale. Filed as [#324](https://github.com/yusiwen/minfer/issues/324); no
+> comment was stale. (Both wrappers were deleted with [#799](https://github.com/yusiwen/minfer/issues/799), which left `forward_graph_cached` as the only forward entry; the measurement above stands as the dated record it is.) Filed as [#324](https://github.com/yusiwen/minfer/issues/324); no
 > parity regression is implied. The
 > f16/bf16 device-gate max |Δlogit| numbers are in `docs/SUPPORT-MATRIX.md`
 > (their model files are not cached for a fresh run here).
@@ -1655,7 +1655,7 @@ models. Revisit when a >32K-context model is the user-facing one.
 
 **Observed**: 7B run twice in a row → the second run ≈ 2× faster (Total
 1.46 s → 0.77 s). Note the CLI's `Total` timing starts AFTER model load
-(`engine/generate.rs:136 infer_start`), so the 2× is in the **inference phases**
+(`engine/generate.rs:144 infer_start`), so the 2× is in the **inference phases**
 (prefill + decode), not the load. Root causes:
 
 | Factor | Effect | Evidence |

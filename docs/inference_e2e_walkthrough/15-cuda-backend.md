@@ -581,7 +581,7 @@ cparams: CParams {
 },
 ```
 
-`weights_on_cuda` (`qwen2/graph.rs:889`) walks every weight the graph reads
+`weights_on_cuda` (`qwen2/graph.rs:865`) walks every weight the graph reads
 — embedding, output head, every layer's norms/biases/matmul weights — and
 requires each to be (a) registered and (b) a type with a matching kernel.
 The type check is per *role*: matmul weights admit all eight quant types

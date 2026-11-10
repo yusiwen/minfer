@@ -156,7 +156,7 @@ layout is `[out][in]` row-major, and activations are token-major `[nt][d]`
 
 ### 2.5 The main event: one forward pass, node by node
 
-`Qwen2Graph::build` (`src/models/qwen2/graph.rs:39`) is where the forward
+`Qwen2Graph::build` (`src/models/qwen2/graph.rs:37`) is where the forward
 pass is actually written down. The real thing below is from the Qwen2.5-0.5B
 model (24 layers, hidden 896, 14 query heads of dim 64, 2 KV heads — more on
 that below, FFN width 4864, vocabulary 151936), prefilled with a 30-token

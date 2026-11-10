@@ -57,10 +57,6 @@ pub struct Qwen3Model {
 }
 
 impl ModelDef for Qwen3Model {
-    fn forward(&self, tokens: &[u32], positions: &[usize], n_out: usize, n_ctx: usize) -> Vec<f32> {
-        graph::Qwen3Graph::forward(self, tokens, positions, n_out, n_ctx)
-    }
-
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -102,16 +98,6 @@ impl ModelDef for Qwen3Model {
         params: &crate::graph::params::GraphParams,
     ) -> crate::graph::ComputeGraph {
         graph::Qwen3Graph::build(self, params)
-    }
-
-    fn forward_graph(
-        &self,
-        tokens: &[u32],
-        positions: &[usize],
-        n_out: usize,
-        n_ctx: usize,
-    ) -> Vec<f32> {
-        graph::Qwen3Graph::forward(self, tokens, positions, n_out, n_ctx)
     }
 
     fn forward_graph_cached(
@@ -160,6 +146,9 @@ impl ModelDef for Qwen3Model {
     }
     fn n_vocab(&self) -> usize {
         self.hparams.n_vocab as usize
+    }
+    fn max_seq_len(&self) -> usize {
+        self.hparams.max_seq_len as usize
     }
     fn rope_style(&self) -> crate::vec_ops::RopeStyle {
         self.hparams.rope_style

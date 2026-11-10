@@ -67,6 +67,13 @@ observability sinks are process-wide; the first `config::install` wins and a lat
 Everything that can differ between engines — the backend fence, the KV format, the context size, the
 offload plan — is per engine, and the fence can be scoped (`registry::with_filter`).
 
+**The graph cache is per engine too** ([#799](https://github.com/yusiwen/minfer/issues/799)). A
+`GraphCache` owns the persistent KV regions, sized once by `n_ctx` and the model's KV format, so two
+owners that share one is the bug the allocator refuses at run time. The owner is therefore an
+argument, never a global: `Engine::generate` keeps one per engine and rebuilds it when `n_ctx`
+changes, a `Session` owns one through `GraphEngine`, a server slot owns one, and `ModelDef`'s single
+forward entry (`forward_graph_cached`) takes it.
+
 ## Failures
 
 - Every load returns a named error: `EngineError::{Gguf, Model, Tokenizer, Template}`, wrapping

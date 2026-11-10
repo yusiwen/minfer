@@ -119,7 +119,7 @@ layer:
 
 The top-level flow lives in `crates/minfer-cli/src/main.rs`. The whole engine is a **single-pass
 prefill** followed by an **autoregressive decode loop**; both call
-`ModelDef::forward`, which routes through the compute graph. Every forward is
+`ModelDef::forward_graph_cached`, which routes through the compute graph. Every forward is
 **build → assign → fuse → alloc → execute** (the subgraph below), but the
 built graph is cached per `GraphParams` and reused — only the first call with
 new params pays the build/assign/alloc cost.
@@ -144,7 +144,7 @@ llama-bench "Generation" caliber); `Total:` = blended.
 Inference = **build a `ComputeGraph` (pure, side-effect free) → assign backends
 → fuse → allocate → execute**. The graph is built once per distinct
 `GraphParams` and reused (decode steps reuse the same graph; the model's
-`forward()` routes through `Qwen2Graph::forward`).
+forward routes through `Qwen2Graph::forward_cached`).
 
 ### 4.1 The IR
 

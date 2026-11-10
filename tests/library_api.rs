@@ -356,3 +356,96 @@ fn a_model_loaded_from_bytes_answers_like_the_path_load() {
     assert!(!a.is_empty(), "the turn produced text");
     assert_eq!(a, b, "a bytes load answers byte-identically to a path load");
 }
+
+/// One prefill on a fresh engine, returning how many tokens it reported. A panic
+/// inside the forward is the failure this file's #799 gates are about, so the
+/// count is the assertion: reaching it means the graph allocated and ran.
+fn prefill_tokens(path: &std::path::Path, n_ctx: usize) -> usize {
+    let engine = Engine::load(path).expect("load");
+    let ids = engine.tokenizer().encode("hi");
+    let sampler = SamplerConfig::default();
+    let params = minfer::engine::GenerateParams {
+        tokens: &ids,
+        n_ctx,
+        n_predict: 1,
+        sampler: &sampler,
+        seed: 42,
+        stop_strings: &[],
+        timing: false,
+        spec_adaptive: false,
+        spec_d_max: 2,
+        cancel: None,
+    };
+    let outcome = engine.generate(&params, &mut |_| {}, &mut |_, _| {});
+    assert_eq!(
+        outcome.prefill_tokens,
+        ids.len(),
+        "the prefill ran on {path:?} at n_ctx {n_ctx}"
+    );
+    outcome.prefill_tokens
+}
+
+/// #799: two engines at different `n_ctx` in one process both generate. Before
+/// the fix the second panicked inside the allocator, because both borrowed the
+/// process-global graph cache (the KV regions are persistent and sized once).
+///
+/// The second engine is the cached 0.5B at 4096 when the model is present — the
+/// issue's own reproduction — and the toy at 64 otherwise. The toy sizes are 32
+/// and 64, never 64 and 128: the toy's `max_seq_len` is 64, so the larger pair
+/// clamps to one size and would pass vacuously.
+#[test]
+fn two_engines_at_different_context_sizes_both_generate() {
+    let toy_path = toy();
+    let cached = std::env::var_os("HOME").map(|home| {
+        let mut p = std::path::PathBuf::from(home);
+        p.push(
+            ".cache/minfer/models/hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_0.gguf",
+        );
+        p
+    });
+    let (second, second_ctx) = match cached.filter(|p| p.exists()) {
+        Some(p) => (p, 4096usize),
+        None => {
+            eprintln!(
+                "[#799] the cached 0.5B is absent; the second engine is the toy at 64 \
+                 (the 4096 arm needs the model)"
+            );
+            (toy_path.clone(), 64)
+        }
+    };
+    assert!(prefill_tokens(&toy_path, 32) >= 1, "the toy at 32 prefills");
+    assert!(
+        prefill_tokens(&second, second_ctx) >= 1,
+        "the second engine at {second_ctx} prefills"
+    );
+}
+
+/// #799: one engine at two context sizes does not panic either. A single-shot
+/// generation carries no sequence state, so its cache is an optimization: a
+/// changed `n_ctx` rebuilds it instead of tripping the allocator's refusal.
+#[test]
+fn one_engine_regenerates_after_a_context_size_change() {
+    let engine = Engine::load(&toy()).expect("load");
+    let ids = engine.tokenizer().encode("hi");
+    let sampler = SamplerConfig::default();
+    for n_ctx in [32usize, 64, 32] {
+        let params = minfer::engine::GenerateParams {
+            tokens: &ids,
+            n_ctx,
+            n_predict: 1,
+            sampler: &sampler,
+            seed: 42,
+            stop_strings: &[],
+            timing: false,
+            spec_adaptive: false,
+            spec_d_max: 2,
+            cancel: None,
+        };
+        let outcome = engine.generate(&params, &mut |_| {}, &mut |_, _| {});
+        assert_eq!(
+            outcome.prefill_tokens,
+            ids.len(),
+            "a run at n_ctx {n_ctx} prefills"
+        );
+    }
+}

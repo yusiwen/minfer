@@ -218,11 +218,6 @@ pub fn ffn_composition(requested: Option<&str>, device: Device) -> bool {
 /// [#242]: https://github.com/yusiwen/minfer/issues/242
 /// [#244]: https://github.com/yusiwen/minfer/issues/244
 pub trait ModelDef: Send + Sync {
-    /// Single-shot forward. `n_ctx` sizes the graph's persistent KV regions
-    /// (which the graph allocator owns). Callers must guarantee
-    /// `positions[i] < n_ctx` for every position.
-    fn forward(&self, tokens: &[u32], positions: &[usize], n_out: usize, n_ctx: usize) -> Vec<f32>;
-
     /// Downcast helper for **test** code, and nothing else.
     ///
     /// Its callers are `#[cfg(test)]` only (`tooling::tests`,
@@ -259,29 +254,6 @@ pub trait ModelDef: Send + Sync {
         _params: &crate::graph::params::GraphParams,
     ) -> crate::graph::ComputeGraph {
         unimplemented!("build_graph not implemented for this architecture")
-    }
-
-    /// Graph-based forward (Phase 6); defaults to the imperative path.
-    ///
-    /// Reachable from a `#[cfg(all(target_os = "macos", feature = "metal"))]` **test** block only
-    /// (`models::qwen2::graph::tests::real_model::graph_metal_matches_cpu_logits`), so the
-    /// allowance names both halves of the configuration in which it is unused —
-    /// a non-test build or a non-macOS host ([#244]; [#243]'s rule).
-    ///
-    /// [#243]: https://github.com/yusiwen/minfer/issues/243
-    /// [#244]: https://github.com/yusiwen/minfer/issues/244
-    #[cfg_attr(
-        any(not(test), not(all(target_os = "macos", feature = "metal"))),
-        allow(dead_code)
-    )]
-    fn forward_graph(
-        &self,
-        tokens: &[u32],
-        positions: &[usize],
-        n_out: usize,
-        n_ctx: usize,
-    ) -> Vec<f32> {
-        self.forward(tokens, positions, n_out, n_ctx)
     }
 
     /// Graph-based forward with a caller-provided cache and explicit context
@@ -341,6 +313,12 @@ pub trait ModelDef: Send + Sync {
     fn n_embd_head(&self) -> usize;
     fn n_kv_embd(&self) -> usize;
     fn n_vocab(&self) -> usize;
+
+    /// The model's positional limit. A forward above it reads the rope table out
+    /// of range, so a convenience caller (the facade's single-shot path) clamps
+    /// `n_ctx` here — llama.cpp clamps `n_ctx` the same way. Required, not
+    /// defaulted: a default would silently disable the cap.
+    fn max_seq_len(&self) -> usize;
     fn rope_style(&self) -> RopeStyle;
 
     /// RoPE base, frequency scale and (for a `llama3`-scaled model, #724) the

@@ -340,7 +340,7 @@ The graph declares three inputs for a prefill — `token_ids` (`models/qwen2/gra
 `[nt,1,1,1]`, `positions` `[nt,1,1,1]`, and (when the tail-row
 optimization is active) `tail_ids` — all typed `DType::I32` in the IR. Yet
 every pool buffer is f32 (§2.1). The bridge is `fill_input_i32`
-`fill_input_i32` (`alloc.rs:1894`): each u32 is packaged as `f32::from_bits(v)` — a pure
+`fill_input_i32` (`alloc.rs:1895`): each u32 is packaged as `f32::from_bits(v)` — a pure
 bit reinterpretation, *not* a numeric conversion — and written into the input
 node's buffer via the backend's `write_host`. On the consumer side the
 kernels run the inverse, `x.to_bits()`, recovering the exact integer:
@@ -388,7 +388,7 @@ the consumer's inputs across `execute` (`scheduler.rs:`, the phase-A staging enq
 allocator's `copy_across`, which routes through `copy_to_cpu` (a host round
 trip — Metal/CUDA buffers here are CPU-visible, so this is a plain memcpy)
 and then `write_host` into a buffer on the *destination* pool
-`copy_across` (`alloc.rs:2440`), the staging copy).
+`copy_across` (`alloc.rs:2441`), the staging copy).
 
 That destination staging buffer must be **fresh** — `alloc_fresh_in` (`alloc.rs:`)
 — never drawn from the recycle free list. The trait
@@ -657,8 +657,8 @@ The region is also sized on **first use only**: if a later graph asked for a
 different size, it would silently get the old buffer — one reason `n_ctx`
 must stay consistent across a run (§3.3, question 3).
 
-**Excerpt 6 — I32 input filling** `fill_input_i32` (`alloc.rs:1894`) plus the routing tail
-of `fill_input_impl`, `alloc.rs:2068`).
+**Excerpt 6 — I32 input filling** `fill_input_i32` (`alloc.rs:1895`) plus the routing tail
+of `fill_input_impl`, `alloc.rs:2069`).
 
 ```rust
 /// Fill an I32 input (token ids / positions). Stored as `f32::from_bits`
@@ -702,7 +702,7 @@ let data = self
     .ok_or_else(|| format!("node {node_id} host read failed"))?;
 self.write_cross_staging(dst, &data)
 
-// `write_cross_staging` (`alloc.rs:2621`) → `write_pool` (`alloc.rs:2801`): one
+// `write_cross_staging` (`alloc.rs:2622`) → `write_pool` (`alloc.rs:2802`): one
 // registry lookup through the handle, never a `match` on a backend variant.
 match self.pool_mut(dst.backend) {
     Some(pool) => pool.write_host(dst.id, data),
@@ -941,7 +941,7 @@ longer matters.
   at rebuild (§2.7).
 - KV positions are data: the region is sized `n_kv_embd × n_ctx`, and a
   position ≥ `n_ctx` is a loud error, not an overflow (`cpu_backend.rs:358`),
-  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:403`).
+  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:401`).
 - Dead nodes get no buffer and the scheduler skips them — so adding an op the
   fusion pass orphans cannot corrupt memory, it just does nothing — skipped
   where `node_buffer` (`scheduler.rs:`, the bufferless-node skip) reads `None`.

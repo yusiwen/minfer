@@ -391,8 +391,6 @@ Excerpt 3 — the interface everything downstream codes against.
 
 ```rust
 pub trait ModelDef: Send + Sync {
-    fn forward(&self, tokens: &[u32], positions: &[usize],
-               n_out: usize, n_ctx: usize) -> Vec<f32>;
     /// Downcast helper for the graph path's weight registration.
     fn as_any(&self) -> &dyn std::any::Any;
     /// Build the declarative compute graph for one forward step (Phase 5).
@@ -409,6 +407,8 @@ pub trait ModelDef: Send + Sync {
     fn n_embd_head(&self) -> usize;
     fn n_kv_embd(&self) -> usize;
     fn n_vocab(&self) -> usize;
+    /// The model's positional limit; a convenience caller clamps `n_ctx` here.
+    fn max_seq_len(&self) -> usize;
     fn rope_style(&self) -> RopeStyle;
 }
 ```
@@ -419,7 +419,8 @@ not know which architecture it is talking to.
 
 | Method | Who consumes it, and for what |
 |---|---|
-| `forward`, `forward_graph_cached` | the CLI loop (doc 09) and the server's per-slot path — both just "run a forward"; the default `forward_graph` routes to the graph |
+| `forward_graph_cached` | the CLI loop (doc 09) and the server's per-slot path — both just "run a forward", each passing the cache it owns |
+| `max_seq_len` | the clamp a convenience caller applies to `n_ctx` (it used to live in the deleted `Qwen2Graph::forward`) |
 | `build_graph` | doc 05: the pure-IR graph builder; topology is a function of `GraphParams` only |
 | `n_layer` | loader-loop sizing here, the graph builder's per-layer loop (doc 05), the legacy KV cache above |
 | `n_head_kv`, `n_embd_head`, `n_kv_embd` | GQA (grouped-query attention: fewer K/V heads than query heads) head mapping and strides (doc 11), and the KV region width `n_kv_embd × n_ctx` (doc 07) |

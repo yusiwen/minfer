@@ -1071,7 +1071,7 @@ redundancy is an assertion.
 
 - **`minfer info <model>`** (`crates/minfer-cli/src/main.rs:1028`) runs this exact stage and
   dumps its output instead of continuing: you get the full metadata KV dump
-  (`dump_gguf_metadata`, `crates/minfer-cli/src/main.rs:2286` — every key with its type and
+  (`dump_gguf_metadata`, `crates/minfer-cli/src/main.rs:2291` — every key with its type and
   value, arrays itemized) followed by `dump_key_tensors`' name/type/shape
   table (`crates/minfer-cli/src/main.rs:2334`). On the 0.5B Q4_0 file: `n_kv=26`, `n_tensors=291`,
   `general.architecture = "qwen2"`, `qwen2.block_count = 24`,

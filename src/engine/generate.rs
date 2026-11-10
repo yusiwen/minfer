@@ -120,15 +120,23 @@ fn decode_bytes(tokenizer: &Tokenizer, id: u32) -> Vec<u8> {
 
 /// Prefill `p.tokens`, then decode up to `p.n_predict` tokens, streaming the
 /// answer through `emit`.
+///
+/// `cache` is the run's KV state: prefill and every decode step write into it,
+/// so one build serves the whole run. It belongs to the caller — the facade's
+/// [`Engine::generate`](crate::engine::Engine::generate) keeps one per engine,
+/// a slot keeps one per slot — and it is **not** a process global: two models
+/// or two `n_ctx` values in one process must never share one ([#799]).
+///
+/// [#799]: https://github.com/yusiwen/minfer/issues/799
 pub fn generate(
     model: &dyn ModelDef,
     tokenizer: &Tokenizer,
     mut spec: Option<&mut SpecEngine>,
     p: &GenerateParams<'_>,
+    cache: &mut GraphCache,
     emit: &mut dyn FnMut(&[u8]),
     on_prefill: &mut dyn FnMut(&[f32], f64),
 ) -> GenerateOutcome {
-    let mut target_cache = GraphCache::new();
     let mut stopped_by_eog = false;
     let mut stopped_by_string = false;
     let mut grammar_error: Option<String> = None;
@@ -142,9 +150,11 @@ pub fn generate(
     // n_ctx (--n-ctx, default 4096) sizes the graph KV regions — NOT the
     // model's max_seq_len, which would allocate 12 GB+ and pay a first-submit
     // Metal tax (docs/PERF-QWEN3-4B-VS-LLAMACPP.md §2). It never shrinks below
-    // the prompt length, and the model's forward clamps it to max_seq_len.
-    // Computed ONCE so prefill and decode size the same KV regions.
-    let ctx = p.n_ctx.max(p.tokens.len());
+    // the prompt length, and it is capped at the model's positional limit here —
+    // llama.cpp clamps `n_ctx` the same way, and the wrapper that used to do it
+    // for the whole loop is gone (#799). Computed ONCE so prefill and decode
+    // size the same KV regions.
+    let ctx = p.n_ctx.max(p.tokens.len()).min(model.max_seq_len());
     // P2 trace (MINFER_TRACE=<path>): the scheduler records per-node data; this
     // loop marks the phase boundaries and attaches tokens/logits for the page
     // (the CLI adds the exported graph JSONs when it finishes).
@@ -153,18 +163,13 @@ pub fn generate(
     if trace_on {
         crate::trace::begin_phase("prefill");
     }
-    let logits = if spec.is_some() {
-        // Spec mode: drive the target through forward_graph_cached so its KV
-        // lives in the cache the verify rounds reuse; the draft prefills the
-        // same tokens into its own cache.
-        let l = model.forward_graph_cached(&p.tokens, &positions, 1, ctx, &mut target_cache);
-        spec.as_mut()
-            .expect("spec engine checked above")
-            .prefill(&p.tokens, ctx);
-        l
-    } else {
-        model.forward(&p.tokens, &positions, 1, ctx)
-    };
+    // The target's KV lives in the caller's cache, so the speculative verify
+    // rounds and the decode step below reuse the same regions; the draft
+    // prefills the same tokens into its own cache.
+    let logits = model.forward_graph_cached(&p.tokens, &positions, 1, ctx, cache);
+    if let Some(sp) = spec.as_mut() {
+        sp.prefill(&p.tokens, ctx);
+    }
     let last_logits: Vec<f32> = logits;
     if trace_on {
         crate::trace::attach_step(&last_logits);
@@ -285,7 +290,7 @@ pub fn generate(
             let t0r = std::time::Instant::now();
             let round_toks = engine.round(
                 &*model,
-                &mut target_cache,
+                cache,
                 next_token,
                 current_pos,
                 ctx,
@@ -417,7 +422,7 @@ pub fn generate(
                 crate::trace::set_token(sampled.token_id, &text);
             }
             t1 = std::time::Instant::now();
-            logits = model.forward(&[sampled.token_id], &[current_pos], 1, ctx);
+            logits = model.forward_graph_cached(&[sampled.token_id], &[current_pos], 1, ctx, cache);
             if trace_on {
                 crate::trace::attach_step(&logits);
             }

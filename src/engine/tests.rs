@@ -29,11 +29,9 @@ fn a_missing_model_is_a_named_error() {
 }
 
 /// #796: a clone shares the flag a generator checks, which is the only
-/// cross-thread invariant the type carries. The loop's behaviour is asserted
-/// from outside the crate (`tests/library_api.rs`): a generation here would
-/// size the process-global Qwen2 graph cache at the toy's `n_ctx`, poisoning
-/// the real-model gates in this same test binary (the reason `forward()`'s
-/// global cache is a known limitation, not a test detail).
+/// cross-thread invariant the type carries. The loop's *behaviour* is asserted
+/// from outside the crate (`tests/library_api.rs`), but a generation itself can
+/// run here too — see the gate below (#799).
 #[test]
 fn a_cancel_token_shares_its_flag_with_its_clones() {
     let token = CancelToken::new();
@@ -42,4 +40,35 @@ fn a_cancel_token_shares_its_flag_with_its_clones() {
     token.cancel();
     assert!(clone.is_cancelled(), "clones share one flag");
     assert!(format!("{token:?}").contains("cancelled: true"));
+}
+
+/// #799: a generation inside the lib test binary, which the process-global
+/// graph cache used to forbid — it sized the cache at the toy's `n_ctx` for
+/// every real-model gate sharing this binary. Each engine now owns its cache,
+/// so the isolation is structural, not a test-ordering accident.
+#[test]
+fn a_generation_inside_the_lib_borrows_no_process_global() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/toy/toy-qwen2-f32.gguf");
+    let engine = Engine::load(&path).expect("the toy GGUF loads");
+    let ids = engine.tokenizer().encode("hi");
+    let sampler = crate::sampler::SamplerConfig::default();
+    let params = GenerateParams {
+        tokens: &ids,
+        n_ctx: 32,
+        n_predict: 1,
+        sampler: &sampler,
+        seed: 42,
+        stop_strings: &[],
+        timing: false,
+        spec_adaptive: false,
+        spec_d_max: 2,
+        cancel: None,
+    };
+    let outcome = engine.generate(&params, &mut |_| {}, &mut |_, _| {});
+    assert_eq!(
+        outcome.prefill_tokens,
+        ids.len(),
+        "the prefill ran, so the forward did too"
+    );
 }

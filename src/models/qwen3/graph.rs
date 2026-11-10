@@ -13,8 +13,6 @@
 //! follow-up). The unfused 3-matmul path is correct on both backends. The
 //! fused-FFN decode path (`Op::FusedFFN`) IS reused (FFN is Qwen2-identical).
 
-use std::sync::{Mutex, OnceLock};
-
 use crate::graph::alloc::GraphAllocator;
 use crate::graph::backend::Backend;
 use crate::graph::cache::GraphCache;
@@ -389,28 +387,6 @@ impl Qwen3Graph {
                 }
             }
         }
-    }
-
-    /// Graph-based forward: build/assign/fuse/alloc/execute with reuse.
-    /// KV is owned by the graph (persistent regions), not by the caller.
-    ///
-    /// CLI convenience wrapper: uses the process-global `graph_cache()`. The
-    /// KV regions are sized by `n_ctx`, clamped to the model's `max_seq_len`
-    /// (llama.cpp clamps `n_ctx` the same way); single-shot previously used the
-    /// full `max_seq_len` unconditionally (40960 on Qwen3-4B → 12.1 GB of f32
-    /// KV buffers + a ~275 ms first-submit Metal tax, see
-    /// docs/PERF-QWEN3-4B-VS-LLAMACPP.md §2). Server / multi-slot code must
-    /// call [`Qwen3Graph::forward_cached`] with a slot-scoped cache instead.
-    pub fn forward(
-        model: &Qwen3Model,
-        tokens: &[u32],
-        positions: &[usize],
-        n_out: usize,
-        n_ctx: usize,
-    ) -> Vec<f32> {
-        let n_ctx = n_ctx.min(model.hparams.max_seq_len as usize);
-        let mut guard = graph_cache().lock().unwrap();
-        Self::forward_cached(model, tokens, positions, n_out, n_ctx, &mut guard)
     }
 
     /// Graph-based forward with a caller-provided cache and explicit context
@@ -923,13 +899,6 @@ impl Qwen3Graph {
         }
         ok
     }
-}
-
-/// Process-wide graph cache: the allocator inside it owns the KV cache, so it
-/// must survive across steps (and rebuilds). Single model per process today.
-fn graph_cache() -> &'static Mutex<GraphCache> {
-    static CACHE: OnceLock<Mutex<GraphCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(GraphCache::new()))
 }
 
 #[cfg(test)]
