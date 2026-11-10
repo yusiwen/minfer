@@ -578,6 +578,37 @@ const CHAT_FIXTURES: &[(&str, &str)] = &[
     ),
 ];
 
+/// One fixture case rendered at the instant the fixture records.
+///
+/// A template that reads the clock (`strftime_now`) would make every gate a
+/// daily diff, so a clocked fixture stores `clock_unix` and every gate renders at
+/// that same instant (§2.5 of `docs/CHAT-TEMPLATE-AND-TOKENIZER-DESIGN.md`,
+/// ADR-0057). The committed-template gate and the GGUF gate both go through here,
+/// so a new gate cannot pick the wall clock by accident (#761).
+fn render_fixture_case(
+    slug: &str,
+    name: &str,
+    template: &str,
+    fx: &serde_json::Value,
+    case: &serde_json::Value,
+    msgs: &[(String, Option<String>)],
+) -> String {
+    let add_gen = case["add_generation_prompt"].as_bool().unwrap();
+    let bos = fx["bos_token"].as_str().unwrap_or("");
+    match fx["clock_unix"].as_i64() {
+        Some(unix) => render_at(
+            civil_from_unix(unix),
+            Some(template),
+            &messages_from_parts(msgs),
+            None,
+            add_gen,
+            bos,
+        ),
+        None => render_messages(template, msgs, add_gen, bos),
+    }
+    .unwrap_or_else(|e| panic!("{slug}/{name} refused: {}", e.message()))
+}
+
 #[test]
 fn model_templates_render_byte_for_byte() {
     for (slug, raw) in CHAT_FIXTURES {
@@ -603,7 +634,14 @@ fn model_templates_render_byte_for_byte() {
         assert!(!prov["date"].as_str().unwrap().is_empty());
 
         let template = fx["template"].as_str().unwrap();
-        let bos = fx["bos_token"].as_str().unwrap_or("");
+        // A template that reads the clock must record the instant it rendered at,
+        // or every gate over this fixture becomes a daily diff (#761).
+        if template.contains("strftime_now") {
+            assert!(
+                fx["clock_unix"].is_i64(),
+                "{slug}: a template that reads the clock must record `clock_unix`"
+            );
+        }
         let cases = fx["cases"].as_array().unwrap();
         assert!(cases.len() >= 6, "{slug}: fixture shrank");
         let mut names = Vec::new();
@@ -621,23 +659,8 @@ fn model_templates_render_byte_for_byte() {
                     )
                 })
                 .collect();
-            let add_gen = case["add_generation_prompt"].as_bool().unwrap();
             let expected = case["expected"].as_str().unwrap();
-            // A template that reads the clock (`strftime_now`) would make the
-            // fixture a daily diff; such a fixture records the instant it was
-            // rendered at, and the gate renders at the same one.
-            let got = match fx["clock_unix"].as_i64() {
-                Some(unix) => render_at(
-                    civil_from_unix(unix),
-                    Some(template),
-                    &messages_from_parts(&msgs),
-                    None,
-                    add_gen,
-                    bos,
-                ),
-                None => render_messages(template, &msgs, add_gen, bos),
-            }
-            .unwrap_or_else(|e| panic!("{slug}/{name} refused: {}", e.message()));
+            let got = render_fixture_case(slug, name, template, &fx, case, &msgs);
             assert_eq!(
                 got, expected,
                 "{slug}/{name}: rendered prompt differs from the transformers reference\n\
@@ -657,6 +680,76 @@ fn model_templates_render_byte_for_byte() {
             "{slug}: {names:?}"
         );
     }
+}
+
+/// #761: the recorded instant is what a clocked fixture is compared at, so no
+/// gate expires with the calendar, and a one-day shift moves only the date field.
+///
+/// This is the machine-checkable form of "passes today and tomorrow without a
+/// fixture edit": the wall clock never enters the comparison. The shift arm is the
+/// control — if the injected clock were ignored, both renders would agree and the
+/// gate would pass for the wrong reason.
+#[test]
+fn a_clocked_fixture_renders_at_its_recorded_instant_and_a_day_shift_moves_only_the_date() {
+    let (slug, fx) = CHAT_FIXTURES
+        .iter()
+        .find_map(|(slug, raw)| {
+            let fx: serde_json::Value = serde_json::from_str(raw).ok()?;
+            fx["clock_unix"].is_i64().then_some((*slug, fx))
+        })
+        .expect("a fixture that reads the clock records the instant it was rendered at");
+    let unix = fx["clock_unix"].as_i64().unwrap();
+    let template = fx["template"].as_str().unwrap();
+    let case = fx["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "single_user")
+        .expect("the clocked fixture has a single_user case");
+    let msgs: Vec<(String, Option<String>)> = case["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["role"].as_str().unwrap().to_string(),
+                m["content"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+
+    let recorded = render_fixture_case(slug, "single_user", template, &fx, case, &msgs);
+    assert_eq!(
+        recorded,
+        case["expected"].as_str().unwrap(),
+        "{slug}: the recorded instant must render the committed reference"
+    );
+
+    let later = render_at(
+        civil_from_unix(unix + 86_400),
+        Some(template),
+        &messages_from_parts(&msgs),
+        None,
+        case["add_generation_prompt"].as_bool().unwrap(),
+        fx["bos_token"].as_str().unwrap_or(""),
+    )
+    .unwrap();
+    assert_ne!(
+        recorded, later,
+        "{slug}: a one-day shift must change the render"
+    );
+    let earlier_date = format_civil(civil_from_unix(unix), "%d %b %Y").unwrap();
+    let later_date = format_civil(civil_from_unix(unix + 86_400), "%d %b %Y").unwrap();
+    assert_eq!(
+        later.matches(later_date.as_str()).count(),
+        1,
+        "{slug}: the clock field must occur exactly once in the render"
+    );
+    assert_eq!(
+        later.replacen(later_date.as_str(), earlier_date.as_str(), 1),
+        recorded,
+        "{slug}: a one-day shift must move only the date field"
+    );
 }
 
 /// The override path has its own byte-for-byte gate (#602): each model fixture's
@@ -798,7 +891,6 @@ fn gguf_template_renders_like_the_reference() {
             .find(|kv| kv.key == "tokenizer.chat_template")
             .map(|kv| kv.get_val_str(0).to_string())
             .unwrap_or_else(|| panic!("{slug}: the GGUF carries no chat template"));
-        let bos = fx["bos_token"].as_str().unwrap_or("");
         let cases = fx["cases"].as_array().unwrap();
         for case in cases {
             let msgs: Vec<(String, Option<String>)> = case["messages"]
@@ -813,13 +905,14 @@ fn gguf_template_renders_like_the_reference() {
                 })
                 .collect();
             let expected = case["expected"].as_str().unwrap();
-            let got = render_messages(
+            let got = render_fixture_case(
+                slug,
+                case["name"].as_str().unwrap(),
                 &template,
+                &fx,
+                case,
                 &msgs,
-                case["add_generation_prompt"].as_bool().unwrap(),
-                bos,
-            )
-            .unwrap_or_else(|e| panic!("{slug}: GGUF template refused: {}", e.message()));
+            );
             assert_eq!(
                 got,
                 expected,
