@@ -171,7 +171,7 @@ to f32 it would be 2 GB — 7× more, copied at load time, for zero benefit.
 `TensorData` is an `Arc` plus a `(off, len)` range; `clone()` bumps the `Arc` and
 copies the range, not the weight. That is what makes it affordable for the graph
 path to re-register all weights on every graph (re)build (`t.clone()` at
-`qwen2/graph.rs:412`) — the clone duplicates a small struct and a name string,
+`qwen2/graph.rs:410`) — the clone duplicates a small struct and a name string,
 not gigabytes. The registries still skip a same-name registration; excerpt 10
 states the current reason.
 

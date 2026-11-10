@@ -175,7 +175,7 @@ arrives in two steps:
   context is `params.n_ctx.max(input_ids.len())` — a long prompt must never
   overflow the notepad — and the model's forward pass clamps again with
   `n_ctx.min(max_seq_len)` where `max_seq_len` comes from the GGUF metadata
-  (`src/models/qwen2/graph.rs:408`). The CLI flag *requests*; the model's
+  (`src/models/qwen2/graph.rs:406`). The CLI flag *requests*; the model's
   own context length *caps*.
 
 So: at the command line `--n-ctx` is "how much room to reserve"; after doc
@@ -687,7 +687,7 @@ The first consumer of `params.n_ctx` after load (`crates/minfer-cli/src/main.rs:
     let logits = model.forward(&input_ids, &positions, &mut kv_cache, 1, ctx);
 ```
 
-and the second clamp inside the model (`src/models/qwen2/graph.rs:408`):
+and the second clamp inside the model (`src/models/qwen2/graph.rs:406`):
 
 ```rust
         let n_ctx = n_ctx.min(model.hparams.max_seq_len as usize);

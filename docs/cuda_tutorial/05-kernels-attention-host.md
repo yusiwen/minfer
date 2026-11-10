@@ -571,7 +571,7 @@ needs a host round trip to learn where the history ends.
 **f16 KV: half the bytes, same addresses.** The per-engine `kv_layout` tag
 (`cuda_backend.rs:46`, the `KV_LAYOUT_*` code) is fixed when the backend is built from the
 engine's resolved `KvFormat` (`src/graph/kvformat.rs` is the single authority): `load_model_configured`
-(`src/models/mod.rs:439`) resolves it from `MINFER_CACHE_TYPE` and stamps it through
+(`src/models/mod.rs:417`) resolves it from `MINFER_CACHE_TYPE` and stamps it through
 `GraphAllocator::set_kv_format`. When the tag is f16, every store converts to `__half` and
 every attention read converts back; §3.2's kernel shows both sides of that. The
 `store_kv_f16` header comment states the trade (`kv_store.cu:23-30`): "halves attention
