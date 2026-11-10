@@ -330,6 +330,19 @@ jobs:
         run: cargo check --release -p minfer-cli --no-default-features
       - name: The published tarball builds (cargo package)
         run: cargo package -p minfer --allow-dirty
+      # The tarball is what a consumer downloads, and `cargo package` verifies
+      # the library only — the tests a published crate ships with are never
+      # built here. That blind spot is how #818's tarball passed CI while its
+      # own `cargo test` could not compile: `src/quantize/tests.rs` includes
+      # `docs/GGUF-TOOLING.md`, and the package `include` list had dropped
+      # `docs/`. Checking the extracted copy's test targets closes it, and the
+      # job's own `target/` keeps it cheap (the package verify step already
+      # compiled the dev profile there).
+      - name: The published tarball's tests compile
+        run: |
+          pkg=$(find target/package -maxdepth 1 -type d -name 'minfer-*' -print -quit)
+          test -n "$pkg" || { echo "::error::cargo package produced no extracted directory"; exit 1; }
+          cargo check --tests --manifest-path "$pkg/Cargo.toml" --target-dir "$PWD/target"
 
   # The container tag carries both the CUDA toolkit and the base image, and the
   # base is the compile-time glibc/gcc floor. Keep the toolkit at a version

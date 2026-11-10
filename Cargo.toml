@@ -11,15 +11,22 @@ categories = ["science", "algorithms", "hardware-support"]
 # The pinned toolchain is 1.97.1 (rust-toolchain.toml); say so for consumers
 # instead of letting them discover it.
 rust-version = "1.97"
-# Keep the published crate source-only: the book, the document tree and the
-# research experiments are repository material. `viz/` ships because the `viz`
-# feature reads its assets at runtime; the CUDA diagnostic example is the one
-# experiment a manifest entry names, so its single file travels.
+# Keep the published crate source-only: the book, the rest of the document tree
+# and the research experiments are repository material. Two files travel beyond
+# the source, and each has a consumer:
+#
+# - the CUDA diagnostic example, the one `[[example]]` entry a manifest names;
+# - `docs/GGUF-TOOLING.md`, which `src/quantize/tests.rs` compiles in with
+#   `include_str!` to hold the document and the CLI's refusal text together —
+#   without it the published tarball's own test suite cannot be built (#818).
+#
+# `viz/` does not travel: the visualizer moved to `crates/minfer-cli` (#805).
 include = [
     "/src/**",
     "/tests/**",
     "/examples/**",
     "/experiments/cuda/cuda_graph_rust/cuda_graph_diag.rs",
+    "/docs/GGUF-TOOLING.md",
     "/build.rs",
     "/Cargo.toml",
     "/README.md",
