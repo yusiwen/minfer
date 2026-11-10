@@ -504,7 +504,7 @@ At forward time, before the graph is built or reused, the model asks a yes/no qu
 `metal_available()` (`metal_backend.rs:`) is just `MpsState::get().is_some()` — device present, not disabled. `weights_on_gpu` (`:721-777`) is the gate itself: it enumerates *every* tensor name the graph will read (embedding, output norm, lm_head, output bias, then per layer the norm, `wq/bq/wk/bk/wv/bv/wo`, the FFN norm, `ffn_gate/ffn_up/ffn_down`) and requires all of them in the Metal registry:
 
 ```rust
-// src/models/qwen2/graph.rs:821 (`weights_on_gpu`) (tail of weights_on_gpu)
+// src/models/qwen2/graph.rs:797 (`weights_on_gpu`) (tail of weights_on_gpu)
         #[cfg(target_os = "macos")]
         {
             let Some(mps) = crate::metal::MpsState::get() else {
@@ -519,7 +519,7 @@ One `false` ⇒ `metal_on = false` ⇒ the whole model on CPU. Why all-or-nothin
 The result flows into `CParams` (`:447-468`): `gpu: metal_on || cuda_on`, plus `fuse_qkv`/`fuse_ffn` gated on `nt == 1 && (metal_on || cuda_on)` — on the GPU the fusions are always shape-eligible at decode, on CPU they are not built (the CPU prefers the batched-quantization shape of doc 10). From there, if `try_reuse` fails, the rebuild path enables the backend and assigns:
 
 ```rust
-// src/models/qwen2/graph.rs:490 (`forward_batch`) (rebuild: register → enable → assign)
+// src/models/qwen2/graph.rs:466 (`forward_batch`) (rebuild: register → enable → assign)
         if !cache.try_reuse(&params) {
             let mut graph = Self::build(model, &params);
             let sched = BackendScheduler::new();
@@ -739,7 +739,7 @@ production path holds a hand-written chain — so on a Mac with both compiled in
 **Why a fresh allocation for cross-split staging (`alloc_fresh`) instead of reusing the free list?** The trait comment (§2.1) is the record of a real bug class: at execute time, free-list ids still back `node_to_buf` entries that later nodes in the *same* execute will read or write; recycling one for a staging copy would clobber in-flight data. The staging buffer is born outside the recycle economy and joins it only at graph-rebuild time, when liveness recycling is safe again (doc 07's allocator owns that transition).
 
 **Why is the f16 KV cache auto-selected by model size?** `kvformat::auto_device_format`
-(`src/graph/kvformat.rs:174`, reached through `resolve` at the end of a load — `src/models/mod.rs:498`)
+(`src/graph/kvformat.rs:174`, reached through `resolve` at the end of a load — `src/models/mod.rs:476`)
 turns f16 on when the device is not the CPU and `n_layers × n_kv_embd ≥ 8192` — the 7B class — and
 keeps f32 for the 0.5B class. The asymmetry is measured, not aesthetic: on the 7B, attention streams the whole KV per decode step, so halving those bytes is a direct win (−~1 ms/token at 2K ctx; #13 measured 1.60 → 0.95 s on a long-context case); on the 0.5B the decode is dispatch-latency-bound, the f16 conversion kernels cost more than the bandwidth saves, and f16 measured ~3 % *slower* (the comment cites the decided-not record). `MINFER_CACHE_TYPE=f16|f32|q8_0` overrides either way (`f16` on the CPU is mapped back to f32, which has
 no f16 KV kernel).

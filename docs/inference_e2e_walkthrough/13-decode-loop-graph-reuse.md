@@ -8,7 +8,7 @@
 > **Code**: the decode loop in `src/engine/generate.rs` (`generate` L75, the
 > plain loop L284–351, the speculative round loop L166–283, the repeat window
 > `REPEAT_LAST_N` L142 — the session's own copy is `conversation.rs:444` — the
-> stop gates `special.is_stop` (`src/models/mod.rs:372`) and
+> stop gates `special.is_stop` (`src/models/mod.rs:350`) and
 > `sampler::match_stop_suffix` (`src/sampler.rs:120`)); the cached forward
 > `src/models/qwen2/graph.rs::forward_cached` (L460); the reuse decision
 > `src/graph/cache.rs::try_reuse` (L69); the params `src/graph/params.rs`
@@ -98,7 +98,7 @@ step reads it.
 
 The loop also decides **when to stop**. Three gates live in (or beside) the
 loop: the sampled token is an end-of-generation id (`special.is_stop`,
-`src/models/mod.rs:372`, decided in the loop at `src/engine/generate.rs:385`),
+`src/models/mod.rs:350`, decided in the loop at `src/engine/generate.rs:385`),
 the generated *byte stream* now ends with a user-supplied stop string
 (`sampler::match_stop_suffix`, `src/sampler.rs:120`), or the `-n` token cap is
 reached (the `while` condition itself, `src/engine/generate.rs:359`). Doc 12
@@ -338,7 +338,7 @@ the graph*; on the "survives" side, everything that *holds data*:
 | Survives the rebuild | Recomputed on rebuild |
 |---|---|
 | The `GraphAllocator` itself (it lives inside `GraphCache`, `cache.rs:`) | The node list (`Self::build`, `src/models/qwen2/graph.rs`) |
-| Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `src/models/qwen2/graph.rs:636`) |
+| Registered weights (registered once by name; `register_weight`, `alloc.rs:374`) | Backend assignment (`assign_backends`, `src/models/qwen2/graph.rs:612`) |
 | **The per-layer KV regions** — `kv.{ℓ}.k` / `kv.{ℓ}.v`, allocated once at full `n_ctx` size and never freed (`ensure_kv`, `alloc.rs:`; `alloc_graph` explicitly frees only liveness buffers, `alloc_graph` (`alloc.rs:`)) | The fusion pass (`FusionPass::run`, `src/models/qwen2/graph.rs:`) |
 | Backend buffer *pools* (freed liveness buffers return to their pool; the memory is recycled, not released) | The node→buffer mapping (`alloc_graph` clears `node_to_buf`, `alloc.rs:519`) |
 | The monotonic graph `uid` of the *reused* graph (a rebuilt graph gets a fresh uid — which is exactly what invalidates a stale CUDA Graph capture, `replace_graph` (`cache.rs:`) + §3.4) | Cross-backend staging buffers (keyed by `(graph uid, node, backend)` and surviving a rebuild *and* a re-map — E4 S3; `alloc_graph` clears only the in-flight `cross_pending` set, `alloc_graph` (`alloc.rs:`)) |
@@ -396,7 +396,7 @@ instead of the next forward (§3.2 walks the code):
 
 1. **End-of-generation token.** The sampled id equals the model's `eos` or
    one of its declared end roles — `special.is_stop(id)` (`SpecialTokens::is_stop`,
-   `src/models/mod.rs:372`; the ids come from `ModelDef::special_tokens()`,
+   `src/models/mod.rs:350`; the ids come from `ModelDef::special_tokens()`,
    `src/models/mod.rs:338`). Decided in the loop (`src/engine/generate.rs:385`);
    the token is *not* appended and *not* fed to the graph — the run just ends.
    (Conversation mode deliberately does the opposite: it writes the EOG token
@@ -431,10 +431,10 @@ and is only read:
 | Data | Type / shape | Where it comes from | Where it goes |
 |---|---|---|---|
 | `token_ids` input | `I32`, shape `[1, 1, 1, 1]` (one token) | step 1: the token sampled from prefill's logits; every later step: the previous iteration's `sampled.token_id` | `fill_input_i32` writes it into the input node's buffer (`src/models/qwen2/graph.rs:663`) |
-| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`src/engine/generate.rs:198`) — starts at `p.tokens.len()`, incremented once per step at `:428` | same, `src/models/qwen2/graph.rs:665`; the KV store uses it as the write slot, attention as the last readable slot |
+| `positions` input | `I32`, shape `[1, 1, 1, 1]` | `current_pos` (`src/engine/generate.rs:203`) — starts at `p.tokens.len()`, incremented once per step at `:428` | same, `src/models/qwen2/graph.rs:665`; the KV store uses it as the write slot, attention as the last readable slot |
 | K/V regions (per layer) | `f32`, `[nkt][n_ctx]` (128 × 4096 = 2 MiB per region for Qwen2.5-0.5B at `--n-ctx 4096`) | allocated once at first use (`ensure_kv`, `alloc.rs:`); contents: prefill's prompt + every generated token so far | step ℓ's store writes slot `position`; step ℓ+1's attention reads slots `0..=nkv-1` |
 | logits output | `f32`, `[n_vocab]` = 151,936 × 4 B ≈ 607 KB | the graph's output buffer (`graph.outputs[0]`, copied to host at `src/models/qwen2/graph.rs:`) | moved into the loop's `logits` variable (`src/engine/generate.rs:420`, the `logits = model.forward(...)` assignment) for the next sample |
-| `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens — `recent_window` (`engine/generate.rs:205, 391-394`) | the sampler's repeat/frequency/presence penalties (doc 12) |
+| `prev_tokens` window | `Vec<u32>`, ≤ 64 ids | prompt tail + generated tokens — `recent_window` (`engine/generate.rs:210, 391-394`) | the sampler's repeat/frequency/presence penalties (doc 12) |
 | `generated` | `Vec<u32>` | pushed per step (`src/engine/generate.rs:389`, the `generated.push(...)` call) | stop checks, final stats; decode_bytes streams it to stdout |
 
 Two details of this table deserve unpacking.
@@ -443,7 +443,7 @@ Two details of this table deserve unpacking.
 every node reads and writes `f32` slices, whatever its logical type. Token
 ids and positions are integers. Rather than special-case integer buffers,
 `fill_input_i32` stores each `u32` *bit pattern* reinterpreted as an `f32`
-value `fill_input_i32` (`alloc.rs:1894`), and the kernels that consume these inputs
+value `fill_input_i32` (`alloc.rs:1895`), and the kernels that consume these inputs
 (attention, KV store) convert back with `f32::to_bits() as usize`
 (`cpu_backend.rs:`, the store's position decode; `:919-920`, attention's). This is exact for values below 2²⁴ —
 vocabulary ids and positions never come close — and it keeps one uniform
@@ -453,13 +453,13 @@ arithmetic conversion, which is why a round trip through the buffer is
 lossless.
 
 **One forward call per step, five hidden phases.** The loop's single
-`model.forward(...)` — `ModelDef::forward` (`src/engine/generate.rs:420`) —
-expands inside `forward_cached` into: build params (six fields) → try_reuse
+`model.forward_graph_cached(..., cache)` — `ModelDef::forward_graph_cached`
+(`src/engine/generate.rs:425`) — expands inside `forward_cached` into: build params (six fields) → try_reuse
 (usually a hit) → fill 2–3 small inputs → one `scheduler.execute` walk → copy
 the output buffer back. On a rebuild step the same call additionally runs
 build → register → assign → fuse → alloc. The loop code has no idea any of that
-exists — which is the point of the `ModelDef::forward` facade
-(`models/mod.rs:224`).
+exists — which is the point of the `ModelDef::forward_graph_cached` facade
+(`models/mod.rs:265`).
 
 One name in the call needs a sentence for honesty: `forward`'s signature *used*
 to take a `&mut KVCache` (the CLI passed a `kv_cache` it created at load). On the
@@ -507,7 +507,7 @@ hand the loop plays with on every iteration:
   time that the prompt fits; from here the cursor only ever increments (`:350`).
 - `special` carries the model's stop-token ids: eos, plus `<|im_end|>` and the
   declared EOT/EOM roles when the model has them — gate 1 of §2.7; the
-  predicate is `SpecialTokens::is_stop` (`src/models/mod.rs:372`).
+  predicate is `SpecialTokens::is_stop` (`src/models/mod.rs:350`).
 - `rng` is seeded once (`--seed`, default 42): the whole run's sampling is a
   deterministic function of the seed, which is what makes minfer's
   llama.cpp-comparison claims testable.
@@ -589,7 +589,7 @@ Reading it as a state machine, one iteration:
    loop records `grammar_error` and breaks — never emitting an arbitrary
    token — and the CLI prints the refusal after the run
    (`crates/minfer-cli/src/main.rs:1670-1672`).
-3. **Gate: EOS.** `special.is_stop` (`src/models/mod.rs:372`) checks `eos`,
+3. **Gate: EOS.** `special.is_stop` (`src/models/mod.rs:350`) checks `eos`,
    `im_end` and the declared EOT/EOM roles; a hit breaks *before* the token is
    pushed — the sentinel is not text, and `stopped_by_eog` is what the caller's
    stats line reports.
@@ -656,7 +656,7 @@ stop gate fires or (in conversation mode) a guard stops it before the
 regions overflow.
 
 The EOS predicate itself is the smallest function in the pipeline —
-`SpecialTokens::is_stop` (`src/models/mod.rs:372`):
+`SpecialTokens::is_stop` (`src/models/mod.rs:350`):
 
 ```rust
     pub fn is_stop(&self, id: u32) -> bool {
@@ -788,7 +788,7 @@ invariant in one breath (`params.rs:`, the module comment): these are "the ONLY 
 graph reuse … `n_past` (KV position) is deliberately absent: it is
 execution data."
 
-#### The rebuild branch `forward_cached` (`src/models/qwen2/graph.rs:466`, `599-645`)
+#### The rebuild branch `forward_cached` (`src/models/qwen2/graph.rs:442`, `576-622`)
 
 When the comparison fails, the five-phase pipeline of docs 05–08 runs, and
 its result is stored back into the same cache:
@@ -1321,10 +1321,10 @@ the evidence is on stderr of any plain run.
   `crates/minfer-cli/src/main.rs:1571-1576`) vs `Generated: M tokens in … (tok/s)`
   (`crates/minfer-cli/src/main.rs:1750-1755`) — two deliberately different calibers (pure-decode
   rate vs blended rate, the comment at `crates/minfer-cli/src/main.rs:1747-1749`; the timer itself
-  is `gen_start`, `src/engine/generate.rs:195`). The gap between the two numbers
+  is `gen_start`, `src/engine/generate.rs:200`). The gap between the two numbers
   *is* this document's §2.2 argument, measured.
 - **`MINFER_TIMING=1`.** Splits the per-token wall clock into sampling vs
-  forward milliseconds — `t_samp` (`src/engine/generate.rs:381-383`) and
+  forward milliseconds — `t_samp` (`src/engine/generate.rs:386-388`) and
   `t_fwd` (`:346-349`), printed by the CLI (`crates/minfer-cli/src/main.rs:1691-1695`). Expect sampling in the
   tens of microseconds and forward in the milliseconds — the loop's own
   overhead is the difference between the two.
@@ -1339,8 +1339,8 @@ the evidence is on stderr of any plain run.
   (`src/engine/generate.rs:154`, `:193`) — and tags each decode step with its
   sampled token (`set_token`, called at `src/engine/generate.rs:417`), while the
   CLI attaches both the prefill graph and a *separate decode graph* JSON at the
-  end — `export_graph_json` (`crates/minfer-cli/src/main.rs:1729`, `:1738`) and
-  `trace::finish` (`crates/minfer-cli/src/main.rs:1842`). Opening the trace in `viz/` shows the two
+  end — `export_graph_json` (`crates/minfer-cli/src/main.rs:1734`, `:1743`) and
+  `trace::finish` (`src/trace.rs:215`). Opening the trace in `viz/` shows the two
   topologies side by side — the G3 tail nodes present in one and absent in
   the other.
 - **`--dump-graph <dot>` / `--dump-graph-json <path>`.** Exits after

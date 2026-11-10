@@ -523,14 +523,14 @@ fn ensure_kv(&mut self, layer: usize, backend: Backend, n_embd: usize, row_elems
 
 `ensure_kv` is fallible: a packed `row_elems` is checked against the format
 and the registry's `reads_packed_kv`, and an existing region must match `n_ctx`,
-backend and packing — else `Err`. `alloc_persistent` (`alloc.rs:1081`) routes
+backend and packing — else `Err`. `alloc_persistent` (`alloc.rs:1082`) routes
 through the same pool allocator as everything else — on CUDA a `cudaMalloc` held
 in the backend's buffer pool (§3.4) — and registers it as *never freed*. Because the
 allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:123` ("Compute Graph — core rules", rule 2)), the regions survive
 rebuilds and hold their contents across decode steps: two device buffers per layer nobody may recycle.
 
 **Size and layout.** The size comes from the graph builder:
-`kv_elems: nkt * n_ctx` (`kv_elems` (`src/models/qwen2/graph.rs:159`)), where
+`kv_elems: nkt * n_ctx` (`kv_elems` (`src/models/qwen2/graph.rs:157`)), where
 `nkt = n_head_kv · hd` (the `n_kv_embd` dimension) and `n_ctx` is the
 capacity. So the brief question — "[n_past][kv_heads*head_dim]?" — resolves
 like this in the store code:
@@ -582,7 +582,7 @@ allocation does not shrink, the bytes written per store and read per attention c
 `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1253`).
 
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
-copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1092`) maps the node to
+copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1093`) maps the node to
 `pair[0]`; the CUDA arm comments "out_buf IS the region — no kernel" at
 (`cuda_backend.rs:951`, the `KvcacheLoad` arm comment). So the whole path — matmul, fused tail, cache,
 attention, next layer — touches pool device memory and crosses no host
@@ -840,7 +840,7 @@ time*, all-or-nothing: CUDA participation requires a device **and** every
 weight registered with a kernel-supported type
 (`Qwen2Graph::device` (`src/models/qwen2/graph.rs`),
 `cuda_on = … && Self::weights_on_cuda(model)`). `weights_on_cuda`
-`weights_on_cuda` (`src/models/qwen2/graph.rs:889`) walks every tensor — embedding,
+`weights_on_cuda` (`src/models/qwen2/graph.rs:865`) walks every tensor — embedding,
 per-layer wq/wk/wv/wo, gate/up/down, norms, biases — and on failure prints the
 exact loser: `"CUDA GATE: weight '{}' (type {:?}) has no CUDA kernel or is not registered"` —
 the gate is `Qwen2Graph::device` (`src/models/qwen2/graph.rs`). That either routes the

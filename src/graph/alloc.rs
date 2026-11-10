@@ -1046,7 +1046,8 @@ impl GraphAllocator {
             if region.elems != elems {
                 return Err(format!(
                     "KV region for layer {layer} was allocated with {} elements but {elems} are \
-                     requested (n_ctx changed on a live GraphCache; the regions are persistent)",
+                     requested (a live GraphCache keeps its regions; a different n_ctx or KV \
+                     format needs a new cache, not a resized one)",
                     region.elems
                 ));
             }

@@ -139,11 +139,17 @@ struct GreedySteps {
     top2: Vec<[(u32, f32); 2]>,
 }
 
-/// The production decode loop (prefill, then one `ModelDef::forward` per token),
-/// recording what the sampler sees at each step.
+/// The production decode loop (prefill, then one cached forward per token),
+/// recording what the sampler sees at each step. The cache is local to the run,
+/// never a process global ([#799]); prefill and decode share it so the KV
+/// persists across the shape change.
+///
+/// [#799]: https://github.com/yusiwen/minfer/issues/799
 fn greedy_steps(model: &dyn ModelDef, prompt_ids: &[u32], n: usize, n_ctx: usize) -> GreedySteps {
+    let n_ctx = n_ctx.min(model.max_seq_len());
     let positions: Vec<usize> = (0..prompt_ids.len()).collect();
-    let mut logits = model.forward(prompt_ids, &positions, 1, n_ctx);
+    let mut cache = crate::graph::cache::GraphCache::new();
+    let mut logits = model.forward_graph_cached(prompt_ids, &positions, 1, n_ctx, &mut cache);
     let mut ids = Vec::with_capacity(n);
     let mut top2 = Vec::with_capacity(n);
     for step in 0..n {
@@ -151,7 +157,7 @@ fn greedy_steps(model: &dyn ModelDef, prompt_ids: &[u32], n: usize, n_ctx: usize
         ids.push(t1.0);
         top2.push([t1, t2]);
         let pos = prompt_ids.len() + step;
-        logits = model.forward(&[t1.0], &[pos], 1, n_ctx);
+        logits = model.forward_graph_cached(&[t1.0], &[pos], 1, n_ctx, &mut cache);
     }
     GreedySteps { ids, top2 }
 }

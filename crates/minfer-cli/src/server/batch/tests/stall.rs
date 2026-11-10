@@ -32,16 +32,6 @@ impl FailingForward {
     }
 }
 impl ModelDef for FailingForward {
-    fn forward(
-        &self,
-        _tokens: &[u32],
-        _positions: &[usize],
-        _n_out: usize,
-        _n_ctx: usize,
-    ) -> Vec<f32> {
-        unreachable!("the batched engine calls forward_batch, never forward")
-    }
-
     fn forward_batch(
         &self,
         _batch: &minfer::advanced::Batch,
@@ -87,6 +77,9 @@ impl ModelDef for FailingForward {
     }
     fn n_vocab(&self) -> usize {
         4
+    }
+    fn max_seq_len(&self) -> usize {
+        4096
     }
     fn rope_style(&self) -> minfer::vec_ops::RopeStyle {
         minfer::vec_ops::RopeStyle::NonInterleaved

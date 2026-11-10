@@ -393,7 +393,7 @@ from the decode side.
 #### The prefill stage (`src/engine/generate.rs:` L75–126)
 
 The CLI builds `GenerateParams`, hands in the tokenizer and two closures, and
-calls `engine::generate` (`crates/minfer-cli/src/main.rs:1650-1669`). Everything below is inside
+calls `engine::generate` (`crates/minfer-cli/src/main.rs:1673`). Everything below is inside
 that call — the engine's, not the CLI's:
 
 ```rust

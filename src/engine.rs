@@ -6,16 +6,20 @@
 //! the message history). A host creates one `Engine` and as many sessions as it
 //! has conversations.
 //!
-//! **Status:** loading, `chat` and the raw `complete` continuation are here; the
-//! CLI's single-shot path uses `Engine::generate` and its conversation mode
-//! still drives `conversation::Conversation` directly (#800).
+//! **Status:** loading, `chat` and the raw `complete` continuation are here. The
+//! CLI's single-shot path calls the free [`generate`] because it threads a
+//! `SpecEngine`; `Engine::generate` is the embedder's entry — same loop, with the
+//! engine owning the run's KV cache (#799). The CLI's conversation mode still
+//! drives `conversation::Conversation` directly (#800).
 
 use std::path::Path;
+use std::sync::Mutex;
 
 pub use generate::{generate, CancelToken, GenerateOutcome, GenerateParams, SpecStatsOut};
 
 use crate::conversation::{self, ConvError, Conversation, GraphEngine, TurnOutcome, TurnParams};
 use crate::gguf::{GgufLoadError, GgufModel};
+use crate::graph::cache::GraphCache;
 use crate::graph::offload::OffloadRequest;
 use crate::models::{ModelDef, ModelLoadError, SpecialTokens};
 use crate::sampler::MirostatState;
@@ -68,6 +72,45 @@ pub struct Engine {
     template: Option<String>,
     /// The ChatML fallback was chosen (no template in the file, none supplied).
     chatml_notice: bool,
+    /// The single-shot path's KV state, owned **per engine** ([#799]).
+    ///
+    /// A `GraphCache`'s KV regions are persistent and sized once, so two models
+    /// or two `n_ctx` values must never share one. Sessions do not come through
+    /// here — each owns its own cache through `GraphEngine`.
+    ///
+    /// [#799]: https://github.com/yusiwen/minfer/issues/799
+    generate_cache: Mutex<GenerateCache>,
+}
+
+/// The single-shot path's cache and the context size it was built for.
+///
+/// A generation carries no sequence state, so its KV is a pure optimization:
+/// when the context size changes, dropping the cache and rebuilding costs one
+/// graph build and keeps the facade total instead of panicking in the
+/// allocator, which correctly refuses to resize live regions ([#799]).
+///
+/// [#799]: https://github.com/yusiwen/minfer/issues/799
+struct GenerateCache {
+    n_ctx: Option<usize>,
+    cache: GraphCache,
+}
+
+impl GenerateCache {
+    fn new() -> Self {
+        Self {
+            n_ctx: None,
+            cache: GraphCache::new(),
+        }
+    }
+
+    /// The cache sized for `n_ctx`, rebuilt when the size changed.
+    fn for_ctx(&mut self, n_ctx: usize) -> &mut GraphCache {
+        if self.n_ctx != Some(n_ctx) {
+            self.cache = GraphCache::new();
+            self.n_ctx = Some(n_ctx);
+        }
+        &mut self.cache
+    }
 }
 
 impl Engine {
@@ -130,6 +173,7 @@ impl Engine {
             tokenizer,
             template: startup.text,
             chatml_notice: startup.announce_chatml,
+            generate_cache: Mutex::new(GenerateCache::new()),
         })
     }
 
@@ -157,17 +201,30 @@ impl Engine {
     /// One single-shot generation on this engine (no session state): prefill
     /// `params.tokens`, decode up to `params.n_predict`, stream deltas through
     /// `emit`. The caller owns tokenization and prompt rendering.
+    ///
+    /// The engine owns the run's KV cache, so repeated runs on one engine build
+    /// their graph once; a changed `n_ctx` rebuilds it. Two engines never share
+    /// one, and two concurrent runs on the *same* engine serialize on it —
+    /// sessions are the independent-concurrency path.
     pub fn generate(
         &self,
         params: &GenerateParams<'_>,
         emit: &mut dyn FnMut(&[u8]),
         on_prefill: &mut dyn FnMut(&[f32], f64),
     ) -> GenerateOutcome {
+        let mut state = self.generate_cache.lock().unwrap();
+        // The same clamp `generate` applies, so the cache is keyed by the size
+        // the regions are actually built for.
+        let ctx = params
+            .n_ctx
+            .max(params.tokens.len())
+            .min(self.model.max_seq_len());
         generate(
             self.model.as_ref(),
             &self.tokenizer,
             None,
             params,
+            state.for_ctx(ctx),
             emit,
             on_prefill,
         )
