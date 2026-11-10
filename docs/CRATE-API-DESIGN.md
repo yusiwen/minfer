@@ -5,12 +5,15 @@ behind it is [ADR-0079](adr/0079-the-engine-is-a-crate-with-two-api-tiers.md); t
 can actually call today. The slices that built it are #763's S0–S10 (the epic's comments carry each
 landing), and the end of the page names each gap that was left, with the ticket that closed it.
 
+The **task-ordered guide** for a host is [Using the engine as a library](./LIBRARY-USAGE.md);
+this page is the contract that guide implements.
+
 ## The tiers
 
 | tier | surface | consumers | stability |
 | :--- | :--- | :--- | :--- |
 | **L2 facade** | `engine::{Engine, Session, SessionConfig}`, `Session::chat` (delta callback), `Engine::generate` (single-shot), `EngineError`, `ConversationSpec`/`TurnParams` | embedders, the CLI | documented; the only semver-relevant promise before 1.0 |
-| **L1 primitives** (`minfer::advanced`) | `ModelDef`, `GraphCache`, `GraphParams`, `Batch`, `KvFormat`, `Backend`/`BackendFilter`, `OffloadRequest`, `Tokenizer`, `SpecialTokens`, `SamplerConfig`/`MirostatMode`, `Grammar`, the conversation types, `SpecEngine` | the HTTP server, bench, tooling | public, **not** semver-stable before 1.0 |
+| **L1 primitives** (`minfer::advanced`) | `ModelDef`, `GraphCache`, `GraphParams`, `Batch`, `KvFormat`, `Backend`/`BackendFilter`, `OffloadRequest`, `Tokenizer`, `SpecialTokens`, `SamplerConfig`/`MirostatMode`, `Grammar`, `CancelToken` (`minfer::cancel`), the conversation types, `SpecEngine` | the HTTP server, bench, tooling | public, **not** semver-stable before 1.0 |
 | **L0 observation** (`observe`) | `live`, `trace`, `graph::json`, `optiming` — re-exported from `minfer::advanced` (`live` only with `observe`) | `viz`, `/metrics` | feature-gated; off in the default consumer build |
 
 The rule that keeps the tiers honest: an embedder that needs L1 is telling us the facade is missing a
@@ -90,7 +93,8 @@ forward entry (`forward_graph_cached`) takes it.
   this seam and exits 130 (#796). The conversation turn loop takes the same token as
   `TurnParams.cancel` and reports it as `TurnOutcome.cancelled`
   ([#800](https://github.com/yusiwen/minfer/issues/800)); there the CLI interrupts one turn and keeps
-  the session.
+  the session. One type, one home: `CancelToken` is `minfer::cancel`, and `engine` plus `advanced`
+  re-export it.
 
 ## Features
 
@@ -190,9 +194,11 @@ after the move.
 ## Non-goals
 
 - No inference-semantics change; the identity gates are the guard.
-- No whole-module `pub`; only the tiers are exported. The one deliberate exception is the
-  `test-hooks` feature, which exposes test-only observers to a dependent package's tests
-  (ADR-0082) and is off in every build but that package's test build.
+- No semver promise outside the tiers. The crate root exports every module the project's own
+  packages consume (they live in this workspace), but only `engine`, `advanced` and `config`
+  carry a contract. The one deliberate addition is the `test-hooks` feature, which exposes
+  test-only observers to a dependent package's tests (ADR-0082) and is off in every build but
+  that package's test build.
 - The server is not rewritten onto the facade.
 - `deny(warnings)` does not move into the library.
 
