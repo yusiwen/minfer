@@ -207,12 +207,13 @@ CUDA 12.8 vs 13 notes), and cudart linking details — lives in
 
 ## Use as a library
 
-The inference engine is a library (`minfer`); the binary, the HTTP server and the
-visualizer are its first consumers.
+The inference engine is the library crate `minfer`; the binary, the HTTP server and the
+visualizer are the separate `crates/minfer-cli` package, which depends on it (ADR-0082).
 
 ```toml
 [dependencies]
-minfer = { version = "0.0.9", default-features = false }
+# Not on crates.io yet: depend on a checkout until the first publish.
+minfer = { path = "../minfer", default-features = false }
 ```
 
 ```rust
@@ -226,6 +227,7 @@ let params = TurnParams {
     n_predict: 64,
     sampler: SamplerConfig::default(),
     stop_strings: Vec::new(),
+    cancel: None,
 };
 let mut out = Vec::new();
 session.chat("hello", &params, &mut |delta| out.extend_from_slice(delta))?;
@@ -236,22 +238,25 @@ Beyond a chat turn, the facade also carries what a host needs to drive it:
 - `Session::complete(tokens, …)` — a **raw continuation**: it prefills only the tokens you pass (no
   template render, no history entry) and reports them in `TurnOutcome::prefill_tokens`, which is what
   makes a long prompt feedable in pieces.
-- `GenerateParams.cancel` (a `CancelToken`) — a caller-side stop, checked **between tokens** and
-  never inside a forward pass; the outcome reports `cancelled`.
+- `TurnParams.cancel` / `GenerateParams.cancel` (a `CancelToken`, `minfer::cancel`) — a caller-side
+  stop for a turn or a single-shot run, checked **between tokens** and never inside a forward pass;
+  the outcome reports `cancelled`.
 - `Engine::load_from_bytes(bytes)` — a model the host already holds, loaded without a temp file and
   without copying the buffer (every weight stays a range of it).
 
-Their contracts — and their limits — are in
+The task-ordered guide — features, the three loaders, sessions, cancellation, concurrency, the
+single-shot path and the advanced tier — is
+[`docs/LIBRARY-USAGE.md`](docs/LIBRARY-USAGE.md). The contracts and limits behind it are in
 [`docs/CRATE-API-DESIGN.md`](docs/CRATE-API-DESIGN.md): §Sessions, §Failures, and §Ownership and
 lifetime; the bytes loader's decision record is
 [ADR-0081](docs/adr/0081-a-tensor-s-bytes-are-a-backing-handle-plus-a-range.md).
 
-`examples/embed.rs` is this program. The public tiers (`engine` facade,
+`examples/embed.rs` is this program, compiled by CI. The public tiers (`engine` facade,
 `advanced` primitives, `config`) and their stability promise are in
 [`docs/CRATE-API-DESIGN.md`](docs/CRATE-API-DESIGN.md); the decision behind them
 is [ADR-0079](docs/adr/0079-the-engine-is-a-crate-with-two-api-tiers.md).
-`default-features = false` builds the engine without the server, the tooling or
-the visualizer; `cargo build --release` still produces the full binary.
+`default-features = false` builds the engine without the Metal backend;
+`cargo build --release` still produces the full binary.
 
 ## Usage
 

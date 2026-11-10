@@ -7,6 +7,7 @@
 - [Features](./FEATURES.md)
 - [Build](./BUILD.md)
 - [Usage](./USAGE.md)
+- [Using the engine as a library](./LIBRARY-USAGE.md)
 - [Support Matrix](./SUPPORT-MATRIX.md)
 
 # Architecture
