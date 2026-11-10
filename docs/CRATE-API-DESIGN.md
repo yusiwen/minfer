@@ -139,6 +139,7 @@ let params = TurnParams {
     n_predict: 64,
     sampler: SamplerConfig::default(),
     stop_strings: Vec::new(),
+    cancel: None,
 };
 let mut out = Vec::new();
 session.chat("hello", &params, &mut |delta| out.extend_from_slice(delta))?;
