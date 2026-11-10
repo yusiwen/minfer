@@ -503,7 +503,7 @@ pub fn recent_window(tokens: &[u32], last_n: usize) -> Vec<u32> {
     const REPEAT_LAST_N: usize = 64;
     let mut prev_tokens = sampler::recent_window(&input_ids, REPEAT_LAST_N);
 
-// src/main.rs:1927-1930 — every sampled token enters the window
+// src/main.rs:1976-1979 — every sampled token enters the window
         generated.push(sampled.token_id);
         prev_tokens.push(sampled.token_id);
         if prev_tokens.len() > REPEAT_LAST_N {
@@ -925,7 +925,7 @@ run even when the stochastic stages are skipped.
 - **The sampler destroys its input buffer** (it holds probabilities after
   `sample_temperature`). The caller-side invariant that makes this safe:
   `logits` is reassigned from the next forward before it is ever read
-  again (`crates/minfer-cli/src/main.rs:1955`). Reading `logits` between sample and reassign
+  again (`crates/minfer-cli/src/main.rs:2004`). Reading `logits` between sample and reassign
   would read probabilities and call them logits.
 
 ## 4. Observe & verify

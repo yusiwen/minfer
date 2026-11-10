@@ -29,7 +29,8 @@
 > stderr 报告 `[turn N] prefill X tokens, generated Y tokens`（增量性断言用）。README 增补
 > 会话用法。测试：3 个快路径进程级测试（参数校验，默认跑）+ 4 个 `#[ignore]` 真实模型会话测试
 > （`tests/conversation_cli.rs`，stdin 管道脚本化会话；标量 CPU 上 ~10 分钟）。决策点 3 落地：
-> **MVP 不做 Ctrl+C 打断**（EOF 退出；Ctrl+C 走默认终止），信号语义留待后续。
+> **MVP 不做 Ctrl+C 打断**（EOF 退出；Ctrl+C 走默认终止），信号语义留待后续 —— 已在
+> Revision 6 落地（[#800](https://github.com/yusiwen/minfer/issues/800)）。
 >
 > **Revision 5 (2026-09-16) — 溢出路径升级为 KV 上下文平移（C2）。** §5.7 的"未来项"已落地：
 > `Conversation::user_turn` 溢出时先用 `Engine::kv_rm` 物理删除被丢弃回合的 KV 行段（保留
@@ -49,6 +50,15 @@
 >   不序列化 KV state）；退出时落盘。
 > - 测试：+4 单测（溢出截断/单条超长/session JSON 往返/load_history 重灌）；+2 `#[ignore]`
 >   真实模型进程测试（溢出续聊、session save→load→续聊往返）。全量 142 passed。
+>
+> **Revision 6 (2026-11-10) — Ctrl+C 打断落地（[#800](https://github.com/yusiwen/minfer/issues/800)）。**
+> 决策点 3 关闭：`TurnParams.cancel` 携带 `CancelToken`，两条生成循环（普通 / 投机）在
+> token（轮）边界各检查一次，取消以 `TurnOutcome.cancelled` 上报，**不是** `hit_n_predict`。
+> 语义按 llama.cpp：生成中第一次 Ctrl-C 打断本回合（部分答案留在历史、置
+> `need_insert_eot`，下一回合先补 EOT 再继续），第二次 Ctrl-C 或空闲时 Ctrl-C 退出 130。
+> REPL 每次回合发一个新 token（`CancelToken` 不重置）。测试：+5 单测（`src/conversation/
+> tests/cancel.rs`：普通回合、下一回合可续、预取消、`complete_tokens`、投机轮）；
+> 变异：去掉任一处检查，对应测试跑到 `n_predict` 而红。
 
 ---
 
@@ -666,8 +676,8 @@ let mut child = Command::new(env!("CARGO_BIN_EXE_minfer"))
 1. **`--cnv` 显式开启 vs 有模板自动开启**（llama.cpp 默认 auto）。
    ✅ 已定：显式开启（MVP），保持单发用法兼容；auto 未来可加。
 2. **溢出策略**：截断 + 重灌（✅ 已实现，Phase 3）vs KV 平移（Phase 4 可选）vs 直接报错。
-3. **Ctrl+C 打断**：⚠️ 未实现（MVP 决策：EOF 退出；Ctrl+C 走默认终止）。需要信号处理
-   （`#[cfg(unix)]` unsafe handler 或 `libc`）；打断语义列为后续。
+3. **Ctrl+C 打断**：✅ 已实现（Revision 6，[#800](https://github.com/yusiwen/minfer/issues/800)）：
+   `TurnParams.cancel` + `TurnOutcome.cancelled`，REPL 第一次 Ctrl-C 打断回合、第二次退出 130。
 4. **解码循环是否与 server 共享**（抽 `src/generate.rs`）：⚠️ 未做——MVP 复制循环骨架
    （低风险），统一重构放 Phase 4。
 5. **会话持久化**：✅ 已实现（Phase 3，`--session`：仅 messages JSON + 全量重灌，不存 KV）。

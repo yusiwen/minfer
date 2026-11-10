@@ -779,6 +779,7 @@ fn cuda_conversation_multiturn_reuse() {
             ..crate::sampler::SamplerConfig::default()
         },
         stop_strings: Vec::new(),
+        cancel: None,
     };
     use crate::conversation::Engine as _;
 

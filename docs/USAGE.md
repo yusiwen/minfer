@@ -152,6 +152,13 @@ the next token. An embedding host gets the same seam as `GenerateParams.cancel` 
 `minfer::engine::CancelToken`), and `GenerateOutcome.cancelled` says the run stopped that way
 ([#796](https://github.com/yusiwen/minfer/issues/796)).
 
+`--cnv` takes the same seam with one difference, because a REPL outlives a turn: the **first**
+Ctrl-C cancels the running turn (the partial answer stays, the reply is recorded, and the next turn
+continues from it — it writes the pending end-of-turn marker first), the prompt comes back, and a
+**second** Ctrl-C — or one at the `> ` prompt, where no turn is running — exits **130**
+([#800](https://github.com/yusiwen/minfer/issues/800)). An embedding host drives a turn the same
+way: `TurnParams.cancel` carries the token and `TurnOutcome.cancelled` reports it.
+
 ## Chat templates and tokenizer
 
 Chat rendering uses the model's own `tokenizer.chat_template` from the GGUF. The

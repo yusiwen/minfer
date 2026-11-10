@@ -24,7 +24,7 @@ mod server;
 mod spec_verify;
 mod tooling;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Conversation-mode color behavior (CLI-CONVERSATION-PLAN.md §5.6).
@@ -1807,6 +1807,55 @@ fn install_ctrl_c_cancel(token: minfer::engine::CancelToken) {
     });
 }
 
+/// Cancel the running **turn** when SIGINT arrives (#800).
+///
+/// The single-shot path installs one token for a run that then ends (#796). A
+/// REPL keeps going, so the token is per turn: this router holds the *current*
+/// turn's token and flips it on the first Ctrl-C, which stops that turn at its
+/// next token boundary. A second Ctrl-C while the same turn is still unwinding —
+/// or one at the prompt, where no turn owns the slot — exits 130, which is the
+/// convention the REPL inherits from every other shell.
+fn install_ctrl_c_cancel_router(slot: Arc<Mutex<Option<minfer::engine::CancelToken>>>) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                match slot.lock().unwrap().take() {
+                    Some(token) => token.cancel(),
+                    None => std::process::exit(130),
+                }
+            }
+        });
+    });
+}
+
+/// Claim the cancel slot for one turn and build that turn's params.
+///
+/// A fresh token per turn, because [`CancelToken`](minfer::engine::CancelToken)
+/// never resets: a cancelled token stays cancelled, so reusing one would cancel
+/// every later turn instantly.
+fn begin_turn(
+    slot: &Arc<Mutex<Option<minfer::engine::CancelToken>>>,
+    tp: &conversation::TurnParams,
+) -> conversation::TurnParams {
+    let token = minfer::engine::CancelToken::new();
+    *slot.lock().unwrap() = Some(token.clone());
+    conversation::TurnParams {
+        n_predict: tp.n_predict,
+        sampler: tp.sampler.clone(),
+        stop_strings: tp.stop_strings.clone(),
+        cancel: Some(token),
+    }
+}
+
 /// Colors the Qwen3-style `<think>…</think>` block gray so the reasoning
 /// stands apart from the normal answer. Streaming-safe: the markers may be
 /// split across arbitrary token/chunk boundaries. `exit_code` restores the
@@ -2067,7 +2116,14 @@ fn run_conversation(
         n_predict: params.n_predict,
         sampler: params.sampler_config(),
         stop_strings: params.stop_strings.clone(),
+        cancel: None,
     };
+    // #800: Ctrl-C interrupts the running turn and the REPL keeps its session;
+    // a second Ctrl-C (or one at the prompt) exits 130. The slot is empty
+    // between turns, which is how the router tells the two apart.
+    let cancel_slot: Arc<Mutex<Option<minfer::engine::CancelToken>>> = Arc::new(Mutex::new(None));
+    install_ctrl_c_cancel_router(cancel_slot.clone());
+    let mut exit_code = 0;
     let color_on = color_mode.enabled();
     let mut turn = 0usize;
 
@@ -2123,7 +2179,10 @@ fn run_conversation(
                         let _ = std::io::stdout().write_all(b);
                         let _ = std::io::stdout().flush();
                     });
-                    let r = conv.regen_turn(&*tokenizer, &tp, &mut engine, &mut |b| hi.feed(b));
+                    let turn_tp = begin_turn(&cancel_slot, &tp);
+                    let r =
+                        conv.regen_turn(&*tokenizer, &turn_tp, &mut engine, &mut |b| hi.feed(b));
+                    *cancel_slot.lock().unwrap() = None;
                     hi.finish();
                     if color_on {
                         print!("\x1b[0m");
@@ -2133,8 +2192,19 @@ fn run_conversation(
                         Ok(out) => {
                             turn += 1;
                             println!();
-                            eprintln!("[turn {turn}] regen: prefill {} tokens, generated {} tokens in {:.2}s",
-                                out.prefill_tokens, out.tokens_generated, t0.elapsed().as_secs_f64());
+                            if out.cancelled {
+                                eprintln!(
+                                    "\n[cancelled] SIGINT — {} of {} requested tokens",
+                                    out.tokens_generated, tp.n_predict
+                                );
+                                if single_turn {
+                                    exit_code = 130;
+                                    break;
+                                }
+                            } else {
+                                eprintln!("[turn {turn}] regen: prefill {} tokens, generated {} tokens in {:.2}s",
+                                    out.prefill_tokens, out.tokens_generated, t0.elapsed().as_secs_f64());
+                            }
                         }
                         Err(e) => eprintln!("\n[regen failed: {e}]"),
                     }
@@ -2160,7 +2230,11 @@ fn run_conversation(
             let _ = std::io::stdout().write_all(b);
             let _ = std::io::stdout().flush();
         });
-        let result = conv.user_turn(&input, &*tokenizer, &tp, &mut engine, &mut |b| hi.feed(b));
+        let turn_tp = begin_turn(&cancel_slot, &tp);
+        let result = conv.user_turn(&input, &*tokenizer, &turn_tp, &mut engine, &mut |b| {
+            hi.feed(b)
+        });
+        *cancel_slot.lock().unwrap() = None;
         hi.finish();
         if color_on {
             print!("\x1b[0m");
@@ -2170,6 +2244,21 @@ fn run_conversation(
             Ok(out) => {
                 turn += 1;
                 println!();
+                if out.cancelled {
+                    // #800: the partial answer is already on stdout and the
+                    // turn is in the history, so the conversation continues
+                    // (with `-st` there is nothing to continue, so the process
+                    // exits 130 like the single-shot path).
+                    eprintln!(
+                        "\n[cancelled] SIGINT — {} of {} requested tokens",
+                        out.tokens_generated, tp.n_predict
+                    );
+                    if single_turn {
+                        exit_code = 130;
+                        break;
+                    }
+                    continue;
+                }
                 eprintln!(
                     "[turn {turn}] prefill {} tokens, generated {} tokens in {:.2}s",
                     out.prefill_tokens,
@@ -2194,7 +2283,7 @@ fn run_conversation(
     }
     save_session(&conv, &mut engine);
     eprintln!("\n---\nconversation ended after {turn} turn(s)");
-    0
+    exit_code
 }
 
 /// C5 S2: resume `--session FILE` from its KV companion, when the companion describes
