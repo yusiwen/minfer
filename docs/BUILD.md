@@ -177,7 +177,10 @@ crate: `cargo test --release --no-run` on the Linux CPU job (implicitly), `cargo
 runner has no Metal device ([#674](https://github.com/yusiwen/minfer/issues/674), measured — 13
 device tests fail with no `MPS:` line in the log), so the device gate is
 `scripts/mac_gate.sh` on a Mac, and a Metal-path PR must paste its record into the PR body
-([#678](https://github.com/yusiwen/minfer/issues/678)). Those
+([#678](https://github.com/yusiwen/minfer/issues/678)). A self-hosted runner would replace that
+manual record: [`scripts/install_mac_runner.sh`](../scripts/install_mac_runner.sh) installs one on an
+Apple Silicon Mac, and [#674](https://github.com/yusiwen/minfer/issues/674) tracks the job, the frozen
+baseline and the branch-protection step — none of it is enabled yet. Those
 three jobs are skipped when the change classifier finds no code change (ADR-0025): a docs-only
 change runs the doc gates instead, and the suite still runs whenever the suite ledger moves. Since the KV storage format became **per engine**
 ([#99](https://github.com/yusiwen/minfer/issues/99)) the parallel harness no
