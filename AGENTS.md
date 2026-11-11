@@ -100,7 +100,7 @@ curl -s http://127.0.0.1:8080/metrics                              # F8: Prometh
 - Batching default (E6): `chat::batch_mode(requested, model.device())` — pure and unit-tested, so CI covers the matrix. `ModelDef::device()` (`Device::{Cpu,Metal,Cuda}`) is the single authority for "the device participates", shared with the graph builder's `CParams.gpu`.
 - Full CLI + options: `docs/USAGE.md`. Build details (CUDA ccbin/arch/cudart) and the **devShell contents** (pinned `rust`, **mdBook 0.4.37**, `uv`, pre-commit; `.envrc` = `use flake`): `docs/BUILD.md` §"The devShell".
 - Multi-part GGUF: written by `minfer split` (F6) as `{stem}-NNNNN-of-MMMMM.gguf`, all parts parsed into one merged tensor index. Details: [`docs/GGUF-TOOLING.md`](docs/GGUF-TOOLING.md) ("The multi-part convention").
-- **Nested worktrees**: `.worktrees/<scope>` via `scripts/agent_worktree.sh new|rm|list`, with its **own** `target/` (never point `CARGO_TARGET_DIR` at the outer tree); full rules and per-failure records: global `~/.dsh/AGENTS.md` §"Parallel Work: Nested Worktrees".
+- **Nested worktrees**: `.worktrees/<scope>` via `scripts/agent_worktree.sh new|rm|list`, with its **own** `target/` (never point `CARGO_TARGET_DIR` at the outer tree); full procedure and per-failure records: the global `nested-worktree` skill.
 
 ## Support
 
