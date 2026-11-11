@@ -297,8 +297,10 @@ runner's VM exposes no GPU. The job therefore stays `build-macos` (compile check
 only), and the rule for anyone reading it is: *a green `build-macos` proves the
 crate and the test target compile, not that a kernel ran.* The Metal correctness
 gate is the local run recorded below; a real CI gate needs a self-hosted runner on
-a Mac, which [#674] tracks and nobody has asked for yet. The same failure is what
-produced [#676] (the two unavailability causes now print differently).
+a Mac, which [#674] tracks — [`scripts/install_mac_runner.sh`](../scripts/install_mac_runner.sh)
+installs the agent, the per-job ephemeral re-registration and the `caffeinate` wrapper,
+and no runner is registered yet, so the record below is still the gate. The same
+failure is what produced [#676] (the two unavailability causes now print differently).
 
 **A Metal-path PR must run the whole gate on the Mac, and record it** (#678). The
 trigger is path-based and checked by the classifier, not by judgement:
