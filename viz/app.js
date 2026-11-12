@@ -70,6 +70,9 @@ const state = {
   stepData: null,     // Map nodeId -> {stats, values, stride, n, dtype}
   live: false,        // P3 live (SSE) mode
   p2: null,
+  // Colour scheme ramp, refreshed from CSS by readTheme() (viz/theme.js owns
+  // the values; these are the graphite defaults for a cold start).
+  theme: { h: 36, s: 62, lo: 52, hi: 86, hs: 50, hlo: 18, hhi: 80 },
   // Flow view (semantic reasoning pipeline)
   viewMode: "graph",      // "graph" (op grid) | "flow"
   flow: null,             // built in buildFlow()
@@ -80,7 +83,63 @@ const state = {
 };
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const NODE_H = 30, ROW_H = 108, X_PAD = 76, HGAP = 26;
+const NODE_H = 30, ROW_H = 88, X_PAD = 76, HGAP = 26;
+
+/* Transport glyphs. Inline so the page stays dependency-free and the button
+ * keeps one stroke weight with the rest of the icons (index.html carries the
+ * same paths in its initial markup). */
+const ICON_PLAY =
+  '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">' +
+  '<path d="M5.4 3.6v8.8a.6.6 0 0 0 .92.5l7-4.4a.6.6 0 0 0 0-1l-7-4.4a.6.6 0 0 0-.92.5Z" fill="currentColor"/></svg>';
+const ICON_PAUSE =
+  '<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">' +
+  '<rect x="4.6" y="3.5" width="2.1" height="9" rx="1" fill="currentColor"/>' +
+  '<rect x="9.3" y="3.5" width="2.1" height="9" rx="1" fill="currentColor"/></svg>';
+
+/* Data magnitude -> one hue: dim (small) to bright (large). A single-hue ramp
+ * keeps the value readable and reserves hue for meaning. The hue and the two
+ * ends come from the colour scheme's custom properties (viz/theme.js), so a
+ * scheme switch re-tints the graph without touching this code. */
+function magnitudeFill(t) {
+  const th = state.theme;
+  return `hsl(${th.h}, ${th.s}%, ${(th.lo + t * (th.hi - th.lo)).toFixed(1)}%)`;
+}
+function magnitudeSteps(t) {
+  const th = state.theme;
+  return `hsl(${th.h}, ${th.hs}%, ${(th.hlo + t * (th.hhi - th.hlo)).toFixed(0)}%)`;
+}
+
+/* Read the ramp out of the active scheme. Guarded for the stubbed DOM the
+ * headless gate boots: no getComputedStyle there, so the defaults stand. */
+function refreshThemeTints() {
+  readTheme();
+  if (!state.nodes.length) return;
+  clearTints();
+  if (state.cursor >= 0) syncExecutionState();
+  // The inspector's heatmap is generated markup, so it is re-rendered rather
+  // than re-tinted; the open node (or the step summary) stays where it was.
+  if (state.selected) renderPanel(state.selected);
+  else if (state.trace) {
+    const phase = state.phases[state.phaseIdx];
+    const step = phase && phase.steps && phase.steps[state.stepIdx];
+    if (step) renderStepPanel(step);
+  }
+}
+
+function readTheme() {
+  const root = typeof document !== "undefined" ? document.documentElement : null;
+  const cs = root && typeof getComputedStyle === "function" ? getComputedStyle(root) : null;
+  const num = (name, fallback) => {
+    if (!cs) return fallback;
+    const v = parseFloat(cs.getPropertyValue(name));
+    return Number.isFinite(v) ? v : fallback;
+  };
+  state.theme = {
+    h: num("--ramp-h", 36), s: num("--ramp-s", 62),
+    lo: num("--ramp-lo", 52), hi: num("--ramp-hi", 86),
+    hs: num("--heat-s", 50), hlo: num("--heat-lo", 18), hhi: num("--heat-hi", 80),
+  };
+}
 
 /* ---------------- 工具 ---------------- */
 
@@ -245,11 +304,31 @@ function layout() {
   return pos;
 }
 
+/* Put one of the two frame markers around a node (or hide it). Both are single
+ * shared elements, so a step moves a frame instead of restyling a box. */
+function placeRing(kind, id) {
+  const r = state.rings && state.rings[kind];
+  if (!r) return;
+  const g = id === null || id === undefined ? null : nodeEls[id];
+  const row = g ? state.rows[state.rowOf.get(id)] : null;
+  const n = g ? state.byId.get(id) : null;
+  if (!g || !row || !n || g.classList.contains("hidden")) { r.style.display = "none"; return; }
+  const pad = kind === "cur" ? 2 : 4;
+  r.setAttribute("x", n._x - pad);
+  r.setAttribute("y", row.y - pad);
+  r.setAttribute("width", n._w + pad * 2);
+  r.setAttribute("height", NODE_H + pad * 2);
+  r.setAttribute("rx", 4 + pad);
+  r.style.display = "";
+}
+
 /* ---------------- 渲染 ---------------- */
 
 const gNodes = document.getElementById("nodes");
 const gEdges = document.getElementById("edges");
 const viewport = document.getElementById("viewport");
+// Frames for the cursor and the selection, in their own layer above the nodes.
+const gMarkers = el("g", { id: "markers", "pointer-events": "none" }, viewport);
 const canvas = document.getElementById("canvas");
 
 let nodeEls = [], edgeEls = [];
@@ -262,16 +341,22 @@ function renderGraph() {
 function renderGraphGrid() {
   gNodes.textContent = ""; gEdges.textContent = "";
   nodeEls = []; edgeEls = [];
+  state.rings = {};
   const pos = layout();
   const n = state.nodes.length;
 
-  // 行标签
+  // 行标签（标签 + 折叠箭头同一个 g，同一个点击目标）
   for (const r of state.rows) {
-    const t = el("text", {
-      x: 6, y: r.y + NODE_H / 2 + 4, class: "row-label",
-    }, gNodes);
-    t.textContent = r.name + (r.collapsed ? " ▸" : " ▾");
-    t.addEventListener("click", () => {
+    const cy = r.y + NODE_H / 2 + 4;
+    const head = el("g", { class: "row-head" }, gNodes);
+    const t = el("text", { x: 16, y: cy, class: "row-label" }, head);
+    t.textContent = r.name;
+    el("path", {
+      class: "row-chevron",
+      d: "M0 1 L3.5 4.5 L0 8",
+      transform: `translate(4 ${cy - 11}) rotate(${r.collapsed ? 0 : 90} 3.5 4.5)`,
+    }, head);
+    head.addEventListener("click", () => {
       r.collapsed = !r.collapsed;
       renderGraph(); applyFilters(); updateStepInfo(); fit();
     });
@@ -285,7 +370,10 @@ function renderGraphGrid() {
     const g = el("g", { class: "node-group" }, gNodes);
     g.setAttribute("data-id", node.id);
     const w = p.w, cx = p.x + w / 2;
-    const rect = el("rect", { class: "node-rect", x: p.x, y: p.y - NODE_H / 2, width: w, height: NODE_H, rx: 6 }, g);
+    const rect = el("rect", { class: "node-rect", x: p.x, y: p.y - NODE_H / 2, width: w, height: NODE_H, rx: 4 }, g);
+    // Backend marker: a 2px rule inside the node's top edge. It stays legible
+    // on both the idle and the lit fill, which a border colour did not.
+    el("rect", { class: "node-stripe", x: p.x + 1, y: p.y - NODE_H / 2 + 1, width: w - 2, height: 2, rx: 1 }, g);
     el("text", { class: "node-label", x: cx, y: p.y + 3.5 }, g).textContent = p.label;
     el("text", { class: "node-sublabel", x: cx, y: p.y + NODE_H / 2 + 11 }, g).textContent = shortName(node.name);
     const title = el("title", {}, g);
@@ -293,6 +381,16 @@ function renderGraphGrid() {
     g.addEventListener("click", ev => { ev.stopPropagation(); selectNode(node.id); });
     nodeEls[node.id] = g;
   }
+
+  // Markers live above the nodes: a frame drawn *outside* the box stays visible
+  // on a lit fill, where a same-colour border disappeared.
+  gMarkers.textContent = "";
+  state.rings = {
+    cur: el("rect", { class: "cursor-ring" }, gMarkers),
+    sel: el("rect", { class: "select-ring" }, gMarkers),
+  };
+  placeRing("cur", state.cursor >= 0 ? state.order[state.cursor] : null);
+  placeRing("sel", state.selected);
 
   // 边
   for (const e of state.edges) {
@@ -320,9 +418,14 @@ function renderGraphGrid() {
   }
 }
 
+// The row label already carries the block ("blk.0"), so the node sublabel only
+// needs the tail that distinguishes one weight from another.
 function shortName(name) {
-  const s = String(name);
-  return s.length > 26 ? s.slice(0, 24) + "…" : s;
+  const s = String(name)
+    .replace(/^matmul_/, "")
+    .replace(/^blk\.\d+\./, "")
+    .replace(/\.(weight|bias)$/, "");
+  return s.length > 12 ? s.slice(0, 11) + "…" : s;
 }
 
 function edgePath(s, d) {
@@ -347,7 +450,7 @@ const STAGE_NAME = {
 const STAGE_ORDER = { norm1: 1, attn: 2, add_attn: 3, norm2: 4, ffn: 5, add_ffn: 6, other: 7, add: 3 };
 
 const CHIP_W = 74, CHIP_H = 16, CHIP_GX = 6, CHIP_GY = 4, CHIPS_PER_ROW = 2;
-const SEG_W = 200, SEG_HDR = 44, SEG_GAP = 64, STAGE_GAP = 24, BOX_PAD = 10, LAYER_GAP = 34, LABEL_H = 18;
+const SEG_W = 200, SEG_HDR = 46, SEG_GAP = 64, STAGE_GAP = 24, BOX_PAD = 10, LAYER_GAP = 34, LABEL_H = 18;
 const STAGE_MIN_W = 130, LAYER_PAD = 14;
 
 /* 一个 op 属于哪个语义阶段（依赖 meta.weight + op）。 */
@@ -492,20 +595,24 @@ function flowAggregate(ids, stageKey) {
     : (ncuda && ncuda >= ncpu) ? "cuda"
     : (ncpu ? "cpu" : "none");
   let sub = `${(ids || []).length} op${(ids || []).length !== 1 ? "s" : ""}`;
-  if (stageKey === "attn") sub += ` · h=${nhead} hd=${hd}`;
-  if (stageKey === "ffn") sub += ` · nf=${nf}`;
-  if (stageKey === "embed") sub += ` · vocab=${vocab}`;
+  // Only append a dimension the export actually carries: "· nf=" with an empty
+  // value looks like a rendering bug.
+  if (stageKey === "attn" && nhead !== "" && hd !== "") sub += ` · h=${nhead} hd=${hd}`;
+  if (stageKey === "ffn" && nf !== "") sub += ` · nf=${nf}`;
+  if (stageKey === "embed" && vocab !== "") sub += ` · vocab=${vocab}`;
   if (stageKey === "logits") sub += ` · in×out=${dim}`;
   if (!sub && kind) sub = kind;
   return { backend, sub, dim };
 }
 
 /* 每个算子在 flow 里的一个小框（可点选，复用现有 inspector）。 */
-function flowOp(id, x, y, w, h) {
+function flowOp(id, x, y, w, h, parent) {
   const n = state.byId.get(id);
   const label = OP_LABEL[n.op] || n.op;
   const fused = n.op.startsWith("fused") || n.op === "swiglu";
-  const g = el("g", { class: "flow-op backend-" + (n.backend || "none") + (fused ? " fused" : "") }, gNodes);
+  // Inside the stage box's group on purpose: a chip must follow the box's lit
+  // state in CSS (a sibling would need JS to mirror it on every step).
+  const g = el("g", { class: "flow-op backend-" + (n.backend || "none") + (fused ? " fused" : "") }, parent || gNodes);
   g.setAttribute("data-id", id);
   el("rect", { x, y, width: w, height: h, rx: 4 }, g);
   el("text", { class: "flow-op-label", x: x + w / 2, y: y + h / 2 + 3 }, g).textContent = label;
@@ -521,9 +628,9 @@ function flowContainer(key, x, y, w, h, o) {
   const g = el("g", { class: "flow-box backend-" + (o.backend || "none") }, gNodes);
   g.setAttribute("data-block", key);
   const rect = el("rect", { class: "flow-box-rect", x, y, width: w, height: h, rx: 8 }, g);
-  el("text", { class: "flow-box-label", x: x + BOX_PAD, y: y + 15 }, g).textContent = o.label;
-  if (o.sub) el("text", { class: "flow-box-sub", x: x + BOX_PAD, y: y + 28 }, g).textContent = o.sub;
-  if (o.dim) el("text", { class: "flow-dim", x: x + BOX_PAD, y: y + 38 }, g).textContent = o.dim;
+  el("text", { class: "flow-box-label", x: x + BOX_PAD, y: y + 16 }, g).textContent = o.label;
+  if (o.sub) el("text", { class: "flow-box-sub", x: x + BOX_PAD, y: y + 30 }, g).textContent = o.sub;
+  if (o.dim) el("text", { class: "flow-dim", x: x + BOX_PAD, y: y + 41 }, g).textContent = o.dim;
   const title = el("title", {}, g);
   title.textContent = `${o.label}${(o.members && o.members.length) ? ` · ${o.members.length} ops` : ""}${o.sub ? `\n${o.sub}` : ""}`;
   if (o.onClick) g.addEventListener("click", ev => { ev.stopPropagation(); o.onClick(); });
@@ -569,13 +676,14 @@ function drawStageBox(st, x, y, layer) {
   const geom = stageGeom(st, x, y);
   const w = geom.w, h = geom.h;
   const g = flowContainer(key, x, y, w, h, {
-    label: STAGE_NAME[st.key] || st.key, sub: agg.sub, dim: agg.dim ? `in×out ${agg.dim}` : "",
+    // The sub already names in×out when there is one; a second line would repeat it.
+    label: STAGE_NAME[st.key] || st.key, sub: agg.sub, dim: "",
     backend: agg.backend, members: ids, onClick: () => flowSelectBlock(key),
   });
   let cx = x + BOX_PAD, cy = y + SEG_HDR;
   ids.forEach((id, i) => {
     if (i > 0 && i % CHIPS_PER_ROW === 0) { cx = x + BOX_PAD; cy += CHIP_H + CHIP_GY; }
-    flowOp(id, cx, cy, CHIP_W, CHIP_H);
+    flowOp(id, cx, cy, CHIP_W, CHIP_H, g);
     cx += CHIP_W + CHIP_GX;
   });
   return { key, x, y, w, h };
@@ -610,8 +718,8 @@ function drawSegBox(seg, x, y) {
   const chipH = rows ? rows * (CHIP_H + CHIP_GY) - CHIP_GY : 0;
   const h = SEG_HDR + chipH + BOX_PAD;
   const w = Math.max(SEG_W, CHIPS_PER_ROW * (CHIP_W + CHIP_GX) - CHIP_GX + BOX_PAD * 2);
-  const dimTxt = seg.synthetic ? "" : (agg.dim ? `in×out ${agg.dim}` : "");
-  flowContainer(key, x, y, w, h, {
+  const dimTxt = seg.synthetic || /in×out/.test(agg.sub) ? "" : (agg.dim ? `in×out ${agg.dim}` : "");
+  const g = flowContainer(key, x, y, w, h, {
     label: seg.name, sub: seg.synthetic ? (seg.caption || "sample") : agg.sub,
     dim: dimTxt, backend: agg.backend, members: ids, onClick: () => flowSelectBlock(key),
   });
@@ -619,7 +727,7 @@ function drawSegBox(seg, x, y) {
     let cx = x + BOX_PAD, cy = y + SEG_HDR;
     ids.forEach((id, i) => {
       if (i > 0 && i % CHIPS_PER_ROW === 0) { cx = x + BOX_PAD; cy += CHIP_H + CHIP_GY; }
-      flowOp(id, cx, cy, CHIP_W, CHIP_H);
+      flowOp(id, cx, cy, CHIP_W, CHIP_H, g);
       cx += CHIP_W + CHIP_GX;
     });
   }
@@ -632,14 +740,14 @@ function drawLayersSegment(seg, x, y) {
     const agg = flowAggregate(seg.allIds);
     const key = "seg:layers";
     flowContainer(key, x, y, w, h, {
-      label: `${seg.name}  × ${n}`, sub: agg.sub, dim: "click to expand",
+      label: `${seg.name}  × ${n}`, sub: agg.sub, dim: "expand",
       backend: agg.backend, members: seg.allIds || [],
       onClick: () => toggleFlowLayers(),
     });
     return { key, x, y, w, h };
   }
   const label = el("text", { class: "flow-layer-label", x: x + BOX_PAD, y: y + 4 }, gNodes);
-  label.textContent = `${seg.name}  × ${seg.count}  (click to collapse)`;
+  label.textContent = `${seg.name}  × ${seg.count}  (collapse)`;
   label.classList.add("flow-clickable");
   label.addEventListener("click", () => toggleFlowLayers());
   let ly = y + 18;
@@ -658,12 +766,14 @@ function toggleFlowLayers() {
   state.flowLayerExpanded = !state.flowLayerExpanded;
   renderFlow();
   restoreExec();
-  fit();
+  frameTopFlow();
 }
 
 function setFlowBounds() { /* bounds are stored on flowBoxEls; used by fit() */ }
 
 function renderFlow() {
+  gMarkers.textContent = "";
+  state.rings = {};
   // 没有加载任何图（空态）：清空画布，什么都不画，让 #empty-hint 干净地显示。
   if (!state.nodes.length) {
     gNodes.textContent = ""; gEdges.textContent = "";
@@ -751,14 +861,24 @@ function flowTint(id) {
   if (!d || !d.stats) return;
   const a = Math.abs(d.stats.absmean);
   const t = Math.min(Math.max((Math.log10(a + 1e-9) + 6) / 8, 0), 1);
-  const hue = 240 - t * 240;
-  // 浅填充：固定 lightness/saturation，只让 hue 表现量级（蓝→红），
-  // 这样配深色文字在任何色相下都有强对比。
-  const fill = `hsl(${hue}, 55%, 62%)`;
-  // 只染阶段框（携带内容与颜色）；layer 分组框保持半透明细边框不整块染色。
+  // Only the stage box is tinted, on the same single-hue ramp as the grid:
+  // the layer brackets stay a hairline so the colour reads as data.
+  const fill = magnitudeFill(t);
   const k = f.blockKeyOf.get(id);
   const b = k ? state.flowBoxEls.get(k) : null;
   if (b) { b.rect.style.fill = fill; b.g.classList.add("executed"); }
+}
+
+/* The op the playback is standing on. It is a ring, not another fill step, so
+ * the lit region keeps its magnitude ramp and the cursor stays findable. */
+function markCurrent(id, on) {
+  const g = nodeEls[id];
+  if (g) g.classList.toggle("current", on);
+  placeRing("cur", on ? id : null);
+  if (state.viewMode !== "flow" || !state.flow) return;
+  const k = state.flow.blockKeyOf.get(id);
+  const b = k ? state.flowBoxEls.get(k) : null;
+  if (b) b.g.classList.toggle("current", on);
 }
 
 /* 在 flow 渲染后恢复当前执行态（直播用 live 数据，否则从 cursor 重放）。 */
@@ -789,7 +909,9 @@ function setPlaying(on) {
   clearInterval(state.timer);
   const btn = document.getElementById("btn-play");
   if (on) {
-    btn.textContent = "⏸";
+    btn.innerHTML = ICON_PAUSE;
+    btn.title = "Pause";
+    btn.setAttribute("aria-label", "Pause");
     state.timer = setInterval(() => {
       if (state.cursor >= state.order.length - 1) {
         // 当前步播完：trace 模式下自动进入下一步
@@ -806,17 +928,22 @@ function setPlaying(on) {
       stepForward();
     }, state.speed);
   } else {
-    btn.textContent = "▶";
+    btn.innerHTML = ICON_PLAY;
+    btn.title = "Play";
+    btn.setAttribute("aria-label", "Play");
   }
 }
 
 function stepForward() {
   if (state.cursor >= state.order.length - 1) return;
+  const prev = state.cursor >= 0 ? state.order[state.cursor] : null;
   state.cursor++;
   const id = state.order[state.cursor];
+  if (prev !== null) markCurrent(prev, false);
   // 已执行样式（flow 折叠态可能未绘制该 op，nodeEls[id] 可能缺失 → 仅点亮所属框）
   const g = nodeEls[id];
-  if (g) { g.classList.remove("ready", "current"); g.classList.add("executed"); }
+  if (g) { g.classList.remove("ready"); g.classList.add("executed"); }
+  markCurrent(id, true);
   applyTint(id);
   flowLight(id);
   // 入边点亮
@@ -858,13 +985,27 @@ function updateReady(executedId) {
   }
 }
 
+// The toolbar title is truncated to its slot; keep the full string one hover away.
+function setDocTitle(text) {
+  const node = document.getElementById("doc-title");
+  node.textContent = text;
+  node.title = text;
+}
+
 function updateStepInfo() {
   const total = state.order.length;
   const info = document.getElementById("step-info");
-  if (state.cursor < 0) { info.textContent = "Ready (click ▶ to start)"; return; }
+  const fill = document.getElementById("rail-fill");
+  const done = state.cursor < 0 ? 0 : state.cursor + 1;
+  if (fill) fill.style.width = (total ? (done / total) * 100 : 0).toFixed(2) + "%";
+  if (state.cursor < 0) {
+    info.textContent = `0 / ${total}`;
+    info.title = "Press play to walk the pass";
+    return;
+  }
   const n = state.byId.get(state.order[state.cursor]);
-  const pct = ((state.cursor + 1) / total * 100).toFixed(1);
-  info.textContent = `Step ${state.cursor + 1}/${total} (${pct}%) · ${n.name} (${n.op})`;
+  info.textContent = `${done} / ${total} · ${n.op}`;
+  info.title = `${n.name} · ${n.op}`;
 }
 
 /* ---------------- 选中 / 面板 ---------------- */
@@ -877,6 +1018,7 @@ function selectNode(id) {
   for (const g of nodeEls) if (g) g.classList.remove("selected");
   for (const [, b] of state.flowBoxEls) b.g.classList.remove("selected");
   nodeEls[id].classList.add("selected");
+  placeRing("sel", id);
   try {
     renderPanel(id);
   } catch (e) {
@@ -929,6 +1071,7 @@ function goBack() {
   } else {
     state.selected = prev.id; state.selectedBlock = null;
     if (nodeEls[prev.id]) nodeEls[prev.id].classList.add("selected");
+    placeRing("sel", prev.id);
     renderPanel(prev.id);
   }
 }
@@ -949,8 +1092,9 @@ function deselect() {
   state.panelNav = [];
   for (const g of nodeEls) if (g) g.classList.remove("selected");
   for (const [, b] of state.flowBoxEls) b.g.classList.remove("selected");
+  placeRing("sel", null);
   document.getElementById("panel-body").innerHTML =
-    '<div class="placeholder">Click any node to view that step\'s data</div>';
+    '<div class="placeholder">Select a node on the canvas to inspect the data it produced</div>';
 }
 
 function renderPanel(id) {
@@ -983,7 +1127,7 @@ function renderPanel(id) {
   h += row("Tensor shape", shapeStr(n.shape));
   h += row("Elements", n.shape.reduce((a, b) => a * b, 1).toLocaleString());
   h += row("Type", n.dtype + " (activation)");
-  h += row("Exec order", `Step ${state.order.indexOf(id) + 1}/${state.order.length}`);
+  h += row("Exec order", `${state.order.indexOf(id) + 1} / ${state.order.length}`);
   const d = n.detail || {};
   if (Object.keys(d).length) h += row("Op params", htmlEscape(JSON.stringify(d)));
   const m = n.meta || {};
@@ -1044,7 +1188,7 @@ function renderExtraData(n) {
     }
     h += `</table>`;
   } else if (state.trace) {
-    h += `<div class="explain" style="color:var(--fg-faint)">No data for this node in this step (skipped at runtime / no output buffer)</div>`;
+    h += `<div class="explain" style="color:var(--fg-3)">No data for this node in this step (skipped at runtime / no output buffer)</div>`;
   }
   if (Array.isArray(values) && values.length) {
     h += `<div class="section-title">Value heatmap (downsampled)</div>`;
@@ -1073,9 +1217,8 @@ function renderHeatmap(containerId, values, shape, stride) {
   let cells = "";
   for (let i = 0; i < values.length; i++) {
     const t = (values[i] - min) / span;
-    const hue = 240 - t * 240; // 蓝 → 红
     const x = (i % cols) * CELL, y = Math.floor(i / cols) * CELL;
-    cells += `<rect x="${x}" y="${y}" width="${CELL}" height="${CELL}" fill="hsl(${hue},75%,55%)"/>`;
+    cells += `<rect x="${x}" y="${y}" width="${CELL}" height="${CELL}" fill="${magnitudeSteps(t)}"/>`;
   }
   wrap.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="${SVG_NS}" preserveAspectRatio="none">${cells}</svg>`;
 }
@@ -1109,6 +1252,9 @@ function applyFilters() {
 function setView() {
   viewport.setAttribute("transform",
     `translate(${state.view.x} ${state.view.y}) scale(${state.view.k})`);
+  // Below ~0.55 the 11px labels are sub-pixel: the fitted view is a map, so it
+  // drops the type instead of drawing unreadable grey mush. Zooming in restores it.
+  viewport.classList.toggle("zoomed-out", state.view.k < 0.55);
 }
 function fit() {
   if (state.viewMode === "flow") { fitFlow(); return; }
@@ -1136,6 +1282,47 @@ function fit() {
   const k = Math.min(winW / (maxX - minX + 40), winH / (maxY - minY + 40), 1.6);
   const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
   state.view = { x: W / 2 - cx * k, y: H / 2 - cy * k, k };
+  setView();
+}
+
+/* Frame the top of the pass at 1:1 on load.
+ *
+ * `fit()` shows the whole graph, which for a 24-layer export is a ~0.3x texture
+ * where the node labels collapse into noise. Opening at 1:1 on the first rows
+ * shows real labels and the first nodes playback touches; "Fit" stays one
+ * click away for the whole map. */
+function frameTopFlow() {
+  const W = document.getElementById("canvas-wrap").clientWidth;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity;
+  for (const [, b] of state.flowBoxEls) {
+    if (b.g.classList.contains("hidden")) continue;
+    minX = Math.min(minX, b.x);
+    maxX = Math.max(maxX, b.x + b.w);
+    minY = Math.min(minY, b.y);
+  }
+  if (!isFinite(minX) || !isFinite(minY)) { fitFlow(); return; }
+  // The expanded ladder is 24 layers tall; 1:1 at its top keeps the stage names
+  // readable instead of fitting 2 000px of pipeline into 700.
+  state.view = { x: Math.round(Math.max(12, W / 2 - (minX + maxX) / 2)), y: 28 - minY, k: 1 };
+  setView();
+}
+
+function frameTop() {
+  if (state.viewMode === "flow") { frameTopFlow(); return; }
+  let minY = Infinity;
+  for (const r of state.rows) {
+    if (r.collapsed) continue;
+    for (const id of r.nodes) {
+      if (nodeEls[id].classList.contains("hidden")) continue;
+      minY = Math.min(minY, r.y);
+      break;
+    }
+  }
+  if (!isFinite(minY)) { fit(); return; }
+  // 1:1 at the start of the pass. A 440-op row is wider than any screen; fitting
+  // it whole is what made every label 3px tall, so the first screen is the
+  // readable entry point and "Fit" is the map.
+  state.view = { x: 12, y: 28 - minY, k: 1 };
   setView();
 }
 
@@ -1219,16 +1406,16 @@ async function loadDoc(doc) {
   state.flowLayerExpanded = false;
   state.selectedBlock = null;
 
-  document.getElementById("doc-title").textContent =
-    `${doc.model} · ${doc.kind} · ${doc.nodes.length} nodes`;
-  document.getElementById("status-model").textContent = `Model: ${doc.model}`;
+  const layers = state.rows.filter(r => r.name.startsWith("blk.")).length;
+  setDocTitle(`${doc.model} · ${doc.kind} · ${doc.nodes.length} nodes`);
+  document.getElementById("status-model").textContent = doc.model;
   document.getElementById("status-counts").textContent =
-    `${state.nodes.length} nodes · ${state.edges.length} edges · ${state.rows.filter(r => r.name.startsWith("blk.")).length} layers`;
+    `${state.nodes.length} nodes · ${state.edges.length} edges · ${layers} layers`;
   document.getElementById("empty-hint").style.display = "none";
 
   renderGraph();
   applyFilters();
-  fit();
+  frameTop();
   updateStepInfo();
   updatePlaybackEnabled();
   deselect();
@@ -1253,16 +1440,16 @@ function loadPhase(pi) {
 
   document.getElementById("tracebar").hidden = false;
   renderTracebar();
-  document.getElementById("doc-title").textContent =
-    `${phase.graph.model} · ${phase.kind} · ${phase.graph.nodes.length} nodes · ${(phase.steps || []).length} steps`;
-  document.getElementById("status-model").textContent = `Model: ${phase.graph.model}`;
+  const steps = (phase.steps || []).length;
+  setDocTitle(`${phase.graph.model} · ${phase.kind} · ${phase.graph.nodes.length} nodes · ${steps} step${steps === 1 ? "" : "s"}`);
+  document.getElementById("status-model").textContent = phase.graph.model;
   document.getElementById("status-counts").textContent =
-    `${state.nodes.length} nodes · ${state.edges.length} edges · data: ${(phase.steps || []).length} steps`;
+    `${state.nodes.length} nodes · ${state.edges.length} edges · data: ${steps} step${steps === 1 ? "" : "s"}`;
   document.getElementById("empty-hint").style.display = "none";
 
   renderGraph();
   applyFilters();
-  fit();
+  frameTop();
   loadStep(0);
   if (state.live) applyLivePhaseState();
   updatePlaybackEnabled();
@@ -1312,7 +1499,7 @@ function renderTracebar() {
     b.className = "phase-tab" + (i === state.phaseIdx ? " active" : "");
     b.textContent = state.live
       ? `${p.kind} · Live`
-      : `${p.kind} · ${(p.steps || []).length} steps`;
+      : `${p.kind} · ${(p.steps || []).length} step${(p.steps || []).length === 1 ? "" : "s"}`;
     b.title = `Switch phase (${p.graph.nodes.length} nodes)`;
     b.addEventListener("click", () => {
       // Re-loading the current phase would `deselect()` and wipe the panel
@@ -1408,6 +1595,7 @@ function syncExecutionState() {
     if (nodeEls[id]) nodeEls[id].classList.add("executed");
     applyTint(id);
     flowLight(id);
+    if (i === state.cursor) markCurrent(id, true);
     const node = state.byId.get(id);
     for (const s of node.src) {
       const e = state.edgeById.get(s + ">" + id);
@@ -1420,17 +1608,21 @@ function syncExecutionState() {
   }
 }
 
-/* 按本步数据的 abs-mean 给已执行节点染色（log 尺度） */
+/* 按本步数据的 abs-mean 给已执行节点染色（log 尺度）
+ * One hue only: the fill's brightness carries the magnitude, so hue stays
+ * available for meaning (backend, selection) instead of a blue→red rainbow. */
 function applyTint(id) {
   const g = nodeEls[id];
   if (!g) return;
+  // The pipeline's chips are not heat-mapped: their stage box carries the
+  // magnitude, and an inline fill here would override the chip's lit styling.
+  if (state.viewMode === "flow") { flowTint(id); return; }
   const rect = g.querySelector("rect");
   const d = state.stepData && state.stepData.get(id);
   if (d && d.stats && d.stats.absmean !== undefined) {
     const a = Math.abs(d.stats.absmean);
     const t = Math.min(Math.max((Math.log10(a + 1e-9) + 6) / 8, 0), 1); // -6..2 → 0..1
-    const hue = 240 - t * 240; // 蓝 → 红
-    rect.style.fill = `hsl(${hue}, 70%, 45%)`;
+    rect.style.fill = magnitudeFill(t);
   } else {
     rect.style.fill = "";
   }
@@ -1659,6 +1851,7 @@ async function loadManifest() {
       const opt = document.createElement("option");
       opt.value = "samples/" + s.file;
       opt.textContent = s.label;
+      if (s.detail) opt.title = s.detail;
       sel.appendChild(opt);
     }
     sel.addEventListener("change", () => {
@@ -1677,6 +1870,10 @@ async function loadManifest() {
 /* ---------------- 初始化 ---------------- */
 
 function init() {
+  readTheme();
+  // A scheme switch repaints the CSS on its own (custom properties); the fills
+  // built in JS are literals, so they are rebuilt once from the same state.
+  document.addEventListener("minfer-theme", refreshThemeTints);
   initPanZoom();
 
   document.getElementById("btn-play").addEventListener("click", () => {
@@ -1847,7 +2044,7 @@ const BACKEND_SWATCHES = [
   ["none", "unassigned"],
 ];
 function backendColorRows() {
-  let h = "<tr><th colspan=2 style='padding-top:10px'>Backend colors</th></tr>";
+  let h = "<tr><th colspan=2 style='padding-top:8px'>Backend (top rule)</th></tr>";
   for (const [b, desc] of BACKEND_SWATCHES) {
     h += `<tr><td><span class="legend-swatch" style="background:var(--${b === "none" ? "none" : b})"></span><span class="op-name">${b}</span></td><td>${desc}</td></tr>`;
   }
@@ -1894,10 +2091,10 @@ function buildPipelineLegend() {
   h += "<tr><th colspan=2 style='padding-top:10px'>Pipeline order</th></tr>";
   h += `<tr><td colspan=2 class="legend-flow">Input → Embedding → [ RMSNorm → Attention → +Residual → RMSNorm → FFN → +Residual ] × N → Final RMSNorm → Logits → [ Sampler ]</td></tr>`;
   h += "<tr><th colspan=2 style='padding-top:10px'>Box markings</th></tr>";
-  h += `<tr><td><span class="legend-swatch" style="background:hsl(48,55%,62%)"></span><span class="op-name">executed</span></td><td>pale fill by data magnitude (blue→red) + dark text</td></tr>`;
-  h += `<tr><td><span class="legend-swatch" style="background:transparent;border:1.5px dashed var(--accent-2)"></span><span class="op-name">fused</span></td><td>one fused kernel (QKV✚ / FFN✚, dashed border)</td></tr>`;
-  h += `<tr><td><span class="legend-swatch" style="background:transparent;border:1.5px dashed var(--fg-dim)"></span><span class="op-name">collapsed</span></td><td>the ×N layer summary — click to expand</td></tr>`;
-  h += `<tr><td><span class="legend-swatch" style="background:transparent;border-top:1.5px solid var(--fg-dim)"></span><span class="op-name">arrow</span></td><td>next reasoning step (a layer also loops at the top)</td></tr>`;
+  h += `<tr><td><span class="legend-swatch" style="background:hsl(36,62%,68%)"></span><span class="op-name">executed</span></td><td>fill brightness follows the data magnitude</td></tr>`;
+  h += `<tr><td><span class="legend-swatch" style="background:transparent;border:1.5px dashed var(--accent)"></span><span class="op-name">fused</span></td><td>one fused kernel (QKV+ / FFN+, dashed border)</td></tr>`;
+  h += `<tr><td><span class="legend-swatch" style="background:transparent;border:1.5px dashed var(--fg-3)"></span><span class="op-name">collapsed</span></td><td>the ×N layer summary, click to expand</td></tr>`;
+  h += `<tr><td><span class="legend-swatch" style="background:transparent;border-top:1.5px solid var(--fg-3)"></span><span class="op-name">arrow</span></td><td>the next reasoning step</td></tr>`;
   h += backendColorRows();
   document.getElementById("legend-table").innerHTML = h;
 }

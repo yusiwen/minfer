@@ -1,27 +1,33 @@
 {
   "samples": [
     {
-      "label": "★ Qwen2.5-0.5B · trace: prefill + 3-step decode (real data)",
+      "label": "Qwen2.5-0.5B · trace",
+      "detail": "prefill + 3-step decode, real per-node data",
       "file": "qwen2.5-0.5b-trace.json"
     },
     {
-      "label": "Qwen2.5-0.5B · prefill · Metal (440 nodes)",
+      "label": "Qwen2.5-0.5B · prefill · Metal",
+      "detail": "440 nodes, Metal backend",
       "file": "qwen2.5-0.5b-prefill-metal.json"
     },
     {
-      "label": "Qwen2.5-0.5B · prefill · CPU (440 nodes)",
+      "label": "Qwen2.5-0.5B · prefill · CPU",
+      "detail": "440 nodes, CPU backend",
       "file": "qwen2.5-0.5b-prefill-cpu.json"
     },
     {
-      "label": "Qwen2.5-0.5B · decode · Metal fused (305 nodes)",
+      "label": "Qwen2.5-0.5B · decode · Metal",
+      "detail": "305 nodes, fused QKV + FFN",
       "file": "qwen2.5-0.5b-decode-metal.json"
     },
     {
-      "label": "Qwen3-0.6B · prefill · Metal (568 nodes)",
+      "label": "Qwen3-0.6B · prefill · Metal",
+      "detail": "568 nodes, per-head QK norm",
       "file": "qwen3-0.6b-prefill-metal.json"
     },
     {
-      "label": "Qwen2.5-7B · prefill · Metal (512 nodes)",
+      "label": "Qwen2.5-7B · prefill · Metal",
+      "detail": "512 nodes, 28 layers",
       "file": "qwen2.5-7b-prefill-metal.json"
     }
   ]

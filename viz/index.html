@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>minfer · Inference Graph Demo</title>
+<title>minfer · inference graph</title>
 <script>
   /* Asset freshness (#103). These pages are edited in place and served by a plain
      static server, which sends no `Cache-Control`: the browser may then reuse a
@@ -13,77 +13,112 @@
      to remember, and no server-side rewrite is needed. `minfer viz` keeps its own
      `no-store` (src/server/viz.rs); the stamp only has to survive that router.
      Written while the parser is still running, so the stylesheet still blocks
-     first paint. Keep this loader in sync with the one in viz/e2e.html. */
-  document.write('<link rel="stylesheet" href="style.css?t=' + Date.now() + '">');
+     first paint; theme.js goes first so a stored colour scheme lands before the
+     first frame instead of flashing the default. Keep this loader in sync with
+     the one in viz/e2e.html. */
+  document.write(
+    '<script src="theme.js?t=' + Date.now() + '"><\/script>' +
+    '<link rel="stylesheet" href="style.css?t=' + Date.now() + '">'
+  );
 </script>
 <style>
   /* The toolbar jump to the other view is inlined on purpose: it must look right
      even when the browser still holds a stale style.css (that happened), and the
-     rule is three lines. Keep the two copies of this block in sync:
+     rule is a dozen lines. Keep the two copies of this block in sync:
      viz/index.html and viz/e2e.html. */
   a.nav-btn {
-    display: inline-block; background: #273449; color: #e2e8f0;
-    border: 1px solid #334155; border-radius: 5px; padding: 4px 8px;
-    font-size: 12px; text-decoration: none; cursor: pointer; white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 28px; padding: 0 10px;
+    border: 1px solid var(--line-2, rgba(236, 236, 239, .14)); border-radius: 6px;
+    background: var(--raised, #242427); color: var(--fg-2, #a6a6ad);
+    font: 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    text-decoration: none; white-space: nowrap;
   }
-  a.nav-btn:hover { border-color: #38bdf8; }
+  a.nav-btn:hover { background: var(--raised-2, #2b2b2f); color: var(--fg, #ececed); }
+  a.nav-btn svg { color: var(--fg-3, #86868d); }
 </style>
-
 </head>
 <body>
 <header id="toolbar">
   <div class="brand">
-    <span class="logo">▣</span>
-    <span class="title">minfer Inference Graph</span>
-    <span class="subtitle" id="doc-title">not loaded</span>
+    <svg class="mark" width="16" height="16" viewBox="0 0 16 16" fill="none"
+         stroke="currentColor" stroke-width="1.3" aria-hidden="true">
+      <rect x="1.25" y="6" width="3" height="3" rx="0.9"/>
+      <rect x="6.5" y="1.25" width="3" height="3" rx="0.9"/>
+      <rect x="6.5" y="11.75" width="3" height="3" rx="0.9"/>
+      <rect x="11.75" y="6" width="3" height="3" rx="0.9"/>
+      <path d="M4.25 7.5h1.5M9.5 4.25 10.5 6M9.5 10.5 10.5 9M9.5 7.5h1.5" stroke-linecap="round"/>
+    </svg>
+    <span class="wordmark">minfer</span>
+    <span class="brand-rule"></span>
+    <span id="doc-title">no graph loaded</span>
   </div>
 
-  <div class="controls">
-    <select id="model-select" title="Choose a pre-generated sample graph (needs an http server; or use “Open File” below)">
-      <option value="">— Select a sample model —</option>
+  <div class="doc-actions">
+    <select id="model-select" title="Load a pre-generated sample graph">
+      <option value="">Select a sample graph</option>
     </select>
-    <button id="btn-open" title="Load a graph JSON from any path (works under file://)">Open File…</button>
+    <button id="btn-open" title="Load a graph JSON from any path (works under file://)">Open file</button>
     <input type="file" id="file-input" accept=".json" hidden>
-
-    <span class="sep"></span>
-
-    <button id="btn-step-back" title="Previous step">⏮</button>
-    <button id="btn-play" class="primary" title="Play / Pause">▶</button>
-    <button id="btn-step-fwd" title="Next step">⏭</button>
-    <input type="range" id="speed" min="1" max="200" value="60" title="Playback speed (ms/step)">
-    <span class="speed-label" id="speed-label">60ms</span>
-    <span class="step-info" id="step-info">—</span>
   </div>
+
+  <span class="spacer"></span>
 
   <div class="filters">
-    <label title="Show KV cache read/write edges"><input type="checkbox" id="f-kv" checked> KV edges</label>
-    <label title="Show input/output nodes"><input type="checkbox" id="f-io" checked> Input/Output</label>
-    <label title="Only show nodes on the attention path"><input type="checkbox" id="f-attn"> Attention path</label>
-    <label title="Only show nodes on the FFN path"><input type="checkbox" id="f-ffn"> FFN path</label>
-    <span class="sep"></span>
-    <div class="view-switch" title="Switch render mode: the operator grid (one node = one operator), or the semantic reasoning pipeline (one box = one stage)">
-      <button id="view-dataflow" class="view-btn active" title="Operator grid — one node = one operator, edges = tensor dataflow (the original view)">Operators</button>
-      <button id="view-flow" class="view-btn" title="Semantic reasoning pipeline — one box = one stage (norm / attention / FFN / logits)">Pipeline</button>
-    </div>
-    <button id="btn-live" class="live-btn" title="Connect to a minfer server to watch live inference">Live</button>
-    <a id="btn-shape-flow" class="nav-btn" href="e2e.html" title="End-to-end shape flow — one animated pass from the prompt to the next token, showing how the tensor shape changes at every node">Shape flow →</a>
+    <label title="Show KV cache read/write edges"><input type="checkbox" id="f-kv" checked> KV</label>
+    <label title="Show input/output nodes"><input type="checkbox" id="f-io" checked> I/O</label>
+    <label title="Only show nodes on the attention path"><input type="checkbox" id="f-attn"> Attn</label>
+    <label title="Only show nodes on the FFN path"><input type="checkbox" id="f-ffn"> FFN</label>
   </div>
+
+  <div class="view-switch" role="group" aria-label="View">
+    <button id="view-dataflow" class="view-btn active" title="Operator grid — one node = one operator, edges = tensor dataflow">Operators</button>
+    <button id="view-flow" class="view-btn" title="Semantic reasoning pipeline — one box = one stage">Pipeline</button>
+  </div>
+
+  <button id="btn-live" title="Connect to a minfer server to watch live inference">
+    <span class="dot"></span>Live
+  </button>
+
+  <a id="btn-shape-flow" class="nav-btn" href="e2e.html"
+     title="End-to-end shape flow — one animated pass from the prompt to the next token">Shape flow
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M2.5 8h10M8.5 4.5 12 8l-3.5 3.5"/>
+    </svg>
+  </a>
 </header>
 
-<div id="live-panel" hidden>
-  <div class="live-head">
-    <span class="live-dot" id="live-dot"></span>
-    <span>Live (P3)</span>
-    <button id="live-close" title="Close">×</button>
+<div id="transport">
+  <div class="transport-controls">
+    <button id="btn-step-back" class="icon-btn" title="Previous step" aria-label="Previous step">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M4.75 3.5v9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        <path d="M11.5 3.9 6.6 8l4.9 4.1z" fill="currentColor"/>
+      </svg>
+    </button>
+    <button id="btn-play" class="icon-btn primary" title="Play" aria-label="Play">
+      <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M5.4 3.6v8.8a.6.6 0 0 0 .92.5l7-4.4a.6.6 0 0 0 0-1l-7-4.4a.6.6 0 0 0-.92.5Z" fill="currentColor"/>
+      </svg>
+    </button>
+    <button id="btn-step-fwd" class="icon-btn" title="Next step" aria-label="Next step">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="M11.25 3.5v9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        <path d="M4.5 3.9 9.4 8l-4.9 4.1z" fill="currentColor"/>
+      </svg>
+    </button>
+    <span class="speed">
+      <input type="range" id="speed" min="1" max="200" value="60" title="Playback speed (ms per op)">
+      <span id="speed-label">60ms</span>
+    </span>
   </div>
-  <div class="live-row">
-    <input id="live-url" value="http://127.0.0.1:8081" placeholder="http://127.0.0.1:8081" title="minfer --viz address">
-    <button id="live-connect">Connect</button>
-    <input id="live-prompt" value="Hello! Introduce yourself in one sentence" placeholder="prompt…" title="Prompt to send to the model">
-    <input id="live-max" type="number" value="8" min="1" max="64" title="max_tokens">
-    <button id="live-run" class="primary" disabled>Run</button>
+
+  <div class="pass">
+    <span class="pass-label">pass</span>
+    <div class="rail"><span class="rail-fill" id="rail-fill"></span></div>
+    <span id="step-info">—</span>
   </div>
-  <div class="live-status" id="live-status">Not connected</div>
 </div>
 
 <main>
@@ -91,11 +126,12 @@
     <div class="phase-tabs" id="phase-tabs"></div>
     <div class="step-ctl">
       <span class="step-ctl-label">step</span>
-      <input type="range" id="step-slider" min="0" max="0" value="0" title="Select this step">
+      <input type="range" id="step-slider" min="0" max="0" value="0" title="Select this decode step">
       <span class="step-ctl-label" id="step-label">0/0</span>
     </div>
     <div class="token-strip" id="token-strip"></div>
   </div>
+
   <div id="graph-body">
     <div id="canvas-wrap">
       <svg id="canvas" width="100%" height="100%">
@@ -105,16 +141,15 @@
         </g>
       </svg>
       <div id="empty-hint">
-        Load an inference graph (JSON) to start the demo:<br>
-        <code>minfer --dump-graph-json graph.json model.gguf "Hello"</code><br>
-        Or click “Open File…” above to load an exported graph.<br><br>
-        <b>Watch live inference</b>: if you've started <code>minfer --viz model.gguf</code>,
-        click “Live” in the toolbar to connect, enter a prompt, then click “Run”.
+        <p class="hint-title">No graph loaded</p>
+        <p>Export one from the binary, or pick a sample above</p>
+        <code>minfer --dump-graph-json graph.json model.gguf "Hello"</code>
+        <p>Live: run <code>minfer viz model.gguf</code>, then press Live</p>
       </div>
     </div>
 
     <aside id="panel">
-      <div id="panel-body"><div class="placeholder">Click any node to view that step's data</div></div>
+      <div id="panel-body"><div class="placeholder">Select a node on the canvas to inspect the data it produced</div></div>
     </aside>
   </div>
 </main>
@@ -122,18 +157,49 @@
 <footer id="statusbar">
   <span id="status-model">—</span>
   <span class="flex-spacer"></span>
+  <label class="scheme-pick" title="Colour scheme">
+    <span>scheme</span>
+    <select id="scheme-select" data-scheme aria-label="Colour scheme"></select>
+  </label>
   <span id="status-counts">—</span>
 </footer>
 
 <div id="legend-pop">
-  <div class="legend-title"><span id="legend-title-text">Operator legend</span> <button id="legend-close">×</button></div>
+  <div class="legend-title"><span id="legend-title-text">Operator legend</span>
+    <button id="legend-close" title="Close" aria-label="Close">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+           stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+    </button>
+  </div>
   <table id="legend-table"></table>
 </div>
 <div class="corner-tools">
-  <button id="btn-fit" title="Fit to window" aria-label="Fit to window">
-    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 2v3M8 11v3M2 8h3M11 8h3"/></svg>
+  <button id="btn-fit" title="Fit the whole graph to the window" aria-label="Fit to window">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 6V3.5A.5.5 0 0 1 3.5 3H6M10 3h2.5a.5.5 0 0 1 .5.5V6M13 10v2.5a.5.5 0 0 1-.5.5H10M6 13H3.5a.5.5 0 0 1-.5-.5V10"/>
+    </svg>
   </button>
   <button id="btn-legend" title="Operator legend">Legend</button>
+</div>
+
+<div id="live-panel" hidden>
+  <div class="live-head">
+    <span class="live-dot" id="live-dot"></span>
+    <span>Live run</span>
+    <button id="live-close" title="Close" aria-label="Close">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+           stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+    </button>
+  </div>
+  <div class="live-row">
+    <input id="live-url" value="http://127.0.0.1:8081" placeholder="http://127.0.0.1:8081" title="minfer viz address">
+    <button id="live-connect">Connect</button>
+    <input id="live-prompt" value="Hello! Introduce yourself in one sentence" placeholder="prompt…" title="Prompt to send to the model">
+    <input id="live-max" type="number" value="8" min="1" max="64" title="max_tokens">
+    <button id="live-run" class="primary" disabled>Run</button>
+  </div>
+  <div class="live-status" id="live-status">Not connected</div>
 </div>
 
 <script>
