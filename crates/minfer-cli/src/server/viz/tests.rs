@@ -84,10 +84,11 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 /// entry from the previous one.
 #[tokio::test]
 async fn every_embedded_page_and_asset_forbids_caching() {
-    let cases: [(&str, Response); 7] = [
+    let cases: [(&str, Response); 8] = [
         ("index.html", page().await),
         ("style.css", style_asset().await),
         ("app.js", app_asset().await),
+        ("theme.js", theme_asset().await),
         ("e2e.html", e2e_page().await),
         ("e2e.css", e2e_style_asset().await),
         ("e2e-model.js", e2e_model_asset().await),
@@ -133,7 +134,14 @@ fn the_embedded_pages_use_the_loader_and_carry_no_version_literal() {
             !html.contains(".css?v=") && !html.contains(".js?v="),
             "{name} still carries a hand-bumped version parameter on an asset URL"
         );
-        for asset in ["style.css", "app.js", "e2e.css", "e2e-model.js", "e2e.js"] {
+        for asset in [
+            "style.css",
+            "app.js",
+            "theme.js",
+            "e2e.css",
+            "e2e-model.js",
+            "e2e.js",
+        ] {
             assert!(
                 !html.contains(&format!("\"{asset}\"")),
                 "{name} references {asset} with a literal attribute instead of the loader"
@@ -154,6 +162,11 @@ async fn the_router_serves_the_asset_urls_the_loader_composes() {
     assert!(head.starts_with("HTTP/1.1 200 OK"), "status line: {head}");
     assert_eq!(header(&head, "cache-control"), Some("no-store"));
     assert_eq!(body, STYLE_CSS);
+
+    let (head, body) = get(addr, "/theme.js?t=1750000000000").await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "status line: {head}");
+    assert_eq!(header(&head, "cache-control"), Some("no-store"));
+    assert_eq!(body, THEME_JS);
 
     let (head, body) = get(addr, "/e2e.js?t=1").await;
     assert!(head.starts_with("HTTP/1.1 200 OK"), "status line: {head}");

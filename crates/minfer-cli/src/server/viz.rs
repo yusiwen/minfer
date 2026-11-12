@@ -41,6 +41,8 @@ use super::AppState;
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../viz/index.html"));
 const STYLE_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../viz/style.css"));
 const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../viz/app.js"));
+// Colour schemes; both pages load it before first paint.
+const THEME_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../viz/theme.js"));
 // The end-to-end shape-flow view (viz/e2e.html) and its data layer.
 const E2E_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../viz/e2e.html"));
 const E2E_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../viz/e2e.css"));
@@ -211,6 +213,7 @@ fn viz_router(state: Arc<VizState>) -> Router {
         .route("/favicon.ico", get(favicon))
         .route("/style.css", get(style_asset))
         .route("/app.js", get(app_asset))
+        .route("/theme.js", get(theme_asset))
         .route("/e2e.html", get(e2e_page))
         .route("/e2e.css", get(e2e_style_asset))
         .route("/e2e-model.js", get(e2e_model_asset))
@@ -232,6 +235,9 @@ async fn style_asset() -> Response {
 }
 async fn app_asset() -> Response {
     asset("application/javascript", APP_JS)
+}
+async fn theme_asset() -> Response {
+    asset("application/javascript", THEME_JS)
 }
 async fn e2e_page() -> Response {
     html(E2E_HTML.to_string())
