@@ -35,7 +35,9 @@ node, and how does it change*. It plays one animated forward pass — prompt in,
 turns every shape change into something you can see instead of a number you have to read.
 
 It is the second view of the same export, so the two pages share their data and their stage names:
-the toolbar link **Shape flow →** jumps here, and **Operators view →** jumps back.
+the toolbar link **Shape flow →** jumps here, and **Operators view →** jumps back. They also share
+the colour scheme — the same picker, the same `localStorage` key, and a canvas palette re-read on
+every switch (a canvas cannot resolve CSS custom properties, so `viz/e2e.js` resolves them once).
 
 ```bash
 # static, no build step
@@ -203,7 +205,8 @@ built.
 |---|---|
 | `viz/index.html`, `viz/app.js`, `viz/style.css` | The operator / pipeline page: SVG graph, node inspector, sample dropdown, live panel |
 | `viz/e2e.html` | The page: toolbar, canvas, side panel, text strip, footer |
-| `viz/e2e.css` | Styles (palette shared with `style.css`) |
+| `viz/e2e.css` | Styles; its palette aliases the shared scheme tokens (viz/theme.js) |
+| `viz/theme.js` | Colour schemes: overrides the palette custom properties per scheme, mounts the status-bar picker, persists the choice |
 | `viz/e2e-model.js` | The data layer: export → stage script with shape math. No DOM, so it is testable in Node |
 | `viz/e2e.js` | The canvas renderer, animation and UI wiring |
 | `scripts/check_viz_e2e.mjs` | Shape agreement with every sample (the gate above) |
@@ -384,24 +387,37 @@ Right — filters & view:
 | **Fit** | Fit the whole graph to the window (zoom & pan) |
 | **Legend** | Context-aware legend: operator list (Operators view) or stage/flowing legend (Pipeline view) |
 | **Live** | Toggle the live-streaming panel (top-right) |
+| **scheme** (status bar) | Colour scheme: Graphite · Nord · Dracula · Ink · Paper · Noir. Stored in `localStorage`, shared by both pages |
 
 ### 3. Reading the graph
 - **Phase tabs** (`prefill · Live` / `decode · Live`, top-left of the graph area): switch between
   the prefill and decode graphs. Each phase has its own coloring from the last run.
 - **Layered layout**: `start` → `blk.0 … blk.N` → `end`, one row per transformer layer.
   Click a **row label** to collapse/expand that layer.
-- **Node coloring**: each box is one operator node. The fill color is the backend the node was
-  **assigned** to at build time (Metal blue / CPU yellow / CUDA green — the scheduler's answer, not a
-  builder default; #736 fixed a call site that read `metal_on` alone, so a CUDA-only run's graph
-  claimed the CPU) **and** is tinted by that node's data magnitude
-  (abs-mean, blue → red) for the current/last step. A **dashed border** means a fused operator
-  (e.g. `QKV✚`, `FFN✚`, `swiglu`).
-- **Edges**: tensor data flow. KV edges (to/from the KV cache) are drawn differently and can be
-  filtered with the **KV edges** checkbox.
+- **Node coloring**: each box is one operator node. The node carries two channels that do not
+  compete: the **2px rule along its top edge** is the backend the node was **assigned** to at build
+  time (Metal steel / CPU copper / CUDA sage — the scheduler's answer, not a builder default; #736
+  fixed a call site that read `metal_on` alone, so a CUDA-only run's graph claimed the CPU), and the
+  **fill** is the data magnitude of the current/last step (abs-mean on a single amber ramp, dark →
+  bright). The op the playback is standing on gets a **white ring**; a node whose inputs are ready
+  gets a dashed hairline. A **dashed border** means a fused operator (e.g. `QKV+`, `FFN+`, `swiglu`).
+- **Edges**: tensor data flow. KV edges (to/from the KV cache) are dashed and can be filtered with
+  the **KV edges** checkbox. The **pass** rail in the transport row marks where the cursor stands in
+  the whole pass (`40 / 440`).
+- **Zoom**: the page opens at 1:1 on the first ops, where labels are readable; **Fit** shows the
+  whole graph as a map (labels are dropped below ~0.55× instead of being drawn at 3px).
+- **Colour schemes**: `viz/theme.js` defines Nord (default), Graphite, Dracula, Ink, Paper and Noir.
+  Each one sets the same custom properties on `<html>`, so components, the magnitude ramp, the
+  heatmap, the logits bars and the Shape flow canvas all switch without a per-theme rule; the
+  `:root` blocks in `style.css` / `e2e.css` are the no-script fallback. Both pages share one picker
+  and one `localStorage` key, and `theme.js` loads synchronously so a stored scheme is applied
+  before the first frame. In Paper the lit ramp goes light → dark (more ink = more value); the ring
+  that frames the cursor and the selection is drawn outside the node, so it stays visible on every
+  fill.
 
 ### 4. Node inspector (right panel)
 - With nothing selected, the panel shows the current/last step summary: **Input token** and
-  **THIS STEP OUTPUT LOGITS TOP-5** probability bars.
+  **This step output logits top-5** probability bars.
 - **Click any node** → the panel shows that node's details: op, backend, tensor shape/dtype,
   execution order, the weight it reads + quantization type, bias, in×out dims, upstream/downstream
   links, and "what this step does". With trace data it also shows the **tensor stats table**
@@ -428,13 +444,13 @@ Input → Embedding → [Transformer Layers × N] → Final RMSNorm → Logits �
 
 - **Layers are collapsible.** The `Transformer Layers` box is a summary by default (`× N`);
   click it to expand into one row per layer:
-  `RMSNorm → Attention → +Residual → RMSNorm → FFN → +Residual`. Click the `(click to collapse)`
+  `RMSNorm → Attention → +Residual → RMSNorm → FFN → +Residual`. Click the `(collapse)`
   label to fold back. Each layer is a **thin dashed group frame** with internal padding, so the
   stage boxes (and their chips) sit inside it and are fully visible.
 - **Each stage box is a function.** Its label is the stage (`Attention`, `FFN`, …), its sublabel
   is the aggregate `in×out / h / hd / nf / vocab`, the backend it runs on, and the contained ops
-  are drawn as small chips inside. Executed boxes use a pale magnitude tint (blue→red by
-  abs-mean) with **dark text** for high contrast.
+  are drawn as small chips inside. Executed boxes use the same amber magnitude ramp as the grid
+  with **dark text**; a chip whose op has run is dark with pale text.
 - **Drill in with Back.** Click a stage/layer box → the inspector shows the stage's aggregate
   (backend, op count, the ops it owns) + "How this stage works". Click an op chip (or a
   `Contained ops` link) → the per-op inspector, with a **`← Back`** button in the top-left that
