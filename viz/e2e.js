@@ -133,7 +133,12 @@
     };
   }
   readPalette();
-  document.addEventListener('minfer-theme', readPalette);
+  document.addEventListener('minfer-theme', function () {
+    readPalette();
+    // The loop redraws continuously today; calling render() makes the switch
+    // independent of that, so a paused/one-shot frame cannot keep old colours.
+    render();
+  });
   function kindColor(k) { return KIND_COLOR[k] || C.accent; }
 
   // A tensor dims interpolator: shapes morph instead of snapping.
@@ -939,7 +944,8 @@
         var nq = fl.qkv.length, nf = fl.ffn.length, n = S.profile.dims.nLayer;
         if (nq && nq < n) extra = '  (qkv fused: ' + nq + '/' + n + ')';
       }
-      ctx.fillText('× ' + S.profile.dims.nLayer + ' ' + "layer" + extra, b.x + 6, b.y - 6);
+      var nl = S.profile.dims.nLayer;
+      ctx.fillText('× ' + nl + ' ' + (nl === 1 ? "layer" : "layers") + extra, b.x + 6, b.y - 6);
       ctx.restore();
     }
 

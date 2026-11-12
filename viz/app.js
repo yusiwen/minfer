@@ -119,6 +119,7 @@ function refreshThemeTints() {
   // The inspector's heatmap is generated markup, so it is re-rendered rather
   // than re-tinted; the open node (or the step summary) stays where it was.
   if (state.selected) renderPanel(state.selected);
+  else if (state.selectedBlock) renderFlowPanel(state.selectedBlock);
   else if (state.trace) {
     const phase = state.phases[state.phaseIdx];
     const step = phase && phase.steps && phase.steps[state.stepIdx];
