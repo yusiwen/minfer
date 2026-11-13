@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>minfer · brand</title>
+<style>
+  /* The brand sheet. It is a static, dependency-free page: every image is one of
+     the SVG files beside it, so the sheet and the assets can never drift. */
+  :root {
+    --bg: #17171a; --surface: #1e1e22; --line: #2c2c32; --line-2: #3a3a42;
+    --fg: #ececed; --fg-2: #a6a6ad; --fg-3: #6f6f77;
+    --paper: #fbf9f4; --ink: #1f1b16; --amber: #e0a45c; --copper: #a85a28;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    -webkit-font-smoothing: antialiased; }
+  main { max-width: 940px; margin: 0 auto; padding: 56px 32px 96px; }
+  .eyebrow { font: 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--amber); }
+  h1 { font-size: 13px; font-weight: 600; letter-spacing: .02em; color: var(--fg-2); margin: 0 0 40px; }
+  h2 { font: 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--fg-3);
+       margin: 64px 0 18px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+  p { color: var(--fg-2); margin: 0 0 14px; max-width: 62ch; }
+  code { font: 12px/1.4 var(--mono); color: var(--fg); background: #26262b; padding: 1px 5px; border-radius: 4px; }
+  .hero { display: flex; align-items: center; justify-content: space-between; gap: 32px; margin-bottom: 28px; }
+  .hero img { height: 64px; }
+  .hero .note { max-width: 30ch; text-align: right; color: var(--fg-3); font-size: 12px; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 26px 28px; }
+  .panel.light { background: var(--paper); border-color: #e2dbcc; color: var(--ink); }
+  .row { display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; }
+  .cell { display: flex; flex-direction: column; align-items: center; gap: 10px;
+          font: 10px/1 var(--mono); color: var(--fg-3); }
+  .cell img { display: block; }
+  .sizes img.a { width: 96px; height: 96px; }
+  .sizes img.b { width: 48px; height: 48px; }
+  .sizes img.c { width: 32px; height: 32px; }
+  .sizes img.d { width: 16px; height: 16px; }
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .swatches { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .sw { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .sw .chip { height: 76px; }
+  .sw .meta { padding: 10px 12px; background: var(--surface); }
+  .sw .name { font-size: 12px; color: var(--fg); }
+  .sw .hex { font: 11px/1.5 var(--mono); color: var(--fg-3); }
+  /* in-context mocks */
+  .toolbar { display: flex; align-items: center; gap: 8px; height: 48px; padding: 0 12px;
+             background: #333b48; border-radius: 10px; color: #eceff4; }
+  .toolbar .brand { display: flex; align-items: center; gap: 8px; }
+  .toolbar img { width: 22px; height: 22px; }
+  .toolbar .wm { font: 600 13px/1 -apple-system, "Segoe UI", sans-serif; }
+  .toolbar .rule { width: 1px; height: 14px; background: #4c566a; margin: 0 2px; }
+  .toolbar .title { font: 11px/1 var(--mono); color: #a0aabc; }
+  .toolbar .spacer { flex: 1; }
+  .toolbar .btn { font: 12px/1 -apple-system, sans-serif; color: #d8dee9; background: #3b4252;
+                  border: 1px solid #4c566a; border-radius: 6px; padding: 7px 10px; }
+  .tabs { border-radius: 10px; overflow: hidden; border: 1px solid var(--line); }
+  .tabs .tab { display: flex; align-items: center; gap: 9px; height: 36px; padding: 0 12px;
+               font-size: 12px; color: var(--fg-2); background: #26262b; border-bottom: 1px solid var(--line); }
+  .tabs .tab:last-child { border-bottom: 0; }
+  .tabs .tab img { width: 16px; height: 16px; }
+  .tabs .tab .close { margin-left: auto; color: var(--fg-3); font: 15px/1 var(--mono); }
+  ul.files { list-style: none; margin: 0; padding: 0; font: 12px/2 var(--mono); color: var(--fg-2);
+             columns: 2; column-gap: 32px; }
+  ul.files code { background: none; padding: 0; color: var(--fg); }
+  ul.files span { color: var(--fg-3); }
+  footer { margin-top: 72px; color: var(--fg-3); font: 11px/1.6 var(--mono); }
+  @media (max-width: 720px) { .duo, .swatches { grid-template-columns: 1fr; } ul.files { columns: 1; } }
+</style>
+</head>
+<body>
+<main>
+
+  <div class="hero">
+    <div>
+      <div class="eyebrow">minfer · brand</div>
+      <img src="minfer-logo-dark.svg" alt="minfer" style="height:56px;margin-top:22px">
+    </div>
+    <div class="note">Four operator nodes, four edges, one step: the compute graph folded into an app icon.</div>
+  </div>
+
+  <h2>The mark</h2>
+  <div class="panel">
+    <div class="row sizes">
+      <div class="cell"><img class="a" src="minfer-icon.svg" alt=""><span>96</span></div>
+      <div class="cell"><img class="b" src="minfer-icon.svg" alt=""><span>48</span></div>
+      <div class="cell"><img class="c" src="minfer-icon.svg" alt=""><span>32</span></div>
+      <div class="cell"><img class="d" src="minfer-icon.svg" alt=""><span>16</span></div>
+      <div class="cell" style="margin-left:auto"><img src="minfer-mark-dark.svg" style="height:72px" alt=""><span>mark / dark</span></div>
+      <div class="cell"><span style="display:inline-block;background:var(--paper);padding:10px;border-radius:8px"><img src="minfer-mark-light.svg" style="height:52px" alt=""></span><span>mark / light</span></div>
+    </div>
+    <p style="margin-top:24px;margin-bottom:0;font-size:13px">
+      Four op nodes read one hub — the step itself. The tile is the launcher form; the free
+      mark is the graph without its container, the hub its only colour. The wordmark's i is a
+      node too, so the type carries the same vocabulary.
+    </p>
+  </div>
+
+  <h2>Lockups</h2>
+  <div class="duo">
+    <div class="panel"><img src="minfer-logo-dark.svg" alt="minfer" style="height:52px"></div>
+    <div class="panel light"><img src="minfer-logo-light.svg" alt="minfer" style="height:52px"></div>
+  </div>
+  <p style="margin-top:16px">Horizontal lockup only: the tile is set to 1.3× the wordmark size, with a
+    gap of 0.42×. The tinted tile is the only place the amber appears at full strength.</p>
+
+  <h2>Palette</h2>
+  <div class="swatches">
+    <div class="sw"><div class="chip" style="background:#17171a;border-bottom:1px solid #2c2c32"></div><div class="meta"><div class="name">Ink</div><div class="hex">#17171A</div></div></div>
+    <div class="sw"><div class="chip" style="background:#fbf9f4"></div><div class="meta"><div class="name">Paper</div><div class="hex">#FBF9F4</div></div></div>
+    <div class="sw"><div class="chip" style="background:#e0a45c"></div><div class="meta"><div class="name">Amber</div><div class="hex">#E0A45C</div></div></div>
+    <div class="sw"><div class="chip" style="background:#a85a28"></div><div class="meta"><div class="name">Copper</div><div class="hex">#A85A28</div></div></div>
+  </div>
+  <p style="margin-top:16px">Ink and paper carry the work; amber is the accent, copper is amber's
+    stand-in on paper (the contrast pair the visualizer's light scheme already uses).</p>
+
+  <h2>In context</h2>
+  <div class="toolbar">
+    <div class="brand">
+      <img src="minfer-favicon.svg" alt="">
+      <span class="wm">minfer</span>
+      <span class="rule"></span>
+      <span class="title">qwen2.5-0.5b · 440 nodes</span>
+    </div>
+    <span class="spacer"></span>
+    <span class="btn">Operators</span>
+    <span class="btn">Pipeline</span>
+    <span class="btn">Live</span>
+  </div>
+  <div class="tabs" style="margin-top:16px;width:340px">
+    <div class="tab"><img src="minfer-favicon.svg" alt="">minfer · inference graph<span class="close">×</span></div>
+    <div class="tab"><img src="minfer-favicon.svg" alt="">minfer · shape flow<span class="close">×</span></div>
+  </div>
+
+  <h2>Files</h2>
+  <ul class="files">
+    <li><code>minfer-icon.svg</code> <span>· 512 tile</span></li>
+    <li><code>minfer-icon-512.png</code> <span>· raster</span></li>
+    <li><code>minfer-icon-256.png</code> <span>· raster</span></li>
+    <li><code>minfer-icon-128.png</code> <span>· raster</span></li>
+    <li><code>minfer-favicon.svg</code> <span>· 32 tile</span></li>
+    <li><code>minfer-favicon-32.png</code> <span>· raster</span></li>
+    <li><code>minfer-logo-dark.svg</code> <span>· lockup</span></li>
+    <li><code>minfer-logo-light.svg</code> <span>· lockup</span></li>
+    <li><code>minfer-mark.svg</code> <span>· currentColor</span></li>
+    <li><code>minfer-mark-dark.svg</code> <span>· free mark</span></li>
+    <li><code>minfer-mark-light.svg</code> <span>· free mark</span></li>
+    <li><code>minfer-wordmark-dark.svg</code></li>
+    <li><code>minfer-wordmark-light.svg</code></li>
+  </ul>
+
+  <footer>minfer · assets/brand · four op nodes, one step: the graph folded into a tile.</footer>
+</main>
+</body>
+</html>
