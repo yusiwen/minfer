@@ -173,6 +173,39 @@ async fn the_router_serves_the_asset_urls_the_loader_composes() {
     assert_eq!(body, E2E_JS);
 }
 
+/// The tab icon is part of the page contract: both pages link `/favicon.svg`, the
+/// router answers it as an SVG, and the legacy `/favicon.ico` returns the same bytes.
+/// The pages inline the same tile for their own brand block, so the placeholder that
+/// used to sit in both places cannot come back unnoticed.
+#[tokio::test]
+async fn the_favicon_is_the_brand_tile_and_both_pages_point_at_it() {
+    for (name, html) in [("index.html", INDEX_HTML), ("e2e.html", E2E_HTML)] {
+        assert!(
+            html.contains("rel=\"icon\"") && html.contains("/favicon.svg"),
+            "{name} must link the brand favicon"
+        );
+        assert!(
+            html.contains("#E0A45C"),
+            "{name} must inline the brand tile"
+        );
+    }
+
+    let (state, _jobs) = state();
+    let addr = serve(viz_router(state)).await;
+
+    let (head, body) = get(addr, "/favicon.svg").await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "status line: {head}");
+    assert_eq!(header(&head, "content-type"), Some("image/svg+xml"));
+    assert!(
+        body.contains("#E0A45C") && body.contains("viewBox"),
+        "the favicon body must be the brand tile"
+    );
+
+    let (head, body_ico) = get(addr, "/favicon.ico").await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "status line: {head}");
+    assert_eq!(body_ico, body, "both favicon paths serve one asset");
+}
+
 /// A throwaway `viz/` directory with the named files under `samples/`, removed when
 /// it drops (`server::viz::sample_response` takes the directory as an argument, so no
 /// test has to set the process-wide `MINFER_VIZ_DIR`).

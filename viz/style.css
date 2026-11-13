@@ -118,7 +118,7 @@ button, select, input { font: inherit; color: inherit; }
 
 .brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .brand .mark, .wordmark, .brand-rule { flex: none; }
-.brand .mark { flex: none; color: var(--fg-2); }
+.brand .mark { flex: none; }
 .wordmark {
   font-size: 13px;
   font-weight: 600;

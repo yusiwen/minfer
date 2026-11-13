@@ -211,6 +211,7 @@ fn viz_router(state: Arc<VizState>) -> Router {
         .route("/", get(page))
         .route("/index.html", get(page))
         .route("/favicon.ico", get(favicon))
+        .route("/favicon.svg", get(favicon))
         .route("/style.css", get(style_asset))
         .route("/app.js", get(app_asset))
         .route("/theme.js", get(theme_asset))
@@ -266,11 +267,15 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
     )
         .into_response()
 }
-/// Tiny inline SVG favicon (kills the browser's /favicon.ico 404 noise).
+/// The brand tile (assets/brand/minfer-favicon.svg), inline: four op nodes around an
+/// amber hub, drawn in ink. Served at `/favicon.svg` (linked by both pages) and at the
+/// legacy `/favicon.ico`, which browsers still request by name.
+const FAVICON_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' width='32' height='32'><rect width='32' height='32' rx='7.36' fill='#E0A45C'/><g transform='translate(16 16) scale(0.70) translate(-16 -16)'><path d='M16.0 10.3V16.0M16.0 21.7V16.0M10.3 16.0H16.0M21.7 16.0H16.0' fill='none' stroke='#17171A' stroke-width='2.3' stroke-linecap='round'/><rect x='12.40' y='1.40' width='7.2' height='7.2' rx='1.9' fill='none' stroke='#17171A' stroke-width='3.4'/><rect x='12.40' y='23.40' width='7.2' height='7.2' rx='1.9' fill='none' stroke='#17171A' stroke-width='3.4'/><rect x='1.40' y='12.40' width='7.2' height='7.2' rx='1.9' fill='none' stroke='#17171A' stroke-width='3.4'/><rect x='23.40' y='12.40' width='7.2' height='7.2' rx='1.9' fill='none' stroke='#17171A' stroke-width='3.4'/><circle cx='16.0' cy='16.0' r='3.0' fill='#17171A'/></g></svg>";
+
 async fn favicon() -> Response {
     (
         [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
-        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230ea5e9'/><path d='M4 11l3-6 2 3 1.5-2 1.5 5z' fill='white'/></svg>",
+        FAVICON_SVG,
     )
         .into_response()
 }
