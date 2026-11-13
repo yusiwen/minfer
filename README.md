@@ -1,6 +1,11 @@
-# minfer
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/minfer-logo-dark.svg">
+    <img src="assets/brand/minfer-logo-light.svg" alt="minfer" width="300">
+  </picture>
+</p>
 
-A minimal local LLM inference engine built from scratch in Rust.
+<p align="center">A minimal local LLM inference engine built from scratch in Rust.</p>
 
 <p align="center">
 
