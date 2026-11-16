@@ -33,10 +33,10 @@
 //!   (`row_elems == n_kv_embd`) and stores halves in the first half of those words, so a
 //!   region is the same size as f32's. `stored_bits_per_element` and
 //!   `region_bits_per_element` are printed separately so the difference is visible.
-//! - `KvArenaStats::free_cells` counts *reservations* while `free_runs` counts *spans*, so
-//!   the two disagree once a donor is released and its rows stay shared
-//!   (`kv_sharing.after_release_a`). Recorded for
-//!   [#829](https://github.com/yusiwen/minfer/issues/829).
+//! - `KvArenaStats::free_cells` used to count *reservations* while `free_runs` counted
+//!   *spans*, so the two disagreed once a donor was released and its rows stayed shared
+//!   (`kv_sharing.after_release_a`). [#829](https://github.com/yusiwen/minfer/issues/829)
+//!   put both on the same `occupied()` authority; the test now asserts the equality.
 
 use super::*;
 
@@ -372,18 +372,18 @@ fn kv_sharing_layout() {
         vec![(SHARED + PRIVATE, N_CTX - SHARED - PRIVATE)],
         "one free run, starting above B's private cells"
     );
-    // The two views diverge here on purpose (see the module docs and #829): `free_cells`
-    // is n_ctx - reserved, and the shared rows are not in B's reservation.
+    // #829: `free_cells` reads the same span authority `free_runs` does, so the 34
+    // shared cells — no longer inside any reservation — still count as taken.
     assert_eq!(
         after.free_cells,
-        N_CTX - PRIVATE,
-        "free_cells counts reservations, not spans - it says 56 while only 22 cells are \
-         actually writable"
+        N_CTX - SHARED - PRIVATE,
+        "free is n_ctx minus every covered cell: the shared prefix stays taken after its \
+         donor's run is released"
     );
-    assert!(
-        after.free_cells > after.largest_free_run,
-        "the disagreement is the finding: a caller that trusts free_cells would write over \
-         the shared prefix"
+    assert_eq!(
+        after.free_cells,
+        runs_after.iter().map(|&(_, len)| len).sum::<usize>(),
+        "free_cells is exactly the sum of free_runs (#829)"
     );
 
     emit(

@@ -769,29 +769,13 @@ impl KvCache {
         Ok(out)
     }
 
-    /// The maximal **free** cell runs, in cell order: free means "not covered by
-    /// any live reservation" — the same notion `reserve_seq` uses, so a written
-    /// row inside a released run counts as free even though its bytes are still
-    /// there.
+    /// The maximal **free** cell runs, in cell order: free means "no live span covers
+    /// it" — the same notion `reserve_seq` uses. A shared prefix is covered by its
+    /// sharer's span even after the donor's own run is released, so it is **not** free;
+    /// a written row inside a released run with no sharer is, even though its bytes are
+    /// still there.
     pub fn free_runs(&self) -> Vec<(usize, usize)> {
-        let n = self.n_ctx;
-        let taken = self.occupied();
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        let mut open: Option<usize> = None;
-        for (c, &t) in taken.iter().enumerate() {
-            match (t, open) {
-                (false, None) => open = Some(c),
-                (true, Some(start)) => {
-                    runs.push((start, c - start));
-                    open = None;
-                }
-                _ => {}
-            }
-        }
-        if let Some(start) = open {
-            runs.push((start, n - start));
-        }
-        runs
+        free_runs_in(self.n_ctx, &self.occupied())
     }
 
     /// Positions sequence `seq` has written — its shared prefix plus the rows it
@@ -987,7 +971,10 @@ impl KvCache {
     /// same numbers F8 exports).
     pub fn arena_stats(&self) -> KvArenaStats {
         let reserved_cells: usize = self.seqs.values().map(|s| s.cap.min(self.n_ctx)).sum();
-        let runs = self.free_runs();
+        // #829: one `occupied()` pass drives the run view **and** `free_cells`, so the
+        // two cannot disagree — the reservation view alone counted a live share as free.
+        let taken = self.occupied();
+        let runs = free_runs_in(self.n_ctx, &taken);
         KvArenaStats {
             n_ctx: self.n_ctx,
             reserved_cells,
@@ -1000,7 +987,7 @@ impl KvCache {
                 .values()
                 .next()
                 .map_or(0, |l| l.owner.iter().filter(|&&o| o != FREE).count()),
-            free_cells: self.n_ctx.saturating_sub(reserved_cells),
+            free_cells: taken.iter().filter(|&&t| !t).count(),
             free_runs: runs.len(),
             largest_free_run: runs.iter().map(|&(_, len)| len).max().unwrap_or(0),
             sequences: self.seqs.len(),
@@ -1320,6 +1307,34 @@ impl KvCache {
     }
 }
 
+/// The maximal free runs of a `taken` map — the shape [`KvCache::free_runs`] returns,
+/// and the one `KvArenaStats::free_runs` / `largest_free_run` / `free_cells` are derived
+/// from.
+///
+/// One implementation on purpose (#829): `free_cells` used to be
+/// `n_ctx - reserved_cells`, so a released donor's shared prefix counted as free while
+/// `free_runs` (derived here, from spans) counted it as taken. The
+/// `crates/minfer-cli` slot-growth loop read the first number, so a state with **no**
+/// writable slack looked like it had enough.
+fn free_runs_in(n: usize, taken: &[bool]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<usize> = None;
+    for (c, &t) in taken.iter().enumerate() {
+        match (t, open) {
+            (false, None) => open = Some(c),
+            (true, Some(start)) => {
+                runs.push((start, c - start));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = open {
+        runs.push((start, n - start));
+    }
+    runs
+}
+
 /// Order relocations so that an overlapping move never lands on a row that has not
 /// been copied yet: runs moving **up** go top-down, runs moving **down** bottom-up,
 /// and every upward move precedes the downward ones — a downward destination is
@@ -1377,12 +1392,22 @@ pub struct KvMove {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvArenaStats {
     pub n_ctx: usize,
+    /// Cells a sequence holds in its **own** run (`SeqSlot::cap`), summed. This is the
+    /// reservation view: a shared prefix lives inside another sequence's run and is
+    /// not counted here.
     pub reserved_cells: usize,
     /// C8b S2: rows a sequence reads in place from another sequence's run. Two
     /// sharers of one prefix report the same cells here and `owned_cells` counts
     /// them once, so the saving is visible without double-counting the arena.
     pub shared_cells: usize,
+    /// Cells written by any sequence (`owner != FREE`), counted once: the "used"
+    /// prefix a compaction keeps (C3).
     pub owned_cells: usize,
+    /// Cells **no live span covers** — the same authority `free_runs` and
+    /// `reserve_seq` read, so `free_cells` is exactly the sum of `free_runs`' lengths
+    /// (#829). It used to be `n_ctx - reserved_cells`, which counted a shared prefix
+    /// as free once its donor's run was released: 56 cells "free" where only 22 were
+    /// writable, and `crates/minfer-cli`'s slot-growth loop trusted the number.
     pub free_cells: usize,
     /// Maximal free runs — the "node count" a compaction reduces.
     pub free_runs: usize,

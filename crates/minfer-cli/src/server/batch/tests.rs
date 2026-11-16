@@ -12,6 +12,17 @@ mod metrics;
 mod prefill;
 mod slots;
 mod stall;
+/// The checked-in toy GGUF (`tests/fixtures/toy/`, 113 KB): the model for gates that
+/// must run in CI, where no real model is cached. `None` when the fixture is missing.
+fn toy_model() -> Option<(Box<dyn ModelDef>, Tokenizer)> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/toy/toy-qwen2-f32.gguf");
+    let gguf = minfer::gguf::load_gguf_model(&path).ok()?;
+    let tok = Tokenizer::load(&gguf.parts[0].ctx).ok()?;
+    let model = minfer::models::load_model(&gguf).ok()?;
+    Some((model, tok))
+}
+
 fn cached_model() -> Option<std::path::PathBuf> {
     // `MINFER_BATCH_TEST_MODEL` points the measurement at another cached
     // model (the 7B is where batching should pay: decode is weight-bandwidth

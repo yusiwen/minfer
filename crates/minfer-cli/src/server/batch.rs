@@ -621,6 +621,8 @@ impl BatchEngine {
             if j == idx || self.slots[j].run.is_some() || self.slots[j].cap == 0 {
                 continue;
             }
+            // #829: this is the **writable** view (spans, not reservations), so a
+            // released donor's shared prefix does not count as room here.
             if self.cache.alloc().kv_arena_stats().free_cells >= need {
                 break;
             }
