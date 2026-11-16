@@ -387,23 +387,19 @@ fn a_long_request_may_use_the_whole_arena() {
     );
 }
 
-/// #829: the slot-growth loop (`BatchEngine::ensure_slot_capacity`) budgets with
-/// `KvArenaStats::free_cells`, so that number decides whether an idle slot's run is
-/// reclaimed. A released donor whose rows a sharer still reads is **not** free, but the
-/// old `n_ctx - reserved_cells` formula counted it as free: the loop stopped reclaiming
-/// and the resize that followed packed a run over the shared prefix.
+/// #831: the growth loop must not reclaim a slot that is **lending** its prefix. Those
+/// rows are another request's data, so releasing the run would strand them under a span
+/// no run holds — the state where a compaction can place a run over them (the defect
+/// #831 was filed for). The loop now skips a lending slot and takes the next idle one.
 ///
-/// The toy GGUF keeps this gate in CI (no cached real model needed). The startup
-/// partition fixes the layout: slot 0 grows, slot 1 is the idle run that has to pay,
-/// slot 2 reads slot 3's prefix in place, and slot 3's run is released first — which is
-/// what the loop does to an idle donor.
+/// The toy GGUF keeps this in CI. Startup partition: slot 0 grows, slot 1 lends, slot 2
+/// reads the prefix, slot 3 is the idle run that has to pay.
 #[test]
-fn a_growth_reclaims_an_idle_run_when_a_released_donors_share_fills_the_arena() {
+fn a_growth_skips_a_slot_that_is_lending_its_prefix() {
     let Some((model, tok)) = toy_model() else {
-        eprintln!("[#829] the toy fixture is missing; skipping");
+        eprintln!("[#831] the toy fixture is missing; skipping");
         return;
     };
-    // 4 slots x 12 cells: [0, 12) target, [12, 24) idle, [24, 36) sharer, [36, 48) donor.
     let mut engine = BatchEngine::new(&*model, 4, 48).expect("engine");
     assert_eq!(engine.n_ctx_total, 48);
     assert_eq!(
@@ -416,69 +412,59 @@ fn a_growth_reclaims_an_idle_run_when_a_released_donors_share_fills_the_arena() 
         "the fixture assumes the startup partition"
     );
 
-    // The donor's prompt must fit its own run, or serving it would already reclaim slots
-    // and the layout above would be gone.
     let prompt = tok.encode("hi hi hi");
     assert!(
         prompt.len() <= 12,
         "the prompt must fit one slot, got {} tokens",
         prompt.len()
     );
-    serve_on(&mut engine, &*model, &tok, 3, prompt.clone(), 1);
+    serve_on(&mut engine, &*model, &tok, 1, prompt.clone(), 1);
     assert_eq!(
-        (engine.slots[3].start, engine.slots[3].cap),
-        (36, 12),
+        (engine.slots[1].start, engine.slots[1].cap),
+        (12, 12),
         "a fitting request must not repartition"
     );
-
-    let (sharer, donor) = (engine.slots[2].seq, engine.slots[3].seq);
+    let (donor, sharer) = (engine.slots[1].seq, engine.slots[2].seq);
     let rows = prompt.len();
     engine
         .cache
         .alloc()
         .kv_share_prefix(donor, sharer, rows)
-        .expect("the donor wrote its prompt as one contiguous run");
-    // What the loop does to an idle slot: drop the reservation, keep the rows readable.
-    assert!(engine.cache.alloc().kv_release_seq(donor) > 0);
-    engine.slots[3].cap = 0;
+        .expect("the donor wrote its prompt");
+    assert_eq!(engine.cache.alloc().kv_shared_from(donor), rows);
 
     let before = engine.cache.alloc().kv_arena_stats();
     assert_eq!(
-        (before.reserved_cells, before.shared_cells),
-        (36, rows),
-        "three live runs plus the released donor's prefix, read in place"
-    );
-    assert_eq!(
-        before.free_cells,
-        48 - 36 - rows,
-        "only the tail above the sharer's prefix is writable"
-    );
-    assert_eq!(
-        before.free_cells, before.largest_free_run,
-        "free_cells is the free-run view (#829)"
+        (
+            before.reserved_cells,
+            before.shared_cells,
+            before.free_cells
+        ),
+        (48, rows, 0),
+        "every cell is reserved and the share sits inside the lender's run"
     );
 
-    // Slot 0 wants twice its run: the writable tail alone cannot pay for it, so the
-    // idle run has to.
     engine.ensure_slot_capacity(0, 24);
 
     assert_eq!(
-        engine.slots[1].cap, 0,
-        "the idle run paid for the growth; with the reservation-only free_cells the \
-         loop stopped here and left it reserved"
+        engine.slots[1].cap, 12,
+        "the lending slot keeps its run: its rows are another request's data"
+    );
+    assert_eq!(
+        engine.slots[2].cap, 0,
+        "the idle sharer's own run paid for the growth"
     );
     assert_eq!(engine.slots[0].cap, 24, "the growth happened");
     assert_eq!(
-        engine.slots[2].start, 24,
-        "the sharer's run must not be repacked onto the prefix it reads"
+        engine.cache.alloc().kv_shared_from(donor),
+        0,
+        "releasing the sharer is what ends the share"
     );
     let after = engine.cache.alloc().kv_arena_stats();
-    assert_eq!(after.shared_cells, rows, "the share is untouched");
     assert_eq!(
-        after.reserved_cells, 36,
-        "the freed run paid for the growth"
+        after.free_cells, 0,
+        "the growth consumed exactly the run the sharer gave up"
     );
-    assert_eq!(after.free_cells, 48 - 36 - rows);
 }
 
 /// #833: the donor's side of a read-in-place share. A slot that lends its first rows
