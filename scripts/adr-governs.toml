@@ -103,6 +103,11 @@ what = "memory is accounted before it is allocated, and the refusal names the nu
 path = "src/graph/alloc.rs"
 
 [[governs]]
+adr = "0083"
+what = "a live share pins its donor's run, and a store may not write a lent prefix"
+path = "src/graph/kvcache.rs"
+
+[[governs]]
 adr = "0017"
 what = "speculative decoding refuses the features its identity contract cannot carry"
 path = "src/spec.rs"

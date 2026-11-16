@@ -324,7 +324,11 @@ the tables are in the E2 and E6 records of
 elastic* share only: the server starts from `n_ctx / n_slots` per slot, but a request's real
 bound is the whole `n_ctx`. When a request needs more than its share, admission reclaims
 cells from idle slots (releasing their cached prefixes) and the allocator moves whatever runs
-are in the way, so a busy neighbour cannot block it (C7/C7b, the same plan §5). The serial
+are in the way, so a busy neighbour cannot block it (C7/C7b, the same plan §5). A slot that is
+**lending** its prefix to another request is skipped: its rows are the sharer's data and its run
+stays reserved until the share ends (ADR-0083). While a slot lends, it takes only a prompt that
+reuses at least the lent rows — anything else is placed on another slot, or answered `503` with
+the lending slot named. The serial
 path (`MINFER_BATCH=0`) is the exception: its per-slot graph region really is `n_ctx /
 n_slots` cells.
 
@@ -390,7 +394,9 @@ Two environment switches around the GPU are easy to get wrong:
   admission points the arriving request at the donor slot's rows and no byte is copied. A
   device that cannot gather, and any device at all under `MINFER_NO_KV_SHARE=1` (the A/B
   switch), falls back to C8a's row copy — either way the arriving request prefills only its own
-  suffix.
+  suffix. A share is a **loan**: the donor's run is pinned (it cannot be released, and the donor
+  slot will not take a prompt that does not reuse the lent rows) until the last sharer finishes
+  (ADR-0083), so concurrency trades a little slot elasticity for one copy of the prefix bytes.
 
 ### Slot saturation
 
@@ -593,7 +599,8 @@ the per-op family is **seconds**, everything else is a count):
   backend (CPU/Metal with no budget) the `budget`/`headroom` families are
   **omitted**, not reported as 0.
 - KV arena: `minfer_kv_{layers,rows,region_bytes}`, `minfer_kv_packed` (1 for a
-  packed Q8_0 cache), `minfer_kv_{reserved,owned,shared,free}_cells`,
+  packed Q8_0 cache), `minfer_kv_{reserved,owned,shared,free}_cells` (`free` counts the cells
+  no live span covers: a released donor's shared rows stay taken, #829),
   `minfer_kv_{free_runs,sequences}`, and the C3/C8b counters
   `minfer_kv_{defrags,cells_moved,cows,cow_cells}_total`.
 - Per-op timing (present **only** when the flag below is set):

@@ -588,7 +588,8 @@ is worth reading as five beats:
 4. **Fill inputs, execute** (L657–692): the input buffers are overwritten with
    this step's data (by *name* — node ids shift between rebuilds, names do
    not), `fill_batch_inputs` writes the per-sequence ids and resolves each
-   query's attention window in the same call, `tail_ids` carries the output
+   query's attention window in the same call — and refuses a store position inside a
+   prefix the sequence lends (the #837 backstop, ADR-0083) — `tail_ids` carries the output
    rows, and then the scheduler walks the nodes (doc 08). `execute` returning
    `Ok(())` is the guarantee that every buffer — logits included — holds its
    final value (doc 08 §2.4).

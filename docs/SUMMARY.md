@@ -103,6 +103,7 @@
     - [0080. The Metal backend is a cargo feature, and a metal-less build refuses the name](./adr/0080-the-metal-backend-is-a-cargo-feature-and-a-metal-less-build-refuses-the-name.md)
     - [0081. A tensor's bytes are a backing handle plus a range, and the backing may be an owned buffer](./adr/0081-a-tensor-s-bytes-are-a-backing-handle-plus-a-range.md)
     - [0082. The application layer is its own package, and the engine's four application features retire](./adr/0082-the-application-layer-is-its-own-package.md)
+    - [0083. A live share pins its donor's run, and a store may not write a lent prefix](./adr/0083-a-live-share-pins-its-donor-s-run-and-a-store-may-not-write-a-lent-prefix.md)
 
 # Model Support
 
