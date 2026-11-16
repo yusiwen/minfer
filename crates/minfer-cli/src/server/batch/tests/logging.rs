@@ -8,15 +8,6 @@
 
 use super::*;
 
-fn toy_model() -> Option<(Box<dyn ModelDef>, Tokenizer)> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/toy/toy-qwen2-f32.gguf");
-    let gguf = minfer::gguf::load_gguf_model(&path).ok()?;
-    let tok = Tokenizer::load(&gguf.parts[0].ctx).ok()?;
-    let model = minfer::models::load_model(&gguf).ok()?;
-    Some((model, tok))
-}
-
 /// Drive exactly one request through the real `serve_loop`, returning its event
 /// lines at `level` and the metrics snapshot afterwards.
 fn one_request(

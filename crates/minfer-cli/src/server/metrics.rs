@@ -766,7 +766,8 @@ pub fn render(m: &MetricsSnapshot) -> String {
     sample(
         &mut out,
         "minfer_kv_free_cells",
-        "KV cells neither reserved nor owned.",
+        "KV cells no live span covers: neither reserved nor shared. A released donor's \
+         shared rows stay counted as taken (#829).",
         "gauge",
         m.kv.free_cells,
     );

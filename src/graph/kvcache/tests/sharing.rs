@@ -403,3 +403,50 @@ fn a_shared_prefix_stops_a_physical_removal() {
     let err = c.after_shift(1).unwrap_err();
     assert!(err.contains("shares a 4-row prefix"), "got: {err}");
 }
+/// #829: `free_cells` and `free_runs` must read the **same** authority (`occupied()`,
+/// the span list), including after a donor's run is released while a sharer still reads
+/// its rows.
+///
+/// This is the arena-level half of the gate. `free_cells` used to be
+/// `n_ctx - reserved_cells`, so the 34 rows B reads in place — no longer inside any
+/// reservation — counted as free: 56 cells reported, 22 writable. `crates/minfer-cli`'s
+/// slot-growth loop (`BatchEngine::ensure_slot_capacity`) trusts the number, which is
+/// why the batch-level gate exists beside this one.
+#[test]
+fn free_cells_counts_a_released_donors_shared_rows_as_taken() {
+    let mut c = cache(64);
+    let donor = c.reserve_seq(1, 34).unwrap(); // [0, 34)
+    c.own_range(1, donor.start, donor.start + 34);
+    c.reserve_seq(2, 8).unwrap(); // [34, 42)
+    c.share_prefix(1, 2, 34).unwrap();
+    let tail: Vec<usize> = (34..42).collect();
+    c.own_positions(2, &tail).unwrap();
+
+    let before = c.arena_stats();
+    assert_eq!(
+        (before.free_cells, before.free_runs, before.largest_free_run),
+        (22, 1, 22)
+    );
+    assert_eq!(before.owned_cells, 42);
+
+    assert_eq!(c.release_seq(1), 34);
+    let after = c.arena_stats();
+    assert_eq!(
+        (after.shared_cells, after.reserved_cells),
+        (34, 8),
+        "B's reservation is its private run; the shared rows are a span"
+    );
+    assert_eq!(
+        after.free_cells, 22,
+        "the shared rows are not writable, so they are not free"
+    );
+    assert_eq!(
+        after.free_cells,
+        c.free_runs().iter().map(|&(_, len)| len).sum::<usize>(),
+        "free_cells is exactly the sum of free_runs, in every state"
+    );
+    // The other two views agree with it: one 22-cell run above B's tail, and first-fit
+    // takes a 22-cell reservation but not a 23-cell one.
+    assert_eq!((after.free_runs, after.largest_free_run), (1, 22));
+    assert_eq!(c.reserve_seq(3, 22).unwrap().start, 42);
+}
