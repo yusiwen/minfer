@@ -225,36 +225,6 @@ fn a_copy_on_write_refuses_a_run_without_room() {
     let stats = c.arena_stats();
     assert_eq!((stats.cows, stats.cow_cells), (0, 0), "nothing ran");
 }
-/// A released donor must not hand its rows to somebody else while a sharer
-/// still reads them (C8b S2 gate 3): occupancy comes from the span lists, so
-/// the cells stay taken even though no slot reserves them any more.
-#[test]
-fn releasing_the_donor_keeps_the_shared_rows_taken() {
-    let mut c = cache(16);
-    let donor = c.reserve_seq(1, 4).unwrap(); // [0, 4)
-    let dst = c.reserve_seq(2, 2).unwrap(); // [4, 6)
-    for layer in [0usize, 1] {
-        c.note_written(1, layer, &[0, 1, 2, 3]);
-    }
-    c.share_prefix(1, 2, 4).unwrap();
-    assert_eq!(c.release_seq(1), 4, "the donor's run is what it freed");
-    assert_eq!(c.cell_of(2, 0), Some(donor.start), "still reading the rows");
-    assert_eq!(c.written_rows(2), 4);
-    let held = donor.start..donor.start + 4;
-    assert!(
-        c.free_runs()
-            .iter()
-            .all(|&(s, l)| s + l <= held.start || s >= held.end),
-        "the shared rows are not free: {:?}",
-        c.free_runs()
-    );
-    // A third sequence cannot be placed on top of them.
-    let err = c.reserve_seq(3, 16).unwrap_err();
-    assert!(err.contains("no free run"), "got: {err}");
-    // Once the sharer drops them they are free again.
-    c.release_seq(2);
-    assert_eq!(c.free_runs(), vec![(0, 16)]);
-}
 /// A compaction moves the donor's rows and **every sharer's pointer has to
 /// follow** — the requirement the plan calls out for a shared block.
 #[test]
@@ -387,8 +357,10 @@ fn the_map_lists_a_querys_runs_and_refuses_to_truncate() {
     let err = c.attn_map(&[1], &[4]).unwrap_err();
     assert!(err.contains("more than"), "got: {err}");
 }
-/// A physical removal (C2) renumbers cells across the whole arena, so it cannot
-/// run while a prefix is shared — the rows it would move belong to someone else.
+/// A physical removal (C2) renumbers cells across the whole arena, so it cannot run
+/// while a prefix is shared. Two refusals stand in the way now: the **pin** is what a
+/// shift meets first (#831 — the lending run cannot be released at all), and the share
+/// check stays as the backstop for a state a pre-#831 snapshot can restore.
 #[test]
 fn a_shared_prefix_stops_a_physical_removal() {
     let mut c = cache(16);
@@ -398,22 +370,30 @@ fn a_shared_prefix_stops_a_physical_removal() {
         c.note_written(1, layer, &[0, 1, 2, 3]);
     }
     c.share_prefix(1, SEQ_MAIN, 4).unwrap();
-    c.release_seq(1);
+    assert_eq!(c.release_seq(1), 0, "the lending run is pinned");
     assert_eq!(c.cell_of(SEQ_MAIN, 0), Some(donor.start));
+    let err = c.after_shift(1).unwrap_err();
+    assert!(err.contains("single-sequence"), "got: {err}");
+
+    // The backstop, on the one state that can still carry an orphan share.
+    let mut st = c.session_state();
+    st.seqs.retain(|(seq, _)| *seq != 1);
+    st.spans.retain(|(seq, _)| *seq != 1);
+    c.restore_session(&st).unwrap();
     let err = c.after_shift(1).unwrap_err();
     assert!(err.contains("shares a 4-row prefix"), "got: {err}");
 }
-/// #829: `free_cells` and `free_runs` must read the **same** authority (`occupied()`,
-/// the span list), including after a donor's run is released while a sharer still reads
-/// its rows.
+
+/// #829 / #831: `free_cells` and `free_runs` read the **same** authority (`occupied()`,
+/// the span list). The one state where that view and the reservation view differ is an
+/// **orphan** share — a live span whose donor's run is gone.
 ///
-/// This is the arena-level half of the gate. `free_cells` used to be
-/// `n_ctx - reserved_cells`, so the 34 rows B reads in place — no longer inside any
-/// reservation — counted as free: 56 cells reported, 22 writable. `crates/minfer-cli`'s
-/// slot-growth loop (`BatchEngine::ensure_slot_capacity`) trusts the number, which is
-/// why the batch-level gate exists beside this one.
+/// The public API no longer produces it: `release_seq` refuses a lending run (#831, see
+/// `a_live_share_pins_its_donors_run`). A C5 session file written before that *can*
+/// carry it, so the metric must stay honest — which is what this pins, through the real
+/// restore path.
 #[test]
-fn free_cells_counts_a_released_donors_shared_rows_as_taken() {
+fn free_cells_counts_an_orphan_share_restored_from_a_session() {
     let mut c = cache(64);
     let donor = c.reserve_seq(1, 34).unwrap(); // [0, 34)
     c.own_range(1, donor.start, donor.start + 34);
@@ -421,34 +401,84 @@ fn free_cells_counts_a_released_donors_shared_rows_as_taken() {
     c.share_prefix(1, 2, 34).unwrap();
     let tail: Vec<usize> = (34..42).collect();
     c.own_positions(2, &tail).unwrap();
-
-    let before = c.arena_stats();
     assert_eq!(
-        (before.free_cells, before.free_runs, before.largest_free_run),
-        (22, 1, 22)
+        c.arena_stats().free_cells,
+        22,
+        "the donor's run is reserved"
     );
-    assert_eq!(before.owned_cells, 42);
 
-    assert_eq!(c.release_seq(1), 34);
+    // An older snapshot: the donor's run is absent from the run table, its stamps are
+    // freed, and the sharer's span still names its rows.
+    let mut st = c.session_state();
+    st.seqs.retain(|(seq, _)| *seq != 1);
+    st.spans.retain(|(seq, _)| *seq != 1);
+    for layer in &mut st.layers {
+        for cell in donor.start..donor.start + 34 {
+            if layer.owner[cell] == 1 {
+                layer.owner[cell] = FREE;
+            }
+        }
+    }
+    c.restore_session(&st).expect("the old snapshot restores");
+
     let after = c.arena_stats();
     assert_eq!(
         (after.shared_cells, after.reserved_cells),
         (34, 8),
-        "B's reservation is its private run; the shared rows are a span"
+        "B's reservation is its private run; the orphaned rows are a span"
     );
     assert_eq!(
         after.free_cells, 22,
-        "the shared rows are not writable, so they are not free"
+        "rows a live span covers are not writable, so they are not free"
     );
     assert_eq!(
         after.free_cells,
         c.free_runs().iter().map(|&(_, len)| len).sum::<usize>(),
-        "free_cells is exactly the sum of free_runs, in every state"
+        "free_cells is exactly the sum of free_runs"
     );
-    // The other two views agree with it: one 22-cell run above B's tail, and first-fit
-    // takes a 22-cell reservation but not a 23-cell one.
     assert_eq!((after.free_runs, after.largest_free_run), (1, 22));
+    assert_eq!(c.written_rows(2), 42, "the sharer's positions are intact");
+    // First-fit agrees: 22 cells above B's tail, and no more.
+    assert!(c.reserve_seq(3, 23).is_err(), "no 23-cell run exists");
     assert_eq!(c.reserve_seq(3, 22).unwrap().start, 42);
+    // Once the sharer drops the span, the orphaned rows come back.
+    assert_eq!(c.release_seq(2), 8);
+    assert_eq!(c.free_runs(), vec![(0, 42)]);
+}
+
+/// #831: a run a **live share** points into cannot be released — its rows are the
+/// sharer's data, and the cells must stay covered by a run the compaction can move.
+///
+/// This is the invariant the whole family rests on: a share always lives inside a
+/// reserved run, so the packer, the owner table and `free_cells` all stay consistent
+/// without knowing about shares.
+#[test]
+fn a_live_share_pins_its_donors_run() {
+    let mut c = cache(64);
+    let donor = c.reserve_seq(1, 34).unwrap();
+    c.own_range(1, donor.start, donor.start + 34);
+    c.reserve_seq(2, 8).unwrap();
+    c.share_prefix(1, 2, 34).unwrap();
+    assert_eq!(c.shared_from(1), 34);
+
+    assert_eq!(c.release_seq(1), 0, "a lending run is not releasable");
+    assert_eq!(
+        c.seq_slot(1).map(|s| s.start),
+        Some(donor.start),
+        "the run is intact"
+    );
+    assert_eq!(
+        c.cell_of(2, 0),
+        Some(donor.start),
+        "the share still resolves"
+    );
+    let err = c.set_cap(1, 0).unwrap_err();
+    assert!(err.contains("read in place"), "{err}");
+
+    // The share is what pins it: release the sharer and the donor's run goes.
+    assert_eq!(c.release_seq(2), 8);
+    assert_eq!(c.shared_from(1), 0);
+    assert_eq!(c.release_seq(1), 34);
 }
 
 /// #833: `shared_from` is the mirror of C8b S3 — the donor's side of a read-in-place

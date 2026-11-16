@@ -330,6 +330,17 @@ fn kv_sharing_layout() {
     );
     assert_eq!(cache.cell_of(2, SHARED), Some(b.start), "then its own run");
 
+    // The span lists as they are *now*: the JSON below describes the live layout, and
+    // the releases at the end would empty them.
+    let span_json = |seq: u32| -> Vec<serde_json::Value> {
+        cache
+            .spans_of(seq)
+            .iter()
+            .map(|&(base, cell, len)| json!({"base": base, "cell": cell, "len": len}))
+            .collect()
+    };
+    let (a_spans, b_spans) = (span_json(1), span_json(2));
+
     let live = cache.arena_stats();
     assert_eq!(
         (live.reserved_cells, live.shared_cells, live.owned_cells),
@@ -343,47 +354,63 @@ fn kv_sharing_layout() {
         "with the donor alive, the reservation count and the span count agree"
     );
 
-    // Release A: its reservation and its stamps go, B still reads the rows in place.
+    // #831: a live share **pins** its donor's run. The release is refused outright —
+    // dropping the reservation would strand the rows B reads under a span no run holds,
+    // where a compaction could place another run over them.
     let freed = cache.release_seq(1);
-    assert_eq!(freed, SHARED);
-    let after = cache.arena_stats();
-    let runs_after = cache.free_runs();
+    assert_eq!(freed, 0, "a lending run is not releasable");
+    let pinned = cache.arena_stats();
+    let runs_pinned = cache.free_runs();
     assert!(
-        cache.spans_of(1).is_empty(),
-        "the donor's own address space is gone"
+        !cache.spans_of(1).is_empty(),
+        "the donor's run and address space survive the refusal"
     );
     assert_eq!(
         cache.cell_of(2, 0),
         Some(a.start),
-        "releasing the donor must keep the shared rows readable"
+        "B keeps reading the rows in place"
     );
     assert_eq!(
-        (after.shared_cells, after.reserved_cells, after.owned_cells),
-        (SHARED, PRIVATE, PRIVATE),
-        "B's reservation is only its private run; the shared rows stay taken as spans"
+        (
+            pinned.shared_cells,
+            pinned.reserved_cells,
+            pinned.owned_cells
+        ),
+        (SHARED, SHARED + PRIVATE, SHARED + PRIVATE),
+        "the share keeps the donor's reservation: the cells are in use"
     );
     assert_eq!(
-        (after.free_runs, after.largest_free_run),
-        (1, N_CTX - SHARED - PRIVATE),
-        "the span view: only the tail above B's run is free"
+        (pinned.free_cells, pinned.free_runs, pinned.largest_free_run),
+        (N_CTX - SHARED - PRIVATE, 1, N_CTX - SHARED - PRIVATE),
+        "nothing became free"
     );
     assert_eq!(
-        runs_after,
+        runs_pinned,
         vec![(SHARED + PRIVATE, N_CTX - SHARED - PRIVATE)],
         "one free run, starting above B's private cells"
     );
-    // #829: `free_cells` reads the same span authority `free_runs` does, so the 34
-    // shared cells — no longer inside any reservation — still count as taken.
+    // #829: `free_cells` is exactly the sum of `free_runs`, the span authority.
     assert_eq!(
-        after.free_cells,
-        N_CTX - SHARED - PRIVATE,
-        "free is n_ctx minus every covered cell: the shared prefix stays taken after its \
-         donor's run is released"
+        pinned.free_cells,
+        runs_pinned.iter().map(|&(_, len)| len).sum::<usize>()
     );
+
+    // The share is what pins the run: release the sharer, then the donor, and the whole
+    // arena comes back. (B's slot is captured first — the JSON below describes the
+    // pinned state, before either release.)
+    let b_pinned = slot_json(cache.seq_slot(2).expect("B survives"));
+    assert_eq!(cache.release_seq(2), PRIVATE);
+    assert_eq!(cache.release_seq(1), SHARED);
+    let empty = cache.arena_stats();
     assert_eq!(
-        after.free_cells,
-        runs_after.iter().map(|&(_, len)| len).sum::<usize>(),
-        "free_cells is exactly the sum of free_runs (#829)"
+        (
+            empty.free_cells,
+            empty.reserved_cells,
+            empty.shared_cells,
+            empty.owned_cells
+        ),
+        (N_CTX, 0, 0, 0),
+        "both runs are gone"
     );
 
     emit(
@@ -404,23 +431,29 @@ fn kv_sharing_layout() {
                     "free_runs": live.free_runs,
                     "largest_free_run": live.largest_free_run,
                 },
-                "spans": {
-                    "a": cache.spans_of(1).iter().map(|&(base, cell, len)| json!({"base": base, "cell": cell, "len": len})).collect::<Vec<_>>(),
-                    "b": cache.spans_of(2).iter().map(|&(base, cell, len)| json!({"base": base, "cell": cell, "len": len})).collect::<Vec<_>>(),
-                },
+                "spans": {"a": a_spans, "b": b_spans},
             },
-            "after_release_a": {
+            "after_release_attempt": {
                 "freed": freed,
-                "b": slot_json(cache.seq_slot(2).expect("B survives")),
+                "b": b_pinned,
                 "cells": {
-                    "reserved": after.reserved_cells,
-                    "shared": after.shared_cells,
-                    "owned": after.owned_cells,
-                    "free": after.free_cells,
-                    "free_runs": after.free_runs,
-                    "largest_free_run": after.largest_free_run,
+                    "reserved": pinned.reserved_cells,
+                    "shared": pinned.shared_cells,
+                    "owned": pinned.owned_cells,
+                    "free": pinned.free_cells,
+                    "free_runs": pinned.free_runs,
+                    "largest_free_run": pinned.largest_free_run,
                 },
-                "free_runs": runs_after.iter().map(|&(start, len)| json!({"start": start, "len": len})).collect::<Vec<_>>(),
+                "free_runs": runs_pinned.iter().map(|&(start, len)| json!({"start": start, "len": len})).collect::<Vec<_>>(),
+            },
+            "after_release_both": {
+                "cells": {
+                    "reserved": empty.reserved_cells,
+                    "shared": empty.shared_cells,
+                    "owned": empty.owned_cells,
+                    "free": empty.free_cells,
+                    "free_runs": empty.free_runs,
+                },
             },
         }),
     );

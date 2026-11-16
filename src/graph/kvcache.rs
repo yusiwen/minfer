@@ -360,7 +360,17 @@ impl KvCache {
     }
 
     /// Release everything `seq` reserved and owned; returns the freed capacity.
+    ///
+    /// #831: a run a **live share** points into is refused (0, state unchanged). Its
+    /// rows are the sharer's data, and dropping the reservation would leave them covered
+    /// by a span no run holds — the "orphan" state where a compaction cannot move the
+    /// rows and may place another run over them. The release succeeds once the last
+    /// sharer releases, which is why the pin needs no reference count: it is derived
+    /// from the span list.
     pub fn release_seq(&mut self, seq: SeqId) -> usize {
+        if self.shared_from(seq) > 0 {
+            return 0;
+        }
         let Some(slot) = self.seqs.remove(&seq) else {
             return 0;
         };
@@ -393,6 +403,15 @@ impl KvCache {
             return Ok(Vec::new());
         }
         if cap == 0 {
+            let lent = self.shared_from(seq);
+            if lent > 0 {
+                return Err(format!(
+                    "set_cap: sequence {seq} holds {} cells and {lent} of them are read in \
+                     place by another sequence; releasing the run would leave the share \
+                     uncovered — release the sharer(s) first",
+                    slot.cap
+                ));
+            }
             self.release_seq(seq);
             return Ok(self.compaction_plan(None));
         }
@@ -884,8 +903,11 @@ impl KvCache {
             if other == seq || o.shared.rows == 0 {
                 continue;
             }
-            let hi = (o.shared.cell + o.shared.rows).min(slot.start + slot.cap);
-            if hi > run {
+            // The share's cells that fall inside this run: overlap, not "starts below
+            // the end", or a share *above* the run would look like a protection.
+            let lo = o.shared.cell.max(run);
+            let hi = (o.shared.cell + o.shared.rows).min(run + slot.cap);
+            if lo < hi {
                 // Conservative on purpose: today every share starts at `run`, so this is
                 // exactly `rows`; if a future layout ever shares a mid-run range, this
                 // protects everything up to its end rather than under-protecting.

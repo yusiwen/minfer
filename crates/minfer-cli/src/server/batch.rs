@@ -626,6 +626,13 @@ impl BatchEngine {
             if self.cache.alloc().kv_arena_stats().free_cells >= need {
                 break;
             }
+            // #831: a slot that lends its prefix is in use, not idle — its rows are the
+            // sharer's data, so its run is not reclaimed until the share ends. Releasing
+            // it would strand those rows under a span no run holds, where a compaction
+            // could place another run over them.
+            if self.cache.alloc().kv_shared_from(self.slots[j].seq) > 0 {
+                continue;
+            }
             self.cache.alloc().kv_release_seq(self.slots[j].seq);
             self.slots[j].cached_tokens.clear();
             self.slots[j].cap = 0;
