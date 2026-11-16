@@ -450,3 +450,35 @@ fn free_cells_counts_a_released_donors_shared_rows_as_taken() {
     assert_eq!((after.free_runs, after.largest_free_run), (1, 22));
     assert_eq!(c.reserve_seq(3, 22).unwrap().start, 42);
 }
+
+/// #833: `shared_from` is the mirror of C8b S3 — the donor's side of a read-in-place
+/// share. It reports the leading rows of the donor's run that a live sharer reads, so
+/// the caller that places work can keep the donor's next forward from writing them.
+#[test]
+fn shared_from_reports_the_rows_a_donor_must_not_write() {
+    let mut c = cache(64);
+    let a = c.reserve_seq(1, 34).unwrap(); // [0, 34)
+    c.own_range(1, a.start, a.start + 34);
+    c.reserve_seq(2, 8).unwrap(); // [34, 42)
+    c.reserve_seq(3, 8).unwrap(); // [42, 50)
+
+    assert_eq!(c.shared_from(1), 0, "no share yet");
+    c.share_prefix(1, 2, 20).unwrap();
+    assert_eq!(c.shared_from(1), 20, "the lent rows");
+    assert_eq!(c.shared_from(2), 0, "a sharer is not a donor");
+    assert_eq!(c.shared_from(3), 0, "an unrelated run protects nothing");
+
+    c.share_prefix(1, 3, 34).unwrap();
+    assert_eq!(
+        c.shared_from(1),
+        34,
+        "the widest share bounds the donor's protected prefix"
+    );
+
+    // The sharer's release is what unpins the donor's rows, one share at a time.
+    c.release_seq(3);
+    assert_eq!(c.shared_from(1), 20);
+    c.release_seq(2);
+    assert_eq!(c.shared_from(1), 0);
+    assert_eq!(c.shared_from(99), 0, "no run, nothing to protect");
+}

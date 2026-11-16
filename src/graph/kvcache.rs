@@ -858,6 +858,43 @@ impl KvCache {
         Ok(())
     }
 
+    /// The leading cells of `seq`'s run that a **live share** points into — the cells
+    /// `seq` must not write until every sharer releases (0 when it is not a donor).
+    ///
+    /// A share is read in place (`SharedPrefix`), so the donor's rows are the sharer's
+    /// data. C8b S3 protects the *sharer* from writing into a shared block; this is the
+    /// mirror: the **donor** must not write there either. `share_prefix` requires a
+    /// share to start at the donor's first cell, so the protected range is the run's
+    /// leading `rows` cells; a share can only be established for rows the donor has
+    /// already written, and a donor's forward writes from its own reuse point forward —
+    /// so a caller that keeps its reuse point at or beyond this number cannot touch the
+    /// share.
+    ///
+    /// It is a **query, not a pin**: nothing in the store refuses a write into the
+    /// range, because the store cannot know whether a forward writes from 0 or from a
+    /// reuse point. The caller that places work (the batch engine's admission) is where
+    /// the refusal belongs.
+    pub fn shared_from(&self, seq: SeqId) -> usize {
+        let Some(slot) = self.seqs.get(&seq) else {
+            return 0;
+        };
+        let run = slot.start;
+        let mut covered = 0usize;
+        for (&other, o) in &self.seqs {
+            if other == seq || o.shared.rows == 0 {
+                continue;
+            }
+            let hi = (o.shared.cell + o.shared.rows).min(slot.start + slot.cap);
+            if hi > run {
+                // Conservative on purpose: today every share starts at `run`, so this is
+                // exactly `rows`; if a future layout ever shares a mid-run range, this
+                // protects everything up to its end rather than under-protecting.
+                covered = covered.max(hi - run);
+            }
+        }
+        covered
+    }
+
     /// C8b S3: the copy-on-write a store at position `t` needs, or `None` when `t`
     /// already resolves into the sequence's own run.
     ///

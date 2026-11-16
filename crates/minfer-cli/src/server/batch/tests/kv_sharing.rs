@@ -480,3 +480,128 @@ fn a_growth_reclaims_an_idle_run_when_a_released_donors_share_fills_the_arena() 
     );
     assert_eq!(after.free_cells, 48 - 36 - rows);
 }
+
+/// #833: the donor's side of a read-in-place share. A slot that lends its first rows
+/// must not be handed a prompt that writes over them; the placement either refuses the
+/// slot or starts the prefill past the lent rows.
+fn toy_job_ids(input_ids: Vec<u32>) -> Job {
+    let (tx, _rx) = mpsc::channel::<StreamEvent>(16);
+    Job {
+        id: String::new(),
+        admitted: std::time::Instant::now(),
+        input_ids,
+        params: sampling_params(1),
+        tx,
+    }
+}
+
+fn toy_job(tok: &Tokenizer, text: &str) -> Job {
+    toy_job_ids(tok.encode(text))
+}
+
+/// The donor's leading `rows` cells out of the real K region, as bit patterns: two runs
+/// agree byte for byte iff their bit vectors do.
+fn lent_row_bits(engine: &mut BatchEngine, rows: usize) -> Vec<u32> {
+    let n_ctx = engine.n_ctx_total;
+    let (k, _v) = engine
+        .cache
+        .alloc()
+        .copy_kv_to_cpu(0)
+        .expect("the toy model has a K region");
+    let per_cell = k.len() / n_ctx;
+    k[..rows * per_cell]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect()
+}
+
+/// #833's reproduction, as a gate: without the pin, a different prompt on the donor
+/// slot rewrote the shared prefix (measured 192 of 256 K elements changed on the toy
+/// model). Now the slot refuses it, its rows are byte-identical, and admission places
+/// the request elsewhere instead of dropping it.
+#[test]
+fn a_donor_slot_refuses_a_prompt_that_would_overwrite_its_lent_prefix() {
+    let Some((model, tok)) = toy_model() else {
+        eprintln!("[#833] the toy fixture is missing; skipping");
+        return;
+    };
+    let mut engine = BatchEngine::new(&*model, 2, 64).expect("engine");
+    let prompt = tok.encode("hi hi hi");
+    let other = tok.encode("zz zz zz");
+    assert_ne!(
+        prompt.first(),
+        other.first(),
+        "the fixture needs a prompt whose first token differs"
+    );
+    serve_on(&mut engine, &*model, &tok, 0, prompt.clone(), 1);
+    let (sharer, donor) = (engine.slots[1].seq, engine.slots[0].seq);
+    let rows = prompt.len();
+    engine
+        .cache
+        .alloc()
+        .kv_share_prefix(donor, sharer, rows)
+        .expect("the donor wrote its prompt");
+    assert_eq!(engine.cache.alloc().kv_shared_from(donor), rows);
+
+    let before = lent_row_bits(&mut engine, rows);
+    let err = engine
+        .submit_on(&*model, &tok, 0, toy_job(&tok, "zz zz zz"))
+        .unwrap_err();
+    assert!(
+        err.message.contains("lending"),
+        "the refusal must name the share: {:?}",
+        err.message
+    );
+    assert_eq!(
+        lent_row_bits(&mut engine, rows),
+        before,
+        "a refused placement wrote the lent rows"
+    );
+
+    // Admission does not reject the request: the other slot takes it, and its prefill
+    // takes a private row (the copy-on-write the sharer needs to stop sharing).
+    let placed = engine.admit(&*model, &tok, vec![toy_job(&tok, "zz zz zz")]);
+    assert_eq!(placed[0].as_ref().ok(), Some(&1), "{:?}", placed[0]);
+    assert_eq!(
+        engine.cache.alloc().kv_shared_from(donor),
+        0,
+        "the sharer's private write ended the share"
+    );
+}
+
+/// #833's other half: a prompt that **does** reuse the lent rows is safe, because its
+/// prefill starts at the donor's reuse point — past the share.
+#[test]
+fn a_donor_slot_accepts_a_prompt_that_reuses_its_lent_prefix() {
+    let Some((model, tok)) = toy_model() else {
+        eprintln!("[#833] the toy fixture is missing; skipping");
+        return;
+    };
+    let mut engine = BatchEngine::new(&*model, 2, 64).expect("engine");
+    let prompt = tok.encode("hi hi hi");
+    serve_on(&mut engine, &*model, &tok, 0, prompt.clone(), 1);
+    let (sharer, donor) = (engine.slots[1].seq, engine.slots[0].seq);
+    let rows = prompt.len();
+    engine
+        .cache
+        .alloc()
+        .kv_share_prefix(donor, sharer, rows)
+        .expect("the donor wrote its prompt");
+
+    let before = lent_row_bits(&mut engine, rows);
+    let mut longer = prompt.clone();
+    longer.push(prompt[0]);
+    engine
+        .submit_on(&*model, &tok, 0, toy_job_ids(longer))
+        .expect("a prompt that reuses the lent rows is safe");
+    assert_eq!(
+        lent_row_bits(&mut engine, rows),
+        before,
+        "the prefill must start past the lent rows"
+    );
+    assert_eq!(
+        engine.cache.alloc().kv_shared_from(donor),
+        rows,
+        "the share survives a write that starts past it"
+    );
+}
