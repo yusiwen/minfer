@@ -671,3 +671,51 @@ fn a_sequence_without_a_reserved_run_is_refused_by_the_cell_resolver() {
         vec![(slot.start + 3) as u32]
     );
 }
+
+/// #837: the store's own backstop. The batch engine refuses to place a prompt that
+/// would write the rows a slot lends to another request, but that guarantee lives in
+/// the *placement* layer; a caller that reaches `fill_batch_inputs` another way
+/// (speculative decoding, a new server path, a test) must fail loudly instead of
+/// overwriting a live share. One lookup and one minimum per sequence group, no
+/// per-token cost — and the sharer's own store stays legal through the copy-on-write.
+#[test]
+fn a_store_into_a_lent_prefix_is_refused_by_the_fill() {
+    const N_CTX: usize = 16;
+    const ROW: usize = 4;
+    let mut b = GraphBuilder::new();
+    let _positions = b.input("positions", [1, 1, 1, 1], crate::graph::DType::I32);
+    let k = b.input("k", [ROW, 1, 1, 1], crate::graph::DType::F32);
+    let v = b.input("v", [ROW, 1, 1, 1], crate::graph::DType::F32);
+    let _store = b.kvcache_store(0, k, v, N_CTX);
+    let load = b.kvcache_load(0, ROW, N_CTX, 1);
+    b.output(load);
+    let g = b.build();
+
+    let mut alloc = GraphAllocator::new();
+    alloc.kv_set_capacity(N_CTX);
+    alloc.alloc_graph(&g).unwrap();
+    // A donor writes eight rows; B reads the first four of them in place.
+    let donor = alloc.kv_reserve_seq(1, 8).unwrap();
+    alloc.kv.own_range(1, donor.start, donor.start + 8);
+    alloc.kv_reserve_seq(2, 8).unwrap();
+    alloc.kv_share_prefix(1, 2, 4).unwrap();
+    assert_eq!(alloc.kv_shared_from(1), 4);
+
+    // A store at a position inside the lent rows is refused, by name.
+    let err = alloc
+        .fill_batch_inputs(&g, &Batch::new(vec![0], vec![0], vec![1]))
+        .unwrap_err();
+    assert!(err.contains("inside the 4 row(s) it lends"), "got: {err}");
+    assert!(err.contains("sequence 1"), "got: {err}");
+    // The donor's own rows past the lent prefix are its business.
+    alloc
+        .fill_batch_inputs(&g, &Batch::new(vec![0], vec![4], vec![1]))
+        .unwrap();
+    assert_eq!(alloc.kv_shared_from(1), 4, "the legal store kept the share");
+    // The sharer's store at 0 is the copy-on-write, not a write into the donor's cells.
+    alloc
+        .fill_batch_inputs(&g, &Batch::new(vec![0], vec![0], vec![2]))
+        .unwrap();
+    assert_eq!(alloc.kv_shared_from(1), 0, "the share became a private row");
+    assert_eq!(alloc.kv_arena_stats().cows, 1);
+}
