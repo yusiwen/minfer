@@ -5,6 +5,7 @@ use crate::graph::Backend;
 
 mod cells;
 mod defrag;
+mod measure;
 mod resize;
 mod sharing;
 mod spans;

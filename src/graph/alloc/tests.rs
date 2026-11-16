@@ -10,6 +10,7 @@ mod budget;
 mod kv_arena;
 mod kv_shift;
 mod liveness;
+mod measure;
 mod staging;
 mod views;
 fn chain(n_ops: usize) -> ComputeGraph {
