@@ -710,8 +710,15 @@ impl BatchEngine {
         let mut placed: Vec<(usize, Job, usize)> = Vec::new(); // (job index, job, slot)
         for (i, job) in jobs.into_iter().enumerate() {
             let mut best: Option<(usize, usize)> = None; // (prefix match, slot)
+            let mut lent = 0usize;
             for slot in 0..self.slots.len() {
                 if taken[slot] {
+                    continue;
+                }
+                // #833: a slot lending its prefix to another request can only take a
+                // prompt that reuses the lent rows; anything else is placed elsewhere.
+                if !self.slot_takes_prompt(slot, &job.input_ids) {
+                    lent += 1;
                     continue;
                 }
                 let n = common_prefix_len(&self.slots[slot].cached_tokens, &job.input_ids);
@@ -724,7 +731,17 @@ impl BatchEngine {
                     taken[slot] = true;
                     placed.push((i, job, slot));
                 }
-                None => answers[i] = Some(Err(reject(job, ApiError::unavailable("no idle slot")))),
+                None => {
+                    let e = if lent > 0 {
+                        ApiError::unavailable(format!(
+                            "no idle slot: {lent} slot(s) are lending their prefix to another \
+                             request"
+                        ))
+                    } else {
+                        ApiError::unavailable("no idle slot")
+                    };
+                    answers[i] = Some(Err(reject(job, e)));
+                }
             }
         }
         let total: usize = placed
@@ -776,6 +793,21 @@ impl BatchEngine {
             0
         };
         prefill_span(input_ids.len(), reuse)
+    }
+
+    /// #833: the leading rows this slot is **lending** to a live sharer (0 when it is
+    /// not a donor), i.e. the cells its own forward must not write.
+    fn lent_rows(&mut self, idx: usize) -> usize {
+        let seq = self.slots[idx].seq;
+        self.cache.alloc().kv_shared_from(seq)
+    }
+
+    /// #833: may `prompt` be placed on slot `idx` without writing into a lent prefix?
+    /// Safe iff the prompt reuses at least the lent rows, so the prefill starts past
+    /// them.
+    fn slot_takes_prompt(&mut self, idx: usize, prompt: &[u32]) -> bool {
+        let lent = self.lent_rows(idx);
+        lent == 0 || self.feed_span(idx, prompt).0 >= lent
     }
 
     /// C8a: the longest prefix this slot may start from, and the slot holding it when
@@ -1040,13 +1072,28 @@ impl BatchEngine {
             ));
         }
         let seq = self.slots[idx].seq;
+        // #833: this slot may be **lending** its first rows to another request (C8b's
+        // read-in-place share), and those rows are that request's data. A forward
+        // writes from this slot's reuse point forward, so the placement is safe only
+        // when that point is at or beyond the lent rows; otherwise the prefill would
+        // overwrite the sharer's prefix silently.
+        let (own, _) = self.feed_span(idx, &job.input_ids);
+        let lent = self.lent_rows(idx);
+        if lent > 0 && own < lent {
+            return Err(reject(
+                job,
+                ApiError::unavailable(format!(
+                    "slot {idx} is lending its first {lent} row(s) to another request; a \
+                     prompt that reuses fewer of them cannot be placed here"
+                )),
+            ));
+        }
         // C8a: the rows this request can start from may live in *another* slot — the
         // slot that already computed the same prefix (possibly while still generating:
         // its rows are stable for the duration of the copy). The match is verified
         // against the donor's recorded tokens, so the rows are known to hold this
         // prompt's prefix, and C6 makes the donor's different run start irrelevant to
         // this slot's arithmetic — which is why the gate can demand byte equality.
-        let (own, _) = self.feed_span(idx, &job.input_ids);
         let (want_rows, donor) = self.shared_prefix(idx, &job.input_ids, own);
         let feed_from = match donor {
             Some(src) => {

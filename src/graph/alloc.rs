@@ -1664,6 +1664,15 @@ impl GraphAllocator {
         self.kv.seq_slot(seq)
     }
 
+    /// #833: the leading cells of `seq`'s run a live share points into (0 when it is
+    /// not a donor) — the write side of C8b's read-in-place share.
+    ///
+    /// `KvCache::shared_from` is the authority; this is the application layer's way to
+    /// ask it before it places a request on a slot.
+    pub fn kv_shared_from(&self, seq: super::kvcache::SeqId) -> usize {
+        self.kv.shared_from(seq)
+    }
+
     /// Arena capacity in rows (`n_ctx`), 0 before allocation.
     pub fn kv_n_ctx(&self) -> usize {
         self.kv.n_ctx()
