@@ -2606,6 +2606,18 @@ rather than a new op field. A `kv_map` flag on `Op::Attn` would have touched eve
 across three backends, the models and the tests for no behavioural gain; the size *is* the topology
 here, and every backend that cannot gather refuses loudly instead of misreading pairs.
 
+**#831/#833 (2026-11-16) — a live share pins its donor's run and the donor's next forward.**
+The departure above ("a released donor's rows stay taken") held only in the *observer*: the
+cells stayed covered by the sharer's span, but `compaction_plan` packs over reservations, so
+once the donor's run was released those rows were unmovable and a resize could place a run on
+them — silently, because `apply_moves` checks run-vs-run overlap only
+([#831](https://github.com/yusiwen/minfer/issues/831)). The rule is now "a share always lives
+inside a reserved run": `KvCache::release_seq` and `set_cap(seq, 0)` refuse a lending run, the
+server's growth loop skips a lending slot, and `KvCache::shared_from` keeps the donor's own
+next forward off the rows it lent
+([#833](https://github.com/yusiwen/minfer/issues/833)). The **no-refcount** decision is
+unchanged: the pin is derived from the span list, never counted.
+
 S3 then adds copy-on-write (`kv_private_row_for`) for a store that would land in a shared block; S4
 ports the gather to CUDA's `gqa_attn_*` loop; S5 is Metal behind G5 — **lifted later** by the G5
 port and Metal's `kv_map` kernel ([#362](https://github.com/yusiwen/minfer/issues/362)); see the S5
