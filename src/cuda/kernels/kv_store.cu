@@ -71,6 +71,25 @@ __device__ __forceinline__ void q8_0_quantize_block(const float* x, unsigned cha
     }
 }
 
+// Warp form of `q8_0_quantize_block`: one lane per element of one 32-element
+// block. `amax` is a max over the same 32 values, so the scale and every quant
+// byte are identical to the serial form's; the caller must keep each 32-lane
+// group inside one hardware warp (the epilogues start the K/V section on a
+// 32-lane boundary for that reason).
+__device__ __forceinline__ void q8_0_quantize_block_warp(
+    float x, int lane, unsigned char* cell) {
+    float amax = fabsf(x);
+    #pragma unroll
+    for (int off = Q8_0_BLOCK_ELEMS / 2; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+    const float d = amax / 127.0f;
+    const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+    if (lane == 0) *reinterpret_cast<__half*>(cell) = __float2half_rn(d);
+    float v = rintf(x * id);
+    v = fminf(127.0f, fmaxf(-128.0f, v));
+    reinterpret_cast<signed char*>(cell + 2)[lane] = (signed char)(int)v;
+}
+
 // C6: one rope pair's rotation — the SAME expression as `rope_f32` (neox
 // pairing d <-> d + hd/2, one `freq = freq_scale / powf(freq_base, 2d/hd)` and
 // one cosf/sinf per pair). Every fused decode epilogue calls this instead of
@@ -241,7 +260,11 @@ __global__ void attn_bias_rope_store_q8_0(
     const int half_dim = hd / 2;
     const int qpairs = nqt / 2;
     const int kblks = nkt / Q8_0_BLOCK_ELEMS;
-    const int total = qpairs + 2 * kblks;
+    // K/V blocks are quantized by one full warp each (32 lanes = 32 elements).
+    // The section starts on a 32-lane boundary so every group is one hardware
+    // warp; the lanes between `qpairs` and `kv_base` are padding.
+    const int kv_base = (qpairs + Q8_0_BLOCK_ELEMS - 1) & ~(Q8_0_BLOCK_ELEMS - 1);
+    const int total = kv_base + 2 * kblks * Q8_0_BLOCK_ELEMS;
     const int u = blockIdx.x * blockDim.x + threadIdx.x;
     if (u >= total) return;
     // C6: `positions[0]` is the rope angle's sequence-relative index and
@@ -260,39 +283,32 @@ __global__ void attn_bias_rope_store_q8_0(
             q[j] + bias_q[j], q[j2] + bias_q[j2], d, hd, pos, freq_base, freq_scale, freqs);
         q[j]  = r.x;
         q[j2] = r.y;
-    } else if (u < qpairs + kblks) {
-        // K section: one (head, block). `b` is also the block's index inside the
-        // packed row (blocks are laid out in flat element order).
-        const int b = u - qpairs;
-        const int blk = b % (hd / Q8_0_BLOCK_ELEMS);
-        const int head = b / (hd / Q8_0_BLOCK_ELEMS);
-        float x[Q8_0_BLOCK_ELEMS];
-        #pragma unroll
-        for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) {
-            // `d` is the element's index inside the head, so the block's own
-            // offset must be added — without it every block of a head would
-            // compute the head's first 32 values (caught by
-            // cuda_q8_0_fused_epilogue_matches_the_cpu_quantizer's byte arm).
-            const int d = blk * Q8_0_BLOCK_ELEMS + i;
+    } else if (u >= kv_base) {
+        // K/V: one warp per (head, 32-element block); the warp's max is the
+        // block's amax and each lane writes its own quant byte.
+        const int t = u - kv_base;
+        const int lane = t % Q8_0_BLOCK_ELEMS;
+        const int b = t / Q8_0_BLOCK_ELEMS;
+        if (b < kblks) {
+            const int blk = b % (hd / Q8_0_BLOCK_ELEMS);
+            const int head = b / (hd / Q8_0_BLOCK_ELEMS);
+            const int d = blk * Q8_0_BLOCK_ELEMS + lane;
             const int dd = (d < half_dim) ? d : d - half_dim;
             const int ja = head * hd + dd;
             const int jb = ja + half_dim;
             const float2 r = minfer_rope_pair(
                 k[ja] + bias_k[ja], k[jb] + bias_k[jb], dd, hd, pos, freq_base, freq_scale, freqs);
-            x[i] = (d < half_dim) ? r.x : r.y;
+            const float x = (d < half_dim) ? r.x : r.y;
+            q8_0_quantize_block_warp(
+                x, lane, kv_k + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
+        } else {
+            // V: bias + quantize; the V buffer itself stays dead.
+            const int bb = b - kblks;
+            const int base = bb * Q8_0_BLOCK_ELEMS;
+            const float x = v[base + lane] + bias_v[base + lane];
+            q8_0_quantize_block_warp(
+                x, lane, kv_v + (size_t)row * row_bytes + (size_t)bb * Q8_0_BLOCK_BYTES);
         }
-        q8_0_quantize_block(x, kv_k + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
-    } else {
-        // V section: one block, bias + quantize. The bias is folded into the
-        // quantized value only: like the K section, the V buffer itself is dead
-        // in both fused classes (attention reads the packed region), and leaving
-        // it unwritten lets `v` stay `const`.
-        const int b = u - qpairs - kblks;
-        const int base = b * Q8_0_BLOCK_ELEMS;
-        float x[Q8_0_BLOCK_ELEMS];
-        #pragma unroll
-        for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) x[i] = v[base + i] + bias_v[base + i];
-        q8_0_quantize_block(x, kv_v + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
     }
 }
 
@@ -393,7 +409,8 @@ __global__ void attn_rope_store_q8_0(
     const int half_dim = hd / 2;
     const int qpairs = nqt / 2;
     const int kblks = nkt / Q8_0_BLOCK_ELEMS;
-    const int total = qpairs + 2 * kblks;
+    const int kv_base = (qpairs + Q8_0_BLOCK_ELEMS - 1) & ~(Q8_0_BLOCK_ELEMS - 1);
+    const int total = kv_base + 2 * kblks * Q8_0_BLOCK_ELEMS;
     const int u = blockIdx.x * blockDim.x + threadIdx.x;
     if (u >= total) return;
     const int pos = positions[0];
@@ -409,32 +426,39 @@ __global__ void attn_rope_store_q8_0(
         const float2 r = minfer_rope_pair(q[j], q[j2], d, hd, pos, freq_base, freq_scale, freqs);
         q[j]  = r.x;
         q[j2] = r.y;
-    } else if (u < qpairs + kblks) {
-        // K section: one (head, block), roped then quantized as a whole block.
-        const int b = u - qpairs;
-        const int blk = b % (hd / Q8_0_BLOCK_ELEMS);
-        const int head = b / (hd / Q8_0_BLOCK_ELEMS);
-        float x[Q8_0_BLOCK_ELEMS];
-        #pragma unroll
-        for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) {
-            const int d = blk * Q8_0_BLOCK_ELEMS + i;
+    } else if (u >= kv_base) {
+        const int t = u - kv_base;
+        const int lane = t % Q8_0_BLOCK_ELEMS;
+        const int b = t / Q8_0_BLOCK_ELEMS;
+        if (b < kblks) {
+            const int blk = b % (hd / Q8_0_BLOCK_ELEMS);
+            const int head = b / (hd / Q8_0_BLOCK_ELEMS);
+            const int d = blk * Q8_0_BLOCK_ELEMS + lane;
             const int dd = (d < half_dim) ? d : d - half_dim;
             const int ja = head * hd + dd;
             const int jb = ja + half_dim;
             const float2 r = minfer_rope_pair(k[ja], k[jb], dd, hd, pos, freq_base, freq_scale, freqs);
-            x[i] = (d < half_dim) ? r.x : r.y;
+            const float x = (d < half_dim) ? r.x : r.y;
+            q8_0_quantize_block_warp(
+                x, lane, kv_k + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
+        } else {
+            const int bb = b - kblks;
+            const int base = bb * Q8_0_BLOCK_ELEMS;
+            const float x = v[base + lane];
+            q8_0_quantize_block_warp(
+                x, lane, kv_v + (size_t)row * row_bytes + (size_t)bb * Q8_0_BLOCK_BYTES);
         }
-        q8_0_quantize_block(x, kv_k + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
-    } else {
-        // V section: one block, quantized as-is (no bias in Qwen3).
-        const int b = u - qpairs - kblks;
-        const int base = b * Q8_0_BLOCK_ELEMS;
-        float x[Q8_0_BLOCK_ELEMS];
-        #pragma unroll
-        for (int i = 0; i < Q8_0_BLOCK_ELEMS; i++) x[i] = v[base + i];
-        q8_0_quantize_block(x, kv_v + (size_t)row * row_bytes + (size_t)b * Q8_0_BLOCK_BYTES);
     }
 }
+
+// One warp per packed K/V block: `kv_base` is the 32-lane-aligned start of the
+// K/V section, so every block's 32 threads are one hardware warp.
+static inline int q8_0_epilogue_total(int nqt, int nkt) {
+    const int qpairs = nqt / 2;
+    const int kv_base = (qpairs + Q8_0_BLOCK_ELEMS - 1) & ~(Q8_0_BLOCK_ELEMS - 1);
+    return kv_base + 2 * (nkt / Q8_0_BLOCK_ELEMS) * Q8_0_BLOCK_ELEMS;
+}
+
 extern "C" {
 
 void launch_store_kv_f32(
@@ -516,7 +540,7 @@ void launch_attn_bias_rope_store_q8_0(
     const int* positions, const int* cells, size_t row_bytes,
     cudaStream_t stream
 ) {
-    const int total = nqt / 2 + 2 * (nkt / Q8_0_BLOCK_ELEMS);
+    const int total = q8_0_epilogue_total(nqt, nkt);
     const int block = 256;
     const int grid = (total + block - 1) / block;
     minfer_launch_prelude("launch:attn_bias_rope_store_q8_0", "attn_bias_rope_store_q8_0");
@@ -560,7 +584,7 @@ void launch_attn_rope_store_q8_0(
     const int* positions, const int* cells, size_t row_bytes,
     cudaStream_t stream
 ) {
-    const int total = nqt / 2 + 2 * (nkt / Q8_0_BLOCK_ELEMS);
+    const int total = q8_0_epilogue_total(nqt, nkt);
     const int block = 256;
     const int grid = (total + block - 1) / block;
     minfer_launch_prelude("launch:attn_rope_store_q8_0", "attn_rope_store_q8_0");
