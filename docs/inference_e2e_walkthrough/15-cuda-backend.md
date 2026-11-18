@@ -867,7 +867,7 @@ weights to zero.
 The combine kernel is 20 lines and re-derives the whole answer:
 
 ```rust
-// src/cuda/kernels/attention_decode.cu:360
+// src/cuda/kernels/attention_decode.cu:513
 __global__ void gqa_attn_split_combine(
     const float* __restrict__ partial,
     float* __restrict__ o,
