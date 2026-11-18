@@ -326,19 +326,48 @@ __device__ __forceinline__ void attn_split_1w_body(
     }
 }
 
-// E2 (#842): the packed decode body with two KV cells per warp. At hd 64 the
-// one-cell body leaves lanes 16..31 masked off; splitting the warp into two
-// 16-lane groups (A: the first half of the split's cell range, B: the second)
-// halves the warp instructions per cell and doubles the independent cell
-// chains. Per cell the dot reduction is 16-wide — bitwise the 32-wide version
-// with the idle half's exact zeros — and the two halves' (mx,S,oc) are merged
-// with the combine kernel's formula, which is a different association:
-// tolerance-class, not bitwise (#633).
-__device__ __forceinline__ void attn_split_1w_body_q8_2cell(
+// E2 (#842) put two KV cells in one warp at hd 64 (16-lane groups, 4 dims per
+// lane) and measured 38.53 -> 20.58 µs/layer. E3 (#847) takes the same lever one
+// step further: four 8-lane groups, 8 dims per lane, so one warp keeps four
+// cells in flight and the split's cell range divides by four. The K dot becomes
+// two `dp4a` (one per 4-dim half) summed in `int` — exact — and the reduction is
+// 8-wide, so it is 3 shuffles instead of 4. The query quantization is unchanged
+// bit for bit: a Q8_0 block is still the same 32 dims (four lanes here, eight
+// there), so `amax` covers the same 32 values and every dim's quant is the same.
+// The four groups' (mx,S,oc) are merged pairwise with the combine kernel's
+// formula, a different association again: tolerance-class, not bitwise.
+//
+// `hd == 64` only (the caller gates it): 8 lanes × 8 dims = 64, one Q8_0 block
+// per 4-lane subgroup.
+
+/// Pack four f32 values into one `int` of int8 quants (little-endian byte
+/// order), the layout `__dp4a` wants — the per-lane half of the query
+/// quantization the 16-lane body did inline.
+static __device__ __forceinline__ int q8_0_pack4(float4 x, float qid) {
+    const int c0 = (int)fminf(127.0f, fmaxf(-128.0f, rintf(x.x * qid)));
+    const int c1 = (int)fminf(127.0f, fmaxf(-128.0f, rintf(x.y * qid)));
+    const int c2 = (int)fminf(127.0f, fmaxf(-128.0f, rintf(x.z * qid)));
+    const int c3 = (int)fminf(127.0f, fmaxf(-128.0f, rintf(x.w * qid)));
+    return (c0 & 0xFF) | ((c1 & 0xFF) << 8) | ((c2 & 0xFF) << 16) | ((c3 & 0xFF) << 24);
+}
+
+/// The four `float4` lanes of `x`, permuted by one XOR shuffle — the merge's unit.
+static __device__ __forceinline__ float4 shfl4_xor(float4 x, int off) {
+    float4 r;
+    r.x = __shfl_xor_sync(0xFFFFFFFF, x.x, off);
+    r.y = __shfl_xor_sync(0xFFFFFFFF, x.y, off);
+    r.z = __shfl_xor_sync(0xFFFFFFFF, x.z, off);
+    r.w = __shfl_xor_sync(0xFFFFFFFF, x.w, off);
+    return r;
+}
+
+template <bool MAP>
+__device__ __forceinline__ void attn_split_1w_body_q8_4cell(
     const float* __restrict__ q,
     const void* __restrict__ k,
     const void* __restrict__ v,
     float* __restrict__ partial,
+    const int* __restrict__ bound, int qt,
     int row0, int nkv, int sp, int h,
     int nh, int nk, int hd, float scale, int pstr, size_t row_bytes, int lane_id
 ) {
@@ -346,81 +375,93 @@ __device__ __forceinline__ void attn_split_1w_body_q8_2cell(
     const int chunk = (nkv + SPLITS - 1) / SPLITS;
     const int lo = sp * chunk;
     const int hi = min(nkv, lo + chunk);
-    const int half = (chunk + 1) / 2;   // cells per group (loop bound, uniform)
-    const int g = lane_id >> 4;         // 0 / 1
-    const int li = lane_id & 15;
-    const int d0 = li * 4;
+    const int quart = (chunk + 3) / 4;  // cells per group (loop bound, uniform)
+    const int g = lane_id >> 3;         // 0..3
+    const int li = lane_id & 7;
+    const int d0 = li * 8;
     const bool live = d0 < hd;
-    const int lo_g = lo + g * half;
-    const int hi_g = min(hi, lo_g + half);
-    const int len_g = hi_g - lo_g;      // 0 on an empty half / idle split
+    const int lo_g = lo + g * quart;
+    const int hi_g = min(hi, lo_g + quart);
+    const int len_g = hi_g - lo_g;      // 0 on an empty group / idle split
 
     const int gqa = nh / nk;
     const int hk = h / gqa;
-    const float4 q4 = live ? *reinterpret_cast<const float4*>(q + h * hd + d0)
+    const float4 qa = live ? *reinterpret_cast<const float4*>(q + h * hd + d0)
+                           : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4 qb = live ? *reinterpret_cast<const float4*>(q + h * hd + d0 + 4)
                            : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
-    // Query quantization: the 8-lane block groups stay inside a 16-lane group.
-    int qk = 0;
+    // Query quantization: a Q8_0 block is 32 dims = this lane's 4-lane
+    // subgroup, so the reduce is 2 steps and its 8 dims share one block scale.
+    int qka = 0, qkb = 0;
     float qscale = 0.0f;
     {
-        float amax = live ? fmaxf(fmaxf(fabsf(q4.x), fabsf(q4.y)), fmaxf(fabsf(q4.z), fabsf(q4.w)))
+        float amax = live ? fmaxf(fmaxf(fmaxf(fabsf(qa.x), fabsf(qa.y)), fmaxf(fabsf(qa.z), fabsf(qa.w))),
+                                  fmaxf(fmaxf(fabsf(qb.x), fabsf(qb.y)), fmaxf(fabsf(qb.z), fabsf(qb.w))))
                           : 0.0f;
         #pragma unroll
-        for (int off = 4; off > 0; off >>= 1)
+        for (int off = 2; off > 0; off >>= 1)
             amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, off));
         qscale = amax / 127.0f;
         const float qid = (qscale != 0.0f) ? (1.0f / qscale) : 0.0f;
         if (live) {
-            signed char c0 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.x * qid)));
-            signed char c1 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.y * qid)));
-            signed char c2 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.z * qid)));
-            signed char c3 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.w * qid)));
-            qk = ((int)(unsigned char)c0) | ((int)(unsigned char)c1 << 8) |
-                 ((int)(unsigned char)c2 << 16) | ((int)(unsigned char)c3 << 24);
+            qka = q8_0_pack4(qa, qid);
+            qkb = q8_0_pack4(qb, qid);
         }
     }
 
     float mx = -INFINITY, S = 0.0f;
-    float4 oc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 oa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 ob = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
 
-    for (int base_l = 0; base_l < half; base_l += 4) {
-        const int nr = min(4, half - base_l);   // warp-uniform
+    for (int base_l = 0; base_l < quart; base_l += 4) {
+        const int nr = min(4, quart - base_l);  // warp-uniform
         const int base = lo_g + base_l;
         int cell[4];
         {
-            // Non-MAP only (the caller gates it): the window is linear.
-            const int at = row0 + base;
+            // C8b S4: a map's runs are long, so four consecutive rows almost
+            // always sit inside one run — resolve the batch's first row (and how
+            // many rows its run holds) once, then every other row is an add; a
+            // run boundary *inside* the batch falls back to the walk. For the
+            // contiguous modes `left >= 4` and this folds back to `base + j`.
+            int left;
+            const int at = kv_cell_left<MAP>(bound, qt, row0, base, left);
             #pragma unroll
-            for (int j = 0; j < 4; j++) cell[j] = at + j;
+            for (int j = 0; j < 4; j++)
+                cell[j] = (j < left) ? (at + j) : kv_cell<MAP>(bound, qt, row0, base + j);
         }
-        int ki4[4];
+        int kia[4], kib[4];
         float kd4[4];
-        float4 v4[4];
+        float4 va[4], vb[4];
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             const bool use = live && j < nr && (base_l + j < len_g);
             if (use) {
-                kv4_q8_0_packed<true>(
-                    kv_row(k, cell[j], row_bytes), hk * hd + d0, ki4[j], kd4[j]);
+                const char* kr = kv_row(k, cell[j], row_bytes);
+                kv4_q8_0_packed<true>(kr, hk * hd + d0, kia[j], kd4[j]);
+                kv4_q8_0_packed<true>(kr, hk * hd + d0 + 4, kib[j], kd4[j]);
+                const char* vr = kv_row(v, cell[j], row_bytes);
+                va[j] = kv4<KV_LAYOUT_Q8_0, true>(vr, hk * hd + d0);
+                vb[j] = kv4<KV_LAYOUT_Q8_0, true>(vr, hk * hd + d0 + 4);
             } else {
-                ki4[j] = 0;
+                kia[j] = 0;
+                kib[j] = 0;
                 kd4[j] = 0.0f;
+                va[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                vb[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
-            v4[j] = use ? kv4<KV_LAYOUT_Q8_0, true>(kv_row(v, cell[j], row_bytes), hk * hd + d0)
-                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             if (j >= nr) break;
-            float d = (float)__dp4a(qk, ki4[j], 0) * (qscale * kd4[j]);
+            float d = (float)(__dp4a(qka, kia[j], 0) + __dp4a(qkb, kib[j], 0)) * (qscale * kd4[j]);
             #pragma unroll
-            for (int off = 8; off > 0; off >>= 1)
-                d += __shfl_xor_sync(0xFFFFFFFF, d, off, 16);
+            for (int off = 4; off > 0; off >>= 1)
+                d += __shfl_xor_sync(0xFFFFFFFF, d, off, 8);
             const bool valid = live && (base_l + j < len_g);
             const float s = valid ? d * scale : -INFINITY;
             // An invalid row must not enter the online softmax: mx is -INF
-            // there, and expf(-INF - -INF) is NaN (an empty half would poison
+            // there, and expf(-INF - -INF) is NaN (an empty group would poison
             // the merge). Masked, not branched, so the warp stays converged.
             const float nmx = valid ? fmaxf(mx, s) : mx;
             const float corr = valid ? expf(mx - nmx) : 1.0f;
@@ -428,45 +469,56 @@ __device__ __forceinline__ void attn_split_1w_body_q8_2cell(
             S = S * corr + e;
             mx = nmx;
             if (live) {
-                const float4 vv = v4[j];
-                oc.x = oc.x * corr + e * vv.x;
-                oc.y = oc.y * corr + e * vv.y;
-                oc.z = oc.z * corr + e * vv.z;
-                oc.w = oc.w * corr + e * vv.w;
+                oa.x = oa.x * corr + e * va[j].x;
+                oa.y = oa.y * corr + e * va[j].y;
+                oa.z = oa.z * corr + e * va[j].z;
+                oa.w = oa.w * corr + e * va[j].w;
+                ob.x = ob.x * corr + e * vb[j].x;
+                ob.y = ob.y * corr + e * vb[j].y;
+                ob.z = ob.z * corr + e * vb[j].z;
+                ob.w = ob.w * corr + e * vb[j].w;
             }
         }
     }
 
-    // Merge the two halves with the split-combine formula. A group with no
-    // cells keeps mx = -INF, S = 0; two empty groups must stay -INF (the
-    // combine weights them to zero) rather than produce a NaN.
-    const float pmx = __shfl_xor_sync(0xFFFFFFFF, mx, 16);
-    const float pS  = __shfl_xor_sync(0xFFFFFFFF, S, 16);
-    float4 poc;
-    poc.x = __shfl_xor_sync(0xFFFFFFFF, oc.x, 16);
-    poc.y = __shfl_xor_sync(0xFFFFFFFF, oc.y, 16);
-    poc.z = __shfl_xor_sync(0xFFFFFFFF, oc.z, 16);
-    poc.w = __shfl_xor_sync(0xFFFFFFFF, oc.w, 16);
-    if (!(mx == -INFINITY && pmx == -INFINITY)) {
-        const float m = fmaxf(mx, pmx);
-        const float wA = expf(mx - m);
-        const float wB = expf(pmx - m);
-        S = S * wA + pS * wB;
-        oc.x = oc.x * wA + poc.x * wB;
-        oc.y = oc.y * wA + poc.y * wB;
-        oc.z = oc.z * wA + poc.z * wB;
-        oc.w = oc.w * wA + poc.w * wB;
-        mx = m;
+    // Merge the four groups pairwise (offset 8, then 16) with the split-combine
+    // formula. A group with no cells keeps mx = -INF, S = 0; two empty groups
+    // must stay -INF (the combine weights them to zero) rather than NaN.
+    #pragma unroll
+    for (int lvl = 0; lvl < 2; lvl++) {
+        const int off = 8 << lvl;
+        const float pmx = __shfl_xor_sync(0xFFFFFFFF, mx, off);
+        const float pS = __shfl_xor_sync(0xFFFFFFFF, S, off);
+        const float4 pa = shfl4_xor(oa, off);
+        const float4 pb = shfl4_xor(ob, off);
+        if (!(mx == -INFINITY && pmx == -INFINITY)) {
+            const float m = fmaxf(mx, pmx);
+            const float wA = expf(mx - m);
+            const float wB = expf(pmx - m);
+            S = S * wA + pS * wB;
+            oa.x = oa.x * wA + pa.x * wB;
+            oa.y = oa.y * wA + pa.y * wB;
+            oa.z = oa.z * wA + pa.z * wB;
+            oa.w = oa.w * wA + pa.w * wB;
+            ob.x = ob.x * wA + pb.x * wB;
+            ob.y = ob.y * wA + pb.y * wB;
+            ob.z = ob.z * wA + pb.z * wB;
+            ob.w = ob.w * wA + pb.w * wB;
+            mx = m;
+        }
     }
 
-    // Group A owns the split's one partial.
+    // Group 0 owns the split's one partial.
     if (g == 0) {
         float* dst = partial + ((size_t)sp * nh + h) * pstr;
         if (li == 0) {
             dst[0] = mx;
             dst[1] = S;
         }
-        if (live) *reinterpret_cast<float4*>(dst + 4 + d0) = oc;
+        if (live) {
+            *reinterpret_cast<float4*>(dst + 4 + d0) = oa;
+            *reinterpret_cast<float4*>(dst + 4 + d0 + 4) = ob;
+        }
     }
 }
 
@@ -496,12 +548,13 @@ __global__ void gqa_attn_split_partial(
         const int chunk0 = (nkv + ATTN_SPLITS - 1) / ATTN_SPLITS;
         if (((chunk0 + 3) >> 2) >= rpw_gate) return;
     }
-    // E2 (#842): at hd 64 the packed decode body packs two cells per warp.
-    if constexpr (Q8DP4A && Q8WIDE && !MAP) {
+    // E2 (#842) / E3 (#847): at hd 64 the packed decode body keeps four cells in
+    // flight per warp (four 8-lane groups, 8 dims per lane).
+    if constexpr (Q8DP4A && Q8WIDE) {
         if (hd == 64) {
-            attn_split_1w_body_q8_2cell(q, k, v, partial, row0, nkv,
-                                        blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr,
-                                        row_bytes, threadIdx.x);
+            attn_split_1w_body_q8_4cell<MAP>(q, k, v, partial, bound, 0, row0, nkv,
+                                             blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr,
+                                             row_bytes, threadIdx.x);
             return;
         }
     }
