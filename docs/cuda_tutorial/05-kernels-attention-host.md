@@ -890,7 +890,7 @@ launch overhead" at a 14B decode (`cuda_backend.rs:`, the positions-memo comment
 launch, right in TECH-PRIMER's band. §3.2's fusion is the same arithmetic at
 graph level — the 7-launch QKV tail becomes 1 ("−310 launches/step" across a
 whole model, `docs/CUDA-TECH-PRIMER.md:294-298` (§6 "Element-wise and fused epilogue kernels")  — and the dispatch notes
-price even one wasted launch at "~1-2 us/layer" (`attention_decode.cu:1083`, the split-K dispatch note).
+price even one wasted launch at "~1-2 us/layer" (`attention_decode.cu:1136`, the split-K dispatch note).
 
 **f16 KV bytes per token per layer.** With `nkt = n_head_kv · hd`, each region
 stores `nkt` elements per position. Qwen2.5-0.5B: `nkt = 2·64 = 128` elements
