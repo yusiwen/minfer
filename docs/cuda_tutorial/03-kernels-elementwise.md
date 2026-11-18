@@ -64,7 +64,7 @@ family. Here is the map (file and line):
 | Decode matvec (MMVQ) | `q4_k_q8_mmvq_multi` (`mmvq_multi.cu:25`), `q4_0_q8_mmvq` (`:446`) | one output row per block, dp4a integer dots | ch 04 |
 | Prefill GEMM | `gemm_f16_nt_kernel_t` (`gemm_wmma.cu:367`), `mmq_nt_kernel` (`mmq_int8.cu:236`) | tiled tensor-core GEMM, f16 or int8 | ch 04 |
 | Attention | `gqa_attn_f32_f16kv` (`attention_decode.cu:18`), `fa_prefill_kv` (`attention_prefill.cu:117`) | GQA attention, flash-style prefill | ch 05 |
-| Fused decode tail | `attn_bias_rope_store_f32` (`kv_store.cu:134`), `attn_rope_store_f32` (`:310`), `attn_rope_store_q8_0` (`:380`) | bias×3 + rope×2 + store×2 in one launch; the `attn_rope_store_*` pair is the no-bias variant | ch 05 |
+| Fused decode tail | `attn_bias_rope_store_f32` (`kv_store.cu:153`), `attn_rope_store_f32` (`:326`), `attn_rope_store_q8_0` (`:396`) | bias×3 + rope×2 + store×2 in one launch; the `attn_rope_store_*` pair is the no-bias variant | ch 05 |
 | Activation quantize | `quantize_q8_0_pad40_t` (`mmvq_aquant.cu:85`), `rms_norm_quant_f32_t` (`:169`) | f32 activations → q8 blocks for MMQ | ch 04 |
 
 Two structural facts the table hides, and both matter for reading:
