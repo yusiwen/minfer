@@ -326,6 +326,150 @@ __device__ __forceinline__ void attn_split_1w_body(
     }
 }
 
+// E2 (#842): the packed decode body with two KV cells per warp. At hd 64 the
+// one-cell body leaves lanes 16..31 masked off; splitting the warp into two
+// 16-lane groups (A: the first half of the split's cell range, B: the second)
+// halves the warp instructions per cell and doubles the independent cell
+// chains. Per cell the dot reduction is 16-wide — bitwise the 32-wide version
+// with the idle half's exact zeros — and the two halves' (mx,S,oc) are merged
+// with the combine kernel's formula, which is a different association:
+// tolerance-class, not bitwise (#633).
+__device__ __forceinline__ void attn_split_1w_body_q8_2cell(
+    const float* __restrict__ q,
+    const void* __restrict__ k,
+    const void* __restrict__ v,
+    float* __restrict__ partial,
+    int row0, int nkv, int sp, int h,
+    int nh, int nk, int hd, float scale, int pstr, size_t row_bytes, int lane_id
+) {
+    constexpr int SPLITS = ATTN_SPLITS;
+    const int chunk = (nkv + SPLITS - 1) / SPLITS;
+    const int lo = sp * chunk;
+    const int hi = min(nkv, lo + chunk);
+    const int half = (chunk + 1) / 2;   // cells per group (loop bound, uniform)
+    const int g = lane_id >> 4;         // 0 / 1
+    const int li = lane_id & 15;
+    const int d0 = li * 4;
+    const bool live = d0 < hd;
+    const int lo_g = lo + g * half;
+    const int hi_g = min(hi, lo_g + half);
+    const int len_g = hi_g - lo_g;      // 0 on an empty half / idle split
+
+    const int gqa = nh / nk;
+    const int hk = h / gqa;
+    const float4 q4 = live ? *reinterpret_cast<const float4*>(q + h * hd + d0)
+                           : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // Query quantization: the 8-lane block groups stay inside a 16-lane group.
+    int qk = 0;
+    float qscale = 0.0f;
+    {
+        float amax = live ? fmaxf(fmaxf(fabsf(q4.x), fabsf(q4.y)), fmaxf(fabsf(q4.z), fabsf(q4.w)))
+                          : 0.0f;
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, off));
+        qscale = amax / 127.0f;
+        const float qid = (qscale != 0.0f) ? (1.0f / qscale) : 0.0f;
+        if (live) {
+            signed char c0 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.x * qid)));
+            signed char c1 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.y * qid)));
+            signed char c2 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.z * qid)));
+            signed char c3 = (signed char)(int)fminf(127.0f, fmaxf(-128.0f, rintf(q4.w * qid)));
+            qk = ((int)(unsigned char)c0) | ((int)(unsigned char)c1 << 8) |
+                 ((int)(unsigned char)c2 << 16) | ((int)(unsigned char)c3 << 24);
+        }
+    }
+
+    float mx = -INFINITY, S = 0.0f;
+    float4 oc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    for (int base_l = 0; base_l < half; base_l += 4) {
+        const int nr = min(4, half - base_l);   // warp-uniform
+        const int base = lo_g + base_l;
+        int cell[4];
+        {
+            // Non-MAP only (the caller gates it): the window is linear.
+            const int at = row0 + base;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) cell[j] = at + j;
+        }
+        int ki4[4];
+        float kd4[4];
+        float4 v4[4];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const bool use = live && j < nr && (base_l + j < len_g);
+            if (use) {
+                kv4_q8_0_packed<true>(
+                    kv_row(k, cell[j], row_bytes), hk * hd + d0, ki4[j], kd4[j]);
+            } else {
+                ki4[j] = 0;
+                kd4[j] = 0.0f;
+            }
+            v4[j] = use ? kv4<KV_LAYOUT_Q8_0, true>(kv_row(v, cell[j], row_bytes), hk * hd + d0)
+                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (j >= nr) break;
+            float d = (float)__dp4a(qk, ki4[j], 0) * (qscale * kd4[j]);
+            #pragma unroll
+            for (int off = 8; off > 0; off >>= 1)
+                d += __shfl_xor_sync(0xFFFFFFFF, d, off, 16);
+            const bool valid = live && (base_l + j < len_g);
+            const float s = valid ? d * scale : -INFINITY;
+            // An invalid row must not enter the online softmax: mx is -INF
+            // there, and expf(-INF - -INF) is NaN (an empty half would poison
+            // the merge). Masked, not branched, so the warp stays converged.
+            const float nmx = valid ? fmaxf(mx, s) : mx;
+            const float corr = valid ? expf(mx - nmx) : 1.0f;
+            const float e = valid ? expf(s - nmx) : 0.0f;
+            S = S * corr + e;
+            mx = nmx;
+            if (live) {
+                const float4 vv = v4[j];
+                oc.x = oc.x * corr + e * vv.x;
+                oc.y = oc.y * corr + e * vv.y;
+                oc.z = oc.z * corr + e * vv.z;
+                oc.w = oc.w * corr + e * vv.w;
+            }
+        }
+    }
+
+    // Merge the two halves with the split-combine formula. A group with no
+    // cells keeps mx = -INF, S = 0; two empty groups must stay -INF (the
+    // combine weights them to zero) rather than produce a NaN.
+    const float pmx = __shfl_xor_sync(0xFFFFFFFF, mx, 16);
+    const float pS  = __shfl_xor_sync(0xFFFFFFFF, S, 16);
+    float4 poc;
+    poc.x = __shfl_xor_sync(0xFFFFFFFF, oc.x, 16);
+    poc.y = __shfl_xor_sync(0xFFFFFFFF, oc.y, 16);
+    poc.z = __shfl_xor_sync(0xFFFFFFFF, oc.z, 16);
+    poc.w = __shfl_xor_sync(0xFFFFFFFF, oc.w, 16);
+    if (!(mx == -INFINITY && pmx == -INFINITY)) {
+        const float m = fmaxf(mx, pmx);
+        const float wA = expf(mx - m);
+        const float wB = expf(pmx - m);
+        S = S * wA + pS * wB;
+        oc.x = oc.x * wA + poc.x * wB;
+        oc.y = oc.y * wA + poc.y * wB;
+        oc.z = oc.z * wA + poc.z * wB;
+        oc.w = oc.w * wA + poc.w * wB;
+        mx = m;
+    }
+
+    // Group A owns the split's one partial.
+    if (g == 0) {
+        float* dst = partial + ((size_t)sp * nh + h) * pstr;
+        if (li == 0) {
+            dst[0] = mx;
+            dst[1] = S;
+        }
+        if (live) *reinterpret_cast<float4*>(dst + 4 + d0) = oc;
+    }
+}
+
 template <int LAYOUT, bool CAUSAL, bool MAP, bool Q8DP4A = false, bool Q8WIDE = false>
 __global__ void gqa_attn_split_partial(
     const float* __restrict__ q,
@@ -351,6 +495,15 @@ __global__ void gqa_attn_split_partial(
     if (rpw_gate > 0) {
         const int chunk0 = (nkv + ATTN_SPLITS - 1) / ATTN_SPLITS;
         if (((chunk0 + 3) >> 2) >= rpw_gate) return;
+    }
+    // E2 (#842): at hd 64 the packed decode body packs two cells per warp.
+    if constexpr (Q8DP4A && Q8WIDE && !MAP) {
+        if (hd == 64) {
+            attn_split_1w_body_q8_2cell(q, k, v, partial, row0, nkv,
+                                        blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr,
+                                        row_bytes, threadIdx.x);
+            return;
+        }
     }
     attn_split_1w_body<LAYOUT, CAUSAL, MAP, Q8DP4A, Q8WIDE>(q, k, v, partial, bound, 0, row0, nkv,
                                             blockIdx.x, blockIdx.y, nh, nk, hd, scale, pstr,
