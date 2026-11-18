@@ -268,6 +268,7 @@
         - [108 — #186: the dp4a packed Q8_0 K dot on CUDA (LANDED)](./cuda_optimization_steps/108-c4-dp4a-packed-q8-kv-cuda.md)
         - [109 — #202: the packed Q8_0 KV cell's L1 request count (counter-only)](./cuda_optimization_steps/109-c4-packed-q8-kv-l1-request.md)
         - [110 — #212: the packed Q8_0 decode residual is a long-scoreboard chain (refuted lever)](./cuda_optimization_steps/110-c4-pack-q8-decode-stall-attribution.md)
+        - [111 — #633/#843: the packed Q8_0 decode residual falls 1.239x → 1.0139x (LANDED)](./cuda_optimization_steps/111-c4-packed-decode-epilogue-and-two-cell.md)
 
 # Sampling and Chat Templates
 
