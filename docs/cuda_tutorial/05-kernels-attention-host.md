@@ -367,17 +367,17 @@ projection matmuls, three small jobs remain before attention can run: add the
 attention biases (if the model has them), rotate q and k by RoPE, and write k/v
 into the persistent KV cache. The unfused graph spent **seven launches** on
 these (`add_bias` ×3, `rope` ×2, `store_kv` ×2 — the count in the kernel's
-header comment, `kv_store.cu:116-133`; TECH-PRIMER §6.4 prices the whole
+header comment, `kv_store.cu:135-152`; TECH-PRIMER §6.4 prices the whole
 campaign at "−310 launches/step"). This kernel is one launch that does all of
 it, ending with K/V in exactly the layout the next kernel reads.
 
-**Thread mapping.** The launcher `launch_attn_bias_rope_store` (`kv_store.cu:484`) is a flat 1-D
+**Thread mapping.** The launcher `launch_attn_bias_rope_store` (`kv_store.cu:508`) is a flat 1-D
 grid of 256-thread blocks over `total = nqt/2 + nkt/2 + nkt` — one thread per
 *RoPE pair* for q (`nqt/2`), one per RoPE pair for k (`nkt/2`), one per element
 for v (`nkt`); `nqt = nh·hd` and `nkt = nk·hd` are the q and k section widths
 of the (single) token's QKV output. Each thread branches on which section its
 linear id `u` falls in — three sections, one kernel
-`attn_bias_rope_store_f32` (`kv_store.cu:134`):
+`attn_bias_rope_store_f32` (`kv_store.cu:153`):
 
 ```c
 __global__ void attn_bias_rope_store_f32(
@@ -399,11 +399,11 @@ __global__ void attn_bias_rope_store_f32(
     const int row = cells[0];              // C6: the row the store lands on
 ```
 
-`positions[0]`/`cells[0]` are read *on the device* — the comment at `kv_store.cu:132-133` calls
+`positions[0]`/`cells[0]` are read *on the device* — the comment at `kv_store.cu:151-152` calls
 this out: "no host scalar crosses the launch — CUDA Graph capture/replay safe". A captured graph
 freezes its kernel arguments, so a host-side `n_past` would be baked in and wrong on every replay; device data is re-read each time.
 
-**Section 1 — q: bias + RoPE in place** `attn_bias_rope_store_f32` (`kv_store.cu:134`):
+**Section 1 — q: bias + RoPE in place** `attn_bias_rope_store_f32` (`kv_store.cu:153`):
 
 ```c
 if (u < qpairs) {
@@ -427,12 +427,12 @@ This is verbatim `rope_f32` (`ops_elementwise.cu:263`) with the bias add
 folded into the loads — same NEOX pairing `(j, j + hd/2)`, same frequency
 expression, same `cosf/sinf`. "Verbatim" is a hard requirement: the fused
 kernel had to be *bit-identical* to the seven-kernel chain it replaced (the
-header comment, `kv_store.cu:116-133`, lists each correspondence) —
+header comment, `kv_store.cu:135-152`, lists each correspondence) —
 fusion is only free when the answer does not change. The A/B proof lives in
 the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1253`
 exercises the f16 round trip end to end).
 
-**Section 2 — k: bias + RoPE + store into the cache** `attn_bias_rope_store_f32` (`kv_store.cu:134`).
+**Section 2 — k: bias + RoPE + store into the cache** `attn_bias_rope_store_f32` (`kv_store.cu:153`).
 The first twelve lines are the q-section math with `bias_k`/`k` swapped — same
 pairing, same frequency, same rotation. The new part is what happens after the
 rotation: the rotated values are written *both* back to the k buffer *and* into
@@ -461,7 +461,7 @@ in the standalone `store_kv_f32` (`kv_store.cu:11`); the f16 branch converts on 
 with `__float2half` (round-to-nearest), the identical conversion the unfused
 `store_kv_f16` path uses — again for bit-identity.
 
-**Section 3 — v: bias + store** `attn_bias_rope_store_f32` (`kv_store.cu:134`): v gets no RoPE
+**Section 3 — v: bias + store** `attn_bias_rope_store_f32` (`kv_store.cu:153`): v gets no RoPE
 (only q and k are rotated), so its threads add the bias and store one element
 each, same `row * nkt + j` addressing into the V region.
 
@@ -490,7 +490,7 @@ launches it.
 
 **Two ways to call the same kernel.** The `q/k/v` parameters are *pointer-form
 section bases*, which lets one kernel serve both decode layer classes
-`attn_bias_rope_store_f32` (`kv_store.cu:134`): the **concat class** points all three into one
+`attn_bias_rope_store_f32` (`kv_store.cu:153`): the **concat class** points all three into one
 concatenated matmul output (`q = base`, `k = base + nqt`, `v = base + 2·nkt`;
 the Rust arm does this pointer arithmetic at (`cuda_backend.rs:`, the `Op::FusedQKV` section bases), and
 the **mixed-quant class** (e.g. a model where `attn_v` is Q6_K and cannot join

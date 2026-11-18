@@ -466,7 +466,7 @@ gates give your model's truth.**
 
 One more dispatch consumer: the decode fused path. Chapter 05 documented
 `Op::FusedQKV` (`cuda_backend.rs`) as concat-matmul then a fused
-bias+rope+store (`attn_bias_rope_store_f32`, `kv_store.cu:134`); the concat matmul inside it is the *same*
+bias+rope+store (`attn_bias_rope_store_f32`, `kv_store.cu:153`); the concat matmul inside it is the *same*
 `matmul_f32_ptr_layout` (`cuda_backend.rs`) call, so the fused node and
 the plain `Op::MatMul` node make identical kernel choices at identical
 shapes — the fusion is in the epilogue, not the matvec.
