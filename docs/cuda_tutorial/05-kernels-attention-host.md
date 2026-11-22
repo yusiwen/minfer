@@ -530,7 +530,7 @@ allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:123` ("Compute Graph 
 rebuilds and hold their contents across decode steps: two device buffers per layer nobody may recycle.
 
 **Size and layout.** The size comes from the graph builder:
-`kv_elems: nkt * n_ctx` (`kv_elems` (`src/models/qwen2/graph.rs:157`)), where
+`kv_elems: nkt * n_ctx` (`kv_elems` (`src/models/qwen2/graph.rs:170`)), where
 `nkt = n_head_kv · hd` (the `n_kv_embd` dimension) and `n_ctx` is the
 capacity. So the brief question — "[n_past][kv_heads*head_dim]?" — resolves
 like this in the store code:
@@ -625,7 +625,7 @@ is load-bearing for §3.5: a captured graph bakes in device *pointers*, so any
 pool churn invalidates every capture, and `pool_gen` detects that.
 
 **`execute_node`: the dispatch.** The trait method
-(`execute_node` (`cuda_backend.rs:2366`)) is a thin wrapper: it calls
+(`execute_node` (`cuda_backend.rs:2381`)) is a thin wrapper: it calls
 `execute_node_inner` and, if the node failed *while a capture window was
 open*, aborts the window first (`abort_capture` (`cuda_backend.rs:909`) — a doomed window
 must never be closed into a cached graph). The real dispatch is one big match
@@ -687,7 +687,7 @@ fn alloc_buffer(&mut self, size: usize) -> usize {
 }
 ```
 
-(`alloc_buffer` (`cuda_backend.rs:2313`).) Three conventions to notice. *Exact-size
+(`alloc_buffer` (`cuda_backend.rs:2328`).) Three conventions to notice. *Exact-size
 reuse*: the free list matches byte length, so a recycled buffer is always big
 enough. *`pool_gen` on every path*: fresh alloc or reuse, both bump it, because
 both can change the node→pointer mapping a captured graph depends on. *No
@@ -695,9 +695,9 @@ panics on OOM*: `cuda_malloc` logs and returns null, and the null buffer fails
 cleanly as an `Err` from `ptr_of` at execute time — never a panic inside the
 allocator (`ptr_of` (`cuda_backend.rs:639`); `stream_guard` is a shim, not a lock).
 `free_buffer` never calls `cudaFree` — it recycles
-(`free_buffer` (`cuda_backend.rs:2340`)), which is what lets the persistent KV regions
+(`free_buffer` (`cuda_backend.rs:2355`)), which is what lets the persistent KV regions
 and the per-step scratch share one arena; `alloc_fresh`
-(`alloc_fresh` (`cuda_backend.rs:2350`)) bypasses the free list when a buffer's *id* is
+(`alloc_fresh` (`cuda_backend.rs:2365`)) bypasses the free list when a buffer's *id* is
 still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
 (`cuda_backend.rs:868`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
@@ -716,10 +716,10 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
     None
 }
 ```
-(`read_host` (`cuda_backend.rs:2460`).) Reading device memory back to the host is
+(`read_host` (`cuda_backend.rs:2475`).) Reading device memory back to the host is
 *always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:651`:
 `state.sync()` then a pinned-staging readback); `write_host`
-(`write_host` (`cuda_backend.rs:2467`)) is the input-fill path — a pinned-staged *async*
+(`write_host` (`cuda_backend.rs:2482`)) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
 The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — is
 AGENTS rule 5 (`AGENTS.md:126` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
@@ -840,7 +840,7 @@ time*, all-or-nothing: CUDA participation requires a device **and** every
 weight registered with a kernel-supported type
 (`Qwen2Graph::device` (`src/models/qwen2/graph.rs`),
 `cuda_on = … && Self::weights_on_cuda(model)`). `weights_on_cuda`
-`weights_on_cuda` (`src/models/qwen2/graph.rs:865`) walks every tensor — embedding,
+`weights_on_cuda` (`src/models/qwen2/graph.rs:878`) walks every tensor — embedding,
 per-layer wq/wk/wv/wo, gate/up/down, norms, biases — and on failure prints the
 exact loser: `"CUDA GATE: weight '{}' (type {:?}) has no CUDA kernel or is not registered"` —
 the gate is `Qwen2Graph::device` (`src/models/qwen2/graph.rs`). That either routes the

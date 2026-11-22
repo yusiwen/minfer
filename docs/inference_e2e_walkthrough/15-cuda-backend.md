@@ -565,7 +565,7 @@ persistent KV regions. So the model wiring applies an **all-or-nothing
 gate** before the graph is even built:
 
 ```rust
-// src/models/qwen2/graph.rs:758 (`device`) (abridged)
+// src/models/qwen2/graph.rs:771 (`device`) (abridged)
 // CUDA participation (Phase 7): requires a usable device AND every
 // matmul weight registered on the CUDA registry in a kernel-supported
 // type (all-or-nothing; 7e③ moved the embedding gather on device, so
@@ -581,7 +581,7 @@ cparams: CParams {
 },
 ```
 
-`weights_on_cuda` (`qwen2/graph.rs:865`) walks every weight the graph reads
+`weights_on_cuda` (`qwen2/graph.rs:878`) walks every weight the graph reads
 — embedding, output head, every layer's norms/biases/matmul weights — and
 requires each to be (a) registered and (b) a type with a matching kernel.
 The type check is per *role*: matmul weights admit all eight quant types
@@ -602,7 +602,7 @@ kernel's structural invariants, and launches. The wrapper adds one
 capture-window duty:
 
 ```rust
-// src/graph/cuda_backend.rs:2366 (`execute_node`)
+// src/graph/cuda_backend.rs:2381 (`execute_node`)
 fn execute_node(
     &mut self,
     node: &CNode,
@@ -1001,7 +1001,7 @@ The pool mirrors Metal's (doc 14): a `Vec<CudaBuf>` plus a byte-length-matched
 free list. Two details are CUDA-specific:
 
 ```rust
-// src/graph/cuda_backend.rs:2313 (`alloc_buffer`) (alloc_buffer)
+// src/graph/cuda_backend.rs:2328 (`alloc_buffer`) (alloc_buffer)
 fn alloc_buffer(&mut self, size: usize) -> usize {
     let _sg = self.stream_guard(); // cudaMalloc syncs the device
     let bytes = size * 4;
