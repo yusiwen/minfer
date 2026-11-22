@@ -95,7 +95,7 @@
 
 | # | Step | Purpose | llama.cpp location | minfer equivalent |
 |---|---|---|---|---|
-| 3.1 | Entry | `llama_model::build_graph` → `build_arch_graph` | `llama-model.cpp:2457` | `src/models/qwen2/graph.rs:443` (forward) |
+| 3.1 | Entry | `llama_model::build_graph` → `build_arch_graph` | `llama-model.cpp:2457` | `src/models/qwen2/graph.rs:456` (forward) |
 | 3.2 | Input embd | `build_inp_embd`: token ids + `ggml_get_rows(tok_embd, inp_tokens)` | `llama-graph.cpp:2284` | `src/metal/` (embed_tokens_gpu, get_rows — **2026-08-21: all minfer quants on GPU + dispatched into the MAIN command buffer, llama-graph-style single submit, #38/#39**) |
 | 3.3 | Position input | `build_inp_pos` | `llama-graph.cpp:2373` | `src/metal/ops.rs` (upload_positions) |
 | 3.4 | KV graph inputs | `build_attn_inp_kv` (k_idxs/v_idxs, mask, rotation tensors) | `llama-graph.cpp:2729` | `src/metal/` (store_kv uses pos_buf) |

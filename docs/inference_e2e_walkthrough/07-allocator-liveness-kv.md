@@ -79,7 +79,7 @@ Three terms, defined once and used everywhere after:
 One deliberate simplification shapes everything: **every pool buffer is
 f32-typed**. The allocator counts sizes in f32 elements (`Backend::alloc_buffer`
 "allocate / release a buffer of `size` f32 elements", `supports_fused` (`backend.rs:25`),
-Metal sizes buffers as `size * 4` bytes in `alloc_buffer` (`metal_backend.rs:895`), and weights
+Metal sizes buffers as `size * 4` bytes in `alloc_buffer` (`metal_backend.rs:910`), and weights
 keep their quantized bytes elsewhere (registered by name in doc 03). One dtype
 means one allocator, one copy path, one set of host-access functions — and,
 as §2.6 shows, even integers ride along as f32 bit patterns.
@@ -332,7 +332,7 @@ buffer* — `node_to_buf` (`alloc.rs:`: "the node's buffer = the K region") — 
 executor enforces that contract `supports_op` (`cpu_backend.rs:128`): "KV store out
 buffer must be the K region"). The V region is a sibling the kernel reaches
 through the `kv_pair` handle (§3.2, excerpt 8). The load node executes as a
-no-op — it is a *view* of the K region `execute_node` (`cpu_backend.rs:307`).
+no-op — it is a *view* of the K region `execute_node` (`cpu_backend.rs:319`).
 
 ### 2.6 Filling inputs: why f32 buffers, and the I32 bit-pattern ride
 
@@ -347,10 +347,10 @@ kernels run the inverse, `x.to_bits()`, recovering the exact integer:
 
 | consumer | code |
 |---|---|
-| embedding row gather (CPU) | `ins[0][t].to_bits()` → token id `execute_node` (`cpu_backend.rs:307`) |
-| generic get_rows (CPU) | `ins[1][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:307`) |
-| RoPE positions (CPU) | `ins[1][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:307`) |
-| attention positions (CPU) | `ins[2][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:307`) |
+| embedding row gather (CPU) | `ins[0][t].to_bits()` → token id `execute_node` (`cpu_backend.rs:319`) |
+| generic get_rows (CPU) | `ins[1][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:319`) |
+| RoPE positions (CPU) | `ins[1][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:319`) |
+| attention positions (CPU) | `ins[2][t].to_bits() as usize` `execute_node` (`cpu_backend.rs:319`) |
 | CUDA kernels | device-side `__float_as_int` in one pass `gather_rows_f32` (`ops_misc.cu:145`) |
 
 Why this trick at all? Because of the uniform-pool decision. The alternatives
@@ -768,7 +768,7 @@ fn alloc_fresh(&mut self, size: usize) -> usize {
 ```
 
 (Metal's pool is the same shape with `MTLBuffer` lengths in bytes,
-`alloc_buffer` (`metal_backend.rs:895`), except recycled buffers are *not* re-zeroed —
+`alloc_buffer` (`metal_backend.rs:910`), except recycled buffers are *not* re-zeroed —
 kernels fully overwrite their outputs, and the driver zero-fills only new
 allocations.)
 
@@ -886,7 +886,7 @@ sometimes needed a copy: the original allocator materialized cross-backend and
 in-place inputs through a host `copy_in`. On Metal, though, one split's
 kernels are *encoded* into an `MpsCommandBuffer` as they execute — and only
 *submitted* at the split boundary `capture_split` (`metal_backend.rs:173`),
-`execute_node` (`metal_backend.rs:923`). A host copy enqueued mid-split therefore read
+`execute_node` (`metal_backend.rs:938`). A host copy enqueued mid-split therefore read
 the buffer's *old* contents: freshly allocated Metal memory, i.e. **zeros**.
 The copy captured zeros, RoPE dutifully rotated them, `KvcacheStore` wrote
 them into the layer's persistent region — and the whole KV region was zeros,
@@ -940,8 +940,8 @@ longer matters.
 - Split-boundary staging always allocates fresh; it rejoins the free list only
   at rebuild (§2.7).
 - KV positions are data: the region is sized `n_kv_embd × n_ctx`, and a
-  position ≥ `n_ctx` is a loud error, not an overflow (`cpu_backend.rs:358`),
-  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:401`).
+  position ≥ `n_ctx` is a loud error, not an overflow (`cpu_backend.rs:370`),
+  plus the pre-flight assert `maxp < n_ctx` in `register_graph_weights` (`models/qwen2/graph.rs:414`).
 - Dead nodes get no buffer and the scheduler skips them — so adding an op the
   fusion pass orphans cannot corrupt memory, it just does nothing — skipped
   where `node_buffer` (`scheduler.rs:`, the bufferless-node skip) reads `None`.
