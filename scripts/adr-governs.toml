@@ -457,3 +457,18 @@ path = "src/cuda/methods/accounting.rs"
 adr = "0080"
 what = "the Metal backend is the `metal` cargo feature (macOS only), and a build without it refuses the name by naming the feature"
 symbol = "not_compiled_why"
+
+[[governs]]
+adr = "0084"
+what = "a packed cell's fused-epilogue store is a declared backend capability, not a test for CUDA"
+path = "src/graph/registry.rs"
+
+[[governs]]
+adr = "0084"
+what = "the Qwen2 QKV fusion gate reads the declared capability instead of `cfg(cuda)`/`CudaState`"
+path = "src/models/qwen2/graph.rs"
+
+[[governs]]
+adr = "0084"
+what = "the Qwen3 fused-norm gate asks the same capability, so the two builders cannot diverge"
+path = "src/models/qwen3/graph.rs"

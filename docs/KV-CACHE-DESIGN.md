@@ -35,6 +35,7 @@ CUDA packed decode cost is measured in docs 111-112: after #847 it is **0.970x**
 This page is the *current contract*; the decisions behind it are frozen in the ADR corpus:
 - [ADR-0002](adr/0002-topology-is-a-function-of-graph-params.md) — Topology is a function of `GraphParams` alone, so `positions` cannot be structure
 - [ADR-0006](adr/0006-kv-format-is-a-per-engine-gate.md) — The KV storage format is a per-engine gate, not a process-wide global
+- [ADR-0084](adr/0084-a-backend-declares-whether-it-can-store-a-packed-cell-from-the-fused-epilogue.md) — A backend declares whether it can store a packed cell from the fused epilogue
 - [ADR-0014](adr/0014-a-kv-session-is-a-versioned-file.md) — A KV session is a versioned, checksummed file — never a memory dump
 - [ADR-0083](adr/0083-a-live-share-pins-its-donor-s-run-and-a-store-may-not-write-a-lent-prefix.md) — A live share pins its donor's run, and a store may not write a lent prefix
 - [ADR-0005](adr/0005-metal-becomes-a-first-class-backend.md) — Metal becomes a first-class backend
