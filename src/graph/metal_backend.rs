@@ -738,6 +738,20 @@ pub const SUPPORTS_ATTN_SPAN: bool = true;
 /// [`crate::metal::packed_attn_route`]. See `docs/METAL-BACKEND-DESIGN.md` §4.4.
 pub const READS_PACKED_KV: bool = true;
 
+/// C4 ([#844], ADR-0084): whether the fused QKV epilogue can store a **packed**
+/// KV cell. Metal answers `false` — its fused epilogue (`kernel_attn_rope_store`
+/// and the `fused_qkv_norm` family) writes f32/f16 K/V, not `q8_0` blocks — so a
+/// packed cache keeps the unfused chain (3 matmul + 2 rope + 2 store per layer).
+///
+/// The packed store arm is #844's next change and this value flips **with** that
+/// kernel, never before it: a fused epilogue that wrote f16 K/V into a region
+/// sized for `q8_0` would be an out-of-region write, not a wrong number
+/// (ADR-0084 decision 6). Frozen by
+/// `graph::registry::tests::the_fused_epilogue_packed_kv_capability_is_the_registrys_answer`.
+///
+/// [#844]: https://github.com/yusiwen/minfer/issues/844
+pub const WRITES_PACKED_KV_FROM_FUSED_EPILOGUE: bool = false;
+
 /// F5 ([#58], ported by [#137]): registry hook **phase A** of a cross-backend
 /// staging copy out of Metal.
 ///
@@ -843,6 +857,7 @@ pub fn entry() -> super::registry::BackendEntry {
         priority: PRIORITY_METAL,
         caps: BackendCaps {
             reads_packed_kv: READS_PACKED_KV,
+            writes_packed_kv_from_fused_epilogue: WRITES_PACKED_KV_FROM_FUSED_EPILOGUE,
         },
         pool: |a| a.metal().map(|m| m as &dyn Backend),
         pool_mut: |a| a.metal_mut().map(|m| m as &mut dyn Backend),

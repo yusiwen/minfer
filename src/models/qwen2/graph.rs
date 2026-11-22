@@ -49,6 +49,16 @@ impl Qwen2Graph {
         let nf = hp.n_ff as usize;
         let eps = hp.f_norm_rms_eps;
         let n_ctx = params.cparams.n_ctx;
+        // #844 / ADR-0084: whether the fused QKV epilogue can store a **packed**
+        // KV cell is a declared backend capability, read from the registry for the
+        // backend that owns the layers — the same call Qwen3's
+        // `fused_norm_packed_ok` makes, never a `cfg` on this binary or a device
+        // probe. Resolved once per build (`device()` re-checks the weight
+        // registry, so it is not a per-layer question); `layer_gpu` below still
+        // gates the fusion itself, so a CPU-owned layer never reaches this.
+        let qkv_epilogue_ok = crate::graph::registry::writes_packed_kv_from_fused_epilogue(
+            Self::device(model).backend(),
+        );
 
         let mut b = crate::graph::builder::GraphBuilder::new();
 
@@ -116,16 +126,19 @@ impl Qwen2Graph {
             // blocks in place. Pre-#144 the gate read `&& !b.kv_is_packed()` and a
             // Q8_0 decode ran the unfused bias/rope/store chain.
             //
-            // #310: that packed fused epilogue is CUDA-only. Metal's fused kernel
-            // is f32/f16-only, so a packed Metal cache takes the unfused chain
-            // (`qkv_epilogue_ok` is false without the CUDA feature), exactly as
-            // Qwen3's `fused_qkv_norm` already gates on `!b.kv_is_packed()`.
-            // class 2 is CUDA-only: on macOS (feature off) the mixed-quant
-            // layers keep the unfused chain, bitwise-neutral vs pre-D3-8.
-            #[cfg(feature = "cuda")]
-            let qkv_epilogue_ok = crate::cuda::CudaState::get().is_some();
-            #[cfg(not(feature = "cuda"))]
-            let qkv_epilogue_ok = false;
+            // #310: the packed fused epilogue is CUDA's. Metal's fused kernel is
+            // f32/f16-only, so a packed Metal cache takes the unfused chain —
+            // the same shape Qwen3's `fused_qkv_norm` gate has. #844 / ADR-0084:
+            // that answer is no longer a `cfg` or a device probe here; it is the
+            // declared backend capability `qkv_epilogue_ok` above, so a backend
+            // that gains a packed store arm flips it in the change that lands the
+            // kernel, and this builder asks the same question.
+            //
+            // class 2 is CUDA-only: the capability's only `true` answer is CUDA's,
+            // so everywhere else the mixed-quant layers keep the unfused chain,
+            // bitwise-neutral vs pre-D3-8. (Class 2's own requirement is
+            // `Op::QkvBiasRopeStore` support; a backend that answers this
+            // capability `true` without that op must split the two gates here.)
             let fuse_qkv = nt == 1
                 && layer_gpu
                 && params.cparams.fuse_qkv
