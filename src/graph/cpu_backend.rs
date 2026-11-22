@@ -173,6 +173,17 @@ pub const SUPPORTS_ATTN_SPAN: bool = true;
 /// [#87]: https://github.com/yusiwen/minfer/issues/87
 pub const READS_PACKED_KV: bool = true;
 
+/// C4 ([#844], ADR-0084): whether the fused QKV epilogue can store a **packed**
+/// KV cell. The CPU answers `false` **by design** — it implements no
+/// `Op::FusedQKV` at all (`supports_op` refuses the fused ops and `execute_node`
+/// names them), so there is no fused epilogue to extend with a packed store arm.
+/// `layer_gpu` never selects a CPU layer for the fusion either, so this answer is
+/// unreachable today; it is declared so the capability matrix has an answer
+/// rather than a gap.
+///
+/// [#844]: https://github.com/yusiwen/minfer/issues/844
+pub const WRITES_PACKED_KV_FROM_FUSED_EPILOGUE: bool = false;
+
 /// F5 ([#58]): registry hook **phase A** of a cross-backend staging copy, CPU
 /// source.
 ///
@@ -230,6 +241,7 @@ pub fn entry() -> super::registry::BackendEntry {
         priority: PRIORITY_CPU,
         caps: BackendCaps {
             reads_packed_kv: READS_PACKED_KV,
+            writes_packed_kv_from_fused_epilogue: WRITES_PACKED_KV_FROM_FUSED_EPILOGUE,
         },
         pool: |a| Some(a.cpu()),
         pool_mut: |a| Some(a.cpu_mut()),

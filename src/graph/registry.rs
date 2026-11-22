@@ -112,8 +112,9 @@ impl Backend {
         registry().get(self)
     }
 
-    /// This handle's capability record. The one field is `reads_packed_kv`; an
-    /// unregistered backend reads nothing — the safe answer, and the pre-F4
+    /// This handle's capability record — the packed-cell **read** and the
+    /// fused-epilogue packed-cell **write** (see [`BackendCaps`]). An
+    /// unregistered backend claims neither: the safe answer, and the pre-F4
     /// answer for the configurations where the backend did not exist.
     pub fn caps(self) -> BackendCaps {
         self.entry().map_or(BackendCaps::NOTHING, |e| e.caps)
@@ -134,8 +135,9 @@ impl fmt::Debug for Backend {
     }
 }
 
-/// The one capability the **registry itself** carries: whether this backend's
-/// attention kernel reads a packed `q8_0` KV region (C4).
+/// The capabilities the **registry itself** carries: the two halves of the
+/// packed-`q8_0` KV question (C4) — whether attention **reads** a packed cell,
+/// and whether the fused QKV epilogue **writes** one.
 ///
 /// Every other capability answer lives in the backend module's own free
 /// function or constant, which is the authority: the `Backend` trait method
@@ -153,6 +155,11 @@ impl fmt::Debug for Backend {
 /// set them, only tests read them) and were deleted in [#244] — option (b) of
 /// that ticket's escalation.
 ///
+/// `writes_packed_kv_from_fused_epilogue` sits here for the same reason: the
+/// graph builders ask it per backend while building a graph, with no engine or
+/// pool in hand ([#844], ADR-0084). Its field is *not* write-only — the model
+/// builders are its production readers.
+///
 /// [#87]: https://github.com/yusiwen/minfer/issues/87
 /// [#244]: https://github.com/yusiwen/minfer/issues/244
 #[derive(Clone, Copy)]
@@ -167,13 +174,34 @@ pub struct BackendCaps {
     ///
     /// [#87]: https://github.com/yusiwen/minfer/issues/87
     pub reads_packed_kv: bool,
+    /// Whether this backend's fused QKV epilogue can store a **packed** `q8_0`
+    /// KV cell ([#844], ADR-0084).
+    ///
+    /// The single authority for the **write** half of the packed-cell question
+    /// (its read half is [`Self::reads_packed_kv`]): the decode fusions
+    /// (`Op::FusedQKV`, `Op::FusedQkvNorm`, `Op::QkvBiasRopeStore`) compute
+    /// q/k/v and store K/V themselves, so a packed region needs a store arm that
+    /// quantizes a whole 32-element block in place. It is deliberately
+    /// **distinct** from `supports_op(Op::FusedQKV)`: CUDA and Metal both claim
+    /// that op, but only a backend with the packing arm may answer `true` — a
+    /// fused epilogue writing f16 K/V into a region sized for `q8_0` writes out
+    /// of region.
+    ///
+    /// Read by `qwen2`'s `qkv_epilogue_ok` and `qwen3`'s `fused_norm_packed_ok`,
+    /// so a backend that answers `false` keeps the unfused chain (3 matmul +
+    /// 2 rope + 2 store per layer). Frozen per backend by
+    /// `tests::the_fused_epilogue_packed_kv_capability_is_the_registrys_answer`.
+    ///
+    /// [#844]: https://github.com/yusiwen/minfer/issues/844
+    pub writes_packed_kv_from_fused_epilogue: bool,
 }
 
 impl BackendCaps {
     /// The capability of a backend that is not compiled in: it reads no packed
-    /// KV region.
+    /// KV region, and writes none from a fused epilogue.
     pub const NOTHING: BackendCaps = BackendCaps {
         reads_packed_kv: false,
+        writes_packed_kv_from_fused_epilogue: false,
     };
 }
 
@@ -415,6 +443,19 @@ pub fn unavailable_reason(backend: Backend) -> Option<&'static str> {
 /// the registry's answer to #87's question (see [`BackendCaps::reads_packed_kv`]).
 pub fn reads_packed_kv(backend: Backend) -> bool {
     backend.caps().reads_packed_kv
+}
+
+/// Whether this backend's fused QKV epilogue can store a **packed** `q8_0` KV
+/// cell — the registry's answer to [#844]'s question (see
+/// [`BackendCaps::writes_packed_kv_from_fused_epilogue`]).
+///
+/// The graph builders' single call site: `qwen2`'s `qkv_epilogue_ok` and
+/// `qwen3`'s `fused_norm_packed_ok` are the same question and ask it here, never
+/// a `cfg`, a device name or a global (ADR-0084 decision 3).
+///
+/// [#844]: https://github.com/yusiwen/minfer/issues/844
+pub fn writes_packed_kv_from_fused_epilogue(backend: Backend) -> bool {
+    backend.caps().writes_packed_kv_from_fused_epilogue
 }
 
 /// A set of backends a run may use: the fence `--backend` / `MINFER_BACKENDS`

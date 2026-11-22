@@ -3,7 +3,8 @@
 use super::*;
 // The capability free functions the trait forwards to — imported here because
 // the parent module no longer imports them (only tests name the op/dtype types
-// now that `BackendCaps` carries just `reads_packed_kv`, [#244]).
+// now that `BackendCaps` carries the packed-KV read and fused-epilogue write
+// capabilities, [#244], [#844]).
 use crate::graph::ops::{FusedOp, Op};
 use crate::graph::DType;
 
@@ -314,6 +315,81 @@ fn the_packed_kv_capability_is_the_registrys_answer() {
         assert!(KvFormat::F32.supports(device));
         assert!(KvFormat::F16.supports(device));
     }
+}
+
+/// #844 / ADR-0084: the fused-epilogue **packed-store** capability is a declared
+/// registry answer, with the three frozen answers.
+///
+/// - **CUDA `true`** — `attn_bias_rope_store_q8_0` (#843/E1) quantizes a cell's
+///   32-element blocks in place; a refactor must not silently take that away.
+/// - **CPU `false`, by design** — the CPU implements no `Op::FusedQKV` at all, so
+///   there is no epilogue to extend with a packed store arm.
+/// - **Metal `false`** — its fused epilogue writes f32/f16 K/V. The value flips
+///   in the change that lands the packed store arm, never before it (a fused
+///   epilogue writing f16 into a `q8_0`-sized region writes out of region).
+///
+/// Flipping any of the three answers, or a backend's `entry()` forgetting the
+/// field, fails here. The free function and the handle's `caps()` are asserted
+/// to agree, so there is one authority rather than two copies.
+#[test]
+fn the_fused_epilogue_packed_kv_capability_is_the_registrys_answer() {
+    // The CPU: nothing to fuse — `supports_op`/`execute_node` refuse the fused
+    // ops by name, so no packed store arm exists to declare.
+    assert!(!Backend::CPU.caps().writes_packed_kv_from_fused_epilogue);
+    assert!(!writes_packed_kv_from_fused_epilogue(Backend::CPU));
+
+    // Metal: registered on macOS+metal (and answering `false` this round — its
+    // fused epilogue is f32/f16-only); on any other configuration it has no entry
+    // and claims nothing. Either way the answer is `false`.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    assert!(Backend::METAL.is_registered());
+    assert!(!Backend::METAL.caps().writes_packed_kv_from_fused_epilogue);
+    assert!(!writes_packed_kv_from_fused_epilogue(Backend::METAL));
+
+    // CUDA: `true` where the backend is compiled in — the fused packed epilogue
+    // (#843/E1). A build without the feature registers no entry, so it claims
+    // nothing; that is the honest answer, not a second declaration.
+    #[cfg(feature = "cuda")]
+    {
+        assert!(Backend::CUDA.is_registered());
+        assert!(Backend::CUDA.caps().writes_packed_kv_from_fused_epilogue);
+        assert!(writes_packed_kv_from_fused_epilogue(Backend::CUDA));
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        assert!(!Backend::CUDA.is_registered());
+        assert!(!Backend::CUDA.caps().writes_packed_kv_from_fused_epilogue);
+        assert!(!writes_packed_kv_from_fused_epilogue(Backend::CUDA));
+    }
+
+    // One authority: the free function and the handle's record agree for every
+    // handle, and every registered entry's record agrees with its own handle —
+    // so a backend whose `entry()` omits the field fails here.
+    for backend in [Backend::CPU, Backend::METAL, Backend::CUDA] {
+        assert_eq!(
+            writes_packed_kv_from_fused_epilogue(backend),
+            backend.caps().writes_packed_kv_from_fused_epilogue,
+            "{backend:?}"
+        );
+    }
+    for entry in registry().iter() {
+        assert_eq!(
+            entry.caps.writes_packed_kv_from_fused_epilogue,
+            writes_packed_kv_from_fused_epilogue(entry.handle),
+            "{:?}",
+            entry.handle
+        );
+    }
+
+    // …and the write half is **not** the read half (ADR-0084 decision 2): where
+    // Metal is registered it reads a packed cell since #310 and still cannot
+    // store one from the fused epilogue.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    assert!(
+        Backend::METAL.caps().reads_packed_kv
+            && !Backend::METAL.caps().writes_packed_kv_from_fused_epilogue,
+        "the two packed-KV capabilities must stay distinct"
+    );
 }
 
 /// The capability answer is **one authority**: each `Backend` trait method

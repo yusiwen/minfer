@@ -46,10 +46,16 @@ impl Qwen3Graph {
         let eps = hp.f_norm_rms_eps;
         let n_ctx = params.cparams.n_ctx;
         // #200: whether this engine's device has the whole-block quantizing
-        // epilogue a packed KV cell needs (CUDA alone today). Resolved once per
+        // epilogue a packed KV cell needs (CUDA alone today). #844 / ADR-0084:
+        // the answer is a **declared backend capability**, read from the registry
+        // for the backend that owns the layers (`Device::backend` is the one
+        // bridge between the id spaces) — the same call Qwen2's
+        // `qkv_epilogue_ok` makes, never a device comparison. Resolved once per
         // build — `device()` re-checks the weight registry, so it is not a
         // per-layer call.
-        let fused_norm_packed_ok = Self::device(model) == crate::models::Device::Cuda;
+        let fused_norm_packed_ok = crate::graph::registry::writes_packed_kv_from_fused_epilogue(
+            Self::device(model).backend(),
+        );
 
         let mut b = crate::graph::builder::GraphBuilder::new();
 
@@ -114,8 +120,9 @@ impl Qwen3Graph {
             // unfused store does. A packed cell is only expressible where the
             // epilogue has a whole-block quantizing arm, and that is CUDA alone
             // (#144's packed epilogue; Metal's fused norm kernel is f32/f16-only,
-            // so a packed Metal cache keeps the unfused chain). The device is
-            // resolved once at the top of this build.
+            // so a packed Metal cache keeps the unfused chain). #844 / ADR-0084:
+            // that answer is the declared backend capability resolved once at the
+            // top of this build, not a device comparison.
             let fuse_qkv_norm = nt == 1
                 && layer_gpu
                 && params.cparams.fuse_qkv

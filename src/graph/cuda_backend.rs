@@ -2154,6 +2154,20 @@ pub const SUPPORTS_ATTN_SPAN: bool = true;
 /// epilogue) are stated in `docs/ARCHITECTURE-EXECUTION-PLAN.md` §5 C4 S2b.
 pub const READS_PACKED_KV: bool = true;
 
+/// C4 ([#843]/E1, [#844], ADR-0084): CUDA's fused QKV epilogue stores a
+/// **packed** KV cell. `attn_bias_rope_store_q8_0` gives one thread a whole
+/// `(head, 32-element K block)` and one V block, so it quantizes the cell's
+/// blocks in place — 21.6 → 1.92 µs/layer, byte-identical output ([#843]/E1).
+/// This is the *packed-store* half of the question and is deliberately distinct
+/// from `supports_op(Op::FusedQKV)`, which Metal claims too: a backend may claim
+/// the op and answer this `false` (ADR-0084 decision 2). Frozen `true` by
+/// `graph::registry::tests::the_fused_epilogue_packed_kv_capability_is_the_registrys_answer`
+/// so a refactor cannot silently take the fused packed path away.
+///
+/// [#843]: https://github.com/yusiwen/minfer/issues/843
+/// [#844]: https://github.com/yusiwen/minfer/issues/844
+pub const WRITES_PACKED_KV_FROM_FUSED_EPILOGUE: bool = true;
+
 /// F5 ([#58]): registry hook **phase A** — enqueue one cross-backend staging
 /// copy out of CUDA.
 ///
@@ -2245,6 +2259,7 @@ pub fn entry() -> super::registry::BackendEntry {
         priority: PRIORITY_CUDA,
         caps: BackendCaps {
             reads_packed_kv: READS_PACKED_KV,
+            writes_packed_kv_from_fused_epilogue: WRITES_PACKED_KV_FROM_FUSED_EPILOGUE,
         },
         pool: |a| a.cuda().map(|c| c as &dyn Backend),
         pool_mut: |a| a.cuda_mut().map(|c| c as &mut dyn Backend),
