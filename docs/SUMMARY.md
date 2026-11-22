@@ -104,6 +104,7 @@
     - [0081. A tensor's bytes are a backing handle plus a range, and the backing may be an owned buffer](./adr/0081-a-tensor-s-bytes-are-a-backing-handle-plus-a-range.md)
     - [0082. The application layer is its own package, and the engine's four application features retire](./adr/0082-the-application-layer-is-its-own-package.md)
     - [0083. A live share pins its donor's run, and a store may not write a lent prefix](./adr/0083-a-live-share-pins-its-donor-s-run-and-a-store-may-not-write-a-lent-prefix.md)
+    - [0084. A backend declares whether it can store a packed cell from the fused epilogue](./adr/0084-a-backend-declares-whether-it-can-store-a-packed-cell-from-the-fused-epilogue.md)
 
 # Model Support
 
