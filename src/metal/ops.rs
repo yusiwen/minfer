@@ -2315,6 +2315,13 @@ impl MpsCommandBuffer<'_> {
     /// [q: 0..nqt][k: nqt..nqt+nkt][v: nqt+nkt..nqt+2nkt]; biases are the raw
     /// per-section buffers. `pos` = the single token position. The KV store
     /// writes f32 or f16 (per the engine's `kv_format`) into kv_k/kv_v.
+    ///
+    /// `packed` (#844, ADR-0084) selects the packed-cell arm: the kernel still
+    /// resolves the biased + rope-rotated rows **into bqkv** but writes nothing
+    /// to kv_k/kv_v (a `q8_0` cell is byte-addressed, so the element stores do
+    /// not apply). The caller then dispatches [`Self::store_kv_q8_0`] on the
+    /// buffer's K section (`off = nqt`) and V section (`off = nqt + nkt`) —
+    /// the same quantizer the unfused chain's store runs.
     pub fn attn_bias_rope_store(
         &self,
         bqkv: &MetalBuffer,
@@ -2335,6 +2342,7 @@ impl MpsCommandBuffer<'_> {
         pos: i32,
         rope_style: i32,
         f16: bool,
+        packed: bool,
     ) {
         self.trace_op("attn_bias_rope_store");
         self.enc.setComputePipelineState(&*self.state.pl_attn_bsr);
@@ -2372,6 +2380,7 @@ impl MpsCommandBuffer<'_> {
         self.set_params(13, &(if f16 { 1 } else { 0 }));
         let freqs = freqs_arg(freqs);
         self.set_bytes(14, freqs_bytes(&freqs));
+        self.set_params(15, &(if packed { 1 } else { 0 }));
         let grid = nqt / 2 + nkt / 2 + nkt;
         self.dispatch_1d(grid as u64, 256);
     }
@@ -2383,6 +2392,12 @@ impl MpsCommandBuffer<'_> {
     /// place, RoPEs + stores K, and stores V into the persistent KV regions.
     /// Grid: nqt/2 + nkt/2 + nkt, 256 threads. Buffer indices: 0=bqkv, 1=kv_k,
     /// 2=kv_v; params 3..=10.
+    ///
+    /// `packed` (#844, ADR-0084) is the packed-cell arm, the same contract as
+    /// [`Self::attn_bias_rope_store`]'s: the rotated rows are resolved into
+    /// bqkv and nothing is written to kv_k/kv_v, so the caller dispatches
+    /// [`Self::store_kv_q8_0`] over the K (`off = nqt`) and V
+    /// (`off = nqt + nkt`) sections.
     pub fn attn_rope_store(
         &self,
         bqkv: &MetalBuffer,
@@ -2397,6 +2412,7 @@ impl MpsCommandBuffer<'_> {
         pos: i32,
         rope_style: i32,
         f16: bool,
+        packed: bool,
     ) {
         self.trace_op("attn_rope_store");
         self.enc
@@ -2423,6 +2439,7 @@ impl MpsCommandBuffer<'_> {
         self.set_params(10, &(if f16 { 1 } else { 0 }));
         let freqs = freqs_arg(freqs);
         self.set_bytes(11, freqs_bytes(&freqs));
+        self.set_params(12, &(if packed { 1 } else { 0 }));
         let grid = nqt / 2 + nkt / 2 + nkt;
         self.dispatch_1d(grid as u64, 256);
     }

@@ -742,6 +742,7 @@ fn non_matmul_bandwidth_profile() {
                     (nkv - 1) as i32,
                     0,
                     false,
+                    false,
                 )
             }),
             400,

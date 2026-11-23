@@ -59,6 +59,10 @@ impl Qwen2Graph {
         let qkv_epilogue_ok = crate::graph::registry::writes_packed_kv_from_fused_epilogue(
             Self::device(model).backend(),
         );
+        // The owning backend's handle, resolved once: the mixed-quant epilogue
+        // below asks it per layer (`Op::QkvBiasRopeStore` support), and
+        // `device()` re-checks the weight registry — not a per-layer question.
+        let backend = Self::device(model).backend();
 
         let mut b = crate::graph::builder::GraphBuilder::new();
 
@@ -126,19 +130,23 @@ impl Qwen2Graph {
             // blocks in place. Pre-#144 the gate read `&& !b.kv_is_packed()` and a
             // Q8_0 decode ran the unfused bias/rope/store chain.
             //
-            // #310: the packed fused epilogue is CUDA's. Metal's fused kernel is
-            // f32/f16-only, so a packed Metal cache takes the unfused chain —
-            // the same shape Qwen3's `fused_qkv_norm` gate has. #844 / ADR-0084:
-            // that answer is no longer a `cfg` or a device probe here; it is the
-            // declared backend capability `qkv_epilogue_ok` above, so a backend
-            // that gains a packed store arm flips it in the change that lands the
-            // kernel, and this builder asks the same question.
+            // #310: the packed fused epilogue landed on CUDA first. #844 /
+            // ADR-0084: whether a backend can store a packed cell from the fused
+            // epilogue is the declared backend capability `qkv_epilogue_ok`
+            // above, not a `cfg` or a device probe here; a backend that gains
+            // the store arm flips it in the change that lands the kernel. Metal
+            // did in #844 (`qkv_fused.metal` / `kv.metal` resolve the rows and
+            // `kernel_store_kv_q8_0` writes the cells), so a packed Metal cache
+            // now keeps this fusion instead of the unfused chain.
             //
-            // class 2 is CUDA-only: the capability's only `true` answer is CUDA's,
-            // so everywhere else the mixed-quant layers keep the unfused chain,
-            // bitwise-neutral vs pre-D3-8. (Class 2's own requirement is
-            // `Op::QkvBiasRopeStore` support; a backend that answers this
-            // capability `true` without that op must split the two gates here.)
+            // class 2 is CUDA-only, and since #844 its gate is **its own op**,
+            // not the packed-store capability: Metal answers that capability
+            // `true` for its fused epilogue while implementing no mixed-quant
+            // `Op::QkvBiasRopeStore`, and a node the owning backend refuses is
+            // placed on the CPU by the assignment pass — which then collides
+            // with the Metal-owned KV region and refuses the graph. So a backend
+            // that answers this capability `true` without that op splits the two
+            // gates here, and `registry::supports_op` is the one authority.
             let fuse_qkv = nt == 1
                 && layer_gpu
                 && params.cparams.fuse_qkv
@@ -146,6 +154,12 @@ impl Qwen2Graph {
                 && l.bq.is_some()
                 && l.bk.is_some()
                 && l.bv.is_some();
+            let mixed_quant_epilogue_ok = fuse_qkv
+                && crate::graph::registry::supports_op(
+                    backend,
+                    &crate::graph::ops::Op::QkvBiasRopeStore { layer: il },
+                    crate::graph::DType::F32,
+                );
             let (q, kv) = if fuse_qkv && Self::qkv_concat_available(&l.wq, &l.wk, &l.wv) {
                 let qkv = b.fused_qkv(
                     normed,
@@ -175,7 +189,7 @@ impl Qwen2Graph {
                 // persistent regions via the fused store — read them back.
                 let kv = b.kvcache_load(il, nkt, n_ctx, nk);
                 (qkv, kv)
-            } else if fuse_qkv && qkv_epilogue_ok {
+            } else if mixed_quant_epilogue_ok {
                 // D3-8 class 2 (mixed quant types): separate matmuls without
                 // bias, then one epilogue pass (bias×3 + rope×2 + store×2 → 1).
                 // Attention is wired to the epilogue node so q's matmul buffer

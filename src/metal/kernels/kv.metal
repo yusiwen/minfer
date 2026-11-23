@@ -106,6 +106,17 @@ kernel void kernel_dequant_kv_q8_0_to_f32(
 // kernels: bias then rope on the same values, same store addresses.
 // Thread mapping: one thread per (head, d<half_dim) rope pair for q and k,
 // one thread per v element → grid = nqt/2 + nkt/2 + nkt.
+//
+// C4 ([#844], ADR-0084): `kv_packed` is the packed-store arm. A packed cell is
+// **byte-addressed** (`KvFormat::Q8_0.row_bytes`, 34-byte blocks), so the f32/f16
+// element stores below cannot express it (and would write out of the region).
+// With `kv_packed == 1` this kernel still resolves the biased+rotated values
+// **into bqkv** — the K section holds the rope-rotated row, the V section the
+// biased row — and the graph dispatches `kernel_store_kv_q8_0` on those two
+// sections, i.e. the very kernel the unfused chain's store uses. So the bytes
+// are the unfused chain's by construction, and the fusion costs no store code.
+//
+// [#844]: https://github.com/yusiwen/minfer/issues/844
 
 kernel void kernel_attn_bias_rope_store(
     device       float * bqkv [[buffer(0)]],
@@ -123,6 +134,7 @@ kernel void kernel_attn_bias_rope_store(
     constant        int & rope_style [[buffer(12)]],
     constant        int & kv_is_f16 [[buffer(13)]],
     constant    RopeFreqs & freqs [[buffer(14)]],
+    constant        int & kv_packed [[buffer(15)]],
     uint tid [[thread_position_in_grid]]
 ) {
     const int half_dim = hd / 2;
@@ -143,8 +155,10 @@ kernel void kernel_attn_bias_rope_store(
         const float freq = rope_freq(freqs, d, hd, freq_base, freq_scale);
         const float theta = pos * freq;
         const float cs = cos(theta), sn = sin(theta);
-        bqkv[i0] = x0 * cs - x1 * sn;
-        bqkv[i1] = x0 * sn + x1 * cs;
+        // #844: the shared pair rotation (`common.h`) — bit-equal to add_bias+rope.
+        RopePair r = rope_rotate(x0, x1, cs, sn);
+        bqkv[i0] = r.r0;
+        bqkv[i1] = r.r1;
     } else if (u < qpairs + kpairs) {
         const int u2   = u - qpairs;
         const int head = u2 / half_dim;
@@ -158,25 +172,32 @@ kernel void kernel_attn_bias_rope_store(
         const float freq = rope_freq(freqs, d, hd, freq_base, freq_scale);
         const float theta = pos * freq;
         const float cs = cos(theta), sn = sin(theta);
-        float r0 = x0 * cs - x1 * sn;
-        float r1 = x0 * sn + x1 * cs;
+        // #844: the shared pair rotation (`common.h`) — bit-equal to add_bias+rope.
+        RopePair r = rope_rotate(x0, x1, cs, sn);
+        float r0 = r.r0, r1 = r.r1;
         bqkv[k0] = r0; bqkv[k1] = r1;
-        if (kv_is_f16) {
-            ((device half *)kv_k)[pos * nkt + j0] = half(r0);
-            ((device half *)kv_k)[pos * nkt + j1] = half(r1);
-        } else {
-            ((device float *)kv_k)[pos * nkt + j0] = r0;
-            ((device float *)kv_k)[pos * nkt + j1] = r1;
+        // Packed: the rotated row stays in bqkv for kernel_store_kv_q8_0.
+        if (!kv_packed) {
+            if (kv_is_f16) {
+                ((device half *)kv_k)[pos * nkt + j0] = half(r0);
+                ((device half *)kv_k)[pos * nkt + j1] = half(r1);
+            } else {
+                ((device float *)kv_k)[pos * nkt + j0] = r0;
+                ((device float *)kv_k)[pos * nkt + j1] = r1;
+            }
         }
     } else {
         const int j  = u - qpairs - kpairs;
         const int vi = nqt + nkt + j;
         float v = bqkv[vi] + bias_v[j];
         bqkv[vi] = v;
-        if (kv_is_f16) {
-            ((device half *)kv_v)[pos * nkt + j] = half(v);
-        } else {
-            ((device float *)kv_v)[pos * nkt + j] = v;
+        // Packed: the biased row stays in bqkv for kernel_store_kv_q8_0.
+        if (!kv_packed) {
+            if (kv_is_f16) {
+                ((device half *)kv_v)[pos * nkt + j] = half(v);
+            } else {
+                ((device float *)kv_v)[pos * nkt + j] = v;
+            }
         }
     }
 }

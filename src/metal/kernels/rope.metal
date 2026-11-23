@@ -32,7 +32,10 @@ kernel void kernel_rope_f32(
         i1 = base + d + half_dim;
     }
     float x0 = x[i0], x1 = x[i1];
-    x[i0] = x0 * cs - x1 * sn;
-    x[i1] = x0 * sn + x1 * cs;
+    // #844: the shared pair rotation — the same two roundings the fused
+    // epilogue uses, so the fused and unfused paths are bit-equal.
+    RopePair r = rope_rotate(x0, x1, cs, sn);
+    x[i0] = r.r0;
+    x[i1] = r.r1;
 }
 
