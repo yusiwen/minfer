@@ -530,7 +530,7 @@ allocator lives in `GraphCache` (AGENTS rule 2, `AGENTS.md:123` ("Compute Graph 
 rebuilds and hold their contents across decode steps: two device buffers per layer nobody may recycle.
 
 **Size and layout.** The size comes from the graph builder:
-`kv_elems: nkt * n_ctx` (`kv_elems` (`src/models/qwen2/graph.rs:170`)), where
+`kv_elems: nkt * n_ctx` (`kv_elems` (`src/models/qwen2/graph.rs:184`)), where
 `nkt = n_head_kv · hd` (the `n_kv_embd` dimension) and `n_ctx` is the
 capacity. So the brief question — "[n_past][kv_heads*head_dim]?" — resolves
 like this in the store code:
@@ -840,7 +840,7 @@ time*, all-or-nothing: CUDA participation requires a device **and** every
 weight registered with a kernel-supported type
 (`Qwen2Graph::device` (`src/models/qwen2/graph.rs`),
 `cuda_on = … && Self::weights_on_cuda(model)`). `weights_on_cuda`
-`weights_on_cuda` (`src/models/qwen2/graph.rs:878`) walks every tensor — embedding,
+`weights_on_cuda` (`src/models/qwen2/graph.rs:892`) walks every tensor — embedding,
 per-layer wq/wk/wv/wo, gate/up/down, norms, biases — and on failure prints the
 exact loser: `"CUDA GATE: weight '{}' (type {:?}) has no CUDA kernel or is not registered"` —
 the gate is `Qwen2Graph::device` (`src/models/qwen2/graph.rs`). That either routes the
