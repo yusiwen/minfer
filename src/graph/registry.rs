@@ -458,6 +458,36 @@ pub fn writes_packed_kv_from_fused_epilogue(backend: Backend) -> bool {
     backend.caps().writes_packed_kv_from_fused_epilogue
 }
 
+/// Does `backend` claim `op` at `dtype`?
+///
+/// A **router**, not a second authority: every arm forwards to the backend
+/// module's own `supports_op` free function — the same one the `Backend` trait
+/// method forwards to — so the registry cannot disagree with the trait. It
+/// exists because a graph builder asks *before* any pool exists, the same reason
+/// [`writes_packed_kv_from_fused_epilogue`] is here: `qwen2` asks whether the
+/// owning backend implements the mixed-quant epilogue `Op::QkvBiasRopeStore`.
+/// [#844] split that gate from the packed-store capability — Metal answers the
+/// capability `true` for its *own* fused epilogue while implementing no
+/// mixed-quant one, so the two are different questions.
+///
+/// A backend that is not compiled in has no entry and claims nothing here.
+///
+/// [#844]: https://github.com/yusiwen/minfer/issues/844
+pub fn supports_op(backend: Backend, op: &super::ops::Op, dtype: super::DType) -> bool {
+    if backend == Backend::CPU {
+        return super::cpu_backend::supports_op(op, dtype);
+    }
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if backend == Backend::METAL {
+        return super::metal_backend::supports_op(op, dtype);
+    }
+    #[cfg(feature = "cuda")]
+    if backend == Backend::CUDA {
+        return super::cuda_backend::supports_op(op, dtype);
+    }
+    false
+}
+
 /// A set of backends a run may use: the fence `--backend` / `MINFER_BACKENDS`
 /// installs. Indexed by handle id — never iterated as a set, so nothing here can
 /// perturb a deterministic assignment.

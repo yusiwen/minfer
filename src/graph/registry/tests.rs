@@ -324,9 +324,10 @@ fn the_packed_kv_capability_is_the_registrys_answer() {
 ///   32-element blocks in place; a refactor must not silently take that away.
 /// - **CPU `false`, by design** — the CPU implements no `Op::FusedQKV` at all, so
 ///   there is no epilogue to extend with a packed store arm.
-/// - **Metal `false`** — its fused epilogue writes f32/f16 K/V. The value flips
-///   in the change that lands the packed store arm, never before it (a fused
-///   epilogue writing f16 into a `q8_0`-sized region writes out of region).
+/// - **Metal `true`** — since #844 its fused epilogues
+///   (`kernel_attn_bias_rope_store`, `kernel_attn_rope_store`) resolve the rotated
+///   rows into the concat buffer and store the cells through the unfused chain's
+///   own `kernel_store_kv_q8_0`, so the answer is honest rather than optimistic.
 ///
 /// Flipping any of the three answers, or a backend's `entry()` forgetting the
 /// field, fails here. The free function and the handle's `caps()` are asserted
@@ -338,13 +339,19 @@ fn the_fused_epilogue_packed_kv_capability_is_the_registrys_answer() {
     assert!(!Backend::CPU.caps().writes_packed_kv_from_fused_epilogue);
     assert!(!writes_packed_kv_from_fused_epilogue(Backend::CPU));
 
-    // Metal: registered on macOS+metal (and answering `false` this round — its
-    // fused epilogue is f32/f16-only); on any other configuration it has no entry
-    // and claims nothing. Either way the answer is `false`.
+    // Metal: registered on macOS+metal and answering `true` since #844 — its
+    // fused epilogues have the packed store arm; on any other configuration it
+    // has no entry and claims nothing.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     assert!(Backend::METAL.is_registered());
-    assert!(!Backend::METAL.caps().writes_packed_kv_from_fused_epilogue);
-    assert!(!writes_packed_kv_from_fused_epilogue(Backend::METAL));
+    assert_eq!(
+        Backend::METAL.caps().writes_packed_kv_from_fused_epilogue,
+        cfg!(all(target_os = "macos", feature = "metal"))
+    );
+    assert_eq!(
+        writes_packed_kv_from_fused_epilogue(Backend::METAL),
+        cfg!(all(target_os = "macos", feature = "metal"))
+    );
 
     // CUDA: `true` where the backend is compiled in — the fused packed epilogue
     // (#843/E1). A build without the feature registers no entry, so it claims
@@ -381,13 +388,13 @@ fn the_fused_epilogue_packed_kv_capability_is_the_registrys_answer() {
         );
     }
 
-    // …and the write half is **not** the read half (ADR-0084 decision 2): where
-    // Metal is registered it reads a packed cell since #310 and still cannot
-    // store one from the fused epilogue.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    // …and the write half is **not** the read half (ADR-0084 decision 2). Metal
+    // answers both `true` since #844, so the CPU row is the one that keeps the
+    // two fields apart: it reads a packed cell (C4) and can never store one from
+    // a fused epilogue (it has no fused epilogue at all).
     assert!(
-        Backend::METAL.caps().reads_packed_kv
-            && !Backend::METAL.caps().writes_packed_kv_from_fused_epilogue,
+        Backend::CPU.caps().reads_packed_kv
+            && !Backend::CPU.caps().writes_packed_kv_from_fused_epilogue,
         "the two packed-KV capabilities must stay distinct"
     );
 }

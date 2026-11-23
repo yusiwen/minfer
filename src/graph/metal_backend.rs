@@ -739,18 +739,24 @@ pub const SUPPORTS_ATTN_SPAN: bool = true;
 pub const READS_PACKED_KV: bool = true;
 
 /// C4 ([#844], ADR-0084): whether the fused QKV epilogue can store a **packed**
-/// KV cell. Metal answers `false` — its fused epilogue (`kernel_attn_rope_store`
-/// and the `fused_qkv_norm` family) writes f32/f16 K/V, not `q8_0` blocks — so a
-/// packed cache keeps the unfused chain (3 matmul + 2 rope + 2 store per layer).
+/// KV cell. Metal answers `true` — both fused epilogues have the packed arm:
+/// `kernel_attn_bias_rope_store` (Qwen2's `Op::FusedQKV`, `kv.metal`) and
+/// `kernel_attn_rope_store` (Qwen3's `Op::FusedQkvNorm`, `qkv_fused.metal`)
+/// resolve the biased + rope-rotated K row and the V row **into the concat
+/// buffer** and write nothing element-wise when `kv_packed` is set; the graph
+/// then dispatches `kernel_store_kv_q8_0` — the unfused chain's own quantizer —
+/// over the K section (`off = nqt`) and the V section (`off = nqt + nkt`) with
+/// the cell's `row_bytes`. So a packed cache keeps the one-node fusion, and the
+/// bytes are the unfused chain's (verified by the `MINFER_NO_FUSE_QKV=1` graph
+/// dump comparison and `graph::metal_backend::tests::packed_kv`'s store gate).
 ///
-/// The packed store arm is #844's next change and this value flips **with** that
-/// kernel, never before it: a fused epilogue that wrote f16 K/V into a region
-/// sized for `q8_0` would be an out-of-region write, not a wrong number
-/// (ADR-0084 decision 6). Frozen by
+/// The value flips only with that kernel, never before it (ADR-0084 decision 6):
+/// an epilogue writing f16 K/V into a region sized for `q8_0` would be an
+/// out-of-region write, not a wrong number. Frozen by
 /// `graph::registry::tests::the_fused_epilogue_packed_kv_capability_is_the_registrys_answer`.
 ///
 /// [#844]: https://github.com/yusiwen/minfer/issues/844
-pub const WRITES_PACKED_KV_FROM_FUSED_EPILOGUE: bool = false;
+pub const WRITES_PACKED_KV_FROM_FUSED_EPILOGUE: bool = true;
 
 /// F5 ([#58], ported by [#137]): registry hook **phase A** of a cross-backend
 /// staging copy out of Metal.
@@ -1825,7 +1831,39 @@ impl Backend for MetalBackend {
                     pos,
                     meta.rope_style as i32,
                     self.kv_f16(),
+                    self.kv_packed(),
                 );
+                // #844 / ADR-0084: a packed cell is **byte-addressed**
+                // (`KvFormat::Q8_0.row_bytes`), so the epilogue above only
+                // resolved the biased + rope-rotated rows into the concat buffer
+                // (K at `nqt`, V at `nqt + nkt`). The store is the unfused
+                // chain's own quantizer over those sections — the same
+                // `kernel_store_kv_q8_0` the `Op::KvcacheStore` packed arm runs —
+                // so the bytes are the unfused chain's by construction, at one
+                // node instead of five.
+                if self.kv_packed() {
+                    let row_bytes = self.kv_row_bytes(meta.nkt);
+                    let positions = self.buf(in_bufs[1].id);
+                    let concat = self.buf(out_buf.id);
+                    cb.store_kv_q8_0(
+                        concat,
+                        self.buf(k_id),
+                        meta.nkt,
+                        nt,
+                        positions,
+                        meta.nqt,
+                        row_bytes,
+                    );
+                    cb.store_kv_q8_0(
+                        concat,
+                        self.buf(v_id),
+                        meta.nkt,
+                        nt,
+                        positions,
+                        meta.nqt + meta.nkt,
+                        row_bytes,
+                    );
+                }
                 Ok(())
             }
             Op::FusedQkvNorm { layer } => {
@@ -1965,7 +2003,35 @@ impl Backend for MetalBackend {
                     pos,
                     meta.rope_style as i32,
                     self.kv_f16(),
+                    self.kv_packed(),
                 );
+                // #844 / ADR-0084: the same packed-store arm as `Op::FusedQKV`'s
+                // — the epilogue resolved the rotated rows into the concat buffer
+                // (K at `nqt`, V at `nqt + nkt`) and `kernel_store_kv_q8_0`, the
+                // unfused chain's own quantizer, writes the cells.
+                if self.kv_packed() {
+                    let row_bytes = self.kv_row_bytes(meta.nkt);
+                    let positions = self.buf(in_bufs[1].id);
+                    let concat = self.buf(out_buf.id);
+                    cb.store_kv_q8_0(
+                        concat,
+                        self.buf(k_id),
+                        meta.nkt,
+                        nt,
+                        positions,
+                        meta.nqt,
+                        row_bytes,
+                    );
+                    cb.store_kv_q8_0(
+                        concat,
+                        self.buf(v_id),
+                        meta.nkt,
+                        nt,
+                        positions,
+                        meta.nqt + meta.nkt,
+                        row_bytes,
+                    );
+                }
                 Ok(())
             }
             Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => {

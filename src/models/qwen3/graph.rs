@@ -118,11 +118,12 @@ impl Qwen3Graph {
             // C6/#200: the fused family writes K/V at allocator-resolved cells,
             // not at `positions` — the epilogue takes the same `cells` input the
             // unfused store does. A packed cell is only expressible where the
-            // epilogue has a whole-block quantizing arm, and that is CUDA alone
-            // (#144's packed epilogue; Metal's fused norm kernel is f32/f16-only,
-            // so a packed Metal cache keeps the unfused chain). #844 / ADR-0084:
-            // that answer is the declared backend capability resolved once at the
-            // top of this build, not a device comparison.
+            // epilogue has a whole-block quantizing arm; #844 / ADR-0084 made
+            // that the declared backend capability resolved once at the top of
+            // this build, not a device comparison. Metal gained the arm in #844
+            // (`kernel_attn_rope_store` resolves the rows and
+            // `kernel_store_kv_q8_0` writes the cells), so a packed Metal cache
+            // keeps this fusion instead of the unfused chain.
             let fuse_qkv_norm = nt == 1
                 && layer_gpu
                 && params.cparams.fuse_qkv

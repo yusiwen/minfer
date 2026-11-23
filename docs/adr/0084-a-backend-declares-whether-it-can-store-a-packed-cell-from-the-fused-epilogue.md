@@ -1,6 +1,6 @@
 # 0084. A backend declares whether it can store a packed cell from the fused epilogue
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-22
 - Issues: #844, #843, #310
 
