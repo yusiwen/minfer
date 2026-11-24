@@ -599,11 +599,12 @@ The Q/K/V construction is where topology differs materially between prefill and 
 | Class | Condition | Graph |
 |---|---|---|
 | Concat (G4/D3-8 class 1) | `qkv_concat_available(wq, wk, wv)` — same quant type, same input dim, block-aligned, so the loader registered `blk.{i}.attn_qkv` | one `fused_qkv(normed, positions, il, ...)` node (the builder also wires `cells`), then `kvcache_load` for attention |
-| Mixed quant (D3-8 class 2) | concat unavailable, CUDA present | three bias-less `matmul`s + one `qkv_bias_rope_store(q, k, v, positions, il, ...)` epilogue (plus `cells` from the builder); attention is wired to the epilogue node so `q`'s matmul has exactly one consumer and can be aliased in place |
-| Unfused | any gate off (or a Metal-only mixed-quant layer) | `matmul`×3 (+bias) → `rope`×2 → `kvcache_store` → `kvcache_load` |
+| Mixed quant (D3-8 class 2) | concat unavailable, backend claims `QkvBiasRopeStore` | three bias-less `matmul`s + one `qkv_bias_rope_store(q, k, v, positions, il, ...)` epilogue (plus `cells` from the builder); attention is wired to the epilogue node so `q`'s matmul has exactly one consumer and can be aliased in place |
+| Unfused | any gate off (or a backend that refuses the mixed-quant epilogue) | `matmul`×3 (+bias) → `rope`×2 → `kvcache_store` → `kvcache_load` |
 
-Class 2 is CUDA-only: without the `cuda` feature `qkv_epilogue_ok` is `false` and those layers keep
-the unfused chain on Metal, bitwise-neutral against the pre-D3-8 behaviour. The FFN branch: for
+Class 2 asks the backend, not the build: the builder's `mixed_quant_epilogue_ok` calls
+`registry::supports_op(backend, Op::QkvBiasRopeStore, F32)`, so CUDA and Metal (since [#844]) take the
+epilogue and the CPU keeps the unfused chain, bitwise-neutral against the pre-D3-8 behaviour. The FFN branch: for
 decode with `CParams.fuse_ffn`, `gu_concat_available(ffn_gate, ffn_up)` and `nf <= 16384`, the
 builder emits one `fused_ffn(normed, ...)` followed by the down matmul; otherwise it emits
 `matmul(gate)`, `matmul(up)`, `silu`, `mul` and lets `FusionPass` fold the last two.
@@ -723,7 +724,7 @@ float noise (~1e-6, amplified at large values). The real forward path always run
 | Op | Shape of the win | Where it executes |
 |---|---|---|
 | `FusedQKV` | replaces 3 matmul + 3 bias + 2 rope + 2 store (10 dispatches) with one concat matmul + one fused bias/rope/store kernel (2) | Metal and CUDA |
-| `QkvBiasRopeStore` | mixed-quant layers that cannot share a concat matmul: the 3 matmuls stay, but 3 bias + 2 rope + 2 store become 1 epilogue pass | CUDA only (D3-8 class 2) |
+| `QkvBiasRopeStore` | mixed-quant layers that cannot share a concat matmul: the 3 matmuls stay, but 3 bias + 2 rope + 2 store become 1 epilogue pass (7 nodes → 1) | Metal and CUDA (D3-8 class 2) |
 | `FusedFFN` | replaces 2 matmul + silu + mul (4) with one concat matmul + one in-place swiglu (2); gate `nf <= 16384` | Metal and CUDA |
 | `FusedQkvNorm` | Qwen3's concat matmul + per-head q/k norm + no-bias rope/store | Metal only |
 
@@ -913,7 +914,7 @@ attention, KV, `GetRows` and decode-fused ops; `View`/`Reshape`/`Permute` are ac
 | `FusedFFN` | concat matmul + `swiglu_f32_off` (in-place on the concat buffer, gate at offset 0, up at `nf`) |
 | `FusedQkvNorm` | concat matmul + two in-place per-head `rms_norm[_256]` (q at byte offset 0, k at `nqt*4`) + `attn_rope_store` |
 | `Scale` / `Softmax` / `BatchMatMul` | `Err` (no kernel) |
-| `QkvBiasRopeStore` | `Err` (CUDA-only epilogue) |
+| `QkvBiasRopeStore` | one `attn_bias_rope_store` per section (q, k, v), plus the two packed stores when the cache is `q8_0` |
 
 The `*_off` kernel variants (`swiglu_f32_off`, `rope_f32(off)`, `rms_norm(off_x, off_y)`,
 `add_bias_f32(off)`, `store_kv(off)`, `attn_bias_rope_store(bias offsets)`) exist so a fused node can
@@ -1518,8 +1519,9 @@ Post-plan additions:
     matmul + qk-norm + no-bias rope/store). The fused variant is Metal-only; CUDA Qwen3 runs the
     unfused qk_norm chain.
 28. **D3-8 class 2 (`Op::QkvBiasRopeStore`)**: mixed-quant decode layers (e.g. Q6_K `attn_v` among
-    Q4_K q/k) run three separate matmuls plus one bias/rope/store epilogue, CUDA-only. On Metal those
-    layers keep the unfused chain, bitwise-neutral.
+    Q4_K q/k) run three separate matmuls plus one bias/rope/store epilogue. CUDA landed it first; Metal
+    followed in [#844] by dispatching the same `attn_bias_rope_store` kernel once per section, which is
+    bit-equal to the unfused chain (7 nodes → 1). The CPU keeps the unfused chain, bitwise-neutral.
 29. **G4 `FusedQKV` ported to CUDA** (class 1 concat) — `Op::FusedQKV` is no longer Metal-only.
 30. **CUDA Graph replay**: `Backend::graph_replay` + `ComputeGraph::capture_nt_hint`, keyed by
     `(uid, node range)`, invalidated by `pool_gen`; two direct-launch warmups, capture on the third;

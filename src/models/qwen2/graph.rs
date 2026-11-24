@@ -121,9 +121,9 @@ impl Qwen2Graph {
             //   concat matmul + one fused bias+rope+store kernel;
             // - mixed-quant class (e.g. Q6_K attn_v among Q4_K q/k): three
             //   separate matmuls (no bias) + one `Op::QkvBiasRopeStore`
-            //   epilogue (CUDA-only today; Metal keeps the unfused chain for
-            //   these layers). Both replace 3 matmul + 3 bias + 2 rope +
-            //   2 store dispatches.
+            //   epilogue (CUDA since D3-8, Metal since #844 — it dispatches the
+            //   same store-epilogue kernel once per section). Both replace
+            //   3 matmul + 3 bias + 2 rope + 2 store dispatches.
             // #144 item 1: a packed cache builds the fused epilogue too — CUDA's
             // `attn_bias_rope_store_q8_0` gives one thread a whole (head,
             // 32-element K block) and one V block, so it can quantize a cell's
@@ -139,14 +139,14 @@ impl Qwen2Graph {
             // `kernel_store_kv_q8_0` writes the cells), so a packed Metal cache
             // now keeps this fusion instead of the unfused chain.
             //
-            // class 2 is CUDA-only, and since #844 its gate is **its own op**,
-            // not the packed-store capability: Metal answers that capability
-            // `true` for its fused epilogue while implementing no mixed-quant
-            // `Op::QkvBiasRopeStore`, and a node the owning backend refuses is
-            // placed on the CPU by the assignment pass — which then collides
-            // with the Metal-owned KV region and refuses the graph. So a backend
-            // that answers this capability `true` without that op splits the two
-            // gates here, and `registry::supports_op` is the one authority.
+            // class 2's gate is **its own op**, not the packed-store
+            // capability: #844 landed the packed epilogue on Metal before Metal
+            // had the mixed-quant op, and the first attempt at flipping the
+            // capability routed these layers to a CUDA-only node — which the
+            // assignment pass then placed on the CPU, colliding with the
+            // device-owned KV region and refusing the graph (reproduced on f16
+            // too). So the two questions are asked separately here, through the
+            // registry (`supports_op`) rather than a `cfg` or a device probe.
             let fuse_qkv = nt == 1
                 && layer_gpu
                 && params.cparams.fuse_qkv
