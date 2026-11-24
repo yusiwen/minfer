@@ -510,11 +510,35 @@ medians):
 | Qwen2.5-0.5B Q4_0 (`hd` 64) | 6 291 456 B → 1 671 168 B (**3.76×**) | 6 175 → 6 154 tok/s (**0.997×**) | 295.7 → 245.5 tok/s (**0.830×**) |
 
 The memory win is 3.76×. Prefill (mechanism B) lands within noise of f16 (0.997× / 0.967×); decode
-(mechanism A) is **1.20× / 1.10× slower** than f16 — the native packed kernel issues five 2-byte
-loads per lane against the f16 kernel's one vectorized `half4`, so at these short, dispatch-bound
-contexts it is LSU-bound rather than bandwidth-bound and the 34 B/32-element read does not pay off.
-That is inside the CUDA precedent after [#144](https://github.com/yusiwen/minfer/issues/144)
-(1.01–1.24×). `MINFER_PACKED_KV_STAGE=1` on the 0.5B
+(mechanism A) was **1.20× / 1.10× slower** than f16 on that day, and the attribution written here —
+"the native packed kernel issues five 2-byte loads per lane against f16's one vectorized `half4`, so
+at these short, dispatch-bound contexts it is LSU-bound" — **was wrong**. It is kept because the
+correction is the useful part: [#844] priced the whole *step* instead of the kernel and found that
+**82 % of the gap was the QKV fusion a packed cache could not have** (turning the fusion off in the
+*f16* arm costs 556 of the packed arm's 679 µs), while widening those five loads bought 1–2 % and a
+`simdgroup` store 11 %. The `-p 1024` numbers above are therefore history, not the current state; the
+CUDA precedent after [#144](https://github.com/yusiwen/minfer/issues/144) (1.01–1.24×) still frames
+the class.
+
+**Since [#844] (2026-11-24).** Both decode epilogues fuse on Metal — the concat class
+(`Op::FusedQKV`) and, since the mixed-quant arm landed, class 2 (`Op::QkvBiasRopeStore`, dispatched
+as the same store-epilogue kernel once per q/k/v section). The packed cache's remaining cost against
+f16 (`bench -p <n> -n 64 -r 3 --n-ctx 4096`, 3 interleaved rounds, medians):
+
+| model (`hd`) | `-p` | f16 µs/token | q8_0 | ratio | before #844 |
+|---|---|---:|---:|---:|---|
+| Qwen2.5-0.5B Q4_0 (64) | 8 | 3 020.4 | 3 145.2 | **1.041×** | 1.210× |
+| | 2048 | 3 451.3 | 3 685.0 | **1.068×** | 1.212× |
+| Qwen3-0.6B Q8_0 (128) | 8 | 4 255.3 | 4 538.0 | **1.066×** | 1.164× |
+| | 2048 | 5 633.8 | 5 644.3 | **1.002×** | 1.078× |
+
+The fused path is **bit-equal** to the unfused chain for f32, f16 and q8_0 (0 of 121 / 91 comparable
+dump files with a non-zero delta), which cost one deliberate numeric change: every Metal rope output
+re-rounds by ≤ 1 ulp, because the fused epilogue and `kernel_rope_f32` now share one `rope_rotate`
+with an explicit `fma` (before that they differed by exactly one rounding unit, 2⁻²⁴, in the rotated
+words only). The residual is the packed **read** path, not node count —
+[#851](https://github.com/yusiwen/minfer/issues/851) carries that lever. Full record:
+[`cuda_optimization_steps/113`](./cuda_optimization_steps/113-c4-packed-decode-metal-fused-epilogue.md). `MINFER_PACKED_KV_STAGE=1` on the 0.5B
 `tg64` shape (mechanism B decode: dequantize, then the f32 flash) measures **238.8 tok/s**, ~2.7%
 below mechanism A's 245.5 — the stage cost is small and the mechanism-A decode is the slower one. The
 gate `metal_packed_decode_stage_matches_the_native_read` pins A vs B at max |Δ| **1.7e-8** (f32
@@ -1076,3 +1100,5 @@ This page is the *current contract*; the decisions behind it are frozen in the A
 - [ADR-0036](adr/0036-bf16-gets-its-own-device-kernels.md) — bf16 weights get their own device kernels, not a dtype flag on the f16 ones
 - [ADR-0037](adr/0037-a-metal-weight-dtype-a-kernel-cannot-consume-is-refused.md) — A Metal weight dtype a kernel cannot consume is refused, never run as a wrong kernel
 - [ADR-0080](adr/0080-the-metal-backend-is-a-cargo-feature-and-a-metal-less-build-refuses-the-name.md) — The Metal backend is a cargo feature, and a metal-less build refuses the name
+
+[#844]: https://github.com/yusiwen/minfer/issues/844

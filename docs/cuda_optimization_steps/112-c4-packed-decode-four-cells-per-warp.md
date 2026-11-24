@@ -142,7 +142,8 @@ numerics is a hypothesis until measured") gains a corollary: so is *unchanged* n
   [#848](https://github.com/yusiwen/minfer/issues/848).
 - **Prefill at hd 64** is unchanged: 1.232x at 2k, 1.413x at 8k —
   [#845](https://github.com/yusiwen/minfer/issues/845).
-- **Metal** has its own residual, 1.20x / 1.10x — [#844](https://github.com/yusiwen/minfer/issues/844).
+- **Metal** had its own residual, 1.20x / 1.10x — closed in [113](./113-c4-packed-decode-metal-fused-epilogue.md)
+  ([#844](https://github.com/yusiwen/minfer/issues/844)).
 - The split count is untouched, so the combine kernel is still the serial-over-splits shape;
   raising it is only worth revisiting if the partial kernel drops another large step.
 - **The two levers [#847](https://github.com/yusiwen/minfer/issues/847) was written around are
