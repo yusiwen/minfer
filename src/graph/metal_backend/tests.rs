@@ -14,6 +14,7 @@ mod fusion_shape;
 mod map_window;
 mod norm_weight;
 mod packed_kv;
+mod qkv_epilogue;
 mod staging;
 fn f32t(name: &str, shape: [i64; 4], data: Vec<f32>) -> crate::tensor::Tensor {
     let mut bytes = Vec::with_capacity(data.len() * 4);

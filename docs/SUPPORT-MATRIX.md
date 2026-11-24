@@ -265,7 +265,7 @@ set-valued `kv_map` attention window (`Device::gathers_attn_map`), and a packed
 | `FusedQKV` (decode) | ❌ | ✅ | ✅ |
 | `FusedFFN` (decode) | ❌ | ✅ | ✅ |
 | `FusedQkvNorm` (Qwen3 decode) | ❌ | ✅ | ✅ |
-| `QkvBiasRopeStore` (mixed-quant decode) | ❌ | ❌ | ✅ |
+| `QkvBiasRopeStore` (mixed-quant decode) | ❌ | ✅ | ✅ |
 | `Scale`, `Softmax`, `BatchMatMul` | ✅ / ✅ / ❌ | ❌ / ❌ / ❌ | ❌ / ❌ / ❌ |
 
 Notes on the asymmetries — these are the rows where a model's decode path
@@ -281,29 +281,39 @@ differs by platform:
   concat matmul groups its per-row reduction differently, ~1e-3 on the final
   logits); the pinned contract is the same greedy token with a 1e-2 bound, exactly
   as the Metal gate records.
-- **`QkvBiasRopeStore` is CUDA-only — a recorded decision ([#52](https://github.com/yusiwen/minfer/issues/52)),
-  not a gap.** It is the *mixed-quant* decode epilogue: q/k/v use different quant
-  types (so they cannot share `FusedQKV`'s single concat weight), so three separate
-  matmuls (no bias) feed one bias×3 + RoPE×2 + store×2 pass. CUDA fuses it (10
-  dispatches → 4 per layer, −6); Metal keeps the unfused chain and the graph builder
-  never emits the node there (`metal_backend.rs`'s `false` arm is a design statement).
-  Porting would save **6 dispatches per mixed-quant layer — 84 per decode token on
-  Qwen2.5-7B-Q4_K_M**, the realistic case, whose 14 of 28 layers carry `attn_v` as
-  Q6_K against Q4_K q/k — with **no numerical difference** (`supports_op` is a
-  build-time gate and the unfused chain is the reference). The whole forward's
-  host-encode is ~0.2 ms against a ~20 ms/token decode, so those 84 dispatches are a
-  sub-1% slice of decode time; the A/B of the *concat*-class fusion that removes more
-  dispatches (`MINFER_NO_FUSE_QKV=1`, −8 on the same 14 layers) sits within run-to-run
-  variance on `macbook (macOS 27.0.1, Apple M4 Pro)` (2026-10-06, five interleaved
-  `bench -p 0 -n 128 -r 4` pairs: 48.06 vs 46.49 t/s means, individual pairs crossing
-  zero), so a second kernel path and its bitwise gate are not earned by a ~1% ceiling.
-  **Provenance and the rejected alternative, stated so the numbers are not misread.** The ~0.2 ms
-  host-encode figure is `MINFER_OP_PROFILE=1` on that 7B — per-op host-encode **totals**, not
-  per-label counts — and the 10 → 4 / 84-per-token dispatch counts are the CUDA D3-8 ledger applied
-  to Metal's dispatch table; Metal has no per-op profiler, so they were not re-counted on the
-  device. And the port is *cheap*: Metal already has the class-1 `attn_bias_rope_store` kernel, so
-  the refused work is mainly a three-pointer binding — the decision rests on the measured ceiling,
-  not on the size of the change.
+- **`QkvBiasRopeStore` is on both devices since [#844](https://github.com/yusiwen/minfer/issues/844).**
+  It is the *mixed-quant* decode epilogue: q/k/v use different quant types (so they
+  cannot share `FusedQKV`'s single concat weight), so three separate matmuls (no
+  bias) feed one bias×3 + RoPE×2 + store×2 pass. CUDA has fused it since D3-8
+  (10 dispatches → 4 per layer). Metal now executes it too: the same
+  `kernel_attn_bias_rope_store` the concat class already had is dispatched **once
+  per section** (its `(nqt, nkt)` params and the grid select exactly one arm and
+  index it from zero — the derivation is in `MpsCommandBuffer::attn_bias_rope_store_section`),
+  which takes a mixed-quant layer from 7 nodes / 10 dispatches to 1 node /
+  8 dispatches (the two packed stores remain).
+  **It is bit-equal to the unfused chain** — the three projections are the same
+  matmul nodes, and each section dispatch runs the same instructions on the same
+  values as its part of a concat dispatch — pinned by
+  `graph::metal_backend::tests::qkv_epilogue`'s four section-vs-concat gates
+  (f32, f16, packed, interleaved) and measured end-to-end: fused vs
+  `MINFER_NO_FUSE_QKV=1` on Qwen2.5-7B-Instruct Q4_K_M gives 0 differing logits and
+  **114 / 114 identical per-layer KV dumps** for both an f16 and a q8_0 cache.
+  **What it is worth, measured rather than projected.** On that model
+  (`bench -p 8 -n 64 -r 3`, 10 interleaved rounds, medians) the packed arm moves
+  **+0.31 %** (≈ 40 µs/token; 8/10 rounds positive, reproduced +0.29 % on an
+  independently rebuilt binary), taking the packed-vs-f16 gap from 1.48 % to
+  1.29 %. The note that used to sit here projected 6 dispatches × 14 layers and a
+  ~1 % ceiling, and the **ceiling is what the measurement found**: the whole QKV
+  fusion on this model — both classes, `MINFER_NO_FUSE_QKV=1` as the control —
+  is worth only 1.2–1.6 %, because a 7B decode is weight-bandwidth-bound
+  (~20 ms/token) and the host encode is ~0.2 ms of it. The rest of the packed
+  gap is the **read** path, not node count ([#851](https://github.com/yusiwen/minfer/issues/851)).
+  The port landed because the ticket's premise (a 270–600 µs node-overhead
+  slice) had to be tested, and because a bitwise-gated arm is cheap to keep; it
+  is **not** a claim of a material speed-up.
+  Deferred alternative, still rejected: a scratch `[q|k|v]` concat would need
+  mid-split blits; a blit closes the compute pass, so it costs more dispatches
+  than the three section dispatches it would save.
 - **Interleaved RoPE is CPU-only.** Both loaders hard-code `NonInterleaved`
   today, so no shipped model hits this; a family that needs interleaved RoPE
   needs a loader change plus a CUDA kernel.

@@ -2322,6 +2322,11 @@ impl MpsCommandBuffer<'_> {
     /// not apply). The caller then dispatches [`Self::store_kv_q8_0`] on the
     /// buffer's K section (`off = nqt`) and V section (`off = nqt + nkt`) —
     /// the same quantizer the unfused chain's store runs.
+    ///
+    /// The whole-buffer entry point; the mixed-quant epilogue
+    /// (`Op::QkvBiasRopeStore`) has no concat buffer and uses
+    /// [`Self::attn_bias_rope_store_section`] once per section instead.
+    #[allow(clippy::too_many_arguments)]
     pub fn attn_bias_rope_store(
         &self,
         bqkv: &MetalBuffer,
@@ -2335,6 +2340,103 @@ impl MpsCommandBuffer<'_> {
         kv_v: &MetalBuffer,
         nqt: usize,
         nkt: usize,
+        hd: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        freqs: Option<&crate::vec_ops::RopeFreqs>,
+        pos: i32,
+        rope_style: i32,
+        f16: bool,
+        packed: bool,
+    ) {
+        self.attn_bias_rope_store_section(
+            bqkv,
+            bias_q,
+            bq_off,
+            bias_k,
+            bk_off,
+            bias_v,
+            bv_off,
+            kv_k,
+            kv_v,
+            nqt as i32,
+            nkt as i32,
+            (nqt / 2 + nkt / 2 + nkt) as u64,
+            hd,
+            freq_base,
+            freq_scale,
+            freqs,
+            pos,
+            rope_style,
+            f16,
+            packed,
+        );
+    }
+
+    /// One **section** of `kernel_attn_bias_rope_store`, with the kernel's own
+    /// `(nqt, nkt)` params and grid derived by the caller (#844).
+    ///
+    /// The kernel reads one contiguous `[q | k | v]` buffer — q at `0`, k at
+    /// `nqt`, v's element `j` at `nqt + nkt + j` — which `Op::FusedQKV` has (one
+    /// concat matmul writes it) but the mixed-quant decode epilogue
+    /// (`Op::QkvBiasRopeStore`) does not: its three projections are three
+    /// separate matmul nodes, and a mixed quant type (e.g. Q6_K `attn_v` among
+    /// Q4_K q/k) rules out the concat matmul. Copying them into a scratch concat
+    /// is not an option mid-split (a blit closes the compute pass, so it would
+    /// cost a second encoder and a submission boundary per layer); instead the
+    /// **same kernel** is dispatched once per section, with the params that
+    /// leave exactly that section's arm reachable and index it from 0:
+    ///
+    /// | section | `bqkv` | `nqt` | `nkt` | grid |
+    /// |---|---|---|---|---|
+    /// | Q | q's buffer | `nqt` | `0` | `nqt/2` |
+    /// | K | k's buffer | `0` | `nkt` | `nkt/2` |
+    /// | V | v's buffer | `-nkt` | `nkt` | `nkt` |
+    ///
+    /// - **Q**: `kpairs == nkt == 0`, so `total == qpairs` and the grid stops at
+    ///   the q pairs. The Q arm's indices (`i0`/`i1` from `base = head*hd`) do
+    ///   not involve `nqt`, so they are the concat dispatch's own.
+    /// - **K**: `nqt == 0` makes `k0 == j0` (the section's base) and
+    ///   `qpairs == 0` excludes the Q arm, so the grid's `kpairs` threads are the
+    ///   K pairs.
+    /// - **V**: `nqt == -nkt` cancels in `vi = nqt + nkt + j`, and
+    ///   `qpairs + kpairs == 0` makes `j == u` for every thread, so all `nkt`
+    ///   grid threads are V's element `u` — `u < qpairs` and
+    ///   `u < qpairs + kpairs` are both false for `u >= 0`. The V arm ropes
+    ///   nothing and reads `bias_v[j]`, so it is the concat dispatch's V branch
+    ///   verbatim. (`qpairs` truncates toward zero, so the pair cancels for an
+    ///   odd `nkt` too.)
+    ///
+    /// The **thread count is therefore exact, and it is part of the contract**:
+    /// the K section's `total` (`nqt/2 + nkt/2 + nkt == nkt*3/2`) still names the
+    /// concat's V part, so a count rounded up to a whole threadgroup would let
+    /// the tail fall into the V arm and touch `nkt` elements past the k buffer.
+    /// The dispatch below therefore keeps `dispatch_1d` only while its rounding
+    /// lands exactly on `grid`, and otherwise uses `dispatchThreads` (the
+    /// regression shows up as a second bias add on v — the gate in
+    /// `graph::metal_backend::tests::qkv_epilogue` caught it).
+    ///
+    /// Each section therefore runs the same kernel code on the same values as
+    /// its part of the concat dispatch — the same bias add, the same
+    /// `rope_rotate` (`common.h`), the same store address — so a per-section
+    /// dispatch is bit-equal to the fused one by construction, and the mixed
+    /// epilogue is bit-equal to the unfused chain for the same reason. Pinned by
+    /// `graph::metal_backend::tests::qkv_epilogue`'s section-vs-concat gate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_bias_rope_store_section(
+        &self,
+        bqkv: &MetalBuffer,
+        bias_q: &MetalBuffer,
+        bq_off: u64,
+        bias_k: &MetalBuffer,
+        bk_off: u64,
+        bias_v: &MetalBuffer,
+        bv_off: u64,
+        kv_k: &MetalBuffer,
+        kv_v: &MetalBuffer,
+        nqt: i32,
+        nkt: i32,
+        grid: u64,
         hd: usize,
         freq_base: f32,
         freq_scale: f32,
@@ -2370,8 +2472,8 @@ impl MpsCommandBuffer<'_> {
             self.enc
                 .setBuffer_offset_atIndex(Some(&**(kv_v)), (0) as usize, (5) as usize)
         };
-        self.set_params(6, &(nqt as i32));
-        self.set_params(7, &(nkt as i32));
+        self.set_params(6, &nqt);
+        self.set_params(7, &nkt);
         self.set_params(8, &(hd as i32));
         self.set_params(9, &(freq_base.to_bits() as i32));
         self.set_params(10, &(freq_scale.to_bits() as i32));
@@ -2381,8 +2483,35 @@ impl MpsCommandBuffer<'_> {
         let freqs = freqs_arg(freqs);
         self.set_bytes(14, freqs_bytes(&freqs));
         self.set_params(15, &(if packed { 1 } else { 0 }));
-        let grid = nqt / 2 + nkt / 2 + nkt;
-        self.dispatch_1d(grid as u64, 256);
+        // **Exact** thread count (#844): a section dispatch must run `grid`
+        // threads and no more. `dispatch_1d` rounds up to whole 256-thread
+        // groups, and the kernel's own guard is `u < qpairs + kpairs + nkt` —
+        // for the K section that `total` is the *whole concat* (nkt*3/2), not
+        // the k pairs, so a rounded-up tail would fall into the V arm and
+        // read/write `nkt` elements past the end of the k buffer. So: the plain
+        // grid dispatch whenever its rounding happens to land exactly on
+        // `grid` (the shipped decode shapes: nqt/2 and nkt/2 are multiples of
+        // 256, nkt of 128, or the section is small enough to be one group —
+        // where the extra threads only ever hit a section whose `total` equals
+        // the exact count, i.e. Q and V), `dispatchThreads` otherwise.
+        let tg = grid.clamp(1, 256);
+        if (grid + tg - 1) / tg * tg == grid {
+            self.dispatch_1d(grid, tg);
+        } else {
+            self.enc.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: (grid) as usize,
+                    height: (1) as usize,
+                    depth: (1) as usize,
+                },
+                MTLSize {
+                    width: (tg) as usize,
+                    height: (1) as usize,
+                    depth: (1) as usize,
+                },
+            );
+            self.barrier();
+        }
     }
 
     /// Fused decode QKV rope+store WITHOUT attention biases (Qwen3): the concat

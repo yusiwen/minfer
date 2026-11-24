@@ -991,10 +991,14 @@ fn support_table_matches_support_matrix_doc() {
             true,
         ),
         (
+            // #844: Metal gained the mixed-quant epilogue (the same
+            // `attn_bias_rope_store` kernel, once per q/k/v section), so the row
+            // is yes on both device columns; the CPU column stays false — it has
+            // no fused QKV arm at all.
             "QkvBiasRopeStore",
             Op::QkvBiasRopeStore { layer: 0 },
             false,
-            false,
+            true,
             true,
         ),
         ("Scale", Op::Scale(1.0), true, false, false),

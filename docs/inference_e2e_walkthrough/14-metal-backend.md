@@ -62,7 +62,7 @@ One more subtlety hides inside the encoder: within a split, kernels run back-to-
 
 ### 2.5 The dispatch matrix: which op runs which kernel
 
-`supports_op` (`metal_backend.rs:`) is the capability table, and it is nearly a yes for everything the Qwen2/Qwen3 builders emit: elementwise ops (`Add`/`Mul`/`Silu`/`SwiGLU`), norms (`RmsNorm`, Qwen3's per-head `QkNorm`), `MatMul` in every supported quant type, `GetRows` (embedding gather and the tail-row gather), `RoPE`, `KvcacheStore`/`KvcacheLoad`, `Attn`, and the decode fusions `FusedQKV`/`FusedFFN`/`FusedQkvNorm`. It refuses `Scale`, `Softmax` and `BatchMatMul` — none of which the model builders emit in the graph path (attention is one fused node that does its own softmax; the attention scale rides in `AttnMeta`; `BatchMatMul` is a deferred vocabulary entry) — and it refuses `QkvBiasRopeStore`, a CUDA-only fusion (doc 15). Refusal here is not an error: it simply makes `assign_backends` (doc 06) hand such a node to the CPU, creating a split boundary.
+`supports_op` (`metal_backend.rs:`) is the capability table, and it is nearly a yes for everything the Qwen2/Qwen3 builders emit: elementwise ops (`Add`/`Mul`/`Silu`/`SwiGLU`), norms (`RmsNorm`, Qwen3's per-head `QkNorm`), `MatMul` in every supported quant type, `GetRows` (embedding gather and the tail-row gather), `RoPE`, `KvcacheStore`/`KvcacheLoad`, `Attn`, and the decode fusions `FusedQKV`/`FusedFFN`/`FusedQkvNorm`. It refuses `Scale`, `Softmax` and `BatchMatMul` — none of which the model builders emit in the graph path (attention is one fused node that does its own softmax; the attention scale rides in `AttnMeta`; `BatchMatMul` is a deferred vocabulary entry) — and it used to refuse `QkvBiasRopeStore` as well; since [#844] it claims that one too, by dispatching the same store-epilogue kernel the concat class uses once per q/k/v section, and before that a mixed-quant decode layer simply kept the unfused chain. Refusal here is not an error: it simply makes `assign_backends` (doc 06) hand such a node to the CPU, creating a split boundary. Note that a fused op whose inputs are device-resident cannot be split that way — the CPU placement would collide with the device-owned KV region and the graph is refused — so a backend must answer an op it is asked to *produce* conservatively.
 
 Within the ops Metal *does* run, the dispatch is a decision tree of kernel *families* — this is where `docs/METAL_OPTIMIZATIONS.md`'s campaign lives, so here is the map (the doc has the measurements):
 
@@ -181,10 +181,10 @@ The command buffer is created lazily on the first op of a split:
             Op::FusedQKV { .. } | Op::FusedQkvNorm { .. } | Op::FusedFFN => dtype == DType::F32,
             Op::View { .. } | Op::Reshape { .. } | Op::Permute { .. } => true,
             Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => false,
-            // Mixed-quant decode QKV epilogue (D3-8 class 2) is CUDA-only; on
-            // Metal the graph builder never emits it (qkv_epilogue_ok = false
-            // without `--features cuda`), so it is never assigned here.
-            Op::QkvBiasRopeStore { .. } => false,
+            // D3-8 class 2 ([#844]): the mixed-quant decode QKV epilogue — the
+            // same `attn_bias_rope_store` kernel, dispatched once per q/k/v
+            // section over three separate matmul buffers.
+            Op::QkvBiasRopeStore { .. } => dtype == DType::F32,
         }
     }
 
@@ -196,12 +196,12 @@ The command buffer is created lazily on the first op of a split:
     }
 ```
 
-Two things to notice. The `dtype` checks are almost tautological — the graph's node outputs are `DType::F32` everywhere — but the *weight* type is not part of this signature; it lives in `NodeMeta::MatMul.weight_ttype` and is checked at dispatch time against the shader families that exist (§3.2.4). And the two `false` arms are informative negatives: `QkvBiasRopeStore` is refused *with a comment explaining that the builder never emits it on macOS* — the support table and the builder's emission rules are kept in lockstep by that comment, and doc 15's backend claims the same op because CUDA *can* fuse it. `supports_fused` similarly gates the fusion pass (doc 06): only `SwiGLU` is claimed (its kernel exists, and the fusion pass has no other rule), so a `Mul(Silu(x), y)` chain gets rewritten while everything else is left alone.
+Two things to notice. The `dtype` checks are almost tautological — the graph's node outputs are `DType::F32` everywhere — but the *weight* type is not part of this signature; it lives in `NodeMeta::MatMul.weight_ttype` and is checked at dispatch time against the shader families that exist (§3.2.4). And the `false` arms are informative negatives (`Scale`/`Softmax`/`BatchMatMul`, none of which a builder emits) while `QkvBiasRopeStore` used to be one and is now a typed yes — the support table and the builder's emission rules are kept in lockstep by these comments, and doc 15's backend claims the same op. `supports_fused` similarly gates the fusion pass (doc 06): only `SwiGLU` is claimed (its kernel exists, and the fusion pass has no other rule), so a `Mul(Silu(x), y)` chain gets rewritten while everything else is left alone.
 
 #### 3.2.3 The buffer pool: recycle vs fresh
 
 ```rust
-// src/graph/metal_backend.rs:938 (`alloc_fresh`)
+// src/graph/metal_backend.rs:951 (`alloc_fresh`)
     fn alloc_buffer(&mut self, size: usize) -> usize {
         if let Some(idx) = self
             .free
@@ -234,7 +234,7 @@ The recycle logic is an exact-size free-list search: reuse any dead buffer whose
 `execute_node` (`metal_backend.rs:`) is a 782-line `match &node.op` (the `match` opens at `:941`), and every arm follows the same rhythm: resolve metadata → look up weights by name → **encode** one or two kernel launches into `cb` → `Ok(())`. Nothing waits; the submit happens at the split boundary. The `MatMul` arm is the cleanest example:
 
 ```rust
-// src/graph/metal_backend.rs:1057 (`MatMul`)
+// src/graph/metal_backend.rs:679 (`MatMul`)
             Op::MatMul { .. } => {
                 let meta = match &node.meta {
                     NodeMeta::MatMul(m) => m,
@@ -617,7 +617,7 @@ Walk it as three defenses. **(1) A completion handler on a semaphore**: `addComp
 #### 3.2.11 Host read/write: views, plus the readback that feeds the sampler
 
 ```rust
-// src/graph/metal_backend.rs:2113 (`read_host`)
+// src/graph/metal_backend.rs:2326 (`read_host`)
     fn read_host(&self, id: usize) -> Option<&[f32]> {
         let buf = self.pool.get(id)?;
         let len = (buf.length() as usize) / 4;
@@ -819,3 +819,5 @@ no f16 KV kernel).
 - `docs/metal-inference-analysis.md`, `docs/PERF-QWEN3-4B-VS-LLAMACPP.md` — deeper per-kernel analyses and the Qwen3-4B llama-parity A/B.
 
 ← [13 — The decode loop and graph reuse](13-decode-loop-graph-reuse.md) · [Index](./index.md) · [15 — The CUDA backend](15-cuda-backend.md) →
+
+[#844]: https://github.com/yusiwen/minfer/issues/844

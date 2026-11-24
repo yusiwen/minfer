@@ -692,10 +692,23 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         Op::View { offset, .. } => *offset == 0,
         Op::Reshape { .. } | Op::Permute { .. } => true,
         Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => false,
-        // Mixed-quant decode QKV epilogue (D3-8 class 2) is CUDA-only; on
-        // Metal the graph builder never emits it (qkv_epilogue_ok = false
-        // without `--features cuda`), so it is never assigned here.
-        Op::QkvBiasRopeStore { .. } => false,
+        // D3-8 class 2 ([#844]): the mixed-quant decode QKV epilogue. Metal
+        // answers yes — `kernel_attn_bias_rope_store` is dispatched once per
+        // q/k/v section over the three separate matmul buffers (see the
+        // `Op::QkvBiasRopeStore` arm), so a mixed-quant layer (e.g. Qwen2.5-7B
+        // Q4_K_M: Q4_K q/k + Q6_K v, which cannot share `Op::FusedQKV`'s concat
+        // matmul) keeps the decode fusion. This is the op's own gate, separate
+        // from `WRITES_PACKED_KV_FROM_FUSED_EPILOGUE` — the model builder asks
+        // the registry per layer (`qwen2`'s `mixed_quant_epilogue_ok`), which is
+        // why the two questions are separate: the packed-store capability is
+        // about the *store*, this op is about the *mixed-quant epilogue*, and a
+        // backend may have the first without the second (Metal did between #854
+        // and #844's second half — those layers simply kept the unfused chain).
+        //
+        // The arm accepts f32 activations only (the three projections and the
+        // q output are f32; the weight quant type rides in each matmul node) —
+        // the same dtype gate the other fused rows and CUDA's own table use.
+        Op::QkvBiasRopeStore { .. } => dtype == DType::F32,
     }
 }
 
@@ -2034,14 +2047,214 @@ impl Backend for MetalBackend {
                 }
                 Ok(())
             }
+            // D3-8 class 2 ([#844]): the mixed-quant decode QKV epilogue. q/k/v
+            // arrive from three SEPARATE matmul nodes — a mixed quant type (e.g.
+            // Q6_K `attn_v` among Q4_K q/k) cannot share `Op::FusedQKV`'s concat
+            // matmul, and no concat tensor exists for such a layer — so this node
+            // is where the unfused tail (add_bias×3 + rope×2 + store×2, i.e. 7
+            // nodes / 10 dispatches per layer) collapses into one node.
+            //
+            // `kernel_attn_bias_rope_store` reads ONE contiguous `[q | k | v]`
+            // buffer, which this graph never has. Instead of copying the three
+            // projections into a scratch concat (a mid-split blit closes the
+            // compute pass, so it would cost a second encoder and a submission
+            // boundary), the same kernel runs once per **section** over the
+            // projection's own buffer: `attn_bias_rope_store_section` documents
+            // the `(nqt, nkt, grid)` triple that leaves exactly one of the
+            // kernel's three arms reachable and indexes it from 0. Each section
+            // is the concat dispatch's own code path on the same values — one f32
+            // bias add (`kernel_add_bias_f32`'s rounding) then the shared
+            // `rope_rotate` — so the result is bit-equal to the unfused chain by
+            // construction; the `MINFER_NO_FUSE_QKV=1` graph dump on Qwen2.5-7B
+            // Q4_K_M pins it (f16 and q8_0 caches, 0 differing files).
+            Op::QkvBiasRopeStore { layer } => {
+                let nt = node.out_shape[1];
+                if nt != 1 {
+                    return Err(format!(
+                        "metal: {}: QkvBiasRopeStore is decode (nt==1) only, got nt={nt}",
+                        node.name
+                    ));
+                }
+                let meta = match &node.meta {
+                    NodeMeta::QkvBiasRopeStore(m) => m,
+                    other => {
+                        return Err(format!(
+                            "qkv_bias_rope_store node missing QkvBiasRopeStoreMeta: {other:?}"
+                        ));
+                    }
+                };
+                // GPU safety: the epilogue's q/k/v indices assume whole head
+                // pairs, and each section dispatch binds its buffer at offset 0
+                // (Metal kernels take no element offset), so a windowed input
+                // would read the wrong bytes — refuse, never mis-compute.
+                if meta.hd == 0 || meta.hd % 2 != 0 {
+                    return Err(format!(
+                        "metal: {}: qkv epilogue head dim {} must be even",
+                        node.name, meta.hd
+                    ));
+                }
+                for (what, r) in [
+                    ("q", in_bufs[0]),
+                    ("k", in_bufs[1]),
+                    ("v", in_bufs[2]),
+                    ("out", out_buf),
+                ] {
+                    if r.offset != 0 {
+                        return Err(format!(
+                            "metal: {}: qkv epilogue {what} input is a window at element \
+                             offset {} (the per-section dispatch binds whole buffers)",
+                            node.name, r.offset
+                        ));
+                    }
+                }
+                let (k_id, v_id) =
+                    kv_pair.ok_or_else(|| format!("KV regions for layer {layer} not allocated"))?;
+                // q: in place. The builder wires attention to this node, so q's
+                // matmul buffer has exactly one consumer and the allocator aliases
+                // it; the non-alias case is a cross-backend staging input, already
+                // complete at the split boundary (the Silu/RoPE snapshot).
+                if in_bufs[0].id != out_buf.id {
+                    self.copy_in(out_buf.id, in_bufs[0].id);
+                }
+                let bias_off =
+                    |name: &Option<String>| -> Result<(crate::metal::MetalBuffer, u64), String> {
+                        match name {
+                            Some(n) => self
+                                .state
+                                .weight_buf(n)
+                                .ok_or_else(|| format!("bias '{n}' not on GPU")),
+                            None => Err("qkv epilogue bias missing".into()),
+                        }
+                    };
+                let (bq_b, bq_o) = bias_off(&meta.bias_q)?;
+                let (bk_b, bk_o) = bias_off(&meta.bias_k)?;
+                let (bv_b, bv_o) = bias_off(&meta.bias_v)?;
+                // RoPE rotates by the sequence-relative position (the kernel's
+                // scalar `pos`); the store writes the `cells` row — the input the
+                // unfused `Op::KvcacheStore` reads. Metal keeps the pre-C6 gate on
+                // the fused epilogues (`cells == positions`), which is why the
+                // scalar and the byte-addressed store agree.
+                let pos = {
+                    let n = (self.buf(in_bufs[3].id).length() as usize) / 4;
+                    let p = unsafe {
+                        std::slice::from_raw_parts(
+                            self.buf(in_bufs[3].id).contents().as_ptr() as *const u32,
+                            n,
+                        )
+                    };
+                    p[0] as i32
+                };
+                // #38: bound the row this node stores against the region's cell
+                // count before any kernel writes into it.
+                self.check_kv_store_rows(
+                    self.buf(in_bufs[4].id),
+                    nt,
+                    meta.kv_elems / meta.nkt.max(1),
+                    *layer,
+                )?;
+                let (k_b, v_b) = (self.buf(k_id), self.buf(v_id));
+                let (f16, packed) = (self.kv_f16(), self.kv_packed());
+                // 1) Q: bias + rope in place, over q's own (aliased) buffer.
+                cb.attn_bias_rope_store_section(
+                    self.buf(out_buf.id),
+                    &bq_b,
+                    bq_o,
+                    &bk_b,
+                    bk_o,
+                    &bv_b,
+                    bv_o,
+                    k_b,
+                    v_b,
+                    meta.nqt as i32,
+                    0,
+                    (meta.nqt / 2) as u64,
+                    meta.hd,
+                    meta.freq_base,
+                    meta.freq_scale,
+                    meta.freqs.as_deref(),
+                    pos,
+                    meta.rope_style as i32,
+                    f16,
+                    packed,
+                );
+                // 2) K: bias + rope, and the store (f32/f16 element store, or the
+                //    resolved row the packed store then quantizes), over k's buffer.
+                cb.attn_bias_rope_store_section(
+                    self.buf(in_bufs[1].id),
+                    &bq_b,
+                    bq_o,
+                    &bk_b,
+                    bk_o,
+                    &bv_b,
+                    bv_o,
+                    k_b,
+                    v_b,
+                    0,
+                    meta.nkt as i32,
+                    (meta.nkt / 2) as u64,
+                    meta.hd,
+                    meta.freq_base,
+                    meta.freq_scale,
+                    meta.freqs.as_deref(),
+                    pos,
+                    meta.rope_style as i32,
+                    f16,
+                    packed,
+                );
+                if packed {
+                    // #844 / ADR-0084: the same quantizer the unfused store runs,
+                    // over the row the epilogue just resolved (offset 0 — the
+                    // section's own base, not the concat's `nqt`).
+                    cb.store_kv_q8_0(
+                        self.buf(in_bufs[1].id),
+                        k_b,
+                        meta.nkt,
+                        nt,
+                        self.buf(in_bufs[4].id),
+                        0,
+                        self.kv_row_bytes(meta.nkt),
+                    );
+                }
+                // 3) V: bias + store, no rope, over v's buffer. `nqt = -nkt` is
+                //    what puts the kernel's `vi = nqt + nkt + j` back at `j`
+                //    (see `attn_bias_rope_store_section`).
+                cb.attn_bias_rope_store_section(
+                    self.buf(in_bufs[2].id),
+                    &bq_b,
+                    bq_o,
+                    &bk_b,
+                    bk_o,
+                    &bv_b,
+                    bv_o,
+                    k_b,
+                    v_b,
+                    -(meta.nkt as i32),
+                    meta.nkt as i32,
+                    meta.nkt as u64,
+                    meta.hd,
+                    meta.freq_base,
+                    meta.freq_scale,
+                    meta.freqs.as_deref(),
+                    pos,
+                    meta.rope_style as i32,
+                    f16,
+                    packed,
+                );
+                if packed {
+                    cb.store_kv_q8_0(
+                        self.buf(in_bufs[2].id),
+                        v_b,
+                        meta.nkt,
+                        nt,
+                        self.buf(in_bufs[4].id),
+                        0,
+                        self.kv_row_bytes(meta.nkt),
+                    );
+                }
+                Ok(())
+            }
             Op::Scale(_) | Op::Softmax { .. } | Op::BatchMatMul => {
                 Err(format!("op {:?} unsupported on Metal (Phase 3)", node.op))
-            }
-            // CUDA-only mixed-quant decode epilogue; never emitted on the Metal
-            // graph (builder sets qkv_epilogue_ok = false without --features
-            // cuda), so reaching here is a scheduling invariant violation.
-            Op::QkvBiasRopeStore { .. } => {
-                Err(format!("op {:?} unsupported on Metal (CUDA-only)", node.op))
             }
         };
         // Experimental attribution: one submission per node (see the latch at the
