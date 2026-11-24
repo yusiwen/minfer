@@ -199,9 +199,11 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    practice this is masked today because the supported models build a *single*
    GPU split on both GPU backends (`CUDA-BACKEND-DESIGN.md:356-358`), but it is
    exactly what breaks the first time an op is unsupported — e.g. `Softmax` on
-   both device backends (`src/graph/op_matrix.rs`), or `QkvBiasRopeStore`, which
-   only CUDA advertises (`cuda_backend.rs:2123`) while Metal refuses it
-   (`metal_backend.rs:696`).
+   both device backends (`src/graph/op_matrix.rs`), or a fused arm one backend
+   has not learned yet: `QkvBiasRopeStore` was exactly that case, CUDA-only
+   (`cuda_backend.rs:2123`) with Metal refusing it, until [#844] ported it
+   (Metal's `supports_op` table now answers `dtype == DType::F32` for it —
+   `metal_backend.rs:673`).
 2. **Synchronous, host-mediated cross-backend movement.** — **partly closed by
    F5** ([#58](https://github.com/yusiwen/minfer/issues/58), 2026-09-24): the
    boundary is now two registered phases. Phase A (`copy_across` →
@@ -674,8 +676,8 @@ precisely to break reuse on a weight swap, but nothing produces such a swap. �
 parity-only stubs that no architecture emits (`Scale`, `Softmax`, `View`,
 `Reshape`, `Permute`, `AttnMode::Mha` — `COMPUTE-GRAPH-DESIGN.md §1.3`), and
 `View`/`Reshape`/`Permute` execute as copies. CUDA additionally refuses
-`transpose_b` matmul (`cuda_backend.rs:1621`), and Metal refuses
-`QkvBiasRopeStore` (`metal_backend.rs:698`) —
+`transpose_b` matmul (`cuda_backend.rs:1621`), and the CPU column refuses every
+fused QKV arm (`src/graph/op_matrix.rs`) —
 so the two GPU backends do not implement the same op set, and a model's decode
 path differs by platform. ~~Neither is documented in `SUPPORT-MATRIX.md`.~~
 **Fixed in A8**: `SUPPORT-MATRIX.md` now carries an "Operator Coverage by
@@ -1051,3 +1053,5 @@ in §6.2–§6.6; Tier 3 is in §6.7.
 | Sampling | `src/sampler.rs`, `src/tokenizer.rs`, `src/template.rs` |
 | Speculative | `src/spec.rs` |
 | Docs | `AGENTS.md`, `README.md`, `docs/{ARCHITECTURE,COMPUTE-GRAPH-DESIGN,MODEL-SUPPORT-ROADMAP,SUPPORT-MATRIX,METAL_OPTIMIZATIONS,CUDA_OPTIMIZATION,CUDA-BACKEND-DESIGN,DEVICE-ADAPTATION-PLAN,OPENAI-CHAT-API-PLAN,SPECULATIVE-DECODING-PLAN}.md` |
+
+[#844]: https://github.com/yusiwen/minfer/issues/844
