@@ -306,7 +306,10 @@ differs by platform:
   ~1 % ceiling, and the **ceiling is what the measurement found**: the whole QKV
   fusion on this model — both classes, `MINFER_NO_FUSE_QKV=1` as the control —
   is worth only 1.2–1.6 %, because a 7B decode is weight-bandwidth-bound
-  (~20 ms/token) and the host encode is ~0.2 ms of it. The rest of the packed
+  (~20 ms/token) and the host encode is ~0.2 ms of it (`MINFER_OP_PROFILE=1` per-op
+  host-encode totals on that model — not per-label dispatch counts; Metal has no
+  per-op device profiler, so the 6-dispatches-per-layer figure comes from the
+  graph, not from a device measurement). The rest of the packed
   gap is the **read** path, not node count ([#851](https://github.com/yusiwen/minfer/issues/851)).
   The port landed because the ticket's premise (a 270–600 µs node-overhead
   slice) had to be tested, and because a bitwise-gated arm is cheap to keep; it
