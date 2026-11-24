@@ -234,7 +234,7 @@ The recycle logic is an exact-size free-list search: reuse any dead buffer whose
 `execute_node` (`metal_backend.rs:`) is a 782-line `match &node.op` (the `match` opens at `:941`), and every arm follows the same rhythm: resolve metadata → look up weights by name → **encode** one or two kernel launches into `cb` → `Ok(())`. Nothing waits; the submit happens at the split boundary. The `MatMul` arm is the cleanest example:
 
 ```rust
-// src/graph/metal_backend.rs:679 (`MatMul`)
+// src/graph/metal_backend.rs:1070 (`MatMul`)
             Op::MatMul { .. } => {
                 let meta = match &node.meta {
                     NodeMeta::MatMul(m) => m,
@@ -312,7 +312,7 @@ The guard is audit finding **M1** from `GPU_SAFETY.md` §3: the K-quant shaders 
 The **attention arm** (`metal_backend.rs:`) is the largest, and its opening is the safety story:
 
 ```rust
-// src/graph/metal_backend.rs:1221 (`nkt`) (guards; dispatch decision follows)
+// src/graph/metal_backend.rs:1234 (`nkt`) (guards; dispatch decision follows)
                 // GPU safety (H1): kernel_gqa_attn strides KV by nk*hd
                 if meta.nkt != meta.n_head_kv * meta.hd {
                     return Err(format!(
@@ -789,7 +789,7 @@ no f16 KV kernel).
 
 - **Quant-shape assumptions get refused, not absorbed.** The K-quant `id % 256` guard (§3.2.4, audit M1) exists because the failure mode is *wrong numbers, no crash* — the worst kind. The same audit table accepts genuinely low-risk gaps with reasoning (L1: matmul pointers computed past the buffer for out-of-range rows but reads guarded; L2: `store_kv` trusts the host to keep positions < capacity, which doc 07's region sizing guarantees). Every accepted risk is written down with its mitigation — the audit doc is the invariant ledger.
 
-- **The registry and the graph must agree on shapes.** `FusedQkvNorm`'s per-head norms assume the concat layout (`q` at byte 0, `k` at `nqt*4` via `off_k` — `metal_backend.rs:`); `attn_bias_rope_store` assumes the same packing; the f16 KV kernels assume the region's first half is theirs (§3.1). These cross-file layout contracts are exactly where doc 10's lesson applies: they are tested with real-scale isolation tests (`metal_attn_kv_real_scale`, `metal_store_real_dims`, … — the `#[cfg(test)]` module at `metal_backend.rs:1159`), not just small shapes, because the transposed-output bug of doc 10 hid from `nt == 1` tests.
+- **The registry and the graph must agree on shapes.** `FusedQkvNorm`'s per-head norms assume the concat layout (`q` at byte 0, `k` at `nqt*4` via `off_k` — `metal_backend.rs:`); `attn_bias_rope_store` assumes the same packing; the f16 KV kernels assume the region's first half is theirs (§3.1). These cross-file layout contracts are exactly where doc 10's lesson applies: they are tested with real-scale isolation tests (`metal_attn_kv_real_scale`, `metal_store_real_dims`, … — the `#[cfg(test)]` module at `metal_backend.rs:1172`), not just small shapes, because the transposed-output bug of doc 10 hid from `nt == 1` tests.
 
 - **A shader typo must fail at startup, not at token 500.** §3.2.6's pipeline table makes every kernel name a startup-checked fact; the `metal_pipelines_compile` test pins it in CI. The Q5_0 incident (2026-08-06) — a duplicate symbol that silently downgraded the process to CPU and "looked like GPU throttling" — is the reason this is treated as an invariant rather than an annoyance.
 
