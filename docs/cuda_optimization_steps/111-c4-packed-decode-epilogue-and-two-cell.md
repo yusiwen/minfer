@@ -108,7 +108,8 @@ loads vs one `half4`), tracked in #844.
 ## 7. Scope and leftovers
 
 - **Prefill at hd 64** is unchanged: 1.229x at 2k, 1.46x at 8k (one round) — #845.
-- **Metal** has its own residual, 1.20x (hd 64) / 1.10x (hd 128), LSU-bound — #844.
+- **Metal** had its own residual, 1.20x (hd 64) / 1.10x (hd 128) — closed in record 113, where the premise
+  'LSU-bound' was refuted: 82 % of it was the lost QKV fusion.
 - **At 8k** packed decode reads 1.045x (175.35 vs 183.27 tok/s, one round): the dequant work
   scales with the token count, so the memory win does not become a speed win with context.
 - The CPU path is not affected: its K dot is SIMD (`dot_q8_0_q8_0`), V is the scalar

@@ -194,7 +194,15 @@ Notes:
   (`macbook (macOS 27.0.1, Apple M4 Pro)`, 2026-10-08, `minfer bench -p 1024 -n 64 -r 3 --n-ctx 2048`,
   3 interleaved runs, medians; f16 baseline): Qwen3-0.6B `pp1024` 4844 → 4683 tok/s (0.967×) and `tg64`
   193.5 → 176.6 (0.913×), Qwen2.5-0.5B `pp1024` 6175 → 6154 (0.997×) and `tg64` 295.7 → 245.5 (0.830×);
-  region sizes 58 720 256 → 15 597 568 B and 6 291 456 → 1 671 168 B (both 3.76×). The stage is f32, not
+  region sizes 58 720 256 → 15 597 568 B and 6 291 456 → 1 671 168 B (both 3.76×). **Since
+  [#844](https://github.com/yusiwen/minfer/issues/844) the decode arm fuses the QKV projection**
+  (both the concat class and, since the mixed-quant epilogue landed, class 2), which is where most of
+  the packed decode penalty lived: `-p 8 -n 64 -r 3`, 3 interleaved rounds, medians, 2026-11-24 —
+  Qwen2.5-0.5B `tg64` f16 3 020.4 µs/token → q8_0 3 145.2 (**1.041×**), `-p 2048` 3 451.3 → 3 685.0
+  (**1.068×**); Qwen3-0.6B `-p 8` 4 255.3 → 4 538.0 (**1.066×**), `-p 2048` 5 633.8 → 5 644.3
+  (**1.002×**) — and the fused arm is **bit-equal** to the unfused chain. Record:
+  [`cuda_optimization_steps/113`](./cuda_optimization_steps/113-c4-packed-decode-metal-fused-epilogue.md).
+  The residual is the packed **read** path, not node count ([#851](https://github.com/yusiwen/minfer/issues/851)). The stage is f32, not
   f16: f16 staging's second rounding was measured to amplify to 16.9 logit delta on Qwen3-0.6B over 8
   decode steps, outside the inherited C4 class; f32 staging restores it (1.28 / 0.36) at parity speed.
   `docs/METAL-BACKEND-DESIGN.md` §4.4 records the mechanisms, the measurements and the gates.
