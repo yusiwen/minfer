@@ -272,6 +272,7 @@
         - [111 — #633/#843: the packed Q8_0 decode residual falls 1.239x → 1.0139x (LANDED)](./cuda_optimization_steps/111-c4-packed-decode-epilogue-and-two-cell.md)
         - [112 — #847: the packed Q8_0 decode passes f16 at hd 64: four cells per warp (LANDED)](./cuda_optimization_steps/112-c4-packed-decode-four-cells-per-warp.md)
         - [113 — #844: the packed Q8_0 decode takes the QKV fusion on Metal, and the rope becomes bit-equal (LANDED)](./cuda_optimization_steps/113-c4-packed-decode-metal-fused-epilogue.md)
+        - [114 — #848: the hd-128 column measured, and the four ratios #842 quotes (MEASURED)](./cuda_optimization_steps/114-c4-packed-q8-kv-hd128-column.md)
 
 # Sampling and Chat Templates
 
