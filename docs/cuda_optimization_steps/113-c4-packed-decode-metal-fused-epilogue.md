@@ -225,3 +225,5 @@ rewritten with the measurement rather than left standing.
 5. **A gate that can fail is worth its weight**: the section-vs-concat gate found the
    thread-count overrun before a model ever ran, and it is the reason the per-section
    dispatch is defensible at all.
+
+← [112 · #847: the packed Q8_0 decode passes f16 at hd 64](./112-c4-packed-decode-four-cells-per-warp.md) · [Index](./index.md) · [114 · #848: the hd-128 column measured](./114-c4-packed-q8-kv-hd128-column.md)

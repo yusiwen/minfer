@@ -18,9 +18,11 @@ NOT followed this campaign.
 ## Fixed per-doc structure (Markdown; order must not change)
 
 ```markdown
-# NN · <step name> (LANDED / REVERTED / CLOSED)
+# NN · <step name> (LANDED / REVERTED / CLOSED / MEASURED)
 
 > **Result**: one-line numeric conclusion (e.g. 7B @2K prefill 30.7 → 294 tok/s).
+> **Bar**: the bar registered **before** the measurement, quoted from where it was registered
+> (ticket or comment URL + its date) with a one-word verdict — MET / MISSED / FALSIFIED.
 > **Commit**: `<hash>` (write "no repo change" if none). **Date**: YYYY-MM-DD.
 
 ## 1. Background — where things stood
@@ -85,3 +87,12 @@ REVERTED/CLOSED steps: state the measured numbers and the veto mechanism.
    was reverted, and under what future conditions a retry is worthwhile).
 7. End every doc with the nav line: `← NN-1 · Index · NN+1 →` (omit at the
    ends of the range; the index link is `./index.md`).
+8. **A bar named after the fact is not a bar.** The `**Bar**:` line must quote where the bar
+   was registered, with its date, and say which side of it the measurement landed on. When the
+   only number available was written after the run, the line says so in those words — record
+   111 is the worked example ([#842](https://github.com/yusiwen/minfer/issues/842) asked for
+   the distinction). A `MEASURED` record lands no lever (a re-measurement, or a column read on
+   the current tree for the first time): it carries a `**Bar**:` line all the same, naming the
+   prediction and the decision rule that will consume the numbers, registered before the run,
+   and its section 3 is the **measurement recipe** — the commands, the rounds, and the
+   instrumentation traps that would make the numbers mean something else.

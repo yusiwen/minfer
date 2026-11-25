@@ -10,6 +10,19 @@
 > tokens match. The aligned-block option (#633 option 1) is rejected for this residual with
 > record 104 + #202's arithmetic; its better-justified home is Metal (#844). Prefill remains
 > 1.224x at 2k (#845).
+> **Bar**: the bar lives in the tickets, not in this record.
+> [#633](https://github.com/yusiwen/minfer/issues/633) (opened 2026-10-20) fixed the floor at
+> parity with f16 — the split kernel at f16's own 18.4 µs/layer, a 2.1x cut — and required
+> that any smaller bar be "stated first with its step-level arithmetic". The figures this
+> change was held to are the ones [#843](https://github.com/yusiwen/minfer/issues/843) carries
+> (epilogue ≤3.0 µs/layer with 123/123 + 65/65 bit-identical KV dumps, step ≤1.13x from E1
+> alone, two-lever step ≤1.05x), and [#843](https://github.com/yusiwen/minfer/issues/843) was
+> opened on 2026-11-18, *after* the 2026-11-17 measurement: for E1 those are a **post-hoc**
+> target, and #633's parity floor is the only bar that predates the work. Written down on
+> 2026-11-25 at [#842](https://github.com/yusiwen/minfer/issues/842)'s book hand-off, which
+> asked for the provenance; this record should have carried it from the start. **MET** on every
+> count: 1.92 µs/layer against ≤3.0, 1.0139x against ≤1.05x (and 1.1226x from E1 alone against
+> ≤1.13x).
 > **Date**: 2026-11-18. **Box**: dgxspark (aarch64, GB10 sm_121, driver 580.178.04, CUDA 13.0,
 > ncu 2025.3.1). **Base**: `e844591` (+ this PR).
 

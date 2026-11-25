@@ -16,6 +16,16 @@
 > greedy continuation still agrees 9/9 — the association moves a result inside the
 > quantization noise, not the accuracy class. hd 128, f16/f32 and the prefill body are
 > untouched (`hd == 64` dispatch); prefill stays 1.232x at 2k (#845).
+> **Bar**: pre-registered on [#847](https://github.com/yusiwen/minfer/issues/847) in a comment
+> dated 2026-11-18 06:19 UTC, [before the kernel was
+> written](https://github.com/yusiwen/minfer/issues/847#issuecomment-6970849043):
+> `gqa_attn_split_partial` median **≤17.0 µs/layer** (a ≥1.2x cut, the change reverted if the
+> gain stayed under 10%), step **≤1.005x** at this record's own command over three alternating
+> rounds, and a tolerance class rather than a byte claim. Measured 1 h 54 min later, at
+> 08:14 UTC: **13.34 µs/layer, 0.9705x**. The "pre-registered bar" sentence below now has a
+> target to point at instead of an assertion. **MET** on all three: 13.34 µs/layer against
+> ≤17.0, 0.9705x against ≤1.005x, and the tolerance class as registered — the merge turned out
+> byte-identical in the 2-cell comparison but is not claimed as such.
 > **Date**: 2026-11-18. **Box**: dgxspark (aarch64, GB10 sm_121, driver 580.178.04,
 > CUDA 13.0). **Base**: `d4818f9` (+ this change).
 
@@ -181,4 +191,4 @@ numerics is a hypothesis until measured") gains a corollary: so is *unchanged* n
    floats moving; the same idea one notch further moves all of them and still lands in the
    same class. Quote the class, treat identity as a bonus.
 
-← [111 · #633/#843: the packed Q8_0 decode residual falls 1.239x → 1.0139x](./111-c4-packed-decode-epilogue-and-two-cell.md) · [Index](./index.md)
+← [111 · #633/#843: the packed Q8_0 decode residual falls 1.239x → 1.0139x](./111-c4-packed-decode-epilogue-and-two-cell.md) · [Index](./index.md) · [113 · #844: the packed decode takes the QKV fusion on Metal](./113-c4-packed-decode-metal-fused-epilogue.md)
