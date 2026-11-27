@@ -179,7 +179,7 @@ SM — Streaming Multiprocessor — and can share an on-chip scratchpad called
 streams the whole key/value history for that head through a 32-key tile:
 `grid.x = ceil(nt / 64)` query token tiles, `grid.y = nh` heads,
 128 threads = 4 warps (a warp is 32 threads that execute in lockstep)
-`launch_fa_prefill_kv` (`attention_prefill.cu:412`, the launcher). K/V come from the persistent cache as
+`launch_fa_prefill_kv` (`attention_prefill.cu:466`, the launcher). K/V come from the persistent cache as
 `__half` (16-bit float — the f16 KV cache from chapter 04's bandwidth story);
 q and the output `o` are f32. The kernel is instantiated per head dimension — 64
 and 128, the two the supported models use — see the dispatch note at the end of
@@ -337,7 +337,7 @@ softmax treat out-of-range keys uniformly and exclude them with the one
 `gcol < kv_end` test instead of a second control path.
 
 **Which models take this path.** The host wrapper
-`gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:261`) gates it:
+`gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:277`) gates it:
 
 ```rust
 if nt >= 2
@@ -350,7 +350,7 @@ if nt >= 2
 }
 ```
 
-`gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:261`.) Four conditions, each with a reason: `nt >= 2`
+`gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:277`.) Four conditions, each with a reason: `nt >= 2`
 (doc 86 lowered the gate from `nt >= 64`, since the kernel masks causally from the positions
 array, so verify-shaped short batches are safe); `hd` **64 or 128** — the two head dimensions the
 supported models use, and the same pair Metal's `prefill_flash_enabled` accepts. The kernel is
@@ -639,7 +639,7 @@ is load-bearing for §3.5: a captured graph bakes in device *pointers*, so any
 pool churn invalidates every capture, and `pool_gen` detects that.
 
 **`execute_node`: the dispatch.** The trait method
-(`execute_node` (`cuda_backend.rs:2381`)) is a thin wrapper: it calls
+(`execute_node` (`cuda_backend.rs:2394`)) is a thin wrapper: it calls
 `execute_node_inner` and, if the node failed *while a capture window was
 open*, aborts the window first (`abort_capture` (`cuda_backend.rs:909`) — a doomed window
 must never be closed into a cached graph). The real dispatch is one big match
@@ -667,7 +667,7 @@ Three representative arms:
   kernel left the GPU idle, 48% of the 7B decode step per nsys), `2..=16` (f16/f32) →
   the batched variant (`cuda_backend.rs:`), `nt > 16` → the prefill kernels
   (`cuda_backend.rs:`), where the host wrapper `gqa_attn_kv_prefill`
-  (`src/cuda/methods/attention.rs:261`) internally routes to the FA prefill kernel.
+  (`src/cuda/methods/attention.rs:277`) internally routes to the FA prefill kernel.
 - `Op::KvcacheStore` (`cuda_backend.rs:`) — the unfused prefill store: verifies the
   output buffer *is* the K region (`cuda_backend.rs:`), derives `nt` from the element
   count, converts the boundary array device-side, and launches the layout's store
@@ -701,7 +701,7 @@ fn alloc_buffer(&mut self, size: usize) -> usize {
 }
 ```
 
-(`alloc_buffer` (`cuda_backend.rs:2328`).) Three conventions to notice. *Exact-size
+(`alloc_buffer` (`cuda_backend.rs:2341`).) Three conventions to notice. *Exact-size
 reuse*: the free list matches byte length, so a recycled buffer is always big
 enough. *`pool_gen` on every path*: fresh alloc or reuse, both bump it, because
 both can change the node→pointer mapping a captured graph depends on. *No
@@ -709,9 +709,9 @@ panics on OOM*: `cuda_malloc` logs and returns null, and the null buffer fails
 cleanly as an `Err` from `ptr_of` at execute time — never a panic inside the
 allocator (`ptr_of` (`cuda_backend.rs:639`); `stream_guard` is a shim, not a lock).
 `free_buffer` never calls `cudaFree` — it recycles
-(`free_buffer` (`cuda_backend.rs:2355`)), which is what lets the persistent KV regions
+(`free_buffer` (`cuda_backend.rs:2368`)), which is what lets the persistent KV regions
 and the per-step scratch share one arena; `alloc_fresh`
-(`alloc_fresh` (`cuda_backend.rs:2365`)) bypasses the free list when a buffer's *id* is
+(`alloc_fresh` (`cuda_backend.rs:2378`)) bypasses the free list when a buffer's *id* is
 still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
 (`cuda_backend.rs:868`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
@@ -730,10 +730,10 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
     None
 }
 ```
-(`read_host` (`cuda_backend.rs:2475`).) Reading device memory back to the host is
+(`read_host` (`cuda_backend.rs:2488`).) Reading device memory back to the host is
 *always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:651`:
 `state.sync()` then a pinned-staging readback); `write_host`
-(`write_host` (`cuda_backend.rs:2482`)) is the input-fill path — a pinned-staged *async*
+(`write_host` (`cuda_backend.rs:2495`)) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
 The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — is
 AGENTS rule 5 (`AGENTS.md:126` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
@@ -930,7 +930,7 @@ stages K/V once per 32-key chunk: **~0.8 GB per layer** — about 165× less
 traffic `fa_prefill_kv` (`attention_prefill.cu:130`). The grid at those shapes is small and
 regular: `ceil(2048/64) = 32` query tiles × 28 heads = 896 blocks of 128
 threads, each asking for `((64 + 2·32) · 136 · 2) = 34,816 B ≈ 34.8 KB` of
-dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:412`). Both head dims the
+dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:466`). Both head dims the
 supported models use are instantiated — 64 and 128, #845 — and at hd 64 the same
 tile asks 18 432 B; both are under the 48 KiB default dynamic-smem cap, so the
 launcher issues no `cudaFuncSetAttribute` opt-in at all. Two things still decide
