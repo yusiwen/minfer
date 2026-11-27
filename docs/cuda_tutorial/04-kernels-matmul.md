@@ -128,7 +128,7 @@ Count it for the 0.5B down-projection `[od=896, id=4864]` at `nt = 512`
 
 That ratio — traffic divided by `ceil(nt / tile)` — is the entire economic
 argument for the prefill GEMM's complexity, and why `fa_prefill_kv`
-(`src/cuda/kernels/attention_prefill.cu:117`) is shaped the same way: 64 query tokens share one K/V stream.
+(`src/cuda/kernels/attention_prefill.cu:130`) is shaped the same way: 64 query tokens share one K/V stream.
 
 ### 2.4 Tiling in three layers
 
@@ -707,7 +707,7 @@ trigger is a shared row stride that is an exact multiple of the bank count
 (32 floats = 128 bytes): every row's column 0 lands in bank 0, so a
 column-wise read across rows collapses to one bank. The standard fix is
 padding the stride by one bank's width — exactly what chapter 05's attention
-kernel does with `sstr = hd + 8` (`attention_prefill.cu:132`), whose comment
+kernel does with `sstr = hd + 8` (`attention_prefill.cu:148`), whose comment
 is a worked example worth rereading now that you know the term. This GEMM
 sidesteps the issue differently: its hot shared reads are `wmma::
 load_matrix_sync` calls, and the fragment-load hardware handles the layout.

@@ -443,7 +443,7 @@ expression, same `cosf/sinf`. "Verbatim" is a hard requirement: the fused
 kernel had to be *bit-identical* to the seven-kernel chain it replaced (the
 header comment, `kv_store.cu:135-152`, lists each correspondence) —
 fusion is only free when the answer does not change. The A/B proof lives in
-the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1317`
+the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1318`
 exercises the f16 round trip end to end).
 
 **Section 2 — k: bias + RoPE + store into the cache** `attn_bias_rope_store_f32` (`kv_store.cu:153`).
@@ -561,7 +561,7 @@ appears in the layout — it is only ever *how many leading rows are valid*, and
 that count lives in the on-device boundary array. That is precisely
 AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:122` ("Compute Graph — core rules", rule 1)): the
 graph topology is identical at position 0 and position 2000, and the kernels
-discover the valid range from the data — `attention_prefill.cu:206-208` records
+discover the valid range from the data — `attention_prefill.cu:222-224` records
 the exclusive per-row limit, and `fa_prefill_kv` computes `kv_end = bound[last_t] + 1`
 at `fa_prefill_kv` (`attention_prefill.cu:130`). Two payoffs we have already met: the
 decode graph can be allocated once and replayed (§3.5), and attention never
@@ -593,7 +593,7 @@ read bandwidth", and the Rust `store_kv_f16` doc comment (`src/cuda/methods/kvst
 print — *the region stays f32-sized; the f16 view uses the first half of the bytes*:
 allocation does not shrink, the bytes written per store and read per attention call do
 (§4 does the arithmetic). The correctness story for the f16 round trip is test
-`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1317`).
+`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1318`).
 
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
 copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1093`) maps the node to
@@ -920,7 +920,7 @@ per position *touched*, though the regions stay f32-sized in allocation
 (§3.3). The flip side is precision: K/V are rounded to f16 on store and every
 downstream kernel reads the rounded values — which is why the parity tests
 compare against the *f16-rounded* reference, not f32
-(`cuda_kv_f16_roundtrip_attn`, `cuda_backend/tests/kv.rs:1317`).
+(`cuda_kv_f16_roundtrip_attn`, `cuda_backend/tests/kv.rs:1318`).
 
 **Prefill attention: the tiling win in one number.** The legacy per-(token,
 head) kernel re-read the K history once per query token per head: at 7B @2K
