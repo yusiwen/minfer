@@ -471,6 +471,22 @@ fn cuda_issue162_every_launch_site_names_itself_and_leaves_no_latch() {
             st,
         );
     });
+    // #858: the once-per-layer packed staging pass (one site, both head dims —
+    // the kernel is not templated on hd).
+    go!(&["launch:dequant_kv_q8_0_f16"], || unsafe {
+        launch_dequant_kv_q8_0_f16(
+            ctx.p(1),
+            ctx.p(2),
+            ctx.p(0),
+            ctx.p(3),
+            ctx.ci32(4),
+            2,
+            128,
+            136,
+            8,
+            st,
+        );
+    });
     // #144: the FA launcher serves both staged layouts from one source site
     // per (layout, mode); #845 added the hd-64 instantiations, which are their
     // own sites (`*_hd64`) because the head dimension is a template parameter —

@@ -1042,6 +1042,7 @@ fn cuda_map_window_costs_no_more_than_the_span_it_replaces() {
             scale,
             nkt * 2,
             nt,
+            0, // #858: a direct kernel-level call names no region capacity
         );
         cb.copy_to_host(ob2).unwrap()
     };
@@ -1208,6 +1209,7 @@ fn cuda_map_window_costs_no_more_than_the_span_it_replaces() {
                 scale,
                 nkt * 2,
                 nt,
+                0, // #858: a direct kernel-level call names no region capacity
             );
         };
         for _ in 0..warmup {

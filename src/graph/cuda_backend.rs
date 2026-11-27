@@ -1914,6 +1914,18 @@ impl CudaBackend {
                 // documented fallback. f32 stays on the general kernel (its
                 // staging would round the cache to f16 for no reason).
                 if self.kv_layout() != crate::cuda::KV_LAYOUT_F32 {
+                    // #858: the packed causal staging plane is sized from the KV
+                    // region's row capacity — the only row bound this side knows
+                    // (the window is device data). `kv_row_bytes` is one cell's byte
+                    // width, so the division is exact for all three layouts; a
+                    // zero-width region would be a build bug, and the method treats
+                    // 0 as "unknown" (per-tile staging).
+                    let cell_bytes = self.kv_row_bytes(meta.nkt);
+                    let kv_rows = if cell_bytes == 0 {
+                        0
+                    } else {
+                        self.pool[k_id].bytes / cell_bytes
+                    };
                     self.state.gqa_attn_kv_prefill(
                         self.ptr_of_ref(in_bufs[0])?,
                         self.ptr_of(k_id)?,
@@ -1928,6 +1940,7 @@ impl CudaBackend {
                         meta.scale,
                         self.kv_row_bytes(meta.nkt),
                         nt,
+                        kv_rows,
                     );
                 } else {
                     self.state.gqa_attn_f32(

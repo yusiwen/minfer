@@ -399,6 +399,46 @@ fn fa_prefill_q8_0_parity(hd: usize) {
         "the packed prefill did not reach the FA launch (it fell back to the general \
          layout-tagged kernel); this gate would otherwise pass on the old route"
     );
+    // #858: and the causal route must have taken the once-per-layer staging plane,
+    // not the per-tile dequantizing repeat this ticket exists to remove.
+    assert!(
+        crate::testfail::checked("cuda_fa_prefill_q8_0_staged") > 0,
+        "the packed causal prefill did not take the once-per-layer staging plane (#858); \
+         the per-tile packed FA route is still within this gate's 5e-3 tolerance, so only \
+         this counter can tell the two apart"
+    );
+
+    // #858's numerics claim: the plane is a *work removal*, not a numerics change.
+    // Re-run the same node with the per-tile repeat (`MINFER_NO_KV_STAGE=1`'s arm)
+    // and require bit identity — the plane holds exactly the halves `kv8_q8_0`
+    // would have written into the tile, so nothing downstream may move.
+    let mut no_stage = crate::config::EngineConfig::default();
+    no_stage.no_kv_stage = true;
+    let staged_before = crate::testfail::checked("cuda_fa_prefill_q8_0_staged");
+    crate::config::with_config(no_stage, || {
+        cb.exec_ids(&g.nodes[at], &[xb_q, kreg, xb_p], ob_at, Some((kreg, vreg)))
+            .unwrap();
+    });
+    // The control arm must NOT have taken the plane, or the comparison is vacuous.
+    assert_eq!(
+        crate::testfail::checked("cuda_fa_prefill_q8_0_staged"),
+        staged_before,
+        "the MINFER_NO_KV_STAGE control arm still took the staging plane; the bitwise \
+         comparison below would compare the plane with itself"
+    );
+    let per_tile = cb.copy_to_host(ob_at).unwrap();
+    let differ = agot
+        .iter()
+        .zip(&per_tile)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differ,
+        0,
+        "the staged plane is not bit-identical to the per-tile repeat: {differ} of {} \
+         elements differ (it must be a pure work removal)",
+        agot.len()
+    );
 }
 // 8d: split-K decode attention parity (nt == 1 routes to the split path).
 // nkv = 3 exercises EMPTY splits (positions[0] = 2 → splits 3..7 have no

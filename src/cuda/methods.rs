@@ -281,6 +281,12 @@ impl CudaState {
     fn no_fa_prefill() -> bool {
         crate::config::get().no_fa_prefill
     }
+
+    /// #858: the same-binary control for the once-per-layer packed staging plane
+    /// (`MINFER_NO_KV_STAGE=1` reverts to the per-tile dequantizing repeat).
+    fn no_kv_stage() -> bool {
+        crate::config::get().no_kv_stage
+    }
 }
 
 mod accounting;
