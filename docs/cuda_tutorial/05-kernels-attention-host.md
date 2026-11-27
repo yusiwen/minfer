@@ -145,12 +145,12 @@ Two details that matter when you read the real kernel:
 
 - The **first chunk is special**: `m` starts at `−∞` and `α` would be
   `exp(−∞ − m_new) = 0`, so the code simply skips the rescale on the first tile
-  (see the `fresh0`/`fresh1` flags at `fa_prefill_kv` (`attention_prefill.cu:117`)).
+  (see the `fresh0`/`fresh1` flags at `fa_prefill_kv` (`attention_prefill.cu:130`)).
 - **Masked keys must contribute exactly nothing**: causality forbids attending
   to future positions, so a masked score is forced to `0.0` *after* the max
   reduction, not merely given a tiny weight — otherwise `l` would be polluted and
   the normalization would be subtly wrong (this is the `(gcol[q] < qlim0)`
-  guard at `fa_prefill_kv` (`attention_prefill.cu:117`).
+  guard at `fa_prefill_kv` (`attention_prefill.cu:130`).
 
 ### 2.4 RoPE in two sentences, and why the tail is fused
 
@@ -179,10 +179,11 @@ SM — Streaming Multiprocessor — and can share an on-chip scratchpad called
 streams the whole key/value history for that head through a 32-key tile:
 `grid.x = ceil(nt / 64)` query token tiles, `grid.y = nh` heads,
 128 threads = 4 warps (a warp is 32 threads that execute in lockstep)
-`launch_fa_prefill_kv` (`attention_prefill.cu:394`, the launcher). K/V come from the persistent cache as
+`launch_fa_prefill_kv` (`attention_prefill.cu:412`, the launcher). K/V come from the persistent cache as
 `__half` (16-bit float — the f16 KV cache from chapter 04's bandwidth story);
-q and the output `o` are f32. The kernel is gated to `hd == 128` models — see
-the dispatch note at the end of this section.
+q and the output `o` are f32. The kernel is instantiated per head dimension — 64
+and 128, the two the supported models use — see the dispatch note at the end of
+this section.
 
 **Why this shape at all.** The header comment above the prefill kernel
 (`attention_prefill.cu:10-19`) is the honest cost accounting of the kernel it
@@ -202,16 +203,17 @@ One block per (token, head) re-reads every K row once *per query token*; tiling
 64 queries together amortizes each K row across 64 consumers — chapter 03's GEMM
 tiling reasoning, applied to attention.
 
-**The tile constants and shared layout** (`attention_prefill.cu:33-34`, the tile constants, and `:128-135`, the
+**The tile constants and shared layout** (`attention_prefill.cu:33-34`, the tile constants, and `:141-151`, the
 shared layout): `FA_TQ = 64` query rows, `FA_TKV = 32` key columns per iteration;
 shared memory holds the q tile, the K tile, and the V tile, all as `__half` with
 a padded row stride:
 
 ```c
 extern __shared__ __align__(256) uint8_t smem[];
-// Padded smem row stride: hd=128 halves = 256B ≡ 0 mod 32 banks makes
-// every wmma ldmatrix row land on the same bank group (8-way conflict
-// per load). +8 halves (272B) shifts each row by 4 banks.
+// Padded smem row stride: a row is hd halves — 128 B at hd 64 and 256 B at
+// hd 128 — and both are ≡ 0 mod 32 banks, which makes every wmma ldmatrix
+// row land on the same bank group (8-way conflict per load). +8 halves
+// (144 B / 272 B) shifts each row by 4 banks.
 const int sstr = hd + 8;
 __half* Qs = reinterpret_cast<__half*>(smem);
 __half* Ks = Qs + FA_TQ * sstr;
@@ -228,7 +230,7 @@ address formula.
 API for tensor-core matmul) multiplies 16×16×16 matrix fragments; a *fragment*
 is the per-lane register layout of a piece of a matrix. The Q·Kᵀ product of a
 16-query-row block against the 32-column K tile is accumulated in fragment
-registers `fa_prefill_kv` (`attention_prefill.cu:117`):
+registers `fa_prefill_kv` (`attention_prefill.cu:130`):
 
 ```c
 wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[FA_TKV / 16];
@@ -250,14 +252,14 @@ elements at a time (the K dimension of this GEMM), loading an A-fragment
 (16 query rows × 16 dims, row-major) and two B-fragments (16 dims × 16 key
 columns, col-major — `Kᵀ`'s layout falls out of storing `K` row-major) per
 step. The `scale` factor was already folded into q at load
-`fa_prefill_kv` (`attention_prefill.cu:117`), so the scores need no second pass.
+`fa_prefill_kv` (`attention_prefill.cu:130`), so the scores need no second pass.
 
 **The online softmax, fragment-resident.** Now the section-2 machinery, but the
 "row" lives in tensor-core accumulator registers. For an m16n16 f32 accumulator
 each lane holds 8 elements — two fragment rows (`r0`, `r0+8`) × four column
 groups — and four lanes (`l = 0..3`) share one row, so a row max is a local
 loop plus a 2-step butterfly shuffle (`__shfl_xor_sync` exchanges a register
-between lanes) `fa_prefill_kv` (`attention_prefill.cu:117`):
+between lanes) `fa_prefill_kv` (`attention_prefill.cu:130`):
 
 ```c
 float mnew0 = -INFINITY, mnew1 = -INFINITY;
@@ -276,12 +278,12 @@ for (int off = 1; off <= 2; off <<= 1) {
 ```
 
 Note the three validity conditions on every element: **causal masking**
-(`gcol[q] < qlim0` — the per-row *exclusive* limit `fa_prefill_kv` (`attention_prefill.cu:117`) reads
+(`gcol[q] < qlim0` — the per-row *exclusive* limit `fa_prefill_kv` (`attention_prefill.cu:130`) reads
 from the device-side `positions`/`bound` array), **tile-range masking** (`gcol[q] < kv_end` —
 the last KV tile is zero-filled beyond the history end, and zeros must not
 enter the max), and the **window floor** (`CAUSAL || gcol[q] >= win_lo`, E1b).
 Then the classic triple — fresh flags, exponentiate against the new max, running sums —
-`fa_prefill_kv` (`attention_prefill.cu:117`):
+`fa_prefill_kv` (`attention_prefill.cu:130`):
 
 ```c
 const int fresh0 = (m0 == -INFINITY);
@@ -298,15 +300,15 @@ if (mnew0 != -INFINITY) m0 = mnew0;
 l0 = l0 * a0 + sum0;                               // l ← l·α + new sum
 ```
 
-**The O rescale in code.** The output accumulator is 8 fragments (the
-64-dim-per-16-row-block V product, `hd/16 = 8` blocks). Each fragment's 8
+**The O rescale in code.** The output accumulator is `NOB = hd/16` fragments
+(8 at hd 128, 4 at hd 64 — one per 16-column block of the V product). Each fragment's 8
 elements interleave the two fragment rows, so the per-row α is applied by
-multiplying the right lanes of every fragment `fa_prefill_kv` (`attention_prefill.cu:117`):
+multiplying the right lanes of every fragment `fa_prefill_kv` (`attention_prefill.cu:130`):
 
 ```c
 // rescale O fragments by the per-row alpha (x[0,1,4,5] -> row r0,
 // x[2,3,6,7] -> row r1 — the m16n16 f32 accumulator layout).
-for (int ob = 0; ob < 8; ob++) {
+for (int ob = 0; ob < NOB; ob++) {
     acc[ob].x[0] *= aa0; acc[ob].x[1] *= aa0;
     acc[ob].x[2] *= aa1; acc[ob].x[3] *= aa1;
     acc[ob].x[4] *= aa0; acc[ob].x[5] *= aa0;
@@ -316,20 +318,20 @@ for (int ob = 0; ob < 8; ob++) {
 
 This is §2.2's `o ← o·α`, 64 rows at a time, entirely in registers. Then P (the
 probabilities — the scaled scores) is packed into an f16 A-fragment *in place*
-`fa_prefill_kv` (`attention_prefill.cu:117`), exploiting that the m16n16 f32 accumulator and the
+`fa_prefill_kv` (`attention_prefill.cu:130`), exploiting that the m16n16 f32 accumulator and the
 m16k16 f16 row-major A-fragment use the same element-per-lane layout), and the
-P·V product is accumulated `fa_prefill_kv` (`attention_prefill.cu:117`). The comment at
-`attention_prefill.cu:322-325` records the layout facts that make the round trip free — the kind of
+P·V product is accumulated `fa_prefill_kv` (`attention_prefill.cu:130`). The comment at
+`attention_prefill.cu:339-342` records the layout facts that make the round trip free — the kind of
 thing you verify once with a standalone fragment-layout test, then trust.
 
 **Write-out and K/V staging.** After the KV loop, one final normalize `acc / l`
 and the fragments go to global memory; the last, partially-filled query tile
 stages through shared memory so out-of-range rows can be skipped
-`fa_prefill_kv` (`attention_prefill.cu:117`); rows whose `l` is 0 (fully masked) stay 0. The
-K/V tiles themselves arrive via `fa_stage_kv_async` (`attention_prefill.cu:43`):
+`fa_prefill_kv` (`attention_prefill.cu:130`); rows whose `l` is 0 (fully masked) stay 0. The
+K/V tiles themselves arrive via `fa_stage_kv_async` (`attention_prefill.cu:49`):
 16-byte `cp.async` transfers — an asynchronous copy that lands in shared memory
 without passing through registers — which zero-fill rows beyond `kv_end` by
-capping the copy size (`sz = full ? 16 : 0`, `fa_stage_kv_async` (`attention_prefill.cu:43`)); the
+capping the copy size (`sz = full ? 16 : 0`, `fa_stage_kv_async` (`attention_prefill.cu:49`)); the
 pre-sm80 fallback does plain synchronous vector loads. Zero-filling lets the
 softmax treat out-of-range keys uniformly and exclude them with the one
 `gcol < kv_end` test instead of a second control path.
@@ -338,8 +340,11 @@ softmax treat out-of-range keys uniformly and exclude them with the one
 `gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:261`) gates it:
 
 ```rust
-// 8n: prefill (nt >= 64) runs the FA-style tiled attention. ...
-if nt >= 2 && hd == 128 && !Self::no_fa_prefill() && layout != crate::cuda::KV_LAYOUT_F32 {
+if nt >= 2
+    && (hd == 64 || hd == 128)
+    && !Self::no_fa_prefill()
+    && layout != crate::cuda::KV_LAYOUT_F32
+{
     let rc = unsafe { launch_fa_prefill_kv(...) };
     if rc == 0 { return; }
 }
@@ -347,16 +352,25 @@ if nt >= 2 && hd == 128 && !Self::no_fa_prefill() && layout != crate::cuda::KV_L
 
 `gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:261`.) Four conditions, each with a reason: `nt >= 2`
 (doc 86 lowered the gate from `nt >= 64`, since the kernel masks causally from the positions
-array, so verify-shaped short batches are safe); `hd == 128` (the Qwen2/Qwen3 head dim the kernel's
-tile arithmetic and shared-memory budget are computed for);
+array, so verify-shaped short batches are safe); `hd` **64 or 128** — the two head dimensions the
+supported models use, and the same pair Metal's `prefill_flash_enabled` accepts. The kernel is
+*instantiated* once per head dim, so the tile arithmetic (`hd/16` output fragments) and the smem
+budget are compile-time shapes rather than runtime arguments (#845; a third head dim would need a
+new instantiation, which is why the launcher refuses one);
 `MINFER_NO_FA_PREFILL=1` `no_fa_prefill` (`src/cuda/methods.rs:281`) as the A/B escape hatch; and
 `layout != KV_LAYOUT_F32` (the FA tile is `__half`, and the launcher is instantiated only for the f16
-and packed layouts, so a f32 cache keeps the general kernel). If the shared-memory opt-in fails at
-launch `launch_fa_prefill_kv` (`attention_prefill.cu:394`) the launcher returns `−1`, prints one loud warning,
-and the wrapper falls back to the legacy per-token kernel — the one visible fallback in the
-attention path, and it is *announced*, not silent. Note for Qwen2.5-0.5B specifically: its head dim
-is 64 (`docs/QWEN2-SUPPORT.md:79` (§4 "Verified models") ), so 0.5B prefill runs the legacy
-`gqa_attn_f32_f16kv` kernel; `fa_prefill_kv` serves the hd=128 classes (Qwen2.5-7B, Qwen3-4B…).
+and packed layouts, so a f32 cache keeps the general kernel). The launcher returns `−1` for a head
+dim it has no instantiation for and for a launch it could not issue, and the wrapper then falls
+back to the legacy per-token kernel — the one fallback in this path, and it is *announced*, not
+silent. (Until #845 the launcher also returned `−1` when the dynamic-smem opt-in failed; that
+opt-in is gone, because both shapes fit the 48 KiB default cap — 18 432 B at hd 64, 34 816 B at
+hd 128.)
+
+Both head dims take this path, which is what #845 fixed: `fa_prefill_kv` used to be gated to
+hd 128, so Qwen2.5-0.5B (`docs/QWEN2-SUPPORT.md:79`, §4 "Verified models") and the other hd-64
+classes ran the legacy `gqa_attn_f32_f16kv` kernel over the whole prompt. That kernel was 72.7%
+(f16 KV) / 78.5% (packed q8_0) of the hd-64 `pp2048` GPU time, and the packed arm's extra
+per-element dequant is what made its prefill 1.23x the f16 arm's (record 115).
 The CPU counterpart — the same online softmax in scalar Rust — is walkthrough 11 §3.2's
 attention arms.
 
@@ -429,7 +443,7 @@ expression, same `cosf/sinf`. "Verbatim" is a hard requirement: the fused
 kernel had to be *bit-identical* to the seven-kernel chain it replaced (the
 header comment, `kv_store.cu:135-152`, lists each correspondence) —
 fusion is only free when the answer does not change. The A/B proof lives in
-the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1253`
+the parity test `cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1317`
 exercises the f16 round trip end to end).
 
 **Section 2 — k: bias + RoPE + store into the cache** `attn_bias_rope_store_f32` (`kv_store.cu:153`).
@@ -549,7 +563,7 @@ AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:122` ("Compute
 graph topology is identical at position 0 and position 2000, and the kernels
 discover the valid range from the data — `attention_prefill.cu:206-208` records
 the exclusive per-row limit, and `fa_prefill_kv` computes `kv_end = bound[last_t] + 1`
-at `fa_prefill_kv` (`attention_prefill.cu:117`). Two payoffs we have already met: the
+at `fa_prefill_kv` (`attention_prefill.cu:130`). Two payoffs we have already met: the
 decode graph can be allocated once and replayed (§3.5), and attention never
 needs a host round trip to learn where the history ends.
 
@@ -579,7 +593,7 @@ read bandwidth", and the Rust `store_kv_f16` doc comment (`src/cuda/methods/kvst
 print — *the region stays f32-sized; the f16 view uses the first half of the bytes*:
 allocation does not shrink, the bytes written per store and read per attention call do
 (§4 does the arithmetic). The correctness story for the f16 round trip is test
-`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1253`).
+`cuda_kv_f16_roundtrip_attn` (`cuda_backend/tests/kv.rs:1317`).
 
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
 copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1093`) maps the node to
@@ -906,24 +920,25 @@ per position *touched*, though the regions stay f32-sized in allocation
 (§3.3). The flip side is precision: K/V are rounded to f16 on store and every
 downstream kernel reads the rounded values — which is why the parity tests
 compare against the *f16-rounded* reference, not f32
-(`cuda_kv_f16_roundtrip_attn`, `cuda_backend/tests/kv.rs:1253`).
+(`cuda_kv_f16_roundtrip_attn`, `cuda_backend/tests/kv.rs:1317`).
 
 **Prefill attention: the tiling win in one number.** The legacy per-(token,
 head) kernel re-read the K history once per query token per head: at 7B @2K
 that was ~132 GB of K traffic *per layer*, 176 ms, 76% of the whole 2K
 prefill. `fa_prefill_kv` amortizes each K row across a 64-query tile and
 stages K/V once per 32-key chunk: **~0.8 GB per layer** — about 165× less
-traffic `fa_prefill_kv` (`attention_prefill.cu:117`). The grid at those shapes is small and
+traffic `fa_prefill_kv` (`attention_prefill.cu:130`). The grid at those shapes is small and
 regular: `ceil(2048/64) = 32` query tiles × 28 heads = 896 blocks of 128
 threads, each asking for `((64 + 2·32) · 136 · 2) = 34,816 B ≈ 34.8 KB` of
-dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:394`), raised via
-`cudaFuncSetAttribute` (`attention_prefill.cu:417`). What makes it *slow*, by
-construction: an `hd ≠ 128` model silently takes the legacy path (0.5B does
-exactly this, §3.1); a device that refuses the shared-memory opt-in falls back
-with one printed warning and a "~50× slower" attention
-`launch_fa_prefill_kv` (`attention_prefill.cu:394`); and an unpadded shared-memory stride would
-re-introduce the 8-way bank conflicts the `sstr = hd + 8` line exists to
-prevent `fa_prefill_kv` (`attention_prefill.cu:117`).
+dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:412`). Both head dims the
+supported models use are instantiated — 64 and 128, #845 — and at hd 64 the same
+tile asks 18 432 B; both are under the 48 KiB default dynamic-smem cap, so the
+launcher issues no `cudaFuncSetAttribute` opt-in at all. Two things still decide
+whether a prompt is *fast*, by construction: a head dim with no instantiation
+takes the legacy path (and a third head dim is refused by the launcher rather than
+mislabelled), and an unpadded shared-memory stride would re-introduce the 8-way
+bank conflicts the `sstr = hd + 8` line exists to prevent `fa_prefill_kv`
+(`attention_prefill.cu:130`).
 
 ## 5. Try it / Observe
 
