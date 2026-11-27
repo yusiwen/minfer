@@ -832,6 +832,12 @@ pub struct CudaState {
     /// (same assumption as the 8c buf_q8_prefill).
     buf_f16_w: StreamScratch,
     buf_f16_x: StreamScratch,
+    /// #858: the once-per-layer packed-KV staging plane (K then V, an f16 region
+    /// of `arena_rows * nk * hd` halves each). Grown on demand like the other
+    /// prefill scratches; prefill never enters a CUDA Graph capture window, and a
+    /// capture that did reach it would fail the `cudaMalloc` and fall back to the
+    /// per-tile staging (the null check in `gqa_attn_kv_prefill_once`).
+    buf_kv_stage: StreamScratch,
 }
 
 /// Quant block element count (ggml block_q): 256 for K-quants, 32 otherwise.

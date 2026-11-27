@@ -27,6 +27,22 @@ extern "C" {
     // #144 item 3: `layout` is the KV tag the staging reads (f16 or packed
     // Q8_0 — the packed arm dequantizes each cell into the same f16 tile);
     // `row_bytes` is the cell's byte width and is ignored by the f16 arm.
+    /// #858: one pass over a packed causal prefill window, dequantizing it into
+    /// an f16 region (`arena_rows * nk * hd` halves each for K and V) so the FA
+    /// tiles read it as `KV_LAYOUT_F16`. Returns -1 when the launch could not be
+    /// issued — the caller then keeps the per-tile staging.
+    pub(crate) fn launch_dequant_kv_q8_0_f16(
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        sk: *mut std::ffi::c_void,
+        sv: *mut std::ffi::c_void,
+        bound: *const i32,
+        nt: i32,
+        nkt: i32,
+        row_bytes: usize,
+        arena_rows: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
     pub(crate) fn launch_fa_prefill_kv(
         q: *const f32,
         k: *const std::ffi::c_void,
@@ -273,12 +289,13 @@ impl CudaState {
         scale: f32,
         row_bytes: usize,
         nt: usize,
+        kv_rows: usize,
     ) {
         // #189's mutation seam: 1 unless `MINFER_S4_AB_MAP_REPS=2` doubles the
         // map arm's work (`s4_ab_map_reps`).
         for _ in 0..s4_ab_map_reps(mode) {
             self.gqa_attn_kv_prefill_once(
-                q, k, v, o, positions, mode, layout, nh, nk, hd, scale, row_bytes, nt,
+                q, k, v, o, positions, mode, layout, nh, nk, hd, scale, row_bytes, nt, kv_rows,
             );
         }
         // The observation half of gate contract rule 3: the map instantiation
@@ -305,6 +322,7 @@ impl CudaState {
         scale: f32,
         row_bytes: usize,
         nt: usize,
+        kv_rows: usize,
     ) {
         let stream = self.stream();
         // 8n: prefill (nt >= 64) runs the FA-style tiled attention. The legacy
@@ -345,11 +363,75 @@ impl CudaState {
             && !Self::no_fa_prefill()
             && layout != crate::cuda::KV_LAYOUT_F32
         {
+            // #858: a packed *causal* prefill stages its window once per layer and
+            // then runs the f16 FA body over that plane. The per-tile staging
+            // dequantizes the same packed blocks once per query tile — ceil(nt/64)
+            // times — which record 114 priced at 45% of a packed hd-128 launch and
+            // record 115 at 29% of an hd-64 one. The plane is exactly an f16 KV
+            // region (`kv_rows * nk * hd` halves for K, then V), so the kernel needs
+            // no new mode; only the *causal* window is staged, because a `kv_map`
+            // window resolves its cells through a run list (the plane index would
+            // not be the cell) and a span window's union is not worth a second
+            // device-side scan here. Both keep the per-tile staging.
+            //
+            // `kv_rows == 0` means the caller does not know the region's capacity
+            // (direct kernel-level tests do not); a failed allocation or launch
+            // also lands here, which is the documented fallback: the per-tile
+            // route below, not an error.
+            // #858: one query tile (`nt <= FA_TQ`) stages the window exactly once
+            // in the per-tile route too, so the plane would only add a write + a
+            // re-read — the verify band and short prompts keep the per-tile route.
+            const FA_TQ: usize = 64; // mirrors `#define FA_TQ` in attention_prefill.cu
+            let mut staged: Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> = None;
+            if layout == crate::cuda::KV_LAYOUT_Q8_0
+                && mode == AttnWindow::Causal.code()
+                && nt > FA_TQ
+                && kv_rows > 0
+                && !Self::no_kv_stage()
+            {
+                let plane = kv_rows * nk * hd * 2; // bytes of one f16 K/V plane
+                let buf = Self::get_or_grow(&self.buf_kv_stage, 2 * plane);
+                if !buf.is_null() {
+                    let sk = buf;
+                    let sv = unsafe { (buf as *mut u8).add(plane) as *mut std::ffi::c_void };
+                    let rc = unsafe {
+                        launch_dequant_kv_q8_0_f16(
+                            k as *const std::ffi::c_void,
+                            v as *const std::ffi::c_void,
+                            sk,
+                            sv,
+                            positions as *const i32,
+                            nt as i32,
+                            (nk * hd) as i32,
+                            row_bytes,
+                            kv_rows as i32,
+                            stream,
+                        )
+                    };
+                    if rc == 0 {
+                        staged = Some((sk, sv));
+                    }
+                }
+            }
+            let (lk, lv, llayout, lrow) = match staged {
+                Some((sk, sv)) => (
+                    sk as *const std::ffi::c_void,
+                    sv as *const std::ffi::c_void,
+                    crate::cuda::KV_LAYOUT_F16,
+                    nk * hd * 2,
+                ),
+                None => (
+                    k as *const std::ffi::c_void,
+                    v as *const std::ffi::c_void,
+                    layout,
+                    row_bytes,
+                ),
+            };
             let rc = unsafe {
                 launch_fa_prefill_kv(
                     q as *const f32,
-                    k as *const std::ffi::c_void,
-                    v as *const std::ffi::c_void,
+                    lk,
+                    lv,
                     o as *mut f32,
                     positions as *const i32,
                     mode,
@@ -358,8 +440,8 @@ impl CudaState {
                     hd as i32,
                     scale,
                     nt as i32,
-                    layout,
-                    row_bytes,
+                    llayout,
+                    lrow,
                     stream,
                 )
             };
@@ -370,10 +452,15 @@ impl CudaState {
                 // the counter moved. #144 item 3 added the packed counter; #845 the
                 // f16 one, because `cuda_fa_prefill_attention_parity` at hd 64 would
                 // otherwise pass on the legacy body (both are within its 5e-3 CPU
-                // tolerance, so the parity alone does not pin the route).
+                // tolerance, so the parity alone does not pin the route). #858 adds
+                // the staged counter: the packed causal gate must prove it took the
+                // once-per-layer plane, not the per-tile repeat it is here to remove.
                 match layout {
                     crate::cuda::KV_LAYOUT_Q8_0 => {
-                        crate::testfail::note_checked("cuda_fa_prefill_q8_0")
+                        crate::testfail::note_checked("cuda_fa_prefill_q8_0");
+                        if staged.is_some() {
+                            crate::testfail::note_checked("cuda_fa_prefill_q8_0_staged");
+                        }
                     }
                     crate::cuda::KV_LAYOUT_F16 => {
                         crate::testfail::note_checked("cuda_fa_prefill_f16")

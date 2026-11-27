@@ -407,7 +407,61 @@ __global__ void fa_prefill_kv(
         }
     }
 }
+
+// ─── #858: stage one layer's packed KV into f16, once ─────────────────────────
+// The FA tile staging dequantizes the same packed blocks once per *query tile*
+// (ceil(nt / FA_TQ) times per layer at the same cells), which is the +45% of a
+// packed hd-128 launch and the +29% of a packed hd-64 one. This pass removes the
+// repeat: it walks the causal window's rows once and writes the dequantized
+// halves into the caller's scratch, laid out exactly like an f16 KV region (row
+// stride nk * hd) so the FA kernel then runs its unchanged `KV_LAYOUT_F16`
+// instantiation over it. `kv8_q8_0` is the same converter the tile staging uses,
+// so the halves written here are the halves the tile would have produced.
+//
+// One 8-element group per thread, K and V together. The window is device data
+// (`bound[nt - 1] + 1`), so the grid is sized by the arena and blocks past the
+// window return without touching memory. Only the causal mode is staged: a
+// `kv_map` window resolves its cells through a run list (so the scratch index
+// would not be the cell) and a span window's union is not worth a second
+// device-side scan here — both keep the per-tile staging.
+__global__ void dequant_kv_q8_0_f16(
+    const void* __restrict__ k, const void* __restrict__ v,
+    __half* __restrict__ sk, __half* __restrict__ sv,
+    const int* __restrict__ bound, int nt, int nkt, size_t row_bytes
+) {
+    const int groups_per_row = nkt / 8;
+    const int nrows = bound[nt - 1] + 1;
+    const int groups = nrows * groups_per_row;
+    const int stride = gridDim.x * blockDim.x;
+    for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < groups; g += stride) {
+        const int row = g / groups_per_row;
+        const int e = (g - row * groups_per_row) * 8;
+        kv8_q8_0(sk + (size_t)row * nkt + e, kv_row(k, row, row_bytes), e);
+        kv8_q8_0(sv + (size_t)row * nkt + e, kv_row(v, row, row_bytes), e);
+    }
+}
 extern "C" {
+
+int launch_dequant_kv_q8_0_f16(
+    const void* k, const void* v, void* sk, void* sv,
+    const int* bound, int nt, int nkt, size_t row_bytes, int arena_rows,
+    cudaStream_t stream
+) {
+    // The only upper bound a host has is the arena; the kernel trims to the
+    // window itself. Capped so a 32k-cell arena does not ask for a 16k-block
+    // grid: the loop is strided, one 8-element group per thread per step.
+    long groups = (long)arena_rows * (long)(nkt / 8);
+    int blocks = (int)((groups + 255) / 256);
+    if (blocks > 4096) blocks = 4096;
+    if (blocks < 1) blocks = 1;
+    // #162: a documented-fallback launch (the caller keeps the per-tile staging
+    // when this fails), so `_opt` and an int return, like `launch_fa_prefill_kv`.
+    minfer_launch_prelude("launch:dequant_kv_q8_0_f16", "dequant_kv_q8_0_f16");
+    dequant_kv_q8_0_f16<<<blocks, minfer_launch_block("launch:dequant_kv_q8_0_f16", 256), 0, stream>>>(
+        k, v, reinterpret_cast<__half*>(sk), reinterpret_cast<__half*>(sv), bound, nt, nkt,
+        row_bytes);
+    return minfer_launch_ok_opt("launch:dequant_kv_q8_0_f16", "dequant_kv_q8_0_f16") ? 0 : -1;
+}
 
 int launch_fa_prefill_kv(
     const float* q, const void* k, const void* v, float* o,
@@ -548,4 +602,6 @@ extern "C" void minfer_prewarm_attention_prefill_kernels(void) {
     MINFER_PREWARM_ONE(a, (fa_prefill_kv<true, false, KV_LAYOUT_Q8_0, 128>));
     MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, false, KV_LAYOUT_Q8_0, 128>));
     MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 128>));
+    // #858: the once-per-layer packed staging pass.
+    MINFER_PREWARM_ONE(a, (dequant_kv_q8_0_f16));
 }

@@ -309,6 +309,7 @@ impl CudaState {
             buf_q8_decode: StreamScratch::new(),
             buf_f16_w: StreamScratch::new(),
             buf_f16_x: StreamScratch::new(),
+            buf_kv_stage: StreamScratch::new(),
         })
     }
 

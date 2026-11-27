@@ -116,6 +116,9 @@ pub struct EngineConfig {
     pub no_prefill_gemm: bool,
     /// `MINFER_NO_FA_PREFILL=1` — the legacy per-token prefill attention.
     pub no_fa_prefill: bool,
+    /// `MINFER_NO_KV_STAGE=1` — do not stage a packed causal prefill window into
+    /// the f16 plane; the FA tiles dequantize per tile instead (#858).
+    pub no_kv_stage: bool,
     /// `MINFER_SMALL_M_GEMM=1`.
     pub small_m_gemm: bool,
     /// `MINFER_Q6K_PF`; on unless `0` (the Q6_K prefetch decode kernel).
@@ -244,6 +247,7 @@ impl Default for EngineConfig {
             no_w16cache: false,
             no_prefill_gemm: false,
             no_fa_prefill: false,
+            no_kv_stage: false,
             small_m_gemm: false,
             q6k_prefetch: true,
             mmvq_v1: false,
@@ -352,6 +356,7 @@ impl EngineConfig {
             no_w16cache: std::env::var("MINFER_NO_W16CACHE").map_or(false, |v| v == "1"),
             no_prefill_gemm: std::env::var("MINFER_NO_PREFILL_GEMM").map_or(false, |v| v == "1"),
             no_fa_prefill: std::env::var("MINFER_NO_FA_PREFILL").map_or(false, |v| v == "1"),
+            no_kv_stage: std::env::var("MINFER_NO_KV_STAGE").map_or(false, |v| v == "1"),
             small_m_gemm: std::env::var("MINFER_SMALL_M_GEMM").map_or(false, |v| v == "1"),
             q6k_prefetch: std::env::var("MINFER_Q6K_PF").map_or(true, |v| v != "0"),
             mmvq_v1: std::env::var("MINFER_MMVQ_V1").map_or(false, |v| v == "1"),
