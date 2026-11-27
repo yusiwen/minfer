@@ -266,19 +266,27 @@ fn cuda_q8_0_store_matches_the_cpu_quantizer() {
 }
 /// C4 S2b: the Q8_0 store → attention round trip, the packed twin of
 /// [`Self::cuda_kv_f16_roundtrip_attn`]. The device writes real packed cells
-/// through `Op::KvcacheStore`, then attention reads them back through the
-/// layout-tagged split path — and the output must match the **f32** kernel run
-/// over the same cells dequantized on the host: `kv4<Q8_0>` reconstructs
-/// exactly `d * q[i]`, which is what `kvformat::unpack_q8_0_cells` puts in the
-/// reference region. A wrong block index, scale offset or quant offset moves a
-/// value by whole quant steps (the 0.117-magnitude outputs here), so the 1e-6
-/// bound is many orders tighter than any layout fault while leaving room for
-/// the one real difference between the two kernels: nvcc may contract the
-/// packed accessor's `d * q` into the following FMA chain, and the f32 kernel
-/// reads that product from memory, so the two can differ by one ulp. Measured:
-/// exactly one ULP on one element (2.38e-7 of 0.117). The **byte-exact** claim
-/// for the store lives in [`Self::cuda_q8_0_store_matches_the_cpu_quantizer`],
-/// where it belongs.
+/// through `Op::KvcacheStore`, then attention reads them back.
+///
+/// **Two arms, because #845 split the guarantee.** This shape is the packed
+/// verify band (`nt = 3`, `hd = 64`), which since #845 takes the FA tile
+/// staging — the packed blocks are dequantized into an f16 tile, so the graph
+/// arm is a tolerance comparison against the f32 kernel over the same cells
+/// (the class `cuda_q8_0_fa_prefill_attention_parity` pins), not a bit claim.
+/// The **exact** claim still belongs to the general layout-tagged kernel
+/// (`kv4<Q8_0>` reconstructs exactly `d * q[i]`, which is what
+/// `kvformat::unpack_q8_0_cells` puts in the reference region): that kernel is
+/// the documented fallback (`MINFER_NO_FA_PREFILL=1`, or an f32 cache), so the
+/// second arm drives it **directly** on the same packed bytes. A wrong block
+/// index, scale offset or quant offset moves a value by whole quant steps (the
+/// 0.117-magnitude outputs here), so the 1e-6 bound is many orders tighter than
+/// any layout fault while leaving room for the one real difference between the
+/// two kernels: nvcc may contract the packed accessor's `d * q` into the
+/// following FMA chain, and the f32 kernel reads that product from memory, so
+/// the two can differ by one ulp. Measured 2026-11-27: **0** differences at this
+/// shape (an earlier tree read one ULP on one element, 2.38e-7 of 0.117, and the
+/// bound leaves room for that). The **byte-exact** claim for the store lives in
+/// [`Self::cuda_q8_0_store_matches_the_cpu_quantizer`], where it belongs.
 #[test]
 fn cuda_kv_q8_0_roundtrip_attn() {
     let Some(mut cb) = pool() else {
@@ -432,17 +440,74 @@ fn cuda_kv_q8_0_roundtrip_attn() {
         .zip(&want)
         .position(|(a, b)| a != b)
         .map(|i| (i, got_q8[i], want[i]));
+    // #845: the graph arm takes the FA staging at hd 64, so this is the f16 tile
+    // class, not a bit claim (see the doc comment).
     assert!(
-        worst <= 1e-6,
-        "the packed attention read is not the f32 kernel over the dequantized \
-         cells: max |Δ| = {worst}, first {first:?}"
+        worst <= 5e-3,
+        "the packed FA prefill read is not the staged f32 reference: max |Δ| = \
+         {worst}, first {first:?}"
     );
     eprintln!(
-        "[c4s2] packed vs dequantized f32 attention: max |Δ| = {worst} ({} of {} \
-         elements differ)",
+        "[c4s2] packed vs dequantized f32 attention (FA staging): max |Δ| = {worst} \
+         ({} of {} elements differ)",
         got_q8.iter().zip(&want).filter(|(a, b)| a != b).count(),
         got_q8.len()
     );
+
+    // The exactness arm: the general layout-tagged kernel, driven directly on
+    // the same packed bytes against the same dequantized f32 cells.
+    let (ob_exact_q8, ob_exact_f32) =
+        (cb.alloc_buffer(nh * hd * nt), cb.alloc_buffer(nh * hd * nt));
+    let mode = crate::cuda::AttnWindow::Causal.code();
+    let row_q8 = crate::graph::kvformat::KvFormat::Q8_0.row_bytes(nkt);
+    cb.state.gqa_attn_f32(
+        cb.ptr_of(ob_qr).unwrap(),
+        cb.ptr_of(kreg).unwrap(),
+        cb.ptr_of(vreg).unwrap(),
+        cb.ptr_of(ob_exact_q8).unwrap(),
+        cb.ptr_of(xb_p).unwrap(),
+        mode,
+        crate::cuda::KV_LAYOUT_Q8_0,
+        nh,
+        nk_h,
+        hd,
+        scale,
+        row_q8,
+        nt,
+    );
+    cb.state.gqa_attn_f32(
+        cb.ptr_of(ob_qr).unwrap(),
+        cb.ptr_of(kf32).unwrap(),
+        cb.ptr_of(vf32).unwrap(),
+        cb.ptr_of(ob_exact_f32).unwrap(),
+        cb.ptr_of(xb_p).unwrap(),
+        mode,
+        crate::cuda::KV_LAYOUT_F32,
+        nh,
+        nk_h,
+        hd,
+        scale,
+        nkt * 4,
+        nt,
+    );
+    cb.state.sync();
+    let exact_q8 = cb.copy_to_host(ob_exact_q8).unwrap();
+    let exact_f32 = cb.copy_to_host(ob_exact_f32).unwrap();
+    let worst_exact = exact_q8
+        .iter()
+        .zip(&exact_f32)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        exact_q8.iter().any(|x| *x != 0.0),
+        "the direct packed arm is all zero; the exactness claim would be vacuous"
+    );
+    assert!(
+        worst_exact <= 1e-6,
+        "the packed layout arithmetic is not the f32 kernel over the dequantized \
+         cells: max |Δ| = {worst_exact}"
+    );
+    eprintln!("[c4s2] packed vs f32 layout arithmetic (general kernel): max |Δ| = {worst_exact}");
 
     // …and the arm is real: a zero-output kernel would also compare equal to a
     // zero reference, so require non-trivial output.

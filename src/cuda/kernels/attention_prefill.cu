@@ -33,10 +33,16 @@ extern "C" {
 #define FA_TQ 64
 #define FA_TKV 32
 
-// P3: async K/V tile staging (16B cp.async chunks; rows beyond kv_end
-// zero-filled). Overlapped with the previous tile's QK^T/softmax/P·V via
-// double buffering — the synchronous staging version paid the full DRAM
-// latency once per KV tile inside the block's serial k-loop.
+// P3: K/V tile staging (16B cp.async chunks; rows beyond kv_end zero-filled).
+// It is **synchronous**, not double-buffered: one Ks/Vs pair, and the k-loop
+// retires the group (`cp.async.wait_group 0` + `__syncthreads`) before the tile
+// is read, so each tile's DRAM latency is paid once per KV tile inside the
+// block's serial k-loop (#860 — the earlier text claimed a double buffer that
+// was never in the kernel). The packed arm (`LAYOUT == KV_LAYOUT_Q8_0`) cannot
+// cp.async at all: a Q8_0 block has to be dequantized before it can be a
+// tensor-core operand, so its staging is a synchronous load/scale/convert on the
+// same critical path, repeated once per query tile (#858 prices it at +45% of an
+// hd-128 launch).
 }
 
 template <bool MAP, int LAYOUT>
@@ -113,22 +119,32 @@ __device__ __forceinline__ void fa_stage_kv_async(
 #endif
 }
 
-template <bool CAUSAL, bool MAP, int LAYOUT>
+// #845: `HD` is a template parameter, not a runtime argument. The tile
+// arithmetic (one 16-wide tensor-core column block per output fragment, `NOB` of
+// them), the padded smem stride and the per-token strides (`nh * HD`,
+// `nk * HD`) are all fixed by the head dimension, so a runtime `hd` could only
+// have been a way for the two to disagree. hd 64 and hd 128 are the two shapes
+// the supported models use — the same pair Metal's `prefill_flash_enabled`
+// accepts — and the launcher refuses anything else.
+template <bool CAUSAL, bool MAP, int LAYOUT, int HD>
 __global__ void fa_prefill_kv(
     const float* __restrict__ q,
     const void* __restrict__ k,
     const void* __restrict__ v,
     float* __restrict__ o,
     const int* __restrict__ bound,
-    int nh, int nk, int hd,
+    int nh, int nk,
     float scale,
     int nt,
     size_t row_bytes
 ) {
     extern __shared__ __align__(256) uint8_t smem[];
-    // Padded smem row stride: hd=128 halves = 256B ≡ 0 mod 32 banks makes
-    // every wmma ldmatrix row land on the same bank group (8-way conflict
-    // per load). +8 halves (272B) shifts each row by 4 banks.
+    constexpr int hd = HD;
+    constexpr int NOB = HD / 16; // O fragments: 4 at hd 64, 8 at hd 128
+    // Padded smem row stride: a row is hd halves — 128 B at hd 64 and 256 B at
+    // hd 128 — and both are ≡ 0 mod 32 banks, which makes every wmma ldmatrix
+    // row land on the same bank group (8-way conflict per load). +8 halves
+    // (144 B / 272 B) shifts each row by 4 banks.
     const int sstr = hd + 8;
     __half* Qs = reinterpret_cast<__half*>(smem);
     __half* Ks = Qs + FA_TQ * sstr;
@@ -216,10 +232,11 @@ __global__ void fa_prefill_kv(
     const int qlim1 =
         (t1 < nt) ? (MAP ? attn_map_nkv(bound, t1) : (CAUSAL ? bound[t1] + 1 : bound[nt + t1])) : 0;
 
-    // O accumulator: P@V over hd=128 per 16-row block -> 8 x 16x16 fragments.
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[8];
+    // O accumulator: P@V over the head dimension, 16 output columns per
+    // fragment (NOB = hd/16: 4 at hd 64, 8 at hd 128), one 16-row block per warp.
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[NOB];
 #pragma unroll
-    for (int ob = 0; ob < 8; ob++) wmma::fill_fragment(acc[ob], 0.0f);
+    for (int ob = 0; ob < NOB; ob++) wmma::fill_fragment(acc[ob], 0.0f);
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
 
     const int kt0 = CAUSAL ? 0 : (win_lo / FA_TKV) * FA_TKV;
@@ -312,7 +329,7 @@ __global__ void fa_prefill_kv(
         // rescale O fragments by the per-row alpha (x[0,1,4,5] -> row r0,
         // x[2,3,6,7] -> row r1 — the m16n16 f32 accumulator layout).
 #pragma unroll
-        for (int ob = 0; ob < 8; ob++) {
+        for (int ob = 0; ob < NOB; ob++) {
             acc[ob].x[0] *= aa0; acc[ob].x[1] *= aa0;
             acc[ob].x[2] *= aa1; acc[ob].x[3] *= aa1;
             acc[ob].x[4] *= aa0; acc[ob].x[5] *= aa0;
@@ -340,7 +357,7 @@ __global__ void fa_prefill_kv(
 #pragma unroll
         for (int kk0 = 0; kk0 < FA_TKV; kk0 += 16) {
 #pragma unroll
-            for (int ob = 0; ob < 8; ob++) {
+            for (int ob = 0; ob < NOB; ob++) {
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vb;
                 wmma::load_matrix_sync(vb, &Vs[kk0 * sstr + ob * 16], sstr);
                 wmma::mma_sync(acc[ob], pa[kk0 / 16], vb, acc[ob]);
@@ -356,7 +373,7 @@ __global__ void fa_prefill_kv(
         float i0 = (l0 > 0.0f) ? 1.0f / l0 : 0.0f;
         float i1 = (l1 > 0.0f) ? 1.0f / l1 : 0.0f;
 #pragma unroll
-        for (int ob = 0; ob < 8; ob++) {
+        for (int ob = 0; ob < NOB; ob++) {
             acc[ob].x[0] *= i0; acc[ob].x[1] *= i0;
             acc[ob].x[2] *= i1; acc[ob].x[3] *= i1;
             acc[ob].x[4] *= i0; acc[ob].x[5] *= i0;
@@ -367,12 +384,13 @@ __global__ void fa_prefill_kv(
         }
     } else {
         // Qs/Ks/Vs regions are free after the KV loop: contiguous staging for
-        // the 64x128 f32 O tile (32 KB < the 34.8 KB smem budget).
+        // the FA_TQ x hd f32 O tile — 32 KB of the 34.8 KB budget at hd 128,
+        // 16 KB of 18.4 KB at hd 64.
         float* stage = reinterpret_cast<float*>(smem);
         float i0 = (l0 > 0.0f) ? 1.0f / l0 : 0.0f;
         float i1 = (l1 > 0.0f) ? 1.0f / l1 : 0.0f;
 #pragma unroll
-        for (int ob = 0; ob < 8; ob++) {
+        for (int ob = 0; ob < NOB; ob++) {
             acc[ob].x[0] *= i0; acc[ob].x[1] *= i0;
             acc[ob].x[2] *= i1; acc[ob].x[3] *= i1;
             acc[ob].x[4] *= i0; acc[ob].x[5] *= i0;
@@ -399,97 +417,110 @@ int launch_fa_prefill_kv(
 ) {
     // Qs + Ks + Vs only (S/P no longer go through shared memory). sstr = hd+8
     // padding; Ks/Vs are FA_TKV rows (the r46 launcher's 3*FA_TQ bug is gone).
+    //
+    // #845: `hd` selects an instantiation (64 or 128) and is unused otherwise —
+    // the tile arithmetic and the smem budget come from the template parameter,
+    // so a runtime value could only disagree with them. Both shapes fit under
+    // the 48 KiB **default** dynamic-smem cap (18 432 B at hd 64, 34 816 B at
+    // hd 128), so this launcher issues no `cudaFuncSetAttribute` opt-in: the
+    // pre-#845 block was already a no-op at hd 128, and its "smem exceeds the
+    // device limit" fallback could not trigger. A head dim above 128 is not
+    // reachable (the backend's guard caps `hd` at 128); if one ever is, it must
+    // go back through `minfer_smem_optin` (guard.cu, ADR-0034).
     size_t smem = ((size_t)FA_TQ + 2 * FA_TKV) * (hd + 8) * 2;
-    static size_t attr_smem = 0;
-    if (smem > attr_smem) {
-        // The opt-in is per *function*, so every instantiation the dispatch below
-        // can pick needs its own — a single call (the pre-C8b S4 form) left one of
-        // the two window modes without it. #144 adds the packed instantiations:
-        // the smem size is layout-independent (the packed cell is dequantized
-        // into the same f16 tile), so one attribute covers whichever layout runs.
-        cudaError_t e = cudaSuccess;
-        for (int m = ATTN_WIN_CAUSAL; m <= ATTN_WIN_MAP && e == cudaSuccess; m++) {
-            const void* f = m == ATTN_WIN_MAP
-                                ? (const void*)&fa_prefill_kv<false, true, KV_LAYOUT_F16>
-                            : m == ATTN_WIN_SPAN
-                                ? (const void*)&fa_prefill_kv<false, false, KV_LAYOUT_F16>
-                                : (const void*)&fa_prefill_kv<true, false, KV_LAYOUT_F16>;
-            e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-            if (e != cudaSuccess) break;
-            const void* p = m == ATTN_WIN_MAP
-                                ? (const void*)&fa_prefill_kv<false, true, KV_LAYOUT_Q8_0>
-                            : m == ATTN_WIN_SPAN
-                                ? (const void*)&fa_prefill_kv<false, false, KV_LAYOUT_Q8_0>
-                                : (const void*)&fa_prefill_kv<true, false, KV_LAYOUT_Q8_0>;
-            e = cudaFuncSetAttribute(p, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        }
-        if (e != cudaSuccess) {
-            cudaGetLastError(); // clear the error so it cannot poison the stream
-            // NOT silent: the caller falls back to the legacy per-token
-            // attention kernel (~50x slower) — this must be visible.
-            static int warned = 0;
-            if (!warned) {
-                warned = 1;
-                fprintf(stderr,
-                        "minfer/cuda: fa_prefill_kv smem %zu B exceeds the device "
-                        "limit; falling back to the legacy attention kernel\n",
-                        smem);
-            }
-            return -1;
-        }
-        attr_smem = smem;
-    }
     dim3 grid((nt + FA_TQ - 1) / FA_TQ, nh, 1);
-    // #162: a failed launch here is a DOCUMENTED fallback, not a sticky error —
-    // the Rust caller falls back to the legacy per-token attention kernel when
-    // this returns non-zero (the `-1` smem arm above is the same contract).
-    bool launched;
-    if (layout == KV_LAYOUT_Q8_0) {
-        if (mode == ATTN_WIN_MAP) {
-            minfer_launch_prelude("launch:fa_prefill_kv__q8_0_map",
-                                  "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0>");
-            fa_prefill_kv<false, true, KV_LAYOUT_Q8_0><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
-                                                                       scale, nt, row_bytes);
-            launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_map",
-                                            "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0>");
-        } else if (mode == ATTN_WIN_SPAN) {
-            minfer_launch_prelude("launch:fa_prefill_kv__q8_0_span",
-                                  "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0>");
-            fa_prefill_kv<false, false, KV_LAYOUT_Q8_0><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
-                                                                        scale, nt, row_bytes);
-            launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_span",
-                                            "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0>");
-        } else {
-            minfer_launch_prelude("launch:fa_prefill_kv__q8_0_causal",
-                                  "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0>");
-            fa_prefill_kv<true, false, KV_LAYOUT_Q8_0><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
-                                                                       scale, nt, row_bytes);
-            launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_causal",
-                                            "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0>");
+    // #162: one source site per (hd, layout, window mode) — twelve — so a failed
+    // launch names the exact instantiation that failed and the #162 device gate
+    // can drive every one of them into a real `cudaErrorInvalidValue`. The
+    // non-zero return is the documented fallback contract: the Rust caller then
+    // runs the general layout-tagged kernel.
+    bool launched = false;
+    if (hd == 64) {
+        if (layout == KV_LAYOUT_Q8_0) {
+            if (mode == ATTN_WIN_MAP) {
+                minfer_launch_prelude("launch:fa_prefill_kv__q8_0_map_hd64",
+                                      "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0,64>");
+                fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_map_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_map_hd64",
+                                                "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0,64>");
+            } else if (mode == ATTN_WIN_SPAN) {
+                minfer_launch_prelude("launch:fa_prefill_kv__q8_0_span_hd64",
+                                      "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0,64>");
+                fa_prefill_kv<false, false, KV_LAYOUT_Q8_0, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_span_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_span_hd64",
+                                                "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0,64>");
+            } else {
+                minfer_launch_prelude("launch:fa_prefill_kv__q8_0_causal_hd64",
+                                      "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0,64>");
+                fa_prefill_kv<true, false, KV_LAYOUT_Q8_0, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_causal_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_causal_hd64",
+                                                "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0,64>");
+            }
+        } else if (layout == KV_LAYOUT_F16) {
+            if (mode == ATTN_WIN_MAP) {
+                minfer_launch_prelude("launch:fa_prefill_kv__f16_map_hd64",
+                                      "fa_prefill_kv<false,true,KV_LAYOUT_F16,64>");
+                fa_prefill_kv<false, true, KV_LAYOUT_F16, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_map_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_map_hd64",
+                                                "fa_prefill_kv<false,true,KV_LAYOUT_F16,64>");
+            } else if (mode == ATTN_WIN_SPAN) {
+                minfer_launch_prelude("launch:fa_prefill_kv__f16_span_hd64",
+                                      "fa_prefill_kv<false,false,KV_LAYOUT_F16,64>");
+                fa_prefill_kv<false, false, KV_LAYOUT_F16, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_span_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_span_hd64",
+                                                "fa_prefill_kv<false,false,KV_LAYOUT_F16,64>");
+            } else {
+                minfer_launch_prelude("launch:fa_prefill_kv__f16_causal_hd64",
+                                      "fa_prefill_kv<true,false,KV_LAYOUT_F16,64>");
+                fa_prefill_kv<true, false, KV_LAYOUT_F16, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_causal_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_causal_hd64",
+                                                "fa_prefill_kv<true,false,KV_LAYOUT_F16,64>");
+            }
         }
-        return launched ? 0 : -1;
-    }
-    if (mode == ATTN_WIN_MAP) {
-        minfer_launch_prelude("launch:fa_prefill_kv__f16_map",
-                              "fa_prefill_kv<false,true,KV_LAYOUT_F16>");
-        fa_prefill_kv<false, true, KV_LAYOUT_F16><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
-                                                                   scale, nt, row_bytes);
-        launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_map",
-                                        "fa_prefill_kv<false,true,KV_LAYOUT_F16>");
-    } else if (mode == ATTN_WIN_SPAN) {
-        minfer_launch_prelude("launch:fa_prefill_kv__f16_span",
-                              "fa_prefill_kv<false,false,KV_LAYOUT_F16>");
-        fa_prefill_kv<false, false, KV_LAYOUT_F16><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
-                                                                    scale, nt, row_bytes);
-        launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_span",
-                                        "fa_prefill_kv<false,false,KV_LAYOUT_F16>");
-    } else {
-        minfer_launch_prelude("launch:fa_prefill_kv__f16_causal",
-                              "fa_prefill_kv<true,false,KV_LAYOUT_F16>");
-        fa_prefill_kv<true, false, KV_LAYOUT_F16><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, hd,
-                                                                   scale, nt, row_bytes);
-        launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_causal",
-                                        "fa_prefill_kv<true,false,KV_LAYOUT_F16>");
+    } else if (hd == 128) {
+        // The hd-128 sites keep their pre-#845 names: they are the ones the
+        // fixture, the doc anchors and the packed-FA record already refer to.
+        if (layout == KV_LAYOUT_Q8_0) {
+            if (mode == ATTN_WIN_MAP) {
+                minfer_launch_prelude("launch:fa_prefill_kv__q8_0_map",
+                                      "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0,128>");
+                fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_map",
+                                                "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0,128>");
+            } else if (mode == ATTN_WIN_SPAN) {
+                minfer_launch_prelude("launch:fa_prefill_kv__q8_0_span",
+                                      "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0,128>");
+                fa_prefill_kv<false, false, KV_LAYOUT_Q8_0, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_span",
+                                                "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0,128>");
+            } else {
+                minfer_launch_prelude("launch:fa_prefill_kv__q8_0_causal",
+                                      "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0,128>");
+                fa_prefill_kv<true, false, KV_LAYOUT_Q8_0, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_causal",
+                                                "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0,128>");
+            }
+        } else if (layout == KV_LAYOUT_F16) {
+            if (mode == ATTN_WIN_MAP) {
+                minfer_launch_prelude("launch:fa_prefill_kv__f16_map",
+                                      "fa_prefill_kv<false,true,KV_LAYOUT_F16,128>");
+                fa_prefill_kv<false, true, KV_LAYOUT_F16, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_map",
+                                                "fa_prefill_kv<false,true,KV_LAYOUT_F16,128>");
+            } else if (mode == ATTN_WIN_SPAN) {
+                minfer_launch_prelude("launch:fa_prefill_kv__f16_span",
+                                      "fa_prefill_kv<false,false,KV_LAYOUT_F16,128>");
+                fa_prefill_kv<false, false, KV_LAYOUT_F16, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_span",
+                                                "fa_prefill_kv<false,false,KV_LAYOUT_F16,128>");
+            } else {
+                minfer_launch_prelude("launch:fa_prefill_kv__f16_causal",
+                                      "fa_prefill_kv<true,false,KV_LAYOUT_F16,128>");
+                fa_prefill_kv<true, false, KV_LAYOUT_F16, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_causal",
+                                                "fa_prefill_kv<true,false,KV_LAYOUT_F16,128>");
+            }
+        }
     }
     return launched ? 0 : -1;
 }
@@ -502,10 +533,19 @@ int launch_fa_prefill_kv(
 // to link).
 extern "C" void minfer_prewarm_attention_prefill_kernels(void) {
     cudaFuncAttributes a;
-    MINFER_PREWARM_ONE(a, (fa_prefill_kv<true, false, KV_LAYOUT_F16>));
-    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, false, KV_LAYOUT_F16>));
-    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, true, KV_LAYOUT_F16>));
-    MINFER_PREWARM_ONE(a, (fa_prefill_kv<true, false, KV_LAYOUT_Q8_0>));
-    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, false, KV_LAYOUT_Q8_0>));
-    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, true, KV_LAYOUT_Q8_0>));
+    // #845: twelve instantiations — (hd 64, hd 128) x (f16, packed q8_0) x
+    // (causal, span, map). Load-time pre-warm, so the first forward of each
+    // shape does not pay the module load (#223).
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<true, false, KV_LAYOUT_F16, 64>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, false, KV_LAYOUT_F16, 64>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, true, KV_LAYOUT_F16, 64>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<true, false, KV_LAYOUT_Q8_0, 64>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, false, KV_LAYOUT_Q8_0, 64>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 64>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<true, false, KV_LAYOUT_F16, 128>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, false, KV_LAYOUT_F16, 128>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, true, KV_LAYOUT_F16, 128>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<true, false, KV_LAYOUT_Q8_0, 128>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, false, KV_LAYOUT_Q8_0, 128>));
+    MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 128>));
 }

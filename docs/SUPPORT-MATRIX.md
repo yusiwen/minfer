@@ -179,8 +179,9 @@ Notes:
   `docs/cuda_optimization_steps/107-c4-packed-q8-kv-cuda.md`. Measured at hd 64 after
   [#633](https://github.com/yusiwen/minfer/issues/633)/[#843](https://github.com/yusiwen/minfer/issues/843)
   (records 111-112): decode **0.970x** f16, i.e. **3.0% faster** (was 1.230x before
-  #633/#843), prefill 1.232x at 2k (tracked in
-  [#845](https://github.com/yusiwen/minfer/issues/845)); Metal's packed decode is a separate
+  #633/#843); prefill **1.0102x** at 2k and **1.0380x** at 8k, both arms on the FA route since
+  [#845](https://github.com/yusiwen/minfer/issues/845) (record 115 — 4.32x/5.22x over the legacy
+  body, which is what made the ratio fall); Metal's packed decode is a separate
   1.20x / 1.10x ([#844](https://github.com/yusiwen/minfer/issues/844)).
 - **Metal ([#310](https://github.com/yusiwen/minfer/issues/310)) — enabled.**
   `kernel_store_kv_q8_0` writes the same bytes as the CPU quantizer. Two read mechanisms cover every

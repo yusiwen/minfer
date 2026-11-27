@@ -472,39 +472,90 @@ fn cuda_issue162_every_launch_site_names_itself_and_leaves_no_latch() {
         );
     });
     // #144: the FA launcher serves both staged layouts from one source site
-    // per (layout, mode) — six sites, all driven here.
-    for (mode, layout, token) in [
+    // per (layout, mode); #845 added the hd-64 instantiations, which are their
+    // own sites (`*_hd64`) because the head dimension is a template parameter —
+    // twelve sites, all driven here.
+    for (hd, mode, layout, token) in [
         (
+            64usize,
+            MAP,
+            crate::cuda::KV_LAYOUT_F16,
+            "launch:fa_prefill_kv__f16_map_hd64",
+        ),
+        (
+            64usize,
+            SPAN,
+            crate::cuda::KV_LAYOUT_F16,
+            "launch:fa_prefill_kv__f16_span_hd64",
+        ),
+        (
+            64usize,
+            CAUSAL,
+            crate::cuda::KV_LAYOUT_F16,
+            "launch:fa_prefill_kv__f16_causal_hd64",
+        ),
+        (
+            64usize,
+            MAP,
+            crate::cuda::KV_LAYOUT_Q8_0,
+            "launch:fa_prefill_kv__q8_0_map_hd64",
+        ),
+        (
+            64usize,
+            SPAN,
+            crate::cuda::KV_LAYOUT_Q8_0,
+            "launch:fa_prefill_kv__q8_0_span_hd64",
+        ),
+        (
+            64usize,
+            CAUSAL,
+            crate::cuda::KV_LAYOUT_Q8_0,
+            "launch:fa_prefill_kv__q8_0_causal_hd64",
+        ),
+        (
+            128usize,
             MAP,
             crate::cuda::KV_LAYOUT_F16,
             "launch:fa_prefill_kv__f16_map",
         ),
         (
+            128usize,
             SPAN,
             crate::cuda::KV_LAYOUT_F16,
             "launch:fa_prefill_kv__f16_span",
         ),
         (
+            128usize,
             CAUSAL,
             crate::cuda::KV_LAYOUT_F16,
             "launch:fa_prefill_kv__f16_causal",
         ),
         (
+            128usize,
             MAP,
             crate::cuda::KV_LAYOUT_Q8_0,
             "launch:fa_prefill_kv__q8_0_map",
         ),
         (
+            128usize,
             SPAN,
             crate::cuda::KV_LAYOUT_Q8_0,
             "launch:fa_prefill_kv__q8_0_span",
         ),
         (
+            128usize,
             CAUSAL,
             crate::cuda::KV_LAYOUT_Q8_0,
             "launch:fa_prefill_kv__q8_0_causal",
         ),
     ] {
+        // The cell width the packed arm would address (`nkt / 32` Q8_0 blocks of
+        // 34 B); the f16 arm ignores it. Injected launches never read either.
+        let row_bytes: usize = if layout == crate::cuda::KV_LAYOUT_Q8_0 {
+            (2 * hd / 32) * 34
+        } else {
+            2 * 2 * hd
+        };
         go!(&[token], || unsafe {
             launch_fa_prefill_kv(
                 ctx.cf(0),
@@ -515,11 +566,11 @@ fn cuda_issue162_every_launch_site_names_itself_and_leaves_no_latch() {
                 mode,
                 4,
                 2,
-                128,
+                hd as i32,
                 0.125,
                 2,
                 layout,
-                136,
+                row_bytes,
                 st,
             );
         });

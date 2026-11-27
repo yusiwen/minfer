@@ -131,12 +131,24 @@ fn cuda_two_sequences_do_not_cross_attend() {
 }
 #[test]
 fn cuda_fa_prefill_attention_parity() {
+    // #845: both head dims the FA prefill is instantiated for, each against the
+    // CPU reference — 128 was the only shape this gate covered while the
+    // dispatch admitted hd 128 alone.
+    for hd in [64usize, 128usize] {
+        fa_prefill_f16_parity(hd);
+    }
+}
+
+/// One head dim of [`cuda_fa_prefill_attention_parity`]'s loop. `hd` is a
+/// template shape on the kernel side, so a regression at either shape is this
+/// gate's to catch.
+fn fa_prefill_f16_parity(hd: usize) {
     let Some(mut cb) = pool() else {
         eprintln!("skipping: no CUDA device");
         return;
     };
     cb.set_kv_f16_for_test(true);
-    let (nh, nk_h, hd) = (4usize, 2usize, 128usize);
+    let (nh, nk_h) = (4usize, 2usize);
     let nkt = nk_h * hd;
     let (nt, n_ctx) = (100usize, 128usize);
     let scale = 1.0 / (hd as f32).sqrt();
@@ -176,6 +188,10 @@ fn cuda_fa_prefill_attention_parity() {
     let ob_at = cb.alloc_buffer(nh * hd * nt);
     let (kreg, vreg) = (cb.alloc_buffer(nkt * n_ctx), cb.alloc_buffer(nkt * n_ctx));
 
+    // #845: the route arm. A 5e-3 CPU comparison alone would pass on the legacy
+    // per-(token,head) kernel too, so the chokepoint's counter has to prove the
+    // FA prefill actually ran at this head dim.
+    crate::testfail::reset_checked();
     let qs: Vec<f32> = (0..nh * hd * nt)
         .map(|i| ((i * 37) % 19) as f32 / 5.0 - 1.9)
         .collect();
@@ -224,12 +240,18 @@ fn cuda_fa_prefill_attention_parity() {
     for (a, r) in agot.iter().zip(aref.iter()) {
         maxe = maxe.max((a - r).abs());
     }
-    println!("fa prefill attention: max err {maxe:.6}");
+    println!("fa prefill attention: max err {maxe:.6} (hd {hd})");
     assert_close("fa_prefill_kv", &agot, &aref, 5e-3);
+    assert!(
+        crate::testfail::checked("cuda_fa_prefill_f16") > 0,
+        "the f16 prefill at hd {hd} did not reach the FA launch (it fell back to the legacy \
+         kernel); this gate would otherwise pass on the old route"
+    );
 }
 /// #144 item 3: FA prefill over a **packed** cache. Same shape and reference as
-/// [`Self::cuda_fa_prefill_attention_parity`] — `nt = 100 > 16` and `hd = 128`,
-/// the only combination that reaches the FA prefill — but the cache is Q8_0, so
+/// [`Self::cuda_fa_prefill_attention_parity`] — `nt = 100 > 16` at each head dim
+/// the dispatch sends to the FA prefill (128 and, since #845, 64) — but the
+/// cache is Q8_0, so
 /// the staging dequantizes each packed cell into the f16 tile instead of
 /// copying halves. The reference is the CPU attention over the **same packed
 /// bytes** dequantized on the host, so the only difference is the f16 staging:
@@ -241,6 +263,14 @@ fn cuda_fa_prefill_attention_parity() {
 /// chokepoint's `testfail::note_checked` counter is asserted to have moved.
 #[test]
 fn cuda_q8_0_fa_prefill_attention_parity() {
+    // #845: both head dims, same reason as the f16 twin above.
+    for hd in [64usize, 128usize] {
+        fa_prefill_q8_0_parity(hd);
+    }
+}
+
+/// One head dim of [`cuda_q8_0_fa_prefill_attention_parity`]'s loop.
+fn fa_prefill_q8_0_parity(hd: usize) {
     use crate::graph::kvformat::KvFormat;
     let Some(mut cb) = pool() else {
         eprintln!("skipping: no CUDA device");
@@ -248,7 +278,7 @@ fn cuda_q8_0_fa_prefill_attention_parity() {
     };
     let _guard = crate::cuda::CudaState::model_load_guard();
     cb.set_kv_q8_for_test();
-    let (nh, nk_h, hd) = (4usize, 2usize, 128usize);
+    let (nh, nk_h) = (4usize, 2usize);
     let nkt = nk_h * hd;
     let row_words = KvFormat::Q8_0.row_elems(nkt);
     let (nt, n_ctx) = (100usize, 128usize);

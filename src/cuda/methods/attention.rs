@@ -307,13 +307,19 @@ impl CudaState {
         nt: usize,
     ) {
         let stream = self.stream();
-        // 8n: prefill (nt >= 64) runs the FA-style tiled attention. The
-        // legacy kernel is one block per (token, head) — K re-read per token
-        // per head (7B @2K: ~132 GB/layer) with a 128-register accumulator —
-        // and measured 176 ms/layer, 76% of the whole 2K prefill. The gate is
-        // `hd == 128` — the Qwen2/Qwen3 head dim the tile arithmetic and the
-        // shared-memory budget are computed for — and the smem opt-in can fail
-        // on constrained devices, hence the rc fallback.
+        // 8n: prefill (nt >= 64) runs the FA-style tiled attention. The legacy
+        // kernel is one block per (token, head) — K re-read per token per head
+        // (7B @2K: ~132 GB/layer) with a 128-register accumulator — and measured
+        // 176 ms/layer, 76% of the whole 2K prefill.
+        //
+        // #845: the gate is the *head dimension* — 64 or 128, the two shapes the
+        // supported models use and the pair Metal's `prefill_flash_enabled`
+        // accepts. It used to admit hd 128 only, which left hd 64 (Qwen2.5-0.5B
+        // and the 1.5B drafts) on the legacy kernel: record 115 measured that
+        // kernel at 72.7% (f16) / 78.5% (packed q8_0) of the whole hd-64
+        // `pp2048`, so the same FA body now serves both head dims. The template
+        // is instantiated per head dim (kernel side), and the launcher refuses a
+        // third, which is the `rc != 0` fallback below.
         //
         // D5-R stage 4 (doc 86): the verify shapes (nt = d+1, i.e. 2..=9)
         // used to fall through to the legacy per-(token,head) kernel — the
@@ -334,7 +340,11 @@ impl CudaState {
         // layout-tagged kernel remains the documented fallback (the `rc == -1`
         // arm below), and the packed arm reaches it with the same rounded
         // window modes.
-        if nt >= 2 && hd == 128 && !Self::no_fa_prefill() && layout != crate::cuda::KV_LAYOUT_F32 {
+        if nt >= 2
+            && (hd == 64 || hd == 128)
+            && !Self::no_fa_prefill()
+            && layout != crate::cuda::KV_LAYOUT_F32
+        {
             let rc = unsafe {
                 launch_fa_prefill_kv(
                     q as *const f32,
@@ -354,12 +364,21 @@ impl CudaState {
                 )
             };
             if rc == 0 {
-                // #144 item 3: the observation half (gate contract rule 3) — a gate
-                // that must prove the packed FA path *ran* cannot read the dispatch's
-                // own answer, so the chokepoint records it and
-                // `cuda_q8_0_fa_prefill_attention_parity` asserts the counter moved.
-                if layout == crate::cuda::KV_LAYOUT_Q8_0 {
-                    crate::testfail::note_checked("cuda_fa_prefill_q8_0");
+                // The observation half (gate contract rule 3) — a gate that must
+                // prove the FA path *ran* cannot read the dispatch's own answer, so
+                // the chokepoint records it per layout and the parity gates assert
+                // the counter moved. #144 item 3 added the packed counter; #845 the
+                // f16 one, because `cuda_fa_prefill_attention_parity` at hd 64 would
+                // otherwise pass on the legacy body (both are within its 5e-3 CPU
+                // tolerance, so the parity alone does not pin the route).
+                match layout {
+                    crate::cuda::KV_LAYOUT_Q8_0 => {
+                        crate::testfail::note_checked("cuda_fa_prefill_q8_0")
+                    }
+                    crate::cuda::KV_LAYOUT_F16 => {
+                        crate::testfail::note_checked("cuda_fa_prefill_f16")
+                    }
+                    _ => {}
                 }
                 return;
             }
