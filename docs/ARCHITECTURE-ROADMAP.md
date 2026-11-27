@@ -201,7 +201,7 @@ inputs/outputs are the crossing edges. Execution then walks splits, calling
    exactly what breaks the first time an op is unsupported — e.g. `Softmax` on
    both device backends (`src/graph/op_matrix.rs`), or a fused arm one backend
    has not learned yet: `QkvBiasRopeStore` was exactly that case, CUDA-only
-   (`cuda_backend.rs:2123`) with Metal refusing it, until [#844] ported it
+   (`cuda_backend.rs:2136`) with Metal refusing it, until [#844] ported it
    (Metal's `supports_op` table now answers `dtype == DType::F32` for it —
    `metal_backend.rs:673`).
 2. **Synchronous, host-mediated cross-backend movement.** — **partly closed by
@@ -839,7 +839,7 @@ behavioural defects found while executing the plan, already fixed.
 9. ~~**Single-entry cross-backend staging** (`GraphAllocator::cross_staging`), mitigated by
    the consumer-side filter at `scheduler::cross_input_ready`.~~ **Fixed in A5** — keyed
    by `(graph uid, node, dst_backend)`; two foreign consumers can now be served.
-10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2475`), so the
+10. **`read_host` returns `None` on CUDA** (`cuda_backend.rs:2488`), so the
     trait's host-read contract is backend-dependent; the allocator compensates
     with `copy_to_host` (`alloc.rs:`).
 11. **CUDA pool never releases device memory** (`cuda_backend.rs:`),

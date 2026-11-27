@@ -602,7 +602,7 @@ kernel's structural invariants, and launches. The wrapper adds one
 capture-window duty:
 
 ```rust
-// src/graph/cuda_backend.rs:2381 (`execute_node`)
+// src/graph/cuda_backend.rs:2394 (`execute_node`)
 fn execute_node(
     &mut self,
     node: &CNode,
@@ -795,7 +795,7 @@ correctness fallbacks are not, and the code keeps the distinction visible.
 
 #### 3.2.7 Split-KV attention, the kernel
 
-The host side (`gqa_attn_split`, `src/cuda/methods/attention.rs:417`) computes the partial-row
+The host side (`gqa_attn_split`, `src/cuda/methods/attention.rs:504`) computes the partial-row
 stride `pstr = (4 + hd + 3) & !3` (running max, running sum, then the
 `hd`-wide output accumulator, rounded to a 16-byte boundary for the `float4`
 writes), grows the partials scratch *once* (a fixed `[32][nh][pstr]` slab —
@@ -1001,7 +1001,7 @@ The pool mirrors Metal's (doc 14): a `Vec<CudaBuf>` plus a byte-length-matched
 free list. Two details are CUDA-specific:
 
 ```rust
-// src/graph/cuda_backend.rs:2328 (`alloc_buffer`) (alloc_buffer)
+// src/graph/cuda_backend.rs:2341 (`alloc_buffer`) (alloc_buffer)
 fn alloc_buffer(&mut self, size: usize) -> usize {
     let _sg = self.stream_guard(); // cudaMalloc syncs the device
     let bytes = size * 4;
