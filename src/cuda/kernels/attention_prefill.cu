@@ -146,9 +146,23 @@ __global__ void fa_prefill_kv(
     // row land on the same bank group (8-way conflict per load). +8 halves
     // (144 B / 272 B) shifts each row by 4 banks.
     const int sstr = hd + 8;
+    // #865: the f16 arm double-buffers its K/V tiles where a second pair still
+    // fits the SM's shared-memory budget — one tile is prefetched into the other
+    // buffer while the previous one is consumed, so the copy no longer sits on the
+    // critical path. The budget is what decides: a block is 34,816 B single-
+    // buffered and 52,224 B double at hd 128, against 102,400 B per SM on this
+    // device, so hd 128 would drop from 2 resident blocks to 1 and measured +14.6%
+    // slower — it stays single. At hd 64 the pair is 27,648 B, three blocks still
+    // fit (registers are the next limit at three), and the doubled staging
+    // measured 4.3% faster.
+    //
+    // The packed arm cannot double-buffer at any shape: its staging is a
+    // synchronous dequant (#858/#862 move that into the once-per-layer plane), not
+    // a copy, so it keeps one pair and the stage-then-wait shape.
+    constexpr int NBUF = (LAYOUT == KV_LAYOUT_F16 && HD == 64) ? 2 : 1;
     __half* Qs = reinterpret_cast<__half*>(smem);
-    __half* Ks = Qs + FA_TQ * sstr;
-    __half* Vs = Ks + FA_TKV * sstr;
+    __half* Kb = Qs + FA_TQ * sstr;                 // NBUF tile rows
+    __half* Vb = Kb + NBUF * FA_TKV * sstr;
 
     const int tq0 = blockIdx.x * FA_TQ;
     const int h = blockIdx.y;
@@ -240,15 +254,54 @@ __global__ void fa_prefill_kv(
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
 
     const int kt0 = CAUSAL ? 0 : (win_lo / FA_TKV) * FA_TKV;
-    for (int kt = kt0; kt < kv_end; kt += FA_TKV) {
-        // stage K/V tile (padded stride, zero-filled beyond kv_end)
-        fa_stage_kv_async<MAP, LAYOUT>(k, v, Ks, Vs, bound, mt, kt, kv_end, hk, hd, stride_kv,
+    // #865: tile kt0 goes into buffer 0 before the loop; each iteration then issues
+    // tile kt + FA_TKV into the other buffer and retires only the group *before*
+    // it (`wait_group 1`), so the copy of the next tile overlaps this tile's
+    // QK^T / softmax / P@V. The trailing __syncthreads() is what keeps the buffer
+    // the next iteration writes from being the one this iteration still reads.
+    if (NBUF == 2 && kt0 < kv_end) {
+        fa_stage_kv_async<MAP, LAYOUT>(k, v, Kb, Vb, bound, mt, kt0, kv_end, hk, hd, stride_kv,
                                        sstr, tid, 128, row_bytes);
 #if __CUDA_ARCH__ >= 800
         asm volatile("cp.async.commit_group;\n");
-        asm volatile("cp.async.wait_group 0;\n");
 #endif
+    }
+    int bidx = 0;
+    for (int kt = kt0; kt < kv_end; kt += FA_TKV) {
+        // stage K/V tile (padded stride, zero-filled beyond kv_end)
+        if (NBUF == 2) {
+            const int nxt = kt + FA_TKV;
+            __half* Kn = Kb + (bidx ^ 1) * FA_TKV * sstr;
+            __half* Vn = Vb + (bidx ^ 1) * FA_TKV * sstr;
+#if __CUDA_ARCH__ >= 800
+            if (nxt < kv_end) {
+                fa_stage_kv_async<MAP, LAYOUT>(k, v, Kn, Vn, bound, mt, nxt, kv_end, hk, hd,
+                                               stride_kv, sstr, tid, 128, row_bytes);
+                asm volatile("cp.async.commit_group;\n");
+                asm volatile("cp.async.wait_group 1;\n");
+            } else {
+                // last tile: nothing prefetched, so retire the one in flight
+                asm volatile("cp.async.wait_group 0;\n");
+            }
+#else
+            // pre-sm80: no cp.async, so the prefetch is the same synchronous copy
+            // done one tile earlier — no overlap, but the identical instruction mix
+            if (nxt < kv_end) {
+                fa_stage_kv_async<MAP, LAYOUT>(k, v, Kn, Vn, bound, mt, nxt, kv_end, hk, hd,
+                                               stride_kv, sstr, tid, 128, row_bytes);
+            }
+#endif
+        } else {
+            fa_stage_kv_async<MAP, LAYOUT>(k, v, Kb, Vb, bound, mt, kt, kv_end, hk, hd, stride_kv,
+                                           sstr, tid, 128, row_bytes);
+#if __CUDA_ARCH__ >= 800
+            asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 0;\n");
+#endif
+        }
         __syncthreads();
+        const __half* Ks = Kb + bidx * FA_TKV * sstr;
+        const __half* Vs = Vb + bidx * FA_TKV * sstr;
 
         // S = Q · K^T via wmma (reduction over hd), this warp's full row block.
         // fc[0] = kv cols [0,16), fc[1] = [16, FA_TKV) of this tile.
@@ -364,6 +417,7 @@ __global__ void fa_prefill_kv(
             }
         }
         __syncthreads();
+        bidx ^= (NBUF - 1);
     }
 
     // write out: acc / l — rows with l == 0 stay 0 (fully masked). Full tiles
@@ -481,7 +535,13 @@ int launch_fa_prefill_kv(
     // device limit" fallback could not trigger. A head dim above 128 is not
     // reachable (the backend's guard caps `hd` at 128); if one ever is, it must
     // go back through `minfer_smem_optin` (guard.cu, ADR-0034).
-    size_t smem = ((size_t)FA_TQ + 2 * FA_TKV) * (hd + 8) * 2;
+    // #865: the double-going tile pair is only used at hd 64, where it still fits
+    // the SM's shared-memory budget (the kernel decides; see NBUF there), so every
+    // shape stays under the 48 KiB default dynamic-smem cap — 27,648 B at hd 64
+    // double-buffered, 34,816 B at hd 128 single — and no `cudaFuncSetAttribute`
+    // opt-in is issued.
+    const size_t nbuf = (layout == KV_LAYOUT_F16 && hd == 64) ? 2 : 1;
+    size_t smem = ((size_t)FA_TQ + 2 * nbuf * FA_TKV) * (hd + 8) * 2;
     dim3 grid((nt + FA_TQ - 1) / FA_TQ, nh, 1);
     // #162: one source site per (hd, layout, window mode) — twelve — so a failed
     // launch names the exact instantiation that failed and the #162 device gate

@@ -276,6 +276,7 @@
         - [115 — #845: the hd-64 prefill takes the FA body — 4.32x, and the packed arm reads 1.010x (LANDED)](./cuda_optimization_steps/115-c4-packed-q8-kv-hd64-prefill.md)
         - [116 — #858: the packed prefill stages once per layer — the hd-128 cell at 1.021x (LANDED)](./cuda_optimization_steps/116-c4-packed-q8-kv-once-per-layer.md)
         - [117 — #862: the staging plane is window-bounded, and a budget guard can refuse it (LANDED)](./cuda_optimization_steps/117-c4-packed-q8-kv-window-plane.md)
+        - [118 — #865: double-buffered FA staging — where it fits (hd 64, −4%), and the occupancy wall it hit (LANDED)](./cuda_optimization_steps/118-c4-fa-prefill-double-buffer.md)
 
 # Sampling and Chat Templates
 

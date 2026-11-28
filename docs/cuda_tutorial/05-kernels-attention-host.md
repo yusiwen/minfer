@@ -179,7 +179,7 @@ SM — Streaming Multiprocessor — and can share an on-chip scratchpad called
 streams the whole key/value history for that head through a 32-key tile:
 `grid.x = ceil(nt / 64)` query token tiles, `grid.y = nh` heads,
 128 threads = 4 warps (a warp is 32 threads that execute in lockstep)
-`launch_fa_prefill_kv` (`attention_prefill.cu:466`, the launcher). K/V come from the persistent cache as
+`launch_fa_prefill_kv` (`attention_prefill.cu:512`, the launcher). K/V come from the persistent cache as
 `__half` (16-bit float — the f16 KV cache from chapter 04's bandwidth story);
 q and the output `o` are f32. The kernel is instantiated per head dimension — 64
 and 128, the two the supported models use — see the dispatch note at the end of
@@ -930,7 +930,7 @@ stages K/V once per 32-key chunk: **~0.8 GB per layer** — about 165× less
 traffic `fa_prefill_kv` (`attention_prefill.cu:130`). The grid at those shapes is small and
 regular: `ceil(2048/64) = 32` query tiles × 28 heads = 896 blocks of 128
 threads, each asking for `((64 + 2·32) · 136 · 2) = 34,816 B ≈ 34.8 KB` of
-dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:466`). Both head dims the
+dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:512`). Both head dims the
 supported models use are instantiated — 64 and 128, #845 — and at hd 64 the same
 tile asks 18 432 B; both are under the 48 KiB default dynamic-smem cap, so the
 launcher issues no `cudaFuncSetAttribute` opt-in at all. Two things still decide
