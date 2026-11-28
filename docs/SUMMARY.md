@@ -277,6 +277,7 @@
         - [116 — #858: the packed prefill stages once per layer — the hd-128 cell at 1.021x (LANDED)](./cuda_optimization_steps/116-c4-packed-q8-kv-once-per-layer.md)
         - [117 — #862: the staging plane is window-bounded, and a budget guard can refuse it (LANDED)](./cuda_optimization_steps/117-c4-packed-q8-kv-window-plane.md)
         - [118 — #865: double-buffered FA staging — where it fits (hd 64, −4%), and the occupancy wall it hit (LANDED)](./cuda_optimization_steps/118-c4-fa-prefill-double-buffer.md)
+        - [119 — #865: a 128-row FA tile — −7.9% on the hd-128 launch, bit-identical, and the smem pair becomes affordable (LANDED)](./cuda_optimization_steps/119-c4-fa-tile-128.md)
 
 # Sampling and Chat Templates
 

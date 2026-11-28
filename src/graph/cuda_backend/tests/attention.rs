@@ -281,7 +281,10 @@ fn fa_prefill_q8_0_parity(hd: usize) {
     let (nh, nk_h) = (4usize, 2usize);
     let nkt = nk_h * hd;
     let row_words = KvFormat::Q8_0.row_elems(nkt);
-    let (nt, n_ctx) = (100usize, 128usize);
+    // #865: the tile is 128 query rows, so `nt` must exceed it for the staged
+    // (once-per-layer) route to be the one under test — and 200 gives one full tile
+    // plus one tail tile, i.e. both output-store paths.
+    let (nt, n_ctx) = (200usize, 256usize);
     let scale = 1.0 / (hd as f32).sqrt();
     let pos: Vec<usize> = (0..nt).collect();
 

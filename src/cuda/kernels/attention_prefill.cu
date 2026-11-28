@@ -12,7 +12,7 @@ extern "C" {
 // re-read per token per head (7B @2K: ~132 GB per layer) and the hd-wide
 // accumulator lives in registers (float4 oc[32] = 128 regs → spills). It
 // measured 176 ms per layer (76% of the whole 2K prefill). This kernel
-// tiles the q dimension: one block per (64-token q tile, head), K/V tiles
+// tiles the q dimension: one block per (128-token q tile, head), K/V tiles
 // staged in shared memory, QK^T on tensor cores, online softmax with the
 // O accumulator in shared memory. K traffic drops to ~0.8 GB per layer.
 //
@@ -23,15 +23,20 @@ extern "C" {
 // tensor-core QK^T, the fragment-resident softmax and P·V — is layout-blind.
 //
 // Shared layout (dynamic, ~35 KB — opt-in via cudaFuncSetAttribute):
-//   Qs [64*hd] f16   q tile (scale folded in, f16 for the tensor-core QK^T)
+//   Qs [FA_TQ*hd] f16   q tile (scale folded in, f16 for the tensor-core QK^T)
 //   Ks [FA_TKV*hd] f16   K tile      Vs [FA_TKV*hd] f16  V tile
 // S and P live entirely in wmma accumulator fragments (FAP2 register-resident
 // softmax — NO Sf/Pf shared round trip, no m/l/alpha shared arrays). Each warp
 // owns a full 16-query-row block x all FA_TKV KV columns, so the online softmax
 // (per-row max/sum on the fragments) and the P·V contraction (build the f16
 // A-operand from the scaled fragments in place) are both warp-local.
-#define FA_TQ 64
+#define FA_TQ 128
 #define FA_TKV 32
+// #865 item 2: one warp per 16 query rows, so the block's thread count follows the
+// tile (2 threads per query row, i.e. 8 warps at FA_TQ = 128). The tile serves
+// twice as many queries per staged K/V byte and per __syncthreads() as the
+// original 64, at the same warps per SM (one 8-warp block instead of two 4-warp).
+#define FA_NT (FA_TQ * 2)
 
 // P3: K/V tile staging (16B cp.async chunks; rows beyond kv_end zero-filled).
 // It is **synchronous**, not double-buffered: one Ks/Vs pair, and the k-loop
@@ -146,20 +151,18 @@ __global__ void fa_prefill_kv(
     // row land on the same bank group (8-way conflict per load). +8 halves
     // (144 B / 272 B) shifts each row by 4 banks.
     const int sstr = hd + 8;
-    // #865: the f16 arm double-buffers its K/V tiles where a second pair still
-    // fits the SM's shared-memory budget — one tile is prefetched into the other
-    // buffer while the previous one is consumed, so the copy no longer sits on the
-    // critical path. The budget is what decides: a block is 34,816 B single-
-    // buffered and 52,224 B double at hd 128, against 102,400 B per SM on this
-    // device, so hd 128 would drop from 2 resident blocks to 1 and measured +14.6%
-    // slower — it stays single. At hd 64 the pair is 27,648 B, three blocks still
-    // fit (registers are the next limit at three), and the doubled staging
-    // measured 4.3% faster.
+    // #865: the f16 arm double-buffers its K/V tiles — one tile is prefetched into
+    // the other buffer while the previous one is consumed — so the copy no longer
+    // sits on the critical path. The pair is affordable at the 128-row tile because
+    // the block count is set by registers, not shared memory: a block is 52,224 B
+    // single- and 69,632 B double-buffered at hd 128 (34,816 / 52,224 B at hd 64)
+    // against a 102,400 B shared budget, while 256 threads at 127-131 registers are
+    // 33.5 K of the 65,536 register file — one block either way.
     //
-    // The packed arm cannot double-buffer at any shape: its staging is a
-    // synchronous dequant (#858/#862 move that into the once-per-layer plane), not
-    // a copy, so it keeps one pair and the stage-then-wait shape.
-    constexpr int NBUF = (LAYOUT == KV_LAYOUT_F16 && HD == 64) ? 2 : 1;
+    // The packed arm cannot double-buffer: its staging is a synchronous dequant
+    // (#858/#862 move that into the once-per-layer plane), not a copy, so it keeps
+    // one pair and the stage-then-wait shape.
+    constexpr int NBUF = (LAYOUT == KV_LAYOUT_F16) ? 2 : 1;
     __half* Qs = reinterpret_cast<__half*>(smem);
     __half* Kb = Qs + FA_TQ * sstr;                 // NBUF tile rows
     __half* Vb = Kb + NBUF * FA_TKV * sstr;
@@ -170,10 +173,10 @@ __global__ void fa_prefill_kv(
     const int hk = h / gqa;
     const int ne_q = nh * hd;
     const int stride_kv = nk * hd;
-    const int tid = threadIdx.x; // 128
+    const int tid = threadIdx.x; // FA_NT = 2 * FA_TQ
 
     // load q tile (scale folded in) as f16
-    for (int i = tid; i < FA_TQ * hd; i += 128) {
+    for (int i = tid; i < FA_TQ * hd; i += FA_NT) {
         int r = i / hd, d = i % hd;
         int t = tq0 + r;
         float qv = (t < nt) ? q[(size_t)t * ne_q + h * hd + d] * scale : 0.0f;
@@ -217,13 +220,13 @@ __global__ void fa_prefill_kv(
     }
     const bool tile_full = (tq0 + FA_TQ <= nt); // all 64 O rows in-bounds
 
-    // FAP2 decomposition: 4 warps (128 threads), warp wm owns a full 16-query-row
-    // block x all FA_TKV KV columns. S lives in registers (wmma accumulators) and
+    // FAP2 decomposition: 8 warps (FA_NT = 256 threads), warp wm owns a full
+    // 16-query-row block x all FA_TKV KV columns. S lives in registers (wmma accumulators) and
     // is softmaxed in place; P (the scaled S) is converted f32->f16 into the A
     // fragment of P@V, so the S/P shared round trip and its bank conflicts are
     // gone entirely. m/l/alpha are register-resident (per lane, 2 rows).
     using namespace nvcuda;
-    const int warp = tid >> 5; // 0..3
+    const int warp = tid >> 5; // 0..FA_TQ/16-1
     const int wm = warp;       // 16-query-row block
     const int lane = tid & 31;
     const int l = lane & 3;
@@ -261,7 +264,7 @@ __global__ void fa_prefill_kv(
     // the next iteration writes from being the one this iteration still reads.
     if (NBUF == 2 && kt0 < kv_end) {
         fa_stage_kv_async<MAP, LAYOUT>(k, v, Kb, Vb, bound, mt, kt0, kv_end, hk, hd, stride_kv,
-                                       sstr, tid, 128, row_bytes);
+                                       sstr, tid, FA_NT, row_bytes);
 #if __CUDA_ARCH__ >= 800
         asm volatile("cp.async.commit_group;\n");
 #endif
@@ -276,7 +279,7 @@ __global__ void fa_prefill_kv(
 #if __CUDA_ARCH__ >= 800
             if (nxt < kv_end) {
                 fa_stage_kv_async<MAP, LAYOUT>(k, v, Kn, Vn, bound, mt, nxt, kv_end, hk, hd,
-                                               stride_kv, sstr, tid, 128, row_bytes);
+                                               stride_kv, sstr, tid, FA_NT, row_bytes);
                 asm volatile("cp.async.commit_group;\n");
                 asm volatile("cp.async.wait_group 1;\n");
             } else {
@@ -288,12 +291,12 @@ __global__ void fa_prefill_kv(
             // done one tile earlier — no overlap, but the identical instruction mix
             if (nxt < kv_end) {
                 fa_stage_kv_async<MAP, LAYOUT>(k, v, Kn, Vn, bound, mt, nxt, kv_end, hk, hd,
-                                               stride_kv, sstr, tid, 128, row_bytes);
+                                               stride_kv, sstr, tid, FA_NT, row_bytes);
             }
 #endif
         } else {
             fa_stage_kv_async<MAP, LAYOUT>(k, v, Kb, Vb, bound, mt, kt, kv_end, hk, hd, stride_kv,
-                                           sstr, tid, 128, row_bytes);
+                                           sstr, tid, FA_NT, row_bytes);
 #if __CUDA_ARCH__ >= 800
             asm volatile("cp.async.commit_group;\n");
             asm volatile("cp.async.wait_group 0;\n");
@@ -437,27 +440,36 @@ __global__ void fa_prefill_kv(
                 acc[ob], ne_q, wmma::mem_row_major);
         }
     } else {
-        // Qs/Ks/Vs regions are free after the KV loop: contiguous staging for
-        // the FA_TQ x hd f32 O tile — 32 KB of the 34.8 KB budget at hd 128,
-        // 16 KB of 18.4 KB at hd 64.
-        float* stage = reinterpret_cast<float*>(smem);
+        // #865: the tail tile stores per element with a row predicate.
+        //
+        // The pre-#865 path staged the FA_TQ x hd f32 output tile through the
+        // shared-memory region the KV loop had freed; at FA_TQ = 128 that is 64 KB
+        // at hd 128, more than the block's whole budget, and the predicate is exact
+        // anyway. Each lane owns two fragment rows (r0 = lane>>2, r1 = r0 + 8) and
+        // the column pair `2 * (lane&3)` plus its +8 partner in every 16-column
+        // block — the same mapping the softmax and the rescale already use.
         float i0 = (l0 > 0.0f) ? 1.0f / l0 : 0.0f;
         float i1 = (l1 > 0.0f) ? 1.0f / l1 : 0.0f;
+        const int r0 = lane >> 2, r1 = r0 + 8;
+        const int t0r = tq0 + wm * 16 + r0, t1r = tq0 + wm * 16 + r1;
+        const int c0 = 2 * (lane & 3);
+        float* orow0 = o + (size_t)t0r * ne_q + h * hd;
+        float* orow1 = o + (size_t)t1r * ne_q + h * hd;
 #pragma unroll
         for (int ob = 0; ob < NOB; ob++) {
-            acc[ob].x[0] *= i0; acc[ob].x[1] *= i0;
-            acc[ob].x[2] *= i1; acc[ob].x[3] *= i1;
-            acc[ob].x[4] *= i0; acc[ob].x[5] *= i0;
-            acc[ob].x[6] *= i1; acc[ob].x[7] *= i1;
-            wmma::store_matrix_sync(
-                &stage[(wm * 16) * hd + ob * 16],
-                acc[ob], hd, wmma::mem_row_major);
-        }
-        __syncthreads();
-        for (int idx = tid; idx < FA_TQ * hd; idx += 128) {
-            int r = idx / hd, c = idx % hd;
-            int t = tq0 + r;
-            if (t < nt) o[(size_t)t * ne_q + h * hd + c] = stage[idx];
+            const int base = ob * 16 + c0;
+            if (t0r < nt) {
+                orow0[base] = acc[ob].x[0] * i0;
+                orow0[base + 1] = acc[ob].x[1] * i0;
+                orow0[base + 8] = acc[ob].x[4] * i0;
+                orow0[base + 9] = acc[ob].x[5] * i0;
+            }
+            if (t1r < nt) {
+                orow1[base] = acc[ob].x[2] * i1;
+                orow1[base + 1] = acc[ob].x[3] * i1;
+                orow1[base + 8] = acc[ob].x[6] * i1;
+                orow1[base + 9] = acc[ob].x[7] * i1;
+            }
         }
     }
 }
@@ -517,6 +529,27 @@ int launch_dequant_kv_q8_0_f16(
     return minfer_launch_ok_opt("launch:dequant_kv_q8_0_f16", "dequant_kv_q8_0_f16") ? 0 : -1;
 }
 
+// #865: with the 128-row tile every hd-128 instantiation is above the 48 KiB
+// **default** dynamic-smem cap (52,224 B packed, 69,632 B double-buffered f16), so
+// the opt-in is back for that head dim (ADR-0034: eager in the pre-warm, lazily
+// re-checked here as defence in depth). hd 64 needs none (27,648 / 36,864 B).
+static bool fa_optin_hd128(void) {
+    const int smem_f16 = (int)(((size_t)FA_TQ + 4 * FA_TKV) * (128 + 8) * 2);
+    const int smem_q8 = (int)(((size_t)FA_TQ + 2 * FA_TKV) * (128 + 8) * 2);
+#define FA_OPTIN(C, M, L)                                                                    \
+    minfer_smem_optin("attr:fa_prefill_kv", "fa_prefill_kv<" #C "," #M "," #L ",128>",        \
+                      (const void*)&fa_prefill_kv<C, M, L, 128>,                             \
+                      (L == KV_LAYOUT_F16) ? smem_f16 : smem_q8)
+    bool ok = FA_OPTIN(true, false, KV_LAYOUT_F16);
+    ok = ok && FA_OPTIN(false, false, KV_LAYOUT_F16);
+    ok = ok && FA_OPTIN(false, true, KV_LAYOUT_F16);
+    ok = ok && FA_OPTIN(true, false, KV_LAYOUT_Q8_0);
+    ok = ok && FA_OPTIN(false, false, KV_LAYOUT_Q8_0);
+    ok = ok && FA_OPTIN(false, true, KV_LAYOUT_Q8_0);
+#undef FA_OPTIN
+    return ok;
+}
+
 int launch_fa_prefill_kv(
     const float* q, const void* k, const void* v, float* o,
     const int* bound, int mode, int nh, int nk, int hd, float scale, int nt,
@@ -535,13 +568,24 @@ int launch_fa_prefill_kv(
     // device limit" fallback could not trigger. A head dim above 128 is not
     // reachable (the backend's guard caps `hd` at 128); if one ever is, it must
     // go back through `minfer_smem_optin` (guard.cu, ADR-0034).
-    // #865: the double-going tile pair is only used at hd 64, where it still fits
-    // the SM's shared-memory budget (the kernel decides; see NBUF there), so every
-    // shape stays under the 48 KiB default dynamic-smem cap — 27,648 B at hd 64
-    // double-buffered, 34,816 B at hd 128 single — and no `cudaFuncSetAttribute`
-    // opt-in is issued.
-    const size_t nbuf = (layout == KV_LAYOUT_F16 && hd == 64) ? 2 : 1;
+    // #865: the f16 arm double-buffers (see NBUF in the kernel); with the 128-row
+    // tile the block count is register-bound, so both shapes afford the pair:
+    // 52,224 B at hd 64 and 69,632 B at hd 128, both under the 102,400 B per-SM
+    // budget and both **over the 48 KiB default per-block cap** — so the dynamic
+    // smem opt-in is required again for every shape (ADR-0034: eager in the
+    // pre-warm, lazily re-checked here as defence in depth).
+    const size_t nbuf = (layout == KV_LAYOUT_F16) ? 2 : 1;
     size_t smem = ((size_t)FA_TQ + 2 * nbuf * FA_TKV) * (hd + 8) * 2;
+    if (hd == 128) {
+        // Cached: the first launch (the capture warmup, #218) makes the driver
+        // calls outside any capture window; later launches must not repeat them
+        // inside one.
+        static bool opted_in = false;
+        if (!opted_in) {
+            if (!fa_optin_hd128()) return -1;
+            opted_in = true;
+        }
+    }
     dim3 grid((nt + FA_TQ - 1) / FA_TQ, nh, 1);
     // #162: one source site per (hd, layout, window mode) — twelve — so a failed
     // launch names the exact instantiation that failed and the #162 device gate
@@ -554,19 +598,19 @@ int launch_fa_prefill_kv(
             if (mode == ATTN_WIN_MAP) {
                 minfer_launch_prelude("launch:fa_prefill_kv__q8_0_map_hd64",
                                       "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0,64>");
-                fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_map_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_map_hd64", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_map_hd64",
                                                 "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0,64>");
             } else if (mode == ATTN_WIN_SPAN) {
                 minfer_launch_prelude("launch:fa_prefill_kv__q8_0_span_hd64",
                                       "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0,64>");
-                fa_prefill_kv<false, false, KV_LAYOUT_Q8_0, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_span_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<false, false, KV_LAYOUT_Q8_0, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_span_hd64", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_span_hd64",
                                                 "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0,64>");
             } else {
                 minfer_launch_prelude("launch:fa_prefill_kv__q8_0_causal_hd64",
                                       "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0,64>");
-                fa_prefill_kv<true, false, KV_LAYOUT_Q8_0, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_causal_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<true, false, KV_LAYOUT_Q8_0, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_causal_hd64", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_causal_hd64",
                                                 "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0,64>");
             }
@@ -574,19 +618,19 @@ int launch_fa_prefill_kv(
             if (mode == ATTN_WIN_MAP) {
                 minfer_launch_prelude("launch:fa_prefill_kv__f16_map_hd64",
                                       "fa_prefill_kv<false,true,KV_LAYOUT_F16,64>");
-                fa_prefill_kv<false, true, KV_LAYOUT_F16, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_map_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<false, true, KV_LAYOUT_F16, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_map_hd64", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_map_hd64",
                                                 "fa_prefill_kv<false,true,KV_LAYOUT_F16,64>");
             } else if (mode == ATTN_WIN_SPAN) {
                 minfer_launch_prelude("launch:fa_prefill_kv__f16_span_hd64",
                                       "fa_prefill_kv<false,false,KV_LAYOUT_F16,64>");
-                fa_prefill_kv<false, false, KV_LAYOUT_F16, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_span_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<false, false, KV_LAYOUT_F16, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_span_hd64", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_span_hd64",
                                                 "fa_prefill_kv<false,false,KV_LAYOUT_F16,64>");
             } else {
                 minfer_launch_prelude("launch:fa_prefill_kv__f16_causal_hd64",
                                       "fa_prefill_kv<true,false,KV_LAYOUT_F16,64>");
-                fa_prefill_kv<true, false, KV_LAYOUT_F16, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_causal_hd64", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<true, false, KV_LAYOUT_F16, 64><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_causal_hd64", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_causal_hd64",
                                                 "fa_prefill_kv<true,false,KV_LAYOUT_F16,64>");
             }
@@ -598,19 +642,19 @@ int launch_fa_prefill_kv(
             if (mode == ATTN_WIN_MAP) {
                 minfer_launch_prelude("launch:fa_prefill_kv__q8_0_map",
                                       "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0,128>");
-                fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_map", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_map",
                                                 "fa_prefill_kv<false,true,KV_LAYOUT_Q8_0,128>");
             } else if (mode == ATTN_WIN_SPAN) {
                 minfer_launch_prelude("launch:fa_prefill_kv__q8_0_span",
                                       "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0,128>");
-                fa_prefill_kv<false, false, KV_LAYOUT_Q8_0, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<false, false, KV_LAYOUT_Q8_0, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_span", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_span",
                                                 "fa_prefill_kv<false,false,KV_LAYOUT_Q8_0,128>");
             } else {
                 minfer_launch_prelude("launch:fa_prefill_kv__q8_0_causal",
                                       "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0,128>");
-                fa_prefill_kv<true, false, KV_LAYOUT_Q8_0, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<true, false, KV_LAYOUT_Q8_0, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__q8_0_causal", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__q8_0_causal",
                                                 "fa_prefill_kv<true,false,KV_LAYOUT_Q8_0,128>");
             }
@@ -618,19 +662,19 @@ int launch_fa_prefill_kv(
             if (mode == ATTN_WIN_MAP) {
                 minfer_launch_prelude("launch:fa_prefill_kv__f16_map",
                                       "fa_prefill_kv<false,true,KV_LAYOUT_F16,128>");
-                fa_prefill_kv<false, true, KV_LAYOUT_F16, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_map", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<false, true, KV_LAYOUT_F16, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_map", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_map",
                                                 "fa_prefill_kv<false,true,KV_LAYOUT_F16,128>");
             } else if (mode == ATTN_WIN_SPAN) {
                 minfer_launch_prelude("launch:fa_prefill_kv__f16_span",
                                       "fa_prefill_kv<false,false,KV_LAYOUT_F16,128>");
-                fa_prefill_kv<false, false, KV_LAYOUT_F16, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_span", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<false, false, KV_LAYOUT_F16, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_span", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_span",
                                                 "fa_prefill_kv<false,false,KV_LAYOUT_F16,128>");
             } else {
                 minfer_launch_prelude("launch:fa_prefill_kv__f16_causal",
                                       "fa_prefill_kv<true,false,KV_LAYOUT_F16,128>");
-                fa_prefill_kv<true, false, KV_LAYOUT_F16, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_causal", 128), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
+                fa_prefill_kv<true, false, KV_LAYOUT_F16, 128><<<grid, minfer_launch_block("launch:fa_prefill_kv__f16_causal", FA_NT), smem, stream>>>(q, k, v, o, bound, nh, nk, scale, nt, row_bytes);
                 launched = minfer_launch_ok_opt("launch:fa_prefill_kv__f16_causal",
                                                 "fa_prefill_kv<true,false,KV_LAYOUT_F16,128>");
             }
@@ -664,4 +708,11 @@ extern "C" void minfer_prewarm_attention_prefill_kernels(void) {
     MINFER_PREWARM_ONE(a, (fa_prefill_kv<false, true, KV_LAYOUT_Q8_0, 128>));
     // #858: the once-per-layer packed staging pass.
     MINFER_PREWARM_ONE(a, (dequant_kv_q8_0_f16));
+    // #865: every hd-128 instantiation is now above the 48 KiB default dynamic-smem
+    // cap; the opt-in belongs here, at load and outside every capture window
+    // (ADR-0034). The launcher re-checks lazily and refuses the launch if the
+    // device still says no.
+    if (!fa_optin_hd128()) {
+        fprintf(stderr, "minfer/cuda: fa_prefill_kv hd-128 dynamic-smem opt-in refused at load\n");
+    }
 }

@@ -145,12 +145,12 @@ Two details that matter when you read the real kernel:
 
 - The **first chunk is special**: `m` starts at `−∞` and `α` would be
   `exp(−∞ − m_new) = 0`, so the code simply skips the rescale on the first tile
-  (see the `fresh0`/`fresh1` flags at `fa_prefill_kv` (`attention_prefill.cu:130`)).
+  (see the `fresh0`/`fresh1` flags at `fa_prefill_kv` (`attention_prefill.cu:135`)).
 - **Masked keys must contribute exactly nothing**: causality forbids attending
   to future positions, so a masked score is forced to `0.0` *after* the max
   reduction, not merely given a tiny weight — otherwise `l` would be polluted and
   the normalization would be subtly wrong (this is the `(gcol[q] < qlim0)`
-  guard at `fa_prefill_kv` (`attention_prefill.cu:130`).
+  guard at `fa_prefill_kv` (`attention_prefill.cu:135`).
 
 ### 2.4 RoPE in two sentences, and why the tail is fused
 
@@ -179,7 +179,7 @@ SM — Streaming Multiprocessor — and can share an on-chip scratchpad called
 streams the whole key/value history for that head through a 32-key tile:
 `grid.x = ceil(nt / 64)` query token tiles, `grid.y = nh` heads,
 128 threads = 4 warps (a warp is 32 threads that execute in lockstep)
-`launch_fa_prefill_kv` (`attention_prefill.cu:520`, the launcher). K/V come from the persistent cache as
+`launch_fa_prefill_kv` (`attention_prefill.cu:524`, the launcher). K/V come from the persistent cache as
 `__half` (16-bit float — the f16 KV cache from chapter 04's bandwidth story);
 q and the output `o` are f32. The kernel is instantiated per head dimension — 64
 and 128, the two the supported models use — see the dispatch note at the end of
@@ -230,7 +230,7 @@ address formula.
 API for tensor-core matmul) multiplies 16×16×16 matrix fragments; a *fragment*
 is the per-lane register layout of a piece of a matrix. The Q·Kᵀ product of a
 16-query-row block against the 32-column K tile is accumulated in fragment
-registers `fa_prefill_kv` (`attention_prefill.cu:130`):
+registers `fa_prefill_kv` (`attention_prefill.cu:135`):
 
 ```c
 wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc[FA_TKV / 16];
@@ -252,14 +252,14 @@ elements at a time (the K dimension of this GEMM), loading an A-fragment
 (16 query rows × 16 dims, row-major) and two B-fragments (16 dims × 16 key
 columns, col-major — `Kᵀ`'s layout falls out of storing `K` row-major) per
 step. The `scale` factor was already folded into q at load
-`fa_prefill_kv` (`attention_prefill.cu:130`), so the scores need no second pass.
+`fa_prefill_kv` (`attention_prefill.cu:135`), so the scores need no second pass.
 
 **The online softmax, fragment-resident.** Now the section-2 machinery, but the
 "row" lives in tensor-core accumulator registers. For an m16n16 f32 accumulator
 each lane holds 8 elements — two fragment rows (`r0`, `r0+8`) × four column
 groups — and four lanes (`l = 0..3`) share one row, so a row max is a local
 loop plus a 2-step butterfly shuffle (`__shfl_xor_sync` exchanges a register
-between lanes) `fa_prefill_kv` (`attention_prefill.cu:130`):
+between lanes) `fa_prefill_kv` (`attention_prefill.cu:135`):
 
 ```c
 float mnew0 = -INFINITY, mnew1 = -INFINITY;
@@ -278,12 +278,12 @@ for (int off = 1; off <= 2; off <<= 1) {
 ```
 
 Note the three validity conditions on every element: **causal masking**
-(`gcol[q] < qlim0` — the per-row *exclusive* limit `fa_prefill_kv` (`attention_prefill.cu:130`) reads
+(`gcol[q] < qlim0` — the per-row *exclusive* limit `fa_prefill_kv` (`attention_prefill.cu:135`) reads
 from the device-side `positions`/`bound` array), **tile-range masking** (`gcol[q] < kv_end` —
 the last KV tile is zero-filled beyond the history end, and zeros must not
 enter the max), and the **window floor** (`CAUSAL || gcol[q] >= win_lo`, E1b).
 Then the classic triple — fresh flags, exponentiate against the new max, running sums —
-`fa_prefill_kv` (`attention_prefill.cu:130`):
+`fa_prefill_kv` (`attention_prefill.cu:135`):
 
 ```c
 const int fresh0 = (m0 == -INFINITY);
@@ -303,7 +303,7 @@ l0 = l0 * a0 + sum0;                               // l ← l·α + new sum
 **The O rescale in code.** The output accumulator is `NOB = hd/16` fragments
 (8 at hd 128, 4 at hd 64 — one per 16-column block of the V product). Each fragment's 8
 elements interleave the two fragment rows, so the per-row α is applied by
-multiplying the right lanes of every fragment `fa_prefill_kv` (`attention_prefill.cu:130`):
+multiplying the right lanes of every fragment `fa_prefill_kv` (`attention_prefill.cu:135`):
 
 ```c
 // rescale O fragments by the per-row alpha (x[0,1,4,5] -> row r0,
@@ -318,20 +318,20 @@ for (int ob = 0; ob < NOB; ob++) {
 
 This is §2.2's `o ← o·α`, 64 rows at a time, entirely in registers. Then P (the
 probabilities — the scaled scores) is packed into an f16 A-fragment *in place*
-`fa_prefill_kv` (`attention_prefill.cu:130`), exploiting that the m16n16 f32 accumulator and the
+`fa_prefill_kv` (`attention_prefill.cu:135`), exploiting that the m16n16 f32 accumulator and the
 m16k16 f16 row-major A-fragment use the same element-per-lane layout), and the
-P·V product is accumulated `fa_prefill_kv` (`attention_prefill.cu:130`). The comment at
+P·V product is accumulated `fa_prefill_kv` (`attention_prefill.cu:135`). The comment at
 `attention_prefill.cu:392-395` records the layout facts that make the round trip free — the kind of
 thing you verify once with a standalone fragment-layout test, then trust.
 
 **Write-out and K/V staging.** After the KV loop, one final normalize `acc / l`
 and the fragments go to global memory; the last, partially-filled query tile
 stages through shared memory so out-of-range rows can be skipped
-`fa_prefill_kv` (`attention_prefill.cu:130`); rows whose `l` is 0 (fully masked) stay 0. The
-K/V tiles themselves arrive via `fa_stage_kv_async` (`attention_prefill.cu:49`):
+`fa_prefill_kv` (`attention_prefill.cu:135`); rows whose `l` is 0 (fully masked) stay 0. The
+K/V tiles themselves arrive via `fa_stage_kv_async` (`attention_prefill.cu:54`):
 16-byte `cp.async` transfers — an asynchronous copy that lands in shared memory
 without passing through registers — which zero-fill rows beyond `kv_end` by
-capping the copy size (`sz = full ? 16 : 0`, `fa_stage_kv_async` (`attention_prefill.cu:49`)); the
+capping the copy size (`sz = full ? 16 : 0`, `fa_stage_kv_async` (`attention_prefill.cu:54`)); the
 pre-sm80 fallback does plain synchronous vector loads. Zero-filling lets the
 softmax treat out-of-range keys uniformly and exclude them with the one
 `gcol < kv_end` test instead of a second control path.
@@ -563,7 +563,7 @@ AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:122` ("Compute
 graph topology is identical at position 0 and position 2000, and the kernels
 discover the valid range from the data — `attention_prefill.cu:236-238` records
 the exclusive per-row limit, and `fa_prefill_kv` computes `kv_end = bound[last_t] + 1`
-at `fa_prefill_kv` (`attention_prefill.cu:130`). Two payoffs we have already met: the
+at `fa_prefill_kv` (`attention_prefill.cu:135`). Two payoffs we have already met: the
 decode graph can be allocated once and replayed (§3.5), and attention never
 needs a host round trip to learn where the history ends.
 
@@ -927,10 +927,10 @@ head) kernel re-read the K history once per query token per head: at 7B @2K
 that was ~132 GB of K traffic *per layer*, 176 ms, 76% of the whole 2K
 prefill. `fa_prefill_kv` amortizes each K row across a 64-query tile and
 stages K/V once per 32-key chunk: **~0.8 GB per layer** — about 165× less
-traffic `fa_prefill_kv` (`attention_prefill.cu:130`). The grid at those shapes is small and
+traffic `fa_prefill_kv` (`attention_prefill.cu:135`). The grid at those shapes is small and
 regular: `ceil(2048/64) = 32` query tiles × 28 heads = 896 blocks of 128
 threads, each asking for `((64 + 2·32) · 136 · 2) = 34,816 B ≈ 34.8 KB` of
-dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:520`). Both head dims the
+dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:524`). Both head dims the
 supported models use are instantiated — 64 and 128, #845 — and at hd 64 the same
 tile asks 18 432 B; both are under the 48 KiB default dynamic-smem cap, so the
 launcher issues no `cudaFuncSetAttribute` opt-in at all. Two things still decide

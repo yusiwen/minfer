@@ -407,7 +407,7 @@ impl CudaState {
             // #858: one query tile (`nt <= FA_TQ`) stages the window exactly once
             // in the per-tile route too, so the plane would only add a write + a
             // re-read — the verify band and short prompts keep the per-tile route.
-            const FA_TQ: usize = 64; // mirrors `#define FA_TQ` in attention_prefill.cu
+            const FA_TQ: usize = 128; // mirrors `#define FA_TQ` in attention_prefill.cu
             let mut staged: Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> = None;
             if layout == crate::cuda::KV_LAYOUT_Q8_0
                 && mode == AttnWindow::Causal.code()
