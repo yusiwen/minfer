@@ -337,7 +337,7 @@ softmax treat out-of-range keys uniformly and exclude them with the one
 `gcol < kv_end` test instead of a second control path.
 
 **Which models take this path.** The host wrapper
-`gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:277`) gates it:
+`gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:303`) gates it:
 
 ```rust
 if nt >= 2
@@ -350,7 +350,7 @@ if nt >= 2
 }
 ```
 
-`gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:277`.) Four conditions, each with a reason: `nt >= 2`
+`gqa_attn_kv_prefill` (`src/cuda/methods/attention.rs:303`.) Four conditions, each with a reason: `nt >= 2`
 (doc 86 lowered the gate from `nt >= 64`, since the kernel masks causally from the positions
 array, so verify-shaped short batches are safe); `hd` **64 or 128** — the two head dimensions the
 supported models use, and the same pair Metal's `prefill_flash_enabled` accepts. The kernel is
@@ -509,7 +509,7 @@ concatenated matmul output (`q = base`, `k = base + nqt`, `v = base + 2·nkt`;
 the Rust arm does this pointer arithmetic at (`cuda_backend.rs:`, the `Op::FusedQKV` section bases), and
 the **mixed-quant class** (e.g. a model where `attn_v` is Q6_K and cannot join
 the concat) points them at three separate matmul outputs
-(`Op::QkvBiasRopeStore`, arm at `cuda_backend.rs:1308`). One device kernel,
+(`Op::QkvBiasRopeStore`, arm at `cuda_backend.rs:1384`). One device kernel,
 two graph topologies, zero duplicated math.
 
 ### 3.3 KV in device memory — where the cache actually lives
@@ -583,7 +583,7 @@ needs a host round trip to learn where the history ends.
 ```
 
 **f16 KV: half the bytes, same addresses.** The per-engine `kv_layout` tag
-(`cuda_backend.rs:46`, the `KV_LAYOUT_*` code) is fixed when the backend is built from the
+(`cuda_backend.rs:68`, the `KV_LAYOUT_*` code) is fixed when the backend is built from the
 engine's resolved `KvFormat` (`src/graph/kvformat.rs` is the single authority): `load_model_configured`
 (`src/models/mod.rs:417`) resolves it from `MINFER_CACHE_TYPE` and stamps it through
 `GraphAllocator::set_kv_format`. When the tag is f16, every store converts to `__half` and
@@ -598,12 +598,12 @@ allocation does not shrink, the bytes written per store and read per attention c
 **Why attention can read the regions directly.** A `KvcacheLoad` node is not a
 copy — its output buffer *is* the K region (`GraphAllocator::node_buffer` (`src/graph/alloc.rs:1093`) maps the node to
 `pair[0]`; the CUDA arm comments "out_buf IS the region — no kernel" at
-(`cuda_backend.rs:951`, the `KvcacheLoad` arm comment). So the whole path — matmul, fused tail, cache,
+(`cuda_backend.rs:1027`, the `KvcacheLoad` arm comment). So the whole path — matmul, fused tail, cache,
 attention, next layer — touches pool device memory and crosses no host
 boundary. The one structural guard on that layout: attention requires
 `hd == hd_kv` and `nkt == n_head_kv · hd` (the kernels stride KV rows by
 `nkt`), and violations return `Err`, not a workaround
-`execute_node_inner` (`cuda_backend.rs:925`); the same guard has a GPU_SAFETY audit entry,
+`execute_node_inner` (`cuda_backend.rs:1001`); the same guard has a GPU_SAFETY audit entry,
 `docs/GPU_SAFETY.md:105` (§3 "Audit findings (2026-08-02) — status", the H1 finding).
 
 ### 3.4 The Rust host side — `cuda_backend.rs` as a `Backend`
@@ -613,7 +613,7 @@ Everything device-side so far was launched by a Rust struct implementing the
 `execute_node`, host read/write, `synchronize`). Walkthrough 15 gives the full
 tour; this section reads the four parts a contributor actually touches.
 
-**Struct state** `CudaBackend` (`cuda_backend.rs:21`). One field per responsibility:
+**Struct state** `CudaBackend` (`cuda_backend.rs:43`). One field per responsibility:
 
 ```rust
 pub struct CudaBackend {
@@ -639,11 +639,11 @@ is load-bearing for §3.5: a captured graph bakes in device *pointers*, so any
 pool churn invalidates every capture, and `pool_gen` detects that.
 
 **`execute_node`: the dispatch.** The trait method
-(`execute_node` (`cuda_backend.rs:2394`)) is a thin wrapper: it calls
+(`execute_node` (`cuda_backend.rs:2483`)) is a thin wrapper: it calls
 `execute_node_inner` and, if the node failed *while a capture window was
-open*, aborts the window first (`abort_capture` (`cuda_backend.rs:909`) — a doomed window
+open*, aborts the window first (`abort_capture` (`cuda_backend.rs:985`) — a doomed window
 must never be closed into a cached graph). The real dispatch is one big match
-at `execute_node_inner` (`cuda_backend.rs:925`):
+at `execute_node_inner` (`cuda_backend.rs:1001`):
 
 ```rust
 match &node.op {
@@ -667,14 +667,14 @@ Three representative arms:
   kernel left the GPU idle, 48% of the 7B decode step per nsys), `2..=16` (f16/f32) →
   the batched variant (`cuda_backend.rs:`), `nt > 16` → the prefill kernels
   (`cuda_backend.rs:`), where the host wrapper `gqa_attn_kv_prefill`
-  (`src/cuda/methods/attention.rs:277`) internally routes to the FA prefill kernel.
+  (`src/cuda/methods/attention.rs:303`) internally routes to the FA prefill kernel.
 - `Op::KvcacheStore` (`cuda_backend.rs:`) — the unfused prefill store: verifies the
   output buffer *is* the K region (`cuda_backend.rs:`), derives `nt` from the element
   count, converts the boundary array device-side, and launches the layout's store
   (`store_kv_q8_0`/`store_kv_f16`/`store_kv_f32`, `cuda_backend.rs:`) once per region.
 
 Every arm ends `Ok(())` or returns `Err(String)`; there is no third outcome.
-The match's fallthrough makes the policy explicit `execute_node_inner` (`cuda_backend.rs:925`):
+The match's fallthrough makes the policy explicit `execute_node_inner` (`cuda_backend.rs:1001`):
 
 ```rust
 op => Err(format!(
@@ -701,19 +701,19 @@ fn alloc_buffer(&mut self, size: usize) -> usize {
 }
 ```
 
-(`alloc_buffer` (`cuda_backend.rs:2341`).) Three conventions to notice. *Exact-size
+(`alloc_buffer` (`cuda_backend.rs:2430`).) Three conventions to notice. *Exact-size
 reuse*: the free list matches byte length, so a recycled buffer is always big
 enough. *`pool_gen` on every path*: fresh alloc or reuse, both bump it, because
 both can change the node→pointer mapping a captured graph depends on. *No
 panics on OOM*: `cuda_malloc` logs and returns null, and the null buffer fails
 cleanly as an `Err` from `ptr_of` at execute time — never a panic inside the
-allocator (`ptr_of` (`cuda_backend.rs:639`); `stream_guard` is a shim, not a lock).
+allocator (`ptr_of` (`cuda_backend.rs:715`); `stream_guard` is a shim, not a lock).
 `free_buffer` never calls `cudaFree` — it recycles
-(`free_buffer` (`cuda_backend.rs:2368`)), which is what lets the persistent KV regions
+(`free_buffer` (`cuda_backend.rs:2457`)), which is what lets the persistent KV regions
 and the per-step scratch share one arena; `alloc_fresh`
-(`alloc_fresh` (`cuda_backend.rs:2378`)) bypasses the free list when a buffer's *id* is
+(`alloc_fresh` (`cuda_backend.rs:2467`)) bypasses the free list when a buffer's *id* is
 still referenced elsewhere (cross-backend staging, walkthrough 07 §2.7). Drop
-(`cuda_backend.rs:868`, the `Drop` impl) frees the pool, the positions scratch, and every
+(`cuda_backend.rs:944`, the `Drop` impl) frees the pool, the positions scratch, and every
 captured exec. The ownership rule wrapping all of this is AGENTS rule 8:
 "Backends own their buffer pools; the allocator is the single owner"
 (`AGENTS.md:129` ("Compute Graph — core rules", rule 8)) — the `GraphAllocator` decides *which* buffer a node gets and
@@ -730,10 +730,10 @@ fn read_host(&self, _id: usize) -> Option<&[f32]> {
     None
 }
 ```
-(`read_host` (`cuda_backend.rs:2488`).) Reading device memory back to the host is
-*always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:651`:
+(`read_host` (`cuda_backend.rs:2577`).) Reading device memory back to the host is
+*always* an explicit, syncing `copy_to_host` (`cuda_backend.rs:727`:
 `state.sync()` then a pinned-staging readback); `write_host`
-(`write_host` (`cuda_backend.rs:2495`)) is the input-fill path — a pinned-staged *async*
+(`write_host` (`cuda_backend.rs:2584`)) is the input-fill path — a pinned-staged *async*
 H2D copy, safe because same-stream ordering means later kernels see the data.
 The rule behind the asymmetry — **never host-copy a GPU-pending buffer** — is
 AGENTS rule 5 (`AGENTS.md:126` ("Compute Graph — core rules", rule 5)), written in the blood of Phase 3. In three
@@ -761,7 +761,7 @@ fn synchronize(&mut self) {
 }
 ```
 
-(`close_capture_or_sync` (`cuda_backend.rs:578`).) `synchronize` takes the blocking form and
+(`close_capture_or_sync` (`cuda_backend.rs:654`).) `synchronize` takes the blocking form and
 `retire` the non-blocking one (#138): memos expire, an open capture window
 closes here, and the actual wait is `CudaState::sync` (`src/cuda/methods/events.rs:143`) —
 `cudaGetLastError` checked, then `cudaStreamSynchronize`, and its error code
@@ -782,17 +782,17 @@ that tax without changing the kernels. The scheduler asks the CUDA backend,
 before executing a split, whether it wants to replay a capture
 (`BackendScheduler::execute` (`src/graph/scheduler.rs:137`); the ask itself is one line,
 `c.graph_replay(graph.uid, split.node_range, …)` at `graph_replay` (`src/graph/scheduler.rs:299`). On
-the backend, `graph_replay_step` (`cuda_backend.rs:464`) runs a three-run
+the backend, `graph_replay_step` (`cuda_backend.rs:540`) runs a three-run
 protocol: the first two executions of a (graph uid, node range) go through
-normal per-node launches (`graph_runs` counter, `graph_replay_step` (`cuda_backend.rs:464`)); on
+normal per-node launches (`graph_runs` counter, `graph_replay_step` (`cuda_backend.rs:540`)); on
 the third, the backend opens a *capture window* (`graph_begin_capture`,
 with **no** stream lock since #188 — the window opens on this backend's own stream,
-in `cudaStreamCaptureModeThreadLocal`, `graph_replay_step` (`cuda_backend.rs:464`) — from then until `synchronize`,
+in `cudaStreamCaptureModeThreadLocal`, `graph_replay_step` (`cuda_backend.rs:540`) — from then until `synchronize`,
 every kernel the dispatch enqueues is *recorded*, not executed. At the
-boundary, `close_capture_or_sync` (`cuda_backend.rs:578`) instantiates
+boundary, `close_capture_or_sync` (`cuda_backend.rs:654`) instantiates
 the recorded graph, launches it once, and caches the exec; every later step
 replays the whole split as **one** `graph_launch_exec` call
-`graph_replay_step` (`cuda_backend.rs:464`). N per-node launches collapse into one.
+`graph_replay_step` (`cuda_backend.rs:540`). N per-node launches collapse into one.
 
 That sounds fragile — it would be, if anything the kernels read could change
 between steps. Two invariants hold it up. First, **positions are data**
@@ -801,14 +801,14 @@ buffer *contents* change, and those are rewritten before replay — TECH-PRIMER
 §8's "why replay is safe in minfer's design"
 (`docs/CUDA-TECH-PRIMER.md:338-343` (§8 "CUDA Graphs — capture once, replay many (Phase 7")). Second, **pool generations**: any
 buffer (re)allocation bumps `pool_gen`, and a replay whose captured `pool_gen`
-differs is destroyed and re-captured `graph_replay_step` (`cuda_backend.rs:464`).
+differs is destroyed and re-captured `graph_replay_step` (`cuda_backend.rs:540`).
 
 **`MINFER_NO_CUDA_GRAPH=1` is the A/B revert.** It forces
-`GraphMode::Disabled` at construction `with_layout` (`cuda_backend.rs:210`), which makes
-`graph_replay_step` (`cuda_backend.rs:464`) return `false` — every step
+`GraphMode::Disabled` at construction `with_layout` (`cuda_backend.rs:244`), which makes
+`graph_replay_step` (`cuda_backend.rs:540`) return `false` — every step
 runs the plain per-node launch path. It is also the *recovery* switch: any
 capture/replay failure disables graphs for the rest of the session with a loud
-message saying exactly that (`cuda_backend.rs:504` and `:550`, the two "graphs disabled for this session" messages). TECH-PRIMER
+message saying exactly that (`cuda_backend.rs:580` and `:626`, the two "graphs disabled for this session" messages). TECH-PRIMER
 §8 calls it "the A/B control used by every graph-adjacent step doc"
 (`docs/CUDA-TECH-PRIMER.md:336-337` (§8 "CUDA Graphs — capture once, replay many (Phase 7")). A related hard rule: nothing inside a
 capture window may sync — a debug readback corrupts the capture, the 7e②
@@ -862,9 +862,9 @@ whole model to CPU (loudly, at build time, recorded in `CParams.gpu`) or
 admits the graph as fully-GPU. What is *forbidden* is the third option:
 discovering mid-run that a kernel is missing and quietly falling back. If a
 weight lookup still fails inside `execute_node`, it is
-`Err` naming the weight (`execute_node_inner` (`cuda_backend.rs:925`)); an unhandled op is `Err`
-`execute_node_inner` (`cuda_backend.rs:925`); a kernel-invariant violation is `Err` with the
-actual values `execute_node_inner` (`cuda_backend.rs:925`). AGENTS states the contract once:
+`Err` naming the weight (`execute_node_inner` (`cuda_backend.rs:1001`)); an unhandled op is `Err`
+`execute_node_inner` (`cuda_backend.rs:1001`); a kernel-invariant violation is `Err` with the
+actual values `execute_node_inner` (`cuda_backend.rs:1001`). AGENTS states the contract once:
 "kernel-invariant violations return `Err` from `execute_node` — never a
 silent CPU fallback; backend assignment is decided at build time"
 (`AGENTS.md:116` ("GPU Safety", the Err-never-fallback contract)); TECH-PRIMER §7 repeats it

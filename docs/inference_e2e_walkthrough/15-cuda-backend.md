@@ -602,7 +602,7 @@ kernel's structural invariants, and launches. The wrapper adds one
 capture-window duty:
 
 ```rust
-// src/graph/cuda_backend.rs:2394 (`execute_node`)
+// src/graph/cuda_backend.rs:2483 (`execute_node`)
 fn execute_node(
     &mut self,
     node: &CNode,
@@ -795,7 +795,7 @@ correctness fallbacks are not, and the code keeps the distinction visible.
 
 #### 3.2.7 Split-KV attention, the kernel
 
-The host side (`gqa_attn_split`, `src/cuda/methods/attention.rs:504`) computes the partial-row
+The host side (`gqa_attn_split`, `src/cuda/methods/attention.rs:547`) computes the partial-row
 stride `pstr = (4 + hd + 3) & !3` (running max, running sum, then the
 `hd`-wide output accumulator, rounded to a 16-byte boundary for the `float4`
 writes), grows the partials scratch *once* (a fixed `[32][nh][pstr]` slab —
@@ -913,7 +913,7 @@ counter per key), and `capturing` (an open capture window, closed by
 `synchronize`):
 
 ```rust
-// src/graph/cuda_backend.rs:464 (`graph_replay_step`) (abridged)
+// src/graph/cuda_backend.rs:540 (`graph_replay_step`) (abridged)
 let key = (uid, range);
 if let Some(pos) = self.graph_execs
     .iter().position(|g| g.uid == uid && g.range == range)
@@ -977,11 +977,11 @@ Every line answers a "what could go wrong":
   stream and capture runs in `cudaStreamCaptureModeThreadLocal`, so another
   backend's stream work (the CPU-side fills of a mixed split boundary, another
   model slot's launches) cannot be recorded into this graph. `stream_guard`
-  survives as a `None`-returning shim (`cuda_backend.rs:561`) so the historical
+  survives as a `None`-returning shim (`cuda_backend.rs:637`) so the historical
   call sites read as the no-ops they now are.
 
 Closing the window happens in `synchronize` → `close_capture_or_sync`
-(`cuda_backend.rs:565`): end capture, **instantiate**, launch once so the
+(`cuda_backend.rs:641`): end capture, **instantiate**, launch once so the
 step still produces output, and cache the exec. If instantiate/launch fails, the
 recorded launches never executed —
 this step's outputs are undefined, and the code says so out loud (graphs
@@ -1001,7 +1001,7 @@ The pool mirrors Metal's (doc 14): a `Vec<CudaBuf>` plus a byte-length-matched
 free list. Two details are CUDA-specific:
 
 ```rust
-// src/graph/cuda_backend.rs:2341 (`alloc_buffer`) (alloc_buffer)
+// src/graph/cuda_backend.rs:2430 (`alloc_buffer`) (alloc_buffer)
 fn alloc_buffer(&mut self, size: usize) -> usize {
     let _sg = self.stream_guard(); // cudaMalloc syncs the device
     let bytes = size * 4;

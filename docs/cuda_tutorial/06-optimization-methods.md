@@ -390,7 +390,7 @@ counted the difference.
   `attn_bias_rope_store_f32` (`src/cuda/kernels/kv_store.cu:153`) — one launch replaces the 7-launch decode tail;
   the graph ops `Op::FusedQKV` (concat matmul + fused epilogue) and
   `Op::FusedFFN` (gate|up concat matmul + in-place swiglu) are declared in
-  `Op::FusedQKV` (`src/graph/ops.rs:158`), `Op::FusedFFN` (`:177`), executed in `execute_node_inner` (`src/graph/cuda_backend.rs:925`; the `Op::FusedFFN` arm `:1245`, the `Op::FusedQKV` arm `:1375`),
+  `Op::FusedQKV` (`src/graph/ops.rs:158`), `Op::FusedFFN` (`:177`), executed in `execute_node_inner` (`src/graph/cuda_backend.rs:1001`; the `Op::FusedFFN` arm `:1321`, the `Op::FusedQKV` arm `:1451`),
   and gated at build time in `fuse_qkv` (`src/models/qwen2/graph.rs:`). The decode
   A-quantize fusion (`swiglu_quant_pad40`, `rms_norm_quant_pad40`,
   `swiglu_quant_pad40` (`src/cuda/kernels/ops_elementwise.cu:215`), `rms_norm_quant_pad40` (`:90`) writes the quantized activation plane
@@ -421,7 +421,7 @@ the launch overhead is amortized. minfer captures the whole decode step
 measured that capture would be a pure loss for them plus a capture-illegal
 mid-window malloc).
 
-- **Where minfer uses it**: `CudaBackend` (`src/graph/cuda_backend.rs:21`) reads
+- **Where minfer uses it**: `CudaBackend` (`src/graph/cuda_backend.rs:43`) reads
   `MINFER_NO_CUDA_GRAPH` (replay off → per-kernel eager launches); the
   capture/replay machinery and its pool-generation invalidation live in that
   file's `CudaBackend` (chapter 05 walked it).
