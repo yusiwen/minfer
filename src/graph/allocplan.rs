@@ -103,6 +103,26 @@ impl DeviceMemory {
     }
 }
 
+/// #862: the fraction of currently-free device memory a packed prefill's f16
+/// staging plane may take. A plane is a *caching scratch*, not a requirement:
+/// the per-tile route stages tile by tile without one, so a device under
+/// pressure should spend its free memory on weights and pooled buffers first.
+pub const KV_STAGE_FREE_DIVISOR: usize = 8;
+
+/// #862: may the packed prefill allocate a staging plane of `need` bytes?
+///
+/// Pure, so the policy has pass/fail cases without a device. The branches follow
+/// `budget_decision`'s rule for the same reason (#122): a **failed** query is not
+/// a measurement, and turning it into "no memory" would refuse a scratch on a
+/// device that may be perfectly usable — the scratch allocation itself is the
+/// authority (its null return falls back to the per-tile route).
+pub fn kv_stage_admitted(need: usize, mem: &DeviceMemory) -> bool {
+    match mem {
+        DeviceMemory::Reported { free, .. } => need <= free / KV_STAGE_FREE_DIVISOR,
+        DeviceMemory::QueryFailed { .. } | DeviceMemory::NoDevice => true,
+    }
+}
+
 /// The E4 activation budget decision for one backend.
 ///
 /// `budget` is `None` for "unbounded" (CPU/Metal, or no device state) and `Some(n)`

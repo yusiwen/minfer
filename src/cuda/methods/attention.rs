@@ -159,6 +159,32 @@ extern "C" {
     ) -> i32;
 }
 
+/// #862: one loud line when the staging plane is refused — the attention path is
+/// then the per-tile one, which is correct but pays the dequantizing repeat. Once
+/// per process, like the other fallback warnings on this path.
+fn warn_kv_stage_refused(need: usize, mem: &crate::graph::allocplan::DeviceMemory, injected: bool) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let why = if injected {
+        "the `cuda_kv_stage_budget` injection seam is armed".to_string()
+    } else {
+        match mem {
+            crate::graph::allocplan::DeviceMemory::Reported { free, .. } => format!(
+                "free device memory is {free} B, and the plane may take at most 1/{} of it",
+                crate::graph::allocplan::KV_STAGE_FREE_DIVISOR
+            ),
+            _ => "the device memory query did not answer".to_string(),
+        }
+    };
+    eprintln!(
+        "minfer/cuda: packed KV staging plane of {need} B refused ({why}); the prefill \
+         continues on the per-tile staging route (correct, and slower by the dequantizing \
+         repeat — #862)"
+    );
+}
+
 impl CudaState {
     /// C4 S2b: the general nt > 1 attention kernel, layout-tagged. `row_bytes` is
     /// the KV cell's byte width (`nk * hd * {4,2}` for f32/f16,
@@ -390,7 +416,24 @@ impl CudaState {
                 && !Self::no_kv_stage()
             {
                 let plane = kv_rows * nk * hd * 2; // bytes of one f16 K/V plane
-                let buf = Self::get_or_grow(&self.buf_kv_stage, 2 * plane);
+                let need = 2 * plane;
+                // #862: the plane is a caching scratch, so a device under memory
+                // pressure must be allowed to keep its free bytes for weights and
+                // pool. One eighth of what is free is the policy
+                // (`allocplan::kv_stage_admitted`, pure and unit-tested); a refusal,
+                // like an allocation failure below, is the documented fallback to
+                // the per-tile route — never an error. `cuda_kv_stage_budget` is the
+                // #147 seam that lets a gate drive the refusal for real.
+                let mem = self.device_memory();
+                let injected = crate::testfail::requested("cuda_kv_stage_budget");
+                let admitted = !injected && crate::graph::allocplan::kv_stage_admitted(need, &mem);
+                let buf = if admitted {
+                    Self::get_or_grow(&self.buf_kv_stage, need)
+                } else {
+                    crate::testfail::note_checked("cuda_kv_stage_refused");
+                    warn_kv_stage_refused(need, &mem, injected);
+                    std::ptr::null_mut()
+                };
                 if !buf.is_null() {
                     let sk = buf;
                     let sv = unsafe { (buf as *mut u8).add(plane) as *mut std::ffi::c_void };

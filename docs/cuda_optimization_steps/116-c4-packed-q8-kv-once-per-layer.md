@@ -67,8 +67,9 @@ per-tile route by design.
 hd 128 at `n_ctx` 4 096 → **8 MiB each, 16 MiB transient**; at `n_ctx` 32 768 → 128 MiB. That is
 exactly the size an f16 KV region would have been, it exists only while a prefill runs, and it is
 allocated lazily (`get_or_grow`, the `buf_f16_w` precedent) — a failed allocation, or a capture
-window, falls back to the per-tile route instead of erroring. Bounding it by the *window* instead of
-the arena is the follow-up if memory ever matters more than the 1.4 pp.
+window, falls back to the per-tile route instead of erroring. **Updated by
+[117](./117-c4-packed-q8-kv-window-plane.md)**: the plane is now sized by the window (8 MiB at a 2k
+prompt, independent of `n_ctx`, with a budget guard), so the numbers above are the pre-#862 ones.
 
 ## 3. Implementation
 

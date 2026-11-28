@@ -18,6 +18,28 @@ struct CudaBuf {
     bytes: usize,
 }
 
+/// #862: the plane is sized in row buckets so a run of slightly-different prompts
+/// does not grow (and re-capture) the scratch on every forward. One bucket at hd
+/// 128 is 512 KiB per plane.
+pub(crate) const PLANE_ROW_BUCKET: usize = 256;
+
+/// #862: how many rows the packed causal staging plane needs.
+///
+/// `region_rows` is the KV region's capacity (the arena — today's behaviour when
+/// there is no hint); `hint` is the host's `max(position) + 1` for the forward
+/// about to run. The answer is the hint rounded up to [`PLANE_ROW_BUCKET`],
+/// capped by the arena, and the arena when no hint exists. Pure so the sizing has
+/// pass/fail cases without a device.
+pub(crate) fn plane_rows(region_rows: usize, hint: usize) -> usize {
+    if hint == 0 || region_rows == 0 {
+        return region_rows;
+    }
+    let bucketed = hint
+        .div_ceil(PLANE_ROW_BUCKET)
+        .saturating_mul(PLANE_ROW_BUCKET);
+    bucketed.min(region_rows)
+}
+
 pub struct CudaBackend {
     state: &'static crate::cuda::CudaState,
     /// Issue #188: **this backend's own device stream**. Every launch, copy,
@@ -65,6 +87,18 @@ pub struct CudaBackend {
     /// reused (a tiny pool) and re-converted every window, so a stale value can
     /// never be read.
     pos_scratch: std::collections::HashMap<usize, (*mut std::ffi::c_void, usize)>,
+    /// #862: the causal prefill **window** bound the host has announced per
+    /// positions-input buffer id (`GraphAllocator::fill_input_i32` records
+    /// `max(position) + 1`; the window itself is device data by the time attention
+    /// runs). The packed staging plane is sized from
+    /// [`plane_rows`]`(region_rows, hint)`, not from the whole arena.
+    plane_rows: std::collections::HashMap<usize, usize>,
+    /// #862: the largest staging plane this backend has asked for, in bytes. A
+    /// growth makes `CudaState`'s scratch free the old pointer and allocate a new
+    /// one, so it bumps `pool_gen` exactly like `pos_scratch`'s growth does — a
+    /// captured prefill that embedded the old plane address must re-capture rather
+    /// than replay into freed memory.
+    kv_stage_bytes: usize,
     /// D3-7 2c: one-execution-window memo for positions_i32 — (input buf id,
     /// pool_gen) of the last conversion. Every Rope/KvcacheStore/Attn node
     /// re-converted the same positions buffer (240 launches/step at 14B
@@ -234,6 +268,8 @@ impl CudaBackend {
             pool: Vec::new(),
             free: Vec::new(),
             pool_gen: 0,
+            plane_rows: std::collections::HashMap::new(),
+            kv_stage_bytes: 0,
             pos_scratch: std::collections::HashMap::new(),
             graph_execs: Vec::new(),
             graph_runs: std::collections::HashMap::new(),
@@ -267,6 +303,46 @@ impl CudaBackend {
     #[cfg(test)]
     pub(crate) fn device_stream(&self) -> *mut std::ffi::c_void {
         self.stream
+    }
+
+    /// #862: record the window bound the host just filled for `buf_id`
+    /// (`max(position) + 1` over a causal prefill's positions).
+    ///
+    /// Called from `GraphAllocator::fill_input_i32` — the one place positions
+    /// become graph data — so the value is always refreshed before the forward
+    /// that reads it. It is an **upper bound** on every row the causal staging
+    /// reads (`kv_end` is `bound[last_t] + 1`, and the staging only ever walks
+    /// forward from zero), which is what makes a plane sized from it complete.
+    pub fn note_plane_rows(&mut self, buf_id: usize, rows: usize) {
+        self.plane_rows.insert(buf_id, rows);
+    }
+
+    /// #862: the window bound recorded for `buf_id`, or 0 for "the host has not
+    /// announced one" (a direct kernel-level driver, or a non-causal window).
+    pub(crate) fn plane_rows_hint(&self, buf_id: usize) -> usize {
+        self.plane_rows.get(&buf_id).copied().unwrap_or(0)
+    }
+
+    /// #862: this backend's staging-plane bytes, read on the bound stream.
+    /// Test-only (#238): the memory claim is a claim about an allocation.
+    #[cfg(test)]
+    pub(crate) fn kv_stage_bytes_for_test(&self) -> usize {
+        let _bound = self.bind();
+        self.state.kv_stage_bytes_on(self.stream)
+    }
+
+    /// #862: free this backend's staging plane and forget its size, so a gate
+    /// starts from zero and asserts the size *its* forward asked for rather than a
+    /// high-water mark left by an earlier test. Test-only (#238); safe because no
+    /// captured graph references the plane in a test process (a captured prefill
+    /// would need a repeated identical prefill, and the gates that capture do not
+    /// run a packed one).
+    #[cfg(test)]
+    pub(crate) fn reset_kv_stage_for_test(&mut self) {
+        let _bound = self.bind();
+        self.state.release_kv_stage_on(self.stream);
+        self.kv_stage_bytes = 0;
+        self.pool_gen += 1;
     }
 
     /// Pool generation counter (CUDA Graph replay invalidation, Phase 7d).
@@ -1915,17 +1991,30 @@ impl CudaBackend {
                 // staging would round the cache to f16 for no reason).
                 if self.kv_layout() != crate::cuda::KV_LAYOUT_F32 {
                     // #858: the packed causal staging plane is sized from the KV
-                    // region's row capacity — the only row bound this side knows
-                    // (the window is device data). `kv_row_bytes` is one cell's byte
+                    // region's row capacity. `kv_row_bytes` is one cell's byte
                     // width, so the division is exact for all three layouts; a
                     // zero-width region would be a build bug, and the method treats
                     // 0 as "unknown" (per-tile staging).
                     let cell_bytes = self.kv_row_bytes(meta.nkt);
-                    let kv_rows = if cell_bytes == 0 {
+                    let region_rows = if cell_bytes == 0 {
                         0
                     } else {
                         self.pool[k_id].bytes / cell_bytes
                     };
+                    // #862: narrow the plane to the *window* the host announced for
+                    // this forward (the arena is only an upper bound; at a 32k
+                    // context it was 16x the prompt). No hint → the arena, which is
+                    // the pre-#862 behaviour.
+                    let hint = self.plane_rows_hint(bound_buf.id);
+                    let kv_rows = plane_rows(region_rows, hint);
+                    // #862: a growth reallocates the scratch (the old pointer is
+                    // freed), so a captured prefill holding it must re-capture —
+                    // the same invalidation `pos_scratch`'s growth performs.
+                    let plane_bytes = 2 * (kv_rows * meta.nkt * 2);
+                    if plane_bytes > self.kv_stage_bytes {
+                        self.kv_stage_bytes = plane_bytes;
+                        self.pool_gen += 1;
+                    }
                     self.state.gqa_attn_kv_prefill(
                         self.ptr_of_ref(in_bufs[0])?,
                         self.ptr_of(k_id)?,
