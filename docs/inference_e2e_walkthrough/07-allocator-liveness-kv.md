@@ -388,7 +388,7 @@ the consumer's inputs across `execute` (`scheduler.rs:`, the phase-A staging enq
 allocator's `copy_across`, which routes through `copy_to_cpu` (a host round
 trip — Metal/CUDA buffers here are CPU-visible, so this is a plain memcpy)
 and then `write_host` into a buffer on the *destination* pool
-`copy_across` (`alloc.rs:2473`), the staging copy).
+`copy_across` (`alloc.rs:2501`), the staging copy).
 
 That destination staging buffer must be **fresh** — `alloc_fresh_in` (`alloc.rs:`)
 — never drawn from the recycle free list. The trait
@@ -658,7 +658,7 @@ different size, it would silently get the old buffer — one reason `n_ctx`
 must stay consistent across a run (§3.3, question 3).
 
 **Excerpt 6 — I32 input filling** `fill_input_i32` (`alloc.rs:1927`) plus the routing tail
-of `fill_input_impl`, `alloc.rs:2101`).
+of `fill_input_impl`, `alloc.rs:2129`).
 
 ```rust
 /// Fill an I32 input (token ids / positions). Stored as `f32::from_bits`
@@ -702,7 +702,7 @@ let data = self
     .ok_or_else(|| format!("node {node_id} host read failed"))?;
 self.write_cross_staging(dst, &data)
 
-// `write_cross_staging` (`alloc.rs:2654`) → `write_pool` (`alloc.rs:2834`): one
+// `write_cross_staging` (`alloc.rs:2682`) → `write_pool` (`alloc.rs:2862`): one
 // registry lookup through the handle, never a `match` on a backend variant.
 match self.pool_mut(dst.backend) {
     Some(pool) => pool.write_host(dst.id, data),
