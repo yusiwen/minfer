@@ -179,7 +179,7 @@ SM — Streaming Multiprocessor — and can share an on-chip scratchpad called
 streams the whole key/value history for that head through a 32-key tile:
 `grid.x = ceil(nt / 64)` query token tiles, `grid.y = nh` heads,
 128 threads = 4 warps (a warp is 32 threads that execute in lockstep)
-`launch_fa_prefill_kv` (`attention_prefill.cu:524`, the launcher). K/V come from the persistent cache as
+`launch_fa_prefill_kv` (`attention_prefill.cu:553`, the launcher). K/V come from the persistent cache as
 `__half` (16-bit float — the f16 KV cache from chapter 04's bandwidth story);
 q and the output `o` are f32. The kernel is instantiated per head dimension — 64
 and 128, the two the supported models use — see the dispatch note at the end of
@@ -321,7 +321,7 @@ probabilities — the scaled scores) is packed into an f16 A-fragment *in place*
 `fa_prefill_kv` (`attention_prefill.cu:135`), exploiting that the m16n16 f32 accumulator and the
 m16k16 f16 row-major A-fragment use the same element-per-lane layout), and the
 P·V product is accumulated `fa_prefill_kv` (`attention_prefill.cu:135`). The comment at
-`attention_prefill.cu:392-395` records the layout facts that make the round trip free — the kind of
+`attention_prefill.cu:395-398` records the layout facts that make the round trip free — the kind of
 thing you verify once with a standalone fragment-layout test, then trust.
 
 **Write-out and K/V staging.** After the KV loop, one final normalize `acc / l`
@@ -561,7 +561,7 @@ appears in the layout — it is only ever *how many leading rows are valid*, and
 that count lives in the on-device boundary array. That is precisely
 AGENTS rule 1, "KV positions are data, not structure" (`AGENTS.md:122` ("Compute Graph — core rules", rule 1)): the
 graph topology is identical at position 0 and position 2000, and the kernels
-discover the valid range from the data — `attention_prefill.cu:236-238` records
+discover the valid range from the data — `attention_prefill.cu:239-241` records
 the exclusive per-row limit, and `fa_prefill_kv` computes `kv_end = bound[last_t] + 1`
 at `fa_prefill_kv` (`attention_prefill.cu:135`). Two payoffs we have already met: the
 decode graph can be allocated once and replayed (§3.5), and attention never
@@ -930,7 +930,7 @@ stages K/V once per 32-key chunk: **~0.8 GB per layer** — about 165× less
 traffic `fa_prefill_kv` (`attention_prefill.cu:135`). The grid at those shapes is small and
 regular: `ceil(2048/64) = 32` query tiles × 28 heads = 896 blocks of 128
 threads, each asking for `((64 + 2·32) · 136 · 2) = 34,816 B ≈ 34.8 KB` of
-dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:524`). Both head dims the
+dynamic shared memory `launch_fa_prefill_kv` (`attention_prefill.cu:553`). Both head dims the
 supported models use are instantiated — 64 and 128, #845 — and at hd 64 the same
 tile asks 18 432 B; both are under the 48 KiB default dynamic-smem cap, so the
 launcher issues no `cudaFuncSetAttribute` opt-in at all. Two things still decide
@@ -938,7 +938,7 @@ whether a prompt is *fast*, by construction: a head dim with no instantiation
 takes the legacy path (and a third head dim is refused by the launcher rather than
 mislabelled), and an unpadded shared-memory stride would re-introduce the 8-way
 bank conflicts the `sstr = hd + 8` line exists to prevent `fa_prefill_kv`
-(`attention_prefill.cu:130`).
+(`attention_prefill.cu:135`).
 
 ## 5. Try it / Observe
 
