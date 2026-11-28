@@ -76,6 +76,10 @@ hd 128 **+14.6%**.
 | hd 128, f16 FA launch | 418.6 / 413.2 | 418.4 (unchanged) | single-buffered by the budget |
 | hd 128, *double-buffered variant* | — | **479.6** | +14.6%, measured and **not shipped** |
 
+**Updated by [119](./119-c4-fa-tile-128.md)**: with the 128-row tile the block count becomes
+register-bound at one per SM, so the second pair is affordable at **both** head dims and the hd-128
+gate this record introduced is gone. The occupancy arithmetic below is what made that visible.
+
 ## 6. Lessons
 
 1. **A latency lever can lose to an occupancy lever.** The copy is 8% of the launch and overlapping it
