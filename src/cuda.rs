@@ -314,6 +314,47 @@ impl StreamScratch {
     }
 }
 
+impl CudaState {
+    /// #862: the staging-plane byte size currently held for `stream` (0 when none).
+    ///
+    /// Test-only (#238): the memory claim — "the plane is window-bounded, not
+    /// arena-bounded" — is a claim about an allocation, so a gate has to read it
+    /// rather than infer it. Takes the stream explicitly because the scratch is
+    /// per stream and a test's caller is not inside a bind window.
+    #[cfg(test)]
+    pub(crate) fn kv_stage_bytes_on(&self, stream: *mut std::ffi::c_void) -> usize {
+        self.buf_kv_stage
+            .map
+            .lock()
+            .unwrap()
+            .get(&(stream as usize))
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+
+    /// #862: release `stream`'s staging plane, so a gate starts from zero and the
+    /// size it asserts is the one *its* forward asked for rather than a high-water
+    /// mark left by an earlier test.
+    ///
+    /// Test-only (#238). Safe because no captured graph references the plane in a
+    /// test process (capture is off unless a gate opens a window, and the tests
+    /// that do are serial and do not run a packed prefill).
+    #[cfg(test)]
+    pub(crate) fn release_kv_stage_on(&self, stream: *mut std::ffi::c_void) {
+        let removed = self
+            .buf_kv_stage
+            .map
+            .lock()
+            .unwrap()
+            .remove(&(stream as usize));
+        if let Some((ptr, _)) = removed {
+            if !ptr.0.is_null() {
+                Self::cuda_free(ptr.0);
+            }
+        }
+    }
+}
+
 /// Issue #188: the CUDA stream capture mode the device layer opens windows
 /// with. `cudaStreamCaptureModeGlobal` (1, the pre-#188 value) makes *another*
 /// thread's non-capture-safe driver call invalidate the window; both

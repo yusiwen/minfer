@@ -1938,6 +1938,34 @@ impl GraphAllocator {
         // covers every backend without a per-backend guard, Metal included, and
         // costs one O(nt) scan over data that is already on the host.
         self.check_positions_bound(graph, name, data)?;
+        // #862: this is the one place the host still holds a causal prefill's
+        // positions, and the packed attention's staging plane is sized by the
+        // *window* they imply (`max + 1` — an upper bound on every row the causal
+        // staging reads, since it only walks forward from zero). By the time
+        // attention runs they are device data, so the bound is announced here and
+        // the backend narrows its plane to it instead of allocating for the whole
+        // arena. A non-causal window (`attn_span`, `kv_map`) has no entry, which the
+        // backend reads as "no hint" and keeps the arena-sized plane.
+        // CUDA-only: the plane is the CUDA backend's scratch and `cuda_mut` is
+        // feature-gated, so a CPU-only build has no one to announce it to.
+        #[cfg(feature = "cuda")]
+        if name == "positions" {
+            let id = graph
+                .inputs
+                .iter()
+                .copied()
+                .find(|&i| graph.node(i).name == name);
+            let rows = data
+                .iter()
+                .max()
+                .map(|m| *m as usize)
+                .and_then(|m| m.checked_add(1));
+            if let (Some(id), Some(rows)) = (id, rows) {
+                if let Some(cb) = self.cuda_mut() {
+                    cb.note_plane_rows(id, rows);
+                }
+            }
+        }
         let bits: Vec<f32> = data.iter().map(|&v| f32::from_bits(v)).collect();
         self.fill_input_impl(graph, name, &bits)
     }

@@ -439,6 +439,83 @@ fn fa_prefill_q8_0_parity(hd: usize) {
          elements differ (it must be a pure work removal)",
         agot.len()
     );
+
+    // ── #862: the plane is window-bounded, not arena-bounded ─────────────────
+    // Point the same node at a *bigger* region (1024 rows against this graph's
+    // 128-row arena) so the asserted size can tell the two sizings apart: the hint
+    // is `nt = 100`, which the backend rounds up to one `PLANE_ROW_BUCKET`, so the
+    // plane must be `4 * 256 * nkt` bytes — 4x under the arena-sized one this gate
+    // just measured and 16x under the region it is pointed at.
+    let (kbig, vbig) = (
+        cb.alloc_buffer(1024 * row_words),
+        cb.alloc_buffer(1024 * row_words),
+    );
+    cb.write_host(kbig, &vec![0f32; 1024 * row_words]).unwrap();
+    cb.write_host(vbig, &vec![0f32; 1024 * row_words]).unwrap();
+    cb.exec_ids(
+        &g.nodes[store],
+        &[xb_k, xb_v, xb_p],
+        kbig,
+        Some((kbig, vbig)),
+    )
+    .unwrap();
+    cb.reset_kv_stage_for_test();
+    cb.note_plane_rows(xb_p, nt);
+    crate::testfail::reset_checked();
+    cb.exec_ids(&g.nodes[at], &[xb_q, kbig, xb_p], ob_at, Some((kbig, vbig)))
+        .unwrap();
+    let hinted = cb.copy_to_host(ob_at).unwrap();
+    assert_eq!(
+        hinted.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        agot.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "the window-bounded plane changed the output"
+    );
+    assert!(
+        crate::testfail::checked("cuda_fa_prefill_q8_0_staged") > 0,
+        "the hinted forward did not take the staging plane"
+    );
+    let rows = crate::graph::cuda_backend::plane_rows(1024, nt);
+    assert_eq!(
+        rows,
+        crate::graph::cuda_backend::PLANE_ROW_BUCKET,
+        "one bucket"
+    );
+    assert_eq!(
+        cb.kv_stage_bytes_for_test(),
+        4 * rows * nkt,
+        "the plane must be sized by the window ({rows} rows), not by the 1024-row region"
+    );
+
+    // ── #862: the budget guard refuses the plane and falls back ──────────────
+    // Armed, the refusal must be the per-tile route (bit-identical output), not an
+    // error, and it must be observable at its chokepoint.
+    cb.reset_kv_stage_for_test();
+    crate::testfail::reset_checked();
+    {
+        let _g = crate::testfail::InjectionGuard::arm("cuda_kv_stage_budget");
+        cb.exec_ids(&g.nodes[at], &[xb_q, kbig, xb_p], ob_at, Some((kbig, vbig)))
+            .unwrap();
+    }
+    let refused = cb.copy_to_host(ob_at).unwrap();
+    assert_eq!(
+        refused.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        agot.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        "the refused forward did not fall back to the per-tile route"
+    );
+    assert_eq!(
+        crate::testfail::checked("cuda_fa_prefill_q8_0_staged"),
+        0,
+        "the refused forward still took a staging plane"
+    );
+    assert!(
+        crate::testfail::checked("cuda_kv_stage_refused") > 0,
+        "the refusal was not observable at its chokepoint"
+    );
+    assert_eq!(
+        cb.kv_stage_bytes_for_test(),
+        0,
+        "a refused plane must not be allocated"
+    );
 }
 // 8d: split-K decode attention parity (nt == 1 routes to the split path).
 // nkv = 3 exercises EMPTY splits (positions[0] = 2 → splits 3..7 have no

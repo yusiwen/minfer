@@ -316,3 +316,27 @@ fn live_peak(intervals: &[(usize, usize, usize)], classes: &[usize]) -> usize {
     }
     peak
 }
+
+/// #862: the staging plane's budget rule — a reported free read caps it at an
+/// eighth, and an unknown read attempts (the allocation is the authority).
+#[test]
+fn the_kv_stage_plane_needs_an_eighth_of_free_memory() {
+    let reported = |free: usize| DeviceMemory::Reported {
+        free,
+        total: free * 2,
+    };
+    let eighth = 64 << 20;
+    assert!(kv_stage_admitted(eighth, &reported(8 * eighth)));
+    assert!(kv_stage_admitted(eighth - 1, &reported(8 * eighth)));
+    assert!(!kv_stage_admitted(eighth + 1, &reported(8 * eighth)));
+    // A device with no free memory admits nothing, and the boundary is inclusive.
+    assert!(!kv_stage_admitted(1, &reported(0)));
+    assert!(kv_stage_admitted(0, &reported(0)));
+    // Unknown is not "zero" (#122's rule, in the reverse direction).
+    let failed = DeviceMemory::QueryFailed {
+        code: 700,
+        name: "cudaErrorIllegalAddress".to_string(),
+    };
+    assert!(kv_stage_admitted(usize::MAX, &failed));
+    assert!(kv_stage_admitted(usize::MAX, &DeviceMemory::NoDevice));
+}

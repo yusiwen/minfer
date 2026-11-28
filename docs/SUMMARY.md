@@ -275,6 +275,7 @@
         - [114 — #848: the hd-128 column measured, and the four ratios #842 quotes (MEASURED)](./cuda_optimization_steps/114-c4-packed-q8-kv-hd128-column.md)
         - [115 — #845: the hd-64 prefill takes the FA body — 4.32x, and the packed arm reads 1.010x (LANDED)](./cuda_optimization_steps/115-c4-packed-q8-kv-hd64-prefill.md)
         - [116 — #858: the packed prefill stages once per layer — the hd-128 cell at 1.021x (LANDED)](./cuda_optimization_steps/116-c4-packed-q8-kv-once-per-layer.md)
+        - [117 — #862: the staging plane is window-bounded, and a budget guard can refuse it (LANDED)](./cuda_optimization_steps/117-c4-packed-q8-kv-window-plane.md)
 
 # Sampling and Chat Templates
 
